@@ -272,8 +272,14 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
     sent.and(read).or_else(|e| match e.kind() {
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
             let secs = kithd.timeout.as_secs();
+            // A change that timed out may still have landed: say so rather than imply it did not.
+            let maybe = if method == "GET" {
+                ""
+            } else {
+                "; the change may still have been applied"
+            };
             fail(format!(
-                "kithd has not answered for {secs} s (--timeout sets how long to wait)"
+                "kithd has not answered for {secs} s (--timeout sets how long to wait){maybe}"
             ))
         }
         _ => fail(format!("talking to kithd: {e}")),

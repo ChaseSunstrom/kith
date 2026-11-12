@@ -2,7 +2,8 @@
 """Phase 1 acceptance numbers (PLAN.md §7), measured through kithd and the CLI:
 
   - a container whose image is cached starts in under 150 ms (apply -> first output);
-  - 20 containers run, and kithd stays under 30 MB RSS with them.
+  - 20 containers run, and kithd stays under 30 MB RSS with them;
+  - kithd (one thread) answers the API within 100 ms while it starts 20 containers.
 
 Opt-in, like the e2e tests: it pulls an image and needs a delegated cgroup.
 
@@ -77,11 +78,21 @@ def main():
                 f.write(WORKLOAD.format(name="burst", replicas=20, image=IMAGE))
             kith = [os.path.join(bins, "kith"), "--socket", socket]
             subprocess.run([*kith, "apply", "-f", os.path.join(tmp, "burst.yaml")], check=True, stdout=subprocess.DEVNULL)
-            stall = 0
-            for _ in range(20):
+            stall, during = 0, 0
+
+            def burst_up():
+                logs = glob.glob(os.path.join(tmp, "state", "logs", "default_burst_*_main.out"))
+                return len(logs) == 20 and all(os.path.getsize(log) for log in logs)
+
+            # Only calls made before the burst is up count: later ones measure an idle kithd.
+            deadline = time.monotonic() + 120
+            while not burst_up():
+                if time.monotonic() > deadline:
+                    sys.exit("burst: not up after 120 s")
                 began = time.monotonic()
                 subprocess.run([*kith, "get", "ConfigMap"], check=True, stdout=subprocess.DEVNULL)
                 stall = max(stall, time.monotonic() - began)
+                during += 1
             time.sleep(1)
             # Peak, not current: a spike while 20 start at once counts too.
             with open(f"/proc/{daemon.pid}/status") as status:
@@ -96,7 +107,11 @@ def main():
     results = [
         ("cached start (median of 5)", cached <= START_BUDGET, f"{cached * 1000:.0f} ms (budget {START_BUDGET * 1000:.0f} ms)"),
         ("containers still running", running == total == 46, f"{running} of {total}"),
-        ("slowest API call while 20 containers start", stall <= API_BUDGET, f"{stall * 1000:.0f} ms (budget {API_BUDGET * 1000:.0f} ms)"),
+        (
+            "slowest API call while 20 containers start",
+            during >= 3 and stall <= API_BUDGET,
+            f"{stall * 1000:.0f} ms over {during} calls during the burst (budget {API_BUDGET * 1000:.0f} ms, at least 3 calls)",
+        ),
         (f"kithd peak RSS with {total} containers", rss <= RSS_BUDGET, f"{rss / 2**20:.1f} MB (budget {RSS_BUDGET / 2**20:.0f} MB)"),
     ]
     print(f"20 replicas up: {twenty * 1000:.0f} ms")

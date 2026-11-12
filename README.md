@@ -47,6 +47,10 @@ web.yaml:7:13: invalid type: string "yes", expected u32
 
 - Serves the resource API as HTTP/JSON on a unix socket only you can open
   (`$XDG_RUNTIME_DIR/kith/kithd.sock`; `--socket` or `KITH_SOCKET` to move it).
+  `kith` gives up on a kithd that has not answered for 30 s (`--timeout` or
+  `KITH_TIMEOUT`, in seconds); a change that timed out may still have been applied.
+- One kithd per state directory: a second one, or `kith --store` on a store a
+  kithd holds, is refused instead of left waiting.
 - Keeps resources and their revision history in `~/.local/state/kith/store.json`
   (`--state` or `KITH_STATE`). `kith --store FILE` reads or edits such a file
   with no daemon.
