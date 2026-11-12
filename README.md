@@ -20,6 +20,7 @@ kithd &                          # as you, no root: needs cgroup v2 and a system
 kith apply -f examples/hello.yaml
 kith get                         # Workload  default  hello  1  1/1 ready
 kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
+kith get -w workload             # the table, then each row as it changes (a long-poll on GET /v1/watch)
 tail ~/.local/state/kith/logs/default_hello_0_main.out
 kith delete workload/hello       # stops its containers
 ```

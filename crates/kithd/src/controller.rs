@@ -277,6 +277,9 @@ async fn reconcile(
             dirty |= file_store.store.set_status(&key, Some(status)).is_ok();
         }
     }
+    if dirty {
+        shared.bump();
+    }
     if dirty && let Err(e) = file_store.save() {
         eprintln!("kithd: saving status: {e}");
     }

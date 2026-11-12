@@ -317,3 +317,98 @@ spec:
     daemon.stop();
     assert_eq!(count(""), 0, "no container outlives kithd");
 }
+
+/// `GET /v1/watch` over the raw socket: (status line, JSON body).
+fn watch_request(daemon: &Daemon, query: &str) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let mut stream = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
+    write!(
+        stream,
+        "GET /v1/watch{query} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    serde_json::from_str(body).unwrap()
+}
+
+#[test]
+fn watch_reports_changes() {
+    let daemon = Daemon::start("watch");
+    daemon.apply(CONFIG);
+    let now = watch_request(&daemon, "");
+    let g = now["generation"].as_u64().unwrap();
+    assert_eq!(now["resources"].as_array().unwrap().len(), 1);
+
+    // A generation other than the current one (older, or from before a restart) answers at once.
+    let t = Instant::now();
+    assert_eq!(
+        watch_request(&daemon, &format!("?after={}&wait=20", g - 1))["generation"],
+        g
+    );
+    assert_eq!(
+        watch_request(&daemon, &format!("?after={}&wait=20", g + 1))["generation"],
+        g
+    );
+    // Nothing changes: the wait runs out and the same state comes back.
+    let quiet = watch_request(&daemon, &format!("?after={g}&wait=1"));
+    assert_eq!(quiet["generation"], g);
+    assert!(t.elapsed() >= Duration::from_secs(1) && t.elapsed() < Duration::from_secs(10));
+    // The kind filter applies.
+    let other = watch_request(&daemon, "?kind=Secret");
+    assert_eq!(other["resources"].as_array().unwrap().len(), 0);
+
+    // A change wakes a waiting request long before its wait is up.
+    let t = Instant::now();
+    let waiting = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| watch_request(&daemon, &format!("?after={g}&wait=20")));
+        std::thread::sleep(Duration::from_millis(300));
+        daemon.apply(&CONFIG.replace("hello", "goodbye"));
+        waiting.join().unwrap()
+    });
+    assert!(t.elapsed() < Duration::from_secs(10));
+    assert!(waiting["generation"].as_u64().unwrap() > g);
+    assert_eq!(waiting["resources"][0]["metadata"]["revision"], 2);
+
+    // `kith get -w`: the table, then the rows that change.
+    let mut watcher = Command::new(&daemon.kith)
+        .args(["get", "-w", "configmap"])
+        .env("KITH_SOCKET", daemon.dir.join("kithd.sock"))
+        .env_remove("KITH_STORE")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, lines) = std::sync::mpsc::channel();
+    let stdout = watcher.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            let Ok(line) = line else { return };
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let next = || {
+        lines
+            .recv_timeout(Duration::from_secs(20))
+            .expect("a line from kith get -w")
+    };
+    assert!(next().starts_with("KIND"));
+    assert!(next().contains("settings  2"));
+    daemon.apply(&CONFIG.replace("hello", "again"));
+    assert!(next().contains("settings  3"));
+    daemon.ok(&["delete", "configmap/settings"]);
+    assert!(next().ends_with("deleted"));
+    // kithd stopping ends the watch without waiting out a long-poll.
+    let t = Instant::now();
+    let mut daemon = daemon;
+    daemon.stop();
+    assert!(t.elapsed() < Duration::from_secs(10));
+    assert!(!watcher.wait().unwrap().success());
+
+    // -w needs the daemon.
+    let (code, _, err) = daemon.kith(&["--store", "x.json", "get", "-w"]);
+    assert_eq!((code, err.contains("-w needs kithd")), (2, true), "{err}");
+}

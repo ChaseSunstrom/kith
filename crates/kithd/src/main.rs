@@ -31,6 +31,16 @@ pub struct Shared {
     pub store: Mutex<FileStore>,
     /// Poked after every change to the store, so the controller reconciles at once.
     pub changed: Notify,
+    /// Counts changes to the store, for `GET /v1/watch`. Bumped while holding the store
+    /// lock, so a reader under the lock sees the generation that matches what it reads.
+    /// Starts at the clock (ms) so a restarted kithd never repeats a number a client holds.
+    pub generation: watch::Sender<u64>,
+}
+
+impl Shared {
+    pub fn bump(&self) {
+        self.generation.send_modify(|g| *g += 1);
+    }
 }
 
 fn main() -> ExitCode {
@@ -89,6 +99,12 @@ fn run(args: Args) -> Result<(), String> {
     let shared = Arc::new(Shared {
         store: Mutex::new(store),
         changed: Notify::new(),
+        generation: watch::channel(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        )
+        .0,
     });
 
     // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
@@ -105,6 +121,7 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!("kithd: serving {} (state in {})", socket.display(), state.display());
 
         let (stop, stopping) = watch::channel(false);
+        let watched = shared.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
             let (mut term, mut int) = (
@@ -113,6 +130,8 @@ fn run(args: Args) -> Result<(), String> {
             );
             tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
             let _ = stop.send(true);
+            // Shutdown waits for open requests: wake the long-polls so it does not wait out their timeout.
+            watched.bump();
         });
         let mut server_stop = stopping.clone();
         let server = axum::serve(listener, api::router(shared.clone()))
