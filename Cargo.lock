@@ -1048,6 +1048,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kith-sched"
+version = "0.0.1"
+dependencies = [
+ "kith-api",
+ "serde_json",
+]
+
+[[package]]
 name = "kith-yaml"
 version = "0.0.1"
 dependencies = [
