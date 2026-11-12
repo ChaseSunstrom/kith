@@ -117,7 +117,7 @@ Phase 2 of the plan is being built. What works today:
 kithd --listen 192.168.1.10:7443 --name alpha      # first start: makes the cluster's CA
 kith node token                                    # on alpha: good once, for an hour
 kithd --join 192.168.1.10:7443 --token TOKEN --name beta    # on the other machine
-kith get node                                      # on either: alpha and beta, with their addresses
+kith get node                                      # on either: alpha and beta, `ready at` their addresses
 kith node status                                   # who leads the store, who votes
 ```
 
@@ -131,6 +131,11 @@ kith node status                                   # who leads the store, who vo
   voters would stop when either one did; losing it stops changes until it is
   back. A node starts to vote only once it has received the store.
 - `kith delete node/NAME` takes a node out of the store's members.
+- Every node tells every other one, every two seconds, which nodes it has
+  heard from (none of this goes through the store). A node nobody has heard
+  from for ten seconds shows as `unreachable` in `kith get node`, and as
+  `ready` again when it is back. A voter that is unreachable for a minute
+  gives its vote to a node that is there, if the cluster has one to spare.
 
 - Nodes talk over TLS and both ends show a certificate from the cluster's CA:
   that proves membership, not which member (every node trusts every other).
@@ -141,9 +146,7 @@ kith node status                                   # who leads the store, who vo
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
 
-Not yet: a node that joined runs no workloads (scheduling is next), and a voter
-that is lost for good is not replaced by another node on its own: delete its
-Node. A change whose answer was lost with the leader may or may not have
+Not yet: a node that joined runs no workloads (scheduling is next). A change whose answer was lost with the leader may or may not have
 happened; `kith get` tells. Joining needs an empty `--state`. A joined node
 that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and
@@ -162,11 +165,14 @@ kith get dnsrecord                   # each one says `served`, or why not
 ```
 
 - `<node>.node.kith` is the address each node of the cluster is reached at.
+  Names under `kith` are the cluster's own: a zone cannot take them.
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
   zone itself. Names in values are full names (`nas.home.example`).
 - Split horizon: a zone with `clients: [192.168.0.0/16]` is what those clients
-  get, in place of a zone for everyone with the same domain.
+  get, in place of a zone for everyone with the same domain. A client inside
+  two different `clients` lists gets only one of them: give zones that belong
+  together the same list.
 - Every other name is passed to the resolvers in `/etc/resolv.conf`
   (`--dns-upstream 1.1.1.1,9.9.9.9` to say which), for clients on private
   networks only, so a kithd reachable from the internet is not an open

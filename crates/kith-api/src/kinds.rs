@@ -838,6 +838,14 @@ impl Spec for DnsZoneSpec {
                 self.domain
             ));
         }
+        // Room for the names the server adds in front (`hostmaster.`).
+        if self.domain.len() > 240 {
+            return Err("domain: longer than 240 characters".into());
+        }
+        let domain = self.domain.to_ascii_lowercase();
+        if domain == "kith" || domain.ends_with(".kith") {
+            return Err("domain: names under `kith` are the cluster's own".into());
+        }
         for net in &self.clients {
             let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
             let max = match address.parse::<std::net::IpAddr>() {

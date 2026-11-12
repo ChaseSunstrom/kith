@@ -126,15 +126,24 @@ pub fn zones_of(store: &Store) -> (Zones, BTreeMap<String, Value>) {
         };
         status.insert(resource.key(), report);
     }
-    // Checks every record against the rest of its zone's, as the server will hold them.
-    let mut trial: BTreeMap<String, Records> = BTreeMap::new();
+    // Checks every record against the rest of its domain's (for the same clients), as the
+    // server will hold them. Per name: is what is there a CNAME? One has its name to itself.
+    type Trial = (Records, BTreeMap<String, bool>);
+    let mut trial: BTreeMap<(String, Vec<String>), Trial> = BTreeMap::new();
     for resource in store.list(Some("DNSRecord")) {
         let added = spec::<DnsRecordSpec>(resource).and_then(|record| {
             let no_zone = || format!("there is no DNSZone named `{}`", record.zone);
             let (zone, ttl) = zones.get_mut(&record.zone).ok_or_else(no_zone)?;
             let records = records_of(&record, &zone.domain, *ttl)?;
-            let trial = trial.entry(record.zone.clone()).or_default();
-            records.iter().try_for_each(|record| trial.add(record.clone()))?;
+            let (trial, aliases) = trial.entry((zone.domain.clone(), zone.clients.clone())).or_default();
+            for record in &records {
+                let alias = matches!(record.data, Rdata::Cname(_));
+                if aliases.get(&record.name).is_some_and(|other| alias || *other) {
+                    return Err(format!("`{}` is a CNAME and has other records too", record.name));
+                }
+                trial.add(record.clone())?;
+                aliases.insert(record.name.clone(), alias);
+            }
             zone.records.extend(records);
             Ok(())
         });
@@ -162,8 +171,8 @@ pub fn zones_of(store: &Store) -> (Zones, BTreeMap<String, Value>) {
             .chain(apexes)
             .chain(shown.iter().flat_map(|zone| zone.records.clone()))
         {
-            // Each record was added once already, to its own zone, so this only fails
-            // where two zones share a domain and are too much together.
+            // Each record was added once already, beside the rest of its domain's, so this
+            // only fails where one zone's domain lies inside another's and they collide.
             let _ = records.add(record);
         }
         records
@@ -193,8 +202,10 @@ pub fn system_upstreams() -> Vec<SocketAddr> {
 
 /// Would asking `upstream` be asking ourselves, listening on `listen`?
 fn is_self(upstream: SocketAddr, listen: SocketAddr) -> bool {
-    let same_host = upstream.ip() == listen.ip() || (listen.ip().is_unspecified() && upstream.ip().is_loopback());
-    same_host && upstream.port() == listen.port()
+    // Listening on every address: any address of this machine (one a socket can be bound to) is us.
+    let ours = || std::net::UdpSocket::bind((upstream.ip(), 0)).is_ok();
+    let same_host = upstream.ip() == listen.ip() || (listen.ip().is_unspecified() && ours());
+    upstream.port() == listen.port() && same_host
 }
 
 /// UDP and TCP on the same address; with port 0, on the same free port.
@@ -223,6 +234,9 @@ pub async fn run(
     let listen = tcp.local_addr().expect("a bound socket has an address");
     upstreams.retain(|upstream| !is_self(*upstream, listen));
     eprintln!("kithd: serving DNS on {listen}; other names go to {upstreams:?}");
+    if upstreams.is_empty() {
+        eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
+    }
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
     let feed = async {
         let mut generation = shared.generation.subscribe();
@@ -236,7 +250,8 @@ pub async fn run(
                 let made_of = |r: &Resource| {
                     (
                         r.key(),
-                        r.metadata.revision,
+                        // Not the revision: deleted and made again, it starts over.
+                        r.spec.clone(),
                         r.status.as_ref().map(|s| s["address"].clone()),
                     )
                 };
@@ -263,6 +278,8 @@ pub async fn run(
                 && let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await
             {
                 eprintln!("kithd: reporting on DNS records: {e}");
+                // Tried again at the next change to the store.
+                built_from = None;
             }
             if generation.changed().await.is_err() {
                 return;
@@ -333,6 +350,16 @@ metadata: { name: lost }
 spec: { zone: nowhere, name: x, type: A, values: [10.0.0.1] }
 ---
 apiVersion: kith.dev/v1
+kind: DNSZone
+metadata: { name: home-too }
+spec: { domain: home.example }
+---
+apiVersion: kith.dev/v1
+kind: DNSRecord
+metadata: { name: other-alias }
+spec: { zone: home-too, name: nas, type: CNAME, values: [elsewhere.example] }
+---
+apiVersion: kith.dev/v1
 kind: Node
 metadata: { name: alpha }
 spec: {}
@@ -370,6 +397,9 @@ spec: {}
 
         assert_eq!(status["DNSZone/home"], json!({ "state": "served" }));
         assert_eq!(status["DNSRecord/nas-inside"], json!({ "state": "served" }));
+        // A CNAME where another zone of the same domain has an address is refused, not half served.
+        let alias = status["DNSRecord/other-alias"]["message"].as_str().unwrap();
+        assert!(alias.contains("is a CNAME and has other records too"), "{alias}");
         let lost = status["DNSRecord/lost"]["message"].as_str().unwrap();
         assert!(lost.contains("no DNSZone named `nowhere`"), "{lost}");
     }
@@ -381,5 +411,7 @@ spec: {}
         assert!(is_self(at("192.168.1.1:53"), at("192.168.1.1:53")));
         assert!(!is_self(at("127.0.0.1:53"), at("0.0.0.0:5353")));
         assert!(!is_self(at("1.1.1.1:53"), at("0.0.0.0:53")));
+        // Any address of this machine, when listening on all of them.
+        assert!(is_self(at("127.0.0.2:53"), at("0.0.0.0:53")));
     }
 }

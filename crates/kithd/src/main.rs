@@ -10,6 +10,7 @@ mod api;
 mod cluster;
 mod controller;
 mod dns;
+mod members;
 mod pki;
 mod probe;
 mod raft;
@@ -71,6 +72,8 @@ pub struct Shared {
     pub generation: watch::Sender<u64>,
     /// `None` in agent mode: one node, nothing on the network.
     pub cluster: Option<cluster::Cluster>,
+    /// Which nodes were heard from, and when.
+    pub members: members::Members,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
 }
@@ -193,6 +196,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         changed,
         logs: state.join("logs"),
         generation,
+        members: members::Members::new(name),
         cluster,
         stop: watch::channel(false).0,
     });
@@ -349,7 +353,8 @@ fn run(args: Args) -> Result<(), String> {
                     }
                 }
             };
-            let (served, (), ()) = tokio::join!(served, members, registered);
+            let pings = members::run(shared.clone(), stopping.clone());
+            let (served, (), (), ()) = tokio::join!(served, members, registered, pings);
             served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {

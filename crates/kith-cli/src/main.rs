@@ -635,13 +635,15 @@ fn status_summary(resource: &Resource) -> String {
             let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
             format!("{ready}/{replicas} ready{why}")
         }
-        // A Job, or a Node.
+        // A Job or a DNS record; a Node: its state and where it is.
         _ => match (
-            status["state"].as_str().or(status["address"].as_str()),
+            status["state"].as_str(),
             status["message"].as_str(),
+            status["address"].as_str(),
         ) {
-            (Some(state), Some(why)) if state != "succeeded" => format!("{state}: {}", clean(why)),
-            (Some(state), _) => state.into(),
+            (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
+            (Some(state), _, Some(address)) => format!("{state} at {}", clean(address)),
+            (Some(state), ..) | (None, _, Some(state)) => clean(state),
             _ => String::new(),
         },
     }

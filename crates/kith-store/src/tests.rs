@@ -89,6 +89,25 @@ fn commands_replay_to_the_same_store() {
             .collect();
         (store, replies)
     };
+    // A patch sets its fields and leaves the others; a key that is gone is skipped.
+    let patch = |key: &str, field: &str| Command::Patch {
+        statuses: vec![(
+            key.into(),
+            serde_json::Map::from_iter([(field.to_string(), true.into())]),
+        )],
+    };
+    let mut store = Store::default();
+    for command in [
+        commands[0].clone(),
+        patch("ConfigMap/default/a", "x"),
+        patch("ConfigMap/default/a", "y"),
+    ] {
+        run(&mut store, command).unwrap();
+    }
+    run(&mut store, patch("ConfigMap/default/gone", "x")).unwrap();
+    let status = store.get("ConfigMap/default/a").unwrap().status.clone();
+    assert_eq!(status, Some(serde_json::json!({ "x": true, "y": true })));
+
     let (first, replies) = replay();
     std::thread::sleep(std::time::Duration::from_millis(1100));
     // Later, on another node: the same store, to the second.

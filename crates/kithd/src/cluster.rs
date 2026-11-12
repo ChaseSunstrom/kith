@@ -222,7 +222,11 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/join", post(join))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(shared.clone());
-    let members = api::router(shared.clone()).merge(crate::raft::router(shared));
+    let ping = Router::new().route("/v1/ping", post(crate::members::ping));
+    let ping = ping.layer(DefaultBodyLimit::max(64 << 10)).with_state(shared.clone());
+    let members = api::router(shared.clone())
+        .merge(crate::raft::router(shared))
+        .merge(ping);
     open.merge(members.layer(axum::middleware::from_fn(members_only)))
 }
 
@@ -317,8 +321,11 @@ pub async fn register(shared: &Shared, name: &str, address: &str, id: u64) -> Re
         shared.submit(Command::Apply { resources, at }).await?;
     }
     let status = serde_json::json!({ "address": address, "raftId": id.to_string() });
-    let statuses = vec![(node_key(name), Some(status))];
-    shared.submit(Command::Status { statuses }).await.map(drop)
+    let serde_json::Value::Object(status) = status else {
+        unreachable!("an object")
+    };
+    let statuses = vec![(node_key(name), status)];
+    shared.submit(Command::Patch { statuses }).await.map(drop)
 }
 
 async fn join(

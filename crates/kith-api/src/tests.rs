@@ -381,6 +381,14 @@ fn dns_kinds_are_checked() {
         Ok(())
     );
     assert!(said(zone("{ domain: 'home example' }")).contains("not a domain name"));
+    assert!(said(zone("{ domain: Node.Kith }")).contains("the cluster's own"));
+    assert!(
+        said(zone(&format!(
+            "{{ domain: {}.example }}",
+            vec!["a".repeat(60); 4].join(".")
+        )))
+        .contains("longer than 240")
+    );
     assert!(said(zone("{ domain: a.b, clients: [10.0.0.0/33] }")).contains("prefix length"));
     assert!(said(zone("{ domain: a.b, clients: [lan] }")).contains("not a network"));
 

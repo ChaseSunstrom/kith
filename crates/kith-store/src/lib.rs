@@ -50,6 +50,11 @@ pub enum Command {
     Status {
         statuses: Vec<(String, Option<serde_json::Value>)>,
     },
+    /// Set some fields of a status and leave the others: two writers of one status (a
+    /// node's address, its state) do not undo each other. A key that is gone is skipped.
+    Patch {
+        statuses: Vec<(String, serde_json::Map<String, serde_json::Value>)>,
+    },
     /// Replace everything: how a store from before replication comes in.
     Import {
         store: Store,
@@ -95,6 +100,17 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         Command::Status { statuses } => {
             for (key, status) in statuses {
                 let _ = store.set_status(&key, status);
+            }
+            Ok(Done::Nothing)
+        }
+        Command::Patch { statuses } => {
+            for (key, fields) in statuses {
+                let mut status = match store.get(&key).and_then(|r| r.status.clone()) {
+                    Some(serde_json::Value::Object(status)) => status,
+                    _ => serde_json::Map::new(),
+                };
+                status.extend(fields);
+                let _ = store.set_status(&key, Some(status.into()));
             }
             Ok(Done::Nothing)
         }

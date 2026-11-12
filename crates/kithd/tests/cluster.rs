@@ -226,6 +226,13 @@ fn the_store_survives_its_leader() {
             .all(|node| status(node).contains("voters:    alpha, beta, gamma"))
     });
     assert!(status(&gamma).contains("leader:    alpha"), "{}", status(&gamma));
+    // The nodes hear from each other, and the leader writes that down.
+    let states = |node: &Node| {
+        let nodes: serde_json::Value = serde_json::from_str(&node.ok(&["get", "node", "-o", "json"])).unwrap();
+        let state = |node: &serde_json::Value| node["status"]["state"].as_str().unwrap_or("-").to_string();
+        nodes.as_array().unwrap().iter().map(state).collect::<Vec<_>>()
+    };
+    wait_for("three ready nodes", || states(&gamma) == ["ready", "ready", "ready"]);
 
     // A change made through a node that does not lead is on every node.
     let config = |name: &str| {
@@ -251,12 +258,20 @@ fn the_store_survives_its_leader() {
         gamma.kith(&["get", "ConfigMap/after"]).0 == 0
     });
     assert!(!status(&beta).contains("leader:    alpha"), "{}", status(&beta));
+    // Nobody hears from alpha any more: after ten seconds the new leader says so.
+    wait_for("alpha to be called unreachable", || {
+        states(&beta) == ["unreachable", "ready", "ready"]
+    });
+    assert!(beta.ok(&["get", "node"]).contains("unreachable"));
 
     // alpha comes back with what it had, and is sent what it missed.
     alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
     wait_for("alpha to catch up", || alpha.kith(&["get", "ConfigMap/after"]).0 == 0);
     assert!(alpha.ok(&["get", "ConfigMap/before"]).contains("before"));
     assert_eq!(alpha.nodes().len(), 3);
+    wait_for("alpha to be ready again", || {
+        states(&alpha) == ["ready", "ready", "ready"]
+    });
 }
 
 #[test]

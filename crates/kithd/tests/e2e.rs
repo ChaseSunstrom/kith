@@ -941,10 +941,10 @@ fn config_changes_restart() {
     assert_eq!(daemon.log("w_default_greeter_1_main"), "hello\ngoodbye\n");
 }
 
-/// Ask the DNS server on `port` for the A record of `name`: the address, or the response code.
-fn resolve(port: u16, name: &str) -> Result<[u8; 4], u8> {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+/// Ask the DNS server on `port` for the A record of `name`, over UDP or TCP: the address,
+/// or the response code.
+fn resolve_over(tcp: bool, port: u16, name: &str) -> Result<[u8; 4], u8> {
+    use std::io::{Read, Write};
     // Header: id, recursion desired, one question. Then the name, type A, class IN.
     let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
     for label in name.split('.') {
@@ -952,16 +952,57 @@ fn resolve(port: u16, name: &str) -> Result<[u8; 4], u8> {
         query.extend(label.as_bytes());
     }
     query.extend([0, 0, 1, 0, 1]);
-    socket.send_to(&query, ("127.0.0.1", port)).unwrap();
-    let mut reply = [0; 512];
-    let (len, _) = socket.recv_from(&mut reply).expect("an answer from kithd's DNS");
+    let wait = Some(Duration::from_secs(5));
+    let reply = if tcp {
+        // Over TCP every message has its length in front.
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.set_read_timeout(wait).unwrap();
+        stream.write_all(&(query.len() as u16).to_be_bytes()).unwrap();
+        stream.write_all(&query).unwrap();
+        let mut len = [0; 2];
+        stream
+            .read_exact(&mut len)
+            .expect("an answer from kithd's DNS over TCP");
+        let mut reply = vec![0; u16::from_be_bytes(len).into()];
+        stream.read_exact(&mut reply).unwrap();
+        reply
+    } else {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_read_timeout(wait).unwrap();
+        socket.send_to(&query, ("127.0.0.1", port)).unwrap();
+        let mut reply = vec![0; 512];
+        let (len, _) = socket.recv_from(&mut reply).expect("an answer from kithd's DNS");
+        reply.truncate(len);
+        reply
+    };
     assert_eq!(reply[..2], query[..2]);
     match (reply[3] & 0x0f, reply[7]) {
         // The address is the last thing in a reply with one A record.
-        (0, 1) => Ok(reply[len - 4..len].try_into().unwrap()),
+        (0, 1) => Ok(reply[reply.len() - 4..].try_into().unwrap()),
         (0, _) => Err(0),
         (code, _) => Err(code),
     }
+}
+
+fn resolve(port: u16, name: &str) -> Result<[u8; 4], u8> {
+    resolve_over(false, port, name)
+}
+
+/// A resolver that says every name is at 198.51.100.7; returns its port.
+fn upstream() -> u16 {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut query = [0; 512];
+        while let Ok((len, from)) = socket.recv_from(&mut query) {
+            let mut reply = query[..len].to_vec();
+            // A response, recursion available, one answer: the question's name, A, IN, 60 s.
+            (reply[2], reply[3], reply[7]) = (0x81, 0x80, 1);
+            reply.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 7]);
+            let _ = socket.send_to(&reply, from);
+        }
+    });
+    port
 }
 
 #[test]
@@ -971,8 +1012,8 @@ fn dns_answers_from_the_store() {
     }
     let port = free_port();
     let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
-    // An upstream nobody listens on: what is not ours fails instead of leaving the machine.
-    let args: &'static [&'static str] = Box::leak(Box::new(["--dns", listen, "--dns-upstream", "127.0.0.1:1"]));
+    let other: &'static str = Box::leak(format!("127.0.0.1:{}", upstream()).into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--dns", listen, "--dns-upstream", other]));
     let daemon = Daemon::start_with("dns", args);
     let home = include_str!("../../../examples/dns.yaml");
     daemon.apply(home);
@@ -980,9 +1021,12 @@ fn dns_answers_from_the_store() {
         resolve(port, "nas.home.example") == Ok([192, 168, 1, 20])
     });
     assert_eq!(daemon.status("dnsrecord/nas")["state"], "served");
-    // No such name in our zone (3); a name that is not ours and has no upstream to go to (2).
+    // No such name in our zone (3); a name that is not ours is what the other resolver says.
     assert_eq!(resolve(port, "printer.home.example"), Err(3));
-    assert_eq!(resolve(port, "example.org"), Err(2));
+    assert_eq!(resolve(port, "example.org"), Ok([198, 51, 100, 7]));
+    // Our names over TCP too.
+    assert_eq!(resolve_over(true, port, "nas.home.example"), Ok([192, 168, 1, 20]));
+    assert_eq!(resolve_over(true, port, "printer.home.example"), Err(3));
 
     // A record that changes is answered anew; one in a zone that is not there says so.
     daemon.apply(
