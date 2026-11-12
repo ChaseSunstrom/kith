@@ -1,6 +1,7 @@
 //! kithd's DNS server (`--dns ADDR:PORT`): what it answers comes from the store.
 //!
-//! - `<node>.node.kith`: the address each Node is reached at.
+//! - `<node>.node.kith`: the address each Node is reached at; `<node>.mesh.kith`: its
+//!   address on the mesh, if it is on it.
 //! - `DNSZone` and `DNSRecord`: names of your own. A zone with `clients` is split
 //!   horizon: clients in those networks get it, and not a zone for everyone with the
 //!   same domain.
@@ -106,6 +107,15 @@ pub fn zones_of(store: &Store) -> (Zones, BTreeMap<String, Value>) {
                 IpAddr::V6(ip) => Rdata::Aaaa(ip),
             };
             let (name, ttl) = (format!("{}.node.kith", node.metadata.name), NODE_TTL);
+            own.push(Record { name, ttl, data });
+        }
+        let mesh = node
+            .status
+            .as_ref()
+            .and_then(|status| status["mesh"]["address"].as_str());
+        if let Some(address) = mesh.and_then(|address| address.parse().ok()) {
+            let (name, ttl) = (format!("{}.mesh.kith", node.metadata.name), NODE_TTL);
+            let data = Rdata::Aaaa(address);
             own.push(Record { name, ttl, data });
         }
     }
@@ -369,10 +379,15 @@ spec: {}
     fn zones_come_from_the_store() {
         let mut store = store(HOME);
         store
-            .set_status("Node/alpha", Some(json!({ "address": "10.1.2.3:7443" })))
+            .set_status(
+                "Node/alpha",
+                Some(json!({ "address": "10.1.2.3:7443", "mesh": { "address": "fd00:1::1" } })),
+            )
             .unwrap();
         let (zones, status) = zones_of(&store);
         let outside = "198.51.100.1";
+        let on_mesh = zones.lookup(outside.parse().unwrap(), "alpha.mesh.kith", 28).unwrap();
+        assert_eq!(on_mesh.answers[0].data, Rdata::Aaaa("fd00:1::1".parse().unwrap()));
 
         assert_eq!(ask(&zones, outside, "alpha.node.kith"), Ok(vec!["10.1.2.3".into()]));
         // Ours to answer, so "no such name" (3), and never forwarded.

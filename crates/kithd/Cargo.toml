@@ -10,6 +10,7 @@ kith-api.workspace = true
 kith-store = { path = "../kith-store" }
 kith-dns = { path = "../kith-dns" }
 kith-sched = { path = "../kith-sched" }
+kith-mesh = { path = "../kith-mesh" }
 kith-runtime = { path = "../kith-runtime" }
 serde.workspace = true
 serde_json.workspace = true

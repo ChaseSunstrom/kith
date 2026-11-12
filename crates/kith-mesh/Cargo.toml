@@ -1,0 +1,23 @@
+[package]
+name = "kith-mesh"
+description = "The mesh between a cluster's nodes: a kernel WireGuard interface set up over netlink, addresses and peers worked out from the nodes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The versions libcontainer already brings into kithd: no second copy.
+netlink-sys = "0.8"
+netlink-packet-core = "0.8"
+netlink-packet-route = "0.31"
+netlink-packet-generic = "0.4"
+netlink-packet-wireguard = "0.4"
+sha2 = "0.11"
+
+[lints]
+workspace = true
+
+# Its own main: it is also the program its script runs inside the network namespaces.
+[[test]]
+name = "e2e"
+harness = false

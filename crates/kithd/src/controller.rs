@@ -1,5 +1,5 @@
 //! The controller: makes the containers and exec units on this node match the
-//! `Workload`s and `Job`s in the store, restarts them when they exit, and reports
+//! `Workload`s, `NodeWorkload`s and `Job`s in the store, restarts them when they exit, and reports
 //! what it sees in each one's status.
 //!
 // ponytail: one node. Not handled yet, each said so in the status where it
@@ -50,9 +50,9 @@ impl Run {
     }
 }
 
-/// One unit of one replica of one Workload, or of one run of a Job.
+/// One unit of one replica of one Workload, of one copy of a NodeWorkload, or of one run of a Job.
 struct Slot {
-    /// Store key of the Workload or Job.
+    /// Store key of the Workload, NodeWorkload or Job.
     owner: String,
     replica: u32,
     run: Run,
@@ -102,7 +102,7 @@ struct Controller {
     log_cap: u64,
     slots: BTreeMap<String, Slot>,
     jobs: BTreeMap<String, Progress>,
-    /// Log file prefixes of the Workloads and Jobs seen last pass; `None` before the first.
+    /// Log file prefixes of the Workloads, NodeWorkloads and Jobs seen last pass; `None` before the first.
     owners: Option<BTreeSet<String>>,
     /// The status report on its way to the store, if one is.
     report: Option<tokio::task::JoinHandle<()>>,
@@ -187,7 +187,7 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(6)).min(Duration::from_secs(60))
 }
 
-/// What every unit id (so every log file and cgroup) of one Workload or Job starts
+/// What every unit id (so every log file and cgroup) of one Workload, NodeWorkload or Job starts
 /// with. `_` cannot appear in a resource name, so it separates the parts.
 fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
     let kind = match kind {
@@ -248,12 +248,24 @@ pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(
     };
     let key = resource.key();
     let name = name.ok_or_else(|| Error::NotFound(format!("{key} has no unit `{}`", unit.unwrap_or("?"))))?;
-    let has = match resource.kind.as_str() {
-        "NodeWorkload" => bound(resource).contains(&replica),
-        _ => replica < replicas,
+    let numbered = resource.status.as_ref().is_some_and(|s| s.get("nodes").is_some());
+    let (has, copies) = match resource.kind.as_str() {
+        // A node alone has no scheduler to number its one copy: that is copy 0.
+        "NodeWorkload" if !numbered => (replica == 0, String::new()),
+        "NodeWorkload" => {
+            let mut numbers = bound(resource);
+            numbers.sort_unstable();
+            let list: Vec<_> = numbers.iter().map(u32::to_string).collect();
+            let said = match list.is_empty() {
+                true => ": it has no copies".to_string(),
+                false => format!(": its copies are {}; pick one with --replica", list.join(", ")),
+            };
+            (numbers.contains(&replica), said)
+        }
+        _ => (replica < replicas, String::new()),
     };
     if !has {
-        return Err(Error::NotFound(format!("{key} has no replica {replica}")));
+        return Err(Error::NotFound(format!("{key} has no replica {replica}{copies}")));
     }
     let namespace = resource.metadata.namespace.as_deref().unwrap_or_default();
     let prefix = id_prefix(&resource.kind, namespace, &resource.metadata.name);
@@ -285,7 +297,7 @@ impl Controller {
                 .collect()
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
-        // Per Workload or Job key: things to say in its status that belong to no unit.
+        // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut owners = BTreeSet::new();
         // Alone, this node runs everything; in a cluster, the replicas the scheduler bound
@@ -745,7 +757,7 @@ impl Controller {
     }
 
     /// Keep the log directory bounded: a file over the cap is moved aside (one old
-    /// copy is kept), and the files of Workloads and Jobs that are gone are removed.
+    /// copy is kept), and the files of Workloads, NodeWorkloads and Jobs that are gone are removed.
     fn tend_logs(&mut self, owners: BTreeSet<String>) {
         // ponytail: checked once a pass, so a file can pass the cap by what its unit
         // writes in one tick (10 s), and output written between the copy and the
@@ -868,5 +880,28 @@ mod tests {
         assert_eq!(backoff(0), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(8));
         assert_eq!(backoff(40), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_node_workload_log_names_the_copies_it_has() {
+        let mut resource: Resource = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "NodeWorkload",
+            "metadata": { "name": "x", "namespace": "default" },
+            "spec": { "template": { "containers": [{ "name": "run", "image": "img" }] } },
+        }))
+        .unwrap();
+        // No scheduler (a node alone): no `nodes`, and copy 0 is the one.
+        assert!(log_of(&resource, None, 0).is_ok());
+        assert!(log_of(&resource, None, 1).is_err());
+        // Sparse numbers: the error says which exist.
+        resource.status = Some(serde_json::json!({ "nodes": { "2": "b", "1": "a" } }));
+        assert!(log_of(&resource, None, 1).is_ok());
+        let Err(Error::NotFound(said)) = log_of(&resource, None, 0) else {
+            panic!("copy 0 found")
+        };
+        assert!(
+            said.ends_with("has no replica 0: its copies are 1, 2; pick one with --replica"),
+            "{said}"
+        );
     }
 }

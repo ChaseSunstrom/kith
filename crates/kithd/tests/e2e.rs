@@ -484,6 +484,8 @@ fn node_workload_runs_one_copy_alone() {
     wait_for("the copy", || daemon.status("NodeWorkload/agent")["ready"] == 1);
     assert!(daemon.ok(&["get", "nodeworkload"]).contains("1/1 ready"));
     wait_for("the copy's output", || daemon.log("n_default_agent_0_run") == "up\n");
+    // `kith logs` finds copy 0 though no scheduler numbered it.
+    assert_eq!(daemon.ok(&["logs", "nodeworkload/agent"]), "up\n");
     // Nothing here has the labels a selector asks for.
     daemon.apply(&agent("selector: { role: edge }"));
     wait_for("the copy to stop", || {

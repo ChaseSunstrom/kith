@@ -532,6 +532,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 reply["node"].as_str().unwrap_or_default(),
                 reply["applied"]
             );
+            for peer in reply["mesh"].as_array().into_iter().flatten() {
+                let shook = match peer["handshake"].as_u64() {
+                    Some(ago) => format!("handshake {ago} s ago"),
+                    None => "no handshake yet".into(),
+                };
+                let how = if peer["relayed"] == true {
+                    ", through an edge node"
+                } else {
+                    ""
+                };
+                let (node, address) = (peer["node"].as_str(), peer["address"].as_str());
+                println!(
+                    "mesh:      {} at {}, {shook}{how}",
+                    node.unwrap_or_default(),
+                    address.unwrap_or_default()
+                );
+            }
         }
         Command::Schema { kind: None } => {
             let rows = KINDS

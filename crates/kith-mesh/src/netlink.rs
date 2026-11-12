@@ -1,0 +1,292 @@
+//! The kernel's side: a WireGuard link made and addressed over route netlink, its key and
+//! peers set and read over generic netlink.
+
+use crate::{Key, MESH_BITS, NODE_BITS, Peer};
+use netlink_packet_core::{
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkDeserializable,
+    NetlinkMessage, NetlinkPayload, NetlinkSerializable,
+};
+use netlink_packet_generic::GenlMessage;
+use netlink_packet_generic::ctrl::{GenlCtrl, GenlCtrlCmd, nlas::GenlCtrlAttrs};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
+use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+use netlink_packet_wireguard::{
+    WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute, WireguardCmd,
+    WireguardMessage, WireguardPeer, WireguardPeerAttribute, WireguardPeerFlags,
+};
+use netlink_sys::{Socket, SocketAddr, protocols};
+use std::collections::BTreeMap;
+use std::io::{Error, ErrorKind, Result};
+use std::net::Ipv6Addr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A peer as the kernel has it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Seen {
+    pub key: Key,
+    /// Where its packets last came from, or where it was said to be.
+    pub endpoint: Option<std::net::SocketAddr>,
+    /// How long ago the two last agreed on keys; `None`: never.
+    pub handshake: Option<Duration>,
+}
+
+/// A WireGuard interface of this machine.
+pub struct Device {
+    index: u32,
+    family: u16,
+    /// The peers as last set, once they have been.
+    had: Option<BTreeMap<Key, Peer>>,
+}
+
+fn socket(protocol: isize) -> Result<Socket> {
+    let mut socket = Socket::new(protocol)?;
+    socket.bind_auto()?;
+    socket.connect(&SocketAddr::new(0, 0))?;
+    Ok(socket)
+}
+
+/// Send `message` and take the answers, up to the kernel's "done" or its yes or no. Each
+/// question has a socket of its own, so what is left of an earlier one (after an answer
+/// that could not be read) is never taken for this one's.
+fn ask<T>(protocol: isize, message: T, flags: u16) -> Result<Vec<T>>
+where
+    T: NetlinkSerializable + NetlinkDeserializable + std::fmt::Debug,
+    NetlinkMessage<T>: From<T>,
+{
+    let mut message = NetlinkMessage::from(message);
+    message.header.flags = NLM_F_REQUEST | flags;
+    message.finalize();
+    let mut bytes = vec![0; message.buffer_len()];
+    message.serialize(&mut bytes);
+    let socket = socket(protocol)?;
+    socket.send(&bytes, 0)?;
+    let mut answers = Vec::new();
+    loop {
+        let (bytes, _) = socket.recv_from_full()?;
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let answer = NetlinkMessage::<T>::deserialize(rest);
+            let answer = answer.map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))?;
+            // (Messages are padded to four bytes.)
+            let length = (answer.header.length as usize).next_multiple_of(4);
+            match answer.payload {
+                NetlinkPayload::Error(e) if e.code.is_some() => return Err(e.to_io()),
+                NetlinkPayload::Done(done) if done.code != 0 => {
+                    return Err(Error::from_raw_os_error(done.code.abs()));
+                }
+                NetlinkPayload::Error(_) | NetlinkPayload::Done(_) => return Ok(answers),
+                NetlinkPayload::InnerMessage(answer) => answers.push(answer),
+                _ => {}
+            }
+            rest = rest.get(length.max(1)..).unwrap_or_default();
+        }
+    }
+}
+
+fn link(index: u32, name: Option<&str>) -> LinkMessage {
+    let mut link = LinkMessage::default();
+    link.header.index = index;
+    link.attributes
+        .extend(name.map(|name| LinkAttribute::IfName(name.into())));
+    link
+}
+
+impl Device {
+    /// The WireGuard interface `name`, made if it is not there, with this private key,
+    /// UDP port and address (of a cluster's /48), and up. An interface of that name that
+    /// is something else is left alone, and an error.
+    pub fn ensure(name: &str, key: &Key, port: u16, address: Ipv6Addr) -> Result<Device> {
+        let ask_route = |message, flags| ask(protocols::NETLINK_ROUTE, message, flags);
+        let mut new = link(0, Some(name));
+        let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
+        new.attributes.push(kind.clone());
+        let made = ask_route(RouteNetlinkMessage::NewLink(new), NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+        match made {
+            Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
+        }
+        let found = ask_route(RouteNetlinkMessage::GetLink(link(0, Some(name))), NLM_F_ACK)?;
+        let Some(RouteNetlinkMessage::NewLink(found)) = found.into_iter().next() else {
+            return Err(Error::other(format!("no word from the kernel about {name}")));
+        };
+        let is_kind = |info: &LinkInfo| matches!(info, LinkInfo::Kind(InfoKind::Wireguard));
+        let wireguard = found.attributes.iter().any(|attribute| match attribute {
+            LinkAttribute::LinkInfo(infos) => infos.iter().any(is_kind),
+            _ => false,
+        });
+        if !wireguard {
+            let what = format!("there is an interface {name} already, and it is not a WireGuard one");
+            return Err(Error::new(ErrorKind::AlreadyExists, what));
+        }
+        let index = found.header.index;
+
+        let family = GenlCtrl {
+            cmd: GenlCtrlCmd::GetFamily,
+            nlas: vec![GenlCtrlAttrs::FamilyName("wireguard".into())],
+        };
+        let families = ask(protocols::NETLINK_GENERIC, GenlMessage::from_payload(family), NLM_F_ACK)?;
+        let ids = families.iter().flat_map(|family| &family.payload.nlas);
+        let mut id = ids.filter_map(|attribute| match attribute {
+            GenlCtrlAttrs::FamilyId(id) => Some(*id),
+            _ => None,
+        });
+        let family = id.next().ok_or_else(|| Error::other("the kernel has no WireGuard"))?;
+        let mut device = Device {
+            index,
+            family,
+            had: None,
+        };
+        device.set(vec![
+            WireguardAttribute::PrivateKey(*key),
+            WireguardAttribute::ListenPort(port),
+        ])?;
+
+        let mut to = AddressMessage::default();
+        to.header.family = AddressFamily::Inet6;
+        to.header.prefix_len = MESH_BITS;
+        to.header.index = index;
+        to.attributes.push(AddressAttribute::Address(address.into()));
+        // (The /48 on the interface is the route to every other node too.)
+        ask_route(
+            RouteNetlinkMessage::NewAddress(to),
+            NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+        )?;
+        let mut up = link(index, None);
+        up.header.flags = LinkFlags::Up;
+        up.header.change_mask = LinkFlags::Up;
+        ask_route(RouteNetlinkMessage::SetLink(up), NLM_F_ACK)?;
+        Ok(device)
+    }
+
+    fn message(&self, cmd: WireguardCmd, mut attributes: Vec<WireguardAttribute>) -> GenlMessage<WireguardMessage> {
+        attributes.insert(0, WireguardAttribute::IfIndex(self.index));
+        let mut message = GenlMessage::from_payload(WireguardMessage { cmd, attributes });
+        message.set_resolved_family_id(self.family);
+        message
+    }
+
+    fn set(&mut self, attributes: Vec<WireguardAttribute>) -> Result<()> {
+        let message = self.message(WireguardCmd::SetDevice, attributes);
+        ask(protocols::NETLINK_GENERIC, message, NLM_F_ACK).map(drop)
+    }
+
+    fn get(&mut self) -> Result<Vec<WireguardAttribute>> {
+        let message = self.message(WireguardCmd::GetDevice, Vec::new());
+        let answers = ask(protocols::NETLINK_GENERIC, message, NLM_F_DUMP)?;
+        Ok(answers
+            .into_iter()
+            .flat_map(|answer| answer.payload.attributes)
+            .collect())
+    }
+
+    /// The public key that goes with the private one.
+    pub fn public_key(&mut self) -> Result<Key> {
+        let key = self.get()?.into_iter().find_map(|attribute| match attribute {
+            WireguardAttribute::PublicKey(key) => Some(key),
+            _ => None,
+        });
+        key.ok_or_else(|| Error::other("the interface has no key"))
+    }
+
+    /// The peers the interface has now.
+    pub fn peers(&mut self) -> Result<Vec<Seen>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        // (A peer with many allowed addresses comes in parts; the first has what is read.)
+        let mut peers: BTreeMap<Key, Seen> = BTreeMap::new();
+        for attribute in self.get()? {
+            let WireguardAttribute::Peers(some) = attribute else {
+                continue;
+            };
+            for WireguardPeer(attributes) in some {
+                let (mut key, mut endpoint, mut handshake) = (None, None, None);
+                for attribute in attributes {
+                    match attribute {
+                        WireguardPeerAttribute::PublicKey(k) => key = Some(k),
+                        WireguardPeerAttribute::Endpoint(e) => endpoint = Some(e),
+                        WireguardPeerAttribute::LastHandshake(at) if at.seconds > 0 => {
+                            let at = Duration::from_secs(at.seconds as u64);
+                            handshake = Some(now.saturating_sub(at));
+                        }
+                        _ => {}
+                    }
+                }
+                let Some(key) = key else { continue };
+                let seen = Seen {
+                    key,
+                    endpoint,
+                    handshake,
+                };
+                peers.entry(key).or_insert(seen);
+            }
+        }
+        Ok(peers.into_values().collect())
+    }
+
+    /// Make the interface's peers `wanted`: the ones not wanted go, the others are added
+    /// or changed. A peer that is as it was last time is not touched, so it keeps the
+    /// endpoint the kernel has learnt from its packets.
+    pub fn set_peers(&mut self, wanted: &[Peer]) -> Result<()> {
+        let had = match self.had.take() {
+            Some(had) => had,
+            // First time: whatever is there is not ours to keep.
+            None => {
+                let there = self.peers()?.into_iter().map(|seen| Peer {
+                    key: seen.key,
+                    endpoint: None,
+                    allowed: Vec::new(),
+                    keepalive: 0,
+                });
+                there.map(|peer| (peer.key, peer)).collect()
+            }
+        };
+        let wanted: BTreeMap<Key, Peer> = wanted.iter().map(|peer| (peer.key, peer.clone())).collect();
+        let flags = |flags| WireguardPeerAttribute::Flags(flags);
+        let mut changes = Vec::new();
+        for key in had.keys().filter(|key| !wanted.contains_key(*key)) {
+            let gone = vec![
+                WireguardPeerAttribute::PublicKey(*key),
+                flags(WireguardPeerFlags::RemoveMe),
+            ];
+            changes.push(WireguardPeer(gone));
+        }
+        for peer in wanted.values().filter(|peer| had.get(&peer.key) != Some(*peer)) {
+            let allowed = |net: &Ipv6Addr| {
+                WireguardAllowedIp(vec![
+                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
+                    WireguardAllowedIpAttr::IpAddr((*net).into()),
+                    WireguardAllowedIpAttr::Cidr(NODE_BITS),
+                ])
+            };
+            let mut new = vec![
+                WireguardPeerAttribute::PublicKey(peer.key),
+                flags(WireguardPeerFlags::ReplaceAllowedIps),
+                WireguardPeerAttribute::PersistentKeepalive(peer.keepalive),
+                WireguardPeerAttribute::AllowedIps(peer.allowed.iter().map(allowed).collect()),
+            ];
+            new.extend(peer.endpoint.map(WireguardPeerAttribute::Endpoint));
+            changes.push(WireguardPeer(new));
+        }
+        // (A netlink message holds only so much: a few peers in each.)
+        // One the kernel will not have does not keep the others out: all are tried, the
+        // first refusal is the answer, and next time everything is set again.
+        let mut refused = None;
+        for some in changes.chunks(16) {
+            let set = self.set(vec![WireguardAttribute::Peers(some.to_vec())]);
+            refused = refused.or(set.err());
+        }
+        match refused {
+            Some(e) => Err(e),
+            None => {
+                self.had = Some(wanted);
+                Ok(())
+            }
+        }
+    }
+
+    /// Take the interface away.
+    pub fn remove(self) -> Result<()> {
+        let gone = RouteNetlinkMessage::DelLink(link(self.index, None));
+        ask(protocols::NETLINK_ROUTE, gone, NLM_F_ACK).map(drop)
+    }
+}
