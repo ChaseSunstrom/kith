@@ -14,6 +14,7 @@ mod members;
 mod pki;
 mod probe;
 mod raft;
+mod sched;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -55,6 +56,9 @@ struct Args {
     /// Resolvers for names that are not ours, in the order tried [default: those in /etc/resolv.conf]
     #[arg(long, env = "KITH_DNS_UPSTREAM", value_name = "ADDR[:PORT]", value_delimiter = ',')]
     dns_upstream: Vec<String>,
+    /// Seconds a node may be out of contact before what it runs is started on other nodes
+    #[arg(long, env = "KITH_LOST_AFTER", value_name = "SECONDS", default_value_t = 300)]
+    lost_after: u64,
 }
 
 /// What the API handlers and the controller share.
@@ -354,14 +358,13 @@ fn run(args: Args) -> Result<(), String> {
                 }
             };
             let pings = members::run(shared.clone(), stopping.clone());
-            let (served, (), (), ()) = tokio::join!(served, members, registered, pings);
+            let lost_after = std::time::Duration::from_secs(args.lost_after);
+            let scheduler = sched::run(shared.clone(), lost_after, stopping.clone());
+            let (served, (), (), (), ()) = tokio::join!(served, members, registered, pings, scheduler);
             served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {
-            // A node that joined is not given workloads yet (see cluster.rs).
-            if !shared.cluster.as_ref().is_some_and(|cluster| cluster.ca.is_none()) {
-                controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()).await;
-            }
+            controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()).await;
         };
         let names = async {
             if let Some(sockets) = names {

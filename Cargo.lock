@@ -1278,6 +1278,7 @@ dependencies = [
  "kith-api",
  "kith-dns",
  "kith-runtime",
+ "kith-sched",
  "kith-store",
  "rcgen",
  "reqwest",

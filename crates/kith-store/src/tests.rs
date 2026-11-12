@@ -1,4 +1,4 @@
-use crate::{Command, Done, Log, Machine, TypeConfig, node_id, run};
+use crate::{Command, Done, Log, Machine, TypeConfig, node_id, reported, run};
 use kith_api::store::{Error, Store};
 use openraft::StorageError;
 use openraft::testing::{StoreBuilder, Suite};
@@ -138,4 +138,53 @@ fn node_ids_are_stable_and_distinct() {
     assert_eq!(node_id("alpha"), node_id("alpha"));
     let ids: std::collections::BTreeSet<u64> = (0..1000).map(|n| node_id(&format!("node-{n}"))).collect();
     assert_eq!(ids.len(), 1000);
+}
+
+#[test]
+fn nodes_report_on_one_status() {
+    use serde_json::json;
+    let unit = |replica: u32, ready: bool| json!({ "name": "main", "replica": replica, "ready": ready });
+    let says = |units: Vec<serde_json::Value>| Some(json!({ "replicas": 3, "containers": units }));
+    // The scheduler's part is there first, and stays whatever a node says.
+    let bound = json!({ "nodes": { "0": "a", "1": "b", "2": "b" }, "replicas": 3 });
+    let status = reported(Some(bound), "b", says(vec![unit(2, true), unit(1, false)]));
+    let status = reported(Some(status), "a", says(vec![unit(0, true)]));
+    assert_eq!(status["nodes"]["2"], "b");
+    assert_eq!((&status["replicas"], &status["ready"]), (&json!(3), &json!(2)));
+    let places = |status: &serde_json::Value| {
+        let units = status["containers"].as_array().unwrap().iter();
+        units
+            .map(|unit| format!("{}{}", unit["replica"], unit["node"].as_str().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(places(&status), ["0a", "1b", "2b"]);
+    // A node replaces only its own, and a node that runs nothing any more is taken out.
+    let status = reported(Some(status), "b", says(vec![unit(1, true)]));
+    assert_eq!(
+        (places(&status), &status["ready"]),
+        (vec!["0a".to_string(), "1b".into()], &json!(2))
+    );
+    let status = reported(Some(status), "a", None);
+    assert_eq!(
+        (places(&status), &status["ready"], &status["replicas"]),
+        (vec!["1b".to_string()], &json!(1), &json!(3))
+    );
+    // Units from before nodes were named go when a node reports; a replica that two nodes
+    // say they run is ready once, and only when both say so.
+    let old = json!({ "containers": [unit(0, true), unit(1, true)] });
+    let status = reported(Some(old), "a", says(vec![unit(0, true)]));
+    assert_eq!((places(&status), &status["ready"]), (vec!["0a".to_string()], &json!(1)));
+    let status = reported(Some(status), "b", says(vec![unit(0, false)]));
+    assert_eq!(
+        (places(&status), &status["ready"]),
+        (vec!["0a".to_string(), "0b".into()], &json!(0))
+    );
+    // A Job (it has a state) is as its one node says; what is no unit is dropped, not a panic.
+    let job = json!({ "state": "running", "containers": [unit(0, true), 7, "x"] });
+    let status = reported(None, "a", Some(job));
+    assert_eq!((places(&status), status.get("ready")), (vec!["0a".to_string()], None));
+    assert_eq!(
+        reported(None, "a", Some(json!("nonsense"))),
+        json!({ "containers": [], "ready": 0 })
+    );
 }

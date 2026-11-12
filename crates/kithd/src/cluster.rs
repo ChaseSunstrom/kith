@@ -10,7 +10,6 @@
 //! Everything else on the TCP port is for members only: the resource API and Raft
 //! (`raft.rs`), which gives every node its own copy of the store.
 //
-// ponytail: a node that joined runs no workloads yet; its share comes with the scheduler.
 
 use crate::pki::{self, Identity};
 use crate::{Shared, api};

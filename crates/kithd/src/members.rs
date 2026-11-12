@@ -75,6 +75,11 @@ impl Members {
         }
     }
 
+    /// This node's name.
+    pub fn me(&self) -> &str {
+        &self.me
+    }
+
     fn heard(&self) -> std::sync::MutexGuard<'_, Heard> {
         self.heard.lock().expect("nothing panics holding the members")
     }
@@ -111,8 +116,6 @@ impl Members {
     }
 
     /// CPUs and bytes of memory `name` said it has, once it has been heard from.
-    // The scheduler's input (T-0027).
-    #[allow(dead_code)]
     pub fn capacity(&self, name: &str) -> Option<(f64, f64)> {
         if name == self.me {
             return Some(self.mine);

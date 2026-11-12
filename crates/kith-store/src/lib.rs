@@ -55,6 +55,12 @@ pub enum Command {
     Patch {
         statuses: Vec<(String, serde_json::Map<String, serde_json::Value>)>,
     },
+    /// What `node` says of the resources it runs units of (see [`reported`]); `None`
+    /// when it runs none of one any more. A key that is gone is skipped.
+    Report {
+        node: String,
+        statuses: Vec<(String, Option<serde_json::Value>)>,
+    },
     /// Replace everything: how a store from before replication comes in.
     Import {
         store: Store,
@@ -114,11 +120,71 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
             }
             Ok(Done::Nothing)
         }
+        Command::Report { node, statuses } => {
+            for (key, said) in statuses {
+                let old = store.get(&key).and_then(|r| r.status.clone());
+                let _ = store.set_status(&key, Some(reported(old, &node, said)));
+            }
+            Ok(Done::Nothing)
+        }
         Command::Import { store: imported } => {
             *store = imported;
             Ok(Done::Nothing)
         }
     }
+}
+
+/// The status of a resource after `node` said `said` of it. Several nodes run replicas of
+/// one Workload: each node's `containers` are kept apart by their `node` and replaced only
+/// by that node, `ready` is counted over all of them, and what the scheduler wrote (`nodes`,
+/// `unschedulable`) stays. Every other field is as the node says, so it must be one that
+/// every node says the same (it follows from the spec) or the resource must be run by one
+/// node (a Job: its status has a `state`). `None` takes the node's containers out.
+pub fn reported(old: Option<serde_json::Value>, node: &str, said: Option<serde_json::Value>) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let object = |value: Option<Value>| match value {
+        Some(Value::Object(object)) => Some(object),
+        _ => None,
+    };
+    let (old, said) = (object(old).unwrap_or_default(), object(said));
+    let units = |status: &Map<String, Value>| {
+        let units = status.get("containers").and_then(Value::as_array).cloned();
+        units
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|unit| object(Some(unit)))
+    };
+    let mut containers: Vec<_> = units(&old)
+        // (One with no node is from before nodes were named: whoever reports now runs it.)
+        .filter(|unit| unit.get("node").is_some_and(|other| other != node))
+        .collect();
+    for mut unit in said.iter().flat_map(units) {
+        unit.insert("node".into(), node.into());
+        containers.push(unit);
+    }
+    let place = |unit: &Map<String, Value>| {
+        let text = |field: &str| unit.get(field).map(Value::to_string);
+        (unit.get("replica").and_then(Value::as_u64), text("node"))
+    };
+    // Stable: the units of one replica stay in the order its node gave them.
+    containers.sort_by_key(place);
+    let mut status = said.unwrap_or_else(|| old.clone());
+    for kept in ["nodes", "unschedulable"] {
+        match old.get(kept) {
+            Some(value) => status.insert(kept.into(), value.clone()),
+            None => status.remove(kept),
+        };
+    }
+    if !status.contains_key("state") {
+        let mut ready = std::collections::BTreeMap::new();
+        // A replica two nodes say they run (it is moving) is ready when both say so.
+        for unit in &containers {
+            *ready.entry(place(unit).0).or_insert(true) &= unit.get("ready") == Some(&true.into());
+        }
+        status.insert("ready".into(), ready.values().filter(|ready| **ready).count().into());
+    }
+    status.insert("containers".into(), containers.into());
+    status.into()
 }
 
 /// A node's id in Raft, from its name (FNV-1a): every node works it out the same way.

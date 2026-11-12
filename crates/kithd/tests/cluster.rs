@@ -310,3 +310,89 @@ fn a_node_that_is_down_is_not_made_a_voter() {
     });
     wait_for("beta to catch up", || beta.kith(&["get", "ConfigMap/still"]).0 == 0);
 }
+
+#[test]
+fn workloads_move_off_a_lost_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "failover";
+    // Lost is lost after ten seconds without a word, whatever smaller number is given.
+    let quick = ["--lost-after", "1"];
+    let alpha = Node::start(test, "alpha", &quick);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        let args = ["--join", &alpha.address(), "--token", token.trim(), quick[0], quick[1]];
+        Node::start(test, name, &args)
+    };
+    let (beta, mut gamma) = (join("beta"), join("gamma"));
+    // (A node gets replicas once the leader has heard what it has.)
+    wait_for("three ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 3
+    });
+
+    let web = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: web }\nspec:\n  replicas: 3\n  template:\n    \
+        exec: [{ name: run, command: [sh, -c, 'echo up; exec sleep 300'] }]\n";
+    std::fs::write(beta.dir.join("web.yaml"), web).unwrap();
+    beta.ok(&["apply", "-f", "web.yaml"]);
+    let status = |node: &Node| -> serde_json::Value {
+        let web = node.ok(&["get", "workload/web", "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&web).unwrap()["status"].take()
+    };
+    // Where the replicas are, and which nodes say they run one.
+    let bound = |status: &serde_json::Value| {
+        let nodes = status["nodes"].as_object().cloned().unwrap_or_default();
+        let mut nodes: Vec<String> = nodes.values().map(|node| node.as_str().unwrap().to_string()).collect();
+        nodes.sort();
+        nodes
+    };
+    let running = |status: &serde_json::Value| {
+        let units = status["containers"].as_array().cloned().unwrap_or_default();
+        let mut nodes: Vec<String> = units
+            .iter()
+            .map(|unit| unit["node"].as_str().unwrap().to_string())
+            .collect();
+        nodes.sort();
+        nodes
+    };
+
+    // One replica on each node, each run by the node it is bound to, all in one status.
+    wait_for("three ready replicas", || status(&alpha)["ready"] == 3);
+    let spread = status(&alpha);
+    assert_eq!(bound(&spread), ["alpha", "beta", "gamma"], "{spread}");
+    assert_eq!(running(&spread), ["alpha", "beta", "gamma"], "{spread}");
+    assert!(alpha.ok(&["get", "workload"]).contains("3/3 ready"));
+    // The output of every replica can be read from any node.
+    for replica in ["0", "1", "2"] {
+        wait_for("the replica's output", || {
+            alpha
+                .kith(&["logs", "workload/web", "--replica", replica])
+                .1
+                .contains("up")
+        });
+    }
+
+    // gamma goes: once it is lost, its replica is started on a node that is left.
+    gamma.stop();
+    wait_for("the replica to move", || {
+        let now = status(&alpha);
+        let gamma = "gamma".to_string();
+        !bound(&now).contains(&gamma) && !running(&now).contains(&gamma) && now["ready"] == 3
+    });
+    let moved = status(&alpha);
+    assert_eq!(bound(&moved).len(), 3, "{moved}");
+
+    // gamma comes back and runs nothing of it: its replica has a home.
+    gamma.child = Node::spawn(&gamma.dir, "gamma", gamma.port, &quick);
+    wait_for("gamma to be ready again", || {
+        gamma.kith(&["get", "node"]).1.matches("ready at").count() == 3
+    });
+    assert_eq!(bound(&status(&alpha)), bound(&moved));
+    assert_eq!(status(&alpha)["ready"], 3);
+    // (What gamma reads is its own copy, which catches up.)
+    wait_for("gamma to have caught up", || status(&gamma) == status(&alpha));
+}

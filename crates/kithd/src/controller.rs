@@ -131,6 +131,27 @@ pub async fn run(
     if let Err(e) = std::fs::create_dir_all(&shared.logs) {
         eprintln!("kithd: creating {}: {e}", shared.logs.display());
     }
+    // After a restart this node's copy of the store is old news: a replica that was moved
+    // off it while it was away is still written down as its own. So first catch up: a
+    // write that has come back has everything before it.
+    // ponytail: so a node that restarts while the cluster has no leader runs nothing until
+    // it has one. Running from the old copy instead would be a setting, if that is wanted.
+    if shared.cluster.is_some() {
+        let caught_up = async {
+            let nothing = || kith_store::Command::Patch { statuses: Vec::new() };
+            let mut said = false;
+            while let Err(e) = shared.submit(nothing()).await {
+                if !std::mem::replace(&mut said, true) {
+                    eprintln!("kithd: workloads start once this node has the cluster's store: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        };
+        tokio::select! {
+            () = caught_up => {}
+            _ = stopping.changed() => return,
+        }
+    }
     let mut exited = signal(SignalKind::child()).expect("installing a signal handler");
     let mut controller = Controller {
         runtime,
@@ -243,6 +264,12 @@ impl Controller {
         // Per Workload or Job key: things to say in its status that belong to no unit.
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut owners = BTreeSet::new();
+        // Alone, this node runs everything; in a cluster, the replicas the scheduler bound
+        // to it (`nodes` in the status), and a Job when its one binding is here.
+        let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+        // Per key: how many replicas the spec asks for; and the keys this node has a say on.
+        let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+        let mut ours: BTreeSet<String> = BTreeSet::new();
         self.jobs.retain(|key, _| resources.iter().any(|r| r.key() == *key));
         for resource in &resources {
             let key = resource.key();
@@ -253,10 +280,22 @@ impl Controller {
             let (template, replicas) = match template_of(resource) {
                 Ok(found) => found,
                 Err(e) => {
+                    // Every node says the same of it, so any may.
                     note.push(e);
+                    ours.insert(key);
                     continue;
                 }
             };
+            let here = |replica: u32| {
+                let bound = |status: &Value| status["nodes"][replica.to_string()] == *me.unwrap_or_default();
+                me.is_none() || resource.status.as_ref().is_some_and(bound)
+            };
+            if resource.kind == "Job" && !here(0) {
+                // Bound here again later, it starts over, like after a restart.
+                self.jobs.remove(&key);
+                continue;
+            }
+            counts.insert(key.clone(), replicas);
             let strategy = resource.spec["strategy"].clone();
             let strategy = serde_json::from_value::<Option<Strategy>>(strategy).ok().flatten();
             if strategy == Some(Strategy::BlueGreen) {
@@ -278,11 +317,14 @@ impl Controller {
                     (runs, not_before, RestartPolicy::Never)
                 }
                 _ => (
-                    (0..replicas).collect(),
+                    (0..replicas).filter(|replica| here(*replica)).collect(),
                     Instant::now(),
                     template.restart_policy.clone().unwrap_or(RestartPolicy::Always),
                 ),
             };
+            if resource.kind == "Job" || !replicas.is_empty() {
+                ours.insert(key.clone());
+            }
             let containers = template.containers.iter().cloned().map(Run::Container);
             let units: Vec<Run> = containers.chain(template.exec.iter().cloned().map(Run::Exec)).collect();
             if units.is_empty() {
@@ -316,7 +358,8 @@ impl Controller {
             for replica in replicas {
                 for (unit, env) in units.iter().zip(&envs) {
                     match unit_id(&prefix, replica, unit.name()) {
-                        Err(e) if replica == 0 => note.push(e),
+                        // Every node that runs a replica says so, in the same words (one status).
+                        Err(e) if !note.contains(&e) => note.push(e),
                         Err(_) => {}
                         Ok(id) => drop(wanted.entry(id).or_insert(Slot {
                             owner: key.clone(),
@@ -377,10 +420,14 @@ impl Controller {
                 if !ready(pick) || others_ready {
                     vec![pick]
                 } else {
-                    let note = notes.entry(owner.into()).or_default();
-                    note.push(format!(
-                        "rolling update: replica {pick} is next, once the others are ready"
-                    ));
+                    // (No note in a cluster: a status field only one node would say is
+                    // rewritten by the others for ever.)
+                    if me.is_none() {
+                        let note = notes.entry(owner.into()).or_default();
+                        note.push(format!(
+                            "rolling update: replica {pick} is next, once the others are ready"
+                        ));
+                    }
                     Vec::new()
                 }
             } else {
@@ -486,6 +533,7 @@ impl Controller {
 
         // 4. Report.
         let mut statuses = Vec::new();
+        let node = shared.members.me();
         for (key, notes) in notes {
             let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).collect();
             let units: Vec<Value> = mine
@@ -515,30 +563,33 @@ impl Controller {
                     }
                     status
                 }
-                None => {
-                    let replicas = mine.iter().map(|slot| slot.replica + 1).max().unwrap_or(0);
-                    let ready = (0..replicas)
-                        .filter(|r| mine.iter().filter(|s| s.replica == *r).all(|s| s.ready()))
-                        .count();
-                    json!({ "replicas": replicas, "ready": ready, "containers": units })
-                }
+                // `ready` is counted in the store, over what every node says (kith_store::reported).
+                // Everything else here has to follow from the spec: other nodes say it too.
+                None => json!({ "replicas": counts.get(&key).copied().unwrap_or(0), "containers": units }),
             };
             if !notes.is_empty() {
                 status["notes"] = json!(notes);
             }
             // It may have been deleted while this pass ran; the next pass stops its units.
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
-            let live = file_store.store.get(&key);
-            if live.is_some_and(|live| live.status.as_ref() != Some(&status)) {
-                statuses.push((key, Some(status)));
+            let Some(live) = file_store.store.get(&key).map(|live| live.status.as_ref()) else {
+                continue;
+            };
+            // What runs elsewhere is for its node to say; this one only takes back what it said.
+            let said = ours.contains(&key).then_some(status);
+            let units = live.and_then(|status| status["containers"].as_array());
+            let spoke = units.into_iter().flatten().any(|unit| unit["node"] == *node);
+            let after = kith_store::reported(live.cloned(), node, said.clone());
+            if (said.is_some() || spoke) && live != Some(&after) {
+                statuses.push((key, said));
             }
         }
         // Not waited for: with no leader it takes a while to fail, and the units cannot
         // wait that long. What is not reported now still differs on the next pass.
         if !statuses.is_empty() && self.report.as_ref().is_none_or(|report| report.is_finished()) {
-            let shared = shared.clone();
+            let (shared, node) = (shared.clone(), node.to_string());
             self.report = Some(tokio::spawn(async move {
-                if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
+                if let Err(e) = shared.submit(kith_store::Command::Report { node, statuses }).await {
                     eprintln!("kithd: saving status: {e}");
                 }
             }));

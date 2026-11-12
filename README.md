@@ -137,6 +137,20 @@ kith node status                                   # who leads the store, who vo
   `ready` again when it is back. A voter that is unreachable for a minute
   gives its vote to a node that is there, if the cluster has one to spare.
 
+- The node that leads the store says which node runs each replica of a
+  Workload: one with room for what it asks for (`resources`), that matches its
+  `placement`, is not cordoned or tainted, and spread over the nodes. `kith
+  get workload/NAME -o yaml` shows where each one is (`nodes`), or why one
+  has no home (`unschedulable`); `kith logs` reads a replica's output from
+  whichever node has it. A Job is run by one node. A node is given nothing
+  new until the leader has heard from it (a few seconds after it joins).
+- A replica stays on its node. When the node has been unreachable for five
+  minutes (`--lost-after SECONDS`), its replicas are started on other nodes,
+  and stay there when it comes back; a Job it was running starts over.
+  A node that restarts runs nothing until it has caught up with the store
+  (it may have lost replicas while it was away), so not while the cluster has
+  no leader.
+
 - Nodes talk over TLS and both ends show a certificate from the cluster's CA:
   that proves membership, not which member (every node trusts every other).
   Without one, a caller can read the CA certificate and present a join token,
@@ -146,7 +160,10 @@ kith node status                                   # who leads the store, who vo
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
 
-Not yet: a node that joined runs no workloads (scheduling is next). A change whose answer was lost with the leader may or may not have
+Not yet: replicas of one Workload on different nodes are all replaced at once
+when it changes (on one node it is one at a time), a `NodeWorkload` is not run,
+and replicas on a node that is unreachable still count as ready until they are
+moved. A change whose answer was lost with the leader may or may not have
 happened; `kith get` tells. Joining needs an empty `--state`. A joined node
 that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and

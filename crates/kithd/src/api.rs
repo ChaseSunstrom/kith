@@ -187,6 +187,9 @@ struct LogOptions {
     previous: bool,
     offset: Option<u64>,
     tail: Option<u64>,
+    /// Asked by another node: answer from this node's files, or not at all.
+    #[serde(default)]
+    here: bool,
 }
 
 /// Most bytes of output in one reply.
@@ -196,7 +199,35 @@ async fn logs(
     State(shared): State<Arc<Shared>>,
     Path(key): Path<String>,
     Query(options): Query<LogOptions>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Reply<serde_json::Value> {
+    // A replica that runs on another node: its output is there.
+    let elsewhere = shared.cluster.as_ref().filter(|_| !options.here).and_then(|cluster| {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let status = state.store.get(&key)?.status.as_ref()?;
+        let node = status["nodes"][options.replica.to_string()].as_str()?;
+        let there = state.store.get(&format!("Node/{node}"))?.status.as_ref()?;
+        let address = there["address"].as_str().filter(|_| node != cluster.me.name)?;
+        // (Whatever the caller said of `here`, the other node is asked for its own.)
+        let query = query.unwrap_or_default();
+        let query: Vec<&str> = query.split('&').filter(|pair| !pair.starts_with("here")).collect();
+        let query = query.join("&");
+        Some((
+            node.to_string(),
+            format!("https://{address}/v1/logs/{key}?{query}&here=true"),
+        ))
+    });
+    if let (Some((node, url)), Some(cluster)) = (elsewhere, &shared.cluster) {
+        let failed = |e: reqwest::Error| ApiError(Error::Io(format!("asking node {node} for the output: {e}")));
+        let asked = cluster
+            .client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await;
+        let answer = asked.and_then(reqwest::Response::error_for_status).map_err(failed)?;
+        return answer.json().await.map(Json).map_err(failed);
+    }
     // `more` is read before the file: when it says the unit is done, the file is complete.
     let Json((id, more)) = read(&shared, |store| {
         let resource = store.get(&key).ok_or(Error::NotFound(key.clone()))?;
