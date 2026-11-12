@@ -118,6 +118,48 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Work on a package: a directory of resource templates and default values
+    Package {
+        #[command(subcommand)]
+        command: PackageCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PackageCommand {
+    /// Print the resources a package renders to (and its notes, on stderr); nothing is applied
+    Render {
+        /// The package's directory
+        dir: PathBuf,
+        /// The release's name: what the resources are named for [default: the package's name]
+        #[arg(long)]
+        name: Option<String>,
+        /// The namespace of resources that name none
+        #[arg(short, long, default_value = "default")]
+        namespace: String,
+        /// A YAML file of values over the package's defaults; later ones win
+        #[arg(short = 'f', long = "values", value_name = "FILE")]
+        values: Vec<PathBuf>,
+        /// One value over those: `replicas=3`, `expose.host=example.org`. Read as YAML,
+        /// so quote text that looks like a number: `'tag="1.10"'`
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
+    },
+    /// Check a package: its files, its schema, and what it renders to with its default values
+    Lint {
+        /// The package's directory
+        dir: PathBuf,
+    },
+}
+
+/// `a.b=1` as values: `{a: {b: 1}}`. The value is read as YAML, and is text if it is none.
+fn set_value(assignment: &str) -> Result<serde_json::Value, String> {
+    let Some((path, value)) = assignment.split_once('=') else {
+        return fail(format!("--set {assignment}: write KEY=VALUE"));
+    };
+    let value = kith_yaml::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
+    let nest = |inside, key: &str| serde_json::json!({ key: inside });
+    Ok(path.rsplit('.').fold(value, nest))
 }
 
 #[derive(Subcommand)]
@@ -549,6 +591,47 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     address.unwrap_or_default()
                 );
             }
+        }
+        Command::Package {
+            command:
+                PackageCommand::Render {
+                    dir,
+                    name,
+                    namespace,
+                    values,
+                    set,
+                },
+        } => {
+            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let mut layers = Vec::new();
+            for path in &values {
+                let source = std::fs::read_to_string(path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
+                let layer = kith_yaml::from_str(&source).map_err(|e| e.render(&path.display().to_string(), &source))?;
+                layers.push(layer);
+            }
+            for assignment in &set {
+                layers.push(set_value(assignment)?);
+            }
+            let release = kith_packages::Release {
+                name: name.as_deref().unwrap_or(&package.meta.name),
+                namespace: &namespace,
+            };
+            let rendered = package.render(release, &layers).or_else(fail)?;
+            let documents: Vec<String> = rendered.resources.iter().map(kith_api::Resource::to_yaml).collect();
+            print!("{}", documents.join("---\n"));
+            if let Some(notes) = rendered.notes {
+                eprintln!("{}", notes.trim_end());
+            }
+        }
+        Command::Package {
+            command: PackageCommand::Lint { dir },
+        } => {
+            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let wrong = package.lint();
+            if !wrong.is_empty() {
+                return fail(wrong.join("\n"));
+            }
+            println!("{} {} ok", package.meta.name, package.meta.version);
         }
         Command::Schema { kind: None } => {
             let rows = KINDS

@@ -1,0 +1,5 @@
+# An example package: a web server, a Service in front of it, and its page.
+name: web
+version: 0.1.0
+description: A small web server with a page of your own
+kithVersion: ">=0.0.1"

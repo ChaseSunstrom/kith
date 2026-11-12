@@ -291,3 +291,44 @@ fn a_silent_daemon_times_out() {
     );
     assert!(began.elapsed() < std::time::Duration::from_secs(10));
 }
+
+#[test]
+fn package_render_and_lint() {
+    let sandbox = Sandbox::new("package");
+    let web = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/web");
+    let (code, out, _) = sandbox.kith(&["package", "lint", web]);
+    assert_eq!((code, out.as_str()), (0, "web 0.1.0 ok\n"));
+
+    // What it renders to is what `kith apply` takes.
+    sandbox.write("mine.yaml", "replicas: 2\nexpose: { host: shop.example.org }\n");
+    let args = [
+        "package",
+        "render",
+        web,
+        "--name",
+        "shop",
+        "-n",
+        "store",
+        "-f",
+        "mine.yaml",
+    ];
+    let (code, out, notes) = sandbox.kith(&[&args[..], &["--set", "replicas=3", "--set", "env.MODE=fast"]].concat());
+    assert_eq!(code, 0, "{notes}");
+    assert!(notes.contains("https://shop.example.org/"), "{notes}");
+    assert!(out.contains("replicas: 3") && out.contains("namespace: store"), "{out}");
+    assert!(
+        out.contains("kith.dev/release: shop") && out.contains("value: fast"),
+        "{out}"
+    );
+    sandbox.write("rendered.yaml", &out);
+    let (code, out, err) = sandbox.kith(&["apply", "-f", "rendered.yaml"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.matches("created").count(), 3, "{out}");
+
+    // Values the package does not have, and a package that is not there.
+    let (code, _, err) = sandbox.kith(&["package", "render", web, "--set", "colour=red"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("values.colour: is not a value this package has"), "{err}");
+    let (code, _, err) = sandbox.kith(&["package", "lint", "nowhere"]);
+    assert!(code == 2 && err.contains("nowhere: no package.yaml"), "{err}");
+}

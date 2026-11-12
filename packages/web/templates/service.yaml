@@ -1,0 +1,20 @@
+apiVersion: kith.dev/v1
+kind: Service
+metadata:
+  name: {{ name }}
+spec:
+  selector: { app: {{ name }} }
+  ports: [{ port: 80, targetPort: http }]
+  {%- if values.expose.host %}
+  expose: { host: {{ values.expose.host | tojson }}, via: edge }
+  {%- endif %}
+{% if values.page %}
+---
+apiVersion: kith.dev/v1
+kind: ConfigMap
+metadata:
+  name: {{ name }}-page
+spec:
+  data:
+    index.html: {{ values.page | tojson }}
+{% endif %}

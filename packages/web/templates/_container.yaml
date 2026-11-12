@@ -1,0 +1,9 @@
+- name: web
+  image: {{ values.image | tojson }}
+  ports: [{ name: http, port: {{ values.port }} }]
+  {%- if values.env %}
+  env:
+    {%- for name, value in values.env | items %}
+    - { name: {{ name | tojson }}, value: {{ value | tojson }} }
+    {%- endfor %}
+  {%- endif %}

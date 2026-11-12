@@ -1,0 +1,17 @@
+[package]
+name = "kith-packages"
+description = "kith packages: a directory of resource templates and default values, rendered into resources"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-yaml.workspace = true
+kith-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The templates' language (PLAN.md §4.8). `fuel` stops a template that would never end.
+minijinja = { version = "3", default-features = false, features = ["builtins", "macros", "multi_template", "serde", "json", "fuel"] }
+
+[lints]
+workspace = true

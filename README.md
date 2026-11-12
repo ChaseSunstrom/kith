@@ -264,6 +264,46 @@ kith get dnsrecord                   # each one says `served`, or why not
 Not yet: `<service>.<namespace>.kith` (with the load balancer), DNSSEC, zone
 transfers, and caching of upstream answers.
 
+## Packages (in progress)
+
+A package is a directory of resource templates with default values
+([`packages/web`](packages/web) is one):
+
+```text
+package.yaml          name, version, description, kithVersion, dependencies
+values.yaml           the default values
+values.schema.json    what values may be (optional)
+templates/*.yaml      resources, as templates; files named _something are only included
+NOTES                 what to tell whoever installed it (optional; a template too)
+```
+
+```sh
+kith package lint packages/web
+kith package render packages/web --name shop -n store --set replicas=3 -f mine.yaml
+kith package render packages/web --name shop | kith apply -f -
+```
+
+- Templates are Jinja ([minijinja](https://docs.rs/minijinja)). They see
+  `values` (the defaults, with each `-f` file and then each `--set` on top,
+  merged key by key), `release.name`, `release.namespace`, `package.name`,
+  `package.version`, `name` (a name for the release's resources:
+  `shop-web`) and `labels`. `{{ value | toYaml | indent(4) }}` writes a value
+  as YAML, `{{ value | tojson }}` quotes one that could be anything, and
+  `required(value, "why")` stops with `why` when there is none. Using a value
+  that is not there is an error, and so is a template that never ends or
+  writes more than 1 MB. A template reads nothing but its package (links in
+  the package's directory are not followed), and `namespace()` is not there.
+- What comes out is checked like any resource (an error shows the rendered
+  text's line), put in the release's namespace unless it names one, and
+  labelled `kith.dev/release` and `kith.dev/package`.
+- Values are checked against `values.schema.json`, of which kith knows
+  `type`, `properties`, `required`, `additionalProperties`, `items`, `enum`
+  and the `minimum`/`maximum` family; `lint` says so about any other keyword.
+
+Not yet: `dependencies` are read and nothing more, and there is no `Release`
+in the cluster yet (rendering and applying is by hand, as above), nor
+repositories.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):
@@ -285,6 +325,7 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-store` | The replicated store: Raft (`openraft`) with its log in `redb` |
 | `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
 | `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan |
+| `crates/kith-packages` | Packages: templates and values rendered into resources |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 

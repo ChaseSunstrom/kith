@@ -22,8 +22,9 @@ MB = 1024 * 1024
 # the replicated store (openraft and redb, Phase 2b), which raised the size budget from 8.
 KITHD_SIZE = 10
 KITHD_IDLE_RSS = 8 * MB
-# binary -> max size in bytes
-SIZE_BUDGETS = {"kith": int(2.5 * MB), "kithd": KITHD_SIZE * MB}
+# binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
+# 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
+SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 

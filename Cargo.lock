@@ -1212,6 +1212,7 @@ version = "0.0.1"
 dependencies = [
  "clap",
  "kith-api",
+ "kith-packages",
  "kith-yaml",
  "serde",
  "serde_json",
@@ -1234,6 +1235,17 @@ dependencies = [
  "netlink-packet-wireguard",
  "netlink-sys",
  "sha2",
+]
+
+[[package]]
+name = "kith-packages"
+version = "0.0.1"
+dependencies = [
+ "kith-api",
+ "kith-yaml",
+ "minijinja",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1433,6 +1445,15 @@ name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
+
+[[package]]
+name = "minijinja"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "509eeb2603a84eccabb4d75f6ec8ba23b46bbf441aaeb863d6b83a5887fd51e4"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "minimal-lexical"

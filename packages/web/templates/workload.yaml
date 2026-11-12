@@ -1,0 +1,11 @@
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: {{ values.replicas }}
+  template:
+    containers:
+      {% filter indent(6) %}{% include "templates/_container.yaml" %}{% endfilter %}

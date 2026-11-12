@@ -1,0 +1,6 @@
+{{ name }} runs {{ values.replicas }} cop{{ "y" if values.replicas == 1 else "ies" }} of {{ values.image }}.
+{%- if values.expose.host %}
+It answers at https://{{ values.expose.host }}/ once that name points at your ingress nodes.
+{%- else %}
+From a node on the mesh: curl http://{{ name }}.{{ release.namespace }}.kith/
+{%- endif %}

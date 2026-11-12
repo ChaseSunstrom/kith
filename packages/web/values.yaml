@@ -1,0 +1,12 @@
+# How many copies run.
+replicas: 1
+image: docker.io/library/nginx:1.27-alpine
+port: 80
+# The page it serves.
+page: |
+  <h1>Hello from kith</h1>
+# Set a host to reach it from outside, over HTTPS, through the ingress nodes.
+expose:
+  host: ""
+# More environment variables for the server: NAME: value.
+env: {}
