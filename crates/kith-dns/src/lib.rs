@@ -9,7 +9,7 @@ mod wire;
 mod zones;
 
 use std::net::IpAddr;
-use wire::{FORMERR, Query, build, failure};
+use wire::{FORMERR, Query, REFUSED, build, failure};
 
 pub use server::serve;
 pub use wire::SERVFAIL;
@@ -40,7 +40,7 @@ pub fn answer(query: &[u8], client: IpAddr, zones: &Zones, udp: bool) -> Answer 
         return Answer::Reply(failure(query, FORMERR));
     };
     if q.qclass != 1 {
-        return Answer::Forward;
+        return Answer::Reply(failure(query, REFUSED));
     }
     let limit = if udp { q.udp_limit() } else { usize::from(u16::MAX) };
     match zones.lookup(client, &q.qname, q.qtype) {

@@ -7,6 +7,7 @@ pub const FORMERR: u16 = 1;
 pub const SERVFAIL: u16 = 2;
 pub const NXDOMAIN: u16 = 3;
 pub const NOTIMP: u16 = 4;
+pub const REFUSED: u16 = 5;
 
 /// The biggest UDP reply we send to a client that speaks EDNS.
 const EDNS_MAX: u16 = 1232;
@@ -18,7 +19,8 @@ fn u16_at(b: &[u8], p: usize) -> Option<u16> {
 }
 
 /// Reads the name at `pos`. Returns it (dotted, case kept) and where the bytes after it start.
-/// Rejects forward and looping pointers, reserved label types, oversize names and truncation.
+/// Rejects forward and looping pointers, pointers into the header, reserved label types, oversize
+/// names and truncation.
 /// Labels with a dot or a non-ASCII byte are refused too, so a name always splits back the same way.
 pub fn read_name(b: &[u8], pos: usize) -> Option<(String, usize)> {
     let (mut p, mut end, mut jumps, mut total) = (pos, None, 0, 1);
@@ -31,7 +33,7 @@ pub fn read_name(b: &[u8], pos: usize) -> Option<(String, usize)> {
         if len & 0xC0 == 0xC0 {
             let target = usize::from(u16_at(b, p)? & 0x3FFF);
             jumps += 1;
-            if target >= p || jumps > MAX_JUMPS {
+            if !(12..p).contains(&target) || jumps > MAX_JUMPS {
                 return None;
             }
             end.get_or_insert(p + 2);
@@ -69,6 +71,8 @@ pub struct Query {
     pub qclass: u16,
     /// The UDP size from the query's OPT record, when it has one.
     pub edns: Option<u16>,
+    /// Where that size sits in the packet.
+    edns_at: usize,
 }
 
 impl Query {
@@ -80,12 +84,12 @@ impl Query {
         let (qname, p) = read_name(b, 12)?;
         let (qtype, qclass) = (u16_at(b, p)?, u16_at(b, p + 2)?);
         let (an, ns, ar) = (u16_at(b, 6)?, u16_at(b, 8)?, u16_at(b, 10)?);
-        let (mut p, mut edns) = (p + 4, None);
+        let (mut p, mut edns, mut edns_at) = (p + 4, None, 0);
         for i in 0..u32::from(an) + u32::from(ns) + u32::from(ar) {
             p = read_name(b, p)?.1;
             let rdlen = usize::from(u16_at(b, p + 8)?);
-            if i >= u32::from(an) + u32::from(ns) && u16_at(b, p)? == 41 {
-                edns.get_or_insert(u16_at(b, p + 2)?);
+            if i >= u32::from(an) + u32::from(ns) && u16_at(b, p)? == 41 && edns.is_none() {
+                (edns, edns_at) = (Some(u16_at(b, p + 2)?), p + 2);
             }
             p += 10 + rdlen;
             if p > b.len() {
@@ -99,6 +103,7 @@ impl Query {
             qtype,
             qclass,
             edns,
+            edns_at,
         })
     }
 
@@ -234,14 +239,49 @@ fn encode(q: &Query, rcode: u16, aa: bool, answers: &[Record], authority: &[Reco
     w.buf
 }
 
-/// A reply to `q`; one over `limit` bytes becomes a header and question with TC set.
+/// A reply to `q`; one over `limit` bytes becomes a header and question with TC set, or SERVFAIL
+/// when `limit` is the most a TCP message can hold.
 pub fn build(q: &Query, rcode: u16, answers: &[Record], authority: &[Record], limit: usize) -> Vec<u8> {
     let full = encode(q, rcode, true, answers, authority, false);
     if full.len() <= limit {
         full
+    } else if limit >= usize::from(u16::MAX) {
+        encode(q, SERVFAIL, false, &[], &[], false)
     } else {
         encode(q, rcode, true, &[], &[], true)
     }
+}
+
+/// The only question of a message: its name (lowercase), type, class, and where it ends.
+pub fn question(b: &[u8]) -> Option<(String, u16, u16, usize)> {
+    if b.len() < 12 || u16_at(b, 4)? != 1 {
+        return None;
+    }
+    let (name, p) = read_name(b, 12)?;
+    Some((name.to_ascii_lowercase(), u16_at(b, p)?, u16_at(b, p + 2)?, p + 4))
+}
+
+/// `query` with the id `id` and any EDNS size over `EDNS_MAX` brought down to it.
+pub fn for_upstream(query: &[u8], id: u16) -> Option<Vec<u8>> {
+    let q = Query::parse(query)?;
+    let mut out = query.to_vec();
+    out[..2].copy_from_slice(&id.to_be_bytes());
+    if let Some(size) = q.edns {
+        out[q.edns_at..q.edns_at + 2].copy_from_slice(&size.min(EDNS_MAX).to_be_bytes());
+    }
+    Some(out)
+}
+
+/// An upstream `reply` for a UDP client with room for `limit` bytes: a longer one is cut to its
+/// header and question with TC set, never in the middle of a record. `reply` has been checked.
+pub fn truncate(mut reply: Vec<u8>, limit: usize) -> Vec<u8> {
+    if reply.len() <= limit || reply.len() < 12 {
+        return reply;
+    }
+    reply.truncate(question(&reply).map_or(12, |q| q.3));
+    reply[2] |= 2;
+    reply[6..12].fill(0);
+    reply
 }
 
 /// An empty reply with `rcode`, echoing the question when the query has a readable one.
