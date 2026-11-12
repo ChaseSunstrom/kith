@@ -146,7 +146,7 @@ fn errors_point_at_the_mistake() {
 
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
-    assert_eq!(KINDS.len(), 26);
+    assert_eq!(KINDS.len(), 28);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -361,4 +361,59 @@ fn quantities_have_values() {
         (q("2"), q("500m"), q("1.5"), q("64Mi"), q("2Gi"), q("1G")),
         (2.0, 0.5, 1.5, 67108864.0, 2147483648.0, 1e9)
     );
+}
+
+#[test]
+fn dns_kinds_are_checked() {
+    let zone = |spec: &str| format!("apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: {{ name: z }}\nspec: {spec}\n");
+    let record =
+        |spec: &str| format!("apiVersion: kith.dev/v1\nkind: DNSRecord\nmetadata: {{ name: r }}\nspec: {spec}\n");
+    let good = |yaml: String| {
+        let docs = Resource::from_source(&yaml).map_err(|e| e.msg)?;
+        docs.into_iter().try_for_each(|doc| doc.map(drop).map_err(|e| e.msg))
+    };
+    let said = |yaml: String| good(yaml).unwrap_err();
+
+    assert_eq!(
+        good(zone(
+            "{ domain: home.example, clients: [192.168.0.0/16, 'fd00::/8', 10.0.0.1] }"
+        )),
+        Ok(())
+    );
+    assert!(said(zone("{ domain: 'home example' }")).contains("not a domain name"));
+    assert!(said(zone("{ domain: a.b, clients: [10.0.0.0/33] }")).contains("prefix length"));
+    assert!(said(zone("{ domain: a.b, clients: [lan] }")).contains("not a network"));
+
+    for ok in [
+        "{ zone: z, name: nas, type: A, values: [192.168.1.20, 192.168.1.21] }",
+        "{ zone: z, name: '@', type: AAAA, values: ['fd00::1'], ttl: 60 }",
+        "{ zone: z, name: '*.apps', type: CNAME, values: [nas.home.example.] }",
+        "{ zone: z, name: _http._tcp, type: SRV, values: ['0 5 8080 nas.home.example'] }",
+        "{ zone: z, name: '@', type: TXT, values: ['v=spf1 -all'] }",
+    ] {
+        assert_eq!(good(record(ok)), Ok(()), "{ok}");
+    }
+    for (bad, why) in [
+        (
+            "{ zone: z, name: nas, type: A, values: ['fd00::1'] }",
+            "not an IPv4 address",
+        ),
+        ("{ zone: z, name: nas, type: A, values: [] }", "1 to 100 values"),
+        (
+            "{ zone: z, name: 'a b', type: A, values: [1.2.3.4] }",
+            "not a name like",
+        ),
+        (
+            "{ zone: z, name: nas, type: CNAME, values: [a.b, c.d] }",
+            "a CNAME has one value",
+        ),
+        (
+            "{ zone: z, name: nas, type: SRV, values: ['0 5 nas'] }",
+            "priority weight port target",
+        ),
+        ("{ zone: z, name: nas, type: MX, values: [a.b] }", "MX"),
+    ] {
+        let said = said(record(bad));
+        assert!(said.contains(why), "{bad}: {said}");
+    }
 }

@@ -18,8 +18,9 @@ TARGET = "x86_64-unknown-linux-musl"  # static, as shipped
 MB = 1024 * 1024
 
 # Measured 6.5 MB and 4.0 MB when kithd first ran workloads (API server, store,
-# controller, container runtime, registry client with TLS).
-KITHD_SIZE = 8
+# controller, container runtime, registry client with TLS); 8.2 MB and 5.7 MB with
+# the replicated store (openraft and redb, Phase 2b), which raised the size budget from 8.
+KITHD_SIZE = 10
 KITHD_IDLE_RSS = 8 * MB
 # binary -> max size in bytes
 SIZE_BUDGETS = {"kith": int(2.5 * MB), "kithd": KITHD_SIZE * MB}

@@ -3,16 +3,18 @@
 //!
 //! The API is HTTP/JSON on a unix socket only its owner can open. With
 //! `--listen` it is also served to other nodes over TLS, and `--join` makes
-//! this node a member of another node's cluster (see `cluster.rs`).
+//! this node a member of another node's cluster (see `cluster.rs`). The store is
+//! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
 mod api;
 mod cluster;
 mod controller;
+mod dns;
 mod pki;
 mod probe;
+mod raft;
 
 use clap::Parser;
-use kith_api::store::FileStore;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -46,27 +48,31 @@ struct Args {
     /// The address other nodes reach this one at, when it is not the one it listens on
     #[arg(long, env = "KITH_ADVERTISE", value_name = "ADDR:PORT")]
     advertise: Option<String>,
+    /// Serve DNS here, on UDP and TCP: node names, DNSZone and DNSRecord resources, and the rest from upstream
+    #[arg(long, env = "KITH_DNS", value_name = "ADDR:PORT")]
+    dns: Option<std::net::SocketAddr>,
+    /// Resolvers for names that are not ours, in the order tried [default: those in /etc/resolv.conf]
+    #[arg(long, env = "KITH_DNS_UPSTREAM", value_name = "ADDR[:PORT]", value_delimiter = ',')]
+    dns_upstream: Vec<String>,
 }
 
 /// What the API handlers and the controller share.
 pub struct Shared {
-    pub store: Mutex<FileStore>,
+    /// This node's copy of the store, to read. Changes go through [`Shared::submit`].
+    pub store: Arc<Mutex<kith_store::State>>,
+    pub raft: kith_store::Raft,
     /// Poked after every change to the store, so the controller reconciles at once.
-    pub changed: Notify,
+    pub changed: Arc<Notify>,
     /// Where the output of every unit goes: `<unit id>.out` and `.err`.
     pub logs: PathBuf,
-    /// Counts changes to the store, for `GET /v1/watch`. Bumped while holding the store
-    /// lock, so a reader under the lock sees the generation that matches what it reads.
+    /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
+    /// locked, so a reader under the lock sees the generation that matches what it reads.
     /// Starts at the clock (ms) so a restarted kithd never repeats a number a client holds.
     pub generation: watch::Sender<u64>,
     /// `None` in agent mode: one node, nothing on the network.
     pub cluster: Option<cluster::Cluster>,
-}
-
-impl Shared {
-    pub fn bump(&self) {
-        self.generation.send_modify(|g| *g += 1);
-    }
+    /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
+    pub stop: watch::Sender<bool>,
 }
 
 fn main() -> ExitCode {
@@ -105,7 +111,6 @@ async fn membership(
     let listen = args.listen.unwrap_or(([0, 0, 0, 0], 7443).into());
     let tcp = tokio::net::TcpListener::bind(listen).await;
     let tcp = tcp.map_err(|e| format!("listening on {listen}: {e}"))?;
-    let leader_file = dir.join("leader");
     if let Some((me, ca)) = known {
         if args.join.is_some() {
             eprintln!(
@@ -119,14 +124,7 @@ async fn membership(
                 me.name
             ));
         }
-        let leader = std::fs::read_to_string(&leader_file).ok();
-        if ca.is_none() && leader.is_none() {
-            let dir = dir.display();
-            return Err(format!(
-                "{dir} is incomplete (a join was interrupted): remove it and join again"
-            ));
-        }
-        return Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)));
+        return Ok((Some(cluster::Cluster::new(me, ca)?), Some(tcp)));
     }
     let name = match &args.name {
         Some(name) => name.clone(),
@@ -136,8 +134,15 @@ async fn membership(
         }
     };
     pki::valid_name(&name).map_err(|e| format!("{e} (set --name)"))?;
-    let (me, ca, leader) = match &args.join {
+    let (me, ca) = match &args.join {
         Some(address) => {
+            // Its store would be another cluster's: nothing of it could be kept.
+            if state.join("raft").exists() || state.join("store.json").exists() {
+                return Err(format!(
+                    "{} already holds a store, which joining would discard: join with an empty --state",
+                    state.display()
+                ));
+            }
             let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
             let token = args.token.as_deref().expect("clap requires --token with --join");
             let joined = cluster::request_join(address, token, &name, port).await?;
@@ -148,7 +153,7 @@ async fn membership(
                 cert: joined.cert,
                 key: joined.key,
             };
-            (me, None, Some(address.clone()))
+            (me, None)
         }
         None => {
             let ca = pki::Ca::create()?;
@@ -160,16 +165,72 @@ async fn membership(
                 cert,
                 key,
             };
-            (me, Some(ca), None)
+            (me, Some(ca))
         }
     };
-    // The identity last: its presence is what a restart takes for a finished join.
-    if let Some(leader) = &leader {
-        let made = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&leader_file, leader));
-        made.map_err(|e| format!("writing {}: {e}", leader_file.display()))?;
-    }
     pki::save(&dir, &me, ca.as_ref())?;
-    Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)))
+    Ok((Some(cluster::Cluster::new(me, ca)?), Some(tcp)))
+}
+
+/// Open this node's replica of the store and start Raft on it.
+async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> Result<Arc<Shared>, String> {
+    let changed = Arc::new(Notify::new());
+    let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    let generation = watch::channel(clock.map_or(0, |d| d.as_millis() as u64)).0;
+    let poke = {
+        let (changed, generation) = (changed.clone(), generation.clone());
+        Arc::new(move || {
+            generation.send_modify(|g| *g += 1);
+            changed.notify_one();
+        })
+    };
+    let name = cluster.as_ref().map_or("local", |cluster| &cluster.me.name);
+    let network = raft::Network(cluster.as_ref().map(|cluster| cluster.client.clone()));
+    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke).await?;
+    let shared = Arc::new(Shared {
+        store: replica.state,
+        raft: replica.raft,
+        changed,
+        logs: state.join("logs"),
+        generation,
+        cluster,
+        stop: watch::channel(false).0,
+    });
+    // A node that joined waits to be sent the store; any other is where a cluster starts.
+    if shared.cluster.as_ref().is_some_and(|cluster| cluster.ca.is_none()) {
+        return Ok(shared);
+    }
+    let failed = |e: &dyn std::fmt::Display| format!("starting the store: {e}");
+    if !shared.raft.is_initialized().await.map_err(|e| failed(&e))? {
+        // Its address is filled in from its Node, once it has one.
+        let alone = std::collections::BTreeMap::from([(replica.id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(alone).await.map_err(|e| failed(&e))?;
+    }
+    // The store of a kithd from before replication comes in once, into an empty store.
+    let old = state.join("store.json");
+    if old.exists() {
+        let empty = shared.store.lock().expect("nothing panics holding the store").store == Default::default();
+        if empty {
+            let store = kith_api::store::FileStore::read(&old).map_err(|e| e.to_string())?.store;
+            let imported = shared.submit(kith_store::Command::Import { store }).await;
+            imported.map_err(|e| format!("bringing in {}: {e}", old.display()))?;
+            // Left in place it would come in again, should the store ever be empty.
+            std::fs::rename(&old, state.join("store.json.imported")).map_err(|e| {
+                format!(
+                    "{} was brought in but cannot be moved aside ({e}): remove it",
+                    old.display()
+                )
+            })?;
+            eprintln!("kithd: brought in {} (kept as store.json.imported)", old.display());
+        } else {
+            eprintln!(
+                "kithd: {} is not used: the store is in {}",
+                old.display(),
+                state.join("raft").display()
+            );
+        }
+    }
+    Ok(shared)
 }
 
 fn run(args: Args) -> Result<(), String> {
@@ -204,7 +265,6 @@ fn run(args: Args) -> Result<(), String> {
     let state = state
         .canonicalize()
         .map_err(|e| fail("resolving the state directory", &e))?;
-    let store = FileStore::open_owned(&state.join("store.json")).map_err(|e| e.to_string())?;
     // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
     use std::os::unix::fs::FileTypeExt;
     if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
@@ -217,19 +277,25 @@ fn run(args: Args) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| fail("starting", &e))?;
+    let upstream = |address: &String| {
+        let with_port = address.parse().ok();
+        let bare = || address.parse().ok().map(|ip| std::net::SocketAddr::new(ip, 53));
+        with_port
+            .or_else(bare)
+            .ok_or(format!("--dns-upstream: `{address}` is not an address"))
+    };
+    let mut upstreams = args.dns_upstream.iter().map(upstream).collect::<Result<Vec<_>, _>>()?;
+    if upstreams.is_empty() {
+        upstreams = dns::system_upstreams();
+    }
     let (membership, tcp) = rt.block_on(membership(&args, &state))?;
-    let shared = Arc::new(Shared {
-        cluster: membership,
-        store: Mutex::new(store),
-        changed: Notify::new(),
-        logs: state.join("logs"),
-        generation: watch::channel(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as u64),
-        )
-        .0,
-    });
+    let names = rt.block_on(async {
+        match args.dns {
+            Some(listen) => dns::bind(listen).await.map(Some),
+            None => Ok(None),
+        }
+    })?;
+    let shared = rt.block_on(replica(membership, &state))?;
 
     let served = rt.block_on(async {
         // ponytail: bound, then made owner-only. The directory kithd creates for it is
@@ -239,7 +305,7 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|e| fail("securing the socket", &e))?;
         eprintln!("kithd: serving {} (state in {})", socket.display(), state.display());
 
-        let (stop, stopping) = watch::channel(false);
+        let stopping = shared.stop.subscribe();
         let watched = shared.clone();
         tokio::spawn(async move {
             use tokio::signal::unix::{SignalKind, signal};
@@ -248,12 +314,10 @@ fn run(args: Args) -> Result<(), String> {
                 signal(SignalKind::interrupt()).unwrap(),
             );
             tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
-            let _ = stop.send(true);
-            // Shutdown waits for open requests: wake the long-polls so it does not wait out their timeout.
-            watched.bump();
+            watched.stop.send_replace(true);
         });
         let mut server_stop = stopping.clone();
-        let local = cluster::local_router(shared.clone()).merge(cluster::admin_router(shared.clone()));
+        let local = api::router(shared.clone()).merge(cluster::admin_router(shared.clone()));
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         // The same API for other nodes, over TLS.
@@ -262,29 +326,45 @@ fn run(args: Args) -> Result<(), String> {
                 return Ok(());
             };
             let address = tcp.local_addr().map_err(|e| fail("listening", &e))?;
-            if cluster.leader.is_none() {
-                if address.ip().is_unspecified() && args.advertise.is_none() {
-                    return Err(format!(
-                        "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
-                    ));
-                }
-                let reachable = args.advertise.clone().unwrap_or(address.to_string());
-                cluster::register(&shared, &cluster.me.name, &reachable).map_err(|e| e.to_string())?;
+            if address.ip().is_unspecified() && args.advertise.is_none() && cluster.ca.is_some() {
+                return Err(format!(
+                    "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
+                ));
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
             let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
-            served.await.map_err(|e| fail("serving other nodes", &e))
+            let members = raft::tend_members(shared.clone(), stopping.clone());
+            // The node the cluster started on says where it is; one that joined was written down as it did.
+            // ponytail: so a joined node that moves has to be deleted and joined again.
+            let registered = async {
+                if cluster.ca.is_some() {
+                    let reachable = args.advertise.clone().unwrap_or(address.to_string());
+                    let id = shared.raft.metrics().borrow().id;
+                    // Not fatal: the address the cluster has for this node is the one from last time.
+                    if let Err(e) = cluster::register(&shared, &cluster.me.name, &reachable, id).await {
+                        eprintln!("kithd: telling the cluster this node is at {reachable}: {e}");
+                    }
+                }
+            };
+            let (served, (), ()) = tokio::join!(served, members, registered);
+            served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {
-            // A node that joined forwards its API and is not given workloads yet (see cluster.rs).
-            if !shared.cluster.as_ref().is_some_and(|cluster| cluster.leader.is_some()) {
+            // A node that joined is not given workloads yet (see cluster.rs).
+            if !shared.cluster.as_ref().is_some_and(|cluster| cluster.ca.is_none()) {
                 controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()).await;
             }
         };
-        let (served, nodes, ()) = tokio::join!(server, nodes, work);
+        let names = async {
+            if let Some(sockets) = names {
+                dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
+            }
+        };
+        let (served, nodes, (), ()) = tokio::join!(server, nodes, work, names);
+        let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);

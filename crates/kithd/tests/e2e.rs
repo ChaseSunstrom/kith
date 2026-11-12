@@ -217,17 +217,26 @@ fn api_through_the_cli() {
         .mode();
     assert_eq!(mode & 0o777, 0o600);
 
-    // Without a daemon the CLI says what to do, and the store file can be read directly.
+    // Without a daemon the CLI says what to do; the next kithd has what the last one was given.
     daemon.apply(CONFIG);
     daemon.stop();
     assert!(!daemon.dir.join("kithd.sock").exists(), "the socket is removed on exit");
     let (code, _, err) = daemon.kith(&["get"]);
     assert_eq!(code, 2);
     assert!(err.contains("cannot reach kithd") && err.contains("--store"), "{err}");
-    let store = daemon.dir.join("state/store.json");
-    let (code, out, _) = daemon.kith(&["--store", store.to_str().unwrap(), "get"]);
-    assert_eq!(code, 0);
-    assert!(out.contains("settings"), "{out}");
+    daemon.restart();
+    assert!(daemon.ok(&["get"]).contains("settings"));
+
+    // The store of a kithd from before replication is brought in, once.
+    daemon.stop();
+    let state = daemon.dir.join("state");
+    std::fs::remove_dir_all(state.join("raft")).unwrap();
+    let old = state.join("store.json");
+    std::fs::write(daemon.dir.join("old.yaml"), CONFIG.replace("settings", "from-before")).unwrap();
+    daemon.ok(&["--store", old.to_str().unwrap(), "apply", "-f", "old.yaml"]);
+    daemon.restart();
+    assert!(daemon.ok(&["get"]).contains("from-before"));
+    assert!(!old.exists() && state.join("store.json.imported").exists());
 }
 
 #[test]
@@ -930,4 +939,66 @@ fn config_changes_restart() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(daemon.status("Workload/greeter")["ready"], 2);
     assert_eq!(daemon.log("w_default_greeter_1_main"), "hello\ngoodbye\n");
+}
+
+/// Ask the DNS server on `port` for the A record of `name`: the address, or the response code.
+fn resolve(port: u16, name: &str) -> Result<[u8; 4], u8> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Header: id, recursion desired, one question. Then the name, type A, class IN.
+    let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        query.push(label.len() as u8);
+        query.extend(label.as_bytes());
+    }
+    query.extend([0, 0, 1, 0, 1]);
+    socket.send_to(&query, ("127.0.0.1", port)).unwrap();
+    let mut reply = [0; 512];
+    let (len, _) = socket.recv_from(&mut reply).expect("an answer from kithd's DNS");
+    assert_eq!(reply[..2], query[..2]);
+    match (reply[3] & 0x0f, reply[7]) {
+        // The address is the last thing in a reply with one A record.
+        (0, 1) => Ok(reply[len - 4..len].try_into().unwrap()),
+        (0, _) => Err(0),
+        (code, _) => Err(code),
+    }
+}
+
+#[test]
+fn dns_answers_from_the_store() {
+    if !e2e() {
+        return;
+    }
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    // An upstream nobody listens on: what is not ours fails instead of leaving the machine.
+    let args: &'static [&'static str] = Box::leak(Box::new(["--dns", listen, "--dns-upstream", "127.0.0.1:1"]));
+    let daemon = Daemon::start_with("dns", args);
+    let home = include_str!("../../../examples/dns.yaml");
+    daemon.apply(home);
+    wait_for("the name to resolve", || {
+        resolve(port, "nas.home.example") == Ok([192, 168, 1, 20])
+    });
+    assert_eq!(daemon.status("dnsrecord/nas")["state"], "served");
+    // No such name in our zone (3); a name that is not ours and has no upstream to go to (2).
+    assert_eq!(resolve(port, "printer.home.example"), Err(3));
+    assert_eq!(resolve(port, "example.org"), Err(2));
+
+    // A record that changes is answered anew; one in a zone that is not there says so.
+    daemon.apply(
+        &home
+            .replace("192.168.1.20", "192.168.1.30")
+            .replace("zone: home\n  name: \"*.apps\"", "zone: away\n  name: \"*.apps\""),
+    );
+    wait_for("the new address", || {
+        resolve(port, "nas.home.example") == Ok([192, 168, 1, 30])
+    });
+    wait_for("the report on the lost record", || {
+        daemon.status("dnsrecord/apps")["state"] == "error"
+    });
+    let said = daemon.status("dnsrecord/apps")["message"].to_string();
+    assert!(said.contains("no DNSZone named `away`"), "{said}");
+    assert_eq!(resolve(port, "x.apps.home.example"), Err(3));
+    daemon.ok(&["delete", "dnsrecord/nas"]);
+    wait_for("the name to be gone", || resolve(port, "nas.home.example") == Err(3));
 }

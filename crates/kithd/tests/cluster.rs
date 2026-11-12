@@ -173,17 +173,22 @@ fn nodes_join_over_mutual_tls() {
         ("beta".to_string(), beta.address()),
     ];
     assert_eq!(alpha.nodes(), both);
-    // beta answers from the cluster's store, and a change made through beta is seen on alpha.
-    assert_eq!(beta.nodes(), both);
+    // beta is sent the store, and a change made through beta is seen on alpha.
+    wait_for("beta to have the store", || beta.nodes() == both);
     let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: shared }\nspec: { data: { a: b } }\n";
     std::fs::write(beta.dir.join("cm.yaml"), config).unwrap();
     beta.ok(&["apply", "-f", "cm.yaml"]);
     assert!(alpha.ok(&["get", "ConfigMap/shared"]).contains("shared"));
     // beta's own port is for members only too.
     assert_eq!(status_without_certificate(&beta.address(), "/v1/resources"), "401");
-    // Only the node with the CA key admits nodes, and beta says who that is.
+    // Only the node with the CA key admits nodes, and beta says so.
     let (code, _, err) = beta.kith(&["node", "token"]);
-    assert!(code != 0 && err.contains(&alpha.address()), "{err}");
+    assert!(code != 0 && err.contains("the one the cluster was started on"), "{err}");
+    // A state directory that holds a store is not thrown away by joining.
+    std::fs::create_dir_all(scratch.join("x5/state/raft")).unwrap();
+    let args = ["--name", "x5", "--join", &alpha.address(), "--token", token];
+    let said = kithd_fails(&scratch.join("x5"), &args);
+    assert!(said.contains("already holds a store"), "{said}");
 
     // The token was good once.
     let said = join("x4", "gamma", token);
@@ -194,4 +199,99 @@ fn nodes_join_over_mutual_tls() {
     beta.child = Node::spawn(&beta.dir, "beta", beta.port, &[]);
     wait_for("beta to answer again", || beta.kith(&["get", "node"]).0 == 0);
     assert_eq!(beta.nodes(), both);
+    assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
+}
+
+#[test]
+fn the_store_survives_its_leader() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "raft";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    // With three nodes all three vote, and alpha, where it started, still leads.
+    let status = |node: &Node| node.ok(&["node", "status"]);
+    wait_for("three voters", || {
+        [&alpha, &beta, &gamma]
+            .iter()
+            .all(|node| status(node).contains("voters:    alpha, beta, gamma"))
+    });
+    assert!(status(&gamma).contains("leader:    alpha"), "{}", status(&gamma));
+
+    // A change made through a node that does not lead is on every node.
+    let config = |name: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ a: b }} }}\n"
+        )
+    };
+    std::fs::write(gamma.dir.join("before.yaml"), config("before")).unwrap();
+    gamma.ok(&["apply", "-f", "before.yaml"]);
+    assert!(gamma.ok(&["get", "ConfigMap/before"]).contains("before"));
+    wait_for("the change on beta", || beta.kith(&["get", "ConfigMap/before"]).0 == 0);
+
+    // The leader dies without a word: the two that are left pick one of themselves and go on.
+    let _ = Command::new("kill")
+        .args(["-9", &alpha.child.id().to_string()])
+        .status();
+    let _ = alpha.child.wait();
+    std::fs::write(beta.dir.join("after.yaml"), config("after")).unwrap();
+    wait_for("a change without alpha", || {
+        beta.kith(&["apply", "-f", "after.yaml"]).0 == 0
+    });
+    wait_for("that change on gamma", || {
+        gamma.kith(&["get", "ConfigMap/after"]).0 == 0
+    });
+    assert!(!status(&beta).contains("leader:    alpha"), "{}", status(&beta));
+
+    // alpha comes back with what it had, and is sent what it missed.
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    wait_for("alpha to catch up", || alpha.kith(&["get", "ConfigMap/after"]).0 == 0);
+    assert!(alpha.ok(&["get", "ConfigMap/before"]).contains("before"));
+    assert_eq!(alpha.nodes().len(), 3);
+}
+
+#[test]
+fn a_node_that_is_down_is_not_made_a_voter() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "down";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    // beta joins and is gone before there is a third node; then gamma joins.
+    let mut beta = join("beta");
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    beta.stop();
+    let gamma = join("gamma");
+    wait_for("gamma to have the store", || gamma.nodes().len() == 3);
+    // Three nodes, but voting with beta would leave alpha unable to agree with anyone
+    // should gamma go too: alpha goes on alone, and changes still go through.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(alpha.ok(&["node", "status"]).contains("voters:    alpha\n"));
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: still }\nspec: { data: { a: b } }\n";
+    std::fs::write(gamma.dir.join("cm.yaml"), config).unwrap();
+    gamma.ok(&["apply", "-f", "cm.yaml"]);
+
+    // beta is back: now all three vote, and beta has what it missed.
+    beta.child = Node::spawn(&beta.dir, "beta", beta.port, &[]);
+    wait_for("three voters", || {
+        alpha.ok(&["node", "status"]).contains("voters:    alpha, beta, gamma")
+    });
+    wait_for("beta to catch up", || beta.kith(&["get", "ConfigMap/still"]).0 == 0);
 }

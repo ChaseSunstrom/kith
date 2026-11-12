@@ -16,6 +16,8 @@
 //! is asking again; `previous` reads the file that was moved aside at the size cap.
 //! `<key>` is `Kind/namespace/name` or `Kind/name`. Errors are `{"error": "..."}`.
 //!
+//! Changes go through Raft (see `raft.rs`); reads are this node's copy of the store.
+//!
 //! `watch` is a long-poll. `generation` counts changes to the store (status
 //! included) and is only comparable within one kithd run. With `after=G` it
 //! replies at once if the generation is not G (newer, or a restarted kithd's),
@@ -31,6 +33,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use kith_api::Resource;
 use kith_api::store::{Change, Error, Revision, Store};
+use kith_store::{Command, Done};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -62,20 +65,11 @@ impl IntoResponse for ApiError {
 
 type Reply<T> = Result<Json<T>, ApiError>;
 
-/// Change the store and persist it; if it cannot be saved, nothing changed.
-pub fn write<T>(shared: &Shared, change: impl FnOnce(&mut Store) -> Result<T, Error>) -> Result<T, ApiError> {
-    let mut file_store = shared.store.lock().expect("a handler panicked holding the store");
-    let before = file_store.store.clone();
-    let result = change(&mut file_store.store).and_then(|value| file_store.save().map(|()| value));
-    if result.is_err() {
-        file_store.store = before;
-    }
-    if result.is_ok() {
-        shared.bump();
-    }
-    drop(file_store);
-    shared.changed.notify_one();
-    result.map_err(ApiError)
+/// A command answered with another command's kind of reply: a bug, said as an error.
+fn odd() -> ApiError {
+    ApiError(Error::Io(
+        "the store gave an answer that does not fit the request".into(),
+    ))
 }
 
 fn read<T>(shared: &Shared, look: impl FnOnce(&Store) -> Result<T, Error>) -> Reply<T> {
@@ -99,7 +93,12 @@ async fn apply(
     if options.dry_run {
         return read(&shared, |store| store.clone().apply_all(resources));
     }
-    write(&shared, |store| store.apply_all(resources)).map(Json)
+    let at = kith_api::store::now();
+    match shared.submit(Command::Apply { resources, at }).await {
+        Ok(Done::Changes(changes)) => Ok(Json(changes)),
+        Ok(_) => Err(odd()),
+        Err(e) => Err(ApiError(e)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -126,13 +125,13 @@ struct WatchOptions {
 async fn watch(State(shared): State<Arc<Shared>>, Query(options): Query<WatchOptions>) -> Reply<serde_json::Value> {
     if let Some(after) = options.after {
         let secs = options.wait.unwrap_or(MAX_WATCH_SECS).min(MAX_WATCH_SECS);
-        let mut generation = shared.generation.subscribe();
-        // A timeout is not an error: the client gets the current state either way.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(secs),
-            generation.wait_for(|g| *g != after),
-        )
-        .await;
+        let (mut generation, mut stop) = (shared.generation.subscribe(), shared.stop.subscribe());
+        // A timeout is not an error, nor is kithd stopping: the client gets the current state either way.
+        tokio::select! {
+            _ = generation.wait_for(|g| *g != after) => {}
+            _ = stop.wait_for(|stop| *stop) => {}
+            () = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+        }
     }
     read(&shared, |store| {
         Ok(serde_json::json!({
@@ -147,7 +146,11 @@ async fn get_one(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> 
 }
 
 async fn delete(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> Reply<Resource> {
-    write(&shared, |store| store.delete(&key)).map(Json)
+    match shared.submit(Command::Delete { key }).await {
+        Ok(Done::Deleted(resource)) => Ok(Json(*resource)),
+        Ok(_) => Err(odd()),
+        Err(e) => Err(ApiError(e)),
+    }
 }
 
 async fn history(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> Reply<Vec<Revision>> {
@@ -164,7 +167,12 @@ async fn rollback(
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
-    write(&shared, |store| store.rollback(&key, options.to)).map(Json)
+    let (to, at) = (options.to, kith_api::store::now());
+    match shared.submit(Command::Rollback { key, to, at }).await {
+        Ok(Done::Changes(mut changes)) if changes.len() == 1 => Ok(Json(changes.remove(0))),
+        Ok(_) => Err(odd()),
+        Err(e) => Err(ApiError(e)),
+    }
 }
 
 #[derive(Deserialize)]

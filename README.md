@@ -51,11 +51,14 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   (`$XDG_RUNTIME_DIR/kith/kithd.sock`; `--socket` or `KITH_SOCKET` to move it).
   `kith` gives up on a kithd that has not answered for 30 s (`--timeout` or
   `KITH_TIMEOUT`, in seconds); a change that timed out may still have been applied.
-- One kithd per state directory: a second one, or `kith --store` on a store a
-  kithd holds, is refused instead of left waiting.
-- Keeps resources and their revision history in `~/.local/state/kith/store.json`
-  (`--state` or `KITH_STATE`). `kith --store FILE` reads or edits such a file
-  with no daemon.
+- One kithd per state directory: a second one is refused instead of left waiting.
+- Keeps resources and their revision history under `~/.local/state/kith/raft`
+  (`--state` or `KITH_STATE`): a log of changes that is synced to disk before a
+  change is answered, and a snapshot of the store now and then. It is the same
+  replicated store a cluster uses, with this node as its only member. A
+  `store.json` left there by an older kithd is brought in on the first start.
+  `kith --store FILE` reads or edits a store kept in a plain file, with no
+  daemon: for trying things out, not for looking into a kithd's state.
 - Runs each `Workload` container in its own cgroup with youki's `libcontainer`
   linked in: no containerd, no shim, no root. Images are pulled into a
   content-addressed store; one pulled before starts without asking the registry
@@ -115,7 +118,19 @@ kithd --listen 192.168.1.10:7443 --name alpha      # first start: makes the clus
 kith node token                                    # on alpha: good once, for an hour
 kithd --join 192.168.1.10:7443 --token TOKEN --name beta    # on the other machine
 kith get node                                      # on either: alpha and beta, with their addresses
+kith node status                                   # who leads the store, who votes
 ```
+
+- Every node keeps its own copy of the store (Raft, with the log on disk in
+  `<state>/raft`). A change made through any node goes to the leader, is
+  written to disk by more than half of the voting nodes, and only then
+  answered. What a node reads is its own copy, which can be a moment behind.
+- From three nodes on, three of them vote, and the cluster goes on when one of
+  those is lost: the other two pick a new leader within a few seconds. With
+  two nodes (also after one of three is deleted) only one votes, because two
+  voters would stop when either one did; losing it stops changes until it is
+  back. A node starts to vote only once it has received the store.
+- `kith delete node/NAME` takes a node out of the store's members.
 
 - Nodes talk over TLS and both ends show a certificate from the cluster's CA:
   that proves membership, not which member (every node trusts every other).
@@ -126,13 +141,40 @@ kith get node                                      # on either: alpha and beta, 
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
 
-Not yet: a node that joined keeps no copy of the store and runs no workloads; it
-forwards its API to the node it joined (replication and scheduling are next).
+Not yet: a node that joined runs no workloads (scheduling is next), and a voter
+that is lost for good is not replaced by another node on its own: delete its
+Node. A change whose answer was lost with the leader may or may not have
+happened; `kith get` tells. Joining needs an empty `--state`. A joined node
+that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and
 `--token` shows in the process list until then: `KITH_TOKEN` does not), a join
 that dies halfway needs `kith delete node/NAME` and a new token,
 certificates last ten years and cannot be renewed or revoked, and `kith` itself
 only talks to the kithd on its own machine.
+
+## DNS
+
+```sh
+kithd --dns 192.168.1.10:53          # UDP and TCP; port 53 needs root or CAP_NET_BIND_SERVICE
+kith apply -f examples/dns.yaml      # a DNSZone and two DNSRecords
+dig @192.168.1.10 nas.home.example   # 192.168.1.20
+kith get dnsrecord                   # each one says `served`, or why not
+```
+
+- `<node>.node.kith` is the address each node of the cluster is reached at.
+- A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
+  A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
+  zone itself. Names in values are full names (`nas.home.example`).
+- Split horizon: a zone with `clients: [192.168.0.0/16]` is what those clients
+  get, in place of a zone for everyone with the same domain.
+- Every other name is passed to the resolvers in `/etc/resolv.conf`
+  (`--dns-upstream 1.1.1.1,9.9.9.9` to say which), for clients on private
+  networks only, so a kithd reachable from the internet is not an open
+  resolver. Point your router's DHCP at a node and the whole house uses it.
+- In a cluster every node started with `--dns` answers the same names.
+
+Not yet: `<service>.<namespace>.kith` (with the load balancer), DNSSEC, zone
+transfers, and caching of upstream answers.
 
 ## YAML, strictly
 
@@ -152,7 +194,10 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-api` | The resource envelope, the built-in kinds, JSON Schemas, and the store (apply, diff, revisions) |
 | `crates/kith-cli` | The `kith` command |
 | `crates/kith-runtime` | Image pulls and containers |
-| `crates/kithd` | The daemon: API server, store owner and Workload controller |
+| `crates/kith-store` | The replicated store: Raft (`openraft`) with its log in `redb` |
+| `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
+| `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan (not wired in yet) |
+| `crates/kithd` | The daemon: API server, store replica, DNS and Workload controller |
 
 ## Development
 

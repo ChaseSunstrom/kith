@@ -1,0 +1,30 @@
+# Names for the house: kithd answers these itself and asks upstream for the rest.
+# Start kithd with `--dns ADDR:PORT` to serve them.
+apiVersion: kith.dev/v1
+kind: DNSZone
+metadata:
+  name: home
+spec:
+  domain: home.example
+---
+apiVersion: kith.dev/v1
+kind: DNSRecord
+metadata:
+  name: nas
+spec:
+  zone: home
+  name: nas
+  type: A
+  values: [192.168.1.20]
+---
+# Every name under apps.home.example goes to the same two machines.
+apiVersion: kith.dev/v1
+kind: DNSRecord
+metadata:
+  name: apps
+spec:
+  zone: home
+  name: "*.apps"
+  type: A
+  values: [192.168.1.10, 192.168.1.11]
+  ttl: 60

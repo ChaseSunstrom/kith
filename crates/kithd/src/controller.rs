@@ -104,6 +104,8 @@ struct Controller {
     jobs: BTreeMap<String, Progress>,
     /// Log file prefixes of the Workloads and Jobs seen last pass; `None` before the first.
     owners: Option<BTreeSet<String>>,
+    /// The status report on its way to the store, if one is.
+    report: Option<tokio::task::JoinHandle<()>>,
 }
 
 pub async fn run(
@@ -137,6 +139,7 @@ pub async fn run(
         slots: BTreeMap::new(),
         jobs: BTreeMap::new(),
         owners: None,
+        report: None,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -482,8 +485,7 @@ impl Controller {
         kith_runtime::reap_orphans(&mains);
 
         // 4. Report.
-        let mut file_store = shared.store.lock().expect("a handler panicked holding the store");
-        let mut dirty = false;
+        let mut statuses = Vec::new();
         for (key, notes) in notes {
             let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).collect();
             let units: Vec<Value> = mine
@@ -525,19 +527,21 @@ impl Controller {
                 status["notes"] = json!(notes);
             }
             // It may have been deleted while this pass ran; the next pass stops its units.
-            if file_store
-                .store
-                .get(&key)
-                .is_some_and(|live| live.status.as_ref() != Some(&status))
-            {
-                dirty |= file_store.store.set_status(&key, Some(status)).is_ok();
+            let file_store = shared.store.lock().expect("a handler panicked holding the store");
+            let live = file_store.store.get(&key);
+            if live.is_some_and(|live| live.status.as_ref() != Some(&status)) {
+                statuses.push((key, Some(status)));
             }
         }
-        if dirty {
-            shared.bump();
-        }
-        if dirty && let Err(e) = file_store.save() {
-            eprintln!("kithd: saving status: {e}");
+        // Not waited for: with no leader it takes a while to fail, and the units cannot
+        // wait that long. What is not reported now still differs on the next pass.
+        if !statuses.is_empty() && self.report.as_ref().is_none_or(|report| report.is_finished()) {
+            let shared = shared.clone();
+            self.report = Some(tokio::spawn(async move {
+                if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
+                    eprintln!("kithd: saving status: {e}");
+                }
+            }));
         }
 
         if job_moved {

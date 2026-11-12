@@ -394,6 +394,34 @@ spec! {
 
     pub enum ExposeVia { Edge }
 
+    // ---- DNS ----
+
+    /// A domain kithd answers for itself instead of asking upstream.
+    pub struct DnsZoneSpec {
+        /// The domain, like `home.example`.
+        pub domain: String,
+        /// Seconds a resolver may keep an answer, unless a record says otherwise. Defaults to 300.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ttl: Option<u32>,
+        /// Split horizon: only clients in these networks (`192.168.0.0/16`, `fd00::/8`,
+        /// or one address) get this zone's answers. Empty: everyone does.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub clients: Vec<String>,
+    }
+
+    pub struct DnsRecordSpec {
+        /// Name of the `DNSZone` the record is in.
+        pub zone: String,
+        /// The name inside the zone: `nas`, `*.apps`, or `@` for the zone itself.
+        pub name: String,
+        #[serde(rename = "type")]
+        pub record_type: DnsRecordType,
+        /// One record per value. `SRV`: `priority weight port target`.
+        pub values: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ttl: Option<u32>,
+    }
+
     pub struct NetworkPolicySpec {
         /// Workloads the policy applies to. Empty means the whole namespace.
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
@@ -645,6 +673,18 @@ spec! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DnsRecordType {
+    A,
+    Aaaa,
+    Cname,
+    Txt,
+    Srv,
+    Ns,
+    Ptr,
+}
+
 /// A port by number or by name.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
@@ -780,6 +820,84 @@ impl Spec for ServiceSpec {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Is `name` a domain name: labels of letters, digits, `-` and `_`, at most 63 long, 253 in all?
+fn dns_name(name: &str) -> bool {
+    let label =
+        |l: &str| (1..=63).contains(&l.len()) && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    name.len() <= 253 && name.split('.').all(label)
+}
+
+impl Spec for DnsZoneSpec {
+    fn check(&self) -> Result<(), String> {
+        if !dns_name(&self.domain) {
+            return Err(format!(
+                "domain: `{}` is not a domain name like `home.example`",
+                self.domain
+            ));
+        }
+        for net in &self.clients {
+            let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
+            let max = match address.parse::<std::net::IpAddr>() {
+                Ok(address) if address.is_ipv4() => 32,
+                Ok(_) => 128,
+                Err(_) => return Err(format!("clients: `{net}` is not a network like `192.168.0.0/16`")),
+            };
+            if bits.is_some_and(|bits| !bits.parse::<u8>().is_ok_and(|bits| bits <= max)) {
+                return Err(format!("clients: `{net}` has a prefix length that is not 0 to {max}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DnsRecordSpec {
+    /// `SRV` values, taken apart: priority, weight, port, target.
+    pub fn srv(value: &str) -> Option<(u16, u16, u16, &str)> {
+        let mut parts = value.split_ascii_whitespace();
+        let mut number = || parts.next()?.parse().ok();
+        let numbers = (number()?, number()?, number()?);
+        let target = parts.next().filter(|target| dns_name(target.trim_end_matches('.')))?;
+        parts
+            .next()
+            .is_none()
+            .then_some((numbers.0, numbers.1, numbers.2, target))
+    }
+}
+
+impl Spec for DnsRecordSpec {
+    fn check(&self) -> Result<(), String> {
+        let host = self.name.strip_prefix("*.").unwrap_or(&self.name);
+        if !(["@", "*"].contains(&self.name.as_str()) || dns_name(host)) {
+            return Err(format!(
+                "name: `{}` is not a name like `nas`, `*.apps` or `@`",
+                self.name
+            ));
+        }
+        // ponytail: a typo guard and what one DNS answer comfortably carries.
+        if self.values.is_empty() || self.values.len() > 100 {
+            return Err("values: needs 1 to 100 values".into());
+        }
+        use DnsRecordType::*;
+        if self.record_type == Cname && (self.values.len() > 1 || self.name == "@") {
+            return Err("a CNAME has one value, and cannot be the zone itself (`@`)".into());
+        }
+        for value in &self.values {
+            let name = || dns_name(value.trim_end_matches('.'));
+            let (ok, want) = match self.record_type {
+                A => (value.parse::<std::net::Ipv4Addr>().is_ok(), "an IPv4 address"),
+                Aaaa => (value.parse::<std::net::Ipv6Addr>().is_ok(), "an IPv6 address"),
+                Cname | Ns | Ptr => (name(), "a domain name"),
+                Srv => (Self::srv(value).is_some(), "`priority weight port target`"),
+                Txt => (value.len() <= 4000, "at most 4000 bytes"),
+            };
+            if !ok {
+                return Err(format!("values: `{value}` is not {want}"));
+            }
+        }
+        Ok(())
     }
 }
 

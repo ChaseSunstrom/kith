@@ -124,6 +124,8 @@ enum Command {
 enum NodeCommand {
     /// Print a token that lets one more node join, within the hour: `kithd --join ADDR:PORT --token TOKEN`
     Token,
+    /// Say which node leads the store, which nodes vote, and how far this one has got
+    Status,
 }
 
 #[derive(Args)]
@@ -510,6 +512,26 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let reply: serde_json::Value = request(&kithd, "POST", "/v1/tokens", b"")?;
             println!("{}", reply["token"].as_str().unwrap_or_default());
+        }
+        Command::Node {
+            command: NodeCommand::Status,
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("only kithd knows: leave out --store");
+            };
+            let reply: serde_json::Value = request(&kithd, "GET", "/v1/cluster", b"")?;
+            let names = |value: &serde_json::Value| {
+                let names = value.as_array().into_iter().flatten().filter_map(|name| name.as_str());
+                names.collect::<Vec<_>>().join(", ")
+            };
+            println!("leader:    {}", reply["leader"].as_str().unwrap_or("none"));
+            println!("voters:    {}", names(&reply["voters"]));
+            println!("receiving: {}", names(&reply["learners"]));
+            println!(
+                "this node: {}, change {}",
+                reply["node"].as_str().unwrap_or_default(),
+                reply["applied"]
+            );
         }
         Command::Schema { kind: None } => {
             let rows = KINDS

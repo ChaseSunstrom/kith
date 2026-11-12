@@ -14,7 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Revisions kept per resource; older ones are dropped.
 pub const HISTORY_LIMIT: usize = 100;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Error {
     Invalid(String),
     NotFound(String),
@@ -88,6 +88,9 @@ impl Change {
 pub struct Store {
     /// Revisions per resource key, oldest first. The last one is live.
     resources: BTreeMap<String, Vec<Revision>>,
+    /// When the next changes happen, if not now: replicas replaying a change must agree on it.
+    #[serde(skip)]
+    clock: Option<u64>,
 }
 
 impl Store {
@@ -117,12 +120,17 @@ impl Store {
         Ok(Change { action, before, after })
     }
 
+    /// Stamp the changes that follow with `at` (seconds since the epoch) instead of the clock.
+    pub fn at(&mut self, at: Option<u64>) {
+        self.clock = at;
+    }
+
     pub fn apply(&mut self, desired: Resource) -> Result<Change, Error> {
         let change = self.plan(desired)?;
         if change.action != Action::Unchanged {
             let history = self.resources.entry(change.after.key()).or_default();
             history.push(Revision {
-                at: now(),
+                at: self.clock.unwrap_or_else(now),
                 resource: change.after.clone(),
             });
             if history.len() > HISTORY_LIMIT {
@@ -192,7 +200,8 @@ impl Store {
     }
 }
 
-fn now() -> u64 {
+/// Seconds since the epoch.
+pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 

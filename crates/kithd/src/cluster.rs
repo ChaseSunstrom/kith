@@ -5,12 +5,12 @@
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket only
+//! GET  /v1/cluster                     -> {node, leader, voters, learners, applied}   local socket only
 //! ```
-//! Everything else on the TCP port is the resource API, for members only.
+//! Everything else on the TCP port is for members only: the resource API and Raft
+//! (`raft.rs`), which gives every node its own copy of the store.
 //
-// ponytail: a node that joined keeps no store of its own yet: it forwards every API
-// call to the node it joined, and runs no workloads. Its own replica of the store and
-// its share of the workloads come with Raft and the scheduler.
+// ponytail: a node that joined runs no workloads yet; its share comes with the scheduler.
 
 use crate::pki::{self, Identity};
 use crate::{Shared, api};
@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::serve::IncomingStream;
 use axum::{Json, Router};
+use kith_store::Command;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -39,10 +40,9 @@ pub struct Cluster {
     /// Held by the node that can admit others.
     pub ca: Option<pki::Ca>,
     pub tokens: pki::Tokens,
+    joining: tokio::sync::Mutex<()>,
     /// Calls other nodes as this one.
     pub client: reqwest::Client,
-    /// `address:port` of the node this one forwards its API to, if it joined one.
-    pub leader: Option<String>,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -56,13 +56,13 @@ fn client(ca: &str, me: Option<&Identity>) -> Fallible<reqwest::Client> {
 }
 
 impl Cluster {
-    pub fn new(me: Identity, ca: Option<pki::Ca>, leader: Option<String>) -> Fallible<Cluster> {
+    pub fn new(me: Identity, ca: Option<pki::Ca>) -> Fallible<Cluster> {
         Ok(Cluster {
             client: client(&me.ca, Some(&me))?,
             me,
             ca,
             tokens: pki::Tokens::default(),
-            leader,
+            joining: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -222,20 +222,49 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/join", post(join))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(shared.clone());
-    open.merge(local_router(shared).layer(axum::middleware::from_fn(members_only)))
-}
-
-/// The resource API of this node: its own store, or the node it joined.
-pub fn local_router(shared: Arc<Shared>) -> Router {
-    match shared.cluster.as_ref().and_then(|cluster| cluster.leader.as_ref()) {
-        Some(_) => Router::new().fallback(forward).with_state(shared),
-        None => api::router(shared),
-    }
+    let members = api::router(shared.clone()).merge(crate::raft::router(shared));
+    open.merge(members.layer(axum::middleware::from_fn(members_only)))
 }
 
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
-    Router::new().route("/v1/tokens", post(token)).with_state(shared)
+    let admin = Router::new().route("/v1/tokens", post(token));
+    admin.route("/v1/cluster", get(status)).with_state(shared)
+}
+
+/// Who leads the store and who votes, as this node sees it. Nodes are named where a
+/// Node says which Raft id is whose, and shown as that id otherwise.
+async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
+    let metrics = shared.raft.metrics().borrow().clone();
+    let names: std::collections::BTreeMap<String, String> = {
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        let named = |node: &kith_api::Resource| {
+            let id = node.status.as_ref()?["raftId"].as_str()?;
+            Some((id.to_string(), node.metadata.name.clone()))
+        };
+        store.store.list(Some("Node")).filter_map(named).collect()
+    };
+    let me = shared.cluster.as_ref().map_or("this node", |cluster| &cluster.me.name);
+    let name = |id: u64| match names.get(&id.to_string()) {
+        Some(name) => name.clone(),
+        None if id == metrics.id => me.to_string(),
+        None => id.to_string(),
+    };
+    let membership = metrics.membership_config.membership();
+    let voters: Vec<u64> = membership.voter_ids().collect();
+    let by_name = |ids: Vec<u64>| {
+        let mut names: Vec<String> = ids.into_iter().map(name).collect();
+        names.sort();
+        names
+    };
+    let learners = membership.nodes().map(|(id, _)| *id).filter(|id| !voters.contains(id));
+    Json(serde_json::json!({
+        "node": name(metrics.id),
+        "leader": metrics.current_leader.map(name),
+        "learners": by_name(learners.collect()),
+        "voters": by_name(voters),
+        "applied": metrics.last_applied.map_or(0, |log| log.index),
+    }))
 }
 
 async fn ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
@@ -245,8 +274,7 @@ async fn ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
 async fn token(State(shared): State<Arc<Shared>>) -> Result<Json<serde_json::Value>, Refusal> {
     let cluster = cluster(&shared)?;
     let Some(ca) = &cluster.ca else {
-        let leader = cluster.leader.as_deref().unwrap_or("the first node");
-        let why = format!("only a node that holds the cluster CA key can admit nodes: ask {leader}");
+        let why = "only the node that holds the cluster CA key can admit nodes: the one the cluster was started on";
         return Err(refuse(StatusCode::CONFLICT, why));
     };
     let token = cluster.tokens.mint(&ca.cert);
@@ -273,19 +301,24 @@ fn node_key(name: &str) -> String {
     format!("Node/{name}")
 }
 
-/// Put `Node/<name>` in the store, reachable at `address`.
-pub fn register(shared: &Shared, name: &str, address: &str) -> Result<(), kith_api::store::Error> {
+/// Put `Node/<name>` in the store: reachable at `address`, and `id` in Raft (as text:
+/// not every JSON reader keeps 64 bits). The leader then starts sending it the store.
+pub async fn register(shared: &Shared, name: &str, address: &str, id: u64) -> Result<(), kith_api::store::Error> {
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": {},
     });
     let node: kith_api::Resource = serde_json::from_value(node).expect("a Node with a valid name");
-    let written = api::write(shared, |store| {
-        if store.get(&node_key(name)).is_none() {
-            store.apply(node)?;
-        }
-        store.set_status(&node_key(name), Some(serde_json::json!({ "address": address })))
-    });
-    written.map_err(|e| e.0)
+    let known = {
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        store.store.get(&node_key(name)).is_some()
+    };
+    if !known {
+        let (resources, at) = (vec![node], kith_api::store::now());
+        shared.submit(Command::Apply { resources, at }).await?;
+    }
+    let status = serde_json::json!({ "address": address, "raftId": id.to_string() });
+    let statuses = vec![(node_key(name), Some(status))];
+    shared.submit(Command::Status { statuses }).await.map(drop)
 }
 
 async fn join(
@@ -300,6 +333,8 @@ async fn join(
             "this node cannot admit nodes: it does not hold the CA key",
         ));
     };
+    // One join at a time: a token is checked here and spent at the end, and is good once.
+    let _one = cluster.joining.lock().await;
     // The token first: someone without one learns nothing about the cluster.
     if !cluster.tokens.good(&request.token, false) {
         return Err(refuse(
@@ -323,7 +358,9 @@ async fn join(
         .issue(&request.name)
         .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let address = SocketAddr::new(peer.addr.ip(), request.port).to_string();
-    register(&shared, &request.name, &address).map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    register(&shared, &request.name, &address, kith_store::node_id(&request.name))
+        .await
+        .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
     cluster.tokens.good(&request.token, true);
     eprintln!("kithd: node {} joined from {address}", request.name);
     Ok(Json(Joined {
@@ -375,45 +412,4 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16) -> 
         return Err(format!("{address} answered with a CA the token is not for"));
     }
     Ok(joined)
-}
-
-/// Requests larger than this are not forwarded.
-const FORWARD_LIMIT: usize = 16 << 20;
-
-/// Pass a request on to the node this one joined, and its answer back.
-async fn forward(State(shared): State<Arc<Shared>>, request: Request) -> Response {
-    let cluster = shared.cluster.as_ref().expect("only routed in a cluster");
-    let leader = cluster.leader.as_ref().expect("only routed on a node that joined");
-    let (parts, body) = request.into_parts();
-    let Ok(body) = axum::body::to_bytes(body, FORWARD_LIMIT).await else {
-        return refuse(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large").into_response();
-    };
-    let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
-    // Longer than the longest long-poll (watch, 25 s).
-    let call = cluster.client.request(parts.method, format!("https://{leader}{path}"));
-    let mut call = call.timeout(Duration::from_secs(40)).body(body);
-    if let Some(kind) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
-        call = call.header(axum::http::header::CONTENT_TYPE, kind);
-    }
-    let reply = match call.send().await {
-        Ok(reply) => reply,
-        Err(e) => {
-            let why = format!("node {leader}, which this node joined, cannot be reached: {e}");
-            return refuse(StatusCode::BAD_GATEWAY, why).into_response();
-        }
-    };
-    let (status, kind) = (
-        reply.status(),
-        reply.headers().get(axum::http::header::CONTENT_TYPE).cloned(),
-    );
-    match reply.bytes().await {
-        Ok(body) => {
-            let mut response = (status, body).into_response();
-            if let Some(kind) = kind {
-                response.headers_mut().insert(axum::http::header::CONTENT_TYPE, kind);
-            }
-            response
-        }
-        Err(e) => refuse(StatusCode::BAD_GATEWAY, format!("node {leader} stopped answering: {e}")).into_response(),
-    }
 }
