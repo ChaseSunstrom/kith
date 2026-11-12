@@ -292,6 +292,45 @@ fn no_nodes_and_duplicate_ids_are_handled() {
 }
 
 #[test]
+fn nan_inf_and_negative_numbers_never_admit_a_replica() {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+        // A broken capacity counts as 0, so a replica that asks for something is refused.
+        let mut cpu = node("a", 4.0, 4.0);
+        cpu.capacity.cpu = bad;
+        let mut mem = node("b", 4.0, 4.0);
+        mem.capacity.memory = bad;
+        let plan = schedule(&[cpu, mem], &[replica("r", "w")], GRACE);
+        assert_eq!(
+            plan.unschedulable["r"], "0/2 nodes can take it: 1 not enough cpu, 1 not enough memory",
+            "capacity {bad}"
+        );
+        // A broken request is unschedulable on any node, bound or not.
+        for on in [None, Some("e")] {
+            let mut r = replica("r", "w");
+            r.requests.memory = bad;
+            r.bound = on.map(Into::into);
+            let plan = schedule(&[node("e", 4.0, 4.0)], &[r], GRACE);
+            assert!(plan.bind.is_empty(), "request {bad}");
+            assert_eq!(
+                plan.unschedulable["r"],
+                "its requests are not finite, non-negative numbers"
+            );
+        }
+    }
+}
+
+#[test]
+fn duplicate_names_and_ids_give_one_plan_whatever_the_order() {
+    let (big, small) = (node("a", 8.0, 8.0), node("a", 1.0, 1.0));
+    let x = replica("r", "w");
+    let mut y = replica("r", "w");
+    y.requests.cpu = 4.0;
+    let want = schedule(&[big.clone(), small.clone()], &[x.clone(), y.clone()], GRACE);
+    assert_eq!(schedule(&[small, big], &[y, x], GRACE), want);
+    assert_eq!(want.bind.len() + want.unschedulable.len(), 1);
+}
+
+#[test]
 fn requests_sum_every_container_and_exec_unit() {
     let t: Template = serde_json::from_value(serde_json::json!({
         "containers": [
@@ -347,87 +386,177 @@ impl Lcg {
     }
 }
 
-#[test]
-fn random_clusters_never_break_a_filter_or_capacity() {
-    let mut rng = Lcg(7);
-    for round in 0..300 {
-        let mut nodes = Vec::new();
-        for i in 0..rng.below(6) {
-            let mut n = node(&format!("n{i}"), (1 + rng.below(4)) as f64, (1 + rng.below(4)) as f64);
-            n.labels = labels(&[("zone", ["x", "y"][rng.below(2) as usize])]);
-            match rng.below(6) {
-                0 => n.spec.unschedulable = Some(true),
-                1 => taint(&mut n, TaintEffect::NoSchedule),
-                2 => taint(&mut n, TaintEffect::NoExecute),
-                3 => n.lost_for = Some(Duration::from_secs(rng.below(120))),
-                _ => {}
-            }
-            if rng.below(3) == 0 {
-                n.spec.reserved = Some(Resources {
-                    cpu: Some(quantity("500m")),
-                    memory: Some(quantity("512Mi")),
-                });
-            }
-            nodes.push(n);
+fn shuffled<T: Clone>(rng: &mut Lcg, v: &[T]) -> Vec<T> {
+    let mut v = v.to_vec();
+    for i in (1..v.len()).rev() {
+        v.swap(i, rng.below(i as u64 + 1) as usize);
+    }
+    v
+}
+
+/// `below(n) * unit`, now and then NaN, infinite or negative instead.
+fn odd(rng: &mut Lcg, n: u64, unit: f64) -> f64 {
+    match rng.below(12) {
+        0 => f64::NAN,
+        1 => f64::INFINITY,
+        2 => -unit,
+        _ => rng.below(n) as f64 * unit,
+    }
+}
+
+fn random_cluster(rng: &mut Lcg) -> (Vec<Node>, Vec<Replica>) {
+    let mut nodes: Vec<Node> = Vec::new();
+    for i in 0..rng.below(7) {
+        // Now and then a second node with a name already taken.
+        let name = match nodes.len() {
+            0 => format!("n{i}"),
+            len if rng.below(6) == 0 => nodes[rng.below(len as u64) as usize].name.clone(),
+            _ => format!("n{i}"),
+        };
+        let mut n = node(&name, odd(rng, 5, 1.0), odd(rng, 5, 1.0));
+        n.labels = labels(&[("zone", ["x", "y"][rng.below(2) as usize])]);
+        match rng.below(8) {
+            0 => n.spec.unschedulable = Some(true),
+            1 => taint(&mut n, TaintEffect::NoSchedule),
+            2 => taint(&mut n, TaintEffect::NoExecute),
+            3 | 4 => n.lost_for = Some(Duration::from_secs(rng.below(120))),
+            _ => {}
         }
-        let replicas: Vec<Replica> = (0..rng.below(12))
-            .map(|i| {
-                let mut r = replica(&format!("r{i:02}"), &format!("w{}", rng.below(3)));
-                r.requests = Amount {
-                    cpu: rng.below(3) as f64 * 0.5,
-                    memory: rng.below(3) as f64 * GI / 2.0,
-                };
-                if rng.below(2) == 0 {
-                    r.placement = placement(&[("zone", ["x", "y"][rng.below(2) as usize])], &[(5, "zone", "x")]);
-                }
-                r
-            })
-            .collect();
-        let plan = schedule(&nodes, &replicas, GRACE);
-        let mut used: BTreeMap<&str, Amount> = BTreeMap::new();
-        for r in &replicas {
+        if rng.below(3) == 0 {
+            n.spec.reserved = Some(Resources {
+                cpu: Some(quantity("500m")),
+                memory: Some(quantity("512Mi")),
+            });
+        }
+        nodes.push(n);
+    }
+    let mut replicas: Vec<Replica> = Vec::new();
+    for i in 0..rng.below(14) {
+        let id = match replicas.len() {
+            len if len > 0 && rng.below(6) == 0 => replicas[rng.below(len as u64) as usize].id.clone(),
+            _ => format!("r{i:02}"),
+        };
+        let mut r = replica(&id, &format!("w{}", rng.below(3)));
+        r.requests = Amount {
+            cpu: odd(rng, 3, 0.5),
+            memory: odd(rng, 3, GI / 2.0),
+        };
+        if rng.below(2) == 0 {
+            r.placement = placement(&[("zone", ["x", "y"][rng.below(2) as usize])], &[(5, "zone", "x")]);
+        }
+        // Bound to a live node, or to `n{len}`, which does not exist.
+        if rng.below(3) > 0 {
+            r.bound = Some(format!("n{}", rng.below(nodes.len() as u64 + 1)));
+        }
+        replicas.push(r);
+    }
+    (nodes, replicas)
+}
+
+/// The copy of each name that wins: the smallest by its `Debug` text.
+fn winners<T: std::fmt::Debug>(items: &[T], name: fn(&T) -> &str) -> BTreeMap<&str, &T> {
+    let mut won: BTreeMap<&str, &T> = BTreeMap::new();
+    for x in items {
+        let e = won.entry(name(x)).or_insert(x);
+        if format!("{x:?}") < format!("{e:?}") {
+            *e = x;
+        }
+    }
+    won
+}
+
+fn fine(x: f64) -> bool {
+    x.is_finite() && x >= 0.0
+}
+
+/// Checks one plan against the rules, from the input alone.
+fn check(nodes: &[Node], replicas: &[Replica], plan: &Plan) -> (usize, usize) {
+    let live = winners(nodes, |n| &n.name);
+    let mut kept: BTreeMap<&str, (Amount, usize)> = BTreeMap::new();
+    let mut new: BTreeMap<&str, (Amount, usize)> = BTreeMap::new();
+    for r in replicas {
+        // (d) exactly one verdict for every id.
+        assert!(
+            plan.bind.contains_key(&r.id) ^ plan.unschedulable.contains_key(&r.id),
+            "{} has no single verdict",
+            r.id
+        );
+    }
+    for id in plan.bind.keys().chain(plan.unschedulable.keys()) {
+        assert!(replicas.iter().any(|r| &r.id == id), "{id} is not a replica");
+    }
+    for r in winners(replicas, |r| &r.id).into_values() {
+        let valid = fine(r.requests.cpu) && fine(r.requests.memory);
+        let require = r.placement.as_ref().map(|p| p.require.clone()).unwrap_or_default();
+        let may_stay = |n: &Node| {
+            valid
+                && !n.lost_for.is_some_and(|d| d > GRACE)
+                && !n.spec.taints.iter().any(|t| t.effect == TaintEffect::NoExecute)
+                && matches(&n.labels, &require)
+        };
+        let stays = r.bound.as_deref().and_then(|b| live.get(b)).filter(|n| may_stay(n));
+        let Some(to) = plan.bind.get(&r.id) else {
+            assert!(stays.is_none(), "{} was evicted from a node it may stay on", r.id);
+            continue;
+        };
+        assert!(valid, "{} has broken requests but was bound", r.id);
+        let n = live.get(to.as_str()).expect("bound to a node that does not exist");
+        let (side, count) = if stays.is_some() {
+            // (c) a kept replica is where it was and may stay there.
+            assert_eq!(r.bound.as_ref(), Some(to));
+            kept.entry(to).or_default()
+        } else {
+            // (a) a new placement passes every filter.
+            assert_ne!(r.bound.as_ref(), Some(to), "{} kept on a node it must leave", r.id);
             assert!(
-                plan.bind.contains_key(&r.id) ^ plan.unschedulable.contains_key(&r.id),
-                "round {round}: {} has no verdict",
-                r.id
-            );
-            let Some(name) = plan.bind.get(&r.id) else { continue };
-            let n = nodes.iter().find(|n| &n.name == name).unwrap();
-            assert!(n.lost_for.is_none(), "round {round}: bound to a lost node");
-            assert_ne!(
-                n.spec.unschedulable,
-                Some(true),
-                "round {round}: bound to a cordoned node"
+                n.lost_for.is_none() && n.spec.unschedulable != Some(true),
+                "{to}: not ready or cordoned"
             );
             assert_eq!(
                 tainted(n, &[TaintEffect::NoSchedule, TaintEffect::NoExecute]),
                 0,
-                "round {round}: bound to a tainted node"
+                "{to}: tainted"
             );
-            assert!(matches(
-                &n.labels,
-                &r.placement
-                    .as_ref()
-                    .unwrap_or(&Placement {
-                        require: Labels::new(),
-                        prefer: vec![]
-                    })
-                    .require
-            ));
-            let u = used.entry(name).or_default();
-            u.cpu += r.requests.cpu;
-            u.memory += r.requests.memory;
+            assert!(matches(&n.labels, &require), "{to}: labels");
+            new.entry(to).or_default()
+        };
+        side.cpu += r.requests.cpu;
+        side.memory += r.requests.memory;
+        *count += 1;
+    }
+    // (b) new placements fit beside the kept ones, unless the kept ones fill the node already.
+    for (name, (add, count)) in &new {
+        let n = live[name];
+        let held = kept.get(name).map_or(Amount::default(), |k| k.0);
+        let reserved = n.spec.reserved.as_ref().map_or(Amount::default(), Amount::of_resources);
+        let room = |cap: f64, res: f64| if fine(cap) { cap - res } else { 0.0 - res };
+        let (cpu, mem) = (
+            room(n.capacity.cpu, reserved.cpu),
+            room(n.capacity.memory, reserved.memory),
+        );
+        assert!(held.cpu + add.cpu <= cpu, "{name}: over cpu ({count} new)");
+        assert!(held.memory + add.memory <= mem, "{name}: over memory ({count} new)");
+    }
+    (kept.values().map(|k| k.1).sum(), new.values().map(|k| k.1).sum())
+}
+
+#[test]
+fn random_clusters_keep_every_rule_and_ignore_input_order() {
+    let mut rng = Lcg(7);
+    let (mut kept, mut new, mut refused) = (0, 0, 0);
+    for round in 0..4000 {
+        let (nodes, replicas) = random_cluster(&mut rng);
+        let plan = schedule(&nodes, &replicas, GRACE);
+        let (k, n) = check(&nodes, &replicas, &plan);
+        kept += k;
+        new += n;
+        refused += plan.unschedulable.len();
+        // The same plan for any order of nodes and replicas.
+        for _ in 0..3 {
+            let (n2, r2) = (shuffled(&mut rng, &nodes), shuffled(&mut rng, &replicas));
+            assert_eq!(schedule(&n2, &r2, GRACE), plan, "round {round}: order changed the plan");
         }
-        for (name, u) in used {
-            let n = nodes.iter().find(|n| n.name == name).unwrap();
-            let reserved = n.spec.reserved.as_ref().map_or(Amount::default(), Amount::of_resources);
-            assert!(u.cpu <= n.capacity.cpu - reserved.cpu, "round {round}: {name} over cpu");
-            assert!(
-                u.memory <= n.capacity.memory - reserved.memory,
-                "round {round}: {name} over memory"
-            );
-        }
-        // Feeding the plan back in changes nothing.
+        // (e) Feeding the plan back in changes nothing.
         let again: Vec<Replica> = replicas
             .iter()
             .map(|r| Replica {
@@ -435,10 +564,12 @@ fn random_clusters_never_break_a_filter_or_capacity() {
                 ..r.clone()
             })
             .collect();
-        assert_eq!(
-            schedule(&nodes, &again, GRACE).bind,
-            plan.bind,
+        let second = schedule(&nodes, &again, GRACE);
+        assert_eq!(second.bind, plan.bind, "round {round}: not stable");
+        assert!(
+            second.unschedulable.keys().eq(plan.unschedulable.keys()),
             "round {round}: not stable"
         );
     }
+    assert!(kept > 1000 && new > 1000 && refused > 1000, "{kept} {new} {refused}");
 }
