@@ -103,7 +103,7 @@ must be gzip or plain tar, the image's `User` is ignored (containers run as
 root inside their user namespace), and there is no seccomp filter. The log cap
 is checked every 10 s, so a file can pass it by what its unit writes in that
 time, and output written in the instant a file is moved aside is lost. Kinds other than
-`Workload`, `Job`, `ConfigMap` and `Secret` are stored and validated but nothing acts
+`Workload`, `NodeWorkload`, `Job`, `ConfigMap` and `Secret` are stored and validated but nothing acts
 on them. Running as root is untested.
 
 [`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has
@@ -144,6 +144,15 @@ kith node status                                   # who leads the store, who vo
   has no home (`unschedulable`); `kith logs` reads a replica's output from
   whichever node has it. A Job is run by one node. A node is given nothing
   new until the leader has heard from it (a few seconds after it joins).
+- A `NodeWorkload` runs one copy on every node whose labels match its
+  `selector` (empty: every node), except cordoned and `NoExecute`-tainted
+  nodes and ones lost past `--lost-after`. Label a node by editing it:
+  `kith get node/NAME -o yaml`, add `metadata.labels`, `kith apply`. A node
+  that starts to match gets a copy, one that stops loses it; `nodes` in
+  `kith get nodeworkload/NAME -o yaml` says which copy (number) each node
+  runs, `kith get` shows ready over the number of nodes, and `kith logs
+  nodeworkload/NAME --replica N` reads a copy's output. On one node (no
+  cluster) it runs one copy if the selector is empty, none otherwise.
 - A replica stays on its node. When the node has been unreachable for five
   minutes (`--lost-after SECONDS`), its replicas are started on other nodes,
   and stay there when it comes back; a Job it was running starts over.
@@ -161,8 +170,8 @@ kith node status                                   # who leads the store, who vo
   neither `--join` nor `--token`.
 
 Not yet: replicas of one Workload on different nodes are all replaced at once
-when it changes (on one node it is one at a time), a `NodeWorkload` is not run,
-and replicas on a node that is unreachable still count as ready until they are
+when it changes (on one node it is one at a time; a `NodeWorkload` is always
+replaced all at once), and replicas on a node that is unreachable still count as ready until they are
 moved. A change whose answer was lost with the leader may or may not have
 happened; `kith get` tells. Joining needs an empty `--state`. A joined node
 that moves to another address has to be deleted and joined again.

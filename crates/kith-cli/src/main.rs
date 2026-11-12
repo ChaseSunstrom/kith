@@ -88,7 +88,7 @@ enum Command {
         #[arg(long, value_name = "REVISION")]
         to: u64,
     },
-    /// Print the output of a Workload's or Job's container or exec unit
+    /// Print the output of a Workload's, NodeWorkload's or Job's container or exec unit
     Logs {
         #[command(flatten)]
         target: Target,

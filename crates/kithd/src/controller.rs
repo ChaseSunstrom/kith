@@ -12,8 +12,8 @@
 use crate::Shared;
 use kith_api::Resource;
 use kith_api::kinds::{
-    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, PullPolicy, Resources, RestartPolicy, SecretSpec, Strategy,
-    Template, WorkloadSpec,
+    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, NodeWorkloadSpec, PullPolicy, Resources, RestartPolicy,
+    SecretSpec, Strategy, Template, WorkloadSpec,
 };
 use kith_api::store::Error;
 use kith_runtime::{Handle, Runtime, Unit};
@@ -190,7 +190,11 @@ fn backoff(failures: u32) -> Duration {
 /// What every unit id (so every log file and cgroup) of one Workload or Job starts
 /// with. `_` cannot appear in a resource name, so it separates the parts.
 fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
-    let kind = if kind == "Job" { "j" } else { "w" };
+    let kind = match kind {
+        "Job" => "j",
+        "NodeWorkload" => "n",
+        _ => "w",
+    };
     format!("{kind}_{namespace}_{name}_")
 }
 
@@ -205,12 +209,27 @@ fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
     }
 }
 
-/// The template of a Workload or Job, and how many replicas (or runs) it has.
+/// The replica numbers the scheduler gave to the nodes of a NodeWorkload (not in a row:
+/// a node that stops matching leaves a gap).
+fn bound(resource: &Resource) -> Vec<u32> {
+    let nodes = resource.status.as_ref().and_then(|s| s["nodes"].as_object());
+    nodes
+        .into_iter()
+        .flatten()
+        .filter_map(|(number, _)| number.parse().ok())
+        .collect()
+}
+
+/// The template of a Workload, NodeWorkload or Job, and how many replicas (or runs) it has.
 fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
         "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),
         "Job" => serde_json::from_value::<JobSpec>(spec).map(|s| (s.template, s.completions.unwrap_or(1))),
+        // One copy for each node the scheduler has given a number to.
+        "NodeWorkload" => {
+            serde_json::from_value::<NodeWorkloadSpec>(spec).map(|s| (s.template, bound(resource).len() as u32))
+        }
         kind => return Err(format!("a {kind} runs nothing")),
     }
     .map_err(|e| format!("cannot read this {}: {e}", resource.kind))
@@ -229,7 +248,11 @@ pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(
     };
     let key = resource.key();
     let name = name.ok_or_else(|| Error::NotFound(format!("{key} has no unit `{}`", unit.unwrap_or("?"))))?;
-    if replica >= replicas {
+    let has = match resource.kind.as_str() {
+        "NodeWorkload" => bound(resource).contains(&replica),
+        _ => replica < replicas,
+    };
+    if !has {
         return Err(Error::NotFound(format!("{key} has no replica {replica}")));
     }
     let namespace = resource.metadata.namespace.as_deref().unwrap_or_default();
@@ -254,9 +277,10 @@ impl Controller {
         let resources: Vec<Resource> = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
-            store
-                .list(Some("Workload"))
-                .chain(store.list(Some("Job")))
+            let kinds = ["Workload", "NodeWorkload", "Job"];
+            kinds
+                .into_iter()
+                .flat_map(|kind| store.list(Some(kind)))
                 .cloned()
                 .collect()
         };
@@ -295,6 +319,22 @@ impl Controller {
                 self.jobs.remove(&key);
                 continue;
             }
+            // The replicas of a NodeWorkload are the numbers it has nodes for. Alone, there is
+            // one copy, unless a selector asks for nodes there are none of.
+            let numbers: Vec<u32> = match (resource.kind.as_str(), me) {
+                ("NodeWorkload", Some(_)) => bound(resource),
+                ("NodeWorkload", None) if resource.spec["selector"].as_object().is_none_or(|s| s.is_empty()) => vec![0],
+                ("NodeWorkload", None) => {
+                    note.push("no node matches the selector: this one has no labels".into());
+                    Vec::new()
+                }
+                _ => (0..replicas).collect(),
+            };
+            let replicas = if resource.kind == "NodeWorkload" {
+                numbers.len() as u32
+            } else {
+                replicas
+            };
             counts.insert(key.clone(), replicas);
             let strategy = resource.spec["strategy"].clone();
             let strategy = serde_json::from_value::<Option<Strategy>>(strategy).ok().flatten();
@@ -317,12 +357,13 @@ impl Controller {
                     (runs, not_before, RestartPolicy::Never)
                 }
                 _ => (
-                    (0..replicas).filter(|replica| here(*replica)).collect(),
+                    numbers.into_iter().filter(|replica| here(*replica)).collect(),
                     Instant::now(),
                     template.restart_policy.clone().unwrap_or(RestartPolicy::Always),
                 ),
             };
-            if resource.kind == "Job" || !replicas.is_empty() {
+            // (Alone, nobody else says that nothing runs.)
+            if resource.kind == "Job" || !replicas.is_empty() || me.is_none() {
                 ours.insert(key.clone());
             }
             let containers = template.containers.iter().cloned().map(Run::Container);
