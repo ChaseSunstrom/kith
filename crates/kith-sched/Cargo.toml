@@ -1,0 +1,15 @@
+[package]
+name = "kith-sched"
+description = "kith scheduler: filter, score and bind replicas to nodes, as pure functions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-api.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
