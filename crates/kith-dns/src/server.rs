@@ -1,9 +1,12 @@
 //! The UDP and TCP servers and the forwarder.
 
-use crate::{Answer, Zones, answer, servfail};
+use crate::wire::{self, Query, REFUSED};
+use crate::{Answer, Cidr, Zones, answer, servfail};
+use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -17,20 +20,90 @@ const IDLE: Duration = Duration::from_secs(10);
 const MAX_TCP_CONNECTIONS: usize = 64;
 /// UDP queries being forwarded at once; more are dropped.
 const MAX_FORWARDS: usize = 128;
+/// Open TCP connections from one client IP.
+pub(crate) const TCP_PER_IP: usize = 8;
+/// Forwards in flight (UDP and TCP) for one client IP.
+const FORWARDS_PER_IP: usize = 16;
+/// A TCP connection ends after this long in all, or after this many queries.
+const TCP_LIFETIME: Duration = Duration::from_secs(60);
+pub(crate) const TCP_QUERIES: usize = 100;
 
 type ZonesRx = watch::Receiver<Arc<Zones>>;
 
-/// Serves DNS on `udp` and `tcp` until the task is dropped. Names outside `zones` go to each of
-/// `upstreams` in turn; the zones in the watch channel can be replaced while it runs.
-pub async fn serve(udp: UdpSocket, tcp: TcpListener, zones: ZonesRx, upstreams: Vec<SocketAddr>) {
-    let upstreams: Arc<[SocketAddr]> = upstreams.into();
-    tokio::join!(
-        serve_udp(udp, zones.clone(), upstreams.clone()),
-        serve_tcp(tcp, zones, upstreams)
-    );
+/// How many of something each client IP holds. An entry lives only while it is held.
+#[derive(Clone, Default)]
+pub(crate) struct PerIp(Arc<Mutex<HashMap<IpAddr, usize>>>);
+
+/// One unit held for `ip`; dropping it gives the unit back.
+pub(crate) struct Held(PerIp, IpAddr);
+
+impl PerIp {
+    /// A unit for `ip`, unless it already holds `max`.
+    pub(crate) fn take(&self, ip: IpAddr, max: usize) -> Option<Held> {
+        let ip = ip.to_canonical();
+        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip).or_default();
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(Held(self.clone(), ip))
+    }
 }
 
-async fn serve_udp(sock: UdpSocket, zones: ZonesRx, upstreams: Arc<[SocketAddr]>) {
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut m = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
+
+/// Whether a client may use the forwarder: one in `allowed`, or, when that is empty, one on a
+/// loopback, private, link-local or unique-local address.
+pub(crate) fn may_forward(ip: IpAddr, allowed: &[Cidr]) -> bool {
+    let ip = ip.to_canonical();
+    if !allowed.is_empty() {
+        return allowed.iter().any(|n| n.contains(ip));
+    }
+    match ip {
+        IpAddr::V4(a) => a.is_loopback() || a.is_private() || a.is_link_local(),
+        IpAddr::V6(a) => a.is_loopback() || a.is_unique_local() || a.is_unicast_link_local(),
+    }
+}
+
+#[derive(Clone)]
+struct Shared {
+    zones: ZonesRx,
+    upstreams: Arc<[SocketAddr]>,
+    forwarders: Arc<[Cidr]>,
+    forwards: PerIp,
+}
+
+/// Serves DNS on `udp` and `tcp` until the task is dropped. Names outside `zones` go to each of
+/// `upstreams` in turn, for clients in `forwarders` (or, when empty, on local networks); the zones
+/// in the watch channel can be replaced while it runs.
+pub async fn serve(
+    udp: UdpSocket,
+    tcp: TcpListener,
+    zones: ZonesRx,
+    upstreams: Vec<SocketAddr>,
+    forwarders: Vec<Cidr>,
+) {
+    let shared = Shared {
+        zones,
+        upstreams: upstreams.into(),
+        forwarders: forwarders.into(),
+        forwards: PerIp::default(),
+    };
+    tokio::join!(serve_udp(udp, shared.clone()), serve_tcp(tcp, shared));
+}
+
+async fn serve_udp(sock: UdpSocket, sh: Shared) {
     let sock = Arc::new(sock);
     let slots = Arc::new(Semaphore::new(MAX_FORWARDS));
     let mut buf = vec![0u8; 4096];
@@ -39,40 +112,49 @@ async fn serve_udp(sock: UdpSocket, zones: ZonesRx, upstreams: Arc<[SocketAddr]>
             sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let zs = zones.borrow().clone();
+        let zs = sh.zones.borrow().clone();
         match answer(&buf[..n], from.ip(), &zs, true) {
             Answer::Drop => {}
             Answer::Reply(r) => {
                 let _ = sock.send_to(&r, from).await;
             }
+            Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => {
+                let _ = sock.send_to(&wire::failure(&buf[..n], REFUSED), from).await;
+            }
             Answer::Forward => {
-                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                let (Ok(permit), Some(held)) = (
+                    slots.clone().try_acquire_owned(),
+                    sh.forwards.take(from.ip(), FORWARDS_PER_IP),
+                ) else {
                     continue;
                 };
-                let (query, sock, upstreams) = (buf[..n].to_vec(), sock.clone(), upstreams.clone());
+                let (query, sock, upstreams) = (buf[..n].to_vec(), sock.clone(), sh.upstreams.clone());
                 tokio::spawn(async move {
-                    let _ = sock.send_to(&forward(&query, &upstreams, false).await, from).await;
-                    drop(permit);
+                    let limit = Query::parse(&query).map_or(512, |q| q.udp_limit());
+                    let reply = wire::truncate(forward(&query, &upstreams, false).await, limit);
+                    let _ = sock.send_to(&reply, from).await;
+                    drop((permit, held));
                 });
             }
         }
     }
 }
 
-async fn serve_tcp(listener: TcpListener, zones: ZonesRx, upstreams: Arc<[SocketAddr]>) {
+async fn serve_tcp(listener: TcpListener, sh: Shared) {
     let slots = Arc::new(Semaphore::new(MAX_TCP_CONNECTIONS));
+    let conns = PerIp::default();
     loop {
         let Ok((stream, from)) = listener.accept().await else {
             sleep(Duration::from_millis(50)).await;
             continue;
         };
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
+        let (Ok(permit), Some(held)) = (slots.clone().try_acquire_owned(), conns.take(from.ip(), TCP_PER_IP)) else {
             continue;
         };
-        let (zones, upstreams) = (zones.clone(), upstreams.clone());
+        let sh = sh.clone();
         tokio::spawn(async move {
-            let _ = tcp_connection(stream, from, zones, upstreams).await;
-            drop(permit);
+            let _ = timeout(TCP_LIFETIME, tcp_connection(stream, from, sh)).await;
+            drop((permit, held));
         });
     }
 }
@@ -84,23 +166,23 @@ async fn within<T>(f: impl Future<Output = io::Result<T>>) -> io::Result<T> {
         .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
 }
 
-/// Answers queries on one connection until the client stops, errs or goes idle.
-async fn tcp_connection(
-    mut s: TcpStream,
-    from: SocketAddr,
-    zones: ZonesRx,
-    upstreams: Arc<[SocketAddr]>,
-) -> io::Result<()> {
-    loop {
+/// Answers queries on one connection until the client stops, errs, goes idle or sends `TCP_QUERIES`.
+async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::Result<()> {
+    for _ in 0..TCP_QUERIES {
         let query = within(read_frame(&mut s)).await?;
-        let zs = zones.borrow().clone();
+        let zs = sh.zones.borrow().clone();
         let reply = match answer(&query, from.ip(), &zs, false) {
             Answer::Drop => return Ok(()),
             Answer::Reply(r) => r,
-            Answer::Forward => forward(&query, &upstreams, true).await,
+            Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => wire::failure(&query, REFUSED),
+            Answer::Forward => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
+                Some(_held) => forward(&query, &sh.upstreams, true).await,
+                None => servfail(&query),
+            },
         };
         within(write_frame(&mut s, &reply)).await?;
     }
+    Ok(())
 }
 
 /// One message with its 2-byte length. Anything shorter than a header ends the connection.
@@ -122,27 +204,41 @@ async fn write_frame(s: &mut (impl AsyncWriteExt + Unpin), msg: &[u8]) -> io::Re
     s.write_all(&frame).await
 }
 
+/// A random 16-bit id, from the keys std seeds its hash maps with.
+fn random_id() -> u16 {
+    RandomState::new().hash_one(0u8) as u16
+}
+
 /// Asks each upstream in turn (over TCP when the client used it, so no truncation) and returns
-/// the first reply, or SERVFAIL.
+/// the first reply, or SERVFAIL. Each ask has its own random id; the reply gets the client's back.
 async fn forward(query: &[u8], upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
     for &up in upstreams {
+        let Some(sent) = wire::for_upstream(query, random_id()) else {
+            break;
+        };
         let ask = async {
             if tcp {
-                ask_tcp(query, up).await
+                ask_tcp(&sent, up).await
             } else {
-                ask_udp(query, up).await
+                ask_udp(&sent, up).await
             }
         };
-        if let Ok(Ok(reply)) = timeout(UPSTREAM_TIMEOUT, ask).await {
+        if let Ok(Ok(mut reply)) = timeout(UPSTREAM_TIMEOUT, ask).await {
+            reply[..2].copy_from_slice(&query[..2]);
             return reply;
         }
     }
     servfail(query)
 }
 
-/// Whether `reply` answers `query`: a response with the same id.
-fn answers(query: &[u8], reply: &[u8]) -> bool {
-    reply.len() >= 12 && reply[..2] == query[..2] && reply[2] & 0x80 != 0
+/// Whether `reply` answers `sent`: a response with the same id and the same question.
+fn answers(sent: &[u8], reply: &[u8]) -> bool {
+    let ask = |b: &[u8]| wire::question(b).map(|q| (q.0, q.1, q.2));
+    reply.len() >= 12
+        && reply[..2] == sent[..2]
+        && reply[2] & 0x80 != 0
+        && ask(sent).is_some()
+        && ask(sent) == ask(reply)
 }
 
 async fn ask_udp(query: &[u8], up: SocketAddr) -> io::Result<Vec<u8>> {

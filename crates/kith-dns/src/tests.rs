@@ -344,7 +344,7 @@ fn long_udp_replies_are_truncated_and_tcp_ones_are_not() {
     };
     let r = decode(r);
     assert!(r.raw.len() <= 1232 && r.flags & 0x0200 == 0 && r.an.len() == 60);
-    for i in 60..120u8 {
+    for i in 60..100u8 {
         z.records
             .add(rec("big.kith", Rdata::A(Ipv4Addr::new(10, 1, 2, i))))
             .unwrap();
@@ -357,7 +357,7 @@ fn long_udp_replies_are_truncated_and_tcp_ones_are_not() {
         panic!()
     };
     let r = decode(r);
-    assert!(r.flags & 0x0200 == 0 && r.an.len() == 120);
+    assert!(r.flags & 0x0200 == 0 && r.an.len() == 100);
 }
 
 #[test]
@@ -403,6 +403,21 @@ fn hostile_packets_are_rejected_without_panicking() {
     formerr([&head(1)[..], &[1, 0xE9, 0, 0, 1, 0, 1]].concat());
 }
 
+/// Valid queries that reach the record loop: an OPT record, an answer record, and both with
+/// names that end in a compression pointer.
+fn seed_packets() -> Vec<Vec<u8>> {
+    let rr = [1, b'z', 0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4];
+    let opt = [0, 0, 41, 4, 0xD0, 0, 0, 0, 0, 0, 0];
+    let mut with_an = query(5, "web.default.kith", A, None);
+    with_an[7] = 1;
+    with_an.extend(rr);
+    let mut with_ar = query(5, "web.default.kith", A, None);
+    with_ar[11] = 2;
+    with_ar.extend(rr);
+    with_ar.extend(opt);
+    vec![query(5, "web.default.kith", A, Some(1232)), with_an, with_ar]
+}
+
 #[test]
 fn random_bytes_never_panic() {
     let z = zones();
@@ -413,28 +428,185 @@ fn random_bytes_never_panic() {
         seed ^= seed << 17;
         seed
     };
-    let valid = query(5, "web.default.kith", A, Some(1232));
-    for i in 0..30_000 {
+    let seeds = seed_packets();
+    assert!(seeds.iter().all(|s| wire::Query::parse(s).is_some()));
+    let mut parsed = 0;
+    for i in 0..40_000 {
         let mut p: Vec<u8> = if i % 2 == 0 {
             (0..next() % 80).map(|_| next() as u8).collect()
         } else {
-            // A valid query with a few bytes flipped, then maybe cut short.
-            let mut p = valid.clone();
+            // A valid query with a few bytes flipped anywhere; half the time it keeps one question.
+            let mut p = seeds[next() as usize % seeds.len()].clone();
             for _ in 0..1 + next() % 4 {
                 let at = next() as usize % p.len();
                 p[at] = next() as u8;
+            }
+            if next() % 2 == 0 {
+                p[4..6].copy_from_slice(&[0, 1]);
             }
             p
         };
         if next() % 4 == 0 {
             p.truncate(next() as usize % (p.len() + 1));
         }
+        parsed += usize::from(wire::Query::parse(&p).is_some());
         match answer(&p, LOCAL, &z, i % 3 == 0) {
             Answer::Reply(r) => assert!(r.len() >= 12 && r[2] & 0x80 != 0),
             Answer::Forward | Answer::Drop => {}
         }
         let _ = servfail(&p);
+        // Upstream replies are hostile too.
+        let _ = wire::question(&p);
+        let _ = wire::for_upstream(&p, 1);
+        let _ = wire::truncate(p.clone(), 12 + next() as usize % 100);
     }
+    assert!(parsed > 2_000, "only {parsed} mutated packets got past the parser");
+}
+
+#[test]
+fn pointers_into_the_header_are_refused() {
+    let head = [0u8, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+    for target in [0u8, 4, 11] {
+        let p = [&head[..], &[1, b'a', 0xC0, target, 0, 1, 0, 1]].concat();
+        assert!(read_name(&p, 12).is_none(), "{target}");
+    }
+    let p = [&head[..], &[1, b'a', 0, 1, b'b', 0xC0, 12, 0, 1, 0, 1]].concat();
+    assert_eq!(read_name(&p, 15).unwrap().0, "b.a");
+}
+
+#[test]
+fn any_for_a_missing_name_is_nxdomain_and_other_classes_are_refused() {
+    let z = zones();
+    assert_eq!(ask(&z, "nope.kith", ANY).rcode(), 3);
+    assert_eq!(ask(&z, "wild.kith", ANY).rcode(), 3);
+    assert_eq!(ask(&z, "a.wild.kith", ANY).rcode(), 0);
+    for name in ["web.default.kith", "example.com"] {
+        let mut q = query(1, name, A, None);
+        let n = q.len();
+        q[n - 1] = 3; // class CH
+        let Answer::Reply(r) = answer(&q, LOCAL, &z, true) else {
+            panic!("{name} was not refused")
+        };
+        assert_eq!(decode(r).rcode(), 5);
+    }
+}
+
+#[test]
+fn a_name_and_type_hold_100_records_and_a_huge_reply_over_tcp_is_servfail() {
+    let mut z = zones();
+    let a = |i: u8| rec("many.kith", Rdata::A(Ipv4Addr::new(10, 2, 0, i)));
+    for i in 0..100 {
+        z.records.add(a(i)).unwrap();
+    }
+    assert!(z.records.add(a(100)).is_err());
+    z.records.add(rec("many.kith", Rdata::Txt("x".into()))).unwrap();
+    for _ in 0..100 {
+        z.records.add(rec("fat.kith", Rdata::Txt("x".repeat(4000)))).unwrap();
+    }
+    let Answer::Reply(r) = answer(&query(1, "fat.kith", TXT, None), LOCAL, &z, false) else {
+        panic!()
+    };
+    let r = decode(r);
+    assert_eq!((r.rcode(), r.an.len()), (2, 0));
+    // Over UDP it is only truncated.
+    let Answer::Reply(r) = answer(&query(1, "fat.kith", TXT, None), LOCAL, &z, true) else {
+        panic!()
+    };
+    assert!(decode(r).flags & 0x0200 != 0);
+}
+
+#[test]
+fn only_private_clients_may_forward_unless_a_list_says_otherwise() {
+    use crate::server::may_forward;
+    let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+    for yes in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
+        "169.254.1.1",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "fd12::9",
+        "::ffff:192.168.1.1",
+    ] {
+        assert!(may_forward(ip(yes), &[]), "{yes}");
+    }
+    for no in [
+        "8.8.8.8",
+        "172.32.0.1",
+        "100.64.0.1",
+        "192.169.0.1",
+        "2001:db8::1",
+        "fec0::1",
+        "::ffff:8.8.8.8",
+    ] {
+        assert!(!may_forward(ip(no), &[]), "{no}");
+    }
+    let nets = ["8.8.8.0/24".parse().unwrap()];
+    assert!(may_forward(ip("8.8.8.8"), &nets) && !may_forward(ip("10.0.0.1"), &nets));
+}
+
+#[test]
+fn the_per_client_counter_refuses_past_its_limit_and_frees_on_drop() {
+    let p = server::PerIp::default();
+    let other: IpAddr = "10.0.0.9".parse().unwrap();
+    let held: Vec<_> = (0..3).map(|_| p.take(LOCAL, 3).unwrap()).collect();
+    assert!(p.take(LOCAL, 3).is_none());
+    assert!(p.take(other, 3).is_some());
+    drop(held);
+    assert!(p.take(LOCAL, 3).is_some());
+}
+
+#[test]
+fn forwarded_queries_get_a_new_id_and_a_capped_edns_size() {
+    let q = query(0x1234, "example.com", A, Some(4096));
+    let out = wire::for_upstream(&q, 0xBEEF).unwrap();
+    assert_eq!(u16_at(&out, 0), 0xBEEF);
+    assert_eq!(u16_at(&out, out.len() - 8), 1232);
+    assert_eq!(out[2..out.len() - 8], q[2..q.len() - 8]);
+    // A smaller size, and no OPT at all, are left as they are.
+    let q = query(0x1234, "example.com", A, Some(600));
+    assert_eq!(wire::for_upstream(&q, 1).unwrap()[2..], q[2..]);
+    let q = query(0x1234, "example.com", A, None);
+    assert_eq!(wire::for_upstream(&q, 1).unwrap()[2..], q[2..]);
+}
+
+#[test]
+fn relayed_udp_replies_are_cut_to_the_client_limit_with_tc() {
+    let mut z = zones();
+    for i in 0..60u8 {
+        z.records
+            .add(rec("big.kith", Rdata::A(Ipv4Addr::new(10, 1, 1, i))))
+            .unwrap();
+    }
+    let Answer::Reply(big) = answer(&query(1, "big.kith", A, None), LOCAL, &z, false) else {
+        panic!()
+    };
+    assert!(big.len() > 512);
+    let cut = decode(wire::truncate(big.clone(), 512));
+    assert!(cut.raw.len() <= 512 && cut.flags & 0x0200 != 0 && cut.an.is_empty());
+    assert_eq!(read_name(&cut.raw, 12).unwrap().0, "big.kith");
+    // A reply that fits is untouched.
+    assert_eq!(wire::truncate(big.clone(), big.len()), big);
+    assert_eq!(
+        wire::Query::parse(&query(1, "a.kith", A, None)).unwrap().udp_limit(),
+        512
+    );
+    assert_eq!(
+        wire::Query::parse(&query(1, "a.kith", A, Some(100)))
+            .unwrap()
+            .udp_limit(),
+        512
+    );
+    assert_eq!(
+        wire::Query::parse(&query(1, "a.kith", A, Some(9000)))
+            .unwrap()
+            .udp_limit(),
+        1232
+    );
 }
 
 // --- servers ---
@@ -463,9 +635,14 @@ fn upstream_reply(q: &[u8], id: u16) -> Vec<u8> {
 
 /// A fake upstream on one port for UDP and TCP. Over UDP it first sends a reply with the wrong id.
 async fn fake_upstream() -> SocketAddr {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // TCP first on a free port, then UDP on the same number; try again if another test took it.
+    let (tcp, udp) = loop {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
+            break (tcp, udp);
+        }
+    };
     let addr = udp.local_addr().unwrap();
-    let tcp = TcpListener::bind(addr).await.unwrap();
     tokio::spawn(async move {
         let mut buf = [0; 512];
         loop {
@@ -491,18 +668,25 @@ async fn fake_upstream() -> SocketAddr {
     addr
 }
 
-/// An address nothing listens on (UDP and TCP both refuse at once).
-async fn dead_upstream() -> SocketAddr {
-    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    udp.local_addr().unwrap()
+/// An address nothing listens on: port 1 refuses UDP and TCP at once, and no test binds it.
+fn dead_upstream() -> SocketAddr {
+    "127.0.0.1:1".parse().unwrap()
 }
 
 async fn start(z: Zones, upstreams: Vec<SocketAddr>) -> (SocketAddr, SocketAddr, watch::Sender<Arc<Zones>>) {
+    start_for(z, upstreams, vec![]).await
+}
+
+async fn start_for(
+    z: Zones,
+    upstreams: Vec<SocketAddr>,
+    forwarders: Vec<Cidr>,
+) -> (SocketAddr, SocketAddr, watch::Sender<Arc<Zones>>) {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (u, t) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let (tx, rx) = watch::channel(Arc::new(z));
-    tokio::spawn(serve(udp, tcp, rx, upstreams));
+    tokio::spawn(serve(udp, tcp, rx, upstreams, forwarders));
     (u, t, tx)
 }
 
@@ -526,7 +710,7 @@ async fn tcp_ask(to: SocketAddr, q: &[u8]) -> Reply {
 async fn names_resolve_over_udp_and_tcp_and_unknown_names_go_upstream() {
     let up = fake_upstream().await;
     // The first upstream is dead: the second is tried.
-    let (u, t, _tx) = start(zones(), vec![dead_upstream().await, up]).await;
+    let (u, t, _tx) = start(zones(), vec![dead_upstream(), up]).await;
     let q = query(0x1234, "web.default.kith", A, None);
     for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
         assert_eq!((u16_at(&r.raw, 0), r.rcode(), r.flags & 0x0400 != 0), (0x1234, 0, true));
@@ -544,7 +728,7 @@ async fn names_resolve_over_udp_and_tcp_and_unknown_names_go_upstream() {
 
 #[tokio::test]
 async fn servfail_when_no_upstream_answers() {
-    let (u, t, _tx) = start(zones(), vec![dead_upstream().await]).await;
+    let (u, t, _tx) = start(zones(), vec![dead_upstream()]).await;
     let q = query(9, "example.com", A, None);
     for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
         assert_eq!((u16_at(&r.raw, 0), r.rcode(), r.an.len()), (9, 2, 0));
@@ -556,11 +740,101 @@ async fn servfail_when_no_upstream_answers() {
 
 #[tokio::test]
 async fn a_new_zones_value_is_served_at_once() {
-    let (u, _, tx) = start(Zones::default(), vec![dead_upstream().await]).await;
+    let (u, _, tx) = start(Zones::default(), vec![dead_upstream()]).await;
     let q = query(1, "web.default.kith", A, None);
     assert_eq!(udp_ask(u, &q).await.rcode(), 2);
     tx.send(Arc::new(zones())).unwrap();
     assert_eq!(udp_ask(u, &q).await.an.len(), 1);
+}
+
+#[tokio::test]
+async fn the_forwarder_uses_its_own_ids_and_ignores_replies_to_other_questions() {
+    let up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = up.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(vec![]));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (n, from) = up.recv_from(&mut buf).await.unwrap();
+            let id = u16_at(&buf, 0);
+            log.lock().unwrap().push(id);
+            // The right id with another question first, then the real reply.
+            let other = query(id, "evil.example", A, None);
+            up.send_to(&upstream_reply(&other, id), from).await.unwrap();
+            up.send_to(&upstream_reply(&buf[..n], id), from).await.unwrap();
+        }
+    });
+    let (u, _, _tx) = start(zones(), vec![addr]).await;
+    for _ in 0..4 {
+        let r = udp_ask(u, &query(0x1234, "ExAmple.com", A, None)).await;
+        assert_eq!((u16_at(&r.raw, 0), r.rcode(), r.an.len()), (0x1234, 0, 1));
+        assert_eq!(read_name(&r.raw, 12).unwrap().0, "ExAmple.com");
+    }
+    // Four random ids are not all the client's.
+    assert!(seen.lock().unwrap().iter().any(|&id| id != 0x1234));
+}
+
+#[tokio::test]
+async fn clients_outside_the_allowed_networks_are_refused_for_outside_names_only() {
+    let up = fake_upstream().await;
+    let nets = vec!["203.0.113.0/24".parse().unwrap()];
+    let (u, t, _tx) = start_for(zones(), vec![up], nets).await;
+    let q = query(5, "example.com", A, None);
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!((u16_at(&r.raw, 0), r.rcode(), r.an.len()), (5, 5, 0));
+    }
+    let q = query(6, "web.default.kith", A, None);
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!((r.rcode(), r.an.len()), (0, 1));
+    }
+}
+
+/// Whether the server closes `s` instead of answering.
+async fn closed(s: &mut TcpStream) -> bool {
+    let q = query(1, "web.default.kith", A, None);
+    let _ = s.write_all(&[&(q.len() as u16).to_be_bytes()[..], &q].concat()).await;
+    let mut buf = [0; 1];
+    matches!(
+        timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap(),
+        Ok(0) | Err(_)
+    )
+}
+
+#[tokio::test]
+async fn one_client_ip_gets_a_few_tcp_connections() {
+    let (_, t, _tx) = start(zones(), vec![]).await;
+    let mut held = vec![];
+    for _ in 0..server::TCP_PER_IP {
+        let mut s = TcpStream::connect(t).await.unwrap();
+        // Answered, so the server has counted it.
+        frame(&mut s, &query(1, "web.default.kith", A, None)).await;
+        held.push(s);
+    }
+    assert!(closed(&mut TcpStream::connect(t).await.unwrap()).await);
+    // Closing one makes room.
+    drop(held.pop());
+    let mut room = false;
+    for _ in 0..100 {
+        let mut s = TcpStream::connect(t).await.unwrap();
+        if !closed(&mut s).await {
+            room = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(room);
+}
+
+#[tokio::test]
+async fn a_tcp_connection_ends_after_its_query_limit() {
+    let (_, t, _tx) = start(zones(), vec![]).await;
+    let mut s = TcpStream::connect(t).await.unwrap();
+    for id in 0..server::TCP_QUERIES {
+        let r = decode(frame(&mut s, &query(id as u16, "web.default.kith", A, None)).await);
+        assert_eq!(usize::from(u16_at(&r.raw, 0)), id);
+    }
+    assert!(closed(&mut s).await);
 }
 
 #[tokio::test]

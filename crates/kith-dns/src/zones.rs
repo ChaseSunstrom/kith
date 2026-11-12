@@ -11,6 +11,8 @@ const TYPE_CNAME: u16 = 5;
 const MAX_CHAIN: usize = 8;
 /// The longest TXT we take; one record has to fit a 64 KiB message.
 const MAX_TXT: usize = 4000;
+/// The most records one name holds of one type.
+const MAX_RRSET: usize = 100;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rdata {
@@ -105,7 +107,15 @@ impl Records {
             return Err(format!("TXT record over {MAX_TXT} bytes"));
         }
         r.name = key(&r.name);
-        self.by_name.entry(r.name.clone()).or_default().push(r);
+        let set = self.by_name.entry(r.name.clone()).or_default();
+        if set.iter().filter(|x| x.data.rtype() == r.data.rtype()).count() >= MAX_RRSET {
+            return Err(format!(
+                "more than {MAX_RRSET} records for {} of type {}",
+                r.name,
+                r.data.rtype()
+            ));
+        }
+        set.push(r);
         Ok(())
     }
 
@@ -171,12 +181,12 @@ impl Records {
                     authority: vec![soa],
                 }
             };
-            if qtype == TYPE_ANY {
-                return Some(negative(0, answers));
-            }
             let Some(rs) = self.node(&name) else {
                 return Some(negative(NXDOMAIN, answers));
             };
+            if qtype == TYPE_ANY {
+                return Some(negative(0, answers));
+            }
             let hits: Vec<_> = rs.iter().filter(|r| r.data.rtype() == qtype).cloned().collect();
             if !hits.is_empty() {
                 answers.extend(hits);
