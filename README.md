@@ -183,7 +183,9 @@ kith node status                                   # who leads the store, who vo
   not and leaves the setting alone), and it sees what it passes on. kithd
   takes over a WireGuard interface of that name that is already there (its
   key and peers are replaced; one that is not WireGuard is refused) and
-  removes the interface when it stops.
+  removes the interface when it stops. `sh ci/mesh_rtt.sh` measures what the
+  mesh adds to a round trip between two namespaces on a veth (not a LAN): +0.08 to
+  +0.15 ms over the veth's 0.03 ms in five runs here, against the plan's 0.3 ms.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers
