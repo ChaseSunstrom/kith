@@ -473,7 +473,15 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
             None => format!("/v1/watch?wait=0{kind}"),
             Some(g) => format!("/v1/watch?after={g}&wait={wait}{kind}"),
         };
-        let now: Watched = request(kithd, "GET", &path, b"")?;
+        let now: Watched = match request(kithd, "GET", &path, b"") {
+            Ok(now) => now,
+            // A kithd too busy to answer in time has not changed anything we would miss: ask again.
+            Err(e) if after.is_some() && e.contains("has not answered") => continue,
+            Err(e) if after.is_some() && (e.contains("cannot reach kithd") || e.contains("sent no reply")) => {
+                return fail("kithd stopped");
+            }
+            Err(e) => return Err(e),
+        };
         let rows: std::collections::BTreeMap<String, [String; 5]> = now
             .resources
             .iter()
