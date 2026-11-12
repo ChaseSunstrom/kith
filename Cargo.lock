@@ -1106,6 +1106,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kith-dns"
+version = "0.0.1"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "kith-runtime"
 version = "0.0.1"
 dependencies = [

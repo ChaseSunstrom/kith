@@ -1,0 +1,12 @@
+[package]
+name = "kith-dns"
+description = "A small authoritative and forwarding DNS server: RFC 1035 wire format, zones, split-horizon views, UDP and TCP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util", "macros"] }
+
+[lints]
+workspace = true
