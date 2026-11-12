@@ -396,3 +396,67 @@ fn workloads_move_off_a_lost_node() {
     // (What gamma reads is its own copy, which catches up.)
     wait_for("gamma to have caught up", || status(&gamma) == status(&alpha));
 }
+
+/// Two nodes with the mesh on, in a network namespace of their own (this test runs itself
+/// again inside one, where it may make interfaces): each learns the other's key from the
+/// store, they shake hands, and a node that stops takes its interface with it.
+#[test]
+fn nodes_mesh() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
+        let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
+        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+            return eprintln!("skipped: no unprivileged user namespaces here (unshare -Urn)");
+        }
+        let me = std::env::current_exe().unwrap();
+        let again = "ip link set lo up && KITH_IN_NAMESPACE=1 exec \"$0\" --exact nodes_mesh --nocapture";
+        let status = unshare(&["sh", "-c", again, me.to_str().unwrap()]).unwrap();
+        assert!(status.success(), "the test failed inside its namespace");
+        return;
+    }
+    let ports = (free_port().to_string(), free_port().to_string());
+    let alpha = Node::start("mesh", "alpha", &["--mesh", &ports.0, "--mesh-interface", "kith-alpha"]);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let token = alpha.ok(&["node", "token"]);
+    let join = ["--join", &alpha.address(), "--token", token.trim()];
+    let mesh = ["--mesh", &ports.1, "--mesh-interface", "kith-beta"];
+    let mut beta = Node::start("mesh", "beta", &[join, mesh].concat());
+
+    let shook = |node: &Node, other: &str| {
+        let status = node.ok(&["node", "status"]);
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(&format!("mesh:      {other} at fd")));
+        line.is_some_and(|line| line.contains(", handshake ") && !line.contains("edge node"))
+    };
+    wait_for("the two to shake hands", || {
+        shook(&alpha, "beta") && shook(&beta, "alpha")
+    });
+    // Each Node says where it is on the mesh, and nothing of its private key.
+    let nodes = alpha.ok(&["get", "node", "-o", "json"]);
+    let nodes: serde_json::Value = serde_json::from_str(&nodes).unwrap();
+    let key = std::fs::read_to_string(beta.dir.join("state/pki/mesh.key")).unwrap();
+    assert!(key.len() == 64 && !nodes.to_string().contains(&key));
+    assert!(
+        nodes[1]["status"]["mesh"]["address"]
+            .as_str()
+            .unwrap()
+            .starts_with("fd")
+    );
+
+    // A node that stops takes its interface away; the other's stays.
+    let there = |name: &str| {
+        Command::new("ip")
+            .args(["link", "show", name])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(there("kith-beta") && there("kith-alpha"));
+    beta.stop();
+    assert!(!there("kith-beta") && there("kith-alpha"));
+}

@@ -1225,6 +1225,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kith-mesh"
+version = "0.0.1"
+dependencies = [
+ "netlink-packet-core",
+ "netlink-packet-generic",
+ "netlink-packet-route",
+ "netlink-packet-wireguard",
+ "netlink-sys",
+ "sha2",
+]
+
+[[package]]
 name = "kith-runtime"
 version = "0.0.1"
 dependencies = [
@@ -1277,6 +1289,7 @@ dependencies = [
  "clap",
  "kith-api",
  "kith-dns",
+ "kith-mesh",
  "kith-runtime",
  "kith-sched",
  "kith-store",
@@ -1466,6 +1479,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-generic"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f891b2e0054cac5a684a06628f59568f841c93da4e551239da6e518f539e775"
+dependencies = [
+ "netlink-packet-core",
+]
+
+[[package]]
 name = "netlink-packet-route"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1475,6 +1497,19 @@ dependencies = [
  "libc",
  "log",
  "netlink-packet-core",
+]
+
+[[package]]
+name = "netlink-packet-wireguard"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81b0e03593f61a7684836d73fdfef3dddae3f2dbc81896159a14bfafdb013567"
+dependencies = [
+ "bitflags",
+ "libc",
+ "log",
+ "netlink-packet-core",
+ "netlink-packet-generic",
 ]
 
 [[package]]

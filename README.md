@@ -159,8 +159,27 @@ kith node status                                   # who leads the store, who vo
   talking to before it sends the token's secret.
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
+- With `--mesh` (optionally `--mesh 51820`, the UDP port) a node joins the
+  cluster's WireGuard mesh: kithd makes the interface `kith0`
+  (`--mesh-interface NAME`) itself, with no `wg` or `ip`, which takes the
+  kernel's WireGuard and CAP_NET_ADMIN (without them kithd says so and runs
+  without a mesh). Every node gets a stable IPv6 address worked out from the
+  cluster's CA and its own name, `kith get node/NAME -o yaml` shows it and
+  the node's public key (`mesh`), and `kith node status` lists the peers and
+  when each last shook hands. The private key stays in `<state>/pki`.
+  Peers are reached at the address the cluster knows them by. One that has
+  not answered for three minutes is reached through a node with the `edge`
+  role instead, and directly again when it answers; the edge node's machine
+  has to forward (`net.ipv6.conf.all.forwarding=1`, kithd warns if it does
+  not and leaves the setting alone), and it sees what it passes on. kithd
+  takes over a WireGuard interface of that name that is already there (its
+  key and peers are replaced; one that is not WireGuard is refused) and
+  removes the interface when it stops.
 
-Not yet: replicas of one Workload on different nodes are all replaced at once
+Not yet: nothing uses the mesh so far (the nodes still talk to each other at
+their plain addresses), workloads have no addresses on it, and two nodes that
+are both behind NAT only reach each other through an edge node.
+Replicas of one Workload on different nodes are all replaced at once
 when it changes (on one node it is one at a time), a `NodeWorkload` is not run,
 and replicas on a node that is unreachable still count as ready until they are
 moved. A change whose answer was lost with the leader may or may not have
@@ -181,7 +200,8 @@ dig @192.168.1.10 nas.home.example   # 192.168.1.20
 kith get dnsrecord                   # each one says `served`, or why not
 ```
 
-- `<node>.node.kith` is the address each node of the cluster is reached at.
+- `<node>.node.kith` is the address each node of the cluster is reached at,
+  `<node>.mesh.kith` its address on the mesh (if it is on it).
   Names under `kith` are the cluster's own: a zone cannot take them.
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
@@ -219,8 +239,9 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-runtime` | Image pulls and containers |
 | `crates/kith-store` | The replicated store: Raft (`openraft`) with its log in `redb` |
 | `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
-| `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan (not wired in yet) |
-| `crates/kithd` | The daemon: API server, store replica, DNS and Workload controller |
+| `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan |
+| `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
+| `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 
 ## Development
 

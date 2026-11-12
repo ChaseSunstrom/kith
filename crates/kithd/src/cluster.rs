@@ -5,7 +5,7 @@
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket only
-//! GET  /v1/cluster                     -> {node, leader, voters, learners, applied}   local socket only
+//! GET  /v1/cluster                     -> {node, leader, voters, learners, applied, mesh}   local socket only
 //! ```
 //! Everything else on the TCP port is for members only: the resource API and Raft
 //! (`raft.rs`), which gives every node its own copy of the store.
@@ -267,6 +267,7 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         "learners": by_name(learners.collect()),
         "voters": by_name(voters),
         "applied": metrics.last_applied.map_or(0, |log| log.index),
+        "mesh": shared.mesh.lock().expect("nothing panics holding the mesh").clone(),
     }))
 }
 
@@ -356,6 +357,20 @@ async fn join(
     if taken {
         let why = format!(
             "a node named `{0}` is already in the cluster: pick another --name, or `kith delete node/{0}` first",
+            request.name
+        );
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
+    // Mesh addresses come from names: two names with the same ones cannot both be nodes.
+    let net = |name: &str| kith_mesh::node_net(crate::mesh::prefix(&cluster.me.ca), name);
+    let clash = {
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        let mut names = store.store.list(Some("Node")).map(|node| node.metadata.name.clone());
+        names.find(|name| net(name) == net(&request.name))
+    };
+    if let Some(other) = clash {
+        let why = format!(
+            "the name `{}` gets the mesh addresses node `{other}` has: pick another --name",
             request.name
         );
         return Err(refuse(StatusCode::CONFLICT, why));

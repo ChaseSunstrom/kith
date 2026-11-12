@@ -11,6 +11,7 @@ mod cluster;
 mod controller;
 mod dns;
 mod members;
+mod mesh;
 mod pki;
 mod probe;
 mod raft;
@@ -59,6 +60,12 @@ struct Args {
     /// Seconds a node may be out of contact before what it runs is started on other nodes
     #[arg(long, env = "KITH_LOST_AFTER", value_name = "SECONDS", default_value_t = 300)]
     lost_after: u64,
+    /// Join the cluster's WireGuard mesh, on this UDP port (needs CAP_NET_ADMIN)
+    #[arg(long, env = "KITH_MESH", value_name = "PORT", num_args = 0..=1, default_missing_value = "51820")]
+    mesh: Option<u16>,
+    /// The name of the mesh's network interface
+    #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
+    mesh_interface: String,
 }
 
 /// What the API handlers and the controller share.
@@ -78,6 +85,8 @@ pub struct Shared {
     pub cluster: Option<cluster::Cluster>,
     /// Which nodes were heard from, and when.
     pub members: members::Members,
+    /// The mesh's peers as last looked at, for `kith node status`; null without a mesh.
+    pub mesh: Mutex<serde_json::Value>,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
 }
@@ -201,6 +210,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         logs: state.join("logs"),
         generation,
         members: members::Members::new(name),
+        mesh: Mutex::default(),
         cluster,
         stop: watch::channel(false).0,
     });
@@ -371,7 +381,17 @@ fn run(args: Args) -> Result<(), String> {
                 dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
             }
         };
-        let (served, nodes, (), ()) = tokio::join!(server, nodes, work, names);
+        let mesh = async {
+            if let Some(port) = args.mesh {
+                let options = mesh::Options {
+                    interface: args.mesh_interface.clone(),
+                    port,
+                    key: state.join("pki").join("mesh.key"),
+                };
+                mesh::run(shared.clone(), options, stopping.clone()).await;
+            }
+        };
+        let (served, nodes, (), (), ()) = tokio::join!(server, nodes, work, names, mesh);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
