@@ -46,8 +46,9 @@ impl Daemon {
 
     fn spawn(dir: &Path, args: &[&str]) -> Child {
         Command::new(env!("CARGO_BIN_EXE_kithd"))
-            .arg("--state")
-            .arg(dir.join("state"))
+            // A relative state directory has to work too.
+            .current_dir(dir)
+            .args(["--state", "state"])
             .arg("--socket")
             .arg(dir.join("kithd.sock"))
             .args(args)

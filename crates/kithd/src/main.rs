@@ -97,6 +97,10 @@ fn run(args: Args) -> Result<(), String> {
     std::fs::create_dir_all(&state)
         .and_then(|()| std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)))
         .map_err(|e| fail("creating the state directory", &e))?;
+    // The runtime hands this path to containers, whose working directory is not ours.
+    let state = state
+        .canonicalize()
+        .map_err(|e| fail("resolving the state directory", &e))?;
     let store = FileStore::open_owned(&state.join("store.json")).map_err(|e| e.to_string())?;
     // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
     use std::os::unix::fs::FileTypeExt;
