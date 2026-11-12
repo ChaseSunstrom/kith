@@ -101,9 +101,34 @@ fn cordoned(n: &Node) -> bool {
     n.spec.unschedulable == Some(true)
 }
 
+/// A capacity that is NaN, infinite or negative counts as 0.
+fn sane(x: f64) -> f64 {
+    if x.is_finite() && x >= 0.0 { x } else { 0.0 }
+}
+
+/// Are both requests finite and not negative?
+fn valid(a: Amount) -> bool {
+    [a.cpu, a.memory].iter().all(|x| x.is_finite() && *x >= 0.0)
+}
+
+/// Does `want` fit in `free`? False when either is NaN: never write this as
+/// `!(want > free)`, which is true for NaN.
+fn fits(want: f64, free: f64) -> bool {
+    want <= free
+}
+
+/// What `n` has left after its reserved amount and what is `used`.
+fn free(n: &Node, used: Amount) -> Amount {
+    let reserved = n.spec.reserved.as_ref().map_or(Amount::default(), Amount::of_resources);
+    Amount {
+        cpu: sane(n.capacity.cpu) - reserved.cpu - used.cpu,
+        memory: sane(n.capacity.memory) - reserved.memory - used.memory,
+    }
+}
+
 /// Why `n` cannot take `r` given what is already `used` on it.
 fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
-    let reserved = n.spec.reserved.as_ref().map_or(Amount::default(), Amount::of_resources);
+    let left = free(n, used);
     let require = r.placement.as_ref().map(|p| &p.require);
     Some(if n.lost_for.is_some() {
         "not ready"
@@ -113,9 +138,9 @@ fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
         "tainted"
     } else if require.is_some_and(|q| !matches(&n.labels, q)) {
         "missing required labels"
-    } else if r.requests.cpu > n.capacity.cpu - reserved.cpu - used.cpu {
+    } else if !fits(r.requests.cpu, left.cpu) {
         "not enough cpu"
-    } else if r.requests.memory > n.capacity.memory - reserved.memory - used.memory {
+    } else if !fits(r.requests.memory, left.memory) {
         "not enough memory"
     } else {
         return None;
@@ -130,13 +155,32 @@ fn keeps(n: &Node, r: &Replica, grace: Duration) -> bool {
         && r.placement.as_ref().is_none_or(|p| matches(&n.labels, &p.require))
 }
 
+/// One item per name, sorted by name. Of several with the same name the one
+/// whose `Debug` text sorts first wins, so the choice never depends on input order.
+fn unique<T: std::fmt::Debug>(items: &[T], name: fn(&T) -> &str) -> Vec<&T> {
+    let mut v: Vec<(&str, String, &T)> = items.iter().map(|x| (name(x), format!("{x:?}"), x)).collect();
+    v.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    v.dedup_by_key(|x| x.0);
+    v.into_iter().map(|x| x.2).collect()
+}
+
 /// Places `replicas` on `nodes`. A node lost for up to `grace` keeps what is
 /// bound to it, but takes nothing new.
+///
+/// A replica that is already bound is kept on its node without checking
+/// capacity, cordon or `NoSchedule`. Only these move it: the node is lost past
+/// `grace`, has a `NoExecute` taint, no longer matches the replica's `require`
+/// labels, or is gone. So kept replicas can use more than a node has; new
+/// placements then fit around them, or are refused.
+///
+/// Two nodes with one name, or two replicas with one id, count as one: the
+/// copy whose `Debug` text sorts first is used and the others are ignored (a
+/// duplicate id appears once in the plan). A replica whose requests are NaN,
+/// infinite or negative is unschedulable, even when bound. A node capacity
+/// like that counts as 0.
 pub fn schedule(nodes: &[Node], replicas: &[Replica], grace: Duration) -> Plan {
-    let mut nodes: Vec<&Node> = nodes.iter().collect();
-    nodes.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut replicas: Vec<&Replica> = replicas.iter().collect();
-    replicas.sort_by(|a, b| a.id.cmp(&b.id));
+    let nodes = unique(nodes, |n| &n.name);
+    let replicas = unique(replicas, |r| &r.id);
 
     let mut plan = Plan::default();
 
@@ -146,10 +190,13 @@ pub fn schedule(nodes: &[Node], replicas: &[Replica], grace: Duration) -> Plan {
         spread: BTreeMap::new(),
     };
     for r in &replicas {
+        if !valid(r.requests) {
+            let why = "its requests are not finite, non-negative numbers";
+            plan.unschedulable.insert(r.id.clone(), why.into());
+            continue;
+        }
         let home = r.bound.as_deref().and_then(|b| nodes.iter().find(|n| n.name == b));
-        if let Some(n) = home.filter(|n| keeps(n, r, grace))
-            && !plan.bind.contains_key(&r.id)
-        {
+        if let Some(n) = home.filter(|n| keeps(n, r, grace)) {
             state.put(&mut plan, n, r);
         }
     }
@@ -215,8 +262,7 @@ impl<'a> State<'a> {
             .iter()
             .flat_map(|p| &p.prefer)
             .filter(|p| matches(&n.labels, &p.labels));
-        let reserved = n.spec.reserved.as_ref().map_or(0.0, |x| Amount::of_resources(x).memory);
-        let free = n.capacity.memory - reserved - self.used(n).memory;
+        let free = free(n, self.used(n)).memory;
         (
             weight.map(|p| u64::from(p.weight)).sum(),
             Reverse(tainted(n, &[TaintEffect::PreferNoSchedule])),
