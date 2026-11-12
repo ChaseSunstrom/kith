@@ -1,21 +1,54 @@
 //! Running one container from an [`Image`].
 
 use crate::{Context, Image, ImageStore, Result, err};
+use libcgroups::common::{CgroupManager, ControllerOpt};
 use libcontainer::container::Container;
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::syscall::syscall::SyscallType;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
-    LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResourcesBuilder, Mount, MountBuilder, RootBuilder, Spec,
+    LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, Mount, MountBuilder, RootBuilder, Spec,
 };
 use std::fs::{self, File};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+/// First argument of the helper an exec unit starts as (see [`exec_shim`]).
+const SHIM: &str = "--kith-exec-unit";
+const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Call this first thing in `main` of the program that owns a [`Runtime`].
+///
+/// [`Runtime::exec`] starts that program again as a helper: it waits until its cgroup
+/// and limits are in place, then becomes the unit's command. That way the command
+/// never runs a single instruction outside its cgroup, and no shell is needed.
+/// Returns at once when the process is not such a helper.
+pub fn exec_shim() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(SHIM)) {
+        return;
+    }
+    // One byte means go. End of input without it: the parent gave up or died.
+    let mut go = [0u8];
+    if !matches!(std::io::Read::read(&mut std::io::stdin(), &mut go), Ok(1)) {
+        std::process::exit(125);
+    }
+    let Some(command) = args.next() else {
+        std::process::exit(127);
+    };
+    let e = Command::new(&command).args(args).stdin(Stdio::null()).exec();
+    eprintln!("{}: {e}", command.to_string_lossy());
+    std::process::exit(127);
+}
 
 pub struct Runtime {
     root: PathBuf,
     cgroup_parent: String,
     pub images: ImageStore,
+    /// The program [`Runtime::exec`] starts as its helper: this one, which must call [`exec_shim`].
+    pub shim: PathBuf,
 }
 
 /// What to run. Everything is already resolved: the controller turns a
@@ -34,9 +67,12 @@ pub struct Unit {
     pub cpu_millis: Option<u64>,
 }
 
-/// A created container. Dropping it does not stop it; call [`Handle::delete`].
+/// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
 pub struct Handle {
-    container: Container,
+    /// `None` for an exec unit.
+    container: Option<Container>,
+    /// An exec unit's helper waits on this for the word to go.
+    go: Option<std::process::ChildStdin>,
     pid: Pid,
     /// Its exit status has been collected; the pid may belong to something else by now.
     reaped: bool,
@@ -60,6 +96,7 @@ impl Runtime {
             root,
             cgroup_parent: cgroup_parent()?,
             images,
+            shim: std::env::current_exe().ctx("finding this program")?,
         })
     }
 
@@ -76,8 +113,11 @@ impl Runtime {
             if let Ok(mut container) = Container::load(entry.path()) {
                 let _ = container.delete(true);
             }
+            // An exec unit has no container state, only its cgroup.
+            let name = entry.file_name();
+            let _ = manager(&format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy())).remove();
             let _ = fs::remove_dir_all(entry.path());
-            let _ = fs::remove_dir_all(self.root.join("containers").join(entry.file_name()));
+            let _ = fs::remove_dir_all(self.root.join("containers").join(name));
         }
         Ok(found)
     }
@@ -124,32 +164,134 @@ impl Runtime {
             let _ = fs::remove_dir_all(&bundle);
         }
         let (container, pid) = built?;
-        let mut handle = Handle {
-            container,
+        let handle = Handle {
+            container: Some(container),
+            go: None,
             pid,
             reaped: false,
             bundle,
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
         };
-        // A memory limit that swap could stretch is no limit. The OCI spec cannot say
-        // "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
+        handle.no_swap(unit, &what)
+    }
+
+    /// Create the exec unit `id`: `unit.command` as a plain process of this host (its
+    /// files, its network, our user) in its own cgroup with the unit's limits. Like a
+    /// container it does not run until [`Handle::start`].
+    pub fn exec(&self, id: &str, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
+        let what = format!("creating exec unit `{id}`");
+        ContainerBuilder::new(id.into(), SyscallType::Linux)
+            .validate_id()
+            .ctx(&what)?;
+        let Some((command, args)) = unit.command.split_first() else {
+            return err(format!("{what}: no command was given"));
+        };
+        let limits = resources(unit).ctx(&what)?;
+        let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
+        // Marks the id as taken, and tells `cleanup` about the cgroup after a crash.
+        let marker = self.root.join("state").join(id);
+        fs::create_dir(&marker).ctx(&what)?;
+        let child = Command::new(&self.shim)
+            .arg(SHIM)
+            .arg(command)
+            .args(args)
+            .args(&unit.args)
+            .env_clear()
+            .env("PATH", DEFAULT_PATH)
+            .envs(unit.env.iter().cloned())
+            .current_dir(unit.working_dir.as_deref().unwrap_or("/"))
+            .stdin(Stdio::piped())
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn();
+        let mut child = match child {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = fs::remove_dir(&marker);
+                return Err(e).ctx(&what);
+            }
+        };
+        // From here the handle owns the process: std's `Child` neither kills nor reaps on drop.
+        let handle = Handle {
+            container: None,
+            go: child.stdin.take(),
+            pid: Pid::from_raw(child.id() as i32),
+            reaped: false,
+            bundle: marker,
+            cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+        };
+        let manager = manager(&cgroup);
+        let options = ControllerOpt {
+            resources: &limits,
+            disable_oom_killer: false,
+            oom_score_adj: None,
+            freezer_state: None,
+        };
+        // Creates the cgroup with the helper in it; the helper has not run the command yet.
+        let confined = manager
+            .add_task(handle.pid)
+            .and_then(|()| manager.apply(&options))
+            .ctx(&what);
+        match confined {
+            Ok(()) => handle.no_swap(unit, &what),
+            Err(e) => {
+                let _ = handle.delete();
+                Err(e)
+            }
+        }
+    }
+}
+
+/// Collect the children nobody waits for. As a subreaper this process inherits
+/// whatever an exec unit forked and left behind; unreaped, each stays a zombie.
+///
+/// `mains` are the processes of the handles still held ([`Handle::pid`]): their
+/// exit status belongs to [`Handle::try_wait`], so call this after trying those.
+pub fn reap_orphans(mains: &[i32]) {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    // WNOWAIT looks without taking, so a handle's status is never taken from it.
+    let peek = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    while let Ok(Some(pid)) = waitid(Id::All, peek).map(|status| status.pid()) {
+        if mains.contains(&pid.as_raw()) {
+            break; // its handle collects it; whatever queues behind it waits for the next call
+        }
+        let _ = waitpid(pid, None);
+    }
+}
+
+fn manager(cgroup: &str) -> libcgroups::v2::manager::Manager {
+    libcgroups::v2::manager::Manager::new("/sys/fs/cgroup".into(), cgroup.into()).expect("joining two absolute paths")
+}
+
+impl Handle {
+    /// A memory limit that swap could stretch is no limit. The OCI resources cannot say
+    /// "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
+    fn no_swap(self, unit: &Unit, what: &str) -> Result<Handle> {
         if unit.memory_bytes.is_some() {
-            match fs::write(handle.cgroup.join("memory.swap.max"), "0") {
+            match fs::write(self.cgroup.join("memory.swap.max"), "0") {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    let _ = handle.container.delete(true);
-                    let _ = fs::remove_dir_all(&handle.bundle);
+                    let _ = self.delete();
                     return Err(e).ctx(format!("{what}: turning swap off"));
                 }
                 _ => {} // No such file: this kernel does no swap accounting.
             }
         }
-        Ok(handle)
+        Ok(self)
     }
-}
 
-impl Handle {
+    /// The process id of the container's init, or of the exec unit's command.
+    pub fn pid(&self) -> i32 {
+        self.pid.as_raw()
+    }
+
     pub fn start(&mut self) -> Result<()> {
-        self.container.start().ctx("starting the container")
+        match &mut self.container {
+            Some(container) => container.start().ctx("starting the container"),
+            None => {
+                let go = self.go.take().ok_or(crate::Error("it was started before".into()))?;
+                std::io::Write::write_all(&mut &go, b"1").ctx("starting the exec unit")
+            }
+        }
     }
 
     /// Block until the container's process exits. Returns its exit code, or
@@ -182,14 +324,28 @@ impl Handle {
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        self.container
-            .kill(nix::sys::signal::Signal::SIGKILL, true)
-            .ctx("killing the container")
+        match &mut self.container {
+            Some(container) => container
+                .kill(nix::sys::signal::Signal::SIGKILL, true)
+                .ctx("killing the container"),
+            // Everything in the cgroup, whatever the command has forked.
+            None => fs::write(self.cgroup.join("cgroup.kill"), "1").ctx("killing the exec unit"),
+        }
     }
 
     /// Kill it if it still runs, then remove its cgroup, state and bundle.
     pub fn delete(mut self) -> Result<()> {
-        let deleted = self.container.delete(true).ctx("deleting the container");
+        // A helper still waiting for the word to go ends when its input does.
+        drop(self.go.take());
+        let deleted = match &mut self.container {
+            Some(container) => container.delete(true).ctx("deleting the container"),
+            None => {
+                let cgroup = self.cgroup.strip_prefix("/sys/fs/cgroup").unwrap_or(&self.cgroup);
+                manager(&format!("/{}", cgroup.display()))
+                    .remove()
+                    .ctx("deleting the exec unit")
+            }
+        };
         // It was killed just now: collect it, or it stays a zombie for as long as we live.
         if deleted.is_ok() && !self.reaped {
             let _ = waitpid(self.pid, None);
@@ -257,7 +413,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
         env.push(format!("{name}={value}"));
     }
     if !env.iter().any(|e| e.starts_with("PATH=")) {
-        env.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+        env.push(format!("PATH={DEFAULT_PATH}"));
     }
     let mut process = spec.process().clone().unwrap_or_default();
     process.set_args(Some(args));
@@ -292,6 +448,15 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     }
     spec.set_mounts(Some(mounts));
 
+    let mut linux = spec.linux().clone().unwrap_or_default();
+    linux.set_cgroups_path(Some(cgroup.into()));
+    linux.set_resources(Some(resources(unit)?));
+    spec.set_linux(Some(linux));
+    Ok(spec)
+}
+
+/// The cgroup limits of a unit.
+fn resources(unit: &Unit) -> std::result::Result<LinuxResources, Box<dyn std::error::Error>> {
     // ponytail: one fixed ceiling against fork bombs; make it a Unit field when a workload needs more.
     let pids = oci_spec::runtime::LinuxPidsBuilder::default().limit(MAX_PIDS).build()?;
     let mut resources = LinuxResourcesBuilder::default().pids(pids);
@@ -309,11 +474,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
         let quota = i64::try_from(millis.saturating_mul(100))?;
         resources = resources.cpu(LinuxCpuBuilder::default().quota(quota).period(100_000u64).build()?);
     }
-    let mut linux = spec.linux().clone().unwrap_or_default();
-    linux.set_cgroups_path(Some(cgroup.into()));
-    linux.set_resources(Some(resources.build()?));
-    spec.set_linux(Some(linux));
-    Ok(spec)
+    Ok(resources.build()?)
 }
 
 #[cfg(test)]

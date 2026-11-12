@@ -24,6 +24,9 @@ struct Args {
     /// Socket to serve the API on [default: $XDG_RUNTIME_DIR/kith/kithd.sock]
     #[arg(long, env = "KITH_SOCKET", value_name = "PATH")]
     socket: Option<PathBuf>,
+    /// Bytes of output kept per unit and stream before the file is moved aside (one old copy is kept)
+    #[arg(long, env = "KITH_LOG_CAP", value_name = "BYTES", default_value_t = 10 << 20)]
+    log_cap: u64,
 }
 
 /// What the API handlers and the controller share.
@@ -31,9 +34,13 @@ pub struct Shared {
     pub store: Mutex<FileStore>,
     /// Poked after every change to the store, so the controller reconciles at once.
     pub changed: Notify,
+    /// Where the output of every unit goes: `<unit id>.out` and `.err`.
+    pub logs: PathBuf,
 }
 
 fn main() -> ExitCode {
+    // Started again by the runtime as an exec unit's helper? Then this never returns.
+    kith_runtime::exec_shim();
     match run(Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -89,6 +96,7 @@ fn run(args: Args) -> Result<(), String> {
     let shared = Arc::new(Shared {
         store: Mutex::new(store),
         changed: Notify::new(),
+        logs: state.join("logs"),
     });
 
     // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
@@ -117,10 +125,7 @@ fn run(args: Args) -> Result<(), String> {
         let mut server_stop = stopping.clone();
         let server = axum::serve(listener, api::router(shared.clone()))
             .with_graceful_shutdown(async move { drop(server_stop.changed().await) });
-        let (served, ()) = tokio::join!(
-            server,
-            controller::run(shared.clone(), runtime, state.join("logs"), stopping)
-        );
+        let (served, ()) = tokio::join!(server, controller::run(shared.clone(), runtime, args.log_cap, stopping));
         served.map_err(|e| fail("serving", &e))
     });
     let _ = std::fs::remove_file(&socket);

@@ -1,36 +1,61 @@
-//! The Workload controller: makes the containers on this node match the
-//! `Workload`s in the store, restarts them when they exit, and reports what it
-//! sees in each Workload's status.
+//! The controller: makes the containers and exec units on this node match the
+//! `Workload`s and `Job`s in the store, restarts them when they exit, and reports
+//! what it sees in each one's status.
 //!
-// ponytail: one node and containers only. Not handled yet, each said so in the
-// status where it matters: `exec` units, volumes, ports (containers share the
-// host's network), probes (ready means running), rolling updates (a changed
-// Workload is stopped, then started) and restarting on a changed Secret or
-// ConfigMap. Images are pulled one at a time.
+// ponytail: one node. Not handled yet, each said so in the status where it
+// matters: volumes, ports (units share the host's network), probes (ready means
+// running), rolling updates (a changed Workload is stopped, then started) and
+// restarting on a changed Secret or ConfigMap. Images are pulled one at a time.
+// A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
 use crate::Shared;
-use kith_api::kinds::{ConfigMapSpec, Container, EnvVar, PullPolicy, RestartPolicy, SecretSpec, WorkloadSpec};
+use kith_api::Resource;
+use kith_api::kinds::{
+    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, PullPolicy, Resources, RestartPolicy, SecretSpec, Template,
+    WorkloadSpec,
+};
+use kith_api::store::Error;
 use kith_runtime::{Handle, Runtime, Unit};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 
-/// How long a container must have run for its next restart to be immediate again.
+/// How long a unit must have run for its next restart to be immediate again.
 const SETTLED: Duration = Duration::from_secs(60);
 /// With nothing else to wake it, the controller still looks around this often.
 const TICK: Duration = Duration::from_secs(10);
+/// Failed runs a Job shrugs off when it does not say (`retries`).
+const JOB_RETRIES: u32 = 3;
 
-/// One container of one replica of one Workload.
+/// What a slot runs.
+// Most slots are containers, so boxing the big variant would save nothing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, PartialEq)]
+enum Run {
+    Container(Container),
+    Exec(ExecUnit),
+}
+
+impl Run {
+    fn name(&self) -> &str {
+        match self {
+            Run::Container(c) => &c.name,
+            Run::Exec(e) => &e.name,
+        }
+    }
+}
+
+/// One unit of one replica of one Workload, or of one run of a Job.
 struct Slot {
-    /// Store key of the Workload.
-    workload: String,
+    /// Store key of the Workload or Job.
+    owner: String,
     namespace: String,
     replica: u32,
-    container: Container,
+    run: Run,
     policy: RestartPolicy,
     handle: Option<Handle>,
     state: &'static str,
@@ -44,16 +69,41 @@ struct Slot {
     start_at: Option<Instant>,
 }
 
+/// How far one Job has come. Kept in memory: a kithd that restarts runs an
+/// unfinished Job again from the start; a finished one is recognised by its status.
+struct Progress {
+    /// The Job revision this is the progress of: a changed Job runs again.
+    revision: Option<u64>,
+    succeeded: BTreeSet<u32>,
+    failed: u32,
+    began: Instant,
+    /// The next run after a failure waits until then.
+    retry_at: Instant,
+    /// `succeeded` or `failed`, once it is over.
+    outcome: Option<&'static str>,
+    message: Option<String>,
+}
+
+struct Controller {
+    runtime: Runtime,
+    logs: PathBuf,
+    log_cap: u64,
+    slots: BTreeMap<String, Slot>,
+    jobs: BTreeMap<String, Progress>,
+    /// Log file prefixes of the Workloads and Jobs seen last pass; `None` before the first.
+    owners: Option<BTreeSet<String>>,
+}
+
 pub async fn run(
     shared: std::sync::Arc<Shared>,
     runtime: kith_runtime::Result<Runtime>,
-    logs: PathBuf,
+    log_cap: u64,
     mut stopping: watch::Receiver<bool>,
 ) {
     let runtime = match runtime.and_then(|rt| rt.cleanup().map(|old| (rt, old))) {
         Ok((runtime, old)) => {
             if old > 0 {
-                eprintln!("kithd: removed {old} container(s) left by an earlier run");
+                eprintln!("kithd: removed {old} unit(s) left by an earlier run");
             }
             runtime
         }
@@ -64,13 +114,20 @@ pub async fn run(
             return;
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&logs) {
-        eprintln!("kithd: creating {}: {e}", logs.display());
+    if let Err(e) = std::fs::create_dir_all(&shared.logs) {
+        eprintln!("kithd: creating {}: {e}", shared.logs.display());
     }
     let mut exited = signal(SignalKind::child()).expect("installing a signal handler");
-    let mut slots: BTreeMap<String, Slot> = BTreeMap::new();
+    let mut controller = Controller {
+        runtime,
+        logs: shared.logs.clone(),
+        log_cap,
+        slots: BTreeMap::new(),
+        jobs: BTreeMap::new(),
+        owners: None,
+    };
     loop {
-        let wake = reconcile(&shared, &runtime, &logs, &mut slots, &stopping).await;
+        let wake = controller.reconcile(&shared, &stopping).await;
         tokio::select! {
             _ = shared.changed.notified() => {}
             _ = exited.recv() => {}
@@ -78,7 +135,7 @@ pub async fn run(
             _ = stopping.changed() => break,
         }
     }
-    for (id, slot) in slots {
+    for (id, slot) in controller.slots {
         stop(&id, slot.handle);
     }
 }
@@ -94,66 +151,138 @@ fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(6)).min(Duration::from_secs(60))
 }
 
-/// Ids become file and cgroup names. `_` cannot appear in a resource name, so it separates the parts.
-fn container_id(namespace: &str, workload: &str, replica: u32, container: &str) -> Result<String, String> {
-    let ok = !container.is_empty()
-        && container
+/// What every unit id (so every log file and cgroup) of one Workload or Job starts
+/// with. `_` cannot appear in a resource name, so it separates the parts.
+fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
+    let kind = if kind == "Job" { "j" } else { "w" };
+    format!("{kind}_{namespace}_{name}_")
+}
+
+fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
+    let ok = !unit.is_empty()
+        && unit
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
     match ok {
-        true => Ok(format!("{namespace}_{workload}_{replica}_{container}")),
-        false => Err(format!(
-            "container name `{container}`: use letters, digits, `-` and `.`"
-        )),
+        true => Ok(format!("{prefix}{replica}_{unit}")),
+        false => Err(format!("unit name `{unit}`: use letters, digits, `-` and `.`")),
     }
 }
 
-/// One pass: returns how long the controller may sleep if nothing happens.
-async fn reconcile(
-    shared: &Shared,
-    runtime: &Runtime,
-    logs: &Path,
-    slots: &mut BTreeMap<String, Slot>,
-    stopping: &watch::Receiver<bool>,
-) -> Duration {
-    // 1. What should run, from a snapshot of the store.
-    let workloads: Vec<_> = {
-        let file_store = shared.store.lock().expect("a handler panicked holding the store");
-        file_store.store.list(Some("Workload")).cloned().collect()
+/// The template of a Workload or Job, and how many replicas (or runs) it has.
+fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
+    let spec = resource.spec.clone();
+    match resource.kind.as_str() {
+        "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),
+        "Job" => serde_json::from_value::<JobSpec>(spec).map(|s| (s.template, s.completions.unwrap_or(1))),
+        kind => return Err(format!("a {kind} runs nothing")),
+    }
+    .map_err(|e| format!("cannot read this {}: {e}", resource.kind))
+}
+
+/// For the logs API: the id whose log files hold the output of one unit of
+/// `resource`, and whether more output may still come. The id is built from the
+/// stored resource, never from what the caller sent.
+pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(String, bool), Error> {
+    let (template, replicas) = template_of(resource).map_err(Error::Invalid)?;
+    let mut names = template.containers.iter().map(|c| &c.name);
+    let mut names = names.by_ref().chain(template.exec.iter().map(|e| &e.name));
+    let name = match unit {
+        Some(unit) => names.find(|name| *name == unit),
+        None => names.next(),
     };
-    let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
-    // Per Workload key: things to say in its status that belong to no container.
-    let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for resource in workloads {
-        let key = resource.key();
-        let note = notes.entry(key.clone()).or_default();
-        let spec: WorkloadSpec = match serde_json::from_value(resource.spec) {
-            Ok(spec) => spec,
-            Err(e) => {
-                note.push(format!("cannot read this Workload: {e}"));
-                continue;
-            }
+    let key = resource.key();
+    let name = name.ok_or_else(|| Error::NotFound(format!("{key} has no unit `{}`", unit.unwrap_or("?"))))?;
+    if replica >= replicas {
+        return Err(Error::NotFound(format!("{key} has no replica {replica}")));
+    }
+    let namespace = resource.metadata.namespace.as_deref().unwrap_or_default();
+    let prefix = id_prefix(&resource.kind, namespace, &resource.metadata.name);
+    let id = unit_id(&prefix, replica, name).map_err(Error::Invalid)?;
+    let status = resource.status.as_ref();
+    let more = match status.and_then(|s| s["state"].as_str()) {
+        // A Job: until it is over, another run may write more.
+        Some(state) => state == "running",
+        None => status.is_none_or(|s| {
+            let mut units = s["containers"].as_array().into_iter().flatten();
+            units.any(|u| u["name"] == **name && u["replica"] == replica && u["state"] != "exited")
+        }),
+    };
+    Ok((id, more))
+}
+
+impl Controller {
+    /// One pass: returns how long the controller may sleep if nothing happens.
+    async fn reconcile(&mut self, shared: &Shared, stopping: &watch::Receiver<bool>) -> Duration {
+        // 1. What should run, from a snapshot of the store.
+        let resources: Vec<Resource> = {
+            let file_store = shared.store.lock().expect("a handler panicked holding the store");
+            let store = &file_store.store;
+            store
+                .list(Some("Workload"))
+                .chain(store.list(Some("Job")))
+                .cloned()
+                .collect()
         };
-        let meta = resource.metadata;
-        if !spec.template.exec.is_empty() {
-            note.push("exec units are not run yet".into());
-        }
-        let namespace = meta.namespace.unwrap_or_default();
-        for replica in 0..spec.replicas.unwrap_or(1) {
-            for container in &spec.template.containers {
-                if !container.volume_mounts.is_empty() && replica == 0 {
-                    note.push(format!("{}: volumes are not mounted yet", container.name));
+        let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
+        // Per Workload or Job key: things to say in its status that belong to no unit.
+        let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut owners = BTreeSet::new();
+        self.jobs.retain(|key, _| resources.iter().any(|r| r.key() == *key));
+        for resource in &resources {
+            let key = resource.key();
+            let note = notes.entry(key.clone()).or_default();
+            let namespace = resource.metadata.namespace.clone().unwrap_or_default();
+            let prefix = id_prefix(&resource.kind, &namespace, &resource.metadata.name);
+            owners.insert(prefix.clone());
+            let (template, replicas) = match template_of(resource) {
+                Ok(found) => found,
+                Err(e) => {
+                    note.push(e);
+                    continue;
                 }
-                match container_id(&namespace, &meta.name, replica, &container.name) {
-                    Err(e) => note.push(e),
-                    Ok(id) => drop(wanted.insert(
-                        id,
-                        Slot {
-                            workload: key.clone(),
+            };
+            // Which replicas (or runs of a Job) should exist, started no sooner than when, restarted how.
+            let (replicas, not_before, policy) = match resource.kind.as_str() {
+                "Job" => {
+                    let units = template.containers.len() + template.exec.len();
+                    let (runs, not_before) = self.job_runs(&key, resource, replicas, units);
+                    // A Job retries whole runs, so a unit that exits stays exited.
+                    (runs, not_before, RestartPolicy::Never)
+                }
+                _ => (
+                    (0..replicas).collect(),
+                    Instant::now(),
+                    template.restart_policy.clone().unwrap_or(RestartPolicy::Always),
+                ),
+            };
+            let containers = template.containers.iter().cloned().map(Run::Container);
+            let units: Vec<Run> = containers.chain(template.exec.iter().cloned().map(Run::Exec)).collect();
+            if units.is_empty() {
+                note.push("the template has nothing to run".into());
+            }
+            for (i, unit) in units.iter().enumerate() {
+                if units[..i].iter().any(|earlier| earlier.name() == unit.name()) {
+                    note.push(format!(
+                        "{}: two units have this name; only the first runs",
+                        unit.name()
+                    ));
+                }
+                if matches!(unit, Run::Container(c) if !c.volume_mounts.is_empty()) {
+                    note.push(format!("{}: volumes are not mounted yet", unit.name()));
+                }
+            }
+            for replica in replicas {
+                for unit in &units {
+                    match unit_id(&prefix, replica, unit.name()) {
+                        Err(e) if replica == 0 => note.push(e),
+                        Err(_) => {}
+                        Ok(id) => drop(wanted.entry(id).or_insert(Slot {
+                            owner: key.clone(),
                             namespace: namespace.clone(),
                             replica,
-                            container: container.clone(),
-                            policy: spec.template.restart_policy.clone().unwrap_or(RestartPolicy::Always),
+                            run: unit.clone(),
+                            policy: policy.clone(),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -161,128 +290,296 @@ async fn reconcile(
                             exit_code: None,
                             message: None,
                             started: Instant::now(),
-                            start_at: Some(Instant::now()),
-                        },
-                    )),
+                            start_at: Some(not_before),
+                        })),
+                    }
                 }
             }
         }
-    }
 
-    // 2. Stop what is no longer wanted, or whose own definition changed. Scaling or
-    // relabelling a Workload leaves its running containers alone.
-    let stale: Vec<String> = slots
-        .iter()
-        .filter(|(id, slot)| {
-            wanted
-                .get(*id)
-                .is_none_or(|w| w.container != slot.container || w.policy != slot.policy)
-        })
-        .map(|(id, _)| id.clone())
-        .collect();
-    for id in stale {
-        stop(&id, slots.remove(&id).and_then(|slot| slot.handle));
-    }
-    for (id, slot) in wanted {
-        slots.entry(id).or_insert(slot);
-    }
-
-    // 3. Notice exits, then start whatever is due.
-    for (id, slot) in slots.iter_mut() {
-        if *stopping.borrow() {
-            return TICK; // the caller stops everything
-        }
-        if let Some(handle) = &mut slot.handle {
-            let code = match handle.try_wait() {
-                Ok(None) => continue,
-                Ok(Some(code)) => code,
-                Err(e) => {
-                    slot.message = Some(e.to_string());
-                    -1
-                }
-            };
-            stop(id, slot.handle.take());
-            slot.exit_code = Some(code);
-            slot.failures = if slot.started.elapsed() >= SETTLED {
-                0
-            } else {
-                slot.failures + 1
-            };
-            let again = match slot.policy {
-                RestartPolicy::Always => true,
-                RestartPolicy::OnFailure => code != 0,
-                RestartPolicy::Never => false,
-            };
-            slot.state = if again { "waiting" } else { "exited" };
-            slot.start_at = again.then(|| Instant::now() + backoff(slot.failures.saturating_sub(1)));
-            if again {
-                slot.restarts += 1;
-            }
-        }
-        if slot.start_at.is_some_and(|at| at <= Instant::now()) {
-            let mut stop_now = stopping.clone();
-            let started = tokio::select! {
-                started = start(shared, runtime, logs, id, slot) => started,
-                // A pull can take minutes; shutting down does not wait for it.
-                _ = stop_now.changed() => return TICK,
-            };
-            // A cached image starts without ever waiting; let the API answer between starts.
-            tokio::task::yield_now().await;
-            match started {
-                Ok(handle) => {
-                    slot.handle = Some(handle);
-                    (slot.state, slot.message, slot.start_at, slot.started) = ("running", None, None, Instant::now());
-                }
-                Err(message) => {
-                    (slot.state, slot.message) = ("failed", Some(message));
-                    slot.start_at = Some(Instant::now() + backoff(slot.failures));
-                    slot.failures += 1;
-                }
-            }
-        }
-    }
-
-    // 4. Report.
-    let mut file_store = shared.store.lock().expect("a handler panicked holding the store");
-    let mut dirty = false;
-    for (key, notes) in notes {
-        let mine: Vec<&Slot> = slots.values().filter(|slot| slot.workload == key).collect();
-        let replicas = mine.iter().map(|slot| slot.replica + 1).max().unwrap_or(0);
-        let ready = (0..replicas)
-            .filter(|r| mine.iter().filter(|s| s.replica == *r).all(|s| s.state == "running"))
-            .count();
-        let containers: Vec<Value> = mine
+        // 2. Stop what is no longer wanted, or whose own definition changed. Scaling or
+        // relabelling a Workload leaves its running units alone.
+        let stale: Vec<String> = self
+            .slots
             .iter()
-            .map(|slot| {
-                let mut c = json!({ "name": slot.container.name, "replica": slot.replica, "state": slot.state, "restarts": slot.restarts });
-                if let Some(code) = slot.exit_code {
-                    c["exitCode"] = json!(code);
-                }
-                if let Some(message) = &slot.message {
-                    c["message"] = json!(message);
-                }
-                c
+            .filter(|(id, slot)| {
+                wanted
+                    .get(*id)
+                    .is_none_or(|w| w.run != slot.run || w.policy != slot.policy)
             })
+            .map(|(id, _)| id.clone())
             .collect();
-        let mut status = json!({ "replicas": replicas, "ready": ready, "containers": containers });
-        if !notes.is_empty() {
-            status["notes"] = json!(notes);
+        for id in stale {
+            stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
         }
-        // The Workload may have been deleted while this pass ran; the next pass stops its containers.
-        if file_store
-            .store
-            .get(&key)
-            .is_some_and(|live| live.status.as_ref() != Some(&status))
-        {
-            dirty |= file_store.store.set_status(&key, Some(status)).is_ok();
+        for (id, slot) in wanted {
+            self.slots.entry(id).or_insert(slot);
         }
-    }
-    if dirty && let Err(e) = file_store.save() {
-        eprintln!("kithd: saving status: {e}");
+        self.tend_logs(owners);
+
+        // 3. Notice exits, then start whatever is due.
+        // A Job's unit that ended is accounted for in step 1: go round again at once.
+        let mut job_moved = false;
+        for (id, slot) in self.slots.iter_mut() {
+            if *stopping.borrow() {
+                return TICK; // the caller stops everything
+            }
+            if let Some(handle) = &mut slot.handle {
+                let code = match handle.try_wait() {
+                    Ok(None) => continue,
+                    Ok(Some(code)) => code,
+                    Err(e) => {
+                        slot.message = Some(e.to_string());
+                        -1
+                    }
+                };
+                stop(id, slot.handle.take());
+                slot.exit_code = Some(code);
+                slot.failures = if slot.started.elapsed() >= SETTLED {
+                    0
+                } else {
+                    slot.failures + 1
+                };
+                let again = match slot.policy {
+                    RestartPolicy::Always => true,
+                    RestartPolicy::OnFailure => code != 0,
+                    RestartPolicy::Never => false,
+                };
+                slot.state = if again { "waiting" } else { "exited" };
+                slot.start_at = again.then(|| Instant::now() + backoff(slot.failures.saturating_sub(1)));
+                if again {
+                    slot.restarts += 1;
+                }
+                job_moved |= self.jobs.contains_key(&slot.owner);
+            }
+            if slot.start_at.is_some_and(|at| at <= Instant::now()) {
+                let mut stop_now = stopping.clone();
+                let started = tokio::select! {
+                    started = start(shared, &self.runtime, &self.logs, id, slot) => started,
+                    // A pull can take minutes; shutting down does not wait for it.
+                    _ = stop_now.changed() => return TICK,
+                };
+                // A cached image starts without ever waiting; let the API answer between starts.
+                tokio::task::yield_now().await;
+                match started {
+                    Ok(handle) => {
+                        slot.handle = Some(handle);
+                        (slot.state, slot.message, slot.start_at, slot.started) =
+                            ("running", None, None, Instant::now());
+                    }
+                    Err(message) => {
+                        (slot.state, slot.message) = ("failed", Some(message));
+                        slot.start_at = Some(Instant::now() + backoff(slot.failures));
+                        slot.failures += 1;
+                        job_moved |= self.jobs.contains_key(&slot.owner);
+                    }
+                }
+            }
+        }
+
+        // What exec units forked and left behind is ours to collect, now that every unit's own exit has been.
+        let mains: Vec<i32> = self
+            .slots
+            .values()
+            .filter_map(|s| s.handle.as_ref())
+            .map(Handle::pid)
+            .collect();
+        kith_runtime::reap_orphans(&mains);
+
+        // 4. Report.
+        let mut file_store = shared.store.lock().expect("a handler panicked holding the store");
+        let mut dirty = false;
+        for (key, notes) in notes {
+            let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).collect();
+            let units: Vec<Value> = mine
+                .iter()
+                .map(|slot| {
+                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "restarts": slot.restarts });
+                    if let Some(code) = slot.exit_code {
+                        c["exitCode"] = json!(code);
+                    }
+                    if let Some(message) = &slot.message {
+                        c["message"] = json!(message);
+                    }
+                    c
+                })
+                .collect();
+            let mut status = match self.jobs.get(&key) {
+                Some(job) => {
+                    let mut status = json!({
+                        "state": job.outcome.unwrap_or("running"),
+                        "succeeded": job.succeeded.len(),
+                        "failed": job.failed,
+                        "observedRevision": job.revision,
+                        "containers": units,
+                    });
+                    if let Some(message) = &job.message {
+                        status["message"] = json!(message);
+                    }
+                    status
+                }
+                None => {
+                    let replicas = mine.iter().map(|slot| slot.replica + 1).max().unwrap_or(0);
+                    let ready = (0..replicas)
+                        .filter(|r| mine.iter().filter(|s| s.replica == *r).all(|s| s.state == "running"))
+                        .count();
+                    json!({ "replicas": replicas, "ready": ready, "containers": units })
+                }
+            };
+            if !notes.is_empty() {
+                status["notes"] = json!(notes);
+            }
+            // It may have been deleted while this pass ran; the next pass stops its units.
+            if file_store
+                .store
+                .get(&key)
+                .is_some_and(|live| live.status.as_ref() != Some(&status))
+            {
+                dirty |= file_store.store.set_status(&key, Some(status)).is_ok();
+            }
+        }
+        if dirty && let Err(e) = file_store.save() {
+            eprintln!("kithd: saving status: {e}");
+        }
+
+        if job_moved {
+            return Duration::ZERO;
+        }
+        let next = self.slots.values().filter_map(|slot| slot.start_at).min();
+        next.map_or(TICK, |at| at.saturating_duration_since(Instant::now()).min(TICK))
     }
 
-    let next = slots.values().filter_map(|slot| slot.start_at).min();
-    next.map_or(TICK, |at| at.saturating_duration_since(Instant::now()).min(TICK))
+    /// Move one Job along: account for the runs that ended since the last pass, and
+    /// say which runs should exist now and from when. A run is one replica of the
+    /// template; it succeeds when every unit exits 0 and fails as soon as one does not
+    /// (or cannot start). `retries` failed runs are forgiven; one more fails the Job.
+    fn job_runs(&mut self, key: &str, resource: &Resource, completions: u32, units: usize) -> (Vec<u32>, Instant) {
+        let spec: JobSpec = serde_json::from_value(resource.spec.clone()).expect("read once already");
+        let revision = resource.metadata.revision;
+        let job = self.jobs.entry(key.into()).or_insert_with(|| {
+            // After a restart: a Job that had finished stays finished.
+            let status = resource.status.clone().unwrap_or_default();
+            let outcome = match status["state"].as_str() {
+                _ if status["observedRevision"].as_u64() != revision => None,
+                Some("succeeded") => Some("succeeded"),
+                Some("failed") => Some("failed"),
+                _ => None,
+            };
+            let done = outcome.map_or(0, |_| status["succeeded"].as_u64().unwrap_or(0) as u32);
+            Progress {
+                revision,
+                succeeded: (0..done).collect(),
+                failed: outcome.map_or(0, |_| status["failed"].as_u64().unwrap_or(0) as u32),
+                began: Instant::now(),
+                retry_at: Instant::now(),
+                outcome,
+                message: status["message"]
+                    .as_str()
+                    .filter(|_| outcome.is_some())
+                    .map(String::from),
+            }
+        });
+        let mine = |slots: &BTreeMap<String, Slot>, run: Option<u32>| -> Vec<String> {
+            let of_run = |slot: &&Slot| slot.owner == key && run.is_none_or(|run| slot.replica == run);
+            let ids = slots.iter().filter(|(_, slot)| of_run(slot)).map(|(id, _)| id.clone());
+            ids.collect()
+        };
+        if job.revision != revision {
+            // Applied again with changes: it runs again.
+            for id in mine(&self.slots, None) {
+                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+            }
+            *job = Progress {
+                revision,
+                succeeded: BTreeSet::new(),
+                failed: 0,
+                began: Instant::now(),
+                retry_at: Instant::now(),
+                outcome: None,
+                message: None,
+            };
+        }
+        if job.outcome.is_some() {
+            return (Vec::new(), Instant::now());
+        }
+        let runs: BTreeSet<u32> = self
+            .slots
+            .values()
+            .filter(|s| s.owner == key)
+            .map(|s| s.replica)
+            .collect();
+        for run in runs {
+            let ids = mine(&self.slots, Some(run));
+            let slots = || ids.iter().map(|id| &self.slots[id]);
+            let failed = slots().find(|s| s.state == "failed" || (s.state == "exited" && s.exit_code != Some(0)));
+            if let Some(culprit) = failed {
+                job.failed += 1;
+                job.retry_at = Instant::now() + backoff(job.failed - 1);
+                let why = culprit.message.clone();
+                let why = why.unwrap_or_else(|| format!("exited with code {}", culprit.exit_code.unwrap_or(-1)));
+                job.message = Some(format!("run {run}, {}: {why}", culprit.run.name()));
+            } else if ids.len() == units && slots().all(|s| s.state == "exited") {
+                job.succeeded.insert(run);
+            } else {
+                continue; // still going
+            }
+            for id in ids {
+                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+            }
+        }
+        let timeout = spec.timeout_seconds.map(|s| Duration::from_secs(s.into()));
+        if job.failed > spec.retries.unwrap_or(JOB_RETRIES) {
+            job.outcome = Some("failed");
+        } else if timeout.is_some_and(|limit| job.began.elapsed() >= limit) {
+            job.outcome = Some("failed");
+            job.message = Some(format!("not finished after {} s", spec.timeout_seconds.unwrap_or(0)));
+        } else if job.succeeded.len() as u32 >= completions {
+            (job.outcome, job.message) = (Some("succeeded"), None);
+        }
+        if job.outcome.is_some() {
+            for id in mine(&self.slots, None) {
+                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+            }
+            return (Vec::new(), Instant::now());
+        }
+        let parallelism = spec.parallelism.unwrap_or(1).max(1) as usize;
+        let open = (0..completions).filter(|run| !job.succeeded.contains(run));
+        (open.take(parallelism).collect(), job.retry_at)
+    }
+
+    /// Keep the log directory bounded: a file over the cap is moved aside (one old
+    /// copy is kept), and the files of Workloads and Jobs that are gone are removed.
+    fn tend_logs(&mut self, owners: BTreeSet<String>) {
+        // ponytail: checked once a pass, so a file can pass the cap by what its unit
+        // writes in one tick (10 s), and output written between the copy and the
+        // truncation is lost. A pipe per unit would bound both; not needed yet.
+        for id in self.slots.keys() {
+            for stream in ["out", "err"] {
+                let path = self.logs.join(format!("{id}.{stream}"));
+                if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > self.log_cap) {
+                    // The unit holds the file open in append mode, so it carries on at the new end.
+                    let rotated = std::fs::copy(&path, self.logs.join(format!("{id}.{stream}.1")))
+                        .and_then(|_| File::options().write(true).open(&path)?.set_len(0));
+                    if let Err(e) = rotated {
+                        eprintln!("kithd: rotating {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+        if self.owners.as_ref() == Some(&owners) {
+            return;
+        }
+        for entry in std::fs::read_dir(&self.logs).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // `w_namespace_name_` of `w_namespace_name_0_unit.out`.
+            let prefix: String = name.split_inclusive('_').take(3).collect();
+            if !owners.contains(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        self.owners = Some(owners);
+    }
 }
 
 /// The value of one environment variable, looked up in the store if it is a reference.
@@ -313,27 +610,19 @@ fn env_value(shared: &Shared, namespace: &str, var: &EnvVar) -> Result<String, S
 }
 
 async fn start(shared: &Shared, runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<Handle, String> {
-    let c = &slot.container;
-    let mut unit = Unit {
-        command: c.command.clone(),
-        args: c.args.clone(),
-        working_dir: c.working_dir.clone(),
-        ..Unit::default()
+    let (env, resources) = match &slot.run {
+        Run::Container(c) => (&c.env, &c.resources),
+        Run::Exec(e) => (&e.env, &e.resources),
     };
-    for var in &c.env {
+    let mut unit = Unit::default();
+    for var in env {
         unit.env
             .push((var.name.clone(), env_value(shared, &slot.namespace, var)?));
     }
-    if let Some(resources) = &c.resources {
-        unit.memory_bytes = resources.memory.as_ref().map(|q| q.value() as u64);
-        unit.cpu_millis = resources.cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);
+    if let Some(Resources { cpu, memory, .. }) = resources {
+        unit.memory_bytes = memory.as_ref().map(|q| q.value() as u64);
+        unit.cpu_millis = cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);
     }
-    let policy = match c.pull_policy {
-        None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
-        Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
-        Some(PullPolicy::Never) => kith_runtime::PullPolicy::Never,
-    };
-    let image = runtime.images.pull(&c.image, policy).await.map_err(|e| e.to_string())?;
     let log = |ext: &str| {
         let path = logs.join(format!("{id}.{ext}"));
         File::options()
@@ -342,9 +631,23 @@ async fn start(shared: &Shared, runtime: &Runtime, logs: &Path, id: &str, slot: 
             .open(&path)
             .map_err(|e| format!("opening {}: {e}", path.display()))
     };
-    let mut handle = runtime
-        .create(id, &image, &unit, log("out")?, log("err")?)
-        .map_err(|e| e.to_string())?;
+    let created = match &slot.run {
+        Run::Container(c) => {
+            (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
+            let policy = match c.pull_policy {
+                None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
+                Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
+                Some(PullPolicy::Never) => kith_runtime::PullPolicy::Never,
+            };
+            let image = runtime.images.pull(&c.image, policy).await.map_err(|e| e.to_string())?;
+            runtime.create(id, &image, &unit, log("out")?, log("err")?)
+        }
+        Run::Exec(e) => {
+            unit.command = e.command.clone();
+            runtime.exec(id, &unit, log("out")?, log("err")?)
+        }
+    };
+    let mut handle = created.map_err(|e| e.to_string())?;
     match handle.start() {
         Ok(()) => Ok(handle),
         Err(e) => {
@@ -360,12 +663,11 @@ mod tests {
 
     #[test]
     fn ids_and_backoff() {
-        assert_eq!(
-            container_id("default", "web.v2", 1, "app").unwrap(),
-            "default_web.v2_1_app"
-        );
+        let prefix = id_prefix("Workload", "default", "web.v2");
+        assert_eq!(unit_id(&prefix, 1, "app").unwrap(), "w_default_web.v2_1_app");
+        assert_eq!(id_prefix("Job", "default", "web.v2"), "j_default_web.v2_");
         for bad in ["", "a/b", "..\\x", "a_b", "a b"] {
-            assert!(container_id("default", "web", 0, bad).is_err(), "{bad:?}");
+            assert!(unit_id(&prefix, 0, bad).is_err(), "{bad:?}");
         }
         assert_eq!(backoff(0), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(8));

@@ -256,10 +256,10 @@ fn examples_and_schemas() {
     let sb = Sandbox::new("examples");
     let examples = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     let (code, out, err) = sb.kith(&["lint", "-f", examples]);
-    assert_eq!((code, out.as_str()), (0, "5 resources ok\n"), "{err}");
+    assert_eq!((code, out.as_str()), (0, "6 resources ok\n"), "{err}");
     let (code, out, _) = sb.kith(&["apply", "-f", examples]);
     assert_eq!(code, 0);
-    assert_eq!(out.lines().count(), 5);
+    assert_eq!(out.lines().count(), 6);
     assert_eq!(sb.kith(&["diff", "-f", examples]).0, 0);
 
     let (_, out, _) = sb.kith(&["schema"]);

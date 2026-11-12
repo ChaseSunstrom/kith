@@ -62,7 +62,7 @@ def main():
                 kith = [os.path.join(bins, "kith"), "--socket", socket]
                 subprocess.run([*kith, "apply", "-f", path], check=True, stdout=subprocess.DEVNULL)
                 while True:
-                    logs = glob.glob(os.path.join(tmp, "state", "logs", f"default_{name}_*_main.out"))
+                    logs = glob.glob(os.path.join(tmp, "state", "logs", f"w_default_{name}_*_main.out"))
                     if len(logs) == replicas and all(os.path.getsize(log) for log in logs):
                         return time.monotonic() - began
                     if time.monotonic() - began > 120:
@@ -81,7 +81,7 @@ def main():
             stall, during = 0, 0
 
             def burst_up():
-                logs = glob.glob(os.path.join(tmp, "state", "logs", "default_burst_*_main.out"))
+                logs = glob.glob(os.path.join(tmp, "state", "logs", "w_default_burst_*_main.out"))
                 return len(logs) == 20 and all(os.path.getsize(log) for log in logs)
 
             # Only calls made before the burst is up count: later ones measure an idle kithd.

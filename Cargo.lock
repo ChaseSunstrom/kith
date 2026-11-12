@@ -1036,6 +1036,7 @@ name = "kith-runtime"
 version = "0.0.1"
 dependencies = [
  "flate2",
+ "libcgroups",
  "libcontainer",
  "nix 0.29.0",
  "oci-client",

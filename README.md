@@ -9,7 +9,8 @@ cluster, configured entirely through declarative resources. The design is in
 ## Status: one node, in agent mode
 
 `kithd` runs as a service on an existing Linux distro, owns the store, and keeps
-the containers on that machine matching the `Workload`s you apply. Clustering,
+the containers and processes on that machine matching the `Workload`s and `Job`s
+you apply. Clustering,
 networking and the OS image come next (Phase 2 onwards in the plan).
 
 ```sh
@@ -20,7 +21,7 @@ kithd &                          # as you, no root: needs cgroup v2 and a system
 kith apply -f examples/hello.yaml
 kith get                         # Workload  default  hello  1  1/1 ready
 kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
-tail ~/.local/state/kith/logs/default_hello_0_main.out
+kith logs workload/hello -f      # its output, as it arrives
 kith delete workload/hello       # stops its containers
 ```
 
@@ -61,15 +62,32 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   how you follow a tag that moves. Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`, with a backoff of up to a minute.
-- On SIGTERM it stops the containers it started.
+- Runs `exec` units next to containers: a plain process of the host (its files,
+  its network, your user) in its own cgroup with the same limits and restart
+  policy, for host-level tools. Whatever it forks is stopped with it.
+- Runs each `Job` to completion: `completions` runs of its template,
+  `parallelism` at a time (1 unless you say). A run fails as soon as one of its
+  units exits non-zero or cannot start, and is tried again after a backoff;
+  `retries` failed runs are forgiven (3 unless you say), one more fails the Job,
+  and so does taking longer than `timeoutSeconds`. `kith get job` shows
+  `running`, `succeeded` or `failed: <why>`. A finished Job runs again only when
+  you change it; one that kithd was restarted under starts over.
+- Keeps each unit's output: `kith logs KIND/NAME` prints it, with `--unit`,
+  `--replica` (or the run of a Job), `--stderr`, `--tail LINES` and `-f` to
+  follow until the unit is done. A log file that passes 10 MiB (`kithd
+  --log-cap BYTES`) is moved aside, one old copy is kept (`kith logs
+  --previous`), and deleting the Workload or Job deletes its logs.
+- On SIGTERM it stops everything it started.
 
-Not yet: `exec` units, volumes, ports and probes are accepted but do nothing
-(the status says so for `exec` and volumes), containers share the host's
+Not yet: volumes, ports and probes are accepted but do nothing
+(the status says so for volumes), containers share the host's
 network and a read-only image (tmpfs on `/tmp` and `/run`), a changed Workload
 is stopped and then started rather than rolled, pulls are anonymous, layers
 must be gzip or plain tar, the image's `User` is ignored (containers run as
-root inside their user namespace), and there is no seccomp filter. Kinds other than
-`Workload`, `ConfigMap` and `Secret` are stored and validated but nothing acts
+root inside their user namespace), and there is no seccomp filter. The log cap
+is checked every 10 s, so a file can pass it by what its unit writes in that
+time, and output written in the instant a file is moved aside is lost. Kinds other than
+`Workload`, `Job`, `ConfigMap` and `Secret` are stored and validated but nothing acts
 on them. Running as root is untested.
 
 [`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has

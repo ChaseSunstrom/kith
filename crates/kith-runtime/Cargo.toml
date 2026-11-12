@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 # v2 only: no cgroup v1, no systemd/dbus driver, and no libseccomp (a C library) yet.
 libcontainer = { version = "0.7", default-features = false, features = ["v2"] }
+# Already in the tree through libcontainer: exec units get their cgroup from it directly.
+libcgroups = { version = "0.7", default-features = false, features = ["v2"] }
 oci-spec = "0.10"
 # TLS through rustls with ring: smaller than the default aws-lc and no cmake.
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }

@@ -4,6 +4,7 @@
 //!   unpacks each image once.
 //! - [`Runtime`] runs a container from an image in its own cgroup, through
 //!   youki's `libcontainer` used as a library: no containerd, no shim process.
+//!   It also runs exec units: plain host processes in a cgroup, for host-level tools.
 //!
 //! It works unprivileged (user namespace, delegated cgroup), which is how the
 //! tests run it, and is meant to work as root; the root path is not tested yet.
@@ -11,7 +12,7 @@
 mod container;
 mod image;
 
-pub use container::{Handle, Runtime, Unit};
+pub use container::{Handle, Runtime, Unit, exec_shim, reap_orphans};
 pub use image::{Image, ImageStore, PullPolicy};
 
 #[derive(Debug)]

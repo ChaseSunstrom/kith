@@ -85,6 +85,29 @@ enum Command {
         #[arg(long, value_name = "REVISION")]
         to: u64,
     },
+    /// Print the output of a Workload's or Job's container or exec unit
+    Logs {
+        #[command(flatten)]
+        target: Target,
+        /// Which container or exec unit [default: the first]
+        #[arg(short, long, value_name = "NAME")]
+        unit: Option<String>,
+        /// Which replica, or which run of a Job
+        #[arg(long, default_value_t = 0)]
+        replica: u32,
+        /// Its error output instead
+        #[arg(long)]
+        stderr: bool,
+        /// The output moved aside when the log reached its size cap
+        #[arg(long)]
+        previous: bool,
+        /// Only the last LINES lines
+        #[arg(long, value_name = "LINES")]
+        tail: Option<u64>,
+        /// Keep printing as output arrives, until the unit is done
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Print the JSON Schema of a kind, or list the kinds
     Schema { kind: Option<String> },
 }
@@ -398,6 +421,46 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             backend()?.delete(&key)?;
             println!("{key} deleted");
         }
+        Command::Logs {
+            target,
+            unit,
+            replica,
+            stderr,
+            previous,
+            tail,
+            follow,
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("logs are kept by kithd: leave out --store");
+            };
+            let mut path = format!("/v1/logs/{}?replica={replica}", escape(&target.key()?));
+            for (flag, option) in [(stderr, "&stderr=true"), (previous, "&previous=true")] {
+                path += if flag { option } else { "" };
+            }
+            if let Some(unit) = unit {
+                path += &format!("&unit={}", escape(&unit));
+            }
+            let mut from = tail.map_or("&offset=0".into(), |lines| format!("&tail={lines}"));
+            loop {
+                let reply: serde_json::Value = request(&kithd, "GET", &format!("{path}{from}"), b"")?;
+                let data = reply["data"].as_str().unwrap_or_default();
+                {
+                    use std::io::Write;
+                    let mut out = std::io::stdout();
+                    if out.write_all(data.as_bytes()).and_then(|()| out.flush()).is_err() {
+                        break; // `kith logs | head`
+                    }
+                }
+                from = format!("&offset={}", reply["next"].as_u64().unwrap_or(0));
+                if data.is_empty() {
+                    // Drained. Without -f that is all; with it, wait for more while more may come.
+                    if !follow || reply["more"] != true {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
         Command::History { target } => {
             let history = backend()?.history(&target.key()?)?;
             let rows = history.iter().map(|r| {
@@ -438,17 +501,22 @@ fn status_summary(resource: &Resource) -> String {
     let Some(status) = &resource.status else {
         return String::new();
     };
+    // First line only, and nothing that could drive the terminal: messages quote image names and output.
+    let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
     match (status["ready"].as_u64(), status["replicas"].as_u64()) {
         (Some(ready), Some(replicas)) => {
             // Why it is not ready, if a container said so.
             let containers = status["containers"].as_array().into_iter().flatten();
             let why = containers.filter_map(|c| c["message"].as_str()).next();
-            // First line only, and nothing that could drive the terminal: it quotes the image name.
-            let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
             let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
             format!("{ready}/{replicas} ready{why}")
         }
-        _ => String::new(),
+        // A Job.
+        _ => match (status["state"].as_str(), status["message"].as_str()) {
+            (Some(state), Some(why)) if state != "succeeded" => format!("{state}: {}", clean(why)),
+            (Some(state), _) => state.into(),
+            _ => String::new(),
+        },
     }
 }
 
