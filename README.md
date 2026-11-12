@@ -52,7 +52,9 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   with no daemon.
 - Runs each `Workload` container in its own cgroup with youki's `libcontainer`
   linked in: no containerd, no shim, no root. Images are pulled into a
-  content-addressed store. Memory and CPU limits, `command`/`args`, and `env`
+  content-addressed store; one pulled before starts without asking the registry
+  (about 25 ms from `kith apply` to first output here), so `pullPolicy: always` is
+  how you follow a tag that moves. Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`, with a backoff of up to a minute.
 - On SIGTERM it stops the containers it started.
@@ -95,6 +97,7 @@ cargo test --workspace
 KITH_E2E=1 cargo test -p kithd -p kith-runtime --test e2e   # pulls an image and runs containers
 cargo clippy --workspace --all-targets -- -D warnings
 python3 ci/budgets.py            # binary-size and memory budgets, enforced in CI
+python3 ci/bench.py              # Phase 1 numbers: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which

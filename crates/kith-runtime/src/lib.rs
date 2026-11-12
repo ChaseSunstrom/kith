@@ -12,7 +12,7 @@ mod container;
 mod image;
 
 pub use container::{Handle, Runtime, Unit};
-pub use image::{Image, ImageStore};
+pub use image::{Image, ImageStore, PullPolicy};
 
 #[derive(Debug)]
 pub struct Error(String);

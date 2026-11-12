@@ -3,7 +3,7 @@
 //! Needs a registry, unprivileged user namespaces and a delegated cgroup, so
 //! it only runs when asked: `KITH_E2E=1 cargo test -p kith-runtime --test e2e`.
 
-use kith_runtime::{Runtime, Unit};
+use kith_runtime::{PullPolicy, Runtime, Unit};
 use std::fs::{self, File};
 use std::path::Path;
 
@@ -47,16 +47,33 @@ async fn pull_and_run() {
     let rt = Runtime::new(dir.join("runtime")).unwrap();
 
     // Pull: layers land in the content-addressed store; pulling again downloads nothing.
-    let image = rt.images.pull(&image_ref).await.unwrap();
-    assert!(image.downloaded >= 1);
+    let never = rt.images.pull(&image_ref, PullPolicy::Never).await;
+    assert!(never.is_err(), "nothing is here yet");
+    let image = rt.images.pull(&image_ref, PullPolicy::IfNotPresent).await.unwrap();
+    assert!(image.downloaded >= 1 && !image.from_cache);
     assert!(image.rootfs.join("bin/sh").exists());
     let blobs = fs::read_dir(dir.join("runtime/blobs/sha256")).unwrap().count();
     assert_eq!(blobs, image.downloaded);
-    let again = rt.images.pull(&image_ref).await.unwrap();
+    let again = rt.images.pull(&image_ref, PullPolicy::Always).await.unwrap();
     assert_eq!(
-        (again.downloaded, &again.digest, &again.rootfs),
-        (0, &image.digest, &image.rootfs)
+        (again.downloaded, &again.digest, &again.rootfs, again.from_cache),
+        (0, &image.digest, &image.rootfs, false)
     );
+    // A reference pulled before needs no registry: same image, straight from the store.
+    for policy in [PullPolicy::IfNotPresent, PullPolicy::Never] {
+        let cached = rt.images.pull(&image_ref, policy).await.unwrap();
+        assert!(cached.from_cache);
+        assert_eq!(
+            (
+                &cached.digest,
+                &cached.rootfs,
+                &cached.entrypoint,
+                &cached.cmd,
+                &cached.env
+            ),
+            (&image.digest, &image.rootfs, &image.entrypoint, &image.cmd, &image.env)
+        );
+    }
 
     // Create: the process sits in its own cgroup with the limits applied, not yet running.
     let unit = Unit {

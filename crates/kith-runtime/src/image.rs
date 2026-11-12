@@ -34,6 +34,20 @@ pub struct Image {
     pub working_dir: Option<String>,
     /// Layers this pull had to download; 0 when everything was already stored.
     pub downloaded: usize,
+    /// Answered from the store alone: the registry was not asked anything.
+    pub from_cache: bool,
+}
+
+/// When to ask the registry what a reference points at.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum PullPolicy {
+    /// Only if this reference was never pulled here. A tag that moved at the
+    /// registry is not noticed; use `Always`, or a digest, where that matters.
+    #[default]
+    IfNotPresent,
+    Always,
+    /// Use what is here or fail: no network at all.
+    Never,
 }
 
 /// The hex part of a `sha256:<64 hex>` digest. Digests come from the registry
@@ -54,17 +68,67 @@ impl ImageStore {
         let _ = rustls::crypto::ring::default_provider().install_default();
         fs::create_dir_all(root.join("blobs/sha256")).ctx(format!("creating {}", root.display()))?;
         fs::create_dir_all(root.join("images")).ctx(format!("creating {}", root.display()))?;
+        fs::create_dir_all(root.join("refs")).ctx(format!("creating {}", root.display()))?;
         // Images keep their setuid bits; nobody else on this machine gets to run them.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ctx(format!("securing {}", root.display()))?;
         Ok(ImageStore { root })
     }
 
+    /// Where the store remembers what `reference` resolved to.
+    fn ref_file(&self, reference: &Reference) -> Result<PathBuf> {
+        // The whole reference as one file name: `/` and anything unusual become `%xx`.
+        let plain = |b: u8| b.is_ascii_alphanumeric() || b"-._:@".contains(&b);
+        let escape = |b: u8| {
+            if plain(b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02x}")
+            }
+        };
+        let name: String = reference.whole().bytes().map(escape).collect();
+        if name.len() > 250 || name.starts_with('.') {
+            return err(format!("image reference `{reference}` is too long"));
+        }
+        Ok(self.root.join("refs").join(name))
+    }
+
+    /// The image `reference` resolved to last time, if it is still unpacked here.
+    fn cached(&self, reference: &Reference) -> Option<Image> {
+        let saved = fs::read(self.ref_file(reference).ok()?).ok()?;
+        let saved: serde_json::Value = serde_json::from_slice(&saved).ok()?;
+        let strings = |key: &str| -> Option<Vec<String>> { serde_json::from_value(saved[key].clone()).ok() };
+        let digest = saved["digest"].as_str()?;
+        let dir = self.root.join("images").join(sha256_hex(digest).ok()?);
+        dir.join("config.json").exists().then_some(())?;
+        Some(Image {
+            digest: digest.into(),
+            rootfs: dir.join("rootfs"),
+            entrypoint: strings("entrypoint")?,
+            cmd: strings("cmd")?,
+            env: strings("env")?,
+            working_dir: saved["workingDir"].as_str().map(String::from),
+            downloaded: 0,
+            from_cache: true,
+        })
+    }
+
     /// Pull `reference` (e.g. `docker.io/library/busybox:1.36`) for this machine's
-    /// platform. Always asks the registry which manifest the tag points at;
-    /// layers and unpacked images already in the store are reused.
+    /// platform. Under the default policy a reference pulled before is answered
+    /// from the store with no network; otherwise the registry says which manifest
+    /// it points at, and layers and unpacked images already stored are reused.
     // ponytail: anonymous pulls only; registry credentials arrive with Secrets in the controller.
-    pub async fn pull(&self, reference: &str) -> Result<Image> {
+    pub async fn pull(&self, reference: &str, policy: PullPolicy) -> Result<Image> {
         let reference: Reference = reference.parse().ctx(format!("image reference `{reference}`"))?;
+        if policy != PullPolicy::Always
+            && let Some(image) = self.cached(&reference)
+        {
+            return Ok(image);
+        }
+        if policy == PullPolicy::Never {
+            return err(format!(
+                "image `{reference}` is not here and its pull policy is `never`"
+            ));
+        }
         let client = Client::new(ClientConfig::default());
         let auth = RegistryAuth::Anonymous;
         let (manifest, digest, config) = client
@@ -122,7 +186,7 @@ impl ImageStore {
         }
 
         let cfg = config.config.unwrap_or_default();
-        Ok(Image {
+        let image = Image {
             digest,
             rootfs: dir.join("rootfs"),
             entrypoint: cfg.entrypoint.unwrap_or_default(),
@@ -130,7 +194,24 @@ impl ImageStore {
             env: cfg.env.unwrap_or_default(),
             working_dir: cfg.working_dir.filter(|d| !d.is_empty()),
             downloaded,
-        })
+            from_cache: false,
+        };
+        // Remember the answer. Written whole, then renamed: a reader sees the old one or the new one.
+        let saved = serde_json::json!({
+            "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
+            "env": image.env, "workingDir": image.working_dir,
+        });
+        // Best effort: the image is here either way, and without the note the next pull just asks again.
+        if let Ok(file) = self.ref_file(&reference) {
+            let scratch = file.with_file_name(format!(".{}", scratch_name("ref")));
+            if fs::write(&scratch, saved.to_string())
+                .and_then(|()| fs::rename(&scratch, &file))
+                .is_err()
+            {
+                let _ = fs::remove_file(&scratch);
+            }
+        }
+        Ok(image)
     }
 }
 
@@ -302,6 +383,52 @@ mod tests {
     }
 
     const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
+    #[test]
+    fn remembered_references() {
+        let (dir, _) = sandbox("refs");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let reference: Reference = "busybox".parse().unwrap();
+        let file = store.ref_file(&reference).unwrap();
+        // One file per reference, inside refs/, whatever the reference looks like.
+        assert_eq!(file, dir.join("store/refs/docker.io%2flibrary%2fbusybox:latest"));
+        assert_eq!(
+            file,
+            store
+                .ref_file(&"docker.io/library/busybox:latest".parse().unwrap())
+                .unwrap()
+        );
+        let long: Reference = format!("example.com/{}:1", "a/".repeat(100) + "b").parse().unwrap();
+        assert!(store.ref_file(&long).is_err());
+
+        // Nothing remembered, a damaged note, or a note about an image that is gone: ask the registry.
+        assert!(store.cached(&reference).is_none());
+        fs::write(&file, "{ not json").unwrap();
+        assert!(store.cached(&reference).is_none());
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let note = serde_json::json!({ "digest": digest, "entrypoint": ["sh"], "cmd": [], "env": ["A=1"], "workingDir": null });
+        fs::write(&file, note.to_string()).unwrap();
+        assert!(store.cached(&reference).is_none());
+        fs::write(&file, note.to_string().replace("sha256:", "sha256:../")).unwrap();
+        assert!(store.cached(&reference).is_none());
+
+        // The image is unpacked: the note is enough.
+        fs::write(&file, note.to_string()).unwrap();
+        let image_dir = dir.join("store/images").join("a".repeat(64));
+        fs::create_dir_all(&image_dir).unwrap();
+        fs::write(image_dir.join("config.json"), "{}").unwrap();
+        let image = store.cached(&reference).unwrap();
+        assert!(image.from_cache);
+        assert_eq!(
+            (image.entrypoint, image.env, image.rootfs),
+            (
+                vec!["sh".to_string()],
+                vec!["A=1".to_string()],
+                image_dir.join("rootfs")
+            )
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn layers_stack_with_whiteouts() {

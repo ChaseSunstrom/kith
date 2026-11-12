@@ -9,7 +9,7 @@
 // ConfigMap. Images are pulled one at a time.
 
 use crate::Shared;
-use kith_api::kinds::{ConfigMapSpec, Container, EnvVar, RestartPolicy, SecretSpec, WorkloadSpec};
+use kith_api::kinds::{ConfigMapSpec, Container, EnvVar, PullPolicy, RestartPolicy, SecretSpec, WorkloadSpec};
 use kith_runtime::{Handle, Runtime, Unit};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -326,7 +326,12 @@ async fn start(shared: &Shared, runtime: &Runtime, logs: &Path, id: &str, slot: 
         unit.memory_bytes = resources.memory.as_ref().map(|q| q.value() as u64);
         unit.cpu_millis = resources.cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);
     }
-    let image = runtime.images.pull(&c.image).await.map_err(|e| e.to_string())?;
+    let policy = match c.pull_policy {
+        None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
+        Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
+        Some(PullPolicy::Never) => kith_runtime::PullPolicy::Never,
+    };
+    let image = runtime.images.pull(&c.image, policy).await.map_err(|e| e.to_string())?;
     let log = |ext: &str| {
         let path = logs.join(format!("{id}.{ext}"));
         File::options()

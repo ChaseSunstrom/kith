@@ -231,6 +231,9 @@ spec! {
     pub struct Container {
         pub name: String,
         pub image: String,
+        /// When to ask the registry what `image` points at. Defaults to `ifNotPresent`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub pull_policy: Option<PullPolicy>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub command: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -250,6 +253,9 @@ spec! {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub readiness: Option<Probe>,
     }
+
+    /// `ifNotPresent` never notices a tag that moved at the registry.
+    pub enum PullPolicy { IfNotPresent, Always, Never }
 
     pub struct ExecUnit {
         pub name: String,
