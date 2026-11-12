@@ -165,17 +165,24 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The cluster CA is one certificate. Text with more is refused: a second one would be
+/// trusted without being what the join token pinned.
+fn ca_cert(ca: &str) -> Fallible<CertificateDer<'static>> {
+    let mut certs = certs(ca)?;
+    match certs.len() {
+        1 => Ok(certs.remove(0)),
+        more => Err(format!("a cluster CA is one certificate, not {more}")),
+    }
+}
+
 /// SHA-256 of the CA certificate: what a join token pins.
 pub fn fingerprint(ca: &str) -> Fallible<String> {
-    let der = certs(ca)?.remove(0);
-    Ok(hex(ring::digest::digest(&ring::digest::SHA256, &der).as_ref()))
+    Ok(hex(ring::digest::digest(&ring::digest::SHA256, &ca_cert(ca)?).as_ref()))
 }
 
 fn roots(ca: &str) -> Fallible<Arc<RootCertStore>> {
     let mut roots = RootCertStore::empty();
-    for cert in certs(ca)? {
-        tls("trusting the cluster CA", roots.add(cert))?;
-    }
+    tls("trusting the cluster CA", roots.add(ca_cert(ca)?))?;
     Ok(Arc::new(roots))
 }
 
@@ -343,6 +350,10 @@ mod tests {
         };
         assert!(verify(&ca.cert).is_ok());
         assert!(verify(&Ca::create().unwrap().cert).is_err());
+
+        // Two CAs in one text are not a CA: the second would be trusted unpinned.
+        let two = format!("{}{}", ca.cert, Ca::create().unwrap().cert);
+        assert!(fingerprint(&two).is_err() && client_config(&two, None).is_err());
 
         assert!(ca.issue("Not A Name").is_err());
         assert!(valid_name("-x").is_err() && valid_name("").is_err() && valid_name("node-1").is_ok());

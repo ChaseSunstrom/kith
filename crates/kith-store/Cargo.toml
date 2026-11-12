@@ -1,0 +1,17 @@
+[package]
+name = "kith-store"
+description = "The replicated resource store: Raft over a redb log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+openraft = { version = "0.9", default-features = false, features = ["serde", "storage-v2"] }
+redb = { version = "4", default-features = false }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+
+[lints]
+workspace = true

@@ -117,9 +117,10 @@ kithd --join 192.168.1.10:7443 --token TOKEN --name beta    # on the other machi
 kith get node                                      # on either: alpha and beta, with their addresses
 ```
 
-- Nodes talk over TLS and both ends show a certificate from the cluster's CA.
+- Nodes talk over TLS and both ends show a certificate from the cluster's CA:
+  that proves membership, not which member (every node trusts every other).
   Without one, a caller can read the CA certificate and present a join token,
-  nothing else.
+  nothing else, and is cut off after 15 s.
 - The token carries the CA's fingerprint: a joining node checks who it is
   talking to before it sends the token's secret.
 - A node keeps its identity in `<state>/pki`; after the first start it needs
@@ -127,7 +128,9 @@ kith get node                                      # on either: alpha and beta, 
 
 Not yet: a node that joined keeps no copy of the store and runs no workloads; it
 forwards its API to the node it joined (replication and scheduling are next).
-Only the first node can admit others, tokens do not survive its restart,
+Only the first node can admit others, tokens do not survive its restart (and
+`--token` shows in the process list until then: `KITH_TOKEN` does not), a join
+that dies halfway needs `kith delete node/NAME` and a new token,
 certificates last ten years and cannot be renewed or revoked, and `kith` itself
 only talks to the kithd on its own machine.
 

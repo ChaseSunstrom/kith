@@ -179,6 +179,8 @@ fn nodes_join_over_mutual_tls() {
     std::fs::write(beta.dir.join("cm.yaml"), config).unwrap();
     beta.ok(&["apply", "-f", "cm.yaml"]);
     assert!(alpha.ok(&["get", "ConfigMap/shared"]).contains("shared"));
+    // beta's own port is for members only too.
+    assert_eq!(status_without_certificate(&beta.address(), "/v1/resources"), "401");
     // Only the node with the CA key admits nodes, and beta says who that is.
     let (code, _, err) = beta.kith(&["node", "token"]);
     assert!(code != 0 && err.contains(&alpha.address()), "{err}");

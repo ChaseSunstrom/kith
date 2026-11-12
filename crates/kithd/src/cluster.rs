@@ -24,10 +24,13 @@ use axum::serve::IncomingStream;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_rustls::server::TlsStream;
 
 /// This node as a member of a cluster.
@@ -72,20 +75,67 @@ pub struct Peer {
     pub node: Option<String>,
 }
 
+/// A TLS connection. One from a caller without a certificate (a guest) keeps one of the
+/// few guest slots and is cut off after `GUEST_TIME`: a join is two short requests.
+pub struct Connection {
+    stream: TlsStream<TcpStream>,
+    guest: Option<(OwnedSemaphorePermit, Pin<Box<tokio::time::Sleep>>)>,
+}
+
+impl Connection {
+    /// An error once a guest has outstayed its time.
+    fn check(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
+        let late = self
+            .guest
+            .as_mut()
+            .is_some_and(|(_, deadline)| deadline.as_mut().poll(cx).is_ready());
+        if late {
+            Err(std::io::ErrorKind::TimedOut.into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl AsyncRead for Connection {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Connection {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
 /// Accepts TCP connections and hands them on once TLS is up.
 pub struct TlsListener {
-    ready: mpsc::Receiver<(TlsStream<TcpStream>, Peer)>,
+    ready: mpsc::Receiver<(Connection, Peer)>,
     local: SocketAddr,
 }
 
-/// Handshakes in progress at once; more wait in the kernel's queue.
-const HANDSHAKES: usize = 64;
+/// Handshakes in progress plus guest connections at once; more wait in the kernel's queue.
+/// Members are not counted: they are trusted, and few.
+const GUESTS: usize = 64;
+/// How long a handshake may take, and how long a guest connection may last.
+const GUEST_TIME: Duration = Duration::from_secs(15);
 
 pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
     let local = tcp.local_addr()?;
-    let (tx, ready) = mpsc::channel(HANDSHAKES);
+    let (tx, ready) = mpsc::channel(GUESTS);
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
-    let slots = Arc::new(Semaphore::new(HANDSHAKES));
+    let slots = Arc::new(Semaphore::new(GUESTS));
     tokio::spawn(async move {
         loop {
             let Ok(slot) = slots.clone().acquire_owned().await else {
@@ -99,12 +149,13 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
             let (acceptor, tx) = (acceptor.clone(), tx.clone());
             tokio::spawn(async move {
                 // A client that connects and says nothing does not hold a slot for long.
-                let shaken = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await;
-                drop(slot);
+                let shaken = tokio::time::timeout(GUEST_TIME, acceptor.accept(stream)).await;
                 if let Ok(Ok(stream)) = shaken {
                     let certs = stream.get_ref().1.peer_certificates();
                     let node = certs.and_then(|certs| pki::node_of(certs.first()?));
-                    let _ = tx.send((stream, Peer { addr, node })).await;
+                    // A member gives its slot back; a guest keeps it, for a short while.
+                    let guest = node.is_none().then(|| (slot, Box::pin(tokio::time::sleep(GUEST_TIME))));
+                    let _ = tx.send((Connection { stream, guest }, Peer { addr, node })).await;
                 }
             });
         }
@@ -113,7 +164,7 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
 }
 
 impl axum::serve::Listener for TlsListener {
-    type Io = TlsStream<TcpStream>;
+    type Io = Connection;
     type Addr = Peer;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
@@ -318,7 +369,12 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16) -> 
         let why = refusal["error"].as_str().unwrap_or("it refused without saying why");
         return Err(format!("{address} did not let this node join: {why}"));
     }
-    reply.json().await.map_err(|e| failed("reading the reply of", e))
+    let joined: Joined = reply.json().await.map_err(|e| failed("reading the reply of", e))?;
+    // What is kept is what the token pinned, nothing the reply slipped in.
+    if pki::fingerprint(&joined.ca).ok().as_deref() != Some(pinned) {
+        return Err(format!("{address} answered with a CA the token is not for"));
+    }
+    Ok(joined)
 }
 
 /// Requests larger than this are not forwarded.
@@ -333,10 +389,9 @@ async fn forward(State(shared): State<Arc<Shared>>, request: Request) -> Respons
         return refuse(StatusCode::PAYLOAD_TOO_LARGE, "the request is too large").into_response();
     };
     let path = parts.uri.path_and_query().map_or("/", |path| path.as_str());
-    let mut call = cluster
-        .client
-        .request(parts.method, format!("https://{leader}{path}"))
-        .body(body);
+    // Longer than the longest long-poll (watch, 25 s).
+    let call = cluster.client.request(parts.method, format!("https://{leader}{path}"));
+    let mut call = call.timeout(Duration::from_secs(40)).body(body);
     if let Some(kind) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
         call = call.header(axum::http::header::CONTENT_TYPE, kind);
     }

@@ -113,7 +113,19 @@ async fn membership(
                 me.name
             );
         }
+        if args.name.as_ref().is_some_and(|name| *name != me.name) {
+            return Err(format!(
+                "this node joined as `{}`: it cannot be renamed with --name",
+                me.name
+            ));
+        }
         let leader = std::fs::read_to_string(&leader_file).ok();
+        if ca.is_none() && leader.is_none() {
+            let dir = dir.display();
+            return Err(format!(
+                "{dir} is incomplete (a join was interrupted): remove it and join again"
+            ));
+        }
         return Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)));
     }
     let name = match &args.name {
@@ -151,10 +163,12 @@ async fn membership(
             (me, Some(ca), None)
         }
     };
-    pki::save(&dir, &me, ca.as_ref())?;
+    // The identity last: its presence is what a restart takes for a finished join.
     if let Some(leader) = &leader {
-        std::fs::write(&leader_file, leader).map_err(|e| format!("writing {}: {e}", leader_file.display()))?;
+        let made = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&leader_file, leader));
+        made.map_err(|e| format!("writing {}: {e}", leader_file.display()))?;
     }
+    pki::save(&dir, &me, ca.as_ref())?;
     Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)))
 }
 
@@ -249,6 +263,11 @@ fn run(args: Args) -> Result<(), String> {
             };
             let address = tcp.local_addr().map_err(|e| fail("listening", &e))?;
             if cluster.leader.is_none() {
+                if address.ip().is_unspecified() && args.advertise.is_none() {
+                    return Err(format!(
+                        "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
+                    ));
+                }
                 let reachable = args.advertise.clone().unwrap_or(address.to_string());
                 cluster::register(&shared, &cluster.me.name, &reachable).map_err(|e| e.to_string())?;
             }
