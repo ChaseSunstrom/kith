@@ -42,7 +42,29 @@ pub fn prefix(seed: &[u8]) -> Ipv6Addr {
 pub fn node_net(prefix: Ipv6Addr, name: &str) -> Ipv6Addr {
     let mut bytes = prefix.octets();
     bytes[6..10].copy_from_slice(&Sha256::digest(name.as_bytes())[..4]);
+    // (The last /80 is the services'.)
+    if bytes[6..10] == SERVICES {
+        bytes[9] = 0xfe;
+    }
     bytes.into()
+}
+
+/// The /80 no node has: the addresses in it belong to services, and every node has all
+/// of them.
+const SERVICES: [u8; 4] = [0xff; 4];
+
+/// The address of the service `name` in `namespace`: in the services' /80, 48 bits of
+/// the hash of the two. (Two services can land on one: likely from some 16 million on.)
+pub fn service_address(prefix: Ipv6Addr, namespace: &str, name: &str) -> Ipv6Addr {
+    let mut bytes = prefix.octets();
+    bytes[6..10].copy_from_slice(&SERVICES);
+    bytes[10..].copy_from_slice(&Sha256::digest(format!("{namespace}/{name}").as_bytes())[..6]);
+    bytes.into()
+}
+
+/// Is `address` one of the cluster's (a node's, a service's)?
+pub fn in_mesh(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
+    prefix.octets()[..6] == address.octets()[..6]
 }
 
 /// The node's own address: the first of its /80.
@@ -126,6 +148,12 @@ mod tests {
         assert_eq!(a.segments()[5..], [0; 3]);
         assert_eq!(node_address(mesh, "a").segments()[7], 1);
         assert_eq!(node_address(mesh, "a").segments()[..7], a.segments()[..7]);
+        // A service: in the cluster, in no node's part, the same for the same name.
+        let web = service_address(mesh, "default", "web");
+        assert!(in_mesh(mesh, web) && in_mesh(mesh, a) && !in_mesh(mesh, prefix(b"another")));
+        assert_eq!(web.segments()[3..5], [0xffff, 0xffff]);
+        assert_ne!(web, service_address(mesh, "other", "web"));
+        assert_eq!(web, service_address(mesh, "default", "web"));
 
         let member = |name: &str, edge, reached| Member {
             name: name.into(),

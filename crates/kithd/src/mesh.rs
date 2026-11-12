@@ -141,14 +141,19 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                 BTreeMap::new()
             }
         };
-        let (members, said, edge) = {
+        let (members, said, edge, services) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let members = members(&state.store, &shook, &mut known, Instant::now());
             let edge = members.iter().any(|member| member.name == me && member.edge);
-            (members, said, edge)
+            let services = crate::services::addresses(&state.store, prefix);
+            (members, said, edge, services.into_values().collect())
         };
+        // Every node has every Service's address (crate::services listens on them).
+        if let Err(e) = device.set_addresses(&services) {
+            eprintln!("kithd: mesh: the services' addresses on {}: {e}", options.interface);
+        }
         // (Its own Node may not be there yet, right after joining: next time round.)
         if !said {
             let fields = serde_json::Map::from_iter([("mesh".to_string(), mine.clone())]);

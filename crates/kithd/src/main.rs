@@ -16,6 +16,7 @@ mod pki;
 mod probe;
 mod raft;
 mod sched;
+mod services;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -391,7 +392,12 @@ fn run(args: Args) -> Result<(), String> {
                 mesh::run(shared.clone(), options, stopping.clone()).await;
             }
         };
-        let (served, nodes, (), (), ()) = tokio::join!(server, nodes, work, names, mesh);
+        let proxy = async {
+            if let Some(port) = args.mesh {
+                services::run(shared.clone(), port, stopping.clone()).await;
+            }
+        };
+        let (served, nodes, (), (), (), ()) = tokio::join!(server, nodes, work, names, mesh, proxy);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });

@@ -16,7 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-tokio = { version = "1", features = ["rt", "net", "signal", "sync", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "signal", "sync", "time", "macros", "io-util"] }
 # Cluster identity (Phase 2): rustls, tokio-rustls, webpki, reqwest and ring are already
 # linked through kith-runtime's registry client; rcgen writes the certificates.
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }

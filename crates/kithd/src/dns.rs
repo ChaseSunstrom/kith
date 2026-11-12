@@ -91,7 +91,7 @@ fn records_of(record: &DnsRecordSpec, domain: &str, ttl: u32) -> Result<Vec<Reco
 }
 
 /// What the server answers from, and what to report on each DNSZone and DNSRecord.
-pub fn zones_of(store: &Store) -> (Zones, BTreeMap<String, Value>) {
+pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTreeMap<String, Value>) {
     let mut status = BTreeMap::new();
     let served = || json!({ "state": "served" });
     let failed = |why: String| json!({ "state": "error", "message": why });
@@ -115,6 +115,18 @@ pub fn zones_of(store: &Store) -> (Zones, BTreeMap<String, Value>) {
             .and_then(|status| status["mesh"]["address"].as_str());
         if let Some(address) = mesh.and_then(|address| address.parse().ok()) {
             let (name, ttl) = (format!("{}.mesh.kith", node.metadata.name), NODE_TTL);
+            let data = Rdata::Aaaa(address);
+            own.push(Record { name, ttl, data });
+        }
+    }
+    // `<service>.<namespace>.kith`: the Service's address on the mesh.
+    for (key, address) in mesh
+        .into_iter()
+        .flat_map(|mesh| crate::services::addresses(store, mesh))
+    {
+        let mut parts = key.split('/').skip(1);
+        if let (Some(namespace), Some(service)) = (parts.next(), parts.next()) {
+            let (name, ttl) = (format!("{service}.{namespace}.kith"), NODE_TTL);
             let data = Rdata::Aaaa(address);
             own.push(Record { name, ttl, data });
         }
@@ -256,7 +268,7 @@ pub async fn run(
         loop {
             let reports = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                let kinds = ["Node", "DNSZone", "DNSRecord"].into_iter();
+                let kinds = ["Node", "Service", "DNSZone", "DNSRecord"].into_iter();
                 let made_of = |r: &Resource| {
                     (
                         r.key(),
@@ -271,7 +283,11 @@ pub async fn run(
                     .collect();
                 (built_from.as_ref() != Some(&from)).then(|| {
                     built_from = Some(from);
-                    let (built, reports) = zones_of(&state.store);
+                    let mesh = shared
+                        .cluster
+                        .as_ref()
+                        .map(|cluster| crate::mesh::prefix(&cluster.me.ca));
+                    let (built, reports) = zones_of(&state.store, mesh);
                     zones.send_replace(Arc::new(built));
                     let stale = |(key, report): &(String, Value)| {
                         let live = state.store.get(key).and_then(|resource| resource.status.as_ref());
@@ -384,7 +400,8 @@ spec: {}
                 Some(json!({ "address": "10.1.2.3:7443", "mesh": { "address": "fd00:1::1" } })),
             )
             .unwrap();
-        let (zones, status) = zones_of(&store);
+        let mesh = kith_mesh::prefix(b"test");
+        let (zones, status) = zones_of(&store, Some(mesh));
         let outside = "198.51.100.1";
         let on_mesh = zones.lookup(outside.parse().unwrap(), "alpha.mesh.kith", 28).unwrap();
         assert_eq!(on_mesh.answers[0].data, Rdata::Aaaa("fd00:1::1".parse().unwrap()));

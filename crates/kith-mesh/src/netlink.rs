@@ -8,7 +8,7 @@ use netlink_packet_core::{
 };
 use netlink_packet_generic::GenlMessage;
 use netlink_packet_generic::ctrl::{GenlCtrl, GenlCtrlCmd, nlas::GenlCtrlAttrs};
-use netlink_packet_route::address::{AddressAttribute, AddressMessage};
+use netlink_packet_route::address::{AddressAttribute, AddressMessage, CacheInfo};
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkFlags, LinkInfo, LinkMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_packet_wireguard::{
@@ -16,7 +16,7 @@ use netlink_packet_wireguard::{
     WireguardMessage, WireguardPeer, WireguardPeerAttribute, WireguardPeerFlags,
 };
 use netlink_sys::{Socket, SocketAddr, protocols};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
 use std::net::Ipv6Addr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +37,8 @@ pub struct Device {
     family: u16,
     /// The peers as last set, once they have been.
     had: Option<BTreeMap<Key, Peer>>,
+    /// The further addresses (services') this has put on the interface.
+    held: BTreeSet<Ipv6Addr>,
 }
 
 fn socket(protocol: isize) -> Result<Socket> {
@@ -136,27 +138,58 @@ impl Device {
             index,
             family,
             had: None,
+            held: BTreeSet::new(),
         };
         device.set(vec![
             WireguardAttribute::PrivateKey(*key),
             WireguardAttribute::ListenPort(port),
         ])?;
 
-        let mut to = AddressMessage::default();
-        to.header.family = AddressFamily::Inet6;
-        to.header.prefix_len = MESH_BITS;
-        to.header.index = index;
-        to.attributes.push(AddressAttribute::Address(address.into()));
         // (The /48 on the interface is the route to every other node too.)
-        ask_route(
-            RouteNetlinkMessage::NewAddress(to),
-            NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
-        )?;
+        device.address(address, MESH_BITS, true)?;
         let mut up = link(index, None);
         up.header.flags = LinkFlags::Up;
         up.header.change_mask = LinkFlags::Up;
         ask_route(RouteNetlinkMessage::SetLink(up), NLM_F_ACK)?;
         Ok(device)
+    }
+
+    /// Put `address` on the interface, or take it off.
+    fn address(&self, address: Ipv6Addr, bits: u8, there: bool) -> Result<()> {
+        let mut message = AddressMessage::default();
+        message.header.family = AddressFamily::Inet6;
+        message.header.prefix_len = bits;
+        message.header.index = self.index;
+        message.attributes.push(AddressAttribute::Address(address.into()));
+        // A further address (every node has it) is never what this node's own traffic
+        // comes from: the others would not take it for this node's. "Deprecated", to
+        // the kernel: good to be reached at, not to be picked for calling out.
+        if bits == 128 {
+            let mut times = CacheInfo::default();
+            (times.ifa_preferred, times.ifa_valid) = (0, u32::MAX);
+            message.attributes.push(AddressAttribute::CacheInfo(times));
+        }
+        let (message, flags) = match there {
+            true => (RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_REPLACE),
+            false => (RouteNetlinkMessage::DelAddress(message), 0),
+        };
+        ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
+    }
+
+    /// Make the further addresses of the interface (besides its own) `wanted`.
+    //
+    // ponytail: only what this Device added is taken off again: addresses left by a
+    // kithd that was killed stay until the interface goes.
+    pub fn set_addresses(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
+        for gone in self.held.clone().difference(wanted) {
+            self.address(*gone, 128, false)?;
+            self.held.remove(gone);
+        }
+        for new in wanted.difference(&self.held.clone()) {
+            self.address(*new, 128, true)?;
+            self.held.insert(*new);
+        }
+        Ok(())
     }
 
     fn message(&self, cmd: WireguardCmd, mut attributes: Vec<WireguardAttribute>) -> GenlMessage<WireguardMessage> {
