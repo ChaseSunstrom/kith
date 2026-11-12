@@ -1,0 +1,26 @@
+# kithd in agent mode, as a systemd user service (rootless containers):
+#
+#   install -Dm644 dist/kithd.service ~/.config/systemd/user/kithd.service
+#   systemctl --user enable --now kithd
+#   loginctl enable-linger "$USER"     # keep it running after you log out
+#
+# Needs systemd 254 or newer (DelegateSubgroup) and cgroup v2.
+[Unit]
+Description=kith node daemon (agent mode)
+Documentation=https://github.com/ChaseSunstrom/kith
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/kithd
+Restart=on-failure
+# kithd gets this unit's cgroup subtree: it sits in `supervisor`, each container
+# in a cgroup next to it.
+Delegate=yes
+DelegateSubgroup=supervisor
+# SIGTERM goes to kithd alone, which stops its containers itself.
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

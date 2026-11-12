@@ -6,23 +6,32 @@ A tiny, immutable operating system that turns all of your machines into one
 cluster, configured entirely through declarative resources. The design is in
 [PLAN.md](PLAN.md).
 
-## Status: Phase 0 done, Phase 1 started
+## Status: one node, in agent mode
 
-There is no daemon yet. What works today is the resource model, the `kith`
-command against a local store file, and a container runtime library that
-nothing drives yet:
+`kithd` runs as a service on an existing Linux distro, owns the store, and keeps
+the containers on that machine matching the `Workload`s you apply. Clustering,
+networking and the OS image come next (Phase 2 onwards in the plan).
 
 ```sh
 cargo build --release
-alias kith=target/release/kith
-export KITH_STORE=/tmp/kith-demo/store.json   # default: ~/.local/share/kith/store.json
+export PATH=$PWD/target/release:$PATH
 
-kith lint -f examples/           # validate without touching the store
+kithd &                          # as you, no root: needs cgroup v2 and a systemd user session
+kith apply -f examples/hello.yaml
+kith get                         # Workload  default  hello  1  1/1 ready
+kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
+tail ~/.local/state/kith/logs/default_hello_0_main.out
+kith delete workload/hello       # stops its containers
+```
+
+Everything goes through the same few commands:
+
+```sh
+kith lint -f examples/           # validate files; needs no daemon
 kith diff -f examples/           # what apply would change; exits 1 if anything
-kith apply -f examples/
-kith get                         # or: kith get workload/jellyfin -n media -o yaml
-kith history workload/jellyfin -n media
-kith rollback workload/jellyfin -n media --to 1
+kith apply -f examples/          # all or nothing
+kith history workload/hello
+kith rollback workload/hello --to 1
 kith schema                      # the 26 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
@@ -34,19 +43,30 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   |             ^
 ```
 
-## Containers
+## What kithd does today
 
-`kith-runtime` pulls an OCI image into a content-addressed store and runs it in
-its own cgroup, with youki's `libcontainer` linked in: no containerd, no shim,
-no root. `kithd` will drive it; until then its end-to-end test is the demo:
+- Serves the resource API as HTTP/JSON on a unix socket only you can open
+  (`$XDG_RUNTIME_DIR/kith/kithd.sock`; `--socket` or `KITH_SOCKET` to move it).
+- Keeps resources and their revision history in `~/.local/state/kith/store.json`
+  (`--state` or `KITH_STATE`). `kith --store FILE` reads or edits such a file
+  with no daemon.
+- Runs each `Workload` container in its own cgroup with youki's `libcontainer`
+  linked in: no containerd, no shim, no root. Images are pulled into a
+  content-addressed store. Memory and CPU limits, `command`/`args`, and `env`
+  from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
+  restarted according to `restartPolicy`, with a backoff of up to a minute.
+- On SIGTERM it stops the containers it started.
 
-```sh
-KITH_E2E=1 cargo test -p kith-runtime --test e2e    # needs a registry, user namespaces and a systemd user session
-```
+Not yet: `exec` units, volumes, ports and probes are accepted but do nothing
+(the status says so for `exec` and volumes), containers share the host's
+network and a read-only image (tmpfs on `/tmp` and `/run`), a changed Workload
+is stopped and then started rather than rolled, pulls are anonymous, layers
+must be gzip or plain tar, and there is no seccomp filter. Kinds other than
+`Workload`, `ConfigMap` and `Secret` are stored and validated but nothing acts
+on them. Running as root is untested.
 
-Limits for now: the image is shared read-only (with tmpfs on `/tmp` and `/run`),
-containers use the host's network, pulls are anonymous, layers must be gzip or
-plain tar, and there is no seccomp filter yet.
+[`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has
+not been run under systemd yet.
 
 ## YAML, strictly
 
@@ -66,11 +86,13 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-api` | The resource envelope, the built-in kinds, JSON Schemas, and the store (apply, diff, revisions) |
 | `crates/kith-cli` | The `kith` command |
 | `crates/kith-runtime` | Image pulls and containers |
+| `crates/kithd` | The daemon: API server, store owner and Workload controller |
 
 ## Development
 
 ```sh
 cargo test --workspace
+KITH_E2E=1 cargo test -p kithd -p kith-runtime --test e2e   # pulls an image and runs containers
 cargo clippy --workspace --all-targets -- -D warnings
 python3 ci/budgets.py            # binary-size and memory budgets, enforced in CI
 ```

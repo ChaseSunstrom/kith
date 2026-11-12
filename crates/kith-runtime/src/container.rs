@@ -38,6 +38,8 @@ pub struct Unit {
 pub struct Handle {
     container: Container,
     pid: Pid,
+    /// Its exit status has been collected; the pid may belong to something else by now.
+    reaped: bool,
     bundle: PathBuf,
     /// Path of the container's cgroup under `/sys/fs/cgroup`.
     pub cgroup: PathBuf,
@@ -122,12 +124,26 @@ impl Runtime {
             let _ = fs::remove_dir_all(&bundle);
         }
         let (container, pid) = built?;
-        Ok(Handle {
+        let mut handle = Handle {
             container,
             pid,
+            reaped: false,
             bundle,
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
-        })
+        };
+        // A memory limit that swap could stretch is no limit. The OCI spec cannot say
+        // "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
+        if unit.memory_bytes.is_some() {
+            match fs::write(handle.cgroup.join("memory.swap.max"), "0") {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    let _ = handle.container.delete(true);
+                    let _ = fs::remove_dir_all(&handle.bundle);
+                    return Err(e).ctx(format!("{what}: turning swap off"));
+                }
+                _ => {} // No such file: this kernel does no swap accounting.
+            }
+        }
+        Ok(handle)
     }
 }
 
@@ -142,8 +158,8 @@ impl Handle {
         loop {
             match waitpid(self.pid, None) {
                 Err(nix::errno::Errno::EINTR) => {}
-                Ok(WaitStatus::Exited(_, code)) => return Ok(code),
-                Ok(WaitStatus::Signaled(_, signal, _)) => return Ok(128 + signal as i32),
+                Ok(WaitStatus::Exited(_, code)) => break self.reaped(code),
+                Ok(WaitStatus::Signaled(_, signal, _)) => break self.reaped(128 + signal as i32),
                 other => return err(format!("waiting for the container: {other:?}")),
             }
         }
@@ -154,10 +170,15 @@ impl Handle {
         let flags = Some(nix::sys::wait::WaitPidFlag::WNOHANG);
         match waitpid(self.pid, flags).ctx("checking on the container")? {
             WaitStatus::StillAlive => Ok(None),
-            WaitStatus::Exited(_, code) => Ok(Some(code)),
-            WaitStatus::Signaled(_, signal, _) => Ok(Some(128 + signal as i32)),
+            WaitStatus::Exited(_, code) => self.reaped(code).map(Some),
+            WaitStatus::Signaled(_, signal, _) => self.reaped(128 + signal as i32).map(Some),
             other => err(format!("unexpected wait status {other:?}")),
         }
+    }
+
+    fn reaped(&mut self, code: i32) -> Result<i32> {
+        self.reaped = true;
+        Ok(code)
     }
 
     pub fn kill(&mut self) -> Result<()> {
@@ -169,6 +190,10 @@ impl Handle {
     /// Kill it if it still runs, then remove its cgroup, state and bundle.
     pub fn delete(mut self) -> Result<()> {
         let deleted = self.container.delete(true).ctx("deleting the container");
+        // It was killed just now: collect it, or it stays a zombie for as long as we live.
+        if deleted.is_ok() && !self.reaped {
+            let _ = waitpid(self.pid, None);
+        }
         fs::remove_dir_all(&self.bundle).ctx("deleting the container")?;
         deleted
     }
@@ -263,9 +288,10 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
 
     let mut resources = LinuxResourcesBuilder::default();
     if let Some(bytes) = unit.memory_bytes {
-        // Memory plus swap capped at the same number: a hard limit, not one swap can stretch.
-        let limit = i64::try_from(bytes)?;
-        resources = resources.memory(LinuxMemoryBuilder::default().limit(limit).swap(limit).build()?);
+        if bytes == 0 {
+            return Err("a memory limit of 0 leaves nothing to run in".into());
+        }
+        resources = resources.memory(LinuxMemoryBuilder::default().limit(i64::try_from(bytes)?).build()?);
     }
     if let Some(millis) = unit.cpu_millis {
         // 1000 millis = one full 100 ms period. The kernel wants at least 1 ms of it, and 0 would mean no limit.
@@ -302,6 +328,11 @@ mod tests {
             "0 would mean unlimited"
         );
         assert!(spec("a", &image, &unit(Some(9)), "/kith/a").is_err());
+        let no_memory = Unit {
+            memory_bytes: Some(0),
+            ..Unit::default()
+        };
+        assert!(spec("a", &image, &no_memory, "/kith/a").is_err());
 
         let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a").unwrap();
         assert_eq!(made.hostname().as_ref().unwrap().len(), 63);
@@ -314,7 +345,6 @@ mod tests {
         );
         let resources = linux.resources().as_ref().unwrap();
         assert_eq!(resources.cpu().as_ref().unwrap().quota(), Some(50_000));
-        let memory = resources.memory().as_ref().unwrap();
-        assert_eq!((memory.limit(), memory.swap()), (Some(1 << 20), Some(1 << 20)));
+        assert_eq!(resources.memory().as_ref().unwrap().limit(), Some(1 << 20));
     }
 }

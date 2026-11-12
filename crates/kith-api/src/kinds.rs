@@ -43,6 +43,27 @@ impl TryFrom<String> for Quantity {
     }
 }
 
+impl Quantity {
+    /// The amount as a plain number: `500m` is 0.5, `2Gi` is 2147483648.
+    pub fn value(&self) -> f64 {
+        let number = self.0.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+        let scale = match &self.0[number.len()..] {
+            "m" => 1e-3,
+            "k" => 1e3,
+            "M" => 1e6,
+            "G" => 1e9,
+            "T" => 1e12,
+            "Ki" => 1024.0,
+            "Mi" => 1024.0 * 1024.0,
+            "Gi" => 1024.0 * 1024.0 * 1024.0,
+            "Ti" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+            _ => 1.0,
+        };
+        // Validated on the way in, so the number always parses.
+        number.parse::<f64>().unwrap_or(0.0) * scale
+    }
+}
+
 impl From<Quantity> for String {
     fn from(q: Quantity) -> String {
         q.0
@@ -720,6 +741,10 @@ impl Template {
 
 impl Spec for WorkloadSpec {
     fn check(&self) -> Result<(), String> {
+        // ponytail: a typo guard, not a design limit; raise it when one Workload really needs more.
+        if self.replicas.is_some_and(|n| n > 1000) {
+            return Err("replicas: at most 1000".into());
+        }
         self.template.check("template")
     }
 }

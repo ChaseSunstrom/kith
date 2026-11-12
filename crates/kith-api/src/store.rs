@@ -41,7 +41,8 @@ pub struct Revision {
     pub resource: Resource,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Action {
     Created,
     Updated,
@@ -49,7 +50,7 @@ pub enum Action {
 }
 
 /// What applying a resource does, or would do.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Change {
     pub action: Action,
     pub before: Option<Resource>,
@@ -129,6 +130,15 @@ impl Store {
             }
         }
         Ok(change)
+    }
+
+    /// Apply several resources, all or nothing: if one is refused the store is left as it was.
+    pub fn apply_all(&mut self, desired: Vec<Resource>) -> Result<Vec<Change>, Error> {
+        // ponytail: clones the whole store per call; fine until stores are large, then stage per key.
+        let mut staged = self.clone();
+        let changes = desired.into_iter().map(|r| staged.apply(r)).collect::<Result<_, _>>()?;
+        *self = staged;
+        Ok(changes)
     }
 
     pub fn get(&self, key: &str) -> Option<&Resource> {

@@ -69,7 +69,7 @@ fn diff_apply_history_rollback() {
     assert_eq!(err, "2 to create, 0 to update, 0 unchanged\n");
     assert_eq!(
         sb.kith(&["get"]).1,
-        "KIND  NAMESPACE  NAME  REVISION\n",
+        "KIND  NAMESPACE  NAME  REVISION  STATUS\n",
         "diff must not write"
     );
 
@@ -125,7 +125,7 @@ fn diff_apply_history_rollback() {
     let (_, out, _) = sb.kith(&["get"]);
     assert_eq!(
         out,
-        "KIND       NAMESPACE  NAME        REVISION\nConfigMap  default    web-config  1\nWorkload   default    web         2\n"
+        "KIND       NAMESPACE  NAME        REVISION  STATUS\nConfigMap  default    web-config  1\nWorkload   default    web         2\n"
     );
     let (_, yaml, _) = sb.kith(&["get", "workload/web", "-o", "yaml"]);
     assert!(
@@ -240,6 +240,7 @@ fn bad_yaml_points_at_file_and_line() {
     assert!(err.starts_with("error: missing.yaml: "), "{err}");
 
     // A store that is not a store is reported, never overwritten.
+    std::fs::create_dir_all(sb.0.join("store")).unwrap(); // nothing so far created it
     sb.write("store/store.json", "not json");
     let (code, _, err) = sb.kith(&["apply", "-f", "good.yaml"]);
     assert_eq!(code, 2);
@@ -255,10 +256,10 @@ fn examples_and_schemas() {
     let sb = Sandbox::new("examples");
     let examples = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     let (code, out, err) = sb.kith(&["lint", "-f", examples]);
-    assert_eq!((code, out.as_str()), (0, "4 resources ok\n"), "{err}");
+    assert_eq!((code, out.as_str()), (0, "5 resources ok\n"), "{err}");
     let (code, out, _) = sb.kith(&["apply", "-f", examples]);
     assert_eq!(code, 0);
-    assert_eq!(out.lines().count(), 4);
+    assert_eq!(out.lines().count(), 5);
     assert_eq!(sb.kith(&["diff", "-f", examples]).0, 0);
 
     let (_, out, _) = sb.kith(&["schema"]);

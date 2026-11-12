@@ -77,6 +77,11 @@ async fn pull_and_run() {
     let read = |file: &str| fs::read_to_string(c.cgroup.join(file)).unwrap();
     assert_eq!(read("memory.max").trim(), (64 << 20).to_string());
     assert_eq!(read("cpu.max").trim(), "50000 100000");
+    assert_eq!(
+        read("memory.swap.max").trim(),
+        "0",
+        "the memory limit is not stretched by swap"
+    );
     assert_eq!(read("cgroup.procs").lines().count(), 1);
     assert_eq!(fs::read_to_string(&out).unwrap(), "", "created, not started");
     let cgroup = c.cgroup.clone();

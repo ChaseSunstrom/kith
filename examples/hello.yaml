@@ -1,0 +1,14 @@
+# The smallest thing kithd runs: `kith apply -f examples/hello.yaml`.
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: hello
+spec:
+  template:
+    containers:
+      - name: main
+        image: mirror.gcr.io/library/busybox:1.36
+        command: [sh, -c, "while true; do echo hello from $(hostname); sleep 5; done"]
+        resources:
+          memory: 32Mi
+          cpu: 100m

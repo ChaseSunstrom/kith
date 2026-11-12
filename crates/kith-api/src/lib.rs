@@ -125,6 +125,24 @@ kinds! {
     Identity: IdentitySpec, cluster, "A user, node or workload that can call the API";
 }
 
+/// Where kithd listens and `kith` connects: `$KITH_SOCKET`, else
+/// `/run/kith/kithd.sock` for root, else `$XDG_RUNTIME_DIR/kith/kithd.sock`.
+pub fn default_socket() -> Option<std::path::PathBuf> {
+    let env = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    if let Some(path) = env("KITH_SOCKET") {
+        return Some(path);
+    }
+    // Root has no XDG_RUNTIME_DIR under systemd's system manager.
+    match env("XDG_RUNTIME_DIR") {
+        Some(dir) => Some(dir.join("kith/kithd.sock")),
+        None => std::fs::metadata("/run").ok().map(|_| "/run/kith/kithd.sock".into()),
+    }
+}
+
 /// Look a kind up by name, ignoring case (`workload` finds `Workload`).
 pub fn kind(name: &str) -> Option<&'static KindInfo> {
     KINDS.iter().find(|k| k.kind.eq_ignore_ascii_case(name))

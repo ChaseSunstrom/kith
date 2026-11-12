@@ -1,0 +1,21 @@
+[package]
+name = "kithd"
+description = "The kith node daemon: API server, store and workload controller in one process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-api.workspace = true
+kith-runtime = { path = "../kith-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tokio = { version = "1", features = ["rt", "net", "signal", "sync", "time", "macros"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

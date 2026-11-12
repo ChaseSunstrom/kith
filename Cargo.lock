@@ -1027,6 +1027,7 @@ dependencies = [
  "clap",
  "kith-api",
  "kith-yaml",
+ "serde",
  "serde_json",
 ]
 

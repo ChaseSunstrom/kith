@@ -1,13 +1,13 @@
 //! `kith`: the command line for kith.
 //!
-//! Phase 0 works on a local store file. Once kithd serves the API (Phase 1),
-//! the same commands talk to it instead.
+//! Commands talk to kithd over its unix socket, or with `--store` work on a
+//! store file directly (no daemon, nothing runs).
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use kith_api::store::{Action, FileStore, rfc3339};
+use kith_api::store::{self, Action, Change, FileStore, Revision, Store, rfc3339};
 use kith_api::{DEFAULT_NAMESPACE, KINDS, Resource};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -17,8 +17,11 @@ use std::process::ExitCode;
     about = "Configure a kith cluster through declarative resources"
 )]
 struct Cli {
-    /// Local store file [default: $XDG_DATA_HOME/kith/store.json]
-    #[arg(long, env = "KITH_STORE", global = true, value_name = "PATH")]
+    /// kithd's socket [default: $XDG_RUNTIME_DIR/kith/kithd.sock, or /run/kith/kithd.sock]
+    #[arg(long, env = "KITH_SOCKET", global = true, value_name = "PATH")]
+    socket: Option<PathBuf>,
+    /// Work on a store file directly instead of talking to kithd (wins over --socket)
+    #[arg(long, env = "KITH_STORE", global = true, value_name = "FILE")]
     store: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -132,27 +135,155 @@ fn fail<T>(e: impl std::fmt::Display) -> Result<T, String> {
     Err(format!("error: {e}"))
 }
 
+/// Where the resources live: kithd behind its socket, or a store file used directly.
+enum Backend {
+    Daemon(PathBuf),
+    Local(PathBuf),
+}
+
+impl Backend {
+    /// Local changes go through here: nothing is saved unless `change` succeeds.
+    fn local<T>(
+        path: &Path,
+        write: bool,
+        change: impl FnOnce(&mut Store) -> Result<T, store::Error>,
+    ) -> Result<T, String> {
+        // Commands that only look never create, lock or wait for the store.
+        let mut file_store = if write {
+            FileStore::open(path)
+        } else {
+            FileStore::read(path)
+        }
+        .or_else(fail)?;
+        let value = change(&mut file_store.store).or_else(fail)?;
+        if write {
+            file_store.save().or_else(fail)?;
+        }
+        Ok(value)
+    }
+
+    /// All or nothing. A dry run reports the same changes and keeps none of them.
+    fn apply(&self, resources: Vec<Resource>, dry_run: bool) -> Result<Vec<Change>, String> {
+        match self {
+            Backend::Local(path) => Self::local(path, !dry_run, |store| store.apply_all(resources)),
+            Backend::Daemon(socket) => {
+                let body = serde_json::to_vec(&resources).or_else(fail)?;
+                let query = if dry_run { "?dryRun=true" } else { "" };
+                request(socket, "POST", &format!("/v1/apply{query}"), &body)
+            }
+        }
+    }
+
+    fn list(&self, kind: Option<&str>) -> Result<Vec<Resource>, String> {
+        match self {
+            Backend::Local(path) => Self::local(path, false, |store| Ok(store.list(kind).cloned().collect())),
+            Backend::Daemon(socket) => {
+                let query = kind.map(|k| format!("?kind={k}")).unwrap_or_default();
+                request(socket, "GET", &format!("/v1/resources{query}"), b"")
+            }
+        }
+    }
+
+    fn get(&self, key: &str) -> Result<Resource, String> {
+        match self {
+            Backend::Local(path) => {
+                let found = |store: &mut Store| store.get(key).cloned().ok_or(store::Error::NotFound(key.into()));
+                Self::local(path, false, found)
+            }
+            Backend::Daemon(socket) => request(socket, "GET", &format!("/v1/resources/{}", escape(key)), b""),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<Resource, String> {
+        match self {
+            Backend::Local(path) => Self::local(path, true, |store| store.delete(key)),
+            Backend::Daemon(socket) => request(socket, "DELETE", &format!("/v1/resources/{}", escape(key)), b""),
+        }
+    }
+
+    fn history(&self, key: &str) -> Result<Vec<Revision>, String> {
+        match self {
+            Backend::Local(path) => Self::local(path, false, |store| store.history(key).map(<[Revision]>::to_vec)),
+            Backend::Daemon(socket) => request(socket, "GET", &format!("/v1/history/{}", escape(key)), b""),
+        }
+    }
+
+    fn rollback(&self, key: &str, to: u64) -> Result<Change, String> {
+        match self {
+            Backend::Local(path) => Self::local(path, true, |store| store.rollback(key, to)),
+            Backend::Daemon(socket) => request(socket, "POST", &format!("/v1/rollback/{}?to={to}", escape(key)), b""),
+        }
+    }
+}
+
+/// Percent-encode a resource key for a URL path. Valid keys pass through unchanged.
+fn escape(key: &str) -> String {
+    let plain = |b: u8| b.is_ascii_alphanumeric() || b"-._/".contains(&b);
+    key.bytes()
+        .map(|b| {
+            if plain(b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// One HTTP request to kithd over its unix socket.
+// ponytail: HTTP/1.1 by hand keeps an HTTP client and an async runtime out of the CLI
+// (the size and RSS budgets). It relies on `Connection: close` and kithd never
+// chunking these replies; swap in a client library when the API goes over the network.
+fn request<T: serde::de::DeserializeOwned>(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<T, String> {
+    use std::io::Write;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
+        let socket = socket.display();
+        format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
+    })?;
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut reply = Vec::new();
+    let sent = stream.write_all(head.as_bytes()).and_then(|()| stream.write_all(body));
+    // kithd may refuse a request before reading all of it (too large): its reply still explains why.
+    let read = stream.read_to_end(&mut reply);
+    let sent = if reply.is_empty() { sent } else { Ok(()) };
+    sent.and(read).or_else(|e| fail(format!("talking to kithd: {e}")))?;
+
+    let split = reply
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("error: kithd sent no reply")?;
+    let head = String::from_utf8_lossy(&reply[..split]).to_ascii_lowercase();
+    let body = &reply[split + 4..];
+    if head.contains("transfer-encoding") {
+        return fail("kithd sent a chunked reply, which this kith cannot read");
+    }
+    let ok = head.split(' ').nth(1).is_some_and(|status| status.starts_with('2'));
+    if !ok {
+        // API errors are `{"error": "..."}`; anything else (a malformed request) is plain text.
+        let message = serde_json::from_slice::<serde_json::Value>(body).ok();
+        let message = message.as_ref().and_then(|m| m["error"].as_str()).map(String::from);
+        return fail(message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned()));
+    }
+    serde_json::from_slice(body).or_else(|e| fail(format!("reading kithd's reply: {e}")))
+}
+
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    let path = || {
-        cli.store
-            .clone()
-            .or_else(default_store)
-            .ok_or("error: no store path: set --store or $KITH_STORE")
+    let backend = || match (&cli.store, cli.socket.clone().or_else(kith_api::default_socket)) {
+        (Some(path), _) => Ok(Backend::Local(path.clone())),
+        (None, Some(socket)) => Ok(Backend::Daemon(socket)),
+        (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
     };
-    // Commands that only look never create, lock or wait for the store.
-    let read = || FileStore::read(&path()?).or_else(fail);
-    let open = || FileStore::open(&path()?).or_else(fail);
     match cli.command {
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });
         }
         Command::Diff { files } => {
-            let resources = load(&files)?;
-            let file_store = read()?;
             let mut counts = [0; 3];
-            for resource in resources {
-                let change = file_store.store.plan(resource).or_else(fail)?;
+            for change in backend()?.apply(load(&files)?, true)? {
                 counts[change.action as usize] += 1;
                 let diff = change.diff();
                 if !diff.is_empty() {
@@ -166,11 +297,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             return Ok(ExitCode::from(u8::from(counts[0] + counts[1] > 0)));
         }
         Command::Apply { files, dry_run } => {
-            let resources = load(&files)?;
-            let mut file_store = if dry_run { read()? } else { open()? };
-            // Nothing is saved unless every resource applies.
-            for resource in resources {
-                let change = file_store.store.apply(resource).or_else(fail)?;
+            for change in backend()?.apply(load(&files)?, dry_run)? {
                 let what = match change.action {
                     Action::Created => "created",
                     Action::Updated => "updated",
@@ -180,9 +307,6 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 let dry = if dry_run { " (dry run)" } else { "" };
                 println!("{} {what} (revision {revision}){dry}", change.after.key());
             }
-            if !dry_run {
-                file_store.save().or_else(fail)?;
-            }
         }
         Command::Get {
             target,
@@ -190,8 +314,6 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             namespace,
             output,
         } => {
-            let file_store = open()?;
-            let store = &file_store.store;
             let (kind_name, name) = match &target {
                 Some(t) => match t.split_once('/') {
                     Some((kind, name)) => (Some(kind), Some(name.to_string())),
@@ -201,15 +323,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let info = kind_name.map(find_kind).transpose()?;
             let single = name.is_some();
-            let found: Vec<&Resource> = match (info, name) {
-                (Some(info), Some(name)) => {
-                    let key = key(info, &name, namespace.as_deref());
-                    vec![store.get(&key).ok_or(format!("error: {key} not found"))?]
+            let found: Vec<Resource> = match (info, name) {
+                (Some(info), Some(name)) => vec![backend()?.get(&key(info, &name, namespace.as_deref()))?],
+                (info, _) => {
+                    let mut all = backend()?.list(info.map(|i| i.kind))?;
+                    all.retain(|r| namespace.is_none() || r.metadata.namespace == namespace);
+                    all
                 }
-                (info, _) => store
-                    .list(info.map(|i| i.kind))
-                    .filter(|r| namespace.is_none() || r.metadata.namespace == namespace)
-                    .collect(),
             };
             match output {
                 Output::Yaml => {
@@ -219,7 +339,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     }
                 }
                 // One named resource is an object; a listing is an array.
-                Output::Json if single => println!("{}", serde_json::to_string_pretty(found[0]).or_else(fail)?),
+                Output::Json if single => println!("{}", serde_json::to_string_pretty(&found[0]).or_else(fail)?),
                 Output::Json => println!("{}", serde_json::to_string_pretty(&found).or_else(fail)?),
                 Output::Table => {
                     let rows = found.iter().map(|r| {
@@ -229,23 +349,21 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                             m.namespace.clone().unwrap_or_default(),
                             m.name.clone(),
                             m.revision.unwrap_or(0).to_string(),
+                            status_summary(r),
                         ]
                     });
-                    print_table(["KIND", "NAMESPACE", "NAME", "REVISION"], rows.collect());
+                    print_table(["KIND", "NAMESPACE", "NAME", "REVISION", "STATUS"], rows.collect());
                 }
             }
         }
         Command::Delete { target } => {
             let key = target.key()?;
-            let mut file_store = open()?;
-            file_store.store.delete(&key).or_else(fail)?;
-            file_store.save().or_else(fail)?;
+            backend()?.delete(&key)?;
             println!("{key} deleted");
         }
         Command::History { target } => {
-            let key = target.key()?;
-            let file_store = read()?;
-            let rows = file_store.store.history(&key).or_else(fail)?.iter().map(|r| {
+            let history = backend()?.history(&target.key()?)?;
+            let rows = history.iter().map(|r| {
                 let m = &r.resource.metadata;
                 [m.revision.unwrap_or(0).to_string(), rfc3339(r.at)]
             });
@@ -253,9 +371,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
         Command::Rollback { target, to } => {
             let key = target.key()?;
-            let mut file_store = open()?;
-            let change = file_store.store.rollback(&key, to).or_else(fail)?;
-            file_store.save().or_else(fail)?;
+            let change = backend()?.rollback(&key, to)?;
             match change.action {
                 Action::Unchanged => println!("{key} already matches revision {to}"),
                 _ => println!(
@@ -280,12 +396,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn default_store() -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".local/share")))?;
-    Some(data.join("kith/store.json"))
+/// The STATUS column: what a controller reported, in a few words.
+fn status_summary(resource: &Resource) -> String {
+    let Some(status) = &resource.status else {
+        return String::new();
+    };
+    match (status["ready"].as_u64(), status["replicas"].as_u64()) {
+        (Some(ready), Some(replicas)) => {
+            // Why it is not ready, if a container said so.
+            let containers = status["containers"].as_array().into_iter().flatten();
+            let why = containers.filter_map(|c| c["message"].as_str()).next();
+            // First line only, and nothing that could drive the terminal: it quotes the image name.
+            let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
+            let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
+            format!("{ready}/{replicas} ready{why}")
+        }
+        _ => String::new(),
+    }
 }
 
 fn find_kind(name: &str) -> Result<&'static kith_api::KindInfo, String> {

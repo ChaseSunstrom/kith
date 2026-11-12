@@ -338,3 +338,27 @@ fn file_store() {
     assert!(fs.store.delete("Workload/default/web").is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn apply_all_is_all_or_nothing() {
+    let mut store = Store::default();
+    let mut bad = one(&workload(""));
+    bad.metadata.name = "Not Valid".into();
+    assert!(store.apply_all(vec![one(&workload("")), bad]).is_err());
+    assert_eq!(store.list(None).count(), 0, "the good one was not applied either");
+    let changes = store.apply_all(load(JELLYFIN)).unwrap();
+    assert_eq!(changes.len(), 3);
+    assert_eq!(store.list(None).count(), 3);
+    // Changes travel over the API as JSON.
+    let wire: Vec<store::Change> = serde_json::from_str(&serde_json::to_string(&changes).unwrap()).unwrap();
+    assert_eq!(wire, changes);
+}
+
+#[test]
+fn quantities_have_values() {
+    let q = |s: &str| kinds::Quantity::try_from(s.to_string()).unwrap().value();
+    assert_eq!(
+        (q("2"), q("500m"), q("1.5"), q("64Mi"), q("2Gi"), q("1G")),
+        (2.0, 0.5, 1.5, 67108864.0, 2147483648.0, 1e9)
+    );
+}

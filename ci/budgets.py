@@ -2,18 +2,27 @@
 """Size and memory budgets (PLAN.md §3.2, §8). CI fails when one is exceeded.
 
 Budgets are deliberately tight: raise one only in a commit that says why.
-kithd joins the table when it exists (idle RSS <= 40 MB on a 3-node cluster).
+The plan's ceiling for kithd is 40 MB idle on a 3-node cluster; one idle node
+in agent mode sits far below that, and its budget is set near what it measures
+so that creep shows up long before the ceiling does.
 """
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 TARGET = "x86_64-unknown-linux-musl"  # static, as shipped
 MB = 1024 * 1024
 
+# Measured 6.5 MB and 4.0 MB when kithd first ran workloads (API server, store,
+# controller, container runtime, registry client with TLS).
+KITHD_SIZE = 8
+KITHD_IDLE_RSS = 8 * MB
 # binary -> max size in bytes
-SIZE_BUDGETS = {"kith": int(2.5 * MB)}
+SIZE_BUDGETS = {"kith": int(2.5 * MB), "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
@@ -30,6 +39,42 @@ def peak_rss(argv, env):
     return int(line.split()[1]) * 1024  # reported in kB
 
 
+def idle_rss(kithd, tmp):
+    """Resident set size of a kithd that serves its socket and has nothing to run."""
+    socket = os.path.join(tmp, "kithd.sock")
+    daemon = subprocess.Popen([kithd, "--state", os.path.join(tmp, "state"), "--socket", socket], stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 10
+        while not os.path.exists(socket):
+            if daemon.poll() is not None or time.time() > deadline:
+                sys.exit("kithd did not start serving")
+            time.sleep(0.05)
+        time.sleep(0.5)  # past startup: the first reconcile pass has run
+        with open(f"/proc/{daemon.pid}/status") as status:
+            line = next(l for l in status if l.startswith("VmRSS:"))
+        return int(line.split()[1]) * 1024
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        daemon.wait()
+
+
+def musl_cc(env, tmp):
+    """kithd's TLS (ring) has C in it, so a static build needs a musl C compiler.
+
+    CI installs musl-tools. Where there is none but zig is installed, zig is one.
+    """
+    var = "CC_" + TARGET.replace("-", "_")
+    if var in env or shutil.which("musl-gcc") or shutil.which("x86_64-linux-musl-gcc") or not shutil.which("zig"):
+        return env
+    wrapper = os.path.join(tmp, "musl-cc")
+    with open(wrapper, "w") as f:
+        # cc-rs passes rustc's target name, which zig spells differently.
+        f.write('#!/bin/sh\nfor a; do shift; case "$a" in --target=*) ;; *) set -- "$@" "$a";; esac; done\n')
+        f.write('exec zig cc -target x86_64-linux-musl "$@"\n')
+    os.chmod(wrapper, 0o755)
+    return {**env, var: wrapper}
+
+
 def check(name, what, actual, limit):
     ok = actual <= limit
     print(f"{'ok  ' if ok else 'FAIL'} {name}: {what} {actual / MB:.2f} MB (budget {limit / MB:.2f} MB)")
@@ -40,11 +85,12 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = "--self-test" in sys.argv
-    # Only the budgeted binaries: kith-runtime's TLS (ring) needs a musl C compiler,
-    # which CI gets with kithd, the first binary that links it.
-    for binary in SIZE_BUDGETS:
-        package = "kith-cli" if binary == "kith" else binary
-        subprocess.run(["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package], check=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        build_env = musl_cc(os.environ.copy(), tmp)
+        for binary in SIZE_BUDGETS:
+            package = "kith-cli" if binary == "kith" else binary
+            build = ["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package]
+            subprocess.run(build, check=True, env=build_env)
     bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
     results = []
     for binary, limit in SIZE_BUDGETS.items():
@@ -55,6 +101,8 @@ def main():
         for name, (args, limit) in RSS_BUDGETS.items():
             rss = peak_rss([os.path.join(bin_dir, "kith"), *args], env)
             results.append(check(name, "peak RSS", rss, 1 if self_test else limit))
+        rss = idle_rss(os.path.join(bin_dir, "kithd"), tmp)
+        results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
     if self_test:
         # With 1-byte budgets every check must fail; otherwise the checks check nothing.
         if any(results):
