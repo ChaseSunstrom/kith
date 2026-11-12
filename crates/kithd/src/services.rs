@@ -16,12 +16,12 @@ use kith_api::store::Store;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 /// Where a connection may go: a node's name, a port on it, and the Workload it is of.
 type Backend = (String, u16, String);
@@ -184,7 +184,8 @@ fn policy_report(policy: &Resource) -> Value {
         );
     }
     match gaps.is_empty() {
-        true => json!({ "state": "enforced" }),
+        // (A message from before has to go: fields that are not written stay.)
+        true => json!({ "state": "enforced", "message": null }),
         false => json!({ "state": "partial", "message": gaps.join("; ") }),
     }
 }
@@ -224,6 +225,9 @@ impl Proxy {
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
         let mut stream = within(TcpStream::connect(there)).await?;
         stream.write_all(format!("{port} {workload}\n").as_bytes()).await?;
+        // It says so (one byte) when it has the replica; if it hangs up instead (a
+        // policy, a replica just gone), the next backend is tried.
+        within(stream.read_u8()).await?;
         Ok(stream)
     }
 
@@ -279,6 +283,7 @@ impl Proxy {
             return None;
         }
         let mut replica = local(port).await.ok()?;
+        from.write_all(b"+").await.ok()?;
         tokio::io::copy_bidirectional(&mut from, &mut replica)
             .await
             .ok()
@@ -321,7 +326,15 @@ async fn local(port: u16) -> std::io::Result<TcpStream> {
 
 /// Listen for every Service on this node's mesh interface, until stopped. `port` is the
 /// TCP port other nodes pass connections on to (the mesh's own, which is UDP).
-pub async fn run(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<bool>) {
+///
+/// With `strays` (a node with the ingress), ports 443 and 80 of the Services' addresses
+/// are not listened on here: the ingress has those ports, and sends what is ours on.
+pub async fn run(
+    shared: Arc<Shared>,
+    port: u16,
+    mut strays: Option<mpsc::UnboundedReceiver<TcpStream>>,
+    mut stopping: watch::Receiver<bool>,
+) {
     let Some(cluster) = &shared.cluster else { return };
     let prefix = crate::mesh::prefix(&cluster.me.ca);
     let proxy = Arc::new(Proxy {
@@ -331,6 +344,24 @@ pub async fn run(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<b
         turn: AtomicUsize::new(0),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
+    // (False again if the ingress gives up: then the ports are ours after all.)
+    let elsewhere = Arc::new(AtomicBool::new(strays.is_some()));
+    let stray = strays.take().map(|mut strays| {
+        let (proxy, elsewhere) = (proxy.clone(), elsewhere.clone());
+        tokio::spawn(async move {
+            while let Some(stream) = strays.recv().await {
+                let (Ok(SocketAddr::V6(at)), Ok(SocketAddr::V6(from))) = (stream.local_addr(), stream.peer_addr())
+                else {
+                    continue;
+                };
+                if kith_mesh::in_mesh(prefix, *from.ip()) {
+                    let proxy = proxy.clone();
+                    tokio::spawn(async move { proxy.serve((*at.ip(), at.port()), stream).await });
+                }
+            }
+            elsewhere.store(false, Ordering::Relaxed);
+        })
+    });
     let mut listening: BTreeMap<(Ipv6Addr, u16), tokio::task::JoinHandle<()>> = BTreeMap::new();
     let mut generation = shared.generation.subscribe();
     loop {
@@ -343,10 +374,12 @@ pub async fn run(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<b
                 let backends: BTreeSet<&Backend> = backends.flat_map(|(_, backends)| backends).collect();
                 let report = json!({ "address": address.to_string(), "backends": backends.len() });
                 let live = state.store.get(&key).and_then(|service| service.status.as_ref());
-                let Value::Object(fields) = report.clone() else {
+                let Value::Object(fields) = report else {
                     unreachable!("an object")
                 };
-                (live != Some(&report)).then_some((key, fields))
+                // (Only these fields: the ingress writes others.)
+                let same = |(field, value): (&String, &Value)| live.is_some_and(|live| &live[field] == value);
+                (!fields.iter().all(same)).then_some((key, fields))
             };
             let mut reports: Vec<_> = addresses(&state.store, prefix).into_iter().filter_map(stale).collect();
             for policy in state.store.list(Some("NetworkPolicy")) {
@@ -370,6 +403,8 @@ pub async fn run(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<b
         // The relay, and one listener for each Service port; one whose address is not on
         // the interface yet (the mesh puts it there) is tried again shortly.
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
+        let elsewhere = elsewhere.load(Ordering::Relaxed);
+        keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
         keys.insert((me, port));
         *proxy.table.lock().expect("nothing panics holding the table") = wanted;
         listening.retain(|key, task| {
@@ -406,7 +441,10 @@ pub async fn run(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<b
             _ = stopping.changed() => break,
         }
     }
-    listening.values().for_each(tokio::task::JoinHandle::abort);
+    listening
+        .values()
+        .chain(&stray)
+        .for_each(tokio::task::JoinHandle::abort);
 }
 
 #[cfg(test)]
@@ -501,7 +539,7 @@ spec:
         // Not for other workloads.
         assert!(asks(&store, other, "c", 1));
         let report = policy_report(store.get("NetworkPolicy/default/web").unwrap());
-        assert_eq!(report, json!({ "state": "enforced" }));
+        assert_eq!(report, json!({ "state": "enforced", "message": null }));
 
         // Peers by label cannot be told apart yet: allowing them lets nobody in, denying
         // them keeps everybody out, and the status says so.

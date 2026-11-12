@@ -69,6 +69,16 @@ impl Node {
     }
 }
 
+/// A helper process, killed when the test is over.
+struct Stop(std::process::Child);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 impl Drop for Node {
     fn drop(&mut self) {
         let _ = Command::new("kill").arg(self.child.id().to_string()).status();
@@ -117,7 +127,32 @@ fn a_service_spreads_connections() {
         assert!(status.success(), "the test failed inside its namespaces");
         return;
     }
-    let a = Node::start("a", "10.1.0.1", &[]);
+    // A certificate authority of our own, where node a is told to ask (never a real one).
+    let authority = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("services")
+        .join("authority");
+    let _ = std::fs::remove_dir_all(&authority);
+    std::fs::create_dir_all(&authority).unwrap();
+    std::fs::write(authority.join("fake_acme.py"), include_str!("fake_acme.py")).unwrap();
+    let fake = Command::new("nsenter")
+        .args([
+            "--net=/run/netns/a",
+            "python3",
+            "fake_acme.py",
+            "10.1.0.1",
+            "14000",
+            ".",
+        ])
+        .current_dir(&authority)
+        .spawn()
+        .unwrap();
+    let _fake = Stop(fake);
+    wait_for("the authority to listen", || authority.join("ca.pem").exists());
+    let a = Node::start(
+        "a",
+        "10.1.0.1",
+        &["--ingress", "--acme", "http://10.1.0.1:14000/directory"],
+    );
     wait_for("a to lead", || a.kith(&["get", "node"]).0);
     let token = a.ok(&["node", "token"]);
     let b = Node::start("b", "10.1.0.2", &["--join", "10.1.0.1:7443", "--token", token.trim()]);
@@ -132,7 +167,7 @@ fn a_service_spreads_connections() {
         "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: web, labels: {{ app: web }} }}\nspec:\n  \
          replicas: 2\n  template:\n    exec: [{{ name: run, command: [python3, {}] }}]\n---\n\
          apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  selector: {{ app: web }}\n  \
-         ports: [{{ port: 80, targetPort: 8080 }}]\n",
+         ports: [{{ port: 80, targetPort: 8080 }}]\n  expose: {{ host: web.example.test, via: edge }}\n",
         server.display()
     );
     std::fs::write(a.dir.join("web.yaml"), web).unwrap();
@@ -165,6 +200,50 @@ fn a_service_spreads_connections() {
         answers.dedup();
         assert_eq!(answers, ["kith0 lo toa", "kith0 lo tob"], "asked from {from}");
     }
+
+    // From outside (b's plain address will do): HTTPS for the Service's host on node a,
+    // with a certificate a got from the authority; and port 80 points there.
+    wait_for("a certificate", || a.status("service/web")["tls"]["state"] == "ready");
+    let outside = |args: &[&str]| {
+        let curl = Command::new("nsenter")
+            .args(["--net=/run/netns/b", "curl", "-s", "--max-time", "5"])
+            .args([
+                "--resolve",
+                "web.example.test:443:10.1.0.1",
+                "--resolve",
+                "web.example.test:80:10.1.0.1",
+            ])
+            .args(args)
+            .output();
+        String::from_utf8(curl.unwrap().stdout).unwrap()
+    };
+    let ca = authority.join("ca.pem");
+    let https = || outside(&["--cacert", ca.to_str().unwrap(), "https://web.example.test/"]);
+    wait_for("HTTPS to answer", || !https().is_empty());
+    let mut answers: Vec<String> = (0..6).map(|_| https()).collect();
+    answers.sort();
+    answers.dedup();
+    assert_eq!(answers, ["kith0 lo toa", "kith0 lo tob"]);
+    let moved = outside(&[
+        "-o",
+        "/dev/null",
+        "-w",
+        "%{http_code} %{redirect_url}",
+        "http://web.example.test/x?y=1",
+    ]);
+    assert_eq!(moved, "308 https://web.example.test/x?y=1");
+    // Another name gets no certificate and no way on; and the certificate was asked for once.
+    assert_eq!(
+        outside(&["-k", "--resolve", "other.test:443:10.1.0.1", "https://other.test/"]),
+        ""
+    );
+    assert_eq!(
+        outside(&["-o", "/dev/null", "-w", "%{http_code}", "http://10.1.0.1/x"]),
+        "404"
+    );
+    assert_eq!(outside(&["http://10.1.0.1:14000/orders"]), "1");
+    let secret = a.ok(&["get", "secret/tls-web.example.test", "-o", "yaml"]);
+    assert!(secret.contains("BEGIN CERTIFICATE"), "{secret}");
 
     // A replica that is gone gets no more connections: scaled to one, one node answers.
     let one = std::fs::read_to_string(a.dir.join("web.yaml"))

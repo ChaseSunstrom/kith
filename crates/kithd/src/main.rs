@@ -6,10 +6,12 @@
 //! this node a member of another node's cluster (see `cluster.rs`). The store is
 //! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
+mod acme;
 mod api;
 mod cluster;
 mod controller;
 mod dns;
+mod ingress;
 mod members;
 mod mesh;
 mod pki;
@@ -67,6 +69,20 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
+    /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
+    #[arg(long, env = "KITH_INGRESS", requires = "mesh")]
+    ingress: bool,
+    /// Get the certificates for exposed hosts from this ACME directory (Let's Encrypt
+    /// if none is named); giving this agrees to that authority's terms
+    #[arg(
+        long,
+        env = "KITH_ACME",
+        value_name = "URL",
+        requires = "ingress",
+        num_args = 0..=1,
+        default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
+    )]
+    acme: Option<String>,
 }
 
 /// What the API handlers and the controller share.
@@ -392,12 +408,19 @@ fn run(args: Args) -> Result<(), String> {
                 mesh::run(shared.clone(), options, stopping.clone()).await;
             }
         };
+        let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
+        let taken = args.ingress.then_some(taken);
         let proxy = async {
             if let Some(port) = args.mesh {
-                services::run(shared.clone(), port, stopping.clone()).await;
+                services::run(shared.clone(), port, taken, stopping.clone()).await;
             }
         };
-        let (served, nodes, (), (), (), ()) = tokio::join!(server, nodes, work, names, mesh, proxy);
+        let ingress = async {
+            if args.ingress {
+                ingress::run(shared.clone(), args.acme.clone(), strays, stopping.clone()).await;
+            }
+        };
+        let (served, nodes, (), (), (), (), ()) = tokio::join!(server, nodes, work, names, mesh, proxy, ingress);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });

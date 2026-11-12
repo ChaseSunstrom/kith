@@ -209,6 +209,29 @@ pub fn server_config(identity: &Identity) -> Fallible<Arc<ServerConfig>> {
     Ok(Arc::new(tls("setting up TLS", config)?))
 }
 
+/// A certificate chain and its key (both PEM) as a server shows them. Not if the key is
+/// another certificate's.
+pub fn certified(chain: &str, key: &str) -> Fallible<rustls::sign::CertifiedKey> {
+    let key = tls("reading a key", PrivateKeyDer::from_pem_slice(key.as_bytes()))?;
+    let key = tls("reading a key", provider().key_provider.load_private_key(key))?;
+    let certified = rustls::sign::CertifiedKey::new(certs(chain)?, key);
+    tls("a certificate and its key", certified.keys_match())?;
+    Ok(certified)
+}
+
+/// TLS for clients from anywhere: which certificate they get is up to `certificates`
+/// (by the name they ask for). HTTP/1.1 is all that is offered: what is behind is not
+/// asked what else it speaks.
+pub fn ingress_config(certificates: Arc<dyn rustls::server::ResolvesServerCert>) -> Fallible<Arc<ServerConfig>> {
+    let config = tls(
+        "setting up TLS",
+        ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
+    )?;
+    let mut config = config.with_no_client_auth().with_cert_resolver(certificates);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// Checks a server like any other, but for the name every node has rather than the address dialled.
 #[derive(Debug)]
 struct AnyNode(Arc<WebPkiServerVerifier>);

@@ -181,15 +181,20 @@ impl Device {
     // ponytail: only what this Device added is taken off again: addresses left by a
     // kithd that was killed stay until the interface goes.
     pub fn set_addresses(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
+        // All are tried; the first that failed is told. (One that would not go, because it
+        // was gone already, say, is not tried again.)
+        let mut failed = Ok(());
         for gone in self.held.clone().difference(wanted) {
-            self.address(*gone, 128, false)?;
+            failed = failed.and(self.address(*gone, 128, false));
             self.held.remove(gone);
         }
         for new in wanted.difference(&self.held.clone()) {
-            self.address(*new, 128, true)?;
-            self.held.insert(*new);
+            match self.address(*new, 128, true) {
+                Ok(()) => drop(self.held.insert(*new)),
+                Err(e) => failed = failed.and(Err(e)),
+            }
         }
-        Ok(())
+        failed
     }
 
     fn message(&self, cmd: WireguardCmd, mut attributes: Vec<WireguardAttribute>) -> GenlMessage<WireguardMessage> {

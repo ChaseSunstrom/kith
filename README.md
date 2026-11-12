@@ -202,6 +202,22 @@ kith node status                                   # who leads the store, who vo
   enforced; the policy's status says `partial` and why, `enforced` otherwise.
   A policy does not stop a connection that goes to a node's own address
   instead of the Service's.
+- With `--ingress` (and `--mesh`; meant for nodes with a public address) a
+  node answers HTTPS on port 443 for every Service with `expose`, by the host
+  the client asks for, and passes the connection on to the Service (its first
+  TCP port); port 80 sends browsers to HTTPS. Binding the two ports takes
+  CAP_NET_BIND_SERVICE. A host's certificate is the Secret `tls-<host>` next
+  to its Service (`tls.crt` and `tls.key`, PEM): apply your own, or start the
+  node with `--acme` and kithd gets one from Let's Encrypt (`--acme URL` for
+  another ACME directory; giving the flag agrees to that authority's terms)
+  and another before it runs out. The host's DNS has to point at the ingress
+  nodes first: the authority checks by asking port 80 there, and any node
+  with `--ingress` can answer. `kith get service/NAME -o yaml` shows how it
+  went (`tls`); after a failure kithd tries again an hour later, not sooner.
+  TLS ends at the ingress and the bytes go on as they are: the backend is not
+  told the client's address, and to a NetworkPolicy the connection comes from
+  the ingress node. Certificate keys and the ACME account key
+  (`Secret/kith-system/acme-account`) are in the store like other Secrets.
 
 Not yet: the nodes still talk to each other at their plain addresses, not
 over the mesh, workloads have no addresses on it, and two nodes that
