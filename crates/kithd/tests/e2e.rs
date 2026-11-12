@@ -469,6 +469,32 @@ fn logs_are_capped_and_removed() {
 }
 
 #[test]
+fn node_workload_runs_one_copy_alone() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("nodewl");
+    let agent = |selector: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: NodeWorkload\nmetadata: {{ name: agent }}\nspec:\n  {selector}\n  template:\n    \
+             exec: [{{ name: run, command: [sh, -c, 'echo up; exec sleep 300'] }}]\n"
+        )
+    };
+    daemon.apply(&agent("selector: {}"));
+    wait_for("the copy", || daemon.status("NodeWorkload/agent")["ready"] == 1);
+    assert!(daemon.ok(&["get", "nodeworkload"]).contains("1/1 ready"));
+    wait_for("the copy's output", || daemon.log("n_default_agent_0_run") == "up\n");
+    // `kith logs` finds copy 0 though no scheduler numbered it.
+    assert_eq!(daemon.ok(&["logs", "nodeworkload/agent"]), "up\n");
+    // Nothing here has the labels a selector asks for.
+    daemon.apply(&agent("selector: { role: edge }"));
+    wait_for("the copy to stop", || {
+        daemon.status("NodeWorkload/agent")["replicas"] == 0
+    });
+    assert_eq!(daemon.status("NodeWorkload/agent")["ready"], 0);
+}
+
+#[test]
 fn exec_units_run() {
     if !e2e() {
         return;

@@ -1,7 +1,7 @@
 //! The scheduler, on the node that leads the store: says which node runs each replica of
 //! a Workload and which one runs a Job, and writes that into their status as `nodes`
-//! (replica to node name) and `unschedulable` (replica to why not). Every node's controller
-//! runs what is bound to it. The rules are the `kith-sched` crate's: a replica stays where
+//! (replica to node name) and `unschedulable` (replica to why not); a NodeWorkload gets a
+//! replica number for each node that matches. Every node's controller runs what is bound to it. The rules are the `kith-sched` crate's: a replica stays where
 //! it is until its node has been out of contact for `--lost-after`.
 //
 // ponytail: every pass looks at every Workload and Job; fine for hundreds. Past that, plan
@@ -9,7 +9,7 @@
 
 use crate::Shared;
 use kith_api::Resource;
-use kith_api::kinds::{JobSpec, NodeSpec, WorkloadSpec};
+use kith_api::kinds::{JobSpec, NodeSpec, NodeWorkloadSpec, WorkloadSpec};
 use kith_api::store::Store;
 use kith_sched::{Amount, Node, Replica};
 use kith_store::Command;
@@ -32,6 +32,8 @@ fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api::kinds::Pl
             let amount = Amount::of_template(&spec.template);
             Some((spec.replicas.unwrap_or(1), amount, spec.placement))
         }
+        // A NodeWorkload is bound by `every_node`, not placed.
+        "NodeWorkload" => None,
         // A Job is run by one node, all of its runs; one that is over (as it is now, not
         // as it was before it was changed) needs no node.
         _ => {
@@ -43,6 +45,25 @@ fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api::kinds::Pl
             (!over).then(|| (1, Amount::of_template(&spec.template), spec.placement))
         }
     }
+}
+
+/// Where a NodeWorkload's copies are: replica number to node name, one for each node that
+/// matches. A node keeps its number while it matches; a new one takes the lowest free.
+fn every_node(resource: &Resource, nodes: &[Node], grace: Duration) -> Option<Map<String, Value>> {
+    let spec: NodeWorkloadSpec = serde_json::from_value(resource.spec.clone()).ok()?;
+    let mut left = kith_sched::node_workload(nodes, &spec.selector, grace);
+    let old = resource.status.as_ref().and_then(|s| s["nodes"].as_object());
+    let mut bound: Map<String, Value> = old.into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
+    bound.retain(|_, node| node.as_str().is_some_and(|node| left.contains(&node.to_string())));
+    left.retain(|name| !bound.values().any(|node| node == name.as_str()));
+    let mut number = 0;
+    for name in left {
+        while bound.contains_key(&number.to_string()) {
+            number += 1;
+        }
+        bound.insert(number.to_string(), name.into());
+    }
+    Some(bound)
 }
 
 /// For a node name: what it has (CPUs, bytes), and for how long it has been lost.
@@ -61,7 +82,10 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         })
     };
     let nodes: Vec<Node> = store.list(Some("Node")).filter_map(node).collect();
-    let owners = || store.list(Some("Workload")).chain(store.list(Some("Job")));
+    let owners = || {
+        let kinds = ["Workload", "Job", "NodeWorkload"];
+        kinds.into_iter().flat_map(|kind| store.list(Some(kind)))
+    };
     let mut replicas = Vec::new();
     for resource in owners() {
         let Some((count, requests, placement)) = wants(resource) else {
@@ -102,24 +126,28 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         let status = resource.status.as_ref().unwrap_or(&Value::Null);
         let mut changed = Map::new();
         // A Job that is over keeps the node that ran it.
-        if wants(resource).is_some() {
-            for (field, value) in [
-                ("nodes", of(&key, &made.bind)),
-                ("unschedulable", of(&key, &made.unschedulable)),
-            ] {
-                let old = if status[field].is_null() {
-                    &empty
-                } else {
-                    &status[field]
-                };
-                if *old != value {
-                    changed.insert(field.into(), value);
-                }
+        let mut want = Vec::new();
+        if resource.kind == "NodeWorkload" {
+            if let Some(bound) = every_node(resource, &nodes, grace) {
+                want.push(("replicas", Value::from(bound.len())));
+                want.push(("nodes", Value::Object(bound)));
             }
+        } else if wants(resource).is_some() {
+            want.push(("nodes", of(&key, &made.bind)));
+            want.push(("unschedulable", of(&key, &made.unschedulable)));
             // Something to show when no node says anything (none yet, or none any more).
-            let count = Value::from(resource.spec["replicas"].as_u64().unwrap_or(1));
-            if resource.kind == "Workload" && status["replicas"] != count {
-                changed.insert("replicas".into(), count);
+            if resource.kind == "Workload" {
+                want.push(("replicas", Value::from(resource.spec["replicas"].as_u64().unwrap_or(1))));
+            }
+        }
+        for (field, value) in want {
+            let old = if status[field].is_null() {
+                &empty
+            } else {
+                &status[field]
+            };
+            if *old != value {
+                changed.insert(field.into(), value);
             }
         }
         if !changed.is_empty() {
@@ -313,5 +341,91 @@ spec:
         write(&mut store, none);
         let web = status(&store, "Workload/default/web");
         assert_eq!((&web["nodes"], &web["replicas"]), (&json!({}), &json!(0)));
+    }
+
+    #[test]
+    fn a_node_workload_has_a_copy_on_every_matching_node() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a, labels: { disk: ssd } }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b, labels: { disk: ssd } }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: c }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: NodeWorkload
+metadata: { name: agent }
+spec:
+  selector: { disk: ssd }
+  template:
+    exec: [{ name: run, command: [sleep, inf] }]
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let pass = |store: &mut Store, seen: Seen| {
+            let (fields, left) = plan(store, seen, Duration::from_secs(300));
+            assert_eq!(left, vec![]);
+            let wrote = !fields.is_empty();
+            kith_store::run(store, Command::Patch { statuses: fields }).unwrap();
+            wrote
+        };
+        let status = |store: &Store| store.get("NodeWorkload/default/agent").unwrap().status.clone().unwrap();
+        let label = |store: &mut Store, name: &str, labels: Value| {
+            let mut node = store.get(&format!("Node/{name}")).unwrap().clone();
+            node.metadata.labels = serde_json::from_value(labels).unwrap();
+            node.metadata.revision = None;
+            store.apply(node).unwrap();
+        };
+
+        // a and b match; c does not. A second pass has nothing to write.
+        assert!(pass(&mut store, &there));
+        let first = status(&store);
+        assert_eq!(
+            (&first["nodes"], &first["replicas"]),
+            (&json!({ "0": "a", "1": "b" }), &json!(2))
+        );
+        assert!(!pass(&mut store, &there));
+
+        // c matches too: it takes the next number; a and b keep theirs.
+        label(&mut store, "c", json!({ "disk": "ssd" }));
+        assert!(pass(&mut store, &there));
+        assert_eq!(status(&store)["nodes"], json!({ "0": "a", "1": "b", "2": "c" }));
+
+        // a stops matching: its number is free, the others keep theirs, then a new node takes it.
+        label(&mut store, "a", json!({}));
+        assert!(pass(&mut store, &there));
+        let after = status(&store);
+        assert_eq!(
+            (&after["nodes"], &after["replicas"]),
+            (&json!({ "1": "b", "2": "c" }), &json!(2))
+        );
+        label(&mut store, "a", json!({ "disk": "ssd" }));
+        assert!(pass(&mut store, &there));
+        assert_eq!(status(&store)["nodes"], json!({ "0": "a", "1": "b", "2": "c" }));
+
+        // A node lost past the grace loses its copy, and what it said it runs is taken out.
+        let lost = |name: &str| (Some((4.0, 8e9)), (name == "b").then(|| Duration::from_secs(600)));
+        let says = json!({ "replicas": 3, "containers": [{ "name": "run", "replica": 1, "ready": true }] });
+        let report = Command::Report {
+            node: "b".into(),
+            statuses: vec![("NodeWorkload/default/agent".to_string(), Some(says))],
+        };
+        kith_store::run(&mut store, report).unwrap();
+        let (fields, left) = plan(&store, &lost, Duration::from_secs(300));
+        assert_eq!(left, vec![("b".to_string(), "NodeWorkload/default/agent".to_string())]);
+        kith_store::run(&mut store, Command::Patch { statuses: fields }).unwrap();
+        assert_eq!(status(&store)["nodes"], json!({ "0": "a", "2": "c" }));
     }
 }

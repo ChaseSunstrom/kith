@@ -397,6 +397,105 @@ fn workloads_move_off_a_lost_node() {
     wait_for("gamma to have caught up", || status(&gamma) == status(&alpha));
 }
 
+#[test]
+fn node_workload_runs_on_every_matching_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    // (A short name: a socket's path has to fit in 107 bytes.)
+    let test = "everynode";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let (_beta, gamma) = (join("beta"), join("gamma"));
+    wait_for("three ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 3
+    });
+    // Give a node labels: fetch it, change it, apply it.
+    let label = |name: &str, labels: serde_json::Value| {
+        let node = alpha.ok(&["get", &format!("node/{name}"), "-o", "json"]);
+        let mut node: serde_json::Value = serde_json::from_str(&node).unwrap();
+        node["metadata"]["labels"] = labels;
+        std::fs::write(alpha.dir.join("node.json"), node.to_string()).unwrap();
+        alpha.ok(&["apply", "-f", "node.json"]);
+    };
+    label("beta", serde_json::json!({ "role": "edge" }));
+    label("gamma", serde_json::json!({ "role": "edge" }));
+
+    let agent = "apiVersion: kith.dev/v1\nkind: NodeWorkload\nmetadata: { name: agent }\nspec:\n  \
+        selector: { role: edge }\n  template:\n    exec: [{ name: run, command: [sh, -c, 'echo up; exec sleep 300'] }]\n";
+    std::fs::write(gamma.dir.join("agent.yaml"), agent).unwrap();
+    gamma.ok(&["apply", "-f", "agent.yaml"]);
+    let status = || -> serde_json::Value {
+        let agent = alpha.ok(&["get", "nodeworkload/agent", "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&agent).unwrap()["status"].take()
+    };
+    // The nodes that bind a copy, and the nodes that say they run one.
+    let names = |nodes: Vec<&serde_json::Value>| {
+        let mut nodes: Vec<String> = nodes
+            .iter()
+            .map(|node| node.as_str().unwrap_or_default().to_string())
+            .collect();
+        nodes.sort();
+        nodes
+    };
+    let bound = |status: &serde_json::Value| {
+        names(
+            status["nodes"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, n)| n)
+                .collect(),
+        )
+    };
+    let running = |status: &serde_json::Value| {
+        names(
+            status["containers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|u| &u["node"])
+                .collect(),
+        )
+    };
+
+    // One copy on each node that matches, run by that node, and none on alpha.
+    wait_for("two ready copies", || status()["ready"] == 2);
+    let both = status();
+    assert_eq!(bound(&both), ["beta", "gamma"], "{both}");
+    assert_eq!(running(&both), ["beta", "gamma"], "{both}");
+    assert_eq!(both["replicas"], 2);
+    assert!(alpha.ok(&["get", "nodeworkload"]).contains("2/2 ready"));
+    for replica in ["0", "1"] {
+        wait_for("the copy's output", || {
+            alpha
+                .kith(&["logs", "nodeworkload/agent", "--replica", replica])
+                .1
+                .contains("up")
+        });
+    }
+
+    // beta loses its label: its copy stops, gamma's goes on.
+    label("beta", serde_json::json!({}));
+    wait_for("beta's copy to stop", || {
+        let now = status();
+        bound(&now) == ["gamma"] && running(&now) == ["gamma"] && now["ready"] == 1
+    });
+    // alpha gets the label: it takes up a copy.
+    label("alpha", serde_json::json!({ "role": "edge" }));
+    wait_for("alpha's copy", || {
+        let now = status();
+        bound(&now) == ["alpha", "gamma"] && running(&now) == ["alpha", "gamma"] && now["ready"] == 2
+    });
+}
+
 /// Two nodes with the mesh on, in a network namespace of their own (this test runs itself
 /// again inside one, where it may make interfaces): each learns the other's key from the
 /// store, they shake hands, and a node that stops takes its interface with it.
