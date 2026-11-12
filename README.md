@@ -184,9 +184,27 @@ kith node status                                   # who leads the store, who vo
   takes over a WireGuard interface of that name that is already there (its
   key and peers are replaced; one that is not WireGuard is refused) and
   removes the interface when it stops.
+- On the mesh a `Service` has an address of its own, the same on every node
+  (`kith get service/NAME -o yaml` shows it and the number of ready replicas
+  behind it), and the name `<service>.<namespace>.kith` where kithd answers
+  DNS. A TCP connection from a node to that address and one of the Service's
+  ports goes to a ready replica of the Workloads its selector matches, each
+  in turn, on whichever node it runs: kithd passes the bytes on, over the
+  mesh if the replica is elsewhere, to the replica's port on its node's
+  `127.0.0.1` (or `::1`). A kithd that restarts drops the connections through
+  it. Only TCP; a `targetPort` by name is a container port of that name.
+- A `NetworkPolicy` says who may connect to the Workloads it selects through
+  a Service: the first ingress rule that fits decides, and when a policy
+  selects a Workload and no rule fits, the connection is refused. A peer is
+  told by `node` (the node the connection comes from) or `cidr`. Peers by
+  `namespace` or `selector` cannot be told apart yet (an allow rule for them
+  lets nobody in, a deny rule keeps everybody out) and egress rules are not
+  enforced; the policy's status says `partial` and why, `enforced` otherwise.
+  A policy does not stop a connection that goes to a node's own address
+  instead of the Service's.
 
-Not yet: nothing uses the mesh so far (the nodes still talk to each other at
-their plain addresses), workloads have no addresses on it, and two nodes that
+Not yet: the nodes still talk to each other at their plain addresses, not
+over the mesh, workloads have no addresses on it, and two nodes that
 are both behind NAT only reach each other through an edge node.
 Replicas of one Workload on different nodes are all replaced at once
 when it changes (on one node it is one at a time; a `NodeWorkload` is always
