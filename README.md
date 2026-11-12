@@ -78,12 +78,24 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   follow until the unit is done. A log file that passes 10 MiB (`kithd
   --log-cap BYTES`) is moved aside, one old copy is kept (`kith logs
   --previous`), and deleting the Workload or Job deletes its logs.
+- Probes containers: `readiness` decides whether a replica counts as ready, and
+  a `liveness` probe that fails `failureThreshold` times in a row (3 unless you
+  say) gets the container restarted, once it has passed for the first time
+  (there is no start deadline yet). `tcp` and `http` probes are made against
+  `localhost`, every `intervalSeconds` (10) and once a second until the first
+  success.
+- Updates a changed Workload one replica at a time: the next one is replaced
+  only once the others are ready, so an update that does not come up stops at
+  its first replica and the status says where. `strategy: recreate` replaces
+  everything at once. A container or exec unit is replaced the same way when a
+  `ConfigMap` or `Secret` value in its `env` changes.
 - On SIGTERM it stops everything it started.
 
-Not yet: volumes, ports and probes are accepted but do nothing
-(the status says so for volumes), containers share the host's
-network and a read-only image (tmpfs on `/tmp` and `/run`), a changed Workload
-is stopped and then started rather than rolled, pulls are anonymous, layers
+Not yet: volumes, ports and `exec` probes are accepted but do nothing
+(the status says so for volumes and `exec` probes), a replica is stopped before
+its replacement starts (so `replicas: 1` is down for a moment during an update;
+`blueGreen` is treated as rolling), containers share the host's
+network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, layers
 must be gzip or plain tar, the image's `User` is ignored (containers run as
 root inside their user namespace), and there is no seccomp filter. The log cap
 is checked every 10 s, so a file can pass it by what its unit writes in that

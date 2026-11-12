@@ -3,16 +3,17 @@
 //! what it sees in each one's status.
 //!
 // ponytail: one node. Not handled yet, each said so in the status where it
-// matters: volumes, ports (units share the host's network), probes (ready means
-// running), rolling updates (a changed Workload is stopped, then started) and
-// restarting on a changed Secret or ConfigMap. Images are pulled one at a time.
+// matters: volumes, ports (units share the host's network) and exec probes.
+// A rolling update replaces one replica at a time, the old one stopped before the
+// new one starts: unit ids (cgroup, log file) are per replica, so two generations
+// of a replica cannot run side by side. Images are pulled one at a time.
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
 use crate::Shared;
 use kith_api::Resource;
 use kith_api::kinds::{
-    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, PullPolicy, Resources, RestartPolicy, SecretSpec, Template,
-    WorkloadSpec,
+    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, PullPolicy, Resources, RestartPolicy, SecretSpec, Strategy,
+    Template, WorkloadSpec,
 };
 use kith_api::store::Error;
 use kith_runtime::{Handle, Runtime, Unit};
@@ -53,10 +54,15 @@ impl Run {
 struct Slot {
     /// Store key of the Workload or Job.
     owner: String,
-    namespace: String,
     replica: u32,
     run: Run,
     policy: RestartPolicy,
+    /// Its environment with every Secret and ConfigMap reference looked up, or why that failed.
+    /// A unit whose looked-up values changed is replaced like one whose definition changed.
+    env: Result<Vec<(String, String)>, String>,
+    /// Replace changed replicas one at a time (a Workload unless its strategy is `recreate`).
+    rolling: bool,
+    probes: Option<crate::probe::Probes>,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -67,6 +73,12 @@ struct Slot {
     started: Instant,
     /// When to (re)start it; `None` when it is running or done for good.
     start_at: Option<Instant>,
+}
+
+impl Slot {
+    fn ready(&self) -> bool {
+        self.state == "running" && self.probes.as_ref().is_none_or(|p| p.health.borrow().ready)
+    }
 }
 
 /// How far one Job has come. Kept in memory: a kithd that restarts runs an
@@ -213,7 +225,7 @@ pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(
 
 impl Controller {
     /// One pass: returns how long the controller may sleep if nothing happens.
-    async fn reconcile(&mut self, shared: &Shared, stopping: &watch::Receiver<bool>) -> Duration {
+    async fn reconcile(&mut self, shared: &std::sync::Arc<Shared>, stopping: &watch::Receiver<bool>) -> Duration {
         // 1. What should run, from a snapshot of the store.
         let resources: Vec<Resource> = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
@@ -242,6 +254,12 @@ impl Controller {
                     continue;
                 }
             };
+            let strategy = resource.spec["strategy"].clone();
+            let strategy = serde_json::from_value::<Option<Strategy>>(strategy).ok().flatten();
+            if strategy == Some(Strategy::BlueGreen) {
+                note.push("strategy blueGreen is not done yet: this Workload is updated rolling".into());
+            }
+            let rolling = resource.kind == "Workload" && strategy != Some(Strategy::Recreate);
             // Which replicas (or runs of a Job) should exist, started no sooner than when, restarted how.
             let (replicas, not_before, policy) = match resource.kind.as_str() {
                 "Job" => {
@@ -277,18 +295,34 @@ impl Controller {
                 if matches!(unit, Run::Container(c) if !c.volume_mounts.is_empty()) {
                     note.push(format!("{}: volumes are not mounted yet", unit.name()));
                 }
+                if let Run::Container(c) = unit {
+                    note.extend(crate::probe::problems(c));
+                }
             }
+            let envs: Vec<_> = units
+                .iter()
+                .map(|unit| {
+                    let env = match unit {
+                        Run::Container(c) => &c.env,
+                        Run::Exec(e) => &e.env,
+                    };
+                    let value = |var: &EnvVar| Ok((var.name.clone(), env_value(shared, &namespace, var)?));
+                    env.iter().map(value).collect::<Result<Vec<_>, String>>()
+                })
+                .collect();
             for replica in replicas {
-                for unit in &units {
+                for (unit, env) in units.iter().zip(&envs) {
                     match unit_id(&prefix, replica, unit.name()) {
                         Err(e) if replica == 0 => note.push(e),
                         Err(_) => {}
                         Ok(id) => drop(wanted.entry(id).or_insert(Slot {
                             owner: key.clone(),
-                            namespace: namespace.clone(),
                             replica,
                             run: unit.clone(),
                             policy: policy.clone(),
+                            env: env.clone(),
+                            rolling,
+                            probes: None,
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -303,18 +337,58 @@ impl Controller {
             }
         }
 
-        // 2. Stop what is no longer wanted, or whose own definition changed. Scaling or
-        // relabelling a Workload leaves its running units alone.
-        let stale: Vec<String> = self
-            .slots
-            .iter()
-            .filter(|(id, slot)| {
-                wanted
-                    .get(*id)
-                    .is_none_or(|w| w.run != slot.run || w.policy != slot.policy)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        // 2. Stop what is no longer wanted, and replace what changed: its own definition, or
+        // a Secret or ConfigMap value it was started with (a value that can no longer be looked
+        // up stops nothing). Scaling or relabelling a Workload leaves its running units alone.
+        let mut stale: Vec<String> = Vec::new();
+        // Per owner, the replicas with something to replace.
+        let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
+        let differs = |new: &Slot, slot: &Slot| {
+            // A Job's run is not started over because a value changed under it.
+            let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
+            new.run != slot.run || new.policy != slot.policy || new_values
+        };
+        for (id, slot) in &self.slots {
+            let Some(new) = wanted.get(id) else {
+                stale.push(id.clone());
+                continue;
+            };
+            if differs(new, slot) {
+                changed.entry(&slot.owner).or_default().insert(slot.replica);
+            }
+        }
+        for (owner, replicas) in changed {
+            let mine = || self.slots.values().filter(move |slot| slot.owner == owner);
+            let ready = |replica: u32| mine().filter(|slot| slot.replica == replica).all(Slot::ready);
+            let rolling = wanted.values().any(|new| new.owner == owner && new.rolling);
+            let go: Vec<u32> = if rolling {
+                // One replica at a time: one that is down anyway first; a ready one only
+                // while every other replica is ready, so at most one is ever down for the update.
+                let pick = replicas
+                    .iter()
+                    .copied()
+                    .find(|r| !ready(*r))
+                    .or(replicas.first().copied());
+                let pick = pick.expect("a changed owner has a changed replica");
+                let others_ready = mine().all(|slot| slot.replica == pick || ready(slot.replica));
+                if !ready(pick) || others_ready {
+                    vec![pick]
+                } else {
+                    let note = notes.entry(owner.into()).or_default();
+                    note.push(format!(
+                        "rolling update: replica {pick} is next, once the others are ready"
+                    ));
+                    Vec::new()
+                }
+            } else {
+                replicas.into_iter().collect()
+            };
+            let ids = self.slots.iter().filter(|(id, slot)| {
+                let new = wanted.get(*id);
+                slot.owner == owner && go.contains(&slot.replica) && new.is_some_and(|new| differs(new, slot))
+            });
+            stale.extend(ids.map(|(id, _)| id.clone()));
+        }
         for id in stale {
             stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
         }
@@ -324,13 +398,23 @@ impl Controller {
         self.tend_logs(owners);
 
         // 3. Notice exits, then start whatever is due.
-        // A Job's unit that ended is accounted for in step 1: go round again at once.
+        // A Job's unit that ended is accounted for in step 1, and a unit that started may be
+        // what a rolling update waits for in step 2: go round again at once.
         let mut job_moved = false;
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
                 return TICK; // the caller stops everything
             }
             if let Some(handle) = &mut slot.handle {
+                if slot.probes.as_ref().is_some_and(|p| !p.health.borrow().live) {
+                    // Killed here, noticed as an exit below or next pass, restarted like any other exit.
+                    // A kill that failed is tried again next pass: the probes stay.
+                    slot.message = Some("the liveness probe failed".into());
+                    match handle.kill() {
+                        Ok(()) => slot.probes = None,
+                        Err(e) => eprintln!("kithd: {id}: {e}"),
+                    }
+                }
                 let code = match handle.try_wait() {
                     Ok(None) => continue,
                     Ok(Some(code)) => code,
@@ -340,6 +424,7 @@ impl Controller {
                     }
                 };
                 stop(id, slot.handle.take());
+                slot.probes = None;
                 slot.exit_code = Some(code);
                 slot.failures = if slot.started.elapsed() >= SETTLED {
                     0
@@ -361,7 +446,7 @@ impl Controller {
             if slot.start_at.is_some_and(|at| at <= Instant::now()) {
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
-                    started = start(shared, &self.runtime, &self.logs, id, slot) => started,
+                    started = start(&self.runtime, &self.logs, id, slot) => started,
                     // A pull can take minutes; shutting down does not wait for it.
                     _ = stop_now.changed() => return TICK,
                 };
@@ -372,6 +457,10 @@ impl Controller {
                         slot.handle = Some(handle);
                         (slot.state, slot.message, slot.start_at, slot.started) =
                             ("running", None, None, Instant::now());
+                        if let Run::Container(c) = &slot.run {
+                            slot.probes = crate::probe::start(shared.clone(), c);
+                        }
+                        job_moved = true;
                     }
                     Err(message) => {
                         (slot.state, slot.message) = ("failed", Some(message));
@@ -400,7 +489,7 @@ impl Controller {
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
-                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "restarts": slot.restarts });
+                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts });
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }
@@ -427,7 +516,7 @@ impl Controller {
                 None => {
                     let replicas = mine.iter().map(|slot| slot.replica + 1).max().unwrap_or(0);
                     let ready = (0..replicas)
-                        .filter(|r| mine.iter().filter(|s| s.replica == *r).all(|s| s.state == "running"))
+                        .filter(|r| mine.iter().filter(|s| s.replica == *r).all(|s| s.ready()))
                         .count();
                     json!({ "replicas": replicas, "ready": ready, "containers": units })
                 }
@@ -621,16 +710,15 @@ fn env_value(shared: &Shared, namespace: &str, var: &EnvVar) -> Result<String, S
         .ok_or(format!("env `{}`: {key} has no key `{}`", var.name, key_ref.key))
 }
 
-async fn start(shared: &Shared, runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<Handle, String> {
-    let (env, resources) = match &slot.run {
-        Run::Container(c) => (&c.env, &c.resources),
-        Run::Exec(e) => (&e.env, &e.resources),
+async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<Handle, String> {
+    let resources = match &slot.run {
+        Run::Container(c) => &c.resources,
+        Run::Exec(e) => &e.resources,
     };
-    let mut unit = Unit::default();
-    for var in env {
-        unit.env
-            .push((var.name.clone(), env_value(shared, &slot.namespace, var)?));
-    }
+    let mut unit = Unit {
+        env: slot.env.clone()?,
+        ..Unit::default()
+    };
     if let Some(Resources { cpu, memory, .. }) = resources {
         unit.memory_bytes = memory.as_ref().map(|q| q.value() as u64);
         unit.cpu_millis = cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);

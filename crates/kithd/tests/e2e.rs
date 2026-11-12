@@ -750,3 +750,183 @@ fn watch_reports_changes() {
     let (code, _, err) = daemon.kith(&["--store", "x.json", "get", "-w"]);
     assert_eq!((code, err.contains("-w needs kithd")), (2, true), "{err}");
 }
+
+/// A Workload of busybox containers running `script`, with `extra` lines in the container.
+fn boxed(name: &str, replicas: u32, strategy: &str, script: &str, extra: &str) -> String {
+    let image = std::env::var("KITH_E2E_IMAGE").unwrap_or("mirror.gcr.io/library/busybox:1.36".into());
+    format!(
+        "apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {name}
+spec:
+  replicas: {replicas}
+  strategy: {strategy}
+  template:
+    containers:
+      - name: main
+        image: {image}
+        command: [sh, -c, '{script}']
+{extra}"
+    )
+}
+
+/// A port nothing listens on right now.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[test]
+fn probes_gate_ready_and_restart() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("probes");
+    let unit = |name: &str| daemon.status(&format!("Workload/{name}"))["containers"][0].clone();
+
+    // Readiness: running is not ready until the probe passes, and not ready again when it stops passing.
+    let port = free_port();
+    let serve = format!(
+        "mkdir /tmp/www; echo ok > /tmp/www/ok; sleep 3; httpd -p {port} -h /tmp/www; sleep 5; rm /tmp/www/ok; sleep 300"
+    );
+    let probes = format!(
+        "        readiness: {{ http: {{ path: /ok, port: {port} }}, intervalSeconds: 1, failureThreshold: 1 }}
+        liveness: {{ tcp: {{ port: {port} }}, intervalSeconds: 1, failureThreshold: 3 }}
+"
+    );
+    daemon.apply(&boxed("web", 1, "rolling", &serve, &probes));
+    wait_for("web to run, not ready yet", || unit("web")["state"] == "running");
+    assert_eq!(
+        (
+            unit("web")["ready"].clone(),
+            daemon.status("Workload/web")["ready"].clone()
+        ),
+        (false.into(), 0.into())
+    );
+    wait_for("web to be ready", || daemon.status("Workload/web")["ready"] == 1);
+    assert!(daemon.ok(&["get", "Workload/web", "-o", "table"]).contains("1/1 ready"));
+    wait_for("web to stop being ready", || {
+        daemon.status("Workload/web")["ready"] == 0
+    });
+    // Its port still answers, so it was never restarted.
+    assert_eq!(
+        (unit("web")["state"].clone(), unit("web")["restarts"].clone()),
+        ("running".into(), 0.into())
+    );
+
+    // Liveness: a container that runs on but stopped answering is restarted. The test is
+    // what answers here, so it decides when that is.
+    let port = free_port();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let probes = format!("        liveness: {{ tcp: {{ port: {port} }}, intervalSeconds: 1, failureThreshold: 2 }}\n");
+    daemon.apply(&boxed("stuck", 1, "rolling", "echo up; sleep 300", &probes));
+    wait_for("stuck to run", || unit("stuck")["state"] == "running");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(unit("stuck")["restarts"], 0, "restarted though its probe passes");
+    drop(listener);
+    wait_for("stuck to be restarted", || {
+        unit("stuck")["restarts"].as_u64() >= Some(1)
+    });
+    assert_eq!(unit("stuck")["exitCode"], 137);
+    wait_for("stuck to be up again", || {
+        daemon.log("w_default_stuck_0_main").starts_with("up\nup\n")
+    });
+
+    // A probe that cannot run says so and holds nothing back.
+    let probes = "        readiness: { exec: [\"true\"] }\n";
+    daemon.apply(&boxed("plain", 1, "rolling", "sleep 300", probes));
+    wait_for("plain to be ready", || daemon.status("Workload/plain")["ready"] == 1);
+    assert_eq!(
+        daemon.status("Workload/plain")["notes"][0],
+        "main: readiness probe: exec probes are not run yet"
+    );
+}
+
+#[test]
+fn rolling_updates_keep_replicas_ready() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("rolling");
+    // The test answers the readiness probe itself: while it listens, replicas are ready.
+    let port = free_port();
+    let listen = || std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    // A replica that was ready stays so through 100 failures; a new one needs one success first.
+    let probe =
+        format!("        readiness: {{ tcp: {{ port: {port} }}, intervalSeconds: 1, failureThreshold: 100 }}\n");
+    let version = |v: &str, strategy: &str| boxed("roll", 3, strategy, &format!("echo {v}; sleep 300"), &probe);
+    let ready = || daemon.status("Workload/roll")["ready"].as_u64().unwrap_or(0);
+    let on = |v: &str| {
+        let has = |replica: u32| daemon.log(&format!("w_default_roll_{replica}_main")).contains(v);
+        (0..3).filter(|replica| has(*replica)).count()
+    };
+
+    let listener = listen();
+    daemon.apply(&version("v1", "rolling"));
+    wait_for("v1 to be ready", || ready() == 3);
+
+    // Nothing answers the probe: the first new replica never becomes ready, and the update stops there.
+    drop(listener);
+    daemon.apply(&version("v2", "rolling"));
+    wait_for("the first replica to be replaced", || on("v2") == 1);
+    let until = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < until {
+        assert_eq!(
+            (on("v2"), ready()),
+            (1, 2),
+            "the update went on past a replica that is not ready"
+        );
+    }
+    let notes = daemon.status("Workload/roll")["notes"].to_string();
+    assert!(notes.contains("rolling update: replica 1 is next"), "{notes}");
+
+    // Answer again: it goes on, one replica at a time, never more than one down.
+    let listener = listen();
+    wait_for("the update to finish", || {
+        assert!(ready() >= 2, "more than one replica was down");
+        on("v2") == 3 && ready() == 3
+    });
+
+    // strategy: recreate replaces everything at once, ready or not.
+    drop(listener);
+    daemon.apply(&version("v3", "recreate"));
+    wait_for("all replicas to be replaced", || on("v3") == 3);
+    assert_eq!(ready(), 0);
+}
+
+#[test]
+fn config_changes_restart() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("config");
+    let env = "        env:
+          - name: GREETING
+            configMap: { name: settings, key: greeting }
+";
+    daemon.apply(CONFIG);
+    daemon.apply(&boxed("greeter", 2, "rolling", "echo $GREETING; sleep 300", env));
+    daemon.apply(&boxed("bystander", 1, "rolling", "echo here; sleep 300", ""));
+    let greeted = |with: &str| {
+        let has = |replica: u32| daemon.log(&format!("w_default_greeter_{replica}_main")).contains(with);
+        (0..2).filter(|replica| has(*replica)).count()
+    };
+    wait_for("greeter to greet", || greeted("hello") == 2);
+
+    // The value changes: the containers that read it are restarted with the new one.
+    daemon.apply(&CONFIG.replace("hello", "goodbye"));
+    wait_for("greeter to say goodbye", || greeted("goodbye") == 2);
+    wait_for("greeter to be ready again", || {
+        daemon.status("Workload/greeter")["ready"] == 2
+    });
+    // ...and nothing else is.
+    assert_eq!(daemon.log("w_default_bystander_0_main"), "here\n");
+    assert_eq!(daemon.log("w_default_greeter_0_main"), "hello\ngoodbye\n");
+
+    // A value that is gone stops nothing: what runs keeps the value it was started with.
+    daemon.ok(&["delete", "ConfigMap/settings"]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(daemon.status("Workload/greeter")["ready"], 2);
+    assert_eq!(daemon.log("w_default_greeter_1_main"), "hello\ngoodbye\n");
+}

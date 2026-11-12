@@ -6,6 +6,7 @@
 
 mod api;
 mod controller;
+mod probe;
 
 use clap::Parser;
 use kith_api::store::FileStore;
