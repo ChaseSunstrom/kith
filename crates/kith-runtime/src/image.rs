@@ -69,6 +69,22 @@ impl ImageStore {
         fs::create_dir_all(root.join("blobs/sha256")).ctx(format!("creating {}", root.display()))?;
         fs::create_dir_all(root.join("images")).ctx(format!("creating {}", root.display()))?;
         fs::create_dir_all(root.join("refs")).ctx(format!("creating {}", root.display()))?;
+        // What a crashed pull left half-done. One owner per store (kithd holds the
+        // state lock), so nothing here is still being written.
+        for (dir, marker) in [
+            ("blobs/sha256", ".partial-"),
+            ("images", ".unpacking-"),
+            ("refs", ".ref-"),
+        ] {
+            for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Blob and image names are hex; a ref name never starts with a dot.
+                if name.contains(marker) && (dir != "refs" || name.starts_with(marker)) {
+                    let _ = remove(&entry.path());
+                }
+            }
+        }
         // Images keep their setuid bits; nobody else on this machine gets to run them.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ctx(format!("securing {}", root.display()))?;
         Ok(ImageStore { root })
@@ -168,20 +184,7 @@ impl ImageStore {
         if !dir.join("config.json").exists() {
             let staging = dir.with_extension(scratch_name("unpacking"));
             let target = dir.clone();
-            let unpacked = tokio::task::spawn_blocking(move || -> Result<()> {
-                let _ = fs::remove_dir_all(&staging);
-                fs::create_dir_all(staging.join("rootfs")).ctx("unpacking")?;
-                for (blob, media_type) in &layers {
-                    unpack_layer(blob, media_type, &staging.join("rootfs"))?;
-                }
-                // The marker that the image is complete, so it is written last.
-                fs::write(staging.join("config.json"), "{}").ctx("unpacking")?;
-                match fs::rename(&staging, &target) {
-                    // Another pull of the same image finished first; theirs is as good as ours.
-                    Err(_) if target.join("config.json").exists() => fs::remove_dir_all(&staging).ctx("unpacking"),
-                    other => other.ctx("unpacking"),
-                }
-            });
+            let unpacked = tokio::task::spawn_blocking(move || unpack_image(&layers, &staging, &target, Budget::IMAGE));
             unpacked.await.ctx("unpacking")??;
         }
 
@@ -217,38 +220,58 @@ impl ImageStore {
 
 /// A name no other pull has, in this process or another: two pulls of one image
 /// may run at once, and each needs its own files until the final rename.
-// ponytail: a crash leaves its `.partial-*`/`.unpacking-*` behind; sweep them at startup if it shows.
 fn scratch_name(what: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("{what}-{}-{n}", std::process::id())
 }
 
-/// `rootfs/path`, provided that stays inside `rootfs` even through symlinks an
-/// earlier layer may have planted.
+/// Where `path` from a layer lands under `rootfs`. Symlinks on the way are
+/// followed the way the container will see them, with `rootfs` as `/`: an
+/// absolute link (`/var/run -> /run`) or a run of `..` stays inside. The last
+/// component is not followed: it is the thing being created or removed.
 fn inside(rootfs: &Path, path: &Path) -> Result<PathBuf> {
-    let mut clean = PathBuf::new();
+    let mut todo = std::collections::VecDeque::new();
     for part in path.components() {
         match part {
-            Component::Normal(p) => clean.push(p),
+            Component::Normal(p) => todo.push_back(Component::Normal(p).as_os_str().to_owned()),
             Component::CurDir => {}
             _ => return err(format!("layer entry `{}` escapes the image", path.display())),
         }
     }
-    if clean.as_os_str().is_empty() {
+    let Some(name) = todo.pop_back() else {
         return Ok(rootfs.into()); // `./`, the root itself
-    }
-    let target = rootfs.join(&clean);
-    if let Some(parent) = target.parent().filter(|p| p.exists()) {
-        let real = parent.canonicalize().ctx("unpacking")?;
-        if !real.starts_with(rootfs.canonicalize().ctx("unpacking")?) {
+    };
+    let mut real = PathBuf::new(); // relative to rootfs
+    let mut hops = 0;
+    while let Some(part) = todo.pop_front() {
+        if part == ".." {
+            real.pop(); // at the root this stays at the root, as in a chroot
+            continue;
+        }
+        let Ok(link) = fs::read_link(rootfs.join(&real).join(&part)) else {
+            real.push(part);
+            continue;
+        };
+        hops += 1;
+        if hops > 40 {
             return err(format!(
-                "layer entry `{}` escapes the image through a symlink",
+                "layer entry `{}` goes through a loop of symlinks",
                 path.display()
             ));
         }
+        if link.is_absolute() {
+            real = PathBuf::new();
+        }
+        for piece in link.components().rev() {
+            match piece {
+                Component::Normal(p) => todo.push_front(p.to_owned()),
+                Component::ParentDir => todo.push_front("..".into()),
+                _ => {}
+            }
+        }
     }
-    Ok(target)
+    Ok(rootfs.join(real).join(name))
 }
 
 fn remove(path: &Path) -> std::io::Result<()> {
@@ -262,7 +285,79 @@ fn remove(path: &Path) -> std::io::Result<()> {
 /// Apply one layer on top of `rootfs`, as an unprivileged user: ownership is
 /// not kept (everything belongs to us, which is root inside the container) and
 /// device nodes are skipped (the runtime provides /dev).
-pub(crate) fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Result<()> {
+/// What one image may unpack to, all layers together. Far above any real
+/// image; one built to fill the disk or the memory (a few megabytes of gzip can
+/// hold terabytes) stops here.
+#[derive(Clone, Copy)]
+struct Budget {
+    bytes: u64,
+    entries: usize,
+}
+
+impl Budget {
+    const IMAGE: Budget = Budget {
+        bytes: 32 << 30,
+        entries: 4_000_000,
+    };
+}
+
+/// Lets `left` bytes through and then fails, so nothing downstream (tar reads long
+/// names and pax headers whole, into memory) ever sees more than the budget.
+struct Metered<'a, R> {
+    inner: R,
+    left: &'a mut u64,
+}
+
+impl<R: Read> Read for Metered<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if *self.left == 0 {
+            return Err(std::io::Error::other("the image is larger than kith unpacks"));
+        }
+        let most = buf.len().min(usize::try_from(*self.left).unwrap_or(usize::MAX));
+        let n = self.inner.read(&mut buf[..most])?;
+        *self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// tar wraps the real reason (disk full, over the budget) in its own error; say both.
+fn because(what: &str, e: std::io::Error) -> crate::Error {
+    let mut text = format!("{what}: {e}");
+    let mut cause = std::error::Error::source(&e);
+    while let Some(inner) = cause {
+        text.push_str(&format!(": {inner}"));
+        cause = inner.source();
+    }
+    crate::Error(text)
+}
+
+/// Unpack `layers` in order into `staging`, then publish it as `target`.
+/// However it fails, `staging` does not stay behind.
+fn unpack_image(layers: &[(PathBuf, String)], staging: &Path, target: &Path, mut budget: Budget) -> Result<()> {
+    let _ = fs::remove_dir_all(staging);
+    let unpacked = (|| {
+        fs::create_dir_all(staging.join("rootfs")).ctx("unpacking")?;
+        for (blob, media_type) in layers {
+            unpack_layer_capped(blob, media_type, &staging.join("rootfs"), &mut budget)?;
+        }
+        // The marker that the image is complete, so it is written last.
+        fs::write(staging.join("config.json"), "{}").ctx("unpacking")?;
+        match fs::rename(staging, target) {
+            // Another pull of the same image finished first; theirs is as good as ours.
+            Err(_) if target.join("config.json").exists() => Ok(()),
+            other => other.ctx("unpacking"),
+        }
+    })();
+    let _ = fs::remove_dir_all(staging); // already renamed away when all went well
+    unpacked
+}
+
+#[cfg(test)]
+fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Result<()> {
+    unpack_layer_capped(blob, media_type, rootfs, &mut Budget::IMAGE.clone())
+}
+
+fn unpack_layer_capped(blob: &Path, media_type: &str, rootfs: &Path, budget: &mut Budget) -> Result<()> {
     let file = File::open(blob).ctx(format!("opening {}", blob.display()))?;
     let reader: Box<dyn Read> = match media_type.rsplit(['+', '.']).next() {
         Some("gzip") => Box::new(flate2::read::GzDecoder::new(std::io::BufReader::new(file))),
@@ -273,10 +368,18 @@ pub(crate) fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Resu
             ));
         }
     };
-    let mut archive = tar::Archive::new(reader);
+    let metered = Metered {
+        inner: reader,
+        left: &mut budget.bytes,
+    };
+    let mut archive = tar::Archive::new(metered);
     archive.set_preserve_permissions(true);
     for entry in archive.entries().ctx("reading a layer")? {
-        let mut entry = entry.ctx("reading a layer")?;
+        let mut entry = entry.map_err(|e| because("reading a layer", e))?;
+        if budget.entries == 0 {
+            return err("the image has more files than kith unpacks");
+        }
+        budget.entries -= 1;
         let path = entry.path().ctx("reading a layer")?.into_owned();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
 
@@ -294,7 +397,7 @@ pub(crate) fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Resu
             continue;
         }
         if let Some(deleted) = name.strip_prefix(".wh.") {
-            if deleted.is_empty() {
+            if deleted.is_empty() || deleted == "." || deleted == ".." {
                 return err(format!("layer entry `{}` is a whiteout of nothing", path.display()));
             }
             remove(&inside(rootfs, &path.with_file_name(deleted))?).ctx("applying a whiteout")?;
@@ -315,9 +418,22 @@ pub(crate) fn unpack_layer(blob: &Path, media_type: &str, rootfs: &Path) -> Resu
         {
             remove(&target).ctx("unpacking")?;
         }
-        if !entry.unpack_in(rootfs).ctx(format!("unpacking `{}`", path.display()))? {
-            return err(format!("layer entry `{}` escapes the image", path.display()));
+        let what = format!("unpacking `{}`", path.display());
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).ctx(&what)?;
         }
+        if kind.is_hard_link() {
+            // The link's source is a path in the image too, and gets the same treatment.
+            let source = entry
+                .link_name()
+                .ctx(&what)?
+                .ok_or_else(|| crate::Error(format!("{what}: a link to nothing")))?;
+            remove(&target).ctx(&what)?;
+            fs::hard_link(inside(rootfs, &source)?, &target).ctx(&what)?;
+            continue;
+        }
+        // `target` is ours down to its last component, which `unpack` replaces rather than follows.
+        entry.unpack(&target).map_err(|e| because(&what, e))?;
         // Keep directories writable for us, or later entries and cleanup would fail.
         if kind.is_dir() {
             let mode = fs::metadata(&target).ctx("unpacking")?.permissions().mode();
@@ -431,6 +547,53 @@ mod tests {
     }
 
     #[test]
+    fn absolute_links_and_caps() {
+        let (dir, rootfs) = sandbox("links");
+        // Debian-style: /var/run is an absolute link, and a later layer writes through it.
+        let base = [
+            E::Dir("run", 0o755),
+            E::Dir("var", 0o755),
+            E::Link("var/run", "/run"),
+            E::File("bin-sh", "sh"),
+        ];
+        unpack_layer(&layer(&dir, "1.tar", &base), TAR, &rootfs).unwrap();
+        unpack_layer(&layer(&dir, "2.tar", &[E::File("var/run/pid", "1")]), TAR, &rootfs).unwrap();
+        assert_eq!(fs::read_to_string(rootfs.join("run/pid")).unwrap(), "1");
+        assert!(rootfs.join("var/run").is_symlink());
+
+        // A loop of links is an error, not a hang.
+        let looped = [E::Link("a", "b"), E::Link("b", "a"), E::File("a/x", "")];
+        assert!(unpack_layer(&layer(&dir, "loop.tar", &looped), TAR, &rootfs).is_err());
+
+        // The budget, in bytes and in entries, is for the whole image: at it is fine,
+        // over it is refused, and a refused image leaves nothing behind.
+        let big = layer(
+            &dir,
+            "big.tar",
+            &[E::File("one", "12345678"), E::File("two", "12345678")],
+        );
+        let size = fs::metadata(&big).unwrap().len();
+        let layers = [(big.clone(), TAR.to_string()), (big, TAR.to_string())];
+        let (staging, target) = (dir.join("staging"), dir.join("image"));
+        let refused = [
+            (size + 1024, 4, "larger than kith unpacks"),
+            (2 * size, 3, "more files than kith unpacks"),
+        ];
+        for (bytes, entries, message) in refused {
+            let e = unpack_image(&layers, &staging, &target, Budget { bytes, entries }).unwrap_err();
+            assert!(e.to_string().contains(message), "{e}");
+            assert!(!staging.exists() && !target.exists());
+        }
+        let enough = Budget {
+            bytes: 2 * size,
+            entries: 4,
+        };
+        unpack_image(&layers, &staging, &target, enough).unwrap();
+        assert!(!staging.exists() && target.join("config.json").exists() && target.join("rootfs/two").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn layers_stack_with_whiteouts() {
         let (dir, rootfs) = sandbox("stack");
         let base = [
@@ -504,24 +667,40 @@ mod tests {
         let e = unpack_layer(&layer(&dir, "wh.tar", &[E::Raw("../outside/.wh.victim")]), TAR, &rootfs).unwrap_err();
         assert!(e.to_string().contains("escapes the image"), "{e}");
 
-        // A symlink planted by one layer, then used by the next to write, delete or clear outside.
+        // A symlink planted by one layer, then used by the next to write, delete or clear
+        // outside. The link is followed as the container would follow it, with the
+        // rootfs as `/`, so all of it happens inside and the real target is untouched.
         let out = outside.to_str().unwrap();
-        unpack_layer(&layer(&dir, "link.tar", &[E::Link("evil", out)]), TAR, &rootfs).unwrap();
+        unpack_layer(
+            &layer(&dir, "link.tar", &[E::Link("evil", out), E::Link("up", "../../../..")]),
+            TAR,
+            &rootfs,
+        )
+        .unwrap();
         for attack in [
             E::Raw("evil/victim"),
             E::Raw("evil/.wh.victim"),
             E::Raw("evil/.wh..wh..opq"),
+            E::Raw("up/planted"),
+            E::Raw("evil"), // replaces the link itself; never writes through it
         ] {
-            let result = unpack_layer(&layer(&dir, "attack.tar", &[attack]), TAR, &rootfs);
-            assert!(
-                result.is_err(),
-                "an entry under a symlink that leaves the image was accepted"
-            );
+            unpack_layer(&layer(&dir, "attack.tar", &[attack]), TAR, &rootfs).unwrap();
             assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "safe");
+            let around: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+            assert!(!around.iter().any(|n| n == "planted"), "{around:?}");
         }
+        assert_eq!(
+            fs::read_to_string(rootfs.join("planted")).unwrap(),
+            "x",
+            "`..` stops at the root"
+        );
+        assert!(rootfs.join("evil").is_file());
+        fs::write(rootfs.join("evil"), "").unwrap();
+        fs::remove_file(rootfs.join("evil")).unwrap();
+        std::os::unix::fs::symlink(out, rootfs.join("evil")).unwrap();
 
         // Entries that would delete or replace the rootfs itself, lower layers included.
-        for attack in [E::Raw(".wh."), E::Raw("./")] {
+        for attack in [E::Raw(".wh."), E::Raw(".wh.."), E::Raw("./")] {
             assert!(unpack_layer(&layer(&dir, "root.tar", &[attack]), TAR, &rootfs).is_err());
             assert!(rootfs.join("evil").is_symlink(), "the lower layer is still there");
         }

@@ -213,6 +213,12 @@ fn cgroup_parent() -> Result<String> {
     }
 }
 
+/// Processes and threads one container may have.
+const MAX_PIDS: i64 = 4096;
+
+// ponytail: the image's `User` is not applied: rootless, only uid 0 is mapped into
+// the container, so any other user cannot exist there. It needs subuid ranges
+// (newuidmap) or running as root, and comes with whichever arrives first.
 fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
     let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
     let mut spec = if uid.is_root() {
@@ -286,7 +292,9 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     }
     spec.set_mounts(Some(mounts));
 
-    let mut resources = LinuxResourcesBuilder::default();
+    // ponytail: one fixed ceiling against fork bombs; make it a Unit field when a workload needs more.
+    let pids = oci_spec::runtime::LinuxPidsBuilder::default().limit(MAX_PIDS).build()?;
+    let mut resources = LinuxResourcesBuilder::default().pids(pids);
     if let Some(bytes) = unit.memory_bytes {
         if bytes == 0 {
             return Err("a memory limit of 0 leaves nothing to run in".into());
@@ -345,6 +353,7 @@ mod tests {
         );
         let resources = linux.resources().as_ref().unwrap();
         assert_eq!(resources.cpu().as_ref().unwrap().quota(), Some(50_000));
+        assert_eq!(resources.pids().as_ref().unwrap().limit(), MAX_PIDS);
         assert_eq!(resources.memory().as_ref().unwrap().limit(), Some(1 << 20));
     }
 }

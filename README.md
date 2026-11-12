@@ -63,7 +63,8 @@ Not yet: `exec` units, volumes, ports and probes are accepted but do nothing
 (the status says so for `exec` and volumes), containers share the host's
 network and a read-only image (tmpfs on `/tmp` and `/run`), a changed Workload
 is stopped and then started rather than rolled, pulls are anonymous, layers
-must be gzip or plain tar, and there is no seccomp filter. Kinds other than
+must be gzip or plain tar, the image's `User` is ignored (containers run as
+root inside their user namespace), and there is no seccomp filter. Kinds other than
 `Workload`, `ConfigMap` and `Secret` are stored and validated but nothing acts
 on them. Running as root is untested.
 
