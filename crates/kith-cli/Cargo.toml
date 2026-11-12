@@ -1,0 +1,19 @@
+[package]
+name = "kith-cli"
+description = "The `kith` command"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kith"
+path = "src/main.rs"
+
+[dependencies]
+kith-yaml.workspace = true
+kith-api.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

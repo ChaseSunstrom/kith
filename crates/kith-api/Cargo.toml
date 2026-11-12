@@ -1,0 +1,16 @@
+[package]
+name = "kith-api"
+description = "kith resource types, JSON Schemas and the resource store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-yaml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+similar.workspace = true
+
+[lints]
+workspace = true

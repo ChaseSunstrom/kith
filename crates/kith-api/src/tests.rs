@@ -1,0 +1,340 @@
+use crate::store::{Action, FileStore, HISTORY_LIMIT, Store, rfc3339};
+use crate::*;
+use serde_json::json;
+
+const JELLYFIN: &str = include_str!("../../../examples/jellyfin.yaml");
+const WORKSTATION: &str = include_str!("../../../examples/workstation.yaml");
+
+fn load(src: &str) -> Vec<Resource> {
+    Resource::from_source(src)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+fn one(src: &str) -> Resource {
+    load(src).pop().unwrap()
+}
+
+/// The (line, column, message) of the first error in `src`.
+fn err(src: &str) -> (usize, usize, String) {
+    let e = match Resource::from_source(src) {
+        Err(e) => e,
+        Ok(docs) => docs.into_iter().find_map(Result::err).expect("an error"),
+    };
+    let p = e.pos.expect("a position");
+    (p.line, p.col, e.msg)
+}
+
+fn workload(extra: &str) -> String {
+    format!(
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: web\nspec:\n  template:\n    containers:\n      - name: web\n        image: nginx:1.27\n{extra}"
+    )
+}
+
+#[test]
+fn plan_examples_validate_and_normalise() {
+    let docs = load(JELLYFIN);
+    assert_eq!(
+        docs.iter().map(Resource::key).collect::<Vec<_>>(),
+        ["Namespace/media", "Workload/media/jellyfin", "Service/media/jellyfin"]
+    );
+    assert_eq!(docs[0].spec, json!({}));
+    assert_eq!(
+        docs[1].spec,
+        json!({
+            "replicas": 1,
+            "template": {"containers": [{
+                "name": "jellyfin",
+                "image": "docker.io/jellyfin/jellyfin:10",
+                "resources": {"cpu": "2", "memory": "2Gi"},
+                "ports": [{"name": "http", "port": 8096}],
+                "volumeMounts": [{"volume": "media", "path": "/media"}],
+            }]},
+            "placement": {"require": {"node.labels.disks": "hdd"}, "prefer": [{"weight": 50, "node.labels.room": "closet"}]},
+        })
+    );
+    assert_eq!(docs[2].spec["ports"][0]["targetPort"], json!("http"));
+    let release = one(WORKSTATION);
+    assert_eq!(release.spec["values"]["apps"], json!(["firefox", "code", "steam"]));
+    assert_eq!(release.spec["package"]["version"], json!("^1.2"));
+}
+
+#[test]
+fn strings_are_never_coerced() {
+    let r = one(&workload(
+        "        args: [no, 1.0, true, 0x10]\n        resources: { cpu: 2, memory: 512Mi }\n  placement:\n    require: { rack: 12, ssd: yes }\n    prefer: [{ weight: 5, zone: 1.0 }]\n",
+    ));
+    let c = &r.spec["template"]["containers"][0];
+    assert_eq!(c["args"], json!(["no", "1.0", "true", "0x10"]));
+    assert_eq!(c["resources"]["cpu"], json!("2"));
+    assert_eq!(
+        r.spec["placement"],
+        json!({"require": {"rack": "12", "ssd": "yes"}, "prefer": [{"weight": 5, "zone": "1.0"}]})
+    );
+    // And a number field does not take a string.
+    let (line, _, msg) = err(&workload("  replicas: '2'\n"));
+    assert_eq!(line, 10, "{msg}");
+}
+
+#[test]
+fn errors_point_at_the_mistake() {
+    // Unknown field, three levels down.
+    let (l, c, m) = err(&workload("        imagePullPolicy: Always\n"));
+    assert_eq!((l, c), (10, 9), "{m}");
+    assert!(m.contains("unknown field `imagePullPolicy`"), "{m}");
+    // A bad quantity points at the value.
+    let (l, c, m) = err(&workload("        resources:\n          memory: 2 gigs\n"));
+    assert_eq!((l, c), (11, 19), "{m}");
+    assert!(m.contains("invalid quantity `2 gigs`"), "{m}");
+    // Kinds.
+    assert_eq!(
+        err("apiVersion: kith.dev/v1\nkind: workload\nmetadata: {name: a}\n"),
+        (2, 7, "unknown kind `workload`, did you mean `Workload`?".into())
+    );
+    assert_eq!(
+        err("apiVersion: kith.dev/v1\nkind: Deployment\nmetadata: {name: a}\n").0,
+        2
+    );
+    assert_eq!(
+        err("apiVersion: kith.dev/v1\nmetadata: {name: a}\n"),
+        (1, 1, "missing field `kind`".into())
+    );
+    // Envelope rules.
+    assert_eq!(err("apiVersion: apps/v1\nkind: Namespace\nmetadata: {name: a}\n").0, 1);
+    let (l, c, m) = err("apiVersion: kith.dev/v1\nkind: Namespace\nmetadata:\n  name: Media_1\n");
+    assert_eq!((l, c), (4, 9), "{m}");
+    let (l, _, m) = err("apiVersion: kith.dev/v1\nkind: Node\nmetadata:\n  name: a\n  namespace: x\n");
+    assert_eq!(l, 5, "{m}");
+    assert!(m.contains("cluster-scoped"), "{m}");
+    // A kind with required fields needs its spec.
+    assert!(
+        err("apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {name: a}\n")
+            .2
+            .contains("missing field `template`")
+    );
+    // Rules beyond the shape.
+    let (l, _, m) = err(&workload(
+        "        env:\n          - name: A\n            value: x\n            secret: {name: s, key: k}\n",
+    ));
+    assert_eq!(l, 6, "points into the spec: {m}");
+    assert_eq!(
+        m,
+        "template, unit `web`, env `A`: set exactly one of `value`, `secret`, `configMap`"
+    );
+    assert!(
+        err(&workload("      - name: web\n        image: other\n"))
+            .2
+            .contains("two units are named `web`")
+    );
+    assert!(
+        err("apiVersion: kith.dev/v1\nkind: Job\nmetadata: {name: a}\nspec: {template: {}}\n")
+            .2
+            .contains("at least one")
+    );
+    // Enums list what is allowed.
+    let (l, _, m) = err(&workload("  strategy: canary\n"));
+    assert_eq!(l, 10);
+    assert!(m.contains("`rolling`") && m.contains("`blueGreen`"), "{m}");
+    // A later document's error still has its own line.
+    assert_eq!(
+        err(&format!("{JELLYFIN}---\napiVersion: kith.dev/v1\nkind: Nope\n")).0,
+        JELLYFIN.lines().count() + 3
+    );
+}
+
+#[test]
+fn every_kind_has_a_schema_and_a_minimal_resource() {
+    assert_eq!(KINDS.len(), 26);
+    for info in KINDS {
+        let schema = info.schema();
+        assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
+        assert_eq!(
+            schema["required"],
+            json!(["apiVersion", "kind", "metadata"]),
+            "{}",
+            info.kind
+        );
+        assert!(schema["properties"]["spec"].is_object(), "{}", info.kind);
+        assert_eq!(kind(&info.kind.to_lowercase()).unwrap().kind, info.kind);
+    }
+    let workload = kind("Workload").unwrap().schema();
+    let text = workload.to_string();
+    assert!(text.contains("\"required\":[\"template\"]"), "{text}");
+    assert!(text.contains("Ki|Mi|Gi|Ti"), "the quantity pattern is in the schema");
+    assert!(text.contains("blueGreen"));
+}
+
+#[test]
+fn yaml_output_reads_back_identically() {
+    for r in load(JELLYFIN).into_iter().chain(load(WORKSTATION)) {
+        assert_eq!(one(&r.to_yaml()), r, "{}", r.to_yaml());
+    }
+}
+
+#[test]
+fn apply_diff_and_revisions() {
+    let mut store = Store::default();
+    let v1 = one(&workload(""));
+
+    let created = store.apply(v1.clone()).unwrap();
+    assert_eq!(
+        (created.action, created.after.metadata.revision),
+        (Action::Created, Some(1))
+    );
+    assert!(
+        created
+            .diff()
+            .starts_with("--- /dev/null\n+++ Workload/default/web (new)\n"),
+        "{}",
+        created.diff()
+    );
+
+    // Applying the same thing again changes nothing and records nothing.
+    let again = store.apply(v1.clone()).unwrap();
+    assert_eq!((again.action, again.diff().as_str()), (Action::Unchanged, ""));
+    assert_eq!(store.history("Workload/default/web").unwrap().len(), 1);
+
+    let v2 = one(&workload("  replicas: 3\n"));
+    let planned = store.plan(v2.clone()).unwrap();
+    assert_eq!(
+        store.get("Workload/default/web").unwrap().metadata.revision,
+        Some(1),
+        "plan does not write"
+    );
+    let updated = store.apply(v2).unwrap();
+    assert_eq!(planned, updated);
+    assert_eq!(
+        (updated.action, updated.after.metadata.revision),
+        (Action::Updated, Some(2))
+    );
+    let diff = updated.diff();
+    assert!(
+        diff.contains("--- Workload/default/web (live)\n+++ Workload/default/web (desired)\n"),
+        "{diff}"
+    );
+    assert!(diff.contains("\n+  replicas: 3\n"), "{diff}");
+    assert!(!diff.contains("revision"), "{diff}");
+
+    // Rolling back re-applies old content as a new revision.
+    let back = store.rollback("Workload/default/web", 1).unwrap();
+    assert_eq!((back.action, back.after.metadata.revision), (Action::Updated, Some(3)));
+    assert_eq!(back.after.spec, v1.spec);
+    assert!(back.diff().contains("\n-  replicas: 3\n"));
+    assert!(matches!(
+        store.rollback("Workload/default/web", 9),
+        Err(store::Error::NotFound(_))
+    ));
+    let revisions: Vec<_> = store
+        .history("Workload/default/web")
+        .unwrap()
+        .iter()
+        .map(|r| r.resource.metadata.revision)
+        .collect();
+    assert_eq!(revisions, [Some(1), Some(2), Some(3)]);
+
+    // The store survives a round trip through JSON.
+    let saved: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+    assert_eq!(saved, store);
+
+    assert_eq!(store.list(Some("Workload")).count(), 1);
+    assert_eq!(store.list(Some("Service")).count(), 0);
+    assert_eq!(store.delete("Workload/default/web").unwrap().metadata.revision, Some(3));
+    assert!(store.get("Workload/default/web").is_none());
+    assert!(store.delete("Workload/default/web").is_err());
+}
+
+#[test]
+fn apply_keeps_status_and_validates() {
+    let mut store = Store::default();
+    let mut sneaky = one(&workload(""));
+    sneaky.status = Some(json!({"ready": 99}));
+    assert_eq!(
+        store.apply(sneaky).unwrap().after.status,
+        None,
+        "apply never writes status"
+    );
+    store
+        .set_status("Workload/default/web", Some(json!({"ready": 1})))
+        .unwrap();
+    assert_eq!(
+        store.history("Workload/default/web").unwrap().len(),
+        1,
+        "status is not versioned"
+    );
+    let change = store.apply(one(&workload("  replicas: 2\n"))).unwrap();
+    assert_eq!(change.after.status, Some(json!({"ready": 1})));
+
+    // `kith get -o yaml`, edit, apply: fine while the revision is still live, refused once it is stale.
+    let mut edited = one(&store.get("Workload/default/web").unwrap().to_yaml());
+    assert_eq!(edited.metadata.revision, Some(2));
+    edited.spec["replicas"] = json!(5);
+    assert_eq!(store.apply(edited.clone()).unwrap().after.metadata.revision, Some(3));
+    edited.spec["replicas"] = json!(6);
+    assert!(matches!(store.apply(edited), Err(store::Error::Conflict(m)) if m.contains("is at revision 3")));
+
+    // Resources built in code go through the same validation as files.
+    let mut bad = one(&workload(""));
+    bad.spec["template"]["containers"][0]["image"] = json!(5);
+    assert!(matches!(store.plan(bad), Err(store::Error::Invalid(m)) if m.contains("expected a string")));
+    let mut bad = one(&workload(""));
+    bad.kind = "Gadget".into();
+    assert!(store.apply(bad).is_err());
+}
+
+#[test]
+fn history_is_bounded() {
+    let mut store = Store::default();
+    for n in 0..HISTORY_LIMIT + 5 {
+        store.apply(one(&workload(&format!("  replicas: {n}\n")))).unwrap();
+    }
+    let history = store.history("Workload/default/web").unwrap();
+    assert_eq!(history.len(), HISTORY_LIMIT);
+    assert_eq!(
+        history.last().unwrap().resource.metadata.revision,
+        Some(HISTORY_LIMIT as u64 + 5)
+    );
+}
+
+#[test]
+fn timestamps() {
+    assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+    assert_eq!(rfc3339(1_794_476_096), "2026-11-12T09:34:56Z");
+}
+
+#[test]
+fn file_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("kith-file-store-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("nested/store");
+
+    // Reading a store that does not exist gives an empty one and creates nothing.
+    assert_eq!(FileStore::read(&path).unwrap().store, Store::default());
+    assert!(!dir.exists());
+
+    let mut fs = FileStore::open(&path).unwrap();
+    fs.store.apply(one(&workload(""))).unwrap();
+    fs.save().unwrap();
+    fs.save().unwrap();
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "secrets live here"
+    );
+    assert!(!dir.join("nested/store.tmp").exists());
+    assert_eq!(FileStore::read(&path).unwrap().store, fs.store);
+    drop(fs);
+
+    // Damaged stores are errors, not panics and not silent resets.
+    std::fs::write(&path, &std::fs::read(&path).unwrap()[..40]).unwrap();
+    assert!(matches!(FileStore::open(&path), Err(store::Error::Io(m)) if m.contains("is not a kith store")));
+    std::fs::write(&path, r#"{"resources":{"Workload/default/web":[]}}"#).unwrap();
+    let mut fs = FileStore::open(&path).unwrap();
+    assert!(fs.store.get("Workload/default/web").is_none());
+    assert_eq!(fs.store.list(None).count(), 0);
+    assert!(fs.store.delete("Workload/default/web").is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

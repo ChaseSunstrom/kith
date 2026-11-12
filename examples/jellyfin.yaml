@@ -1,0 +1,31 @@
+# The example from PLAN.md §4.2: a workload and the service in front of it.
+apiVersion: kith.dev/v1
+kind: Namespace
+metadata: { name: media }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: jellyfin
+  namespace: media
+  labels: { app: jellyfin }
+spec:
+  replicas: 1
+  template:
+    containers:
+      - name: jellyfin
+        image: docker.io/jellyfin/jellyfin:10
+        resources: { cpu: "2", memory: 2Gi }
+        ports: [{ name: http, port: 8096 }]
+        volumeMounts: [{ volume: media, path: /media }]
+  placement:
+    require: { node.labels.disks: hdd }
+    prefer:  [{ weight: 50, node.labels.room: closet }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: jellyfin, namespace: media }
+spec:
+  selector: { app: jellyfin }
+  ports: [{ name: http, port: 80, targetPort: http }]
+  expose: { host: media.example.com, via: edge }   # public HTTPS through an edge node

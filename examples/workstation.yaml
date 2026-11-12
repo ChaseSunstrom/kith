@@ -1,0 +1,12 @@
+# The example from PLAN.md §4.6: a desktop is a package released into a seat.
+apiVersion: kith.dev/v1
+kind: Release
+metadata: { name: workstation, namespace: desktop }
+spec:
+  package: { repo: kith-community, name: hyprland, version: ^1.2 }
+  values:
+    seat: office-pc/seat0
+    user: casun
+    reserve: { cpu: "4", memory: 8Gi }
+    apps: [firefox, code, steam]
+    dotfiles: { git: https://github.com/me/dotfiles }

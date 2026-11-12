@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 64" width="400" height="128" role="img" aria-label="kith">
+  <title>kith</title>
+  <g stroke="#16181d" stroke-width="4" stroke-linecap="round" fill="none">
+    <line x1="22" y1="14" x2="22" y2="50"/>
+    <line x1="24" y1="36" x2="42" y2="20"/>
+    <line x1="26" y1="38" x2="42" y2="50"/>
+  </g>
+  <circle cx="22" cy="14" r="4" fill="#16181d"/>
+  <circle cx="22" cy="50" r="4" fill="#16181d"/>
+  <circle cx="43" cy="19" r="4.5" fill="#16181d"/>
+  <circle cx="43" cy="50" r="4.5" fill="#16181d"/>
+  <circle cx="24" cy="37" r="5.5" fill="#5b8cff"/>
+  <text x="62" y="47" font-family="Inter, 'Helvetica Neue', Arial, sans-serif" font-size="40" font-weight="600" letter-spacing="-1" fill="#16181d">kith</text>
+</svg>
