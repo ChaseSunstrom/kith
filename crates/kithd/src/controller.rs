@@ -226,6 +226,8 @@ async fn reconcile(
                 // A pull can take minutes; shutting down does not wait for it.
                 _ = stop_now.changed() => return TICK,
             };
+            // A cached image starts without ever waiting; let the API answer between starts.
+            tokio::task::yield_now().await;
             match started {
                 Ok(handle) => {
                     slot.handle = Some(handle);

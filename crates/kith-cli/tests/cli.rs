@@ -269,3 +269,25 @@ fn examples_and_schemas() {
     assert_eq!(schema["title"], "Workload");
     assert_eq!(sb.kith(&["schema", "gadget"]).0, 2);
 }
+
+#[test]
+fn a_silent_daemon_times_out() {
+    let sb = Sandbox::new("silent");
+    let socket = sb.0.join("kithd.sock");
+    // Accepts connections (the kernel does) and never answers.
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let began = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(["--timeout", "1", "get"])
+        .env("KITH_SOCKET", &socket)
+        .env_remove("KITH_STORE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(
+        err,
+        "error: kithd has not answered for 1 s (--timeout sets how long to wait)\n"
+    );
+    assert!(began.elapsed() < std::time::Duration::from_secs(10));
+}

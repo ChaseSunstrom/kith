@@ -229,14 +229,40 @@ impl FileStore {
         })
     }
 
-    /// Open the store for changing it. Blocks while another process has it open this way.
+    /// Open the store for changing it. Another process changing it is waited for,
+    /// briefly: one that keeps it (kithd) is a conflict, not something to wait out.
     pub fn open(path: &Path) -> Result<FileStore, Error> {
+        Self::open_within(path, std::time::Duration::from_secs(10))
+    }
+
+    /// Like [`FileStore::open`], for something that keeps the store open for good.
+    /// The short wait covers a `kith --store` that is just finishing.
+    pub fn open_owned(path: &Path) -> Result<FileStore, Error> {
+        Self::open_within(path, std::time::Duration::from_secs(2))
+    }
+
+    fn open_within(path: &Path, patience: std::time::Duration) -> Result<FileStore, Error> {
         let io = |what: &str, e: std::io::Error| Error::Io(format!("{what} {}: {e}", path.display()));
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| io("creating the directory for", e))?;
         }
         let lock = File::create(sibling(path, ".lock")).map_err(|e| io("locking", e))?;
-        lock.lock().map_err(|e| io("locking", e))?;
+        let began = std::time::Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::Error(e)) => return Err(io("locking", e)),
+                Err(std::fs::TryLockError::WouldBlock) if began.elapsed() < patience => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(Error::Conflict(format!(
+                        "{} is in use by another kithd or kith",
+                        path.display()
+                    )));
+                }
+            }
+        }
         Ok(FileStore {
             _lock: Some(lock),
             ..FileStore::read(path)?

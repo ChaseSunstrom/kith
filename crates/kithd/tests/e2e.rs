@@ -177,6 +177,16 @@ fn api_through_the_cli() {
         .unwrap();
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("already serving"));
+    // So does one on another socket but the same state: it says who has it instead of waiting.
+    let second = Command::new(env!("CARGO_BIN_EXE_kithd"))
+        .arg("--state")
+        .arg(daemon.dir.join("state"))
+        .arg("--socket")
+        .arg(daemon.dir.join("other.sock"))
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    assert!(String::from_utf8_lossy(&second.stderr).contains("is in use by another kithd"));
     use std::os::unix::fs::PermissionsExt;
     let mode = std::fs::metadata(daemon.dir.join("kithd.sock"))
         .unwrap()

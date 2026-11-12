@@ -67,11 +67,6 @@ fn run(args: Args) -> Result<(), String> {
     if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
         return Err(format!("another kithd is already serving {}", socket.display()));
     }
-    // Nobody answered: a socket here is a dead kithd's. Anything else is not ours to remove.
-    use std::os::unix::fs::FileTypeExt;
-    if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
-        let _ = std::fs::remove_file(&socket);
-    }
     if let Some(dir) = socket.parent() {
         // Owner-only: until RBAC exists, reaching the socket is the permission check.
         std::fs::DirBuilder::new()
@@ -84,7 +79,12 @@ fn run(args: Args) -> Result<(), String> {
     std::fs::create_dir_all(&state)
         .and_then(|()| std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)))
         .map_err(|e| fail("creating the state directory", &e))?;
-    let store = FileStore::open(&state.join("store.json")).map_err(|e| e.to_string())?;
+    let store = FileStore::open_owned(&state.join("store.json")).map_err(|e| e.to_string())?;
+    // Nobody answered and the state is ours: a socket here is a dead kithd's. Anything else is not ours to remove.
+    use std::os::unix::fs::FileTypeExt;
+    if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
+        let _ = std::fs::remove_file(&socket);
+    }
     let runtime = kith_runtime::Runtime::new(state.join("runtime"));
     let shared = Arc::new(Shared {
         store: Mutex::new(store),

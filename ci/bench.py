@@ -21,6 +21,7 @@ import time
 IMAGE = os.environ.get("KITH_E2E_IMAGE", "mirror.gcr.io/library/busybox:1.36")
 START_BUDGET = 0.150  # seconds
 RSS_BUDGET = 30 * 1024 * 1024
+API_BUDGET = 0.100  # seconds
 WORKLOAD = """apiVersion: kith.dev/v1
 kind: Workload
 metadata: {{ name: {name} }}
@@ -70,20 +71,33 @@ def main():
             print(f"first start, with the pull: {start('cold', 1) * 1000:.0f} ms")
             cached = statistics.median(start(f"cached{i}", 1) for i in range(5))
             twenty = start("twenty", 20)
+
+            # kithd is one thread: how long does the API go quiet while it starts 20 more?
+            with open(os.path.join(tmp, "burst.yaml"), "w") as f:
+                f.write(WORKLOAD.format(name="burst", replicas=20, image=IMAGE))
+            kith = [os.path.join(bins, "kith"), "--socket", socket]
+            subprocess.run([*kith, "apply", "-f", os.path.join(tmp, "burst.yaml")], check=True, stdout=subprocess.DEVNULL)
+            stall = 0
+            for _ in range(20):
+                began = time.monotonic()
+                subprocess.run([*kith, "get", "ConfigMap"], check=True, stdout=subprocess.DEVNULL)
+                stall = max(stall, time.monotonic() - began)
             time.sleep(1)
             # Peak, not current: a spike while 20 start at once counts too.
             with open(f"/proc/{daemon.pid}/status") as status:
                 rss = int(next(l for l in status if l.startswith("VmHWM:")).split()[1]) * 1024
             listing = subprocess.run([os.path.join(bins, "kith"), "--socket", socket, "get", "-o", "json"], check=True, capture_output=True)
             running = sum(w["status"]["ready"] for w in json.loads(listing.stdout))
+            total = sum(w["spec"].get("replicas", 1) for w in json.loads(listing.stdout))
         finally:
             daemon.send_signal(signal.SIGTERM)
             daemon.wait()
 
     results = [
         ("cached start (median of 5)", cached <= START_BUDGET, f"{cached * 1000:.0f} ms (budget {START_BUDGET * 1000:.0f} ms)"),
-        ("containers still running", running == 26, f"{running} of 26"),
-        ("kithd peak RSS with 26 containers", rss <= RSS_BUDGET, f"{rss / 2**20:.1f} MB (budget {RSS_BUDGET / 2**20:.0f} MB)"),
+        ("containers still running", running == total == 46, f"{running} of {total}"),
+        ("slowest API call while 20 containers start", stall <= API_BUDGET, f"{stall * 1000:.0f} ms (budget {API_BUDGET * 1000:.0f} ms)"),
+        (f"kithd peak RSS with {total} containers", rss <= RSS_BUDGET, f"{rss / 2**20:.1f} MB (budget {RSS_BUDGET / 2**20:.0f} MB)"),
     ]
     print(f"20 replicas up: {twenty * 1000:.0f} ms")
     for name, ok, detail in results:

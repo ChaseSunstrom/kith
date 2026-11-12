@@ -20,6 +20,16 @@ struct Cli {
     /// kithd's socket [default: $XDG_RUNTIME_DIR/kith/kithd.sock, or /run/kith/kithd.sock]
     #[arg(long, env = "KITH_SOCKET", global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
+    /// Give up when kithd has not answered for this many seconds
+    #[arg(
+        long,
+        env = "KITH_TIMEOUT",
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    timeout: u64,
     /// Work on a store file directly instead of talking to kithd (wins over --socket)
     #[arg(long, env = "KITH_STORE", global = true, value_name = "FILE")]
     store: Option<PathBuf>,
@@ -137,7 +147,7 @@ fn fail<T>(e: impl std::fmt::Display) -> Result<T, String> {
 
 /// Where the resources live: kithd behind its socket, or a store file used directly.
 enum Backend {
-    Daemon(PathBuf),
+    Daemon(Kithd),
     Local(PathBuf),
 }
 
@@ -216,6 +226,12 @@ impl Backend {
     }
 }
 
+struct Kithd {
+    socket: PathBuf,
+    /// How long it may stay silent.
+    timeout: std::time::Duration,
+}
+
 /// Percent-encode a resource key for a URL path. Valid keys pass through unchanged.
 fn escape(key: &str) -> String {
     let plain = |b: u8| b.is_ascii_alphanumeric() || b"-._/".contains(&b);
@@ -234,12 +250,16 @@ fn escape(key: &str) -> String {
 // ponytail: HTTP/1.1 by hand keeps an HTTP client and an async runtime out of the CLI
 // (the size and RSS budgets). It relies on `Connection: close` and kithd never
 // chunking these replies; swap in a client library when the API goes over the network.
-fn request<T: serde::de::DeserializeOwned>(socket: &Path, method: &str, path: &str, body: &[u8]) -> Result<T, String> {
+fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<T, String> {
+    let socket = &kithd.socket;
     use std::io::Write;
     let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
         let socket = socket.display();
         format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
     })?;
+    // A kithd that accepts and then says nothing must not hang a script forever.
+    let timeout = Some(kithd.timeout);
+    let _ = stream.set_read_timeout(timeout).and(stream.set_write_timeout(timeout));
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -249,7 +269,15 @@ fn request<T: serde::de::DeserializeOwned>(socket: &Path, method: &str, path: &s
     // kithd may refuse a request before reading all of it (too large): its reply still explains why.
     let read = stream.read_to_end(&mut reply);
     let sent = if reply.is_empty() { sent } else { Ok(()) };
-    sent.and(read).or_else(|e| fail(format!("talking to kithd: {e}")))?;
+    sent.and(read).or_else(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+            let secs = kithd.timeout.as_secs();
+            fail(format!(
+                "kithd has not answered for {secs} s (--timeout sets how long to wait)"
+            ))
+        }
+        _ => fail(format!("talking to kithd: {e}")),
+    })?;
 
     let split = reply
         .windows(4)
@@ -273,7 +301,10 @@ fn request<T: serde::de::DeserializeOwned>(socket: &Path, method: &str, path: &s
 fn run(cli: Cli) -> Result<ExitCode, String> {
     let backend = || match (&cli.store, cli.socket.clone().or_else(kith_api::default_socket)) {
         (Some(path), _) => Ok(Backend::Local(path.clone())),
-        (None, Some(socket)) => Ok(Backend::Daemon(socket)),
+        (None, Some(socket)) => Ok(Backend::Daemon(Kithd {
+            socket,
+            timeout: std::time::Duration::from_secs(cli.timeout),
+        })),
         (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
     };
     match cli.command {
