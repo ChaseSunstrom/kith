@@ -106,6 +106,31 @@ on them. Running as root is untested.
 [`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has
 not been run under systemd yet.
 
+## More than one node (in progress)
+
+Phase 2 of the plan is being built. What works today:
+
+```sh
+kithd --listen 192.168.1.10:7443 --name alpha      # first start: makes the cluster's CA
+kith node token                                    # on alpha: good once, for an hour
+kithd --join 192.168.1.10:7443 --token TOKEN --name beta    # on the other machine
+kith get node                                      # on either: alpha and beta, with their addresses
+```
+
+- Nodes talk over TLS and both ends show a certificate from the cluster's CA.
+  Without one, a caller can read the CA certificate and present a join token,
+  nothing else.
+- The token carries the CA's fingerprint: a joining node checks who it is
+  talking to before it sends the token's secret.
+- A node keeps its identity in `<state>/pki`; after the first start it needs
+  neither `--join` nor `--token`.
+
+Not yet: a node that joined keeps no copy of the store and runs no workloads; it
+forwards its API to the node it joined (replication and scheduling are next).
+Only the first node can admit others, tokens do not survive its restart,
+certificates last ten years and cannot be renewed or revoked, and `kith` itself
+only talks to the kithd on its own machine.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):

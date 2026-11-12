@@ -46,7 +46,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
-struct ApiError(Error);
+pub struct ApiError(pub Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -63,7 +63,7 @@ impl IntoResponse for ApiError {
 type Reply<T> = Result<Json<T>, ApiError>;
 
 /// Change the store and persist it; if it cannot be saved, nothing changed.
-fn write<T>(shared: &Shared, change: impl FnOnce(&mut Store) -> Result<T, Error>) -> Result<T, ApiError> {
+pub fn write<T>(shared: &Shared, change: impl FnOnce(&mut Store) -> Result<T, Error>) -> Result<T, ApiError> {
     let mut file_store = shared.store.lock().expect("a handler panicked holding the store");
     let before = file_store.store.clone();
     let result = change(&mut file_store.store).and_then(|value| file_store.save().map(|()| value));

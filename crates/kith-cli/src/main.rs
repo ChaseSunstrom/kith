@@ -113,6 +113,17 @@ enum Command {
     },
     /// Print the JSON Schema of a kind, or list the kinds
     Schema { kind: Option<String> },
+    /// Manage the nodes of the cluster
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Print a token that lets one more node join, within the hour: `kithd --join ADDR:PORT --token TOKEN`
+    Token,
 }
 
 #[derive(Args)]
@@ -491,6 +502,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 ),
             }
         }
+        Command::Node {
+            command: NodeCommand::Token,
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("tokens are made by kithd: leave out --store");
+            };
+            let reply: serde_json::Value = request(&kithd, "POST", "/v1/tokens", b"")?;
+            println!("{}", reply["token"].as_str().unwrap_or_default());
+        }
         Command::Schema { kind: None } => {
             let rows = KINDS
                 .iter()
@@ -593,8 +613,11 @@ fn status_summary(resource: &Resource) -> String {
             let why = why.map(|m| format!(": {}", clean(m))).unwrap_or_default();
             format!("{ready}/{replicas} ready{why}")
         }
-        // A Job.
-        _ => match (status["state"].as_str(), status["message"].as_str()) {
+        // A Job, or a Node.
+        _ => match (
+            status["state"].as_str().or(status["address"].as_str()),
+            status["message"].as_str(),
+        ) {
             (Some(state), Some(why)) if state != "succeeded" => format!("{state}: {}", clean(why)),
             (Some(state), _) => state.into(),
             _ => String::new(),

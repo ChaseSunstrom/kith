@@ -1,11 +1,14 @@
 //! `kithd`, in agent mode (PLAN.md §4.1): a service on an existing distro that
 //! owns the store, serves the API and runs workloads on this one node.
 //!
-//! The API is HTTP/JSON on a unix socket only its owner can open. gRPC and
-//! mTLS over the mesh arrive with the second node (Phase 2).
+//! The API is HTTP/JSON on a unix socket only its owner can open. With
+//! `--listen` it is also served to other nodes over TLS, and `--join` makes
+//! this node a member of another node's cluster (see `cluster.rs`).
 
 mod api;
+mod cluster;
 mod controller;
+mod pki;
 mod probe;
 
 use clap::Parser;
@@ -28,6 +31,21 @@ struct Args {
     /// Bytes of output kept per unit and stream before the file is moved aside (one old copy is kept)
     #[arg(long, env = "KITH_LOG_CAP", value_name = "BYTES", default_value_t = 10 << 20)]
     log_cap: u64,
+    /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
+    #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
+    listen: Option<std::net::SocketAddr>,
+    /// Join the cluster of the node at this address (needs --token; listens on 0.0.0.0:7443 unless --listen says otherwise)
+    #[arg(long, env = "KITH_JOIN", value_name = "ADDR:PORT", requires = "token")]
+    join: Option<String>,
+    /// A join token, from `kith node token` on a node of that cluster
+    #[arg(long, env = "KITH_TOKEN", value_name = "TOKEN")]
+    token: Option<String>,
+    /// This node's name in the cluster [default: the hostname]
+    #[arg(long, env = "KITH_NAME", value_name = "NAME")]
+    name: Option<String>,
+    /// The address other nodes reach this one at, when it is not the one it listens on
+    #[arg(long, env = "KITH_ADVERTISE", value_name = "ADDR:PORT")]
+    advertise: Option<String>,
 }
 
 /// What the API handlers and the controller share.
@@ -41,6 +59,8 @@ pub struct Shared {
     /// lock, so a reader under the lock sees the generation that matches what it reads.
     /// Starts at the clock (ms) so a restarted kithd never repeats a number a client holds.
     pub generation: watch::Sender<u64>,
+    /// `None` in agent mode: one node, nothing on the network.
+    pub cluster: Option<cluster::Cluster>,
 }
 
 impl Shared {
@@ -71,13 +91,82 @@ fn default_state() -> Option<PathBuf> {
     }
 }
 
+/// This node's place in a cluster, and the port it serves other nodes on: made on the
+/// first start with `--listen` or `--join`, read back from the state directory after that.
+async fn membership(
+    args: &Args,
+    state: &std::path::Path,
+) -> Result<(Option<cluster::Cluster>, Option<tokio::net::TcpListener>), String> {
+    let dir = state.join("pki");
+    let known = pki::load(&dir)?;
+    if known.is_none() && args.listen.is_none() && args.join.is_none() {
+        return Ok((None, None));
+    }
+    let listen = args.listen.unwrap_or(([0, 0, 0, 0], 7443).into());
+    let tcp = tokio::net::TcpListener::bind(listen).await;
+    let tcp = tcp.map_err(|e| format!("listening on {listen}: {e}"))?;
+    let leader_file = dir.join("leader");
+    if let Some((me, ca)) = known {
+        if args.join.is_some() {
+            eprintln!(
+                "kithd: already a member as node {}: --join is not needed again",
+                me.name
+            );
+        }
+        let leader = std::fs::read_to_string(&leader_file).ok();
+        return Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)));
+    }
+    let name = match &args.name {
+        Some(name) => name.clone(),
+        None => {
+            let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+            hostname.trim().to_ascii_lowercase()
+        }
+    };
+    pki::valid_name(&name).map_err(|e| format!("{e} (set --name)"))?;
+    let (me, ca, leader) = match &args.join {
+        Some(address) => {
+            let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
+            let token = args.token.as_deref().expect("clap requires --token with --join");
+            let joined = cluster::request_join(address, token, &name, port).await?;
+            eprintln!("kithd: joined the cluster of {address} as node {name}");
+            let me = pki::Identity {
+                name,
+                ca: joined.ca,
+                cert: joined.cert,
+                key: joined.key,
+            };
+            (me, None, Some(address.clone()))
+        }
+        None => {
+            let ca = pki::Ca::create()?;
+            let (cert, key) = ca.issue(&name)?;
+            eprintln!("kithd: new cluster; `kith node token` lets another node join");
+            let me = pki::Identity {
+                name,
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            };
+            (me, Some(ca), None)
+        }
+    };
+    pki::save(&dir, &me, ca.as_ref())?;
+    if let Some(leader) = &leader {
+        std::fs::write(&leader_file, leader).map_err(|e| format!("writing {}: {e}", leader_file.display()))?;
+    }
+    Ok((Some(cluster::Cluster::new(me, ca, leader)?), Some(tcp)))
+}
+
 fn run(args: Args) -> Result<(), String> {
     let state = args
         .state
+        .clone()
         .or_else(default_state)
         .ok_or("no state directory: set --state")?;
     let socket = args
         .socket
+        .clone()
         .or_else(kith_api::default_socket)
         .ok_or("no socket path: set --socket")?;
     let fail = |what: &str, e: &dyn std::fmt::Display| format!("{what}: {e}");
@@ -108,7 +197,15 @@ fn run(args: Args) -> Result<(), String> {
         let _ = std::fs::remove_file(&socket);
     }
     let runtime = kith_runtime::Runtime::new(state.join("runtime"));
+
+    // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| fail("starting", &e))?;
+    let (membership, tcp) = rt.block_on(membership(&args, &state))?;
     let shared = Arc::new(Shared {
+        cluster: membership,
         store: Mutex::new(store),
         changed: Notify::new(),
         logs: state.join("logs"),
@@ -120,11 +217,6 @@ fn run(args: Args) -> Result<(), String> {
         .0,
     });
 
-    // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| fail("starting", &e))?;
     let served = rt.block_on(async {
         // ponytail: bound, then made owner-only. The directory kithd creates for it is
         // already 0700; in a shared directory there is a moment in between (umask needs libc).
@@ -147,10 +239,34 @@ fn run(args: Args) -> Result<(), String> {
             watched.bump();
         });
         let mut server_stop = stopping.clone();
-        let server = axum::serve(listener, api::router(shared.clone()))
-            .with_graceful_shutdown(async move { drop(server_stop.changed().await) });
-        let (served, ()) = tokio::join!(server, controller::run(shared.clone(), runtime, args.log_cap, stopping));
-        served.map_err(|e| fail("serving", &e))
+        let local = cluster::local_router(shared.clone()).merge(cluster::admin_router(shared.clone()));
+        let server =
+            axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
+        // The same API for other nodes, over TLS.
+        let nodes = async {
+            let (Some(cluster), Some(tcp)) = (&shared.cluster, tcp) else {
+                return Ok(());
+            };
+            let address = tcp.local_addr().map_err(|e| fail("listening", &e))?;
+            if cluster.leader.is_none() {
+                let reachable = args.advertise.clone().unwrap_or(address.to_string());
+                cluster::register(&shared, &cluster.me.name, &reachable).map_err(|e| e.to_string())?;
+            }
+            eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
+            let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
+            let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
+            let mut stop = stopping.clone();
+            let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
+            served.await.map_err(|e| fail("serving other nodes", &e))
+        };
+        let work = async {
+            // A node that joined forwards its API and is not given workloads yet (see cluster.rs).
+            if !shared.cluster.as_ref().is_some_and(|cluster| cluster.leader.is_some()) {
+                controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()).await;
+            }
+        };
+        let (served, nodes, ()) = tokio::join!(server, nodes, work);
+        served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);
     served
