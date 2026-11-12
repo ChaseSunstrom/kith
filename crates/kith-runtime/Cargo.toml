@@ -1,0 +1,25 @@
+[package]
+name = "kith-runtime"
+description = "kith's workload runtime: OCI images and containers, no containerd and no shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# v2 only: no cgroup v1, no systemd/dbus driver, and no libseccomp (a C library) yet.
+libcontainer = { version = "0.7", default-features = false, features = ["v2"] }
+oci-spec = "0.10"
+# TLS through rustls with ring: smaller than the default aws-lc and no cmake.
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["fs", "rt"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
+serde_json.workspace = true
+nix = { version = "0.29", features = ["process", "user", "signal"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

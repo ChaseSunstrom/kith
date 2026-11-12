@@ -40,7 +40,11 @@ def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = "--self-test" in sys.argv
-    subprocess.run(["cargo", "build", "--release", "--quiet", "--target", TARGET], check=True)
+    # Only the budgeted binaries: kith-runtime's TLS (ring) needs a musl C compiler,
+    # which CI gets with kithd, the first binary that links it.
+    for binary in SIZE_BUDGETS:
+        package = "kith-cli" if binary == "kith" else binary
+        subprocess.run(["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package], check=True)
     bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
     results = []
     for binary, limit in SIZE_BUDGETS.items():
