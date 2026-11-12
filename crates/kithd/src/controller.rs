@@ -245,7 +245,13 @@ impl Controller {
             // Which replicas (or runs of a Job) should exist, started no sooner than when, restarted how.
             let (replicas, not_before, policy) = match resource.kind.as_str() {
                 "Job" => {
-                    let units = template.containers.len() + template.exec.len();
+                    if template.restart_policy.is_some() {
+                        note.push("restartPolicy is ignored: a Job retries whole runs (`retries`)".into());
+                    }
+                    // The units a run really has: a name counts once, and only if it can be an id.
+                    let names = template.containers.iter().map(|c| &c.name);
+                    let names: BTreeSet<_> = names.chain(template.exec.iter().map(|e| &e.name)).collect();
+                    let units = names.iter().filter(|name| unit_id(&prefix, 0, name).is_ok()).count();
                     let (runs, not_before) = self.job_runs(&key, resource, replicas, units);
                     // A Job retries whole runs, so a unit that exits stays exited.
                     (runs, not_before, RestartPolicy::Never)
@@ -438,6 +444,9 @@ impl Controller {
                 dirty |= file_store.store.set_status(&key, Some(status)).is_ok();
             }
         }
+        if dirty {
+            shared.bump();
+        }
         if dirty && let Err(e) = file_store.save() {
             eprintln!("kithd: saving status: {e}");
         }
@@ -498,6 +507,9 @@ impl Controller {
                 outcome: None,
                 message: None,
             };
+        }
+        if units == 0 && job.outcome.is_none() {
+            (job.outcome, job.message) = (Some("failed"), Some("the template has nothing that can run".into()));
         }
         if job.outcome.is_some() {
             return (Vec::new(), Instant::now());

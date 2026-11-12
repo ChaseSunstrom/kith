@@ -96,7 +96,8 @@ impl Runtime {
             root,
             cgroup_parent: cgroup_parent()?,
             images,
-            shim: std::env::current_exe().ctx("finding this program")?,
+            // Not `current_exe()`: after an upgrade replaces the file, that names a path that is gone.
+            shim: "/proc/self/exe".into(),
         })
     }
 

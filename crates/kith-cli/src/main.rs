@@ -66,6 +66,9 @@ enum Command {
         namespace: Option<String>,
         #[arg(short, long, value_enum, default_value = "table")]
         output: Output,
+        /// After the table, print each row that changes, until interrupted (needs kithd)
+        #[arg(short, long)]
+        watch: bool,
     },
     /// Delete a resource and its history
     Delete {
@@ -373,6 +376,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             name,
             namespace,
             output,
+            watch,
         } => {
             let (kind_name, name) = match &target {
                 Some(t) => match t.split_once('/') {
@@ -383,6 +387,22 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let info = kind_name.map(find_kind).transpose()?;
             let single = name.is_some();
+            if watch {
+                let Backend::Daemon(kithd) = backend()? else {
+                    return fail("-w needs kithd: it cannot watch a --store file");
+                };
+                if !matches!(output, Output::Table) {
+                    return fail("-w prints a table: leave out -o");
+                }
+                let one = info
+                    .zip(name.as_deref())
+                    .map(|(info, n)| key(info, n, namespace.as_deref()));
+                let keep = |r: &Resource| match &one {
+                    Some(one) => r.key() == *one,
+                    None => namespace.is_none() || r.metadata.namespace == namespace,
+                };
+                return watch_get(&kithd, info.map(|i| i.kind), keep);
+            }
             let found: Vec<Resource> = match (info, name) {
                 (Some(info), Some(name)) => vec![backend()?.get(&key(info, &name, namespace.as_deref()))?],
                 (info, _) => {
@@ -402,16 +422,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Output::Json if single => println!("{}", serde_json::to_string_pretty(&found[0]).or_else(fail)?),
                 Output::Json => println!("{}", serde_json::to_string_pretty(&found).or_else(fail)?),
                 Output::Table => {
-                    let rows = found.iter().map(|r| {
-                        let m = &r.metadata;
-                        [
-                            r.kind.clone(),
-                            m.namespace.clone().unwrap_or_default(),
-                            m.name.clone(),
-                            m.revision.unwrap_or(0).to_string(),
-                            status_summary(r),
-                        ]
-                    });
+                    let rows = found.iter().map(table_row);
                     print_table(["KIND", "NAMESPACE", "NAME", "REVISION", "STATUS"], rows.collect());
                 }
             }
@@ -494,6 +505,77 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn table_row(r: &Resource) -> [String; 5] {
+    let m = &r.metadata;
+    [
+        r.kind.clone(),
+        m.namespace.clone().unwrap_or_default(),
+        m.name.clone(),
+        m.revision.unwrap_or(0).to_string(),
+        status_summary(r),
+    ]
+}
+
+/// `kith get -w`: the table, then each row that changes (a deleted one says so),
+/// by long-polling `GET /v1/watch` until interrupted or kithd goes away.
+fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool) -> Result<ExitCode, String> {
+    #[derive(serde::Deserialize)]
+    struct Watched {
+        generation: u64,
+        resources: Vec<Resource>,
+    }
+    // The reply must come back before --timeout, or every quiet minute would be an error.
+    let wait = kithd.timeout.as_secs().saturating_sub(1).min(25);
+    let kind = kind.map(|k| format!("&kind={k}")).unwrap_or_default();
+    let mut shown = std::collections::BTreeMap::new();
+    let mut after = None;
+    loop {
+        let path = match after {
+            None => format!("/v1/watch?wait=0{kind}"),
+            Some(g) => format!("/v1/watch?after={g}&wait={wait}{kind}"),
+        };
+        let now: Watched = match request(kithd, "GET", &path, b"") {
+            Ok(now) => now,
+            // A kithd too busy to answer in time has not changed anything we would miss: ask again.
+            Err(e) if after.is_some() && e.contains("has not answered") => continue,
+            Err(e) if after.is_some() && (e.contains("cannot reach kithd") || e.contains("sent no reply")) => {
+                return fail("kithd stopped");
+            }
+            Err(e) => return Err(e),
+        };
+        let rows: std::collections::BTreeMap<String, [String; 5]> = now
+            .resources
+            .iter()
+            .filter(|r| keep(r))
+            .map(|r| (r.key(), table_row(r)))
+            .collect();
+        if after.is_none() {
+            print_table(
+                ["KIND", "NAMESPACE", "NAME", "REVISION", "STATUS"],
+                rows.values().cloned().collect(),
+            );
+        } else {
+            // ponytail: changed rows are not aligned with the first table's columns
+            for (key, row) in &rows {
+                if shown.get(key) != Some(row) {
+                    println!("{}", row.join("  ").trim_end());
+                }
+            }
+            for (key, row) in &shown {
+                if !rows.contains_key(key) {
+                    println!("{}", [&row[0], &row[1], &row[2], "", "deleted"].join("  "));
+                }
+            }
+        }
+        shown = rows;
+        if after == Some(now.generation) && wait == 0 {
+            // --timeout 1: kithd answers at once, so do not spin.
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        after = Some(now.generation);
+    }
 }
 
 /// The STATUS column: what a controller reported, in a few words.

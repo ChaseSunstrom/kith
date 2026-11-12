@@ -9,11 +9,19 @@
 //! POST   /v1/rollback/<key>?to=N                 -> Change
 //! GET    /v1/logs/<key>[?unit=&replica=&stderr=true&previous=true&offset=N|tail=LINES]
 //!                                                -> {data, next, more}
+//! GET    /v1/watch[?after=G&kind=Kind&wait=S]    -> {generation, resources}
 //! ```
 //! Logs: `data` is output from byte `offset` on (or the last `tail` lines), `next`
 //! the offset to ask for next, `more` whether the unit may still write. Following
 //! is asking again; `previous` reads the file that was moved aside at the size cap.
 //! `<key>` is `Kind/namespace/name` or `Kind/name`. Errors are `{"error": "..."}`.
+//!
+//! `watch` is a long-poll. `generation` counts changes to the store (status
+//! included) and is only comparable within one kithd run. With `after=G` it
+//! replies at once if the generation is not G (newer, or a restarted kithd's),
+//! otherwise it waits up to `wait` seconds (default and cap 25) for a change
+//! and replies with the current resources either way: compare, then ask again
+//! with the new generation. Without `after` it replies at once.
 
 use crate::Shared;
 use axum::extract::{Path, Query, State};
@@ -29,6 +37,7 @@ use std::sync::Arc;
 pub fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/v1/apply", post(apply))
+        .route("/v1/watch", get(watch))
         .route("/v1/resources", get(list))
         .route("/v1/resources/{*key}", get(get_one).delete(delete))
         .route("/v1/history/{*key}", get(history))
@@ -60,6 +69,9 @@ fn write<T>(shared: &Shared, change: impl FnOnce(&mut Store) -> Result<T, Error>
     let result = change(&mut file_store.store).and_then(|value| file_store.save().map(|()| value));
     if result.is_err() {
         file_store.store = before;
+    }
+    if result.is_ok() {
+        shared.bump();
     }
     drop(file_store);
     shared.changed.notify_one();
@@ -98,6 +110,35 @@ struct ListOptions {
 async fn list(State(shared): State<Arc<Shared>>, Query(options): Query<ListOptions>) -> Reply<Vec<Resource>> {
     read(&shared, |store| {
         Ok(store.list(options.kind.as_deref()).cloned().collect())
+    })
+}
+
+/// The longest a `watch` holds a request, whatever `wait` asks for.
+const MAX_WATCH_SECS: u64 = 25;
+
+#[derive(Deserialize)]
+struct WatchOptions {
+    after: Option<u64>,
+    kind: Option<String>,
+    wait: Option<u64>,
+}
+
+async fn watch(State(shared): State<Arc<Shared>>, Query(options): Query<WatchOptions>) -> Reply<serde_json::Value> {
+    if let Some(after) = options.after {
+        let secs = options.wait.unwrap_or(MAX_WATCH_SECS).min(MAX_WATCH_SECS);
+        let mut generation = shared.generation.subscribe();
+        // A timeout is not an error: the client gets the current state either way.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            generation.wait_for(|g| *g != after),
+        )
+        .await;
+    }
+    read(&shared, |store| {
+        Ok(serde_json::json!({
+            "generation": *shared.generation.borrow(),
+            "resources": store.list(options.kind.as_deref()).collect::<Vec<_>>(),
+        }))
     })
 }
 
@@ -193,7 +234,11 @@ fn log_chunk(path: &std::path::Path, offset: Option<u64>, tail: Option<u64>) -> 
             let body = end.strip_suffix(b"\n").unwrap_or(&end);
             let newlines = body.iter().rposition(|b| *b == b'\n');
             let mut cut = newlines.map(|at| at + 1).filter(|_| lines > 0);
-            for _ in 1..lines {
+            // Never more turns than there are lines: `tail` is whatever the caller sent.
+            for _ in 1..lines.min(body.len() as u64 + 1) {
+                if cut.is_none() {
+                    break;
+                }
                 cut = cut.and_then(|at| body[..at - 1].iter().rposition(|b| *b == b'\n').map(|at| at + 1));
             }
             match (lines, cut) {
@@ -236,6 +281,8 @@ mod tests {
         assert_eq!(chunk(None, Some(1)), ("three\n".into(), 14));
         assert_eq!(chunk(None, Some(2)), ("two\nthree\n".into(), 14));
         assert_eq!(chunk(None, Some(9)), ("one\ntwo\nthree\n".into(), 14));
+        // However many lines are asked for, it is the file that bounds the work.
+        assert_eq!(chunk(None, Some(u64::MAX)), ("one\ntwo\nthree\n".into(), 14));
         // Half a character waits for its other half.
         std::fs::write(&path, [b'a', 0xC3]).unwrap();
         assert_eq!(chunk(None, None), ("a".into(), 1));
