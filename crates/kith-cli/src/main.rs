@@ -305,9 +305,23 @@ enum NodeCommand {
         /// The disk each machine installs on: a name, or `only` for machines with one disk
         #[arg(long, default_value = "only", value_name = "NAME")]
         disk: String,
+        /// The machines keep their state encrypted, its key held by the cluster (`kith node lock`)
+        #[arg(long, requires = "image")]
+        encrypt: bool,
         /// Turn it off now
         #[arg(long, conflicts_with = "image")]
         off: bool,
+    },
+    /// Have the cluster stop handing out the key of NAME's encrypted state: it restarts, and waits
+    Lock { name: String },
+    /// Hand the key of NAME's encrypted state out again
+    Unlock { name: String },
+    /// Forget the key of NAME's encrypted state for good: what its disk holds can no longer be read
+    Wipe {
+        name: String,
+        /// The node's name once more: there is no way back
+        #[arg(long, value_name = "NAME")]
+        erase: String,
     },
 }
 
@@ -746,6 +760,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     mac,
                     minutes,
                     disk,
+                    encrypt,
                     off,
                 },
         } => {
@@ -755,7 +770,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let now: serde_json::Value = match (image, off) {
                 (Some(image), _) => {
                     let file = std::fs::read(&image).or_else(|e| fail(format!("{}: {e}", image.display())))?;
-                    let path = format!("/v1/netboot?macs={}&minutes={minutes}&disk={disk}", mac.join(","));
+                    let path = format!(
+                        "/v1/netboot?macs={}&minutes={minutes}&disk={disk}&encrypt={encrypt}",
+                        mac.join(",")
+                    );
                     request(&kithd, "PUT", &path, &file)?
                 }
                 (None, true) => request(&kithd, "DELETE", "/v1/netboot", b"")?,
@@ -775,6 +793,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 }
                 _ => println!("netboot is off"),
             }
+        }
+        Command::Node {
+            command: command @ (NodeCommand::Lock { .. } | NodeCommand::Unlock { .. } | NodeCommand::Wipe { .. }),
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            let (name, what) = match command {
+                NodeCommand::Lock { name } => (name, "lock"),
+                NodeCommand::Unlock { name } => (name, "unlock"),
+                NodeCommand::Wipe { name, erase } if name == erase => (name, "wipe"),
+                _ => return fail("--erase is not the node's name: nothing was done"),
+            };
+            let _: serde_json::Value = request(&kithd, "POST", &format!("/v1/lock/{name}?do={what}"), b"")?;
+            println!(
+                "{}",
+                match what {
+                    "lock" => format!("{name} is locked: it restarts, and waits until `kith node unlock {name}`"),
+                    "unlock" => format!("{name} is unlocked: it is handed its key when it asks"),
+                    _ => format!("{name} is wiped: the cluster has forgotten the key of its state"),
+                }
+            );
         }
         Command::Identity {
             command: IdentityCommand::Cert { name, out },

@@ -1,0 +1,14 @@
+[package]
+name = "kith-dm-sys"
+description = "Device-mapper by ioctl: a dm-crypt mapping made and removed with no userland. The workspace's one crate with unsafe code (PLAN.md §5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The version kithd already links: for ioctl(2) alone.
+libc = "0.2"
+
+# Not the workspace's: its `unsafe_code = "forbid"` is what this crate is the exception to.
+[lints.clippy]
+all = { level = "warn", priority = -1 }

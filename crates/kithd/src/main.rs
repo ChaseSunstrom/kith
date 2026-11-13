@@ -13,6 +13,7 @@ mod audit;
 mod cluster;
 mod controller;
 mod controllers;
+mod crypt;
 mod dhcp;
 mod dns;
 mod ingress;
@@ -401,7 +402,24 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
     Ok(shared)
 }
 
-fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
+fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
+    // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("starting: {e}"))?;
+    let first_process = boot.is_some();
+    let sealed = boot.as_mut().and_then(|boot| boot.sealed.take());
+    if let Some(boot) = boot {
+        let _in = rt.enter();
+        boot.network();
+    }
+    // An encrypted state is opened with a key the cluster holds: nothing below can be
+    // done before that, and it takes as long as it takes.
+    let mut opened = None;
+    if let Some((record, _)) = &sealed {
+        opened = Some(rt.block_on(crypt::open(record, args.join.as_ref()))?);
+    }
     let state = args
         .state
         .clone()
@@ -441,16 +459,6 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
     }
     let runtime = kith_runtime::Runtime::new(state.join("runtime"));
 
-    // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| fail("starting", &e))?;
-    let first_process = boot.is_some();
-    if let Some(boot) = boot {
-        let _in = rt.enter();
-        boot.network();
-    }
     let upstream = |address: &String| {
         let with_port = address.parse().ok();
         let bare = || address.parse().ok().map(|ip| std::net::SocketAddr::new(ip, 53));
@@ -561,7 +569,12 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
             let controllers = controllers::run(shared.clone(), stopping.clone());
             let plans = update::run(shared.clone(), stopping.clone());
             let system = update::node(shared.clone(), state.clone(), stopping.clone());
-            tokio::join!(units, releases, repositories, sources, controllers, plans, system);
+            let key = async {
+                if let Some(((record, config), opened)) = sealed.zip(opened) {
+                    crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
+                }
+            };
+            tokio::join!(units, releases, repositories, sources, controllers, plans, system, key);
         };
         let names = async {
             if let Some(sockets) = names {

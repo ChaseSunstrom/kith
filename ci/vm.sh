@@ -11,6 +11,7 @@
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
 #   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
+#   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -62,6 +63,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    to install a machine by its card's address; that machine, with an
                    empty disk, starts from the network (PXE), installs, starts from
                    its disk and joins the node's cluster
+  --test crypt     instead: the same, the machine installed with its state encrypted:
+                   the node holds its key; it is locked, unlocked, opened with its
+                   recovery key and wiped
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -84,7 +88,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -241,7 +245,7 @@ EOF
         echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster; one that cannot start tried by one node, which came back, and the plan paused: $line"
         exit 0
     fi
-    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ]; then
         for tool in curl python3 cpio; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -346,14 +350,16 @@ EOF
             exit 0
         fi
 
-        if [ "$test" = netboot ]; then
+        if [ "$test" = netboot ] || [ "$test" = crypt ]; then
             # A network as in a house: one with a DHCP server of its own (ci/dhcpd.py), on a
             # hub with a node's card and a socket that a second machine's card connects to.
             # The node is told to install that machine; the machine, with an empty disk, is
             # set to start from the network. The node's second card is this script's way in.
             out=$root/target/os
             [ "$time" -gt 300 ] || time=600
-            mac=52:54:00:00:09:02
+            mac=52:54:00:00:09:02 more=''
+            # (Six starts of the machine: the node has to outlast them all.)
+            [ "$test" = netboot ] || more='&encrypt=true' time=$((time * 2))
             python3 "$root/ci/dhcpd.py" "$((port + 9))" 52:54:00:00:09:01=10.9.0.1 "$mac=10.9.0.2" &
             vms="$vms $!"
             sleep 0.5
@@ -390,15 +396,14 @@ EOF
             api PUT "/v1/netboot?macs=$mac" --data-binary "@$out/vmlinuz" | grep -qF "not kith's network boot file" || fail "netboot took a file that is not the boot file"
             api PUT '/v1/netboot?minutes=10' --data-binary "@$out/kith-netboot.efi" | grep -qF "a machine's card address" || fail "netboot went on for no machine"
             [ "$(api GET /v1/netboot | field on)" = False ] || fail "netboot is on after two refusals"
-            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot did not go on"
+            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10$more" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot did not go on"
             # (Again while on: the second takes the ports the first held.)
-            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot, on, could not be turned on anew"
+            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10$more" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot, on, could not be turned on anew"
             hears alpha 'kithd: netboot: on for 10 minutes'
 
-            beta() { # LOG: the machine: an empty disk at first, and its card, which it starts from
-                # shellcheck disable=SC2046
-                vm "$1" -m 1024 $(drive beta.disk) -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" \
-                    -device "virtio-net-pci,netdev=n,mac=$mac,bootindex=1"
+            beta() { # LOG [disk]: the machine: an empty disk at first, and its card, which it starts from (or: from its disk)
+                vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device "virtio-blk-pci,drive=d${2+,bootindex=0}" \
+                    -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac${2-,bootindex=1}"
             }
             blank beta
             beta install-beta
@@ -419,6 +424,80 @@ EOF
             ! grep -aqF 'kithd: install:' "$work/beta.log" || fail "the machine was installed a second time"
             [ "$(api DELETE /v1/netboot | field on)" = False ] || fail "netboot did not go off"
             hears alpha 'kithd: netboot: off'
+            if [ "$test" = crypt ]; then
+                # What a disk file says from outside: whether its state partition shows a file
+                # system (ext4's mark) and what its lock record holds.
+                says() {
+                    python3 -c '
+import struct, sys
+disk, at = open(sys.argv[1], "rb"), {}
+disk.seek(512 + 72)
+entries = struct.unpack("<Q", disk.read(8))[0] * 512
+for index in range(128):
+    disk.seek(entries + index * 128)
+    entry = disk.read(128)
+    at[entry[56:].decode("utf-16-le").rstrip("\0")] = struct.unpack("<Q", entry[32:40])[0] * 512
+disk.seek(at["state"] + 1080)
+state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
+disk.seek(at["config"] + (512 << 10))
+record = disk.read(4096)
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held")' "$1"
+                }
+                lock() { api POST "/v1/lock/kith-000902?do=$1"; }
+                up() { # LOG: the machine's state is open and it serves
+                    hears "$1" 'kithd: init: state on /dev/dm-'
+                    hears "$1" 'kithd: node kith-000902 serving other nodes'
+                }
+                recovery=$(grep -ao 'shown this once: [0-9a-f-]*' "$work/install-beta.log") || fail "the installer showed no recovery key"
+                [ "$(says "$out/kith-os.raw")" = 'plain none' ] || fail "the image's state is not a plain file system: $(says "$out/kith-os.raw")"
+                # First start: the key is beside the lock until the other node holds it.
+                hears beta 'still on its disk: no other node holds it yet'
+                up beta
+                hears beta "10.9.0.1:7443 holds the key of this node's state"
+                api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"
+                kill "$vm"
+                wait "$vm" 2>/dev/null || true
+                [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
+                # Started again, it asks the node for its key. Locked, it restarts and waits.
+                beta beta2 ''
+                hears beta2 'asking the cluster for its key'
+                up beta2
+                lock lock | grep -q '"locked": *true' || fail "the machine could not be locked"
+                hears beta2 'kithd: the cluster has locked this node'
+                wait "$vm" || true
+                beta beta3 ''
+                hears beta3 'still locked: 10.9.0.1:7443 does not hand this node'
+                ! grep -aqF 'state on' "$work/beta3.log" || fail "a locked machine opened its state"
+                lock unlock | grep -q '"locked": *false' || fail "the machine could not be unlocked"
+                up beta3
+                # Its key deleted from the store: the running machine gives it again, and has not restarted.
+                api DELETE /v1/resources/NodeKey/kith-000902 >/dev/null
+                sleep 5
+                api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the machine did not give its key again once it was deleted"
+                ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
+                # Locked again: the recovery key, typed at the machine, opens it all the same.
+                lock lock >/dev/null
+                hears beta3 'kithd: the cluster has locked this node'
+                wait "$vm" || true
+                beta beta4 ''
+                hears beta4 'still locked'
+                printf 'aaaa-bbbb\n' | socat - "unix-connect:$work/beta4.tty" >/dev/null
+                hears beta4 "that is not this node's recovery key"
+                printf '%s\n' "${recovery##* }" | socat - "unix-connect:$work/beta4.tty" >/dev/null
+                hears beta4 'kithd: init: opened with the recovery key'
+                up beta4
+                # Wiped: the cluster forgets the key, the machine erases its record and ends;
+                # what is left on its disk opens for nobody.
+                lock wipe | grep -q '"wiped": *true' || fail "the machine could not be wiped"
+                hears beta4 'kithd: the cluster has wiped this node'
+                wait "$vm" || true
+                [ "$(says "$work/beta.disk")" = 'sealed none' ] || fail "the wiped machine's disk, read from outside: $(says "$work/beta.disk")"
+                lock unlock | grep -qF 'was wiped' || fail "a wiped machine could be unlocked"
+                beta beta5 ''
+                hears beta5 'the state partition is damaged'
+                echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; locked again, the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody"
+                exit 0
+            fi
             echo "vm.sh: ok: a node told to install the machine with card $mac answered its network boot (beside the network's own DHCP server), served it the installer once over TFTP; the machine installed on its only disk, started from it and joined the node's cluster; netboot off again"
             exit 0
         fi
@@ -502,11 +581,12 @@ EOF
         typed "The node's name" gamma
         typed 'Its address, as' ''
         typed 'Join a cluster?' ''
+        typed 'Keep its state encrypted' ''
         typed 'will be erased. Type its name again' vda
         hears install-gamma 'kithd: install: `vda` is not `vdb`: nothing was written'
         cmp -s -n $((64 << 20)) "$work/gamma.disk" /dev/zero || fail "a disk was written to before its name was typed twice"
         hears install-gamma 'kithd: install: once more.'
-        for line in vdb gamma 10.9.0.3/24 10.9.0.1:7443 "$join" vdb; do
+        for line in vdb gamma 10.9.0.3/24 10.9.0.1:7443 "$join" '' vdb; do
             printf '%s\n' "$line" | socat - "unix-connect:$work/install-gamma.tty" >/dev/null
             sleep 0.3
         done

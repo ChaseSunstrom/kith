@@ -233,6 +233,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/ca", get(ca))
         .route("/v1/join", post(join))
         .route("/v1/claim", post(claim))
+        .route("/v1/unlock", post(crate::crypt::unlock))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(shared.clone());
     let ping = Router::new().route("/v1/ping", post(crate::members::ping));
@@ -489,7 +490,8 @@ pub async fn netboot(
             let minutes = asked.get("minutes").map_or(Ok(30), |minutes| minutes.parse());
             let minutes = minutes.map_err(|_| "minutes is a number")?;
             let disk = asked.get("disk").map_or("only", String::as_str);
-            netboot::on(image.to_vec(), machines, minutes, disk, || {
+            let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
+            netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
                 cluster.tokens.mint(&ca.cert)
             })
             .await

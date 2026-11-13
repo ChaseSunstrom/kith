@@ -1036,6 +1036,7 @@ dns: 10.0.0.1
 join:                         # without it the node starts a new cluster
   address: 10.0.0.7:7443
   token: $TOKEN
+encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 ```
 
 Then nothing is asked, and nothing confirmed: a stick with answers on it
@@ -1145,10 +1146,72 @@ For a cloud that takes uploaded disk images, `kith-os.raw` and
 `kith-os.qcow2` are that image: such a node asks its network for an address
 and names itself after its network card, as nothing has written its config.
 
-Not yet: a CD image, starting by BIOS, a watchdog for a slot that hangs without
+### Encrypted state
+
+A node's state partition (its certificates, the store, Secrets, volumes) can
+be kept under dm-crypt, with the key not on the machine: the cluster holds it.
+At each start the node brings its network up, asks the nodes it knows for its
+key and only then opens its state. A disk taken out of its cluster, thrown
+away, or sent back under warranty opens for nobody.
+
+It is chosen when the machine is installed: `encrypt: true` in the
+[installer's answers](#installing-on-a-machine) (the installer asks, at the
+console), or `kith node netboot --encrypt`.
+
+```sh
+kith node lock beta                    # the cluster stops handing beta's key out: beta restarts, and waits
+kith node unlock beta                  # beta is handed its key again, and starts
+kith node wipe beta --erase beta       # the key is forgotten for good: beta's state is gone
+sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
+```
+
+`lock` is for a machine that is lost or about to leave the house; a locked
+node that is still running restarts within moments, and from then on says at
+its console that it waits. `wipe` cannot be undone: the cluster no longer
+holds the key, and the node, if it still runs, erases what it would need to
+ask for it and powers off. (The wrapped key is still in backups of the store
+made before, which open nothing without the secret on the wiped disk.)
+A node whose key is still on its own disk, as no other node holds it yet,
+opens whatever the cluster says.
+
+**The recovery key.** The installer shows it once, at the console, when it is
+done (32 digits in groups of four): write it down. Typed at a waiting
+machine's console, it opens the state where no cluster answers: a laptop away
+from home, or a cluster whose nodes were all off at once (each waits for
+another to hand it its key: open one by hand, and the others follow). It
+opens a locked node too, as whoever has it owns the machine; only `wipe`,
+reaching a running node, ends that. An install that nobody watched (from a
+URL, or from the network) has a recovery key that nobody saw.
+
+What is and is not protected:
+
+- The cluster holds the key wrapped with a secret that only the node's disk
+  has (a `NodeKey` in the store): neither the store alone, nor a backup of it,
+  nor the disk alone opens the state. The disk together with a cluster that
+  still hands the key out does, which is what `lock` is for.
+- Until another node holds the key it stays on the node's own disk, and the
+  node says so at each start: a cluster's first node, until a second has
+  joined, is not protected.
+- Whoever may apply NodeKeys can lock and wipe; a running node gives its
+  NodeKey again when it is deleted or written over, and one that was off
+  meanwhile needs its recovery key.
+- The config partition (the node's name, address, and the join token it was
+  installed with, spent since) and the system itself are not encrypted.
+- Anyone who can reach a node's port can ask for a key by its id; what they
+  are sent opens nothing without the disk's secret.
+- A stolen machine that is not locked, started on the cluster's own network,
+  is handed its key: lock it when it goes missing.
+
+Not yet: sealing the key to the machine's TPM (so a laptop starts away from
+home without typing), encrypting a node that was not installed that way, a
+new recovery key for a running node.
+
+### Not in kith OS yet
+
+A CD image, starting by BIOS, a watchdog for a slot that hangs without
 stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
-state partition growing to its disk and being encrypted, drivers for Wi-Fi,
+state partition growing to its disk, drivers for Wi-Fi,
 sound and graphics, a card plugged in later, IPv6 addresses from the network,
 the power button, arm64.
 

@@ -210,10 +210,10 @@ pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
 
 /// Mount the state partition, or say that there is none and keep the state in memory.
 fn state() {
-    let _ = std::fs::create_dir_all(STATE);
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
     let found = labelled("state");
     let Some(device) = found else {
+        let _ = std::fs::create_dir_all(STATE);
+        let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
         eprintln!(
             "kithd: init: no partition is labelled state: this node's state is in memory, and gone when it restarts"
         );
@@ -222,8 +222,15 @@ fn state() {
         }
         return;
     };
+    mount_state(&device)
+}
+
+/// Mount the state's file system from `device`: the partition, or what it is under its key.
+pub fn mount_state(device: &std::path::Path) {
+    let _ = std::fs::create_dir_all(STATE);
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
     match mount(
-        Some(&device),
+        Some(device),
         STATE,
         Some("ext4"),
         flags | MsFlags::MS_NOATIME,
@@ -253,6 +260,9 @@ pub struct Boot {
     pub args: Vec<String>,
     /// Set in the installer: the URL of its answers, or empty.
     pub install: Option<String>,
+    /// The node's state is encrypted and not mounted yet (see crypt.rs): its lock record,
+    /// and the config partition that holds it.
+    pub sealed: Option<(crate::crypt::Record, std::path::PathBuf)>,
 }
 
 impl Boot {
@@ -405,7 +415,16 @@ pub fn early() -> Boot {
         read.ok().map(|_| configured(&String::from_utf8_lossy(&text)))
     });
     let (config, args) = config.unwrap_or_default();
-    if !installing {
+    // (An encrypted state waits for its key, and that for the network: see `main`.)
+    let sealed = labelled("config").filter(|_| !installing);
+    let sealed = sealed.and_then(|device| match crate::crypt::Record::read(&device) {
+        Ok(record) => Some((record?, device)),
+        Err(e) => {
+            eprintln!("kithd: init: {e}");
+            end(true)
+        }
+    });
+    if !installing && sealed.is_none() {
         state();
     }
     // (The command line after the config: what is typed at a boot menu is the last word.)
@@ -443,6 +462,7 @@ pub fn early() -> Boot {
         name,
         args,
         install: options.install,
+        sealed,
     }
 }
 

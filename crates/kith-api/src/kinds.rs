@@ -655,6 +655,24 @@ spec! {
         pub paused: Option<bool>,
     }
 
+    // ---- Encrypted state ----
+
+    /// The key of a node's encrypted state partition, as the cluster holds it: wrapped
+    /// with a secret that only the node's disk has. Written by the node itself.
+    pub struct NodeKeySpec {
+        /// What the node asks for it by: made from its disk's secret.
+        pub id: String,
+        /// The key, wrapped (hex). Empty once wiped.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub wrapped: String,
+        /// Not handed out while set: the node waits at its next start (`kith node lock`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub locked: Option<bool>,
+        /// Forgotten for good (`kith node wipe`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub wiped: Option<bool>,
+    }
+
     // ---- Extensibility and access (§4.10, §4.13) ----
 
     pub struct KindDefinitionSpec {
@@ -764,6 +782,7 @@ no_checks!(
     RepositorySpec,
     OsReleaseSpec,
     UpdatePlanSpec,
+    NodeKeySpec,
     RoleSpec,
     RoleBindingSpec,
     IdentitySpec,

@@ -16,6 +16,7 @@ kith-store = { path = "../kith-store" }
 kith-dns = { path = "../kith-dns" }
 kith-sched = { path = "../kith-sched" }
 kith-mesh = { path = "../kith-mesh" }
+kith-dm-sys = { path = "../kith-dm-sys" }
 kith-runtime = { path = "../kith-runtime" }
 # (In the tree through kith-runtime.) What the first process of a machine does: init.rs.
 nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "net"] }

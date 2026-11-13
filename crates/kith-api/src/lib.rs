@@ -122,6 +122,7 @@ kinds! {
     Source: SourceSpec, namespaced, "GitOps: sync resources from a git repo or OCI artifact";
     OSRelease: OsReleaseSpec, cluster, "A signed kith OS image version";
     UpdatePlan: UpdatePlanSpec, cluster, "A rollout of an OSRelease across nodes";
+    NodeKey: NodeKeySpec, cluster, "The wrapped key of a node's encrypted state";
     KindDefinition: KindDefinitionSpec, cluster, "Defines a new resource kind";
     Role: RoleSpec, cluster, "A set of permissions";
     RoleBinding: RoleBindingSpec, cluster, "Grants a role to identities";

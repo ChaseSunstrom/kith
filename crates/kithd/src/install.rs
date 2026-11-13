@@ -99,6 +99,9 @@ pub struct Answers {
     /// Join this cluster; without, the node starts a new one.
     #[serde(default)]
     pub join: Option<Join>,
+    /// Keep the node's state encrypted, its key held by its cluster (see crypt.rs).
+    #[serde(default)]
+    pub encrypt: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -214,6 +217,7 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
         address,
         token: ask("The join token (`kith node token` there)?"),
     });
+    let encrypt = ask("Keep its state encrypted, the key held by its cluster (yes, or empty: no)?") == "yes";
     let again = ask(&format!(
         "Everything on {chosen} will be erased. Type its name again to go on:"
     ));
@@ -227,12 +231,22 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
         dns: None,
         size: None,
         join,
+        encrypt,
     })
 }
 
 /// In the disk image `image` (GPT): how long it is, and where its partition named
 /// `config` is and how long.
 pub fn layout(image: &File) -> Result<(u64, u64, u64), String> {
+    found(image, "config")
+}
+
+/// Where the image's partition `name` is, and how long.
+pub fn named(image: &File, name: &str) -> Result<(u64, u64), String> {
+    found(image, name).map(|(_, at, length)| (at, length))
+}
+
+fn found(image: &File, wanted: &str) -> Result<(u64, u64, u64), String> {
     let bad = |what: &str| format!("the image the installer carries is not one: {what}");
     let mut header = [0; 92];
     image.read_exact_at(&mut header, 512).map_err(|e| bad(&e.to_string()))?;
@@ -261,15 +275,15 @@ pub fn layout(image: &File) -> Result<(u64, u64, u64), String> {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         let name = String::from_utf16_lossy(&name);
-        if name.trim_end_matches('\0') == "config" {
+        if name.trim_end_matches('\0') == wanted {
             let (first, last) = (u64_at(&entry, 32), u64_at(&entry, 40));
             if first == 0 || last < first || (last + 1) * 512 > length {
-                return Err(bad("its config partition is not inside it"));
+                return Err(bad(&format!("its {wanted} partition is not inside it")));
             }
             return Ok((length, first * 512, (last + 1 - first) * 512));
         }
     }
-    Err(bad("no partition named config"))
+    Err(bad(&format!("no partition named {wanted}")))
 }
 
 /// Copy the image to the disk, read it back, and write the node's config. `said` is told
@@ -337,7 +351,7 @@ pub fn answers(yaml: &str) -> Result<Answers, String> {
 
 /// One line from whoever types at any of the machine's consoles (a screen's keyboard, a
 /// serial line): the kernel hands its first process only the last console named.
-fn keyboard() -> std::sync::mpsc::Receiver<String> {
+pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
     use std::io::BufRead;
     let (lines, typed) = std::sync::mpsc::channel();
     let active = std::fs::read_to_string("/sys/class/tty/console/active").unwrap_or_default();
@@ -424,7 +438,7 @@ pub async fn run(source: String) -> ! {
         Some(fetched(&source).await)
     };
     let typed = std::sync::Arc::new(std::sync::Mutex::new(keyboard()));
-    let (disk, config) = loop {
+    let ((disk, config), encrypt) = loop {
         let told = match &given {
             Some(Ok(yaml)) => answers(yaml),
             Some(Err(e)) => Err(e.clone()),
@@ -449,7 +463,7 @@ pub async fn run(source: String) -> ! {
                 }
             }
         };
-        match told.and_then(|told| plan(&told, &found, length, room)) {
+        match told.and_then(|told| Ok((plan(&told, &found, length, room)?, told.encrypt))) {
             Ok(planned) => break planned,
             Err(e) if given.is_some() || found.is_empty() => stop(&e).await,
             Err(e) => eprintln!("kithd: install: {e}\nkithd: install: once more."),
@@ -472,10 +486,18 @@ pub async fn run(source: String) -> ! {
             .map_err(|e| format!("{}: {e}", device.display()))?;
         write(&mut image, &mut disk, &config, |tenths| {
             eprintln!("kithd: install: {}%", tenths * 10)
-        })
+        })?;
+        // (The disk let go of first: the kernel takes it for the mapping.)
+        drop(disk);
+        encrypt.then(|| crate::crypt::seal(&image, &device)).transpose()
     });
     match wrote.await.map_err(|e| e.to_string()).and_then(|wrote| wrote) {
-        Ok(()) => {
+        Ok(recovery) => {
+            if let Some(recovery) = recovery {
+                eprintln!(
+                    "kithd: install: the node's state is encrypted. Its recovery key opens it where no cluster answers, and is shown this once: {recovery}"
+                );
+            }
             // (Nothing to take out of a machine installed from its own memory: it starts at once.)
             let then = if memory {
                 "Starting it."
@@ -659,7 +681,7 @@ mod tests {
             });
             (told, asked)
         };
-        let (told, asked) = ask(&["sdb", "alpha", "", "", "sdb"]);
+        let (told, asked) = ask(&["sdb", "alpha", "", "", "", "sdb"]);
         let expected = Answers {
             disk: "sdb".into(),
             hostname: Some("alpha".into()),
@@ -676,21 +698,22 @@ mod tests {
                 .unwrap()
                 .contains("Everything on sdb (16.0 GB, Test) will be erased")
         );
-        let (told, asked) = ask(&["sda", "", "10.0.0.5/24", "10.0.0.7:7443", "kith1.ab.cd", "sda"]);
+        let (told, asked) = ask(&["sda", "", "10.0.0.5/24", "10.0.0.7:7443", "kith1.ab.cd", "yes", "sda"]); // pragma: allowlist secret
         let join = Some(Join {
             address: "10.0.0.7:7443".into(),
             token: "kith1.ab.cd".into(), // (made up) pragma: allowlist secret
         });
-        assert_eq!(told.unwrap().join, join);
-        assert_eq!(asked.len(), 6);
+        let told = told.unwrap();
+        assert_eq!((told.join, told.encrypt), (join, true));
+        assert_eq!(asked.len(), 7);
         // Not the same name twice, or a disk that is not there: nothing is chosen.
         assert!(
-            ask(&["sda", "", "", "", "sdb"])
+            ask(&["sda", "", "", "", "", "sdb"])
                 .0
                 .unwrap_err()
                 .contains("nothing was written")
         );
-        assert!(ask(&["sda", "", "", "", ""]).0.is_err());
+        assert!(ask(&["sda", "", "", "", "", ""]).0.is_err());
         assert!(ask(&["sdz"]).0.unwrap_err().contains("no disk `sdz`"));
         assert!(interview(&[], |_| String::new()).is_err());
     }

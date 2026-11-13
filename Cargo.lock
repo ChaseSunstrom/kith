@@ -1234,6 +1234,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kith-dm-sys"
+version = "0.0.1"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "kith-dns"
 version = "0.0.1"
 dependencies = [
@@ -1317,6 +1324,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "kith-api",
+ "kith-dm-sys",
  "kith-dns",
  "kith-mesh",
  "kith-packages",

@@ -42,6 +42,8 @@ struct Active {
     /// Where in `image` the answers go.
     at: usize,
     disk: String,
+    /// The machines keep their state encrypted (crypt.rs).
+    encrypt: bool,
     machines: BTreeMap<Mac, Machine>,
     until: Instant,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -182,8 +184,9 @@ pub fn answer(asked: &Asks, us: Ipv4Addr) -> Vec<u8> {
 }
 
 /// A machine's answers, as long as the room the file has for them.
-fn answers(disk: &str, join: SocketAddr, token: &str) -> Option<Vec<u8>> {
-    let mut text = format!("disk: {disk}\njoin:\n  address: {join}\n  token: {token}\n").into_bytes();
+fn answers(disk: &str, encrypt: bool, join: SocketAddr, token: &str) -> Option<Vec<u8>> {
+    let encrypt = if encrypt { "encrypt: true\n" } else { "" };
+    let mut text = format!("disk: {disk}\n{encrypt}join:\n  address: {join}\n  token: {token}\n").into_bytes();
     (text.len() <= ROOM).then(|| {
         text.resize(ROOM, b'\n');
         text
@@ -300,7 +303,7 @@ async fn tftp(socket: UdpSocket) {
                 mac,
                 active.image.clone(),
                 active.at,
-                active.disk.clone(),
+                (active.disk.clone(), active.encrypt),
                 machine.token.clone(),
             ))
         });
@@ -321,7 +324,7 @@ async fn tftp(socket: UdpSocket) {
             let (Ok(us), Some(port)) = (transfer.local_addr(), PORT.get()) else {
                 return;
             };
-            let Some(answers) = answers(&disk, SocketAddr::new(us.ip(), *port), &token) else {
+            let Some(answers) = answers(&disk.0, disk.1, SocketAddr::new(us.ip(), *port), &token) else {
                 return;
             };
             let sent = send(&transfer, image.len(), &options, |from, len| {
@@ -405,6 +408,7 @@ pub async fn on(
     machines: Vec<Mac>,
     minutes: u64,
     disk: &str,
+    encrypt: bool,
     token: impl Fn() -> Result<String, String>,
 ) -> Result<serde_json::Value, String> {
     let places = image.windows(MARKER.len()).filter(|window| *window == MARKER);
@@ -469,6 +473,7 @@ pub async fn on(
         image: Arc::new(image),
         at,
         disk: disk.to_string(),
+        encrypt,
         machines: held,
         until: Instant::now() + Duration::from_secs(minutes * 60),
         tasks,
@@ -494,6 +499,7 @@ pub fn status() -> serde_json::Value {
             "on": true,
             "secondsLeft": active.until.saturating_duration_since(Instant::now()).as_secs(),
             "disk": active.disk,
+            "encrypt": active.encrypt,
             "machines": active.machines.iter().map(|(mac, machine)| serde_json::json!({
                 "mac": written(mac),
                 "served": machine.served,
@@ -593,7 +599,7 @@ mod tests {
         image.extend(vec![b'#'; ROOM - MARKER.len()]);
         image.extend(vec![b'z'; 50]);
         let join = "10.0.2.15:7443".parse().unwrap();
-        let answers = answers("only", join, "kith1.ab.cd").unwrap(); // (made up) pragma: allowlist secret
+        let answers = answers("only", false, join, "kith1.ab.cd").unwrap(); // (made up) pragma: allowlist secret
         assert_eq!(answers.len(), ROOM);
         let text = String::from_utf8(answers.clone()).unwrap();
         let told = crate::install::answers(&text).unwrap();
@@ -612,7 +618,7 @@ mod tests {
         }
         assert!(read(&image, 100, &answers, image.len(), 512).is_empty());
         // Answers longer than the room are none.
-        assert_eq!(super::answers(&"x".repeat(ROOM), join, "t"), None);
+        assert_eq!(super::answers(&"x".repeat(ROOM), true, join, "t"), None);
     }
 
     /// A TFTP client as firmware is one: asks with options, acknowledges each block.
@@ -662,6 +668,7 @@ mod tests {
             image: Arc::new(image.clone()),
             at: 1000,
             disk: "only".into(),
+            encrypt: false,
             machines: [CARD, SMALL]
                 .map(|card| {
                     let token = "kith1.ab.cd".to_string(); // (made up) pragma: allowlist secret
@@ -718,10 +725,10 @@ mod tests {
         // boot file, or a card that is not one, costs no token.
         let token = || Ok("kith1.ab.cd".to_string()); // (made up) pragma: allowlist secret
         let none = || -> Result<String, String> { panic!("a token for a refusal") };
-        assert!(on(vec![0; 64], vec![CARD], 5, "only", none).await.is_err());
-        assert!(on(image.clone(), vec![CARD], 5, "../x", none).await.is_err());
-        if on(image.clone(), vec![CARD], 5, "only", token).await.is_ok() {
-            assert_eq!(on(image, vec![CARD], 5, "only", token).await.unwrap()["on"], true);
+        assert!(on(vec![0; 64], vec![CARD], 5, "only", false, none).await.is_err());
+        assert!(on(image.clone(), vec![CARD], 5, "../x", false, none).await.is_err());
+        if on(image.clone(), vec![CARD], 5, "only", true, token).await.is_ok() {
+            assert_eq!(on(image, vec![CARD], 5, "only", true, token).await.unwrap()["on"], true);
         }
         for task in off() {
             assert!(task.await.unwrap_err().is_cancelled());
