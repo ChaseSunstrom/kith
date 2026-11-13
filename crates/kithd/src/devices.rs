@@ -173,7 +173,8 @@ pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
             .collect();
         made(
             "Seat",
-            format!("{node}-seat0"),
+            // (Cut like the Devices' names: a node's name may be 63 long by itself.)
+            format!("{}-seat0", node.get(..57).unwrap_or(node).trim_end_matches(['-', '.'])),
             labels,
             json!({ "node": node, "devices": seated }),
         )
@@ -200,7 +201,14 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
         Some(live) => ours(live, node) && (live.metadata.labels != new.metadata.labels || live.spec != new.spec),
     });
     let live = store.list(Some("Device")).chain(store.list(Some("Seat")));
-    let gone = live.filter(|live| ours(live, node) && !found.iter().any(|new| new.key() == live.key()));
+    // Gone from this machine, or of a node the cluster has no more (nobody else would).
+    let left = |live: &Resource| {
+        let of = live.spec["node"].as_str().unwrap_or_default();
+        live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true")
+            && of != node
+            && store.get(&format!("Node/{of}")).is_none()
+    };
+    let gone = live.filter(|live| ours(live, node) && !found.iter().any(|new| new.key() == live.key()) || left(live));
     (apply.cloned().collect(), gone.map(Resource::key).collect())
 }
 
@@ -235,7 +243,9 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         }
         for key in gone {
             if let Err(e) = shared.submit(Command::Delete { key: key.clone() }).await {
+                // (The rest wait for the next round: each would wait out the same trouble.)
                 eprintln!("kithd: devices: taking {key} away: {e}");
+                break;
             }
         }
     }
@@ -382,11 +392,13 @@ mod tests {
     fn a_long_node_name_still_makes_valid_names() {
         let root = tree("long");
         put(&root, "class/video4linux/video0/name", "x\n");
-        let node = "n".repeat(60);
-        let found = scan(&root, &node);
-        assert_eq!(found.len(), 1);
+        put(&root, "class/input/event3/device/name", "k\n");
+        let found = scan(&root, &"n".repeat(58));
+        assert_eq!(found.len(), 3, "a camera, a keyboard and the seat");
         let mut store = Store::default();
-        store.apply(found[0].clone()).unwrap();
+        for resource in found {
+            store.apply(resource).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -406,8 +418,16 @@ mod tests {
         // Nothing changed: nothing to do.
         assert_eq!(changes(&store, "n1", &found), (vec![], vec![]));
         // Another node's discovered one, one written by hand (with a name discovery would use, too).
+        // (While the cluster has no Node n2 it is taken away; with one, it is n2's to keep.)
         let theirs = scan(&root, "n2");
         store.apply(theirs[0].clone()).unwrap();
+        assert_eq!(changes(&store, "n1", &found).1, [theirs[0].key()]);
+        store
+            .apply(written(
+                "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n2 }\nspec: {}",
+            ))
+            .unwrap();
+        assert_eq!(changes(&store, "n1", &found), (vec![], vec![]));
         let hand = "apiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: HAND }\nspec: { node: n1, class: gpu }";
         store.apply(written(&hand.replace("HAND", "n1-gpu-card7"))).unwrap();
         store.apply(written(&hand.replace("HAND", "n1-camera-video0"))).unwrap();
