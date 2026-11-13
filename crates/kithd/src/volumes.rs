@@ -5,8 +5,7 @@
 //! what the replica names) get the same answer from the same store.
 //
 // ponytail: no dynamic provisioning: a VolumeClaim binds a Volume somebody made, and says so when
-// there is none. `shared: true` is not exported over the mesh yet: such a Volume is mounted from
-// its one node like any other. `subvolume: true` is a plain directory (a btrfs subvolume would
+// there is none. A `shared: true` Volume in `kith-system` is refused (see `volumes`). `subvolume: true` is a plain directory (a btrfs subvolume would
 // need the `btrfs` tool or its ioctls). A claim stays bound until its Volume goes; a Volume whose
 // claim goes is free again with its data kept.
 
@@ -22,19 +21,23 @@ use std::path::{Path, PathBuf};
 /// module: reading and writing `Volume`s of `kith-system` is a rule an `Identity` has to be given.
 pub const SYSTEM: &str = "kith-system";
 
-/// Where a volume's data is, as the Volume says: its namespace and name, and its `spec.path`.
+/// Where a volume's data is, as the Volume says: its namespace and name, its `spec.path`, and
+/// the node that is on. A node other than that one mounts it only if it is `shared`
+/// (`crate::share`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Dir {
     pub namespace: String,
     pub name: String,
     pub path: String,
+    pub node: String,
 }
 
-/// What a workload's mounts come to: the one node they are on, and for each name a container
-/// mounts (a Volume's, or a VolumeClaim's) the directory it is.
+/// What a workload's mounts come to: the one node those that are not `shared` are on (none: it
+/// may run anywhere), and for each name a container mounts (a Volume's, or a VolumeClaim's) the
+/// directory it is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Held {
-    pub node: String,
+    pub node: Option<String>,
     pub volumes: BTreeMap<String, Dir>,
 }
 
@@ -49,7 +52,6 @@ pub struct Volumes {
 /// A Volume as read: what binding needs to know and whether its path is allowed.
 struct Vol {
     dir: Dir,
-    node: String,
     size: Option<f64>,
     shared: bool,
     refused: Option<String>,
@@ -87,21 +89,27 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
             namespace: namespace.into(),
             name: name.into(),
             path: String::new(),
+            node: String::new(),
         };
         let vol = match serde_json::from_value::<VolumeSpec>(volume.spec.clone()) {
             Ok(spec) => {
                 dir.path = spec.path;
+                dir.node = spec.node;
+                let shared = spec.shared == Some(true);
+                // ponytail: what a node serves to the others is under its state directory only
+                // (`crate::share`); a path anywhere on the host is not. Lift it by serving each
+                // such path from a root of its own.
+                let anywhere = (shared && namespace == SYSTEM)
+                    .then(|| format!("a shared volume cannot be in {SYSTEM}: its path is anywhere on the host"));
                 Vol {
-                    refused: check_path(namespace, &dir.path).err(),
+                    refused: check_path(namespace, &dir.path).err().or(anywhere),
                     dir,
-                    node: spec.node,
                     size: spec.size.map(|size| size.value()),
-                    shared: spec.shared == Some(true),
+                    shared,
                 }
             }
             Err(e) => Vol {
                 dir,
-                node: String::new(),
                 size: None,
                 shared: false,
                 refused: Some(e.to_string()),
@@ -167,7 +175,7 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
                 && !taken.contains_key(*volume_key)
                 && vol.size.is_none_or(|size| size >= want)
                 && (!shared || vol.shared)
-                && on_node(&vol.node)
+                && on_node(&vol.dir.node)
         };
         let found = vols.iter().filter(|(k, _)| k.starts_with(&prefix)).find(fits);
         if let Some((volume_key, vol)) = found {
@@ -223,15 +231,20 @@ fn held(
         if let Some(why) = &vol.refused {
             return Err(format!("Volume {volume}: {why}"));
         }
-        nodes.insert(vol.node.clone());
+        // (A shared one is served to whichever node the workload is on.)
+        if !vol.shared {
+            nodes.insert(vol.dir.node.clone());
+        }
         volumes.insert(name, vol.dir.clone());
     }
     if nodes.len() > 1 {
         let nodes: Vec<String> = nodes.into_iter().collect();
         return Err(format!("its volumes are on different nodes: {}", nodes.join(", ")));
     }
-    let node = nodes.into_iter().next().expect("a workload that mounts names a volume");
-    Ok(Held { node, volumes })
+    Ok(Held {
+        node: nodes.into_iter().next(),
+        volumes,
+    })
 }
 
 /// Work out every claim, every volume and every workload that mounts some.
@@ -283,21 +296,22 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
 }
 
 /// The one node a workload goes on when it has claimed devices (`devices`) and mounts volumes
-/// (`volumes`): none if it has neither, why not if the two are not on one node.
+/// (`volumes`): none if it has neither or its volumes are all shared, why not if the two are
+/// not on one node.
 pub fn together(
     devices: Option<&Result<crate::claims::Held, String>>,
     volumes: Option<&Result<Held, String>>,
 ) -> Result<Option<String>, String> {
     let devices = devices.map(|d| d.as_ref().map(|held| held.node.as_str()).map_err(Clone::clone));
-    let volumes = volumes.map(|v| v.as_ref().map(|held| held.node.as_str()).map_err(Clone::clone));
-    match (devices.transpose()?, volumes.transpose()?) {
+    let volumes = volumes.map(|v| v.as_ref().map(|held| held.node.as_deref()).map_err(Clone::clone));
+    match (devices.transpose()?, volumes.transpose()?.flatten()) {
         (Some(d), Some(v)) if d != v => Err(format!("its DeviceClaims are on node {d} but its volumes on node {v}")),
         (d, v) => Ok(d.or(v).map(str::to_string)),
     }
 }
 
-/// What each workload placed on `me` mounts: its key, and each name a container mounts with
-/// the directory that is. Only a Volume of `me` is ever in it.
+/// What each workload that may be placed on `me` mounts: its key, and each name a container
+/// mounts with the directory that is. A Volume of another node is in it only if it is shared.
 pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>> {
     let owners = resolve(store).owners;
     // A claim counts once the scheduler has written what it is bound to: this node's own first
@@ -307,12 +321,20 @@ pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>
         name == dir.name || claim.and_then(|c| c.status.as_ref()?["volume"].as_str()) == Some(&dir.name)
     };
     let mine = owners.into_iter().filter_map(|(key, outcome)| {
-        let held = outcome.ok().filter(|held| held.node == me)?;
+        let held = outcome
+            .ok()
+            .filter(|held| held.node.as_deref().is_none_or(|node| node == me))?;
         let namespace = parts(&key).0;
         let settled = held.volumes.iter().all(|(name, dir)| recorded(namespace, name, dir));
         settled.then_some((key, held.volumes))
     });
     mine.collect()
+}
+
+/// The shared Volumes whose data is on `me`: what it serves to the other nodes.
+pub fn served(store: &Store, me: &str) -> Vec<Dir> {
+    let mine = |vol: Vol| (vol.shared && vol.refused.is_none() && vol.dir.node == me).then_some(vol.dir);
+    volumes(store).into_values().filter_map(mine).collect()
 }
 
 /// Make the directory a volume is on this node, and say where it is. In `kith-system` it is the
@@ -439,8 +461,9 @@ spec: { node: a, path: tiny, size: 1Gi }
     #[test]
     fn a_mounted_volume_places_the_workload_on_its_node_and_a_bad_mount_says_why() {
         let source = [
+            res("Volume", "default", "far", "{ node: b, path: far }"),
             workload("default", "db", &["fast"]),
-            workload("default", "both", &["fast", "slow"]),
+            workload("default", "both", &["fast", "far"]),
             workload("default", "lost", &["nowhere"]),
             workload("ops", "other", &["fast"]),
             res(
@@ -454,11 +477,12 @@ spec: { node: a, path: tiny, size: 1Gi }
         let store = store(&source);
         let found = resolve(&store);
         let db = found.owners["Workload/default/db"].clone().unwrap();
-        assert_eq!(db.node, "a");
+        assert_eq!(db.node.as_deref(), Some("a"));
         let fast = Dir {
             namespace: "default".into(),
             name: "fast".into(),
             path: "fast".into(),
+            node: "a".into(),
         };
         assert_eq!(db.volumes, BTreeMap::from([("fast".to_string(), fast)]));
         assert_eq!(
@@ -521,7 +545,10 @@ spec: { node: a, path: tiny, size: 1Gi }
         assert_eq!(status(&store, "VolumeClaim/default/db"), json!({ "volume": "fast" }));
         assert_eq!(status(&store, "Volume/default/fast"), json!({ "claim": "db" }));
         assert_eq!(status(&store, "Volume/default/tiny"), json!({}));
-        assert_eq!(found.owners["Workload/default/app"].clone().unwrap().node, "a");
+        assert_eq!(
+            found.owners["Workload/default/app"].clone().unwrap().node.as_deref(),
+            Some("a")
+        );
         // Nothing else fits `second`: it says what it needs, and its workload waits with that said.
         let said = status(&store, "VolumeClaim/default/second");
         assert_eq!(
@@ -576,7 +603,9 @@ spec: { node: a, path: tiny, size: 1Gi }
         let found = resolve(&store(&source));
         // `slow` is both a Volume (on b) and a claim (that binds `fast`, on a): the Volume is mounted.
         let held = found.owners["Workload/default/app"].clone().unwrap();
-        assert_eq!((held.node.as_str(), held.volumes["slow"].name.as_str()), ("b", "slow"));
+        // (It is shared, so it pins the workload to no node; its data is on b.)
+        let slow = &held.volumes["slow"];
+        assert_eq!((held.node, slow.name.as_str(), slow.node.as_str()), (None, "slow", "b"));
     }
 
     #[test]
@@ -628,6 +657,7 @@ spec: { node: a, path: tiny, size: 1Gi }
             namespace: namespace.into(),
             name: "data".into(),
             path: path.into(),
+            node: "a".into(),
         }
     }
 
@@ -697,6 +727,46 @@ spec: { node: a, path: tiny, size: 1Gi }
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    /// A workload whose volumes are all shared goes on any node, and every node may mount them;
+    /// one that also mounts a volume that is not goes where that one is. Only the volume's own
+    /// node serves it, and a shared volume with a path anywhere on the host is refused.
+    #[test]
+    fn a_shared_volume_pins_nothing_and_is_served_by_its_node_only() {
+        let source = [
+            CLUSTER.to_string(),
+            workload("default", "anywhere", &["slow"]),
+            workload("default", "pinned", &["slow", "fast"]),
+            res(
+                "Volume",
+                "kith-system",
+                "host",
+                "{ node: a, path: /srv/all, shared: true }",
+            ),
+            workload("kith-system", "system", &["host"]),
+        ]
+        .concat();
+        let store = store(&source);
+        let found = resolve(&store);
+        assert_eq!(found.owners["Workload/default/anywhere"].clone().unwrap().node, None);
+        assert_eq!(together(None, found.owners.get("Workload/default/anywhere")), Ok(None));
+        assert_eq!(
+            found.owners["Workload/default/pinned"].clone().unwrap().node.as_deref(),
+            Some("a")
+        );
+        for node in ["a", "b"] {
+            let mounted = mounts(&store, node);
+            assert_eq!(mounted["Workload/default/anywhere"]["slow"].node, "b", "{node}");
+            assert_eq!(mounted.contains_key("Workload/default/pinned"), node == "a");
+        }
+        let names = |node: &str| served(&store, node).into_iter().map(|dir| dir.name).collect::<Vec<_>>();
+        assert_eq!((names("a"), names("b")), (vec![], vec!["slow".to_string()]));
+        let refused = found.owners["Workload/kith-system/system"].clone().unwrap_err();
+        assert!(
+            refused.contains("a shared volume cannot be in kith-system"),
+            "{refused}"
+        );
+    }
+
     /// The example in the README's Storage section is a real one: it applies, binds and places.
     #[test]
     fn the_readme_volume_example_applies_binds_and_places() {
@@ -711,7 +781,7 @@ spec: { node: a, path: tiny, size: 1Gi }
         }
         let found = settle(&mut store);
         let held = found.owners.values().next().expect("a workload that mounts").clone();
-        assert_eq!(held.unwrap().node, "n1");
+        assert_eq!(held.unwrap().node.as_deref(), Some("n1"));
         assert_eq!(status(&store, "VolumeClaim/default/db-data")["volume"], "db-disk");
     }
 }

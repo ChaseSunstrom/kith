@@ -33,6 +33,7 @@ mod releases;
 mod sched;
 mod seats;
 mod services;
+mod share;
 mod sources;
 mod ui;
 mod update;
@@ -655,7 +656,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 ingress::run(shared.clone(), args.acme.clone(), strays, stopping.clone()).await;
             }
         };
-        let (served, nodes, (), (), (), (), ()) = tokio::join!(server, nodes, work, names, mesh, proxy, ingress);
+        let shares = share::run(shared.clone(), state.clone(), stopping.clone());
+        let (served, nodes, (), (), (), (), (), ()) =
+            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, shares);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });

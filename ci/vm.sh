@@ -12,6 +12,7 @@
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
 #   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
+#   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -67,6 +68,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test crypt     instead: the same, the machine installed with its state encrypted:
                    the node holds its key; it is locked, unlocked, opened with its
                    recovery key and wiped
+  --test share     instead: two nodes on the mesh, each with kith as a container image
+                   already there: a file a container makes in a shared volume on the
+                   node that does not hold it is there on the node that does, and the
+                   other way round; and no NFS is answered from outside the mesh
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -89,7 +94,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -120,7 +125,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -128,6 +133,30 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
+        # (rollout: three nodes and nothing more said to kithd; share: two, on the mesh.)
+        others='2 3' more=''
+        seed() { :; }
+      if [ "$test" = share ]; then
+        others=2 more=--mesh
+        # A container image the nodes have without asking anybody (they reach no registry
+        # here): kith itself, put where a node keeps an image it has pulled, in a state
+        # partition made again with that in it.
+        seed() { # DISK
+            if ! [ -f "$work/state.img" ]; then
+                digest=$(printf kith | sha256sum | cut -d ' ' -f 1)
+                image=$work/seed/runtime/images/$digest
+                mkdir -p "$work/seed/runtime/refs" "$image/rootfs/bin"
+                cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
+                echo '{}' >"$image/config.json"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[]}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
+                sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
+                read -r state_start state_sectors <"$work/state.at"
+                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
+            fi
+            read -r state_start state_sectors <"$work/state.at"
+            dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
+        }
+      else
         # Two releases, both signed: one that runs, and one whose root is not the one its
         # verity tree was made for. The nodes fetch them from this machine.
         KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
@@ -141,16 +170,18 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         sign() { sh "$root/os/update.sh" --sign "$work/key" "$work/www/$1.update"; }
         (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
         web=$!
+      fi
 
         # Each node: a card on a network the three share (QEMU passes it over multicast on
-        # this machine's loopback), with a fixed address, and one out to this machine.
+        # this machine's loopback), with a fixed address, and one out to this machine (which
+        # reaches the node's API through it, and tries its NFS port).
         node() { # N [kithd's further arguments]
-            [ -f "$work/n$1.raw" ] || cp "$root/target/os/kith-os.raw" "$work/n$1.raw"
+            [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 ${2:-}" \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:2049" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor none </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
         }
@@ -212,10 +243,93 @@ EOF
         for part in ca cert key; do
             printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
         done
-        for n in 2 3; do
+        for n in $others; do
             join=$(api 1 POST /v1/tokens | field token) || fail "no join token over TLS"
             node "$n" "--join 10.9.0.1:7443 --token $join"
         done
+        if [ "$test" = share ]; then
+            # What a Job says of itself and of its unit: "STATE and what it says"; nothing
+            # while there is no such Job.
+            job() {
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    if r["kind"] == "Job" and r["metadata"]["name"] == sys.argv[1]:
+        status = r.get("status") or {}
+        units = status.get("containers") or [{}]
+        print(status.get("state", "-"), status.get("message", ""), units[0].get("message", ""), status.get("notes", ""))
+' "$1"
+            }
+            until_job() { # NAME STATE: wait for the Job to end that way
+                waited=0
+                until line=$(job "$1") && [ "${line%% *}" = "$2" ]; do
+                    case ${line%% *} in succeeded | failed) fail "the Job $1 $line; expected: $2" ;; esac
+                    waited=$((waited + 1))
+                    [ "$waited" -lt $((time / 2)) ] || fail "waited for the Job $1 to have $2; it says: $line"
+                    sleep 1
+                done
+                echo "vm.sh: the Job $1 $2" >&2
+            }
+            # A Job whose container makes a new file in the shared volume (kith's own keygen:
+            # it refuses a file that is there). The volume of one node it also mounts is what
+            # puts it on that node.
+            run() { # NAME THAT-NODE'S-VOLUME FILE
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/data/$3"],
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"$2","path":"/here"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+            }
+            refused() { # NAME FILE: the Job failed because FILE was there already
+                any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
+                grep -q "/data/$2: File exists" "$work/$1.err" || fail "the Job $1 did not fail for /data/$2 being there: $(cat "$work/$1.err")"
+            }
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"data"},"spec":{"node":"n1","path":"all","shared":true}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on1"},"spec":{"node":"n1","path":"own"}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on2"},"spec":{"node":"n2","path":"own"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the volumes were not applied"
+
+            # Written on the second node, through the first node's volume; there on the first.
+            run write on2 from-n2
+            until_job write succeeded
+            grep -aq 'kithd: mounted volume default/data from node n1' "$work/n2.log" || fail "the second node did not say it mounted the volume"
+            grep -aq 'kithd: serving 1 shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
+            run again on1 from-n2
+            until_job again failed
+            refused again from-n2
+            # And the other way: written on the first node, there on the second.
+            run here on1 from-n1
+            until_job here succeeded
+            run across on2 from-n1
+            until_job across failed
+            refused across from-n1
+
+            # From outside the mesh (this machine, through the node's other card) there is no
+            # NFS server to talk to: it listens on the mesh address alone.
+            python3 - "$((port + 5))" <<'EOF' || fail "the first node's NFS port answered an address outside the mesh"
+import socket, sys
+
+# An RPC call of NFS 4's procedure 0, which a server that hears it answers.
+call = bytes.fromhex("80000028" "00000001" "00000000" "00000002" "000186a3" "00000004" + "00000000" * 5)
+try:
+    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=5) as s:
+        s.sendall(call)
+        sys.exit(1 if s.recv(4) else 0)
+except OSError:
+    sys.exit(0)
+EOF
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh"
+            exit 0
+        fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
         was=${line#- 0 } was=${was%% *}
 

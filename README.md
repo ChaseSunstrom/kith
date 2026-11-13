@@ -945,9 +945,10 @@ spec:
         volumeMounts: [{ volume: db-data, path: /var/lib/db }]
 ```
 
-- The workload runs on the volume's node, and only there. Volumes on two nodes, or
-  a `DeviceClaim` on another node than the volume, leave it unplaced: its `unschedulable`
-  says why. A name that is both a Volume and a VolumeClaim is the Volume.
+- The workload runs on the volume's node, and only there, unless the volume is `shared`
+  (below). Volumes on two nodes, or a `DeviceClaim` on another node than the volume, leave
+  it unplaced: its `unschedulable` says why. A name that is both a Volume and a VolumeClaim
+  is the Volume.
 - A claim with no volume yet takes the first Volume (by name) of its namespace that no
   claim has, is at least as big, is on a node with the labels in its `selector`, and is
   `shared` if the claim asks for that. `kith get volumeclaim db-data -o yaml` shows
@@ -967,9 +968,44 @@ spec:
 - A container path that is not absolute, has `..`, or is `/`, `/proc`, `/sys` or `/dev`
   (or under them) stops the unit from starting, and says so.
 - Not yet (ponytail): no dynamic provisioning (a claim binds a Volume somebody made);
-  `shared: true` is not exported over the mesh, such a Volume is mounted on its one node
-  only; `subvolume: true` makes a plain directory, not a btrfs subvolume; `size` is a
+  `subvolume: true` makes a plain directory, not a btrfs subvolume; `size` is a
   promise for binding, not a quota; an `exec` unit and a NodeWorkload mount nothing.
+
+### Shared volumes
+
+`shared: true` on a Volume lets a workload that mounts it run on any node:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: media }
+spec: { node: n1, path: media, shared: true }
+```
+
+- The data stays on the volume's node (`n1`). A replica on `n1` mounts the directory as
+  any volume; a replica on another node mounts it from `n1` over the mesh (NFS 4.2 over
+  WireGuard) under `<state>/remote/n1/<namespace>/<name>`, when its unit starts, and that is
+  what its container sees. It is unmounted when no unit on the node mounts it any more.
+- A workload whose volumes are all shared is placed like one with none. One that also mounts
+  a volume that is not shared goes to that volume's node.
+- **Who can reach it:** the cluster's nodes, and nothing else. The node serves it on its mesh
+  address only, to the mesh addresses of the cluster's nodes only (a container has another
+  address, and gets nothing), and serves nothing but shared volumes and the names of the
+  directories leading to them. Every node is trusted with a shared volume as root is, as
+  every node is trusted with the cluster today.
+- **What it takes:** the mesh (`--mesh`), and a kernel with the NFS server and the NFS 4.2
+  client built in or loaded, as kith OS's has. kithd drives the kernel itself: there is no
+  `rpc.mountd`, `exportfs`, `rpcbind` or `mount.nfs` to install, and no `/etc/exports`. On a
+  machine that already runs an NFS server of its own, kithd leaves it alone and serves
+  nothing (it says so in its log).
+- While the volume's node is away, a container using the volume from another node waits
+  (the mount is `hard`: it carries on when the node is back, and does not fail a write
+  meanwhile); a unit that would start meanwhile says the node does not serve the volume, and is
+  tried again.
+- Not yet: a shared volume in `kith-system` (an absolute host path) is refused; the data is
+  on one node, not copied to others; a volume that stops being `shared` is still served for
+  up to two minutes; locks held when the volume's node restarts must be taken again within
+  30 seconds; VMs (virtiofs) and machines that are not nodes cannot mount one.
 
 ### Remote apps
 

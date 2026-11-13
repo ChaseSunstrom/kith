@@ -547,6 +547,18 @@ impl Controller {
             self.slots.entry(id).or_insert(slot);
         }
         self.tend_logs(owners);
+        // What this node mounts from the others: a start below mounts it, and what no unit
+        // here mounts any more is let go.
+        let mesh = shared.cluster.as_ref();
+        let mesh = mesh.map(|cluster| (crate::mesh::prefix(&cluster.me.ca), cluster.me.name.as_str()));
+        if let Some((_, me)) = mesh {
+            let mounts = self
+                .slots
+                .values()
+                .flat_map(|slot| slot.volumes.iter().map(|(dir, _, _)| dir));
+            let theirs: Vec<_> = mounts.filter(|dir| dir.node != me).collect();
+            crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs);
+        }
 
         // 3. Notice exits, then start whatever is due.
         // A Job's unit that ended is accounted for in step 1, and a unit that started may be
@@ -597,7 +609,7 @@ impl Controller {
             if slot.start_at.is_some_and(|at| at <= Instant::now()) {
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
-                    started = start(&self.runtime, &self.logs, id, slot) => started,
+                    started = start(&self.runtime, &self.logs, mesh, id, slot) => started,
                     // A pull can take minutes; shutting down does not wait for it.
                     _ = stop_now.changed() => return TICK,
                 };
@@ -911,7 +923,14 @@ fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec
     found.collect()
 }
 
-async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<Handle, String> {
+/// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
+async fn start(
+    runtime: &Runtime,
+    logs: &Path,
+    mesh: Option<(std::net::Ipv6Addr, &str)>,
+    id: &str,
+    slot: &Slot,
+) -> Result<Handle, String> {
     let resources = match &slot.run {
         Run::Container(c) => &c.resources,
         Run::Exec(e) => &e.resources,
@@ -927,7 +946,12 @@ async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<
     // would be left behind.
     let state = logs.parent().unwrap_or(logs);
     for (dir, at, read_only) in &slot.volumes {
-        let host = crate::volumes::host_dir(state, dir).map_err(|e| format!("volume {}: {e}", dir.name))?;
+        // (Only a shared volume of another node ever gets here: `volumes::mounts`.)
+        let host = match mesh.filter(|(_, me)| *me != dir.node) {
+            Some((prefix, me)) => crate::share::mount(state, dir, prefix, me).await,
+            None => crate::volumes::host_dir(state, dir),
+        };
+        let host = host.map_err(|e| format!("volume {}: {e}", dir.name))?;
         unit.mounts.push(kith_runtime::Mount {
             host,
             container: at.clone(),
