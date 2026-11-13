@@ -653,6 +653,9 @@ spec! {
         pub wait_for_idle_seats: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub paused: Option<bool>,
+        /// Let nodes take a release older than the one they run. Refused otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub allow_downgrade: Option<bool>,
     }
 
     // ---- Encrypted state ----
@@ -965,7 +968,7 @@ impl Spec for ServiceSpec {
 
 /// Why a certificate authority would not issue for `host` (a name that passes
 /// `dns_name`), if it would not: an IP address (a last label of digits only, which no
-/// top-level domain is), or a label that starts or ends with `-`.
+/// top-level domain is), a label that starts or ends with `-`, or a `_` anywhere.
 pub fn expose_host_refused(host: &str) -> Option<String> {
     let numeric = |label: &str| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit());
     let dashed = |label: &str| label.starts_with('-') || label.ends_with('-');
@@ -973,6 +976,8 @@ pub fn expose_host_refused(host: &str) -> Option<String> {
         "an IP address (or a number), not a name"
     } else if host.split('.').any(dashed) {
         "a label that starts or ends with `-`"
+    } else if host.contains('_') {
+        "a name with `_` in it"
     } else {
         return None;
     };

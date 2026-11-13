@@ -249,6 +249,8 @@ pub struct Limits {
     room: Arc<Semaphore>,
     sources: Arc<Mutex<BTreeMap<IpAddr, usize>>>,
     per_source: usize,
+    /// How much of an IPv6 address is one source.
+    bits: u32,
 }
 
 /// One connection's place under the `Limits`; given back when dropped.
@@ -264,7 +266,13 @@ impl Limits {
             room: Arc::new(Semaphore::new(connections)),
             sources: Arc::default(),
             per_source,
+            bits: 64,
         }
+    }
+
+    /// For callers on the mesh: a source is a node, which has a /80 of it.
+    pub fn per_node(self) -> Self {
+        Limits { bits: 80, ..self }
     }
 
     /// A place for a connection from `from`, unless it or its source has none left.
@@ -272,7 +280,7 @@ impl Limits {
         // (A client of IPv6 has a /64 to itself: its addresses are one source. A v4
         // client of the dual-stack socket shows as a mapped address.)
         let source = match from.to_canonical() {
-            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << (128 - self.bits)))),
             ip => ip,
         };
         let mut sources = self.sources.lock().expect("nothing panics holding the sources");
@@ -1068,6 +1076,11 @@ mod tests {
         // One that goes frees its place, and the room is still counted too.
         drop(a1);
         assert!(limits.take(at("203.0.113.7:1004").ip()).is_some());
+        // On the mesh a source is a node's /80: two nodes in one /64 are two sources.
+        let nodes = Limits::new(10, 1).per_node();
+        let n1 = nodes.take(at("[fd00:0:0:1:aaaa::1]:1").ip());
+        assert!(n1.is_some() && nodes.take(at("[fd00:0:0:1:aaaa::2]:1").ip()).is_none());
+        assert!(nodes.take(at("[fd00:0:0:1:bbbb::1]:1").ip()).is_some());
         let full = Limits::new(1, 5);
         let _one = full.take(at("203.0.113.7:1").ip());
         assert!(full.take(at("203.0.113.9:1").ip()).is_none());

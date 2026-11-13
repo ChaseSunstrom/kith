@@ -406,7 +406,7 @@ pub async fn run(
         table: Mutex::default(),
         turns: Turns::default(),
         serving: Limits::new(SERVING, SERVING),
-        relaying: Limits::new(RELAYING, RELAYING_PER_NODE),
+        relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -695,10 +695,10 @@ spec:
     async fn an_idle_connection_between_a_client_and_a_service_ends() {
         use tokio::io::AsyncReadExt;
         let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
-        let passing = tokio::spawn(pass(held, backend, Duration::from_millis(600)));
+        let passing = tokio::spawn(pass(held, backend, Duration::from_secs(2)));
         // Bytes both ways keep it going past the idle time...
         for _ in 0..4 {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             client.write_all(b"q").await.unwrap();
             assert_eq!(replica.read_u8().await.unwrap(), b'q');
             replica.write_all(b"a").await.unwrap();

@@ -433,6 +433,7 @@ fn expose_host_is_one_a_certificate_authority_issues_for() {
         "-shop.example.org",
         "shop-.example.org",
         "shop.-a.org",
+        "my_shop.example.org",
     ] {
         let spec =
             format!("selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: '{bad}', via: edge }}");
