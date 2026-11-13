@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod import;
+
 #[derive(Parser)]
 #[command(
     name = "kith",
@@ -122,6 +124,11 @@ enum Command {
     Package {
         #[command(subcommand)]
         command: PackageCommand,
+    },
+    /// Translate Kubernetes manifests or a Helm chart into kith resources
+    Import {
+        #[command(subcommand)]
+        command: import::Import,
     },
 }
 
@@ -400,6 +407,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
     };
     match cli.command {
+        Command::Import { command } => return import::run(command),
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });

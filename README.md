@@ -345,6 +345,35 @@ Not yet: `dependencies` are read and nothing more; no hooks, no looking up
 what is in the cluster from a template, no version ranges, no repositories
 (a package gets into a cluster by `package push`).
 
+## Importing from Kubernetes and Helm
+
+`kith import k8s -f manifests.yaml` (`-f -` reads stdin; `-f` may repeat; a
+`List` is unwrapped) prints the kith resources the manifests translate to.
+`kith import helm ./chart --name shop -n store -f values.yaml` runs your
+installed `helm template` and translates what it prints (no helm: pipe
+`helm template ... | kith import k8s -f -`). Review the output, then
+`kith apply -f` it.
+
+| Kubernetes | kith |
+|---|---|
+| Deployment, StatefulSet | Workload (a StatefulSet's `volumeClaimTemplates` become one shared VolumeClaim `<template>-<name>`) |
+| DaemonSet | NodeWorkload |
+| Service | Service |
+| Ingress | `expose: {host, via: edge}` on the Service behind each host |
+| ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
+| PersistentVolumeClaim | VolumeClaim |
+| Job, CronJob | Job, CronJob |
+
+Nothing is dropped silently. Every field that is not carried over (an
+`affinity`, a `securityContext`, an unknown kind, an object that would not
+validate) is named on stderr by path, such as
+`not translated: Deployment/web: spec.template.spec.affinity not translated`.
+Status, `managedFields`, `uid`, `resourceVersion` and Helm's own labels are
+ignored, not reported. Exit status: 0 everything translated, 1 something is
+in the report (the output is still printed), 2 the input could not be read.
+`nodeSelector` becomes a placement requirement, and a pod template's labels
+are added to the workload's, since kith Services select on those.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):
