@@ -25,7 +25,9 @@ MB = 1024 * 1024
 # on memory (30 MB for kithd), which the idle RSS budget below stays far under.
 # Idle RSS measured 7.80 MB before device claims and 8.00 MB with them (Phase 6): nearly
 # all of the rise is pages of the binary itself, not heap, which raised its budget from 8.
-KITHD_SIZE = 12
+# 12.10 MB with storage (Phase 7: the NFS server's driver, the blob store with BLAKE3,
+# backups with tar and S3), which raised the size budget from 12 for the rest of that phase.
+KITHD_SIZE = 13
 KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.

@@ -331,6 +331,12 @@ pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>
     mine.collect()
 }
 
+/// Where the Volume `name` of `namespace` is, if there is one that is not refused.
+pub fn dir(store: &Store, namespace: &str, name: &str) -> Option<Dir> {
+    let vol = volumes(store).remove(&format!("Volume/{namespace}/{name}"))?;
+    vol.refused.is_none().then_some(vol.dir)
+}
+
 /// The shared Volumes whose data is on `me`: what it serves to the other nodes.
 pub fn served(store: &Store, me: &str) -> Vec<Dir> {
     let mine = |vol: Vol| (vol.shared && vol.refused.is_none() && vol.dir.node == me).then_some(vol.dir);

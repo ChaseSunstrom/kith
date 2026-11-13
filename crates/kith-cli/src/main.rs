@@ -161,6 +161,11 @@ enum Command {
         #[command(subcommand)]
         command: BlobCommand,
     },
+    /// Backups: put one of a Backup's archives back into its volume
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Work on a package: a directory of resource templates and default values
     Package {
         #[command(subcommand)]
@@ -237,6 +242,19 @@ enum BlobCommand {
         namespace: String,
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Unpack a backup of the Backup NAME into its volume, which must be empty
+    Restore {
+        name: String,
+        #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
+        /// Which one: the `at` of one in the Backup's status [default: the last]
+        #[arg(long, value_name = "SECONDS")]
+        at: Option<u64>,
     },
 }
 
@@ -802,6 +820,22 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     change.after.metadata.revision.unwrap_or(0)
                 ),
             }
+        }
+        Command::Backup {
+            command: BackupCommand::Restore { name, namespace, at },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("a backup is restored by kithd: leave out --store");
+            };
+            let at = at.map_or(String::new(), |at| format!("?at={at}"));
+            let path = format!("/v1/backups/{}/{}/restore{at}", escape(&namespace), escape(&name));
+            let done: serde_json::Value = request(&kithd, "POST", &path, b"")?;
+            println!(
+                "{name}: the backup made at {} is back in volume {} on node {}",
+                done["restored"]["at"],
+                done["volume"].as_str().unwrap_or_default(),
+                done["node"].as_str().unwrap_or_default()
+            );
         }
         Command::Blob { command } => {
             let Backend::Daemon(kithd) = backend()? else {

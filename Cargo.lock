@@ -1365,6 +1365,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tar",
  "tokio",
  "tokio-rustls",
  "wasmi",

@@ -106,6 +106,17 @@ impl Incoming {
     }
 }
 
+/// (For what writes an archive into the store: a backup.)
+impl Write for Incoming {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        Incoming::write(self, bytes).map(|()| bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Drop for Incoming {
     fn drop(&mut self) {
         // (Renamed if it was kept: then there is nothing here to remove.)
@@ -327,8 +338,13 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
 fn file_reply(path: &Path) -> std::io::Result<Response> {
     let file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
-    // ponytail: read on the async thread 64 KiB at a time, as the logs are.
-    let chunks = futures_util::stream::unfold(file, |mut file| async move {
+    Ok(([(header::CONTENT_LENGTH, size)], Body::from_stream(chunks(file))).into_response())
+}
+
+/// A file a piece at a time.
+// ponytail: read on the async thread 64 KiB at a time, as the logs are.
+pub fn chunks(file: std::fs::File) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    futures_util::stream::unfold(file, |mut file| async move {
         let mut chunk = vec![0; 64 << 10];
         match file.read(&mut chunk) {
             Ok(0) => None,
@@ -338,8 +354,42 @@ fn file_reply(path: &Path) -> std::io::Result<Response> {
             }
             Err(e) => Some((Err(e), file)),
         }
-    });
-    Ok(([(header::CONTENT_LENGTH, size)], Body::from_stream(chunks)).into_response())
+    })
+}
+
+/// The file of the blob the Blob `key` names, on this node: fetched from a node that says
+/// it holds it if it is not here.
+pub async fn here(shared: &Shared, key: &str) -> Result<PathBuf, String> {
+    let name = key.rsplit('/').next().unwrap_or_default();
+    let (dir, me) = (dir(shared), shared.members.me());
+    let from: Vec<(String, String)> = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let blob = state
+            .store
+            .get(key)
+            .filter(|_| named(name))
+            .ok_or(format!("{key} is not there"))?;
+        let nodes = blob.status.as_ref().and_then(|status| status["nodes"].as_array());
+        let nodes = nodes.into_iter().flatten().filter_map(Value::as_str);
+        let address = |node: &str| {
+            let there = state.store.get(&format!("Node/{node}"))?.status.as_ref()?;
+            Some((node.to_string(), there["address"].as_str()?.to_string()))
+        };
+        nodes.filter(|node| *node != me).filter_map(address).collect()
+    };
+    let path = dir.join(name);
+    if path.exists() {
+        return Ok(path);
+    }
+    let mut failed = format!("no node says it holds blob {name}");
+    for (node, address) in from {
+        let Some(cluster) = &shared.cluster else { break };
+        match fetch(&cluster.client, &address, name, &dir).await {
+            Ok(()) => return Ok(path),
+            Err(e) => failed = format!("blob {name} was not copied from node {node}: {e}"),
+        }
+    }
+    Err(failed)
 }
 
 fn io(what: String) -> ApiError {

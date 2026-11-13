@@ -146,8 +146,8 @@ fn errors_point_at_the_mistake() {
 
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
-    // (PLAN.md's 28, NodeKey and Blob.)
-    assert_eq!(KINDS.len(), 30);
+    // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
+    assert_eq!(KINDS.len(), 31);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -682,4 +682,37 @@ fn batches_and_dry_runs_leave_the_store_as_it_was() {
     store.apply_all(vec![cm("a", "2"), cm("e", "1")]).unwrap();
     assert_eq!(store.get("ConfigMap/default/a").unwrap().metadata.revision, Some(2));
     assert!(store.get("ConfigMap/default/e").is_some());
+}
+
+#[test]
+fn a_backup_says_how_often_and_sends_keys_over_tls_only() {
+    use crate::kinds::every;
+    assert_eq!(
+        (every("90s"), every("30m"), every("24h"), every("7d")),
+        (Some(90), Some(1800), Some(86400), Some(604_800))
+    );
+    for bad in ["", "h", "0h", "-1h", "1.5h", "24", "24 h", "1w", "5é", "é", "+5h"] {
+        assert_eq!(every(bad), None, "{bad}");
+    }
+    let backup = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Backup\nmetadata: {{ name: nightly }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    backup("{ volume: data, every: 24h }").unwrap();
+    assert!(backup("{ volume: data, every: daily }").unwrap_err().contains("every:"));
+    let s3 = |endpoint: &str, bucket: &str| {
+        backup(&format!(
+            "{{ volume: data, every: 1h, s3: {{ endpoint: '{endpoint}', bucket: '{bucket}', secret: keys }} }}"
+        ))
+    };
+    s3("https://s3.example.org", "backups").unwrap();
+    assert!(s3("http://127.0.0.1:9000", "backups").unwrap_err().contains("https://"));
+    assert!(s3("http://s3.example.org", "backups").unwrap_err().contains("https://"));
+    assert!(
+        s3("http://127.0.0.1.example.org", "backups")
+            .unwrap_err()
+            .contains("https://")
+    );
+    assert!(s3("https://s3.example.org", "a/../b").unwrap_err().contains("bucket"));
 }

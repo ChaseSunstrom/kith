@@ -1039,6 +1039,56 @@ kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
   blob passes through the CLI's memory whole; no size limit or quota but the disk; a holder
   does not read its copies again to find one the disk has spoiled.
 
+### Backups
+
+A `Backup` archives a Volume every so often and keeps the last few:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Backup
+metadata: { name: nightly }
+spec:
+  volume: data      # a Volume in this namespace
+  every: 24h        # a number and s, m, h or d
+  keep: 7           # how many are kept (7 unless said)
+```
+
+- The node the volume is on makes a tar of its directory when one is due and keeps it as a
+  blob, so it is on other nodes too (`copies`, 2 unless said). `status.backups` lists them,
+  oldest first: `at` (seconds since 1970), `size`, and the `blob`. Two backups with nothing
+  changed between them are one blob.
+- To an S3-compatible bucket instead:
+
+  ```yaml
+  spec:
+    volume: data
+    every: 24h
+    s3:
+      endpoint: https://s3.example.org   # objects are endpoint/bucket/prefix…
+      bucket: backups
+      prefix: kith/                      # optional
+      region: us-east-1                  # optional
+      secret: s3-keys                    # a Secret here with accessKey and secretKey
+  ```
+
+  Requests are signed (AWS Signature Version 4) and go over `https://` only. The endpoint
+  may be on the internet or the LAN (a NAS), not on the node itself, a link-local address
+  or the cluster's mesh; redirects are not followed. Whoever may apply a Backup in a
+  namespace chooses where that namespace's volumes are sent. Each backup is the object `PREFIX NAMESPACE/NAME-TIME.tar`.
+- `kith backup restore NAME [--at SECONDS]` unpacks one (the last unless said) into the
+  volume, on the volume's node, whichever node is asked. The volume must be empty: nothing
+  is written over. It needs `apply` on `Backup` and on `Volume` in the namespace.
+- Applying a Backup needs `get` on `Volume` and `Secret` in the namespace as well as
+  `apply` on `Backup`: it sends the one where it says, with the other's keys.
+- Restored files keep their owner, mode and times, less setuid and setgid.
+- A backup that fails says why in `status.message` and is tried again in ten minutes.
+- Not yet: the archive is of the directory as it is while it is read (what a crash at that
+  moment would leave), not of a snapshot: stop what writes to it for a backup that must be
+  exact. Each backup is whole, not what changed. It is not encrypted beyond TLS to the
+  bucket and the cluster's own TLS. Stop the workloads that use a volume before restoring it. An
+  archive goes to a bucket in one request (5 GiB at most on Amazon's S3). Deleting a Backup
+  leaves the blobs and objects it made.
+
 ### Remote apps
 
 `kith run --on NODE|SELECTOR [--via PROGRAM] -- APP [ARGS…]` runs a

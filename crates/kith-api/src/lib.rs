@@ -112,6 +112,7 @@ kinds! {
     Volume: VolumeSpec, namespaced, "Storage on a node, optionally shared over the mesh";
     VolumeClaim: VolumeClaimSpec, namespaced, "A request for storage";
     Blob: BlobSpec, namespaced, "Bytes named by their BLAKE3 hash, kept on several nodes";
+    Backup: BackupSpec, namespaced, "A Volume archived on a schedule, to blobs or S3";
     Secret: SecretSpec, namespaced, "Secrets, delivered as files or env vars";
     ConfigMap: ConfigMapSpec, namespaced, "Configuration, delivered as files or env vars";
     Seat: SeatSpec, cluster, "A group of local display, input and audio devices on a node";

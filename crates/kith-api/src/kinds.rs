@@ -513,6 +513,38 @@ spec! {
         pub copies: Option<u32>,
     }
 
+    /// A Volume's directory as an archive, made every so often by the volume's node and
+    /// kept as a blob (on other nodes too) or in an S3 bucket.
+    pub struct BackupSpec {
+        /// The Volume, in this namespace.
+        pub volume: String,
+        /// How often: a number and `s`, `m`, `h` or `d` (`24h`).
+        pub every: String,
+        /// How many are kept [default: 7].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub keep: Option<u32>,
+        /// How many nodes keep each backup's blob [default: 2].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub copies: Option<u32>,
+        /// Send them to an S3-compatible bucket instead of the cluster's blob store.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub s3: Option<S3>,
+    }
+
+    pub struct S3 {
+        /// `https://host[:port]`; objects are `endpoint/bucket/prefix…` (path style).
+        pub endpoint: String,
+        pub bucket: String,
+        /// [default: us-east-1]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub region: Option<String>,
+        /// Put before each object's name (`backups/`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub prefix: Option<String>,
+        /// The Secret, in this namespace, with `accessKey` and `secretKey`.
+        pub secret: String,
+    }
+
     pub struct VolumeClaimSpec {
         pub size: Quantity,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -825,6 +857,49 @@ pub(crate) fn kind_name(name: &str) -> Result<(), String> {
         false => Err(format!(
             "invalid kind `{name}`: letters and digits, a capital first, at most 63"
         )),
+    }
+}
+
+/// `90s`, `30m`, `24h`, `7d` in seconds.
+pub fn every(text: &str) -> Option<u64> {
+    let unit = text.chars().next_back()?;
+    let number = &text[..text.len() - unit.len_utf8()];
+    let unit = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86400,
+        _ => return None,
+    };
+    let digits = number.bytes().all(|b| b.is_ascii_digit());
+    number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| digits && *n > 0)?
+        .checked_mul(unit)
+}
+
+impl Spec for BackupSpec {
+    fn check(&self) -> Result<(), String> {
+        if every(&self.every).is_none() {
+            return Err(format!(
+                "every: `{}` is not a number and s, m, h or d (`24h`)",
+                self.every
+            ));
+        }
+        let Some(s3) = &self.s3 else { return Ok(()) };
+        // (What is in a URL's path as it is written, and signed as it is written.)
+        let plain = |text: &str| text.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b));
+        if s3.bucket.is_empty() || s3.bucket.contains('/') || !plain(&s3.bucket) {
+            return Err(format!("s3.bucket: `{}` is not a bucket's name", s3.bucket));
+        }
+        if !plain(s3.prefix.as_deref().unwrap_or_default()) {
+            return Err("s3.prefix: use letters, digits, `-`, `.`, `_` and `/`".into());
+        }
+        if !s3.endpoint.starts_with("https://") {
+            return Err(format!("s3.endpoint: `{}` must start with https://", s3.endpoint));
+        }
+        Ok(())
     }
 }
 

@@ -372,6 +372,60 @@ fn a_blob_put_on_one_node_is_held_by_two_and_read_through_any() {
 }
 
 #[test]
+fn a_backup_of_a_volume_is_held_by_two_nodes_and_restored_through_another() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "backup";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two nodes with addresses", || {
+        alpha.nodes().iter().filter(|(_, at)| !at.is_empty()).count() == 2
+    });
+
+    // What is in the volume on beta before there is a Backup of it.
+    let data = beta.dir.join("state/volumes/default/data/d");
+    std::fs::create_dir_all(data.join("deep")).unwrap();
+    std::fs::write(data.join("deep/file"), b"what must not be lost").unwrap();
+    let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: beta, path: d }\n---\n\
+                apiVersion: kith.dev/v1\nkind: Backup\nmetadata: { name: often }\nspec: { volume: data, every: 1d, keep: 2 }\n";
+    std::fs::write(alpha.dir.join("backup.yaml"), yaml).unwrap();
+    alpha.ok(&["apply", "-f", "backup.yaml"]);
+
+    // Beta makes it; the blob it is in is held by both nodes.
+    let status = |node: &Node, kind: &str, name: &str| {
+        let found: serde_json::Value = serde_json::from_str(&node.ok(&["get", kind, name, "-o", "json"])).unwrap();
+        found.as_array().map_or(found.clone(), |found| found[0].clone())["status"].clone()
+    };
+    wait_for("the backup to be made", || {
+        status(&alpha, "backup", "often")["backups"][0]["blob"].is_string()
+    });
+    let made = status(&alpha, "backup", "often")["backups"][0].clone();
+    let blob = made["blob"].as_str().unwrap().to_string();
+    wait_for("both nodes to hold the backup", || {
+        status(&alpha, "blob", &blob)["nodes"]
+            .as_array()
+            .is_some_and(|nodes| nodes.len() == 2)
+    });
+    assert!(alpha.dir.join("state/blobs").join(&blob).exists());
+
+    // Over what is there: refused. The volume lost and made again: restored, asked through alpha.
+    let (code, _, err) = alpha.kith(&["backup", "restore", "often"]);
+    assert!(code != 0 && err.contains("restored into an empty volume"), "{err}");
+    std::fs::remove_dir_all(&data).unwrap();
+    let said = alpha.ok(&["backup", "restore", "often", "--at", &made["at"].to_string()]);
+    assert!(said.contains("is back in volume data on node beta"), "{said}");
+    assert_eq!(std::fs::read(data.join("deep/file")).unwrap(), b"what must not be lost");
+    let (code, _, err) = alpha.kith(&["backup", "restore", "often", "--at", "1"]);
+    assert!(code != 0 && err.contains("no such backup"), "{err}");
+}
+
+#[test]
 fn a_node_that_is_down_is_not_made_a_voter() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

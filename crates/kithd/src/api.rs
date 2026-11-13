@@ -57,6 +57,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
         .route("/v1/blobs", axum::routing::put(crate::blobs::put))
+        .route("/v1/backups/{namespace}/{name}/restore", post(crate::backups::restore))
         .route("/v1/blobs/{namespace}/{name}", get(crate::blobs::get))
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
@@ -237,6 +238,13 @@ pub(crate) async fn plan(
     permit(shared, caller, Verb::Apply, |store| {
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(target).collect()
+    })?;
+    // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
+    // writes one must be allowed to read both.
+    permit(shared, caller, Verb::Get, |store| {
+        let backups = resources.iter().filter(|resource| resource.kind == "Backup");
+        let read = |backup: &Resource| ["Volume", "Secret"].map(|kind| (kind.to_string(), place(store, backup)));
+        backups.flat_map(read).collect()
     })?;
     // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
     let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
