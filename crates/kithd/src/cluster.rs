@@ -245,6 +245,10 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/run-hop", post(api::run::hop))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .route("/v1/volume-copy/{namespace}/{name}", get(crate::replicas::copy))
+        .route(
+            "/v1/volume-key/{namespace}/{name}",
+            get(crate::encrypted::get).put(crate::encrypted::put),
+        )
         .with_state(shared.clone());
     let members = crate::raft::router(shared).merge(ping).merge(hop);
     open.merge(crate::ui::pages())

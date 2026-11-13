@@ -970,6 +970,36 @@ spec:
   built, never run here) and a real GPU passed through, which needs a machine with a spare
   card and its owner's say.
 
+### Confidential machines
+
+`confidential: true` on a template has its machines run with their memory encrypted by the
+processor, out of reach of the node they run on (AMD SEV-SNP, or Intel TDX):
+
+```yaml
+spec:
+  placement: { nodeSelector: { kith.dev/node: epyc } }
+  template:
+    confidential: true
+    vms:
+      - name: machine
+        firmware: /usr/share/edk2/x64/OVMF.amdsev.fd   # one built for SEV-SNP (or TDX)
+        disks: [{ path: /var/lib/machines/sealed.raw }]
+        memory: 8Gi
+```
+
+- A node runs it only if its KVM says it has one of the two
+  (`/sys/module/kvm_amd/parameters/sev_snp` or `/sys/module/kvm_intel/parameters/tdx` reads
+  `Y`). **A node that has neither runs none of it** and says why in the status' `notes`;
+  nothing falls back to a machine with its memory in the clear.
+- Only `vms` units, each with a `firmware` and under QEMU: a `containers` or `exec` unit in
+  a confidential template is refused when it is applied (it would run in the clear).
+- Not yet (ponytail): the scheduler does not know which nodes have such a processor (say
+  where with `placement`); nobody is shown the guest's measurement (attestation), so the
+  guest's owner cannot yet check what was started; containers inside such a machine (it
+  takes a guest kernel and an agent of kith's in it); cloud-hypervisor. Tested: the options
+  QEMU is given for each, and the refusal on a machine with neither. **Not tested: a guest
+  started on SEV-SNP or TDX hardware**, which needs such a machine and its owner's say.
+
 ## Storage
 
 A `Volume` is a directory on one node. A container mounts one by naming it, or a
@@ -1154,6 +1184,52 @@ spec:
   `kith-system`; a node sends one copy at a time; `PATH.was-TIME` directories are yours to
   delete; a replica that never synced takes nothing over (the volume waits for its
   node); moving a volume back is done by hand.
+
+### Encrypted volumes
+
+A Volume can be kept encrypted on its node's disk, with its key held by the other nodes:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: vault }
+spec:
+  node: alpha
+  path: data
+  size: 20Gi        # needed: the volume has all of it from the start (8Mi at least)
+  encrypted: true   # said when the Volume is made
+```
+
+- On its node the volume is one file of that size, opened through dm-crypt (aes-xts, a
+  512-bit key) and mounted where the volume's directory would be. Workloads mount it like
+  any volume.
+- **The key is never on the volume's node's disk.** That node makes it; every other node
+  keeps a copy in its own state and hands it to the volume's node alone, over the cluster's
+  mutual TLS, whenever that node has to open the volume (each start). A disk taken from the
+  node has the file and no key. **When a node's disk is lost, delete its Node** (`kith
+  delete node/NAME`), or `kith node lock NAME` if its state is encrypted: the others then
+  hand its volumes' keys to nobody. Until then, whoever has the disk and can reach the
+  cluster with it could ask as that node. Nodes that join later are given the key
+  within a few minutes, so the volume outlives the nodes that kept it first.
+- Until it is open, a workload that mounts it does not start and says so (`volume vault: it
+  is encrypted and not open`); the node's log says what it waits for. Nothing is ever
+  written in its place in the clear.
+- A key is made only for a volume that has no file yet, and only once another node keeps
+  it. **A cluster of one node cannot have an encrypted volume**: nobody else would hold
+  the key. If every node that keeps the key is gone, so is the volume.
+- What it does not do (ponytail): the other nodes keep the key as it is, so someone with
+  the volume's node's disk *and* another node's disk can open it, unless that other node's
+  state is [encrypted too](#encrypted-state). A Backup or an Image of the
+  volume is what was in it, not encrypted by this (a Share of one is untried). An encrypted volume cannot be
+  `shared`, have `replicas`, or be in `kith-system`; it is not resized after it is made,
+  and a directory that already has files is not encrypted in place (move them away, make
+  the volume, copy them in). Taking `encrypted: true` away again does not decrypt it: the
+  node refuses the volume while its encrypted file is there. Its file and the others' copies of its key stay when the
+  Volume is deleted. It needs kith OS (which carries the file system a volume starts as:
+  a node has no mkfs). Why one is not open is in the node's log, not yet in the Volume's
+  status. Tested in VMs (`sh ci/vm.sh --test share`): made on one node with its key on the
+  other, no file system to be seen on the node's disk, opened again after a restart with
+  what was written still in it.
 
 ### Blobs
 

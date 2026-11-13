@@ -20,6 +20,7 @@ mod crypt;
 mod devices;
 mod dhcp;
 mod dns;
+mod encrypted;
 mod images;
 mod ingress;
 mod init;
@@ -670,8 +671,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let backups = backups::run(shared.clone(), state.clone(), stopping.clone());
         let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
         let images = images::run(shared.clone(), state.clone(), stopping.clone());
+        let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
         let registry = images::serve(shared.clone(), args.registry_port, stopping.clone());
-        let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry) };
+        let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry, encrypted) };
         let (served, nodes, (), (), (), (), (), _) =
             tokio::join!(server, nodes, work, names, mesh, proxy, ingress, storage);
         let _ = shared.raft.shutdown().await;

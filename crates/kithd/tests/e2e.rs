@@ -2338,6 +2338,48 @@ spec:
     );
 }
 
+/// A template that is `confidential` runs nothing on a node whose processor keeps no guest's
+/// memory encrypted, and its status says why. Skipped on a machine that would run it.
+#[test]
+fn a_confidential_template_runs_nothing_on_a_node_that_encrypts_no_guest() {
+    if !e2e() {
+        return;
+    }
+    let on = |path: &str| std::fs::read_to_string(path).is_ok_and(|said| said.trim() == "Y");
+    if on("/sys/module/kvm_amd/parameters/sev_snp") || on("/sys/module/kvm_intel/parameters/tdx") {
+        eprintln!("skipped: this machine has SEV-SNP or TDX, and would start the guest");
+        return;
+    }
+    let daemon = Daemon::start("confidential");
+    daemon.apply(
+        "apiVersion: kith.dev/v1
+kind: Job
+metadata:
+  name: sealed
+spec:
+  template:
+    confidential: true
+    vms:
+      - name: machine
+        firmware: /nowhere/OVMF.fd
+        disks: [{ path: /nowhere/disk.raw }]
+        memory: 256Mi
+",
+    );
+    let notes = || daemon.status("Job/sealed")["notes"].to_string();
+    wait_for("the node to say why it runs none of it", || {
+        notes().contains("no AMD SEV-SNP and no Intel TDX")
+    });
+    // (Were the machine started, its hypervisor would have failed on the firmware by now.)
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let status = daemon.status("Job/sealed");
+    assert!(status["succeeded"] != 1 && status["failed"] != 1, "{status}");
+    assert!(
+        status["containers"].as_array().is_none_or(|units| units.is_empty()),
+        "{status}"
+    );
+}
+
 /// The cluster makes an image of its own and runs it: a Job fills a Volume, an Image packs
 /// the volume when the Job has succeeded, the node's registry serves it, and a Job whose
 /// container is that image runs what was built. (The container needs a program with no

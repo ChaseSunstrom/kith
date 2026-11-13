@@ -164,6 +164,13 @@ assemble() { # DIR
     cp "$cache/cacert-$ca_date.pem" "$r/etc/ssl/certs/ca-certificates.crt"
     ln -s /run/resolv.conf "$r/etc/resolv.conf"
     printf 'NAME="kith OS"\nID=kith\nVERSION_ID=%s\nPRETTY_NAME="kith OS %s"\n' "$version" "$version" >"$r/etc/os-release"
+    # The file system an encrypted Volume starts as: a node has no mkfs, so kithd writes
+    # this one under the volume's key and grows it (crates/kithd/src/encrypted.rs). 4 KiB
+    # blocks and an inode for 32 KiB once it has grown; the same bytes at every build.
+    mkdir -p "$r/usr/share/kith"
+    truncate -s 8M "$r/usr/share/kith/volume.ext4"
+    E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -L kith-volume -U "$seed" \
+        -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0" "$r/usr/share/kith/volume.ext4" >&2
     chmod -R u=rwX,go=rX "$r"
     mksquashfs "$r" "$w/root.squashfs" -comp zstd -Xcompression-level 19 -all-root -noappend -no-xattrs -quiet -no-progress
     veritysetup format "$w/root.squashfs" "$w/root.verity" --salt="$salt" --uuid="$seed" >"$w/verity.txt"

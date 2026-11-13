@@ -422,12 +422,20 @@ impl Controller {
             }
             let containers = template.containers.iter().cloned().map(Run::Container);
             // (A VM is the process of its hypervisor: an exec unit, with the command line made here.)
-            let vms = template.vms.iter().map(|vm| Run::Exec(crate::vm::exec(vm, &devices)));
-            let units: Vec<Run> = containers
+            // A confidential template on a node whose processor encrypts no guest: none of it.
+            let guard = crate::vm::confidential(template.confidential, crate::vm::guard(Path::new("/sys")));
+            let vms = template
+                .vms
+                .iter()
+                .map(|vm| Run::Exec(crate::vm::exec(vm, &devices, guard.clone().ok().flatten())));
+            let mut units: Vec<Run> = containers
                 .chain(template.exec.iter().cloned().map(Run::Exec))
                 .chain(vms)
                 .collect();
-            if units.is_empty() {
+            if let Err(why) = &guard {
+                note.push(why.clone());
+                units.clear();
+            } else if units.is_empty() {
                 note.push("the template has nothing to run".into());
             }
             for (i, unit) in units.iter().enumerate() {

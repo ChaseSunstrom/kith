@@ -237,6 +237,10 @@ spec! {
         /// Virtual machines, each run by a hypervisor on the node.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub vms: Vec<VmUnit>,
+        /// Run only where the processor keeps a guest's memory encrypted (AMD SEV-SNP or
+        /// Intel TDX), and only as `vms`: a node that has neither refuses it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub confidential: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub restart_policy: Option<RestartPolicy>,
         /// Names of `DeviceClaim`s this replica holds.
@@ -551,6 +555,10 @@ spec! {
         /// How often the other copies are brought up to date [default: 5m].
         #[serde(skip_serializing_if = "Option::is_none")]
         pub sync: Option<String>,
+        /// Keep it encrypted on its node's disk (dm-crypt), the key held by the cluster's
+        /// other nodes: needs a `size`, which it has from the start. Set when it is made.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub encrypted: Option<bool>,
     }
 
     /// Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3
@@ -981,10 +989,28 @@ pub fn every(text: &str) -> Option<u64> {
         .checked_mul(unit)
 }
 
+/// The smallest encrypted Volume, in bytes: the file system each starts as.
+pub const ENCRYPTED_LEAST: u64 = 8 << 20;
+
 impl Spec for VolumeSpec {
     fn check(&self) -> Result<(), String> {
         if self.replicas == Some(0) {
             return Err("replicas: at least 1 (the volume itself)".into());
+        }
+        if self.encrypted == Some(true) {
+            // (The file system it starts as is this big: crates/kithd/src/encrypted.rs.)
+            if self
+                .size
+                .as_ref()
+                .is_none_or(|size| size.value() < ENCRYPTED_LEAST as f64)
+            {
+                return Err("encrypted: needs a `size` of at least 8Mi".into());
+            }
+            // ponytail: the nodes that mount a shared one, or keep a copy, would each need the
+            // key and a file system of their own under it.
+            if self.shared == Some(true) || self.replicas.is_some_and(|replicas| replicas > 1) {
+                return Err("encrypted: a volume that is shared or has replicas cannot be encrypted yet".into());
+            }
         }
         match &self.sync {
             Some(sync) if every(sync).is_none() => {
@@ -1208,6 +1234,22 @@ impl Template {
         }
         for vm in &self.vms {
             vm.check().map_err(|e| format!("{at}, vm `{}`: {e}", vm.name))?;
+        }
+        if self.confidential == Some(true) {
+            if !self.containers.is_empty() || !self.exec.is_empty() {
+                return Err(format!(
+                    "{at}: confidential: only `vms` (a container or an exec unit runs with its memory in the clear)"
+                ));
+            }
+            // ponytail: QEMU's options alone are known here, and both SEV-SNP and TDX start a
+            // guest through firmware that is part of what is measured.
+            let plain = |vm: &&VmUnit| vm.firmware.is_none() || !matches!(vm.hypervisor, None | Some(Hypervisor::Qemu));
+            if let Some(vm) = self.vms.iter().find(plain) {
+                return Err(format!(
+                    "{at}, vm `{}`: confidential: needs a `firmware` and QEMU as its hypervisor",
+                    vm.name
+                ));
+            }
         }
         let mut names = std::collections::BTreeSet::new();
         for name in self.units() {

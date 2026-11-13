@@ -843,3 +843,56 @@ fn a_vm_unit_names_what_it_starts_by_absolute_paths_and_its_memory() {
     let twice = "{ name: vm, kernel: /k, memory: 256Mi }\n      - { name: vm, kernel: /k, memory: 256Mi }";
     assert!(job(twice).unwrap_err().contains("two units are named `vm`"));
 }
+
+/// `encrypted: true` on a Volume and `confidential: true` on a template: what each needs,
+/// and what neither can be yet.
+#[test]
+fn an_encrypted_volume_and_a_confidential_template_are_checked() {
+    let read = |text: String| {
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let volume = |spec: &str| {
+        read(format!(
+            "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: {{ name: vault }}\nspec: {spec}\n"
+        ))
+    };
+    volume("{ node: a, path: data, size: 1Gi, encrypted: true }").unwrap();
+    volume("{ node: a, path: data, size: 8Mi, encrypted: true }").unwrap();
+    volume("{ node: a, path: data, encrypted: false, shared: true }").unwrap();
+    for (bad, why) in [
+        ("{ node: a, path: data, encrypted: true }", "needs a `size`"),
+        ("{ node: a, path: data, size: 4Mi, encrypted: true }", "at least 8Mi"),
+        (
+            "{ node: a, path: data, size: 1Gi, encrypted: true, shared: true }",
+            "cannot be encrypted yet",
+        ),
+        (
+            "{ node: a, path: data, size: 1Gi, encrypted: true, replicas: 2 }",
+            "cannot be encrypted yet",
+        ),
+    ] {
+        let refused = volume(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+
+    let job = |template: &str| {
+        read(format!(
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: sealed }}\nspec:\n  template: {template}\n"
+        ))
+    };
+    let vm = "{ name: vm, firmware: /usr/share/ovmf/OVMF.fd, disks: [{ path: /var/d.raw }], memory: 1Gi }";
+    job(&format!("{{ confidential: true, vms: [{vm}] }}")).unwrap();
+    for (bad, why) in [
+        (format!("{{ confidential: true, vms: [{vm}], containers: [{{ name: c, image: i }}] }}"), "only `vms`"),
+        (format!("{{ confidential: true, vms: [{vm}], exec: [{{ name: e, command: [/bin/true] }}] }}"), "only `vms`"),
+        ("{ confidential: true, vms: [{ name: vm, kernel: /k, memory: 1Gi }] }".to_string(), "needs a `firmware`"),
+        (
+            "{ confidential: true, vms: [{ name: vm, firmware: /f, disks: [{ path: /d }], hypervisor: cloudHypervisor, memory: 1Gi }] }".to_string(),
+            "QEMU as its hypervisor",
+        ),
+    ] {
+        let refused = job(&bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+}

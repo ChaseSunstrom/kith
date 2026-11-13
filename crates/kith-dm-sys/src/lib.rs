@@ -1,5 +1,7 @@
 //! Device-mapper by ioctl (linux/dm-ioctl.h): what `dmsetup create` and `dmsetup remove`
-//! do, for a machine with no dmsetup. One mapping of one dm-crypt target.
+//! do, for a machine with no dmsetup. One mapping of one dm-crypt target. And two more
+//! things such a machine has no tool for: a file as a block device (`losetup`), and an ext4
+//! file system grown where it is mounted (`resize2fs`).
 //!
 //! The one `unsafe` block of the workspace is the ioctl call itself: the request is put
 //! together as bytes, so there is no struct whose layout has to match the kernel's.
@@ -54,15 +56,59 @@ fn request(name: &str, flags: u32, target: Option<(u64, &str, &str)>) -> Result<
 fn call(control: &File, command: u8, mut request: Vec<u8>) -> Result<Vec<u8>> {
     // _IOWR(0xfd, command, struct dm_ioctl)
     let number = (3u32 << 30) | ((HEADER as u32) << 16) | (0xfd << 8) | u32::from(command);
-    // SAFETY: the kernel reads and writes no more than `data_size` bytes of the buffer,
-    // which `request` set to the buffer's length; the buffer lives past the call.
-    let said = unsafe { libc::ioctl(control.as_raw_fd(), number as _, request.as_mut_ptr()) };
-    if said < 0 {
-        let failed = Error::last_os_error();
+    // (The kernel reads and writes no more than `data_size` bytes of the buffer, which
+    // `request` set to the buffer's length.)
+    if let Err(failed) = ioctl(control, number, &mut request) {
         request.fill(0);
         return Err(failed);
     }
     Ok(request)
+}
+
+/// The ioctl `number` on `file`, with `bytes` as what it points at. What the kernel answers.
+///
+/// For the numbers of this file only: each is one whose argument the kernel takes as a
+/// pointer to no more than `bytes` holds (or does not look at).
+fn ioctl(file: &File, number: u32, bytes: &mut [u8]) -> Result<i32> {
+    // SAFETY: the kernel reads and writes within `bytes` (see above), which lives past the call.
+    let said = unsafe { libc::ioctl(file.as_raw_fd(), number as _, bytes.as_mut_ptr()) };
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(said)
+    }
+}
+
+/// Give `file` a block device (`/dev/loopN`): what `losetup --find` does. The device is
+/// gone again when the last thing that has it open closes it, so keep what is returned open
+/// until something else (a mapping over it) holds the device.
+pub fn attach(file: &File) -> Result<(File, PathBuf)> {
+    const GET_FREE: u32 = 0x4C82;
+    const CONFIGURE: u32 = 0x4C0A;
+    let control = File::options().read(true).write(true).open("/dev/loop-control")?;
+    let mut failed = Error::other("no loop device");
+    // (Another process can take the one that was free between the two calls: ask again.)
+    for _ in 0..8 {
+        let path = PathBuf::from(format!("/dev/loop{}", ioctl(&control, GET_FREE, &mut [])?));
+        let device = File::options().read(true).write(true).open(&path)?;
+        // `struct loop_config`: the file, a block size (the default), then `struct
+        // loop_info64`, whose flags are 52 bytes in: LO_FLAGS_AUTOCLEAR.
+        let mut config = [0u8; 304];
+        config[0..4].copy_from_slice(&(file.as_raw_fd() as u32).to_ne_bytes());
+        config[60..64].copy_from_slice(&4u32.to_ne_bytes());
+        match ioctl(&device, CONFIGURE, &mut config) {
+            Ok(_) => return Ok((device, path)),
+            Err(busy) => failed = busy,
+        }
+    }
+    Err(failed)
+}
+
+/// Grow the ext4 file system mounted at `mounted` to `blocks` of its blocks, as it is in use:
+/// what `resize2fs` asks of the kernel. The device under it must be that big already.
+pub fn grow(mounted: &Path, blocks: u64) -> Result<()> {
+    // EXT4_IOC_RESIZE_FS: _IOW('f', 16, __u64)
+    ioctl(&File::open(mounted)?, 0x4008_6610, &mut blocks.to_ne_bytes()).map(drop)
 }
 
 fn control() -> Result<File> {
@@ -145,5 +191,13 @@ mod tests {
         }
         assert!(crypt("kith-dm-sys-test", Path::new("/dev/null/none"), 0, 8, &[0; 64]).is_err());
         assert!(remove("kith-dm-sys-test").is_err());
+    }
+
+    /// What is no ext4 file system is not grown, and says so (a loop device and a real
+    /// grow are the VM test's to show: ci/vm.sh --test share).
+    #[test]
+    fn grow_refusals_are_errors() {
+        assert!(grow(Path::new("/proc"), 1 << 20).is_err());
+        assert!(grow(Path::new("/nowhere/at/all"), 1).is_err());
     }
 }

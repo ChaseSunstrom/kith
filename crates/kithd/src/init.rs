@@ -572,6 +572,8 @@ pub fn end(failed: bool) -> ! {
     // Written out, then let go of: by now kithd has closed what it had open there. (If
     // not, as after a panic, the file system's journal is what keeps it whole.)
     nix::unistd::sync();
+    // (What is mounted from a file of the state, first.)
+    crate::encrypted::close(std::path::Path::new(STATE));
     // (EINVAL: nothing is mounted there, as in the installer.)
     if let Err(e) = nix::mount::umount(STATE).or_else(|e| if e == nix::errno::Errno::EINVAL { Ok(()) } else { Err(e) })
     {

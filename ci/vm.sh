@@ -12,7 +12,8 @@
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
 #   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
-#   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other
+#   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
+#                               an encrypted volume of one, its key kept by the other
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -73,7 +74,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    node that does not hold it is there on the node that does, and the
                    other way round; no NFS is answered from outside the mesh until a
                    Share names this machine, which then makes a directory in the
-                   Share's volume and cannot write a read-only one
+                   Share's volume and cannot write a read-only one; an encrypted
+                   volume is made on one node with its key kept by the other, shows
+                   no file system on the node's disk, and is opened again with what
+                   was written in it after the node restarts
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -184,7 +188,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:2049" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}" \
-                -serial "file:$work/n$1.log" -monitor none </dev/null >/dev/null 2>&1 &
+                -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
         }
         field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
@@ -368,8 +372,49 @@ found = found if isinstance(found, list) else found.get("resources", found.get("
 status = next(r.get("status") for r in found if r["kind"] == "Share" and r["metadata"]["name"] == "mine")
 sys.exit(0 if status == {"node": "n1", "path": "/default/on1/own"} else 1)
 EOF
+
+            # An encrypted volume on the second node. Its key is made there and kept by the
+            # first node; its file, read from outside on the node's disk, shows nothing of
+            # the file system in it (the one it starts as has a label to look for); told to
+            # restart, the node closes it, comes up, is handed the key again, and what a
+            # container wrote in it is still there.
+            grep -aq kith-volume "$root/target/os/root/usr/share/kith/volume.ext4" || fail "the file system an encrypted volume starts as has no label to look for"
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"vault"},"spec":{"node":"n2","path":"in","size":"12Mi","encrypted":true}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the encrypted volume was not applied"
+            sealed() { # NAME: a Job whose container makes the file `key` in the encrypted volume
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/vault/key"],
+   "volumeMounts":[{"volume":"vault","path":"/vault"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+            }
+            hears() { # N WHAT: wait for node N's console to have said it
+                waited=0
+                until grep -aq "$2" "$work/n$1.log"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "the node n$1 did not say: $2"
+                    sleep 1
+                done
+            }
+            hears 2 'kithd: made the encrypted volume default/vault'
+            sealed seal
+            until_job seal succeeded
+            echo sendkey ctrl-alt-delete | socat - "unix-connect:$work/keys2" >/dev/null
+            hears 2 'reboot: Restarting system'
+            hears 2 'kithd: opened the encrypted volume default/vault'
+            grep -aq 'kithd: handed n2 the key of its volume default/vault' "$work/n1.log" || fail "the first node did not say it handed the volume's key over"
+            sealed sealed-again
+            until_job sealed-again failed
+            any GET "/v1/logs/Job/default/sealed-again?stderr=true" >"$work/sealed.err" 2>/dev/null || true
+            grep -q '/vault/key: File exists' "$work/sealed.err" || fail "what was written in the encrypted volume was not there after the restart: $(cat "$work/sealed.err")"
+            read -r state_start state_sectors <"$work/state.at"
+            ! dd if="$work/n2.raw" bs=512 skip="$state_start" count="$state_sectors" status=none | grep -aq kith-volume || fail "the encrypted volume's file system is in the clear on its node's disk"
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there"
             exit 0
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "

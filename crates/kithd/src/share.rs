@@ -937,6 +937,7 @@ spec: {volume: gone, nfs: {clients: [192.168.1.9]}}
             name: "media".into(),
             path: "films/all of them".into(),
             node: node.into(),
+            encrypted: false,
         };
         let (server, me) = ("fd00:1::1".parse().unwrap(), "fd00:1::2".parse().unwrap());
         let (from, options) = source(server, me, &dir("a"));

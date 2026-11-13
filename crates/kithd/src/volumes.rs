@@ -30,6 +30,8 @@ pub struct Dir {
     pub name: String,
     pub path: String,
     pub node: String,
+    /// Kept under dm-crypt on that node ([`crate::encrypted`]): no directory until it is open.
+    pub encrypted: bool,
 }
 
 /// What a workload's mounts come to: the one node those that are not `shared` are on (none: it
@@ -92,10 +94,12 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
             name: name.into(),
             path: String::new(),
             node: String::new(),
+            encrypted: false,
         };
         let vol = match serde_json::from_value::<VolumeSpec>(volume.spec.clone()) {
             Ok(spec) => {
                 dir.path = spec.path;
+                dir.encrypted = spec.encrypted == Some(true);
                 let replicas = spec.replicas.unwrap_or(1);
                 // A volume that had replicas is where its status says: on the node that took
                 // over when the one it was made on was lost (and stays there with `replicas`
@@ -112,8 +116,11 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
                 // the nodes that mount it would have to follow it, and a host path is one node's.
                 let alone = (replicas > 1 && (shared || namespace == SYSTEM))
                     .then(|| format!("a volume with replicas cannot be shared or in {SYSTEM} yet"));
+                // (A path anywhere on the host is not a file of this node's state.)
+                let sealed = (dir.encrypted && namespace == SYSTEM)
+                    .then(|| format!("an encrypted volume cannot be in {SYSTEM}: its path is anywhere on the host"));
                 Vol {
-                    refused: check_path(namespace, &dir.path).err().or(anywhere).or(alone),
+                    refused: check_path(namespace, &dir.path).err().or(anywhere).or(alone).or(sealed),
                     replicas,
                     dir,
                     size: spec.size.map(|size| size.value()),
@@ -379,6 +386,15 @@ pub fn dir(store: &Store, namespace: &str, name: &str) -> Option<Dir> {
     vol.refused.is_none().then_some(vol.dir)
 }
 
+/// The encrypted Volumes whose data is on `me`, and how big each is to be (bytes).
+pub fn encrypted(store: &Store, me: &str) -> Vec<(Dir, u64)> {
+    let mine = |vol: Vol| {
+        let kept = vol.dir.encrypted && vol.refused.is_none() && vol.dir.node == me;
+        kept.then(|| (vol.dir, vol.size.unwrap_or(0.0) as u64))
+    };
+    volumes(store).into_values().filter_map(mine).collect()
+}
+
 /// The shared Volumes whose data is on `me`: what it serves to the other nodes.
 pub fn served(store: &Store, me: &str) -> Vec<Dir> {
     let mine = |vol: Vol| (vol.shared && vol.refused.is_none() && vol.dir.node == me).then_some(vol.dir);
@@ -405,6 +421,18 @@ pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
     }
     let state = state.canonicalize().map_err(|e| made(state, e))?;
     let root = state.join("volumes").join(&dir.namespace).join(&dir.name);
+    // (Nothing is made under a closed one: what a workload wrote there would be in the clear.)
+    if dir.encrypted && !crate::encrypted::open(&root) {
+        return Err(
+            "it is encrypted and not open: its key comes from the cluster's other nodes, \
+                    and this node's log says what it waits for"
+                .into(),
+        );
+    }
+    // (Nor beside one that was made encrypted: what is in its file would seem to be gone.)
+    if !dir.encrypted && crate::encrypted::made(&state, &dir.namespace, &dir.name) {
+        return Err("it was made encrypted and its file is still on this node: say `encrypted: true` again".into());
+    }
     let mut path = state;
     let inside = ["volumes", &dir.namespace, &dir.name]
         .into_iter()
@@ -531,6 +559,7 @@ spec: { node: a, path: tiny, size: 1Gi }
             name: "fast".into(),
             path: "fast".into(),
             node: "a".into(),
+            encrypted: false,
         };
         assert_eq!(db.volumes, BTreeMap::from([("fast".to_string(), fast)]));
         assert_eq!(
@@ -706,6 +735,7 @@ spec: { node: a, path: tiny, size: 1Gi }
             name: "data".into(),
             path: path.into(),
             node: "a".into(),
+            encrypted: false,
         }
     }
 
