@@ -425,7 +425,14 @@ fn look(
             // One that is good was applied by hand or ordered earlier: either way the
             // status says which Secret it is, once.
             let status = store.get(&exposed.service).and_then(|service| service.status.as_ref());
-            if status.is_none_or(|status| status["tls"]["secret"] != key.as_str()) {
+            // (Not while a node's order is under way: that node says so itself, as `acme`,
+            // and two answers would race.)
+            let ordering = status.is_some_and(|status| {
+                let asked = status["tls"]["at"].as_u64();
+                status["tls"]["state"] == "ordering"
+                    && asked.is_some_and(|asked| at.saturating_sub(asked) < BETWEEN_ORDERS)
+            });
+            if !ordering && status.is_none_or(|status| status["tls"]["secret"] != key.as_str()) {
                 let said = json!({ "state": "ready", "secret": key, "source": "applied" });
                 naming.push((exposed.service.clone(), said));
             }
@@ -786,6 +793,11 @@ mod tests {
         let (wanting, _, naming) = look(&store, prefix, &web);
         assert_eq!((wanting.len(), naming.len()), (1, 0));
         assert!(wanting[0].1.proxy);
+        // (Only a Service that asks gets the line.)
+        let quiet = Resource::from_source(&service.replace("proxyProtocol: true", "proxyProtocol: false"));
+        let mut other = store.clone();
+        other.apply(quiet.unwrap().remove(0).unwrap()).unwrap();
+        assert!(!look(&other, prefix, &web).0[0].1.proxy);
         // One applied by hand: not wanted, and the status is to name its Secret.
         store.apply(serde_json::from_value(secret).unwrap()).unwrap();
         let (wanting, _, naming) = look(&store, prefix, &web);

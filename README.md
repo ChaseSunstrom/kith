@@ -221,9 +221,11 @@ kith node status                                   # who leads the store, who vo
   TLS ends at the ingress and the bytes go on as they are: no header is added,
   and to a NetworkPolicy the connection comes from the ingress node. With
   `expose.proxyProtocol: true` the backend is sent a PROXY protocol v1 line
-  (`PROXY TCP4 <client> <ingress> <port> <port>`) with the client's address
-  before the client's bytes; it is off unless asked for, because a backend
-  that does not expect the line will break on it. Certificate keys and the ACME account key
+  (`PROXY TCP4 <client> <ingress> <client port> <ingress port>`) with the
+  client's address before the client's bytes; it is off unless asked for,
+  because a backend that does not expect the line will break on it. Only the
+  ingress sends it: a client inside the mesh that calls the Service gets
+  none, so the backend has to take both. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
   `expose.host` has to be a domain name (applying anything else is refused).
   Two Services with one host: the first by key has it, and the other's
