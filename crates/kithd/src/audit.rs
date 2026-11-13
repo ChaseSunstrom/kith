@@ -6,14 +6,15 @@
 // ponytail: each node keeps its own file, of what was asked of it. One log for the
 // cluster means writing it through the store (every write twice); ship the files instead.
 
-use crate::access::Caller;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// At this size the file is moved aside (`audit.log.1`, replacing the one before it).
+/// At this size the file is moved aside (`audit.log.1`; the numbered ones before it move up).
 const CAP: u64 = 4 << 20;
+/// How many moved-aside files are kept: `audit.log.1` (the newest) to `audit.log.4`.
+const KEPT: u32 = 4;
 /// Most lines one read gives.
 pub const MOST: u64 = 1000;
 
@@ -47,7 +48,7 @@ impl Audit {
     /// Write down that `who` did `verb` to `what`, or why not.
     // A log that cannot be written is said on stderr and the request goes on: a full disk
     // must not be what keeps an admin from making room.
-    pub fn record(&self, who: &Caller, verb: &str, what: Vec<String>, outcome: Result<(), String>) {
+    pub fn record(&self, who: &impl std::fmt::Display, verb: &str, what: Vec<String>, outcome: Result<(), String>) {
         let at = kith_api::store::now();
         let mut log = self.0.lock().expect("nothing panics holding the audit log");
         if outcome.is_err() {
@@ -76,7 +77,7 @@ impl Audit {
         }
         let path = &log.path;
         if std::fs::metadata(path).is_ok_and(|file| file.len() >= CAP) {
-            let _ = std::fs::rename(path, path.with_extension("log.1"));
+            rotate(path);
         }
         let mut options = std::fs::OpenOptions::new();
         let file = options.append(true).create(true).mode(0o600).open(path);
@@ -101,9 +102,12 @@ impl Audit {
                 .collect())
         };
         let mut entries = read(&log.path, lines)?;
-        let missing = lines.saturating_sub(entries.len() as u64);
-        if missing > 0 {
-            let mut older = read(&log.path.with_extension("log.1"), missing)?;
+        for n in 1..=KEPT {
+            let missing = lines.saturating_sub(entries.len() as u64);
+            if missing == 0 {
+                break;
+            }
+            let mut older = read(&numbered(&log.path, n), missing)?;
             older.append(&mut entries);
             entries = older;
         }
@@ -111,9 +115,24 @@ impl Audit {
     }
 }
 
+/// The moved-aside file `n` back from `path`: `audit.log.1`, `audit.log.2`…
+fn numbered(path: &std::path::Path, n: u32) -> PathBuf {
+    path.with_extension(format!("log.{n}"))
+}
+
+/// Moves the full file aside: each numbered file one further back, the oldest dropped.
+fn rotate(path: &std::path::Path) {
+    let _ = std::fs::remove_file(numbered(path, KEPT));
+    for n in (1..KEPT).rev() {
+        let _ = std::fs::rename(numbered(path, n), numbered(path, n + 1));
+    }
+    let _ = std::fs::rename(path, numbered(path, 1));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::Caller;
 
     #[test]
     fn audit_entries_are_kept_in_order() {
@@ -170,5 +189,61 @@ mod tests {
         );
         std::fs::remove_file(path.with_extension("log.1")).unwrap();
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audit_files_are_numbered_and_read_back() {
+        let path = std::env::temp_dir().join(format!("kith-audit-numbered-{}.log", std::process::id()));
+        let audit = Audit::new(path.clone());
+        // Each round fills the file past the cap with a line that is no entry, then writes
+        // two entries after it (the reader looks at the last megabyte only), then records a
+        // third: that one starts the next file, and the full one moves aside.
+        let write = |text: String| {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let entry = |verb: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"at": 1, "who": "local socket", "verb": verb, "what": [], "ok": true})
+            )
+        };
+        for round in 1..=6 {
+            write(format!("{}\n", " ".repeat(CAP as usize)));
+            write(entry(&format!("a{round}")));
+            write(entry(&format!("b{round}")));
+            audit.record(&Caller::Admin, &format!("t{round}"), vec![], Ok(()));
+        }
+
+        // Four moved-aside files are kept (the newest is `.1`); the fifth back is gone.
+        let holds = |n: u32, verb: &str| {
+            let text = std::fs::read_to_string(numbered(&path, n)).unwrap_or_default();
+            text.contains(&format!("\"verb\":\"{verb}\""))
+        };
+        assert!(holds(1, "a6") && holds(1, "b6") && holds(2, "a5") && holds(3, "a4") && holds(4, "a3"));
+        assert!(!holds(4, "a2") && !numbered(&path, 5).exists());
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\"verb\":\"t6\""));
+
+        // Read back across the moved-aside files, oldest first.
+        for (n, verb) in [(3, "old"), (2, "mid"), (1, "new")] {
+            std::fs::write(numbered(&path, n), entry(verb)).unwrap();
+        }
+        std::fs::write(&path, entry("now")).unwrap();
+        let verbs: Vec<String> = audit
+            .tail(10)
+            .unwrap()
+            .iter()
+            .map(|e| e["verb"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(verbs, ["old", "mid", "new", "now"]);
+
+        std::fs::remove_file(&path).unwrap();
+        for n in 1..=4 {
+            let _ = std::fs::remove_file(numbered(&path, n));
+        }
     }
 }

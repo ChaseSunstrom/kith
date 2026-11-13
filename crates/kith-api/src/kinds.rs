@@ -810,6 +810,11 @@ impl Spec for KindDefinitionSpec {
         if let Some(own) = crate::kind(&self.kind) {
             return Err(format!("kind: `{}` is one of kith's own kinds", own.kind));
         }
+        // The role resource `Audit` is what lets a role read the audit log: a kind of that
+        // name would be granted it.
+        if self.kind.eq_ignore_ascii_case("Audit") {
+            return Err(format!("kind: `{}` is reserved for the audit log", self.kind));
+        }
         let own = self.group == "kith.dev" || self.group.ends_with(".kith.dev");
         if own || !self.group.contains('.') || !dns_name(&self.group) || self.group != self.group.to_ascii_lowercase() {
             return Err(format!(
