@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# The controller SDK is built for wasm32, apart from the rest.
+exclude = ["sdk"]
 
 [workspace.package]
 version = "0.0.1"

@@ -1,0 +1,21 @@
+[package]
+name = "gameserver-controller"
+version = "0.0.1"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kith-controller = { path = "../.." }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Built on its own, for wasm32-unknown-unknown.
+[workspace]

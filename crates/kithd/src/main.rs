@@ -12,6 +12,7 @@ mod api;
 mod audit;
 mod cluster;
 mod controller;
+mod controllers;
 mod dns;
 mod ingress;
 mod members;
@@ -24,6 +25,7 @@ mod releases;
 mod sched;
 mod services;
 mod sources;
+mod wasm;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -107,6 +109,8 @@ pub struct Shared {
     pub logs: PathBuf,
     /// Who changed what, and who was refused.
     pub audit: audit::Audit,
+    /// The WASM modules of `KindDefinition`s, compiled.
+    pub wasm: Arc<wasm::Modules>,
     /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
     /// locked, so a reader under the lock sees the generation that matches what it reads.
     /// Starts at the clock (ms) so a restarted kithd never repeats a number a client holds.
@@ -239,6 +243,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         changed,
         logs: state.join("logs"),
         audit: audit::Audit::new(state.join("audit.log")),
+        wasm: Arc::default(),
         generation,
         members: members::Members::new(name),
         mesh: Mutex::default(),
@@ -413,7 +418,8 @@ fn run(args: Args) -> Result<(), String> {
             let repositories = registry::run(shared.clone(), poll, stopping.clone());
             let units = controller::run(shared.clone(), runtime, args.log_cap, stopping.clone());
             let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());
-            tokio::join!(units, releases, repositories, sources);
+            let controllers = controllers::run(shared.clone(), stopping.clone());
+            tokio::join!(units, releases, repositories, sources, controllers);
         };
         let names = async {
             if let Some(sockets) = names {

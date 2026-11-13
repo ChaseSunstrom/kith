@@ -55,7 +55,7 @@ pub fn custom_kinds(store: &Store) -> BTreeMap<String, bool> {
 }
 
 /// The ConfigMap (in `kith-system`, in a namespace) whose `values` releases are given.
-const SHARED: &str = "kith-values";
+pub const SHARED: &str = "kith-values";
 
 /// What a render was made from: it stands until one of these changes. (A revision and
 /// when it was applied: a resource deleted and made again starts at revision 1 again.)
@@ -69,9 +69,9 @@ struct Inputs {
     kinds: BTreeMap<String, bool>,
 }
 
-type Stamp = Option<(Option<u64>, u64)>;
+pub type Stamp = Option<(Option<u64>, u64)>;
 
-fn stamp(store: &Store, resource: &Resource) -> Stamp {
+pub fn stamp(store: &Store, resource: &Resource) -> Stamp {
     let applied = store.history(&resource.key()).ok().and_then(|history| history.last());
     Some((resource.metadata.revision, applied.map_or(0, |revision| revision.at)))
 }

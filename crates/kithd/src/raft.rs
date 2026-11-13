@@ -154,6 +154,18 @@ impl Shared {
     // "not found", an apply that names a revision "conflict". Request ids kept in the
     // state machine are the fix when that matters.
     pub async fn submit(&self, command: Command) -> Result<Done, Error> {
+        // Whoever applies, here is where a kind's admission module is asked.
+        let command = match command {
+            Command::Apply { resources, at } => {
+                let resources = self.admitted(resources).await?;
+                Command::Apply { resources, at }
+            }
+            Command::Rollback { key, to, at } => {
+                self.restorable(&key, to).await?;
+                Command::Rollback { key, to, at }
+            }
+            other => other,
+        };
         let deadline = Instant::now() + PATIENCE;
         loop {
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;

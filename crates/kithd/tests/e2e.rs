@@ -1716,3 +1716,187 @@ fn rbac_is_enforced_and_audited() {
     daemon.ok(&["delete", "identity/alice"]);
     assert_eq!(call("second", "GET", "/v1/resources/ConfigMap/web/site", "").0, 401);
 }
+
+/// The SDK's example, built to WebAssembly as its users would. `None` (and the test
+/// skipped) where this Rust cannot build for wasm32: `rustup target add wasm32-unknown-unknown`.
+fn wasm_example() -> Option<PathBuf> {
+    let sysroot = Command::new("rustc").args(["--print", "sysroot"]).output().unwrap();
+    let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim());
+    if !sysroot.join("lib/rustlib/wasm32-unknown-unknown").exists() {
+        eprintln!("skipped: no wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)");
+        return None;
+    }
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/kith-controller/examples/gameserver");
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("wasm-example");
+    let built = Command::new(env!("CARGO"))
+        .args(["build", "--quiet", "--release", "--target", "wasm32-unknown-unknown"])
+        .arg("--manifest-path")
+        .arg(example.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(&target)
+        // (Not this build's flags: that one is for another machine.)
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .status()
+        .unwrap();
+    assert!(built.success(), "the SDK example does not build");
+    Some(target.join("wasm32-unknown-unknown/release/gameserver_controller.wasm"))
+}
+
+/// Two kinds of one's own, with the example module as the controller of both and the
+/// admission hook of GameServer.
+fn game_definitions() -> String {
+    let kind = |kind: &str| {
+        let name = kind.to_lowercase();
+        format!(
+            "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: {name} }}\nspec:\n  group: games.example.com\n  \
+             version: v1\n  kind: {kind}\n  schema:\n    type: object\n    required: [map]\n    additionalProperties: false\n    \
+             properties:\n      map: {{ type: string }}\n      players: {{ type: integer, maximum: 64 }}\n"
+        )
+    };
+    format!("{}---\n{}", kind("GameServer"), kind("Match"))
+}
+
+fn game_kinds(daemon: &Daemon, module: &Path) {
+    daemon.apply(&game_definitions());
+    let module = module.to_str().unwrap();
+    let said = daemon.ok(&[
+        "controller",
+        "set",
+        "gameserver",
+        "--controller",
+        module,
+        "--admission",
+        module,
+    ]);
+    assert!(said.contains("KindDefinition/gameserver: admission is"), "{said}");
+    daemon.ok(&["controller", "set", "Match", "--controller", module]);
+}
+
+fn game(kind: &str, name: &str, spec: &str) -> String {
+    format!("apiVersion: games.example.com/v1\nkind: {kind}\nmetadata: {{ name: {name} }}\nspec: {spec}\n")
+}
+
+fn json_of(daemon: &Daemon, target: &str) -> Option<serde_json::Value> {
+    let (code, out, _) = daemon.kith(&["get", target, "-o", "json"]);
+    (code == 0).then(|| serde_json::from_str(&out).unwrap())
+}
+
+#[test]
+fn wasm_admission_refuses_and_changes_writes() {
+    let Some(module) = wasm_example() else { return };
+    let daemon = Daemon::start("wasm_admission");
+    game_kinds(&daemon, &module);
+    let refused = |yaml: &str, dry: bool| {
+        std::fs::write(daemon.dir.join("bad.yaml"), yaml).unwrap();
+        let mut args = vec!["apply", "-f", "bad.yaml"];
+        args.extend(dry.then_some("--dry-run"));
+        let (code, _, err) = daemon.kith(&args);
+        assert_eq!(code, 2, "{err}");
+        err
+    };
+
+    // Changed on the way in: the module fills in what was left out, and leaves what was said.
+    daemon.apply(&game("GameServer", "one", "{ map: dust }"));
+    assert_eq!(json_of(&daemon, "gameserver/one").unwrap()["spec"]["players"], 8);
+    daemon.apply(&game("GameServer", "two", "{ map: dust, players: 4 }"));
+    assert_eq!(json_of(&daemon, "gameserver/two").unwrap()["spec"]["players"], 4);
+
+    // Refused, with the module's reason; a dry run says the same.
+    for dry in [false, true] {
+        let said = refused(&game("GameServer", "three", "{ map: lava }"), dry);
+        let why = "GameServer/default/three: refused by GameServer's admission: the map lava is closed";
+        assert!(said.contains(why), "{said}");
+    }
+    assert!(json_of(&daemon, "gameserver/three").is_none());
+    // What the module makes of it still has to fit the kind's schema.
+    assert!(refused(&game("GameServer", "four", "{ map: dust, players: 99 }"), false).contains("at most 64"));
+
+    // A controller's writes are asked about like anyone's: a Match's server gets its players
+    // from the admission hook, and one on a closed map is refused, which the Match says.
+    daemon.apply(&game("Match", "final", "{ map: dust }"));
+    wait_for("the match's server", || {
+        json_of(&daemon, "gameserver/final-server").is_some()
+    });
+    assert_eq!(
+        json_of(&daemon, "gameserver/final-server").unwrap()["spec"]["players"],
+        8
+    );
+    daemon.apply(&game("Match", "doomed", "{ map: lava }"));
+    wait_for("the match to say why it has no server", || {
+        daemon.status("match/doomed")["controller"]["state"] == "error"
+    });
+    let said = daemon.status("match/doomed")["controller"]["message"].to_string();
+    assert!(said.contains("the map lava is closed"), "{said}");
+    assert!(json_of(&daemon, "gameserver/doomed-server").is_none());
+
+    // A module that is not one is refused when it is set, and the kind keeps the one it had.
+    std::fs::write(daemon.dir.join("not.wasm"), "not a module").unwrap();
+    let (code, _, err) = daemon.kith(&["controller", "set", "GameServer", "--admission", "not.wasm"]);
+    assert!(
+        code == 2 && err.contains("admission.wasm: not a module that can run"),
+        "{err}"
+    );
+    assert!(refused(&game("GameServer", "five", "{ map: lava }"), false).contains("lava is closed"));
+
+    // A rollback is asked about too: what was written before the hook was there does not
+    // come back past it. (The definitions applied again, as they were: without the modules.)
+    daemon.apply(&game_definitions());
+    daemon.apply(&game("GameServer", "six", "{ map: lava, players: 2 }"));
+    daemon.apply(&game("GameServer", "six", "{ map: dust, players: 2 }"));
+    game_kinds(&daemon, &module);
+    let (code, _, err) = daemon.kith(&["rollback", "gameserver/six", "--to", "1"]);
+    assert!(code == 2 && err.contains("the map lava is closed"), "{err}");
+    assert_eq!(json_of(&daemon, "gameserver/six").unwrap()["spec"]["map"], "dust");
+    daemon.apply(&game("GameServer", "six", "{ map: ice, players: 2 }"));
+    daemon.ok(&["rollback", "gameserver/six", "--to", "2"]);
+    assert_eq!(json_of(&daemon, "gameserver/six").unwrap()["spec"]["map"], "dust");
+}
+
+#[test]
+fn wasm_controller_makes_what_its_resource_needs() {
+    let Some(module) = wasm_example() else { return };
+    let daemon = Daemon::start("wasm_controller");
+    game_kinds(&daemon, &module);
+    let data = |name: &str| json_of(&daemon, &format!("configmap/{name}")).map(|map| map["spec"]["data"].clone());
+
+    // What the controller answers appears, as the resource's own, and the status says so.
+    daemon.apply(&game("GameServer", "one", "{ map: dust, players: 4 }"));
+    wait_for("the server's settings", || data("one-config").is_some());
+    assert_eq!(
+        data("one-config").unwrap(),
+        serde_json::json!({ "map": "dust", "players": "4" })
+    );
+    wait_for("the server's status", || {
+        daemon.status("gameserver/one")["state"] == "ready"
+    });
+    let status = daemon.status("gameserver/one");
+    assert_eq!(status["resources"], serde_json::json!(["ConfigMap/default/one-config"]));
+    assert_eq!(status["controller"]["state"], "ok");
+    let config = json_of(&daemon, "configmap/one-config").unwrap();
+    assert_eq!(
+        config["metadata"]["annotations"]["kith.dev/owned-by"],
+        "GameServer/default/one"
+    );
+
+    // It follows the resource, and is put back when someone changes or removes it.
+    daemon.apply(&game("GameServer", "one", "{ map: ice, players: 4 }"));
+    wait_for("the settings to follow", || {
+        data("one-config").is_some_and(|data| data["map"] == "ice")
+    });
+    daemon.ok(&["delete", "configmap/one-config"]);
+    wait_for("the settings to come back", || data("one-config").is_some());
+
+    // A chain: a Match's server has settings of its own; all of it goes with the Match.
+    daemon.apply(&game("Match", "final", "{ map: dust }"));
+    wait_for("the match's server's settings", || {
+        data("final-server-config").is_some()
+    });
+    wait_for("the match's status", || daemon.status("match/final")["servers"] == 1);
+    daemon.ok(&["delete", "match/final"]);
+    wait_for("what the match made to go", || {
+        json_of(&daemon, "gameserver/final-server").is_none() && data("final-server-config").is_none()
+    });
+    daemon.ok(&["delete", "gameserver/one"]);
+    wait_for("the server's settings to go", || data("one-config").is_none());
+}

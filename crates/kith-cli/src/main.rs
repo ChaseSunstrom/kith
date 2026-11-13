@@ -131,6 +131,11 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         tail: u64,
     },
+    /// Controllers: WebAssembly modules kithd runs for a kind of your own
+    Controller {
+        #[command(subcommand)]
+        command: ControllerCommand,
+    },
     /// Work on a package: a directory of resource templates and default values
     Package {
         #[command(subcommand)]
@@ -146,6 +151,35 @@ enum Command {
         #[command(subcommand)]
         command: import::Import,
     },
+}
+
+#[derive(Subcommand)]
+enum ControllerCommand {
+    /// Put WebAssembly modules in a kind's KindDefinition: its controller, its admission hook
+    Set {
+        /// The kind, as its KindDefinition names it
+        kind: String,
+        /// The module kithd runs for each resource of the kind (`kith_reconcile`)
+        #[arg(long, value_name = "FILE")]
+        controller: Option<PathBuf>,
+        /// The module kithd asks before a resource of the kind is written (`kith_admit`)
+        #[arg(long, value_name = "FILE")]
+        admission: Option<PathBuf>,
+    },
+}
+
+/// Bytes as base64, the way a KindDefinition carries a module.
+fn base64(bytes: &[u8]) -> String {
+    const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut text = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for three in bytes.chunks(3) {
+        let bits = three.iter().fold(0u32, |bits, byte| bits << 8 | u32::from(*byte)) << (8 * (3 - three.len()));
+        for place in 0..4 {
+            let letter = LETTERS[(bits >> (18 - 6 * place) & 63) as usize] as char;
+            text.push(if place <= three.len() { letter } else { '=' });
+        }
+    }
+    text
 }
 
 #[derive(Subcommand)]
@@ -704,6 +738,43 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 "Identity/{name} can call the API with {out}/{name}.crt and {out}/{name}.key (nodes show {out}/ca.crt, as `kith`)"
             );
             println!("It may do what Roles bound to it allow: nothing, until a RoleBinding names it.");
+        }
+        Command::Controller {
+            command:
+                ControllerCommand::Set {
+                    kind,
+                    controller,
+                    admission,
+                },
+        } => {
+            if controller.is_none() && admission.is_none() {
+                return fail("give --controller FILE, --admission FILE or both");
+            }
+            let backend = backend()?;
+            let definitions = backend.list(Some("KindDefinition"))?;
+            let named = |definition: &Resource| {
+                definition.spec["kind"]
+                    .as_str()
+                    .is_some_and(|k| k.eq_ignore_ascii_case(&kind))
+            };
+            let Some(mut definition) = definitions.into_iter().find(named) else {
+                return fail(format!("no KindDefinition makes a kind `{kind}`"));
+            };
+            let mut said = Vec::new();
+            for (role, file) in [("controller", controller), ("admission", admission)] {
+                let Some(file) = file else { continue };
+                let module = std::fs::read(&file).map_err(|e| format!("error: reading {}: {e}", file.display()))?;
+                definition.spec[role] = serde_json::json!({ "wasm": base64(&module) });
+                said.push(format!(
+                    "{}: {role} is {} ({} bytes)",
+                    definition.key(),
+                    file.display(),
+                    module.len()
+                ));
+            }
+            definition.status = None;
+            backend.apply(vec![definition], false)?;
+            println!("{}", said.join("\n"));
         }
         Command::Audit { tail } => {
             let Backend::Daemon(kithd) = backend()? else {

@@ -530,8 +530,92 @@ spec: { map: dust, players: 8 }
 - A Source or a package may apply resources of a defined kind; a Source in
   `kith-system` may bring the definition along.
 
-Not yet: several versions of a kind side by side, a schema for `status`,
-rules beyond the schema subset.
+Not yet: several versions of a kind side by side, a schema for `status`.
+
+### Controllers and admission, in WebAssembly
+
+A kind can carry code: a **controller** that says what should exist because
+of each resource of the kind, and an **admission** hook that is asked before
+one is written. Both are WebAssembly modules that kithd runs itself, with no
+container, image or credentials: a function from JSON to JSON that can reach
+nothing else.
+
+```rust
+// sdk/kith-controller/examples/gameserver has all of it
+use kith_controller::{Admit, Reconcile, Reconciled, Value, json};
+
+fn reconcile(input: Reconcile) -> Result<Reconciled, String> {
+    let name = input.resource["metadata"]["name"].as_str().ok_or("no name")?;
+    Ok(Reconciled {
+        status: json!({ "state": "ready" }),
+        resources: vec![json!({
+            "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+            "metadata": { "name": format!("{name}-config") },
+            "spec": { "data": { "map": input.resource["spec"]["map"] } },
+        })],
+    })
+}
+
+fn admit(input: Admit) -> Result<Option<Value>, String> {
+    if input.resource["spec"]["map"] == "lava" {
+        return Err("the map lava is closed".into());   // refused, with this reason
+    }
+    Ok(None)                                           // as it is; Some(resource) changes it
+}
+
+kith_controller::controller!(reconcile);
+kith_controller::admission!(admit);
+```
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown    # a cdylib depending on sdk/kith-controller
+kith controller set GameServer --controller game.wasm --admission game.wasm
+```
+
+`kith controller set` puts the module in the kind's KindDefinition
+(`spec.controller.wasm`, `spec.admission.wasm`, base64), so it is replicated,
+kept in history and rolled back like the rest of the cluster's state.
+
+- **The controller** runs on the node that leads the store, whenever the
+  resource, the module, or something the resource owns changes. It is given
+  `{resource, owned}` and answers `{status, resources}`. The resources are
+  made so in the resource's namespace as its own (annotated
+  `kith.dev/owned-by`), put back if someone changes or removes them, removed
+  when no longer answered, and removed with their owner. It may make anything
+  namespaced except a Release or a Source, including resources of other
+  defined kinds, whose controllers then run in turn.
+- Its `status` fields are recorded on the resource, with `resources` (what it
+  owns) and `controller`: `{state: ok, observedRevision}` or `{state: error,
+  message}`. A run that fails changes nothing and is tried again when
+  something changes.
+- **Admission** is asked about every apply of a resource of the kind through
+  kithd, whoever makes it (`kith apply`, a Source, a Release, a controller),
+  with `{resource, old}`. It may refuse (`refused by GameServer's admission:
+  the map lava is closed`, also on `--dry-run`) or change the spec, labels
+  and annotations; what it makes of the resource is then checked against the
+  schema like any write. A hook that fails refuses the write.
+- **Limits**, each ending that one call with the reason: a module of at most
+  1 MiB, 50 million instructions' worth of fuel, 16 MiB of memory, 1 MiB of
+  input and of answer. A module that imports anything does not start. Each
+  call starts from a fresh instance: nothing is remembered between calls.
+- Whoever may write KindDefinitions may run code in every namespace through
+  them: grant that as you would grant admin.
+
+Things to know: a rollback is asked of admission too (what it refuses does
+not come back; what it would change comes back as it was); a delete is not
+asked. At most four modules run at once, and a controller answers at most 64
+resources. Applying
+a KindDefinition's YAML again without its `controller`/`admission` removes
+them (keep the YAML and the module together, or run `kith controller set`
+after). `kith --store FILE`, which works on a file without kithd, runs
+neither. A module sees one resource and what it owns; a controller that has
+to look further is a Workload using the API.
+
+In another language: export `memory`, `kith_alloc(len: u32) -> ptr`, and
+`kith_reconcile` / `kith_admit` as `(ptr: u32, len: u32) -> u64`: JSON in at
+`ptr`, and the answer's `ptr << 32 | len` out, `{"ok": …}` or `{"error":
+"why"}`.
 
 ## Who may do what
 
@@ -630,6 +714,7 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-packages` | Packages: templates and values rendered into resources |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
+| `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |
 
 ## Development
 
@@ -637,6 +722,7 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 cargo test --workspace
 KITH_E2E=1 cargo test -p kithd -p kith-runtime --test e2e   # pulls an image and runs containers
 cargo clippy --workspace --all-targets -- -D warnings
+rustup target add wasm32-unknown-unknown   # once: without it the WASM end-to-end tests skip themselves
 python3 ci/budgets.py            # binary-size and memory budgets, enforced in CI
 python3 ci/bench.py              # Phase 1 numbers: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```

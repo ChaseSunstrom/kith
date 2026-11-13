@@ -648,6 +648,19 @@ spec! {
         pub schema: serde_json::Value,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub columns: Vec<Column>,
+        /// Run by kithd for each resource of the kind: says what should exist because
+        /// of it, and its status.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub controller: Option<WasmModule>,
+        /// Run by kithd before a resource of the kind is written: lets it be, changes
+        /// it or refuses it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub admission: Option<WasmModule>,
+    }
+
+    pub struct WasmModule {
+        /// The WebAssembly module, base64 (`kith controller set` puts a file here).
+        pub wasm: String,
     }
 
     pub struct Column {
@@ -787,12 +800,26 @@ impl Spec for KindDefinitionSpec {
                 ));
             }
         }
+        for (role, module) in [("controller", &self.controller), ("admission", &self.admission)] {
+            // (kithd reads the module itself when it is applied there; a store file is only asked for the shape.)
+            let base64 = |b: u8| b.is_ascii_alphanumeric() || b"+/=".contains(&b);
+            let text = module.as_ref().map(|module| module.wasm.as_str());
+            if text.is_some_and(|text| text.is_empty() || !text.bytes().all(base64)) {
+                wrong.push(format!("{role}.wasm: must be a WebAssembly module in base64"));
+            }
+            if text.is_some_and(|text| text.len() > WASM_LIMIT.div_ceil(3) * 4) {
+                wrong.push(format!("{role}.wasm: a module is {WASM_LIMIT} bytes at most"));
+            }
+        }
         match wrong.is_empty() {
             true => Ok(()),
             false => Err(wrong.join("; ")),
         }
     }
 }
+
+/// The largest WebAssembly module a `KindDefinition` carries, in bytes.
+pub const WASM_LIMIT: usize = 1 << 20;
 
 fn exactly_one(at: &str, options: &[(&str, bool)]) -> Result<(), String> {
     if options.iter().filter(|(_, set)| *set).count() == 1 {

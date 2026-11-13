@@ -230,6 +230,8 @@ async fn apply(
         return Err(ApiError::Store(Error::Invalid(why)));
     }
     if options.dry_run {
+        // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
+        let resources = shared.admitted(resources).await.map_err(ApiError::Store)?;
         return read(&shared, |store| store.clone().apply_all(resources));
     }
     let at = kith_api::store::now();

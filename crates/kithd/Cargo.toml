@@ -32,9 +32,16 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 ring = "0.17"
 # (In the tree already.) ACME speaks base64url.
 base64 = "0.22"
+# Controllers and admission hooks (PLAN 4.10): an interpreter, about 0.9 MB. (wasmtime, which
+# the plan names, is several MB and compiles to machine code; these modules are small.)
+# portable-dispatch: a loop, not tail calls the compiler has to turn into jumps: without that
+# guarantee (a debug build) the other way overflows the stack of whoever runs a module.
+wasmi = { version = "2", default-features = false, features = ["std", "validate", "portable-dispatch"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+# Test modules are written as text.
+wat = "1"
 
 [lints]
 workspace = true
