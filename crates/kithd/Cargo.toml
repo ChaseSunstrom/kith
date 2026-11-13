@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The same as kith-runtime pulls images with.
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 semver = "1"
 kith-yaml.workspace = true
 kith-packages = { path = "../kith-packages" }

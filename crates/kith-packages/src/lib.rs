@@ -18,6 +18,8 @@
 // from (Repository). The schema check knows the keywords in `KEYWORDS`, and says so
 // about any other; the jsonschema crate if packages come to need more.
 
+pub mod artifact;
+
 use kith_api::Resource;
 use kith_api::kinds::PackageRef;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
@@ -271,6 +273,14 @@ impl Package {
             return Err(format!(
                 "more than {FILES_LIMIT} files, or more than {PACKAGE_LIMIT} bytes in them"
             ));
+        }
+        // (Paths come from registries too, and are written to disk by `package pull`.)
+        let plain = |path: &str| {
+            let part = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['\\', '\0']);
+            path.split('/').all(part)
+        };
+        if let Some(path) = files.keys().find(|path| !plain(path)) {
+            return Err(format!("{path:?}: not a path inside a package"));
         }
         let all = files.clone();
         let meta = files.remove("package.yaml").ok_or("no package.yaml")?;

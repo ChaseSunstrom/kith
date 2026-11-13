@@ -17,6 +17,7 @@ mod mesh;
 mod pki;
 mod probe;
 mod raft;
+mod registry;
 mod releases;
 mod sched;
 mod services;
@@ -64,6 +65,9 @@ struct Args {
     /// Seconds a node may be out of contact before what it runs is started on other nodes
     #[arg(long, env = "KITH_LOST_AFTER", value_name = "SECONDS", default_value_t = 300)]
     lost_after: u64,
+    /// Seconds between asking registries for newer packages (for Releases that name a Repository)
+    #[arg(long, env = "KITH_REPOSITORY_POLL", value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    repository_poll: u64,
     /// Join the cluster's WireGuard mesh, on this UDP port (needs CAP_NET_ADMIN)
     #[arg(long, env = "KITH_MESH", value_name = "PORT", num_args = 0..=1, default_missing_value = "51820")]
     mesh: Option<u16>,
@@ -393,10 +397,10 @@ fn run(args: Args) -> Result<(), String> {
         };
         let work = async {
             let releases = releases::run(shared.clone(), stopping.clone());
-            tokio::join!(
-                controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()),
-                releases
-            );
+            let poll = std::time::Duration::from_secs(args.repository_poll);
+            let repositories = registry::run(shared.clone(), poll, stopping.clone());
+            let units = controller::run(shared.clone(), runtime, args.log_cap, stopping.clone());
+            tokio::join!(units, releases, repositories);
         };
         let names = async {
             if let Some(sockets) = names {

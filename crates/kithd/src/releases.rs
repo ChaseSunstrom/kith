@@ -30,6 +30,21 @@ pub const OWNER: &str = "kith.dev/owned-by";
 /// What no package gets to make, besides anything that is in no namespace (nodes,
 /// packages, repositories): what installs things.
 const KEPT: [&str; 2] = ["Release", "Source"];
+/// The annotation on a Package fetched from a Repository: the Repository's name. A
+/// Release that names a Repository installs only those, and one that names none only
+/// what was pushed here.
+pub const REPOSITORY: &str = "kith.dev/repository";
+/// What a Package fetched from the Repository `name` is annotated with: the name, and
+/// a print of where the Repository points and the key it checks with, so that what
+/// was fetched under another key or from elsewhere is no longer taken for its.
+pub fn origin(store: &Store, name: &str) -> Option<String> {
+    let repository = store.get(&format!("Repository/{name}"))?;
+    let about = format!("{}\n{}", repository.spec["url"], repository.spec["publicKey"]);
+    let print = ring::digest::digest(&ring::digest::SHA256, about.as_bytes());
+    let print: String = print.as_ref()[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("{name}@{print}"))
+}
+
 /// The ConfigMap (in `kith-system`, in a namespace) whose `values` releases are given.
 const SHARED: &str = "kith-values";
 
@@ -89,24 +104,51 @@ fn namespace(resource: &Resource) -> String {
     resource.key().split('/').nth(1).unwrap_or_default().to_string()
 }
 
-/// The Package a release asks for: that version, or the newest there is (a version
-/// that is no semver is older than any that is; `1.0.0-rc1` is older than `1.0.0`).
-fn package<'a>(store: &'a Store, spec: &ReleaseSpec) -> Result<&'a Resource, String> {
-    let name = &spec.package.name;
-    let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
-    let found = match &spec.package.version {
-        Some(version) => store.get(&format!("Package/{name}-{version}")),
-        None => {
-            let named = |package: &&Resource| package.metadata.name == format!("{name}-{}", version(package));
-            let packages = store.list(Some("Package")).filter(named);
-            packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
-        }
+/// Does `version` fit what a Release asks for? One version asked for is that one; a
+/// range (`^1.2`, `>=1, <3`, `*`) is any in it; nothing asked for is any that is not a
+/// pre-release.
+pub fn fits(asked: Option<&str>, version: &str) -> bool {
+    let asked = asked.unwrap_or("*");
+    let Ok(version) = semver::Version::parse(version) else {
+        return asked == version;
     };
-    let wanted = spec.package.version.as_deref();
-    let wanted = wanted.map_or(String::new(), |version| format!("-{version}"));
-    found.ok_or(format!(
-        "there is no Package {name}{wanted}: `kith package push` puts one here"
-    ))
+    match semver::Version::parse(asked) {
+        Ok(exactly) => exactly == version,
+        Err(_) => semver::VersionReq::parse(asked).is_ok_and(|range| range.matches(&version)),
+    }
+}
+
+/// The Package a release is on: of those that fit what it asks for (and came from the
+/// Repository it names, if it names one), the one it has installed, or the newest when
+/// it has none or follows the newest (`autoUpgrade`). `1.0.0-rc1` is older than `1.0.0`.
+fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec) -> Result<&'a Resource, String> {
+    let (name, asked) = (&spec.package.name, spec.package.version.as_deref());
+    let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
+    let from = spec
+        .package
+        .repo
+        .as_ref()
+        .map(|repo| origin(store, repo).unwrap_or_default());
+    let fitting = |package: &&Resource| {
+        package.metadata.name == format!("{name}-{}", version(package))
+            && package.metadata.annotations.get(REPOSITORY) == from.as_ref()
+            && fits(asked, &version(package))
+    };
+    let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
+    let kept = installed.filter(|_| spec.auto_upgrade != Some(true));
+    let kept = kept.and_then(|installed| store.get(&format!("Package/{name}-{installed}")));
+    let newest = || {
+        let packages = store.list(Some("Package")).filter(fitting);
+        packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
+    };
+    let wanted = asked.map_or(String::new(), |version| format!(" {version}"));
+    kept.filter(fitting).or_else(newest).ok_or(match &spec.package.repo {
+        None => format!("there is no Package {name}{wanted}: `kith package push` puts one here"),
+        Some(repo) if store.get(&format!("Repository/{repo}")).is_none() => format!("there is no Repository/{repo}"),
+        Some(repo) => format!(
+            "there is no Package {name}{wanted} from Repository/{repo} (yet): its status says if it cannot be asked"
+        ),
+    })
 }
 
 /// The `values` of the ConfigMap `key`, if there is one: its stamp too.
@@ -133,7 +175,7 @@ fn shared_values(store: &Store, key: &str) -> Result<(Stamp, Option<Value>), Str
 /// every change to the store.)
 fn inputs<'a>(store: &'a Store, release: &Resource) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
-    let package = package(store, &spec)?;
+    let package = package(store, release, &spec)?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -223,6 +265,12 @@ fn owner(resource: &Resource) -> Option<&str> {
 /// not there (nor comes with it): it would be deleted as that Release's leftovers.
 pub fn claims(store: &Store, resources: &[Resource]) -> Result<(), String> {
     for resource in resources {
+        if resource.metadata.annotations.contains_key(REPOSITORY) {
+            let key = resource.key();
+            return Err(format!(
+                "{key} is annotated {REPOSITORY}, which says kithd fetched and checked it: apply it without"
+            ));
+        }
         let coming = |owner: &str| {
             resources
                 .iter()
@@ -450,7 +498,7 @@ mod tests {
                        {% if values.extra %}---\napiVersion: kith.dev/v1\nkind: ConfigMap\n\
                        metadata: { name: {{ name }}-extra }\nspec: { data: { a: b } }\n{% endif %}";
     const RELEASE: &str = "apiVersion: kith.dev/v1\nkind: Release\nmetadata: { name: mine, namespace: shop }\n\
-                           spec: { package: { name: maps }, values: { extra: true } }\n";
+                           spec: { package: { name: maps }, autoUpgrade: true, values: { extra: true } }\n";
 
     /// Render what is pending and carry the plan out, until there is nothing to do.
     fn settle(store: &mut Store, renders: &mut Renders) -> usize {
@@ -692,5 +740,50 @@ mod tests {
         assert!(refused.contains("there is no Release/shop/mine"), "{refused}");
         let release = Resource::from_source(RELEASE).unwrap().remove(0).unwrap();
         assert_eq!(claims(&store, &[copy, release]), Ok(()));
+    }
+
+    #[test]
+    fn a_release_stays_on_its_version_unless_it_follows() {
+        assert!(fits(None, "1.0.0") && !fits(None, "1.0.0-rc1") && fits(Some("1.0.0-rc1"), "1.0.0-rc1"));
+        assert!(
+            fits(Some("1.2.0"), "1.2.0") && !fits(Some("1.2.0"), "1.2.1"),
+            "one version is that one"
+        );
+        assert!(fits(Some("^1.2"), "1.9.0") && !fits(Some("^1.2"), "2.0.0") && fits(Some(">=1, <3"), "2.5.0"));
+        assert!(!fits(Some("nonsense"), "1.0.0") && fits(Some("nightly"), "nightly"));
+
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        let version =
+            |store: &Store| store.get("Release/shop/mine").unwrap().status.clone().unwrap()["version"].clone();
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        let pinned = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        apply(&mut store, &pinned.replace("name: maps }", "name: maps, version: ^1 }"));
+        settle(&mut store, &mut renders);
+        // Newer ones come: it stays; told to follow, it goes to the newest in its range.
+        store.apply(package("1.5.0", &[("map.yaml", MAP)])).unwrap();
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "1.0.0");
+        apply(
+            &mut store,
+            &RELEASE.replace("name: maps }", "name: maps, version: ^1 }"),
+        );
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "1.5.0");
+        // A range the installed one is outside of moves it, following or not.
+        apply(
+            &mut store,
+            &pinned.replace("name: maps }", "name: maps, version: '>=2' }"),
+        );
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "2.0.0");
+        // What was pushed here is not what a Repository supplied.
+        apply(&mut store, &pinned.replace("name: maps }", "name: maps, repo: ours }"));
+        settle(&mut store, &mut renders);
+        let status = store.get("Release/shop/mine").unwrap().status.clone().unwrap();
+        assert_eq!(
+            (&status["state"], &status["message"]),
+            (&json!("error"), &json!("there is no Repository/ours"))
+        );
     }
 }

@@ -150,11 +150,33 @@ enum PackageCommand {
         /// The package's directory
         dir: PathBuf,
     },
-    /// Put a package in the cluster, as the Package `NAME-VERSION`, for Releases to install
+    /// Put a package in the cluster, as the Package `NAME-VERSION`, for Releases to
+    /// install; or, with --to, in a registry
     Push {
         /// The package's directory
         dir: PathBuf,
+        /// The repository to put it in instead: `oci://HOST/PATH`
+        #[arg(long, value_name = "URL")]
+        to: Option<String>,
+        /// Sign it with this key (from `kith package keygen`)
+        #[arg(long, value_name = "FILE", requires = "to")]
+        key: Option<PathBuf>,
     },
+    /// Fetch a package from a registry into a directory
+    Pull {
+        /// The repository: `oci://HOST/PATH`
+        from: String,
+        name: String,
+        version: String,
+        /// The public key it must be signed with [default: taken unsigned or signed by anyone]
+        #[arg(long, value_name = "HEX")]
+        public_key: Option<String>,
+        /// Where to put it [default: NAME-VERSION]
+        #[arg(short, long, value_name = "DIR")]
+        output: Option<PathBuf>,
+    },
+    /// Make a key to sign packages with: the secret into FILE, the public key printed
+    Keygen { file: PathBuf },
 }
 
 /// `a.b=1` as values: `{a: {b: 1}}`. The value is read as YAML, and is text if it is none.
@@ -267,6 +289,19 @@ impl Backend {
                 let query = if dry_run { "?dryRun=true" } else { "" };
                 request(socket, "POST", &format!("/v1/apply{query}"), &body)
             }
+        }
+    }
+
+    /// Have kithd do something with a registry: `kith` itself speaks to none.
+    fn registry<T: serde::de::DeserializeOwned>(&self, verb: &str, asked: &serde_json::Value) -> Result<T, String> {
+        match self {
+            Backend::Local(_) => fail("a registry is reached through kithd: not with --store"),
+            Backend::Daemon(socket) => request(
+                socket,
+                "POST",
+                &format!("/v1/packages/{verb}"),
+                asked.to_string().as_bytes(),
+            ),
         }
     }
 
@@ -639,12 +674,27 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             println!("{} {} ok", package.meta.name, package.meta.version);
         }
         Command::Package {
-            command: PackageCommand::Push { dir },
+            command: PackageCommand::Push { dir, to, key },
         } => {
             let package = kith_packages::Package::load(&dir).or_else(fail)?;
             let wrong = package.lint();
             if !wrong.is_empty() {
                 return fail(wrong.join("\n"));
+            }
+            if let Some(to) = to {
+                let signature = match key {
+                    None => None,
+                    Some(key) => {
+                        let secret =
+                            std::fs::read_to_string(&key).or_else(|e| fail(format!("{}: {e}", key.display())))?;
+                        Some(package.sign(&secret).or_else(fail)?)
+                    }
+                };
+                let asked = serde_json::json!({ "to": to, "files": package.files, "signature": signature });
+                let pushed: String = backend()?.registry("push", &asked)?;
+                let signed = if signature.is_some() { "signed" } else { "not signed" };
+                println!("{pushed} pushed ({signed})");
+                return Ok(ExitCode::SUCCESS);
             }
             for change in backend()?.apply(vec![package.resource().or_else(fail)?], false)? {
                 let what = match change.action {
@@ -654,6 +704,60 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 };
                 println!("{} {what}", change.after.key());
             }
+        }
+        Command::Package {
+            command:
+                PackageCommand::Pull {
+                    from,
+                    name,
+                    version,
+                    public_key,
+                    output,
+                },
+        } => {
+            let asked = serde_json::json!({ "from": from, "name": name, "version": version, "publicKey": public_key });
+            let files: std::collections::BTreeMap<String, String> = backend()?.registry("pull", &asked)?;
+            // (Checked here too: what is written is what this kith takes for a package.)
+            let package = kith_packages::Package::from_files(files).or_else(fail)?;
+            let dir = output.unwrap_or_else(|| PathBuf::from(format!("{name}-{version}")));
+            let wrote = |path: &std::path::Path, done: std::io::Result<()>| {
+                done.or_else(|e| fail(format!("{}: {e}", path.display())))
+            };
+            // (Never into a directory that is there: nothing of anyone's is written over.)
+            wrote(&dir, std::fs::create_dir(&dir))?;
+            for (path, text) in &package.files {
+                let path = dir.join(path);
+                let parent = path.parent().unwrap_or(&dir);
+                wrote(parent, std::fs::create_dir_all(parent))?;
+                wrote(&path, std::fs::write(&path, text))?;
+            }
+            let checked = if public_key.is_some() {
+                "signature checked"
+            } else {
+                "signature not checked"
+            };
+            println!(
+                "{} {} in {} ({checked})",
+                package.meta.name,
+                package.meta.version,
+                dir.display()
+            );
+        }
+        Command::Package {
+            command: PackageCommand::Keygen { file },
+        } => {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let (secret, public) = kith_packages::artifact::keygen().or_else(fail)?;
+            // (A new file only its owner reads: a key is not written over, nor left open.)
+            let made = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&file);
+            let written = made.and_then(|mut made| writeln!(made, "{secret}"));
+            written.or_else(|e| fail(format!("{}: {e}", file.display())))?;
+            println!("{public}");
         }
         Command::Schema { kind: None } => {
             let rows = KINDS

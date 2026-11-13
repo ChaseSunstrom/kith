@@ -46,6 +46,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/history/{*key}", get(history))
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
+        .route("/v1/packages/push", post(push))
+        .route("/v1/packages/pull", post(pull))
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(shared)
@@ -332,4 +334,47 @@ mod tests {
         assert_eq!(chunk(None, None), ("a".into(), 1));
         std::fs::remove_file(&path).unwrap();
     }
+}
+
+#[derive(Deserialize)]
+struct Push {
+    /// The repository: `oci://HOST/PATH`.
+    to: String,
+    files: std::collections::BTreeMap<String, String>,
+    signature: Option<String>,
+}
+
+/// Put a package in a registry, from here: kithd has what it takes to talk to one, and
+/// `kith` does not. The signature is made by whoever asks; no key comes here.
+async fn push(Json(asked): Json<Push>) -> Reply<String> {
+    let invalid = |e| ApiError(Error::Invalid(e));
+    let package = kith_packages::Package::from_files(asked.files).map_err(invalid)?;
+    let pushed = crate::registry::push(&asked.to, &package, asked.signature).await;
+    pushed.map(Json).map_err(|e| ApiError(Error::Io(e)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Pull {
+    from: String,
+    name: String,
+    version: String,
+    /// The key the package must be signed with; none: it is taken as it comes.
+    public_key: Option<String>,
+}
+
+/// A package's files from a registry, its signature checked when a key is given.
+async fn pull(Json(asked): Json<Pull>) -> Reply<std::collections::BTreeMap<String, String>> {
+    let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version).await;
+    let (blob, signature) = fetched.map_err(|e| ApiError(Error::Io(e)))?;
+    let package = crate::registry::checked(
+        &blob,
+        signature.as_deref(),
+        asked.public_key.as_deref(),
+        &asked.name,
+        &asked.version,
+    );
+    package
+        .map(|package| Json(package.files))
+        .map_err(|e| ApiError(Error::Invalid(e)))
 }

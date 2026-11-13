@@ -13,5 +13,8 @@ serde_json.workspace = true
 # The templates' language (PLAN.md §4.8). `fuel` stops a template that would never end.
 minijinja = { version = "3", default-features = false, features = ["builtins", "macros", "multi_template", "serde", "json", "fuel"] }
 
+# Signatures on packages: Ed25519 and SHA-256, and nothing else of it.
+ring = "0.17"
+
 [lints]
 workspace = true
