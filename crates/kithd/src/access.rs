@@ -118,6 +118,63 @@ const FOR_IDENTITIES: [&str; 14] = [
     "/v1/diff",
 ];
 
+/// The public key (DER) of the certificate a request came with, for an Identity: a watch
+/// asks again whether it still stands for the Identity once its wait is over.
+#[derive(Clone)]
+pub struct Certificate(pub Vec<u8>);
+
+/// Does the key `der` still stand for the Identity `name`? Its `publicKey` may have been
+/// given another, or the Identity deleted, since the certificate was shown.
+pub fn stands(shared: &Shared, name: &str, der: &[u8]) -> bool {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    let pinned = state.store.get(&format!("Identity/{name}"));
+    let pinned = pinned.and_then(|identity| identity.spec["publicKey"].as_str());
+    pinned.is_some_and(|pem| pki::same_key(pem, der))
+}
+
+/// Who a request on the TLS port is from, or why it is refused (and with what status). A
+/// certificate that does not stand for an Identity, or none, is refused and written down.
+pub fn who(
+    shared: &Shared,
+    subject: Option<&pki::Subject>,
+    method: &str,
+    path: &str,
+) -> Result<Caller, (StatusCode, String)> {
+    let (name, key) = match subject {
+        Some(pki::Subject::Node(node)) => return Ok(Caller::Node(node.clone())),
+        Some(pki::Subject::User(name, key)) => (name, key),
+        None => {
+            let why = "a certificate from this cluster's CA is needed".to_string();
+            shared
+                .audit
+                .record(&"no certificate", method, vec![path.into()], Err(why.clone()));
+            return Err((StatusCode::UNAUTHORIZED, why));
+        }
+    };
+    let caller = Caller::Identity(name.clone());
+    if !stands(shared, name, key) {
+        let why = format!(
+            "this certificate does not stand for an Identity {name}: there is none, or it has been given another"
+        );
+        shared
+            .audit
+            .record(&caller, method, vec![path.into()], Err(why.clone()));
+        return Err((StatusCode::UNAUTHORIZED, why));
+    }
+    let open = |route: &&str| {
+        let rest = path.strip_prefix(route);
+        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    if !FOR_IDENTITIES.iter().any(open) {
+        let why = format!("{path} is for the cluster's nodes, not for an Identity");
+        shared
+            .audit
+            .record(&caller, method, vec![path.into()], Err(why.clone()));
+        return Err((StatusCode::FORBIDDEN, why));
+    }
+    Ok(caller)
+}
+
 /// Works out the [`Caller`] of a request on the TLS port, for the handlers.
 pub async fn caller(
     State(shared): State<Arc<Shared>>,
@@ -125,41 +182,19 @@ pub async fn caller(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let caller = match peer.subject {
-        Some(pki::Subject::Node(node)) => Caller::Node(node),
-        Some(pki::Subject::User(name, key)) => {
-            let stands = {
-                let state = shared.store.lock().expect("a handler panicked holding the store");
-                let pinned = state.store.get(&format!("Identity/{name}"));
-                let pinned = pinned.and_then(|identity| identity.spec["publicKey"].as_str());
-                pinned.is_some_and(|pem| pki::same_key(pem, &key))
-            };
-            if !stands {
-                let why = format!(
-                    "this certificate does not stand for an Identity {name}: there is none, or it has been given another"
-                );
-                return refuse(StatusCode::UNAUTHORIZED, why).into_response();
-            }
-            let caller = Caller::Identity(name);
-            let path = request.uri().path();
-            let open = |route: &&str| {
-                let rest = path.strip_prefix(route);
-                rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-            };
-            if !FOR_IDENTITIES.iter().any(open) {
-                let why = format!("{path} is for the cluster's nodes, not for an Identity");
-                shared
-                    .audit
-                    .record(&caller, request.method().as_str(), vec![path.into()], Err(why.clone()));
-                return refuse(StatusCode::FORBIDDEN, why).into_response();
-            }
-            caller
-        }
-        None => {
-            let why = "a certificate from this cluster's CA is needed";
-            return refuse(StatusCode::UNAUTHORIZED, why).into_response();
-        }
+    let caller = who(
+        &shared,
+        peer.subject.as_ref(),
+        request.method().as_str(),
+        request.uri().path(),
+    );
+    let caller = match caller {
+        Ok(caller) => caller,
+        Err((status, why)) => return refuse(status, why).into_response(),
     };
+    if let Some(pki::Subject::User(_, key)) = &peer.subject {
+        request.extensions_mut().insert(Certificate(key.clone()));
+    }
     request.extensions_mut().insert(caller);
     next.run(request).await
 }
@@ -168,6 +203,29 @@ pub async fn caller(
 mod tests {
     use super::*;
     use kith_api::Resource;
+
+    /// A refused certificate is written down, with who showed it and what for: a 401 is no
+    /// less a refusal than a 403.
+    #[tokio::test]
+    async fn refused_certificates_are_audited() {
+        let dir = std::env::temp_dir().join(format!("kithd-401-audited-{}", std::process::id()));
+        let shared = crate::replica(None, &dir).await.unwrap();
+        let other = pki::Subject::User("alice".into(), vec![1, 2, 3]);
+        let (status, _) = who(&shared, Some(&other), "POST", "/v1/apply").unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = who(&shared, None, "GET", "/v1/watch").unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let entries = shared.audit.tail(10).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["who"], "alice");
+        assert_eq!(
+            (&entries[0]["verb"], &entries[0]["ok"]),
+            (&"POST".into(), &false.into())
+        );
+        assert_eq!(entries[0]["what"][0], "/v1/apply");
+        assert_eq!(entries[1]["who"], "no certificate");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn store(yaml: &str) -> Store {
         let mut store = Store::default();

@@ -634,6 +634,9 @@ fn custom_kind_definitions_are_checked() {
     let wrong = |from: &str, to: &str| err(&GAME.replace(from, to)).2;
     assert!(wrong("kind: GameServer", "kind: Workload").contains("one of kith's own kinds"));
     assert!(wrong("kind: GameServer", "kind: game_server").contains("invalid kind"));
+    // `Audit` is the role resource that reads the audit log: no definition takes it, in any case.
+    assert!(wrong("kind: GameServer", "kind: Audit").contains("reserved"));
+    assert!(wrong("kind: GameServer", "kind: AUDIT").contains("reserved"));
     assert!(wrong("games.example.com", "kith.dev").contains("not kith.dev"));
     assert!(wrong("games.example.com", "games").contains("domain name"));
     assert!(wrong("version: v1", "version: one").contains("like v1 or v1beta1"));

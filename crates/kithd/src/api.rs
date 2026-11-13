@@ -30,7 +30,7 @@
 //! with the new generation. Without `after` it replies at once.
 
 use crate::Shared;
-use crate::access::{Caller, Grants};
+use crate::access::{self, Caller, Certificate, Grants};
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -76,12 +76,15 @@ pub enum ApiError {
     Store(Error),
     /// The caller may not: why.
     Refused(String),
+    /// The certificate no longer stands for its Identity: why.
+    Unauthorized(String),
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, why) = match self {
             ApiError::Refused(why) => (StatusCode::FORBIDDEN, why),
+            ApiError::Unauthorized(why) => (StatusCode::UNAUTHORIZED, why),
             ApiError::Store(e) => {
                 let status = match e {
                     Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
@@ -324,6 +327,7 @@ struct WatchOptions {
 async fn watch(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
+    certificate: Option<Extension<Certificate>>,
     Query(options): Query<WatchOptions>,
 ) -> Reply<serde_json::Value> {
     let kind = options.kind.as_deref();
@@ -337,6 +341,17 @@ async fn watch(
             _ = stop.wait_for(|stop| *stop) => {}
             () = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
         }
+    }
+    // The wait may have been long: an Identity deleted, or given another key, meanwhile is
+    // told no more, and that is written down.
+    if let (Caller::Identity(name), Some(Extension(Certificate(der)))) = (&caller, &certificate)
+        && !access::stands(&shared, name, der)
+    {
+        let why = format!("this certificate does not stand for an Identity {name} any more");
+        shared
+            .audit
+            .record(&caller, "watch", vec![format!("Identity/{name}")], Err(why.clone()));
+        return Err(ApiError::Unauthorized(why));
     }
     read(&shared, |store| {
         Ok(serde_json::json!({
@@ -551,7 +566,113 @@ pub(crate) fn log_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::pem::PemObject;
     use std::time::Duration;
+
+    /// A watch ends (401) once its Identity is deleted or given another key while it waits,
+    /// and what it ended for is written down.
+    #[tokio::test]
+    async fn a_watch_ends_when_its_identity_no_longer_stands() {
+        let dir = std::env::temp_dir().join(format!("kithd-watch-identity-{}", std::process::id()));
+        let shared = crate::replica(None, &dir).await.unwrap();
+        let ca = crate::pki::Ca::create().unwrap();
+        let (_, _, public) = ca.issue_user("alice").unwrap();
+        let (_, _, given) = ca.issue_user("alice").unwrap();
+        let key = |pem: &str| {
+            let spki = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes());
+            spki.unwrap().as_ref().to_vec()
+        };
+        let identity = |pem: &str| -> kith_api::Resource {
+            let new = serde_json::json!({
+                "apiVersion": kith_api::API_VERSION, "kind": "Identity",
+                "metadata": {"name": "alice"}, "spec": {"publicKey": pem},
+            });
+            serde_json::from_value(new).unwrap()
+        };
+        let reader = "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: reader}
+spec:
+  rules:
+    - {kinds: ['*'], verbs: [get, list, watch]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: alice-reader}
+spec: {role: reader, subjects: [alice]}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(reader).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+            state.store.apply(identity(&public)).unwrap();
+        }
+        let outcome = |reply: Reply<serde_json::Value>| match reply {
+            Ok(_) => "ok".to_string(),
+            Err(ApiError::Unauthorized(_)) => "unauthorized".to_string(),
+            Err(ApiError::Refused(why)) => format!("refused: {why}"),
+            Err(ApiError::Store(e)) => format!("store: {e}"),
+        };
+        let watch_as_alice = |shared: &Arc<Shared>, der: &[u8]| {
+            let after = *shared.generation.borrow() + 1;
+            let options = WatchOptions {
+                after: Some(after),
+                kind: None,
+                wait: Some(0),
+            };
+            watch(
+                State(shared.clone()),
+                Extension(Caller::Identity("alice".into())),
+                Some(Extension(Certificate(der.to_vec()))),
+                Query(options),
+            )
+        };
+        assert!(watch_as_alice(&shared, &key(&public)).await.is_ok());
+
+        // Given another key: the certificate it showed no longer stands.
+        shared.store.lock().unwrap().store.apply(identity(&given)).unwrap();
+        let ended = watch_as_alice(&shared, &key(&public)).await;
+        assert_eq!(outcome(ended), "unauthorized");
+        assert!(watch_as_alice(&shared, &key(&given)).await.is_ok());
+
+        // Deleted while a watch waits: that watch is told no more once the wait is over. The
+        // watch is polled first, so it has passed the Roles check before the delete runs.
+        let after = *shared.generation.borrow();
+        let options = WatchOptions {
+            after: Some(after),
+            kind: None,
+            wait: Some(30),
+        };
+        let watching = watch(
+            State(shared.clone()),
+            Extension(Caller::Identity("alice".into())),
+            Some(Extension(Certificate(key(&given)))),
+            Query(options),
+        );
+        let deleting = async {
+            shared.store.lock().unwrap().store.delete("Identity/alice").unwrap();
+            shared.generation.send_modify(|g| *g += 1);
+        };
+        let (ended, ()) = tokio::join!(watching, deleting);
+        assert_eq!(outcome(ended), "unauthorized");
+        // Asked afresh, with no Identity to be bound to, it is refused by the Roles check.
+        let fresh = outcome(watch_as_alice(&shared, &key(&given)).await);
+        assert!(fresh.starts_with("refused"), "{fresh}");
+        let entries = shared.audit.tail(10).unwrap();
+        let refused = entries
+            .iter()
+            .filter(|e| e["who"] == "alice" && e["ok"] == false)
+            .count();
+        assert!(refused >= 2, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e["verb"] == "watch" && e["what"][0] == "Identity/alice")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// With the four turns taken a fifth dry run waits (it is not refused), goes on when one
     /// is given back, and changes nothing in the store.
