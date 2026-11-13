@@ -235,7 +235,8 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     let callers = axum::middleware::from_fn_with_state(shared.clone(), crate::access::caller);
     let api = api::router(shared.clone()).layer(callers);
     let members = crate::raft::router(shared).merge(ping);
-    open.merge(api)
+    open.merge(crate::ui::pages())
+        .merge(api)
         .merge(members.layer(axum::middleware::from_fn(members_only)))
 }
 

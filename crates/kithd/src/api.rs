@@ -56,6 +56,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))
+        .merge(crate::ui::router())
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(shared)
@@ -85,7 +86,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type Reply<T> = Result<Json<T>, ApiError>;
+pub(crate) type Reply<T> = Result<Json<T>, ApiError>;
 
 /// A command answered with another command's kind of reply: a bug, said as an error.
 fn odd() -> ApiError {
@@ -207,12 +208,49 @@ struct ApplyOptions {
     dry_run: bool,
 }
 
+/// What applying `resources` would do, if `caller` may: a dry run.
+pub(crate) async fn plan(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    resources: Vec<Resource>,
+) -> Result<Vec<Change>, ApiError> {
+    permit(shared, caller, Verb::Apply, |store| {
+        let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
+        resources.iter().map(target).collect()
+    })?;
+    let claimed = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::releases::claims(&state.store, &resources)
+    };
+    claimed.map_err(|why| ApiError::Store(Error::Invalid(why)))?;
+    // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
+    let resources = shared.admitted(resources).await.map_err(ApiError::Store)?;
+    read(shared, |store| store.clone().apply_all(resources)).map(|Json(changes)| veiled(shared, caller, changes))
+}
+
+/// `changes` as `caller` may know them: what a resource was before is for those who may
+/// `get` it (one who may only apply is told what happened, not what was there).
+fn veiled(shared: &Shared, caller: &Caller, mut changes: Vec<Change>) -> Vec<Change> {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    let grants = Grants::of(caller, &state.store);
+    for change in &mut changes {
+        let (kind, namespace) = place_of(&change.after.key());
+        if !grants.may(&Verb::Get, &kind, namespace.as_deref()) {
+            change.before = None;
+        }
+    }
+    changes
+}
+
 async fn apply(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
     Query(options): Query<ApplyOptions>,
     Json(resources): Json<Vec<Resource>>,
 ) -> Reply<Vec<Change>> {
+    if options.dry_run {
+        return plan(&shared, &caller, resources).await.map(Json);
+    }
     // Each resource of the body is asked about: one that is not allowed refuses them all.
     permit(&shared, &caller, Verb::Apply, |store| {
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
@@ -224,19 +262,12 @@ async fn apply(
         crate::releases::claims(&state.store, &resources)
     };
     if let Err(why) = claimed {
-        if !options.dry_run {
-            shared.audit.record(&caller, "apply", keys, Err(why.clone()));
-        }
+        shared.audit.record(&caller, "apply", keys, Err(why.clone()));
         return Err(ApiError::Store(Error::Invalid(why)));
-    }
-    if options.dry_run {
-        // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
-        let resources = shared.admitted(resources).await.map_err(ApiError::Store)?;
-        return read(&shared, |store| store.clone().apply_all(resources));
     }
     let at = kith_api::store::now();
     match change(&shared, &caller, "apply", keys, Command::Apply { resources, at }).await? {
-        Done::Changes(changes) => Ok(Json(changes)),
+        Done::Changes(changes) => Ok(Json(veiled(&shared, &caller, changes))),
         _ => Err(odd()),
     }
 }

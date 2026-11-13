@@ -101,7 +101,7 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 8] = [
+const FOR_IDENTITIES: [&str; 11] = [
     "/v1/apply",
     "/v1/watch",
     "/v1/resources",
@@ -110,6 +110,9 @@ const FOR_IDENTITIES: [&str; 8] = [
     "/v1/logs",
     "/v1/packages",
     "/v1/audit",
+    "/v1/schemas",
+    "/v1/convert",
+    "/v1/diff",
 ];
 
 /// Works out the [`Caller`] of a request on the TLS port, for the handlers.

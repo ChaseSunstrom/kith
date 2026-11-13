@@ -1900,3 +1900,215 @@ fn wasm_controller_makes_what_its_resource_needs() {
     daemon.ok(&["delete", "gameserver/one"]);
     wait_for("the server's settings to go", || data("one-config").is_none());
 }
+
+/// curl, for the web UI's tests: (status, headers in lower case, body).
+fn fetch(args: &[&str]) -> (u16, String, String) {
+    let out = Command::new("curl")
+        .args(["-s", "-i", "--max-time", "10"])
+        .args(args)
+        .output()
+        .unwrap();
+    let out = String::from_utf8(out.stdout).unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or_default();
+    let status = head.split(' ').nth(1).and_then(|status| status.parse().ok());
+    (status.unwrap_or(0), head.to_lowercase(), body.to_string())
+}
+
+#[test]
+fn web_ui_is_served_and_asks_as_its_caller() {
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--name", "alpha", "--listen", listen]));
+    let daemon = Daemon::start_with("web_ui", args);
+    daemon.apply(&game_definitions());
+    daemon.apply(&game("GameServer", "one", "{ map: dust }"));
+    let rules = serde_json::json!([
+        { "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": "games" }, "spec": { "rules": [
+            { "kinds": ["GameServer"], "verbs": ["get", "list", "watch", "apply"] },
+            { "kinds": ["ConfigMap"], "verbs": ["apply"] },
+        ] } },
+        { "apiVersion": "kith.dev/v1", "kind": "RoleBinding", "metadata": { "name": "alice-games" },
+          "spec": { "role": "games", "subjects": ["alice"] } },
+    ]);
+    let documents: Vec<String> = rules.as_array().unwrap().iter().map(|r| r.to_string()).collect();
+    daemon.apply(&documents.join("\n---\n"));
+    daemon.ok(&["identity", "cert", "alice", "--out", "."]);
+    let json = |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+
+    // On the TLS port: the page for anyone (it is the same for everyone, and locked down),
+    // what it asks for only for who the certificate says.
+    let resolve = format!("kith:{port}:127.0.0.1");
+    let ca = daemon.dir.join("ca.crt");
+    let tls = |path: &str, certificate: bool, body: Option<&str>| {
+        let url = format!("https://kith:{port}{path}");
+        let (cert, key) = (daemon.dir.join("alice.crt"), daemon.dir.join("alice.key"));
+        let mut args = vec!["--cacert", ca.to_str().unwrap(), "--resolve", &resolve];
+        if certificate {
+            args.extend(["--cert", cert.to_str().unwrap(), "--key", key.to_str().unwrap()]);
+        }
+        if let Some(body) = body {
+            args.extend(["-H", "Content-Type: application/json", "-d", body]);
+        }
+        args.push(&url);
+        fetch(&args)
+    };
+    wait_for("the TLS port to answer", || tls("/v1/ca", false, None).0 == 200);
+    for (file, kind) in [
+        ("", "text/html"),
+        ("app.js", "text/javascript"),
+        ("forms.js", "text/javascript"),
+        ("app.css", "text/css"),
+    ] {
+        let (status, head, body) = tls(&format!("/ui/{file}"), false, None);
+        assert_eq!(status, 200, "/ui/{file}");
+        assert!(head.contains(&format!("content-type: {kind}")), "{head}");
+        assert!(
+            head.contains("content-security-policy: default-src 'none'; script-src 'self';"),
+            "{head}"
+        );
+        assert!(
+            head.contains("x-content-type-options: nosniff") && head.contains("referrer-policy: no-referrer"),
+            "{head}"
+        );
+        assert!(body.len() > 500, "/ui/{file} is {} bytes", body.len());
+    }
+    let (status, head, _) = tls("/ui", false, None);
+    assert!(status == 308 && head.contains("location: ui/"), "{head}");
+    assert_eq!(tls("/ui/Cargo.toml", false, None).0, 404);
+    for path in ["/v1/schemas", "/v1/watch", "/v1/resources"] {
+        assert_eq!(tls(path, false, None).0, 401, "{path} without a certificate");
+    }
+    assert_eq!(tls("/v1/diff", false, Some("[]")).0, 401);
+    assert_eq!(tls("/v1/convert", false, Some("{}")).0, 401);
+
+    // Alice is told who she is and shown the one kind a Role gives her, with its schema.
+    let (status, _, body) = tls("/v1/schemas", true, None);
+    let said = json(&body);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(said["caller"], "alice");
+    let kinds = said["kinds"].as_array().unwrap();
+    assert_eq!(kinds.len(), 2, "{body}");
+    assert_eq!(
+        (&kinds[0]["kind"], &kinds[0]["may"]),
+        (&"ConfigMap".into(), &serde_json::json!(["apply"]))
+    );
+    assert_eq!(kinds[1]["kind"], "GameServer");
+    assert_eq!(kinds[1]["may"], serde_json::json!(["get", "list", "watch", "apply"]));
+    assert_eq!(kinds[1]["schema"]["properties"]["spec"]["required"][0], "map");
+
+    // What the page does before a write: YAML to JSON, then the diff of a dry run, as her.
+    let yaml = game("GameServer", "one", "{ map: ice }");
+    let (status, _, body) = tls(
+        "/v1/convert",
+        true,
+        Some(&serde_json::json!({ "yaml": yaml }).to_string()),
+    );
+    assert_eq!(status, 200, "{body}");
+    let resources = json(&body)["resources"].clone();
+    assert_eq!(resources[0]["spec"]["map"], "ice");
+    let (status, _, body) = tls("/v1/diff", true, Some(&resources.to_string()));
+    let plan = json(&body);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(plan[0]["key"], "GameServer/default/one");
+    assert_eq!(plan[0]["action"], "updated");
+    let diff = plan[0]["diff"].as_str().unwrap();
+    assert!(diff.contains("-  map: dust") && diff.contains("+  map: ice"), "{diff}");
+    // (Nothing was written by asking.)
+    assert_eq!(json_of(&daemon, "gameserver/one").unwrap()["spec"]["map"], "dust");
+    // What is wrong is said as the store says it; what is not hers to change is refused.
+    let bad = serde_json::json!([{ "apiVersion": "games.example.com/v1", "kind": "GameServer",
+        "metadata": { "name": "one" }, "spec": { "map": "dust", "players": 99 } }]);
+    let (status, _, body) = tls("/v1/diff", true, Some(&bad.to_string()));
+    assert!(status == 422 && body.contains("at most 64"), "{status} {body}");
+    let other = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Namespace", "metadata": { "name": "x" }, "spec": {} }]);
+    let (status, _, body) = tls("/v1/diff", true, Some(&other.to_string()));
+    assert!(
+        status == 403 && body.contains("alice may not apply Namespace"),
+        "{status} {body}"
+    );
+    // What she may apply but not get, she is not shown as it was: neither asking nor applying.
+    daemon.apply(
+        "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: kept }\nspec: { data: { word: hush-hush } }\n",
+    );
+    let over = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+        "metadata": { "name": "kept" }, "spec": { "data": { "word": "loud" } } }]);
+    for path in ["/v1/diff", "/v1/apply?dryRun=true", "/v1/apply"] {
+        let (status, _, body) = tls(path, true, Some(&over.to_string()));
+        assert!(
+            status == 200 && body.contains("loud") && !body.contains("hush-hush"),
+            "{path}: {status} {body}"
+        );
+    }
+    // The write itself is `kith apply`'s call, and is in the audit log as hers.
+    let (status, _, body) = tls("/v1/apply", true, Some(&resources.to_string()));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json_of(&daemon, "gameserver/one").unwrap()["spec"]["map"], "ice");
+    let audit = daemon.ok(&["audit", "--tail", "5"]);
+    assert!(
+        audit
+            .lines()
+            .any(|line| line.contains("alice") && line.contains("GameServer/one") && line.ends_with("ok")),
+        "{audit}"
+    );
+
+    // `kith ui`: the same page for a browser on this machine, as its administrator, behind
+    // the address it prints and nothing else.
+    let mut forwarder = Command::new(&daemon.kith)
+        .args(["ui"])
+        .current_dir(&daemon.dir)
+        .env("KITH_SOCKET", daemon.dir.join("kithd.sock"))
+        .env_remove("KITH_STORE")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut address = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(forwarder.stdout.take().unwrap()),
+        &mut address,
+    )
+    .unwrap();
+    let address = address
+        .trim()
+        .strip_suffix("/ui/")
+        .expect("the address of the page")
+        .to_string();
+    let (origin, secret) = address.rsplit_once('/').unwrap();
+    assert!(
+        origin.starts_with("http://127.0.0.1:") && secret.len() == 32,
+        "{address}"
+    );
+    let (status, head, body) = fetch(&[&format!("{address}/ui/")]);
+    assert!(status == 200 && body.contains("<title>kith</title>"), "{status} {head}");
+    assert!(head.contains("content-security-policy"), "{head}");
+    let (status, _, body) = fetch(&[&format!("{address}/v1/schemas")]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json(&body)["caller"], "local socket");
+    assert!(json(&body)["kinds"].as_array().unwrap().len() > 20);
+    // A write through it, from the page's own origin.
+    let new = serde_json::json!([{ "apiVersion": "games.example.com/v1", "kind": "GameServer",
+        "metadata": { "name": "two" }, "spec": { "map": "dust" } }]);
+    let post = |url: &str, more: &[&str]| {
+        let body = new.to_string();
+        let mut args = vec!["-H", "Content-Type: application/json", "-d", &body];
+        args.extend(more);
+        args.push(url);
+        fetch(&args)
+    };
+    let (status, _, body) = post(&format!("{address}/v1/apply"), &["-H", &format!("Origin: {origin}")]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(json_of(&daemon, "gameserver/two").unwrap()["spec"]["map"], "dust");
+    // Refused: no secret, a wrong one, another site's page, a name pointed at this machine.
+    let refusals = [
+        post(&format!("{origin}/v1/apply"), &[]),
+        post(&format!("{origin}/{}/v1/apply", "0".repeat(32)), &[]),
+        post(&format!("{address}/v1/apply"), &["-H", "Origin: http://evil.example"]),
+        post(&format!("{address}/v1/apply"), &["-H", "Host: evil.example"]),
+        fetch(&[&format!("{origin}/ui/")]),
+    ];
+    for (status, _, body) in refusals {
+        assert_eq!(status, 403, "{body}");
+    }
+    forwarder.kill().unwrap();
+    forwarder.wait().unwrap();
+}

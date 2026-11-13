@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod import;
+mod ui;
 
 #[derive(Parser)]
 #[command(
@@ -130,6 +131,12 @@ enum Command {
         /// How many of the last entries to show (1000 at most)
         #[arg(long, default_value_t = 100)]
         tail: u64,
+    },
+    /// Open kithd's web UI to a browser on this machine (prints the address)
+    Ui {
+        /// The loopback port to listen on; any free one when left out
+        #[arg(long, default_value_t = 0)]
+        port: u16,
     },
     /// Controllers: WebAssembly modules kithd runs for a kind of your own
     Controller {
@@ -775,6 +782,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             definition.status = None;
             backend.apply(vec![definition], false)?;
             println!("{}", said.join("\n"));
+        }
+        Command::Ui { port } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("the web UI is kithd's: leave out --store");
+            };
+            ui::serve(&kithd.socket, port)?;
         }
         Command::Audit { tail } => {
             let Backend::Daemon(kithd) = backend()? else {

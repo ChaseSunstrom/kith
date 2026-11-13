@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>kith</title>
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="#/" aria-label="kith: the start">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true">
+      <line x1="22" y1="14" x2="22" y2="50"/>
+      <line x1="24" y1="36" x2="42" y2="20"/>
+      <line x1="26" y1="38" x2="42" y2="50"/>
+      <circle cx="22" cy="14" r="4"/>
+      <circle cx="22" cy="50" r="4"/>
+      <circle cx="43" cy="19" r="4.5"/>
+      <circle cx="43" cy="50" r="4.5"/>
+      <circle class="ring" cx="24" cy="37" r="5.5"/>
+      <circle class="hub" cx="24" cy="37" r="5.5"/>
+    </svg>
+    <h1>kith</h1>
+  </a>
+  <span id="who" class="who dim"></span>
+  <span class="grow"></span>
+  <span id="generation" class="dim" title="How many times the cluster's state has changed"></span>
+  <span id="link" class="link wait" role="status">connecting</span>
+</header>
+
+<main class="board">
+  <nav class="panel kinds" aria-labelledby="kinds-title">
+    <h2 id="kinds-title"><b>01</b> Kinds</h2>
+    <div class="scroll" id="kinds"></div>
+  </nav>
+
+  <section class="panel pulse" aria-labelledby="pulse-title">
+    <h2 id="pulse-title"><b>02</b> Pulse <span id="pulse-said" class="dim"></span></h2>
+    <svg id="pulse" role="img" aria-labelledby="pulse-said" height="150"></svg>
+  </section>
+
+  <section class="panel list" aria-labelledby="list-title">
+    <h2 id="list-title"><b>03</b> <span id="list-kind">Resources</span> <span id="list-about" class="dim"></span></h2>
+    <div class="tools">
+      <label class="dim" for="filter">filter</label>
+      <input id="filter" type="search" autocomplete="off" spellcheck="false">
+      <span class="grow"></span>
+      <button id="new" type="button">New</button>
+    </div>
+    <div class="scroll"><table id="table"></table></div>
+  </section>
+
+  <section class="panel detail" aria-labelledby="detail-title">
+    <h2 id="detail-title"><b>04</b> <span id="detail-key">Resource</span> <span id="detail-said" class="dim"></span></h2>
+    <div id="tabs" class="tabs" role="tablist" aria-label="Views of this resource"></div>
+    <div id="pane" class="scroll" role="tabpanel" tabindex="0"></div>
+    <div class="tools foot">
+      <span id="check" class="check dim" role="status"></span>
+      <span class="grow"></span>
+      <button id="delete" type="button" class="danger" hidden>Delete</button>
+      <button id="review" type="button" class="primary" hidden>Review changes</button>
+    </div>
+  </section>
+</main>
+
+<dialog id="dialog" aria-labelledby="dialog-title">
+  <h2 id="dialog-title"></h2>
+  <div id="dialog-body" class="scroll"></div>
+  <div class="tools foot">
+    <span id="dialog-said" class="check" role="status"></span>
+    <span class="grow"></span>
+    <button id="dialog-no" type="button">Cancel</button>
+    <button id="dialog-yes" type="button" class="primary"></button>
+  </div>
+</dialog>
+
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<noscript><p class="panel">This page is a program: it needs JavaScript. Everything it does, <code>kith</code> does from a terminal.</p></noscript>
+</body>
+</html>

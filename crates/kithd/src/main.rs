@@ -25,6 +25,7 @@ mod releases;
 mod sched;
 mod services;
 mod sources;
+mod ui;
 mod wasm;
 
 use clap::Parser;
@@ -374,7 +375,8 @@ fn run(args: Args) -> Result<(), String> {
         // Whoever can open the socket is the machine's admin.
         let local = api::router(shared.clone())
             .layer(axum::Extension(access::Caller::Admin))
-            .merge(cluster::admin_router(shared.clone()));
+            .merge(cluster::admin_router(shared.clone()))
+            .merge(ui::pages());
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         // The same API for other nodes, over TLS.
