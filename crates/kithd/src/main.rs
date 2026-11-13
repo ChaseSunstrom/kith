@@ -136,7 +136,13 @@ pub struct Shared {
     pub mesh: Mutex<serde_json::Value>,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
+    /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
+    /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
+    pub dry_runs: tokio::sync::Semaphore,
 }
+
+/// How many dry runs at once.
+const DRY_RUNS: usize = 4;
 
 fn main() -> ExitCode {
     // Started again by the runtime as an exec unit's helper? Then this never returns.
@@ -291,6 +297,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         mesh: Mutex::default(),
         cluster,
         stop: watch::channel(false).0,
+        dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
     });
     // A node that joined waits to be sent the store; any other is where a cluster starts.
     if shared.cluster.as_ref().is_some_and(|cluster| cluster.ca.is_none()) {

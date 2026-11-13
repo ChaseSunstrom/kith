@@ -85,6 +85,9 @@ impl Change {
     }
 }
 
+/// What a key's history was before a batch changed it; none: it was not there.
+type Undo = BTreeMap<String, Option<Vec<Revision>>>;
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Store {
     /// Revisions per resource key, oldest first. The last one is live.
@@ -132,9 +135,17 @@ impl Store {
     }
 
     pub fn apply(&mut self, desired: Resource) -> Result<Change, Error> {
+        self.apply_logged(desired, &mut Undo::new())
+    }
+
+    /// [`Store::apply`], first keeping in `undo` the history of the key it changes.
+    fn apply_logged(&mut self, desired: Resource, undo: &mut Undo) -> Result<Change, Error> {
         let change = self.plan(desired)?;
         if change.action != Action::Unchanged {
-            let history = self.resources.entry(change.after.key()).or_default();
+            let key = change.after.key();
+            undo.entry(key.clone())
+                .or_insert_with(|| self.resources.get(&key).cloned());
+            let history = self.resources.entry(key).or_default();
             history.push(Revision {
                 at: self.clock.unwrap_or_else(now),
                 resource: change.after.clone(),
@@ -154,11 +165,30 @@ impl Store {
 
     /// Apply several resources, all or nothing: if one is refused the store is left as it was.
     pub fn apply_all(&mut self, desired: Vec<Resource>) -> Result<Vec<Change>, Error> {
-        // ponytail: clones the whole store per call; fine until stores are large, then stage per key.
-        let mut staged = self.clone();
-        let changes = desired.into_iter().map(|r| staged.apply(r)).collect::<Result<_, _>>()?;
-        *self = staged;
-        Ok(changes)
+        self.staged(desired, false)
+    }
+
+    /// What [`Store::apply_all`] would do, the store left as it was either way.
+    pub fn dry_run(&mut self, desired: Vec<Resource>) -> Result<Vec<Change>, Error> {
+        self.staged(desired, true)
+    }
+
+    /// Apply one after the other (a later one sees the earlier), keeping the histories they
+    /// change, and put those back if one is refused or `back`. Copies the keys it touches,
+    /// not the store: at 10 000 resources a copy of it cost 18 ms (T-0080).
+    fn staged(&mut self, desired: Vec<Resource>, back: bool) -> Result<Vec<Change>, Error> {
+        let mut undo = Undo::new();
+        let changes: Result<Vec<Change>, Error> =
+            desired.into_iter().map(|r| self.apply_logged(r, &mut undo)).collect();
+        if back || changes.is_err() {
+            for (key, history) in undo {
+                match history {
+                    Some(history) => self.resources.insert(key, history),
+                    None => self.resources.remove(&key),
+                };
+            }
+        }
+        changes
     }
 
     pub fn get(&self, key: &str) -> Option<&Resource> {

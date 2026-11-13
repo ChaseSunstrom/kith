@@ -218,6 +218,8 @@ pub(crate) async fn plan(
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(target).collect()
     })?;
+    // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
+    let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         crate::releases::claims(&state.store, &resources)
@@ -225,7 +227,17 @@ pub(crate) async fn plan(
     claimed.map_err(|why| ApiError::Store(Error::Invalid(why)))?;
     // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
     let resources = shared.admitted(resources).await.map_err(ApiError::Store)?;
-    read(shared, |store| store.clone().apply_all(resources)).map(|Json(changes)| veiled(shared, caller, changes))
+    // Applied to the live store and taken back, under its lock: a copy of it cost 18 ms
+    // at 10 000 resources and as much memory as the store.
+    let changes = shared
+        .store
+        .lock()
+        .expect("a handler panicked holding the store")
+        .store
+        .dry_run(resources);
+    changes
+        .map(|changes| veiled(shared, caller, changes))
+        .map_err(ApiError::Store)
 }
 
 /// `changes` as `caller` may know them: what a resource was before is for those who may
@@ -528,7 +540,37 @@ pub(crate) fn log_chunk(
 
 #[cfg(test)]
 mod tests {
-    use super::log_chunk;
+    use super::*;
+    use std::time::Duration;
+
+    /// With the four turns taken a fifth dry run waits (it is not refused), goes on when one
+    /// is given back, and changes nothing in the store.
+    #[tokio::test]
+    async fn dry_runs_wait_for_one_of_four() {
+        let dir = std::env::temp_dir().join(format!("kithd-dry-{}", std::process::id()));
+        let shared = crate::replica(None, &dir).await.unwrap();
+        let resource = serde_json::from_value::<Resource>(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": "c" }, "spec": {}
+        }))
+        .unwrap();
+        let dry = || plan(&shared, &Caller::Admin, vec![resource.clone()]);
+        let mut held: Vec<_> = Vec::new();
+        for _ in 0..crate::DRY_RUNS {
+            held.push(shared.dry_runs.acquire().await.unwrap());
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(300), dry()).await.is_err());
+        held.pop();
+        let changes = tokio::time::timeout(Duration::from_secs(10), dry())
+            .await
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, kith_api::store::Action::Created);
+        assert_eq!(shared.dry_runs.available_permits(), 1);
+        assert!(shared.store.lock().unwrap().store.get("ConfigMap/default/c").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn log_chunks() {
