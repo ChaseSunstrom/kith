@@ -12,7 +12,7 @@
 // is followed and no hook runs. No signed-commit check yet.
 
 use crate::Shared;
-use crate::releases::{OWNER, Step, carry_out, reconcile, recorded};
+use crate::releases::{OWNER, Step, carry_out, owner, reconcile, recorded};
 use kith_api::Resource;
 use kith_api::kinds::{Approval, SourceSpec};
 use kith_api::store::Store;
@@ -36,6 +36,13 @@ const BYTES_LIMIT: u64 = 4 << 20;
 const PATIENCE: Duration = Duration::from_secs(120);
 /// The most git may say in one go (the list of a big repository's files fits).
 const OUTPUT_LIMIT: u64 = 16 << 20;
+/// The most a git repository of a Source may take on disk, and the most of it git may
+/// write to one file (a pack).
+const DISK_LIMIT: u64 = 256 << 20;
+/// How many Sources are fetched at once.
+const FETCHES_AT_ONCE: usize = 4;
+/// The longest a Source that keeps failing is left alone.
+const BACKOFF_LIMIT: Duration = Duration::from_secs(3600);
 
 /// What a source holds, at one revision.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,10 +195,19 @@ pub fn path_allowed(path: &str) -> Fallible<()> {
 
 /// Run git in the bare repository `dir`: with no configuration but ours, nothing to
 /// ask anyone, and only the transports a Source may use. With `pins` (see [`outward`]) it
-/// connects only where they say and follows no redirect to anywhere else.
-async fn git(dir: &Path, local: bool, pins: &[String], args: &[&str]) -> Fallible<Vec<u8>> {
-    let mut command = tokio::process::Command::new("git");
-    command.arg("-C").arg(dir);
+/// connects only where they say and follows no redirect to anywhere else. It may write no
+/// file bigger than `limit` bytes (run under `ulimit -f`, in 512-byte blocks; the program
+/// that is stopped for it is said so).
+async fn git(limit: u64, dir: &Path, local: bool, pins: &[String], args: &[&str]) -> Fallible<Vec<u8>> {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .args([
+            "-c",
+            &format!("ulimit -f {} && exec git \"$@\"", limit.div_ceil(512)),
+            "git",
+        ])
+        .arg("-C")
+        .arg(dir);
     let file = if local { "always" } else { "never" };
     for setting in [
         "protocol.allow=never",
@@ -233,7 +249,7 @@ async fn git(dir: &Path, local: bool, pins: &[String], args: &[&str]) -> Fallibl
     // (kithd collects the children nobody waits for: this one is waited for.)
     let child = match kith_runtime::spawn_awaited(|| command.spawn(), tokio::process::Child::id) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err("this node has no git: a Source from a git repository needs it".into());
+            return Err("this node has no git or no sh: a Source from a git repository needs both".into());
         }
         Err(e) => return Err(format!("running git: {e}")),
         Ok(child) => child,
@@ -260,6 +276,10 @@ async fn git(dir: &Path, local: bool, pins: &[String], args: &[&str]) -> Fallibl
     if out.len() as u64 > OUTPUT_LIMIT {
         return Err(format!("git {}: more than {OUTPUT_LIMIT} bytes to say", args[0]));
     }
+    // (SIGXFSZ: it tried to write a file past the limit.)
+    if std::os::unix::process::ExitStatusExt::signal(&ran) == Some(25) {
+        return Err(format!("git {}: more than {limit} bytes in a file", args[0]));
+    }
     match ran.success() {
         true => Ok(out),
         false => {
@@ -283,10 +303,40 @@ pub async fn fetch_git(
     local: bool,
     pins: &[String],
 ) -> Fallible<Fetched> {
+    fetch_within(DISK_LIMIT, dir, url, rev, path, local, pins).await
+}
+
+/// What `dir` holds, in bytes (links are not followed).
+fn disk_used(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut used = 0;
+    for entry in entries.flatten() {
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => used += disk_used(&entry.path()),
+            Ok(meta) => used += meta.len(),
+            Err(_) => {}
+        }
+    }
+    used
+}
+
+/// [`fetch_git`] with a bound on the disk: git writes no file past `limit`, and a
+/// repository that holds more than that after the fetch is dropped.
+async fn fetch_within(
+    limit: u64,
+    dir: &Path,
+    url: &str,
+    rev: Option<&str>,
+    path: Option<&str>,
+    local: bool,
+    pins: &[String],
+) -> Fallible<Fetched> {
     url_allowed(url, local)?;
     if !pins.is_empty() {
         // (An older git takes the setting that pins it for nothing, and says nothing.)
-        let version = git(dir.parent().unwrap_or(dir), local, &[], &["version"]).await?;
+        let version = git(limit, dir.parent().unwrap_or(dir), local, &[], &["version"]).await?;
         if !pinnable(&String::from_utf8_lossy(&version)) {
             return Err("this node's git is older than 2.37: it cannot be held to the address that was checked".into());
         }
@@ -298,7 +348,7 @@ pub async fn fetch_git(
     if !dir.join("HEAD").exists() {
         let failed = |e: std::io::Error| format!("{}: {e}", dir.display());
         tokio::fs::create_dir_all(dir).await.map_err(failed)?;
-        git(dir, local, pins, &["init", "--quiet", "--bare", "."]).await?;
+        git(limit, dir, local, pins, &["init", "--quiet", "--bare", "."]).await?;
     }
     let fetch = [
         "fetch",
@@ -310,9 +360,21 @@ pub async fn fetch_git(
         url,
         rev,
     ];
-    git(dir, local, pins, &fetch).await?;
+    let fetched = git(limit, dir, local, pins, &fetch).await;
+    // (A file is held to `limit`, the repository as a whole is counted here. A fetch that
+    // failed may leave half a pack: start again from nothing.)
+    // ponytail: the whole is only counted once git is done, in its 120 s: many files each
+    // under the limit can fill the disk that far; a quota on the state disk is the upgrade.
+    let dir_ = dir.to_path_buf();
+    let used = tokio::task::spawn_blocking(move || disk_used(&dir_)).await.unwrap_or(0);
+    if fetched.is_err() || used > limit {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+        return Err(fetched
+            .err()
+            .unwrap_or_else(|| format!("the repository takes more than {limit} bytes on disk")));
+    }
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).map_err(|_| "git said something that is not text".to_string());
-    let revision = text(git(dir, local, pins, &["rev-parse", "FETCH_HEAD"]).await?)?
+    let revision = text(git(limit, dir, local, pins, &["rev-parse", "FETCH_HEAD"]).await?)?
         .trim()
         .to_string();
 
@@ -320,7 +382,7 @@ pub async fn fetch_git(
     let mut list = vec!["ls-tree", "-r", "-l", "-z", "FETCH_HEAD"];
     list.extend(path.iter().flat_map(|path| ["--", *path]));
     // (A name that is not text is no reason to refuse the rest.)
-    let listed = git(dir, local, pins, &list).await?;
+    let listed = git(limit, dir, local, pins, &list).await?;
     let listed = String::from_utf8_lossy(&listed);
     let (mut wanted, mut skipped, mut bytes) = (Vec::new(), Vec::new(), 0u64);
     for entry in listed.split('\0').filter(|entry| !entry.is_empty()) {
@@ -349,7 +411,7 @@ pub async fn fetch_git(
     }
     let mut files = BTreeMap::new();
     for (name, object) in wanted {
-        match String::from_utf8(git(dir, local, pins, &["cat-file", "blob", &object]).await?) {
+        match String::from_utf8(git(limit, dir, local, pins, &["cat-file", "blob", &object]).await?) {
             Ok(file) => drop(files.insert(name, file)),
             Err(_) => skipped.push(format!("{name}: not text")),
         }
@@ -505,6 +567,8 @@ type Fetches = BTreeMap<String, Result<Fetched, String>>;
 /// What the store needs done for its Sources, given what was fetched.
 fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
     let mut steps = Vec::new();
+    // What the Sources before this one (by key) keep: a resource is one Source's.
+    let mut claimed = BTreeSet::new();
     for source in store.list(Some("Source")) {
         let key = source.key();
         let Some(fetched) = fetches.get(&key) else {
@@ -524,13 +588,26 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
         let done = fetched.as_ref().map_err(String::clone).and_then(|fetched| {
             let resources = fetched.resources.get_or_init(|| desired(&key, fetched));
             let resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
-            let done = reconcile(store, &key, &recorded(source), &resources, spec.prune == Some(true))?;
+            // (What another owns now is no longer ours, whatever we recorded: else two
+            // Sources that named one resource take it back from each other for ever.)
+            let ours = |at: &&str| {
+                store
+                    .get(at)
+                    .is_none_or(|live| owner(live).is_none_or(|owner| owner == key))
+            };
+            let before: BTreeSet<&str> = recorded(source).into_iter().filter(ours).collect();
+            let done = reconcile(store, &key, &before, &resources, spec.prune == Some(true))?;
+            // (And one that an earlier Source in this very pass took is that Source's.)
+            if let Some(at) = done.kept.iter().find(|at| claimed.contains(at.as_str())) {
+                return Err(format!("{at} is there already and is not {key}'s"));
+            }
             Ok((fetched, done))
         });
         let status = match done {
             // (What was applied before stays as it is.)
             Err(e) => json!({ "state": "error", "message": plain(&e), "observedRevision": source.metadata.revision }),
             Ok((fetched, done)) => {
+                claimed.extend(done.kept.iter().cloned());
                 let synced = live.is_some_and(|live| live["revision"] == fetched.revision.as_str());
                 let held =
                     matches!(spec.approval, Some(Approval::Manual)) && spec.approve.as_ref() != Some(&fetched.revision);
@@ -580,13 +657,56 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
 const INTERVAL: u64 = 60;
 const LEAST_INTERVAL: u64 = 5;
 
+/// How often `source` asks to be fetched.
+fn interval(source: &SourceSpec) -> Duration {
+    Duration::from_secs(u64::from(source.interval_seconds.unwrap_or(INTERVAL as u32)).max(LEAST_INTERVAL))
+}
+
+/// How long to leave a Source that failed `failed` times in a row: its interval, doubled
+/// for each, up to an hour (never less than the interval).
+fn backed_off(every: Duration, failed: u32) -> Duration {
+    every.saturating_mul(1 << failed.min(10)).min(BACKOFF_LIMIT).max(every)
+}
+
+/// Fetch what `source` (the Source `key`, of the spec `about`) points at.
+async fn fetch_one(
+    state: PathBuf,
+    local: bool,
+    key: String,
+    source: SourceSpec,
+    about: Value,
+) -> (String, Value, Fallible<Fetched>) {
+    let named = source.git.as_ref().map(|git| &git.url).or(source.oci.as_ref());
+    let own = key.starts_with("Source/kith-system/") || (local && source.git.is_some());
+    let allowed = match named.filter(|_| !own) {
+        Some(url) => outward(url).await,
+        None => Ok(Vec::new()),
+    };
+    let outward = named.is_some() && !own;
+    let got = match (&source.git, &source.oci, allowed) {
+        (_, _, Err(refused)) => Err(refused),
+        (Some(git), _, Ok(pins)) => {
+            let dir = clone_of(&state, &key);
+            fetch_git(&dir, &git.url, git.rev.as_deref(), source.path.as_deref(), local, &pins).await
+        }
+        (None, Some(oci), _) => fetch_oci(oci, source.path.as_deref(), outward).await,
+        (None, None, _) => Err("neither git nor oci".into()),
+    };
+    // (Read here, not while the store is held.)
+    if let Ok(fetched) = &got {
+        fetched.resources.get_or_init(|| desired(&key, fetched));
+    }
+    (key, about, got)
+}
+
 /// Keep the Sources synced, as long as this node leads the store, until told to stop.
 /// Git repositories are kept under `state`; `local` lets a Source name a `file://` one.
 pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
     let mut fetches = Fetches::new();
     // (When each was fetched, and from what spec: a changed Source is fetched at once.)
-    let mut fetched: BTreeMap<String, (Value, tokio::time::Instant)> = BTreeMap::new();
+    // (And how many fetches in a row failed: see `backed_off`.)
+    let mut fetched: BTreeMap<String, (Value, tokio::time::Instant, u32)> = BTreeMap::new();
     loop {
         let metrics = shared.raft.metrics().borrow().clone();
         let mut next = Duration::from_secs(INTERVAL);
@@ -602,46 +722,52 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
             }
             fetched.retain(|key, _| there.contains(key));
             fetches.retain(|key, _| there.contains(key));
+            let mut due = Vec::new();
             for (key, spec) in &sources {
                 let Ok(source) = serde_json::from_value::<SourceSpec>(spec.clone()) else {
                     continue;
                 };
-                let every = Duration::from_secs(
-                    u64::from(source.interval_seconds.unwrap_or(INTERVAL as u32)).max(LEAST_INTERVAL),
-                );
                 // (`approve` is no reason to fetch again: it is about what was fetched.)
                 let mut about = spec.clone();
                 about.as_object_mut().map(|about| about.remove("approve"));
-                let due = fetched
-                    .get(key)
-                    .is_none_or(|(was, at)| *was != about || at.elapsed() >= every);
-                if due {
-                    let named = source.git.as_ref().map(|git| &git.url).or(source.oci.as_ref());
-                    let own = key.starts_with("Source/kith-system/") || (local && source.git.is_some());
-                    let allowed = match named.filter(|_| !own) {
-                        Some(url) => outward(url).await,
-                        None => Ok(Vec::new()),
-                    };
-                    let outward = named.is_some() && !own;
-                    let got = match (&source.git, &source.oci, allowed) {
-                        (_, _, Err(refused)) => Err(refused),
-                        (Some(git), _, Ok(pins)) => {
-                            let dir = clone_of(&state, key);
-                            fetch_git(&dir, &git.url, git.rev.as_deref(), source.path.as_deref(), local, &pins).await
-                        }
-                        (None, Some(oci), _) => fetch_oci(oci, source.path.as_deref(), outward).await,
-                        (None, None, _) => Err("neither git nor oci".into()),
-                    };
-                    // (Read here, not while the store is held.)
-                    if let Ok(fetched) = &got {
-                        fetched.resources.get_or_init(|| desired(key, fetched));
-                    }
-                    fetches.insert(key.clone(), got);
-                    fetched.insert(key.clone(), (about, tokio::time::Instant::now()));
+                let ready = fetched.get(key).is_none_or(|(was, at, failed)| {
+                    *was != about || at.elapsed() >= backed_off(interval(&source), *failed)
+                });
+                if ready {
+                    due.push((key.clone(), source, about));
                 }
-                let left = fetched
-                    .get(key)
-                    .map_or(every, |(_, at)| every.saturating_sub(at.elapsed()));
+            }
+            // (Several at once: a slow or dead one does not hold the rest.)
+            let (mut waiting, mut running, mut done) = (due.into_iter(), tokio::task::JoinSet::new(), Vec::new());
+            loop {
+                while running.len() < FETCHES_AT_ONCE
+                    && let Some((key, source, about)) = waiting.next()
+                {
+                    running.spawn(fetch_one(state.clone(), local, key, source, about));
+                }
+                match running.join_next().await {
+                    None => break,
+                    Some(finished) => done.extend(finished),
+                }
+            }
+            for (key, about, got) in done {
+                // (A changed Source starts again: what failed was another spec.)
+                let was = fetched
+                    .get(&key)
+                    .filter(|(was, ..)| *was == about)
+                    .map_or(0, |(.., n)| *n);
+                let failed = if got.is_err() { was.saturating_add(1) } else { 0 };
+                fetches.insert(key.clone(), got);
+                fetched.insert(key, (about, tokio::time::Instant::now(), failed));
+            }
+            for (key, spec) in &sources {
+                let Ok(source) = serde_json::from_value::<SourceSpec>(spec.clone()) else {
+                    continue;
+                };
+                let every = interval(&source);
+                let left = fetched.get(key).map_or(every, |(_, at, failed)| {
+                    backed_off(every, *failed).saturating_sub(at.elapsed())
+                });
                 next = next.min(left.max(Duration::from_secs(1)));
             }
             let steps = {
@@ -1034,5 +1160,98 @@ mod tests {
                 .iter()
                 .any(|step| step.apply.iter().any(|resource| resource.kind == "Nothing"))
         );
+    }
+
+    /// Two Sources that name one resource end with one owner, the same one however
+    /// they came to the store and however often it settles.
+    #[test]
+    fn two_sources_claiming_one_resource_settle_the_same_way() {
+        let owner = |store: &Store| crate::releases::owner(store.get("ConfigMap/shop/a").unwrap()).map(str::to_string);
+        let status = |store: &Store, key: &str| store.get(key).unwrap().status.clone().unwrap();
+        for names in [["one", "two"], ["two", "one"]] {
+            let mut store = Store::default();
+            let mut fetches = Fetches::new();
+            for name in names {
+                apply(&mut store, &SOURCE.replace("name: repo", &format!("name: {name}")));
+                let fetched = at("r1", &[("a.yaml", map("a", name))])
+                    .remove("Source/shop/repo")
+                    .unwrap();
+                fetches.insert(format!("Source/shop/{name}"), fetched);
+            }
+            settle(&mut store, &fetches);
+            let first = owner(&store);
+            assert!(first.is_some());
+            for _ in 0..3 {
+                settle(&mut store, &fetches);
+                assert_eq!(owner(&store), first);
+            }
+            // (The one that sorts first, however they were applied; the other is told.)
+            assert_eq!(first.as_deref(), Some("Source/shop/one"));
+            assert_eq!(status(&store, "Source/shop/one")["state"], "synced");
+            assert_eq!(status(&store, "Source/shop/two")["state"], "error");
+        }
+    }
+
+    /// A Source that keeps failing is left longer each time, up to an hour, and no
+    /// less than its own interval.
+    #[test]
+    fn a_failing_source_is_fetched_less_and_less() {
+        let every = Duration::from_secs(60);
+        let waits: Vec<u64> = (0..8).map(|failed| backed_off(every, failed).as_secs()).collect();
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1920, 3600, 3600]);
+        assert_eq!(backed_off(every, u32::MAX), BACKOFF_LIMIT);
+        let long = Duration::from_secs(7200);
+        assert_eq!(backed_off(long, 0), long);
+        assert_eq!(backed_off(long, 5), long);
+    }
+
+    fn sh(dir: &Path, script: &str) {
+        let done = std::process::Command::new("sh")
+            .current_dir(dir)
+            .args(["-c", script])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(done.success(), "{script}");
+    }
+
+    /// A repository with a file git cannot make small is not fetched past the bound; a
+    /// small one is; and what a directory holds is counted.
+    #[tokio::test]
+    async fn a_fetch_over_the_disk_bound_is_refused() {
+        let root = std::env::temp_dir().join(format!("kith-bound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        // (A million bytes that do not compress.)
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        std::fs::write(origin.join("noise.bin"), noise).unwrap();
+        std::fs::write(origin.join("a.yaml"), map("a", "red")).unwrap();
+        let commit = "git init -q . && git add . && git -c user.name=t -c user.email=t@t commit -qm x";
+        sh(&origin, commit);
+        let url = format!("file://{}", origin.display());
+
+        let big = fetch_within(256 << 10, &root.join("big.git"), &url, None, None, true, &[]).await;
+        assert!(big.is_err(), "{big:?}");
+        // (What was fetched is not kept.)
+        assert!(!root.join("big.git").exists());
+        let fine = fetch_within(64 << 20, &root.join("fine.git"), &url, None, None, true, &[]).await;
+        assert!(fine.unwrap().files.contains_key("a.yaml"));
+
+        let held = root.join("held");
+        std::fs::create_dir_all(held.join("in")).unwrap();
+        std::fs::write(held.join("x"), [0; 3000]).unwrap();
+        std::fs::write(held.join("in/y"), [0; 5000]).unwrap();
+        assert_eq!(disk_used(&held), 8000);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
