@@ -776,3 +776,31 @@ Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
 has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on
 Debian/Ubuntu, or point `CC_x86_64_unknown_linux_musl` at a `zig cc -target
 x86_64-linux-musl` wrapper.
+
+### Testing on several nodes
+
+```sh
+KITH_E2E=1 cargo test -q -p kithd --test cluster rig_   # 3 nodes: one behind a NAT, a partition, a heal
+sh ci/vm.sh                                             # the host's kernel, booted with kithd as init
+sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
+```
+
+The `rig_` tests in `crates/kithd/tests/cluster.rs` run the test again inside
+`unshare -Urnm` (rootless; nothing outside it changes) and put each kithd in its own
+network namespace, a veth pair to the test's own namespace, which is the router.
+A node can sit behind a NAT (SNAT out, and only its API port forwarded in, TCP
+only, so UDP and every other inbound connection are dropped like a home router
+would), a node's link can be cut and healed, and `tc netem` latency is added when
+the kernel has `sch_netem`. Without `KITH_E2E=1`, user namespaces, `ip`,
+`iptables` or `nsenter`, a test prints `skipped: ...` and passes; without netem
+it prints `skipped: no netem` and goes on without the latency. The relay through an
+edge node is not covered here: kithd falls back to it only after 180 s of
+silence (`QUIET` in `crates/kithd/src/mesh.rs`), and `kith-mesh` has unit tests
+for the choice.
+
+`ci/vm.sh` is the launcher Phase 5's image, installer and update tests reuse. It
+builds the static kithd, makes an initramfs whose `/init` is that kithd, boots the
+host's kernel with it under QEMU and KVM, and prints the console. `--kernel`,
+`--initrd` and `--disk` take any other; a disk image is attached with `-snapshot`
+(it is never written, and a `/dev` path is refused). Where there is no QEMU, KVM or
+readable kernel it prints `skipped: ...` and exits 0.
