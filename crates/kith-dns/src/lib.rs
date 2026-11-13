@@ -43,7 +43,7 @@ pub struct Chase {
 
 impl Chase {
     /// The question to put to the upstreams: the CNAME's target, with the type asked.
-    pub fn ask(&self) -> Vec<u8> {
+    pub(crate) fn ask(&self) -> Vec<u8> {
         wire::ask(&self.target(), self.q.qtype)
     }
 
@@ -55,7 +55,7 @@ impl Chase {
     }
 
     /// The answer as the zones give it, the CNAME alone: for when the upstreams cannot be asked.
-    pub fn plain(&self) -> Vec<u8> {
+    pub(crate) fn plain(&self) -> Vec<u8> {
         build(&self.q, 0, &self.found.answers, &[], self.limit)
     }
 
@@ -64,7 +64,7 @@ impl Chase {
     /// that is an error or has nothing, leaves the answer as `plain`.
     // ponytail: records are taken in the order sent (resolvers send a chain in order), a name
     // in our own zones reached through the chain is not special-cased (the upstream is trusted).
-    pub fn finish(&self, reply: &[u8]) -> Vec<u8> {
+    pub(crate) fn finish(&self, reply: &[u8]) -> Vec<u8> {
         let mut chain = vec![self.target()];
         let mut all = self.found.answers.clone();
         let mut room = CHASE_MAX;
@@ -106,7 +106,8 @@ pub fn answer(query: &[u8], client: IpAddr, zones: &Zones, udp: bool) -> Answer 
         Some(f)
             if f.rcode == 0
                 && f.authority.is_empty()
-                && q.qtype != 5
+                // (Of what the upstreams say, addresses and text are what is read.)
+                && matches!(q.qtype, 1 | 16 | 28)
                 && matches!(
                     f.answers.last(),
                     Some(Record {

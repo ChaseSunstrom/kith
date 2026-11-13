@@ -15,6 +15,8 @@ use tokio::time::{sleep, timeout};
 
 /// How long each upstream gets to answer.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an answer of ours waits for the upstreams to add to it.
+const CHASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a TCP client gets to send a query, or to take a reply.
 const IDLE: Duration = Duration::from_secs(10);
 const MAX_TCP_CONNECTIONS: usize = 64;
@@ -263,7 +265,11 @@ async fn forward(query: &[u8], upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
 /// The zone's answer with what the upstreams say for its CNAME's target (one question, over TCP
 /// when the client used it); the CNAME alone when they say nothing useful.
 async fn chase(c: &Chase, upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
-    c.finish(&forward(&c.ask(), upstreams, tcp).await)
+    // (The CNAME is ours to give: it does not wait on every upstream's full patience.)
+    match timeout(CHASE_TIMEOUT, forward(&c.ask(), upstreams, tcp)).await {
+        Ok(reply) => c.finish(&reply),
+        Err(_) => c.plain(),
+    }
 }
 
 /// Whether `reply` answers `sent`: a response with the same id and the same question.
