@@ -763,3 +763,42 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16, mes
     }
     Ok(joined)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::access::Caller;
+    use axum::body::{Body, Bytes};
+    use futures_util::stream;
+    use std::collections::BTreeMap;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    /// `/v1/netboot` refuses an Identity that may not apply Nodes before it reads the body:
+    /// the body here says when it is read, and it is never.
+    #[tokio::test]
+    async fn netboot_refuses_a_roleless_identity_before_reading_its_body() {
+        let dir = std::env::temp_dir().join(format!("kithd-netboot-refused-{}", std::process::id()));
+        let shared = crate::replica(None, &dir).await.unwrap();
+        let read = Arc::new(AtomicBool::new(false));
+        let said = read.clone();
+        let image = Body::from_stream(stream::poll_fn(move |_| {
+            said.store(true, Ordering::SeqCst);
+            Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"kith-netboot"))))
+        }));
+        let refused = netboot(
+            State(shared),
+            axum::Extension(Caller::Identity("carol".into())),
+            axum::http::Method::PUT,
+            axum::extract::Query(BTreeMap::new()),
+            image,
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let why = axum::body::to_bytes(refused.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&why).contains("carol may not apply Node"));
+        assert!(!read.load(Ordering::SeqCst), "the body was read before the refusal");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

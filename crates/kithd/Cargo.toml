@@ -45,6 +45,8 @@ wasmi = { version = "2", default-features = false, features = ["std", "validate"
 serde_json.workspace = true
 # Test modules are written as text.
 wat = "1"
+# A request body a test makes as a stream (cluster.rs); in the tree already.
+futures-util = "0.3"
 
 [lints]
 workspace = true
