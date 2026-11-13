@@ -5,8 +5,8 @@
 //! POST /v1/run-hop  {on, via?, argv, caller}    -> 101, then bytes both ways   nodes only
 //! ```
 //! `on` is a node's name, or `key=value[,key=value]` for the first ready Node (by name)
-//! with those labels. The first node checks the caller (it may apply a Job in
-//! `namespace`), writes the audit entry and, when the app is to run elsewhere, passes
+//! with those labels. The first node checks the caller (it may `exec` on `Node`, a
+//! rule for the whole cluster), writes the audit entry and, when the app is to run elsewhere, passes
 //! the tunnel to that node's `run-hop` over the cluster's mutual TLS: the hop is for
 //! members only, so a client token cannot call it and skip the check. The node that runs
 //! the app starts `VIA --socket S server -- ARGV…` (VIA is `waypipe` unless said) with S
@@ -237,6 +237,8 @@ pub async fn hop(
         .as_ref()
         .map_or("local", |c| c.me.name.as_str())
         .to_string();
+    // The first node checked the caller; this one takes a member's word for who that was, and
+    // runs what it is asked: a node of the cluster can run anything on any other.
     let who = format!("{} via node {from}", spec.caller);
     start(&shared, &who, &me, spec, upgrade)
 }
@@ -312,6 +314,8 @@ impl Drop for Dir {
 
 /// `VIA --socket S server -- ARGV…`, started and waiting for the tunnel's other end.
 struct App {
+    /// VIA's process group (VIA leads it): the app and whatever it started are in it.
+    group: Option<i32>,
     child: Child,
     listener: UnixListener,
     _dir: Dir,
@@ -321,8 +325,12 @@ impl App {
     // ponytail: one tunnel carries one connection of the app to VIA; the `kith` command
     // starts VIA's client for it, so an app that opens a second Wayland connection through
     // another VIA process needs its own `kith run`.
-    // ponytail: VIA and the app run as kithd's user; whoever may apply a Job may already
-    // run anything as it. A grandchild that outlives VIA's kill (VIA's own app) is not hunted.
+    // ponytail: VIA and the app run as kithd's user, in a process group of their own that is
+    // killed as one when the tunnel ends. A program that leaves the group (a daemon that
+    // makes its own session) is not hunted: a cgroup for each run would catch it.
+    // ponytail: a tunnel whose far end vanishes without a word (a node powered off) is
+    // noticed only when something is written to it: an idle app stays until then, or until
+    // kithd stops. Keepalive on the nodes' connections would end it.
     fn start(node: &str, spec: &Spec) -> Result<App, String> {
         let via = spec.via.as_deref().unwrap_or("waypipe");
         let dir = Dir::make()?;
@@ -337,12 +345,14 @@ impl App {
             .args(&spec.argv)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
+            .process_group(0)
             .kill_on_drop(true);
         let child = command.spawn().map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => format!("{via} is not installed on node {node} (kith does not ship it)"),
             _ => format!("cannot start {via} on node {node}: {e}"),
         })?;
         Ok(App {
+            group: child.id().and_then(|pid| i32::try_from(pid).ok()),
             child,
             listener,
             _dir: dir,
@@ -361,7 +371,23 @@ impl App {
         if let Some((connection, _)) = connected {
             join(stop, tunnel, connection).await;
         }
+        self.end();
         drop(self.child.kill().await);
+    }
+
+    /// Kill VIA, the app and what the app started, while VIA (not yet waited for) still holds
+    /// the group's number.
+    fn end(&mut self) {
+        if let Some(group) = self.group.take() {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(group), nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+}
+
+/// (An app whose tunnel never came up: the upgrade failed, kithd is stopping.)
+impl Drop for App {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -468,14 +494,8 @@ spec: {role: other-jobber, subjects: [carol]}
                 b_port,
                 ca,
             };
-            let source = |name: &str, labels: &str| {
-                format!(
-                    "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}, labels: {{{labels}}}}}\nspec: {{}}\n"
-                )
-            };
             world.node("a", "", Some(a_port));
             world.node("b", "role: display", Some(b_port));
-            let _ = source;
             let mut state = world.a.store.lock().unwrap();
             for resource in kith_api::Resource::from_source(ROLES).unwrap() {
                 state.store.apply(resource.unwrap()).unwrap();
@@ -564,7 +584,8 @@ spec: {role: other-jobber, subjects: [carol]}
     async fn tunnel_to(on: &str) {
         let world = World::new(&format!("tunnel-{on}")).await;
         let alice = world.user("alice");
-        let line = "echo \"$1:$PPID:$KITH_TEST_SOCKET\"; read line; echo \"$1:$line\"; read line";
+        // (The app's own pid: it stays after its input ends, so only being killed ends it.)
+        let line = "echo \"$1:$$:$KITH_TEST_SOCKET\"; read line; echo \"$1:$line\"; read line; exec sleep 300";
         let argv = ["sh", "-c", line, "sh", "two words; $(touch pwned)"];
         let spec = json!({"on": on, "via": stand_in(), "argv": argv});
         let tunnel = tunnel(&alice, world.a_port, "/v1/run", spec).await.unwrap();
@@ -602,7 +623,7 @@ spec: {role: other-jobber, subjects: [carol]}
         // Either end closing ends the app, which is waited for, and the directory goes.
         drop(tunnel);
         assert!(gone(&dir.display().to_string()).await, "the directory stays");
-        assert!(gone(&format!("/proc/{pid}")).await, "the program stays");
+        assert!(gone(&format!("/proc/{pid}")).await, "the app stays");
     }
 
     #[tokio::test]
@@ -616,7 +637,7 @@ spec: {role: other-jobber, subjects: [carol]}
     }
 
     #[tokio::test]
-    async fn run_on_refuses_a_caller_who_may_not_apply_jobs_before_anything_starts() {
+    async fn run_on_refuses_a_caller_who_may_not_exec_on_nodes_before_anything_starts() {
         let world = World::new("refused").await;
         let spec = json!({"on": "b", "via": stand_in(), "argv": ["true"]});
         let bob = world.user("bob");

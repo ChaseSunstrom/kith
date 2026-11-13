@@ -11,7 +11,7 @@
 //!                                                -> {data, next, more}
 //! GET    /v1/watch[?after=G&kind=Kind&wait=S]    -> {generation, resources}
 //! GET    /v1/audit[?tail=LINES]                  -> [{at, who, verb, what, ok, error}]
-//! POST   /v1/run {on, via?, argv, namespace?}    -> 101, then a byte tunnel (see `run.rs`)
+//! POST   /v1/run {on, via?, argv}                -> 101, then a byte tunnel (see `run.rs`)
 //! ```
 //! Every handler takes the [`Caller`] and asks what it may do (`access.rs`): an
 //! Identity gets 403 with the reason, and lists only what it may see. Changes, and

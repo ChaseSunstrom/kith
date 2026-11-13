@@ -92,7 +92,9 @@ fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<UnixStream, String> {
     let _ = stream.read_exact(&mut body);
     let said = serde_json::from_slice::<serde_json::Value>(&body).ok();
     let said = said.as_ref().and_then(|m| m["error"].as_str()).map(String::from);
-    fail(said.unwrap_or_else(|| head.lines().next().unwrap_or("kithd refused").to_string()))
+    let said = said.unwrap_or_else(|| head.lines().next().unwrap_or("kithd refused").to_string());
+    // (What another node said is passed on as it came: nothing of it steers this terminal.)
+    fail(said.chars().filter(|c| !c.is_control()).collect::<String>())
 }
 
 pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {

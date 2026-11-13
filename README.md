@@ -991,8 +991,13 @@ by name, that has them. `--via` names the program that carries the window (defau
 - **How:** the `kith` command asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app
   there with `waypipe --socket S server -- APP…`, S in a private (0700) directory with a name
   nobody can guess, and joins it to the tunnel; `kith` runs `waypipe --socket L client` and
-  joins L to the other end. Either end closing ends the app, which is killed and waited for.
-- Not yet: one `kith run` carries one connection of the app; the app's exit status is not
+  joins L to the other end. Either end closing kills the carrier, the app
+  and what the app started (their process group).
+- The command line is written to the audit log as it is: do not pass a secret on it.
+  A node of the cluster is trusted by the others: the node you ask tells the other who
+  asked, and the other runs it.
+- Not yet: a node that vanishes without a word (powered off) leaves an idle app running
+  on the other until something is written to it; one `kith run` carries one connection of the app; the app's exit status is not
   returned; an interrupt (Ctrl-C) leaves an empty directory in the temp dir.
 
 ## Web UI
