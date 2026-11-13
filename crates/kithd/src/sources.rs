@@ -116,6 +116,50 @@ pub async fn outward(url: &str) -> Fallible<Vec<String>> {
     Ok(vec![format!("{host}:{port}:{}", all.join(","))])
 }
 
+/// The addresses the cluster's Nodes say they are at (`status.address`), as [`run`] last
+/// read them.
+static NODES: std::sync::Mutex<Vec<std::net::IpAddr>> = std::sync::Mutex::new(Vec::new());
+
+/// Is this an address one of this machine's cards has, or one a Node of the cluster
+/// says it is at, public ones included?
+//
+// ponytail: neither set is seen through 6to4 or NAT64, a public address that a NAT in
+// front of this machine holds for it is known only if a Node advertises it, and a Node
+// that joins during a round of fetches is known from the next round on.
+fn ours(ip: std::net::IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let has = |card: nix::ifaddrs::InterfaceAddress| {
+        let address = card.address?;
+        let v4 = address.as_sockaddr_in().map(|at| std::net::IpAddr::from(at.ip()));
+        let v6 = address
+            .as_sockaddr_in6()
+            .map(|at| std::net::IpAddr::from(at.ip()).to_canonical());
+        Some(v4.or(v6)? == ip)
+    };
+    let mut cards = nix::ifaddrs::getifaddrs().into_iter().flatten();
+    cards.any(|card| has(card) == Some(true))
+        || NODES
+            .lock()
+            .expect("nothing panics holding the Nodes' addresses")
+            .contains(&ip)
+}
+
+/// Read where the Nodes say they are (a name is looked up) for [`ours`].
+async fn nodes(shared: &Shared) {
+    let said: Vec<String> = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let at = |node: &Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
+        state.store.list(Some("Node")).filter_map(at).collect()
+    };
+    let mut found = Vec::new();
+    for at in said {
+        if let Ok(Ok(all)) = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(at)).await {
+            found.extend(all.map(|at| at.ip().to_canonical()));
+        }
+    }
+    *NODES.lock().expect("nothing panics holding the Nodes' addresses") = found;
+}
+
 #[cfg(test)]
 thread_local! {
     /// For a test whose "outside" server is on this machine: its own thread takes loopback for outside.
@@ -149,6 +193,7 @@ pub async fn vetted(url: &str) -> Fallible<(String, u16, Vec<std::net::SocketAdd
         Ok(found) => found.collect(),
         Err(e) => return Err(format!("{host}: {e}")),
     };
+    let inward = |ip: std::net::IpAddr| inward(ip) || ours(ip);
     #[cfg(test)]
     let inward = |ip: std::net::IpAddr| inward(ip) && !(ip.is_loopback() && LOOPBACK_IS_OUTSIDE.get());
     match found.is_empty() || found.iter().any(|address| inward(address.ip())) {
@@ -714,6 +759,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
     loop {
         let metrics = shared.raft.metrics().borrow().clone();
         let mut next = Duration::from_secs(INTERVAL);
+        nodes(&shared).await;
         if metrics.current_leader == Some(metrics.id) {
             let sources: Vec<(String, Value)> = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
@@ -883,6 +929,13 @@ mod tests {
             outward("https://8.8.8.8:8443/x").await,
             Ok(vec!["8.8.8.8:8443:8.8.8.8".to_string()])
         );
+        // A Node's public address, and this machine's own (whatever a socket binds to).
+        assert!(outward("https://8.8.4.4/x").await.is_ok());
+        NODES.lock().unwrap().push("8.8.4.4".parse().unwrap());
+        assert!(outward("https://8.8.4.4/x").await.is_err());
+        assert!(outward("https://[::ffff:8.8.4.4]/x").await.is_err());
+        NODES.lock().unwrap().clear();
+        assert!(ours("127.0.0.1".parse().unwrap()) && !ours("8.8.8.8".parse().unwrap()));
         assert_eq!(super::at("2001:db8::1".parse().unwrap()), "[2001:db8::1]");
         assert!(
             pinnable("git version 2.37.0") && pinnable("git version 3.0.1") && pinnable("git version 2.56.0.windows.1")

@@ -496,7 +496,9 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   and writes no file over 256 MB; a repository that takes more is dropped.
 - Only a Source in `kith-system` is fetched over `ssh://` (it is the node's
   own keys that open the door) or from this node and its own networks
-  (loopback, private, link-local and shared addresses, by whatever name).
+  (loopback, private, link-local and shared addresses, by whatever name;
+  any address one of this machine's cards has or a Node of the cluster
+  advertises too).
   Any other Source is fetched from the very address that was checked: a name
   that answers differently a moment later, or a redirect, leads nowhere else
   (git follows none and needs to be 2.37 or newer; a registry's redirects
