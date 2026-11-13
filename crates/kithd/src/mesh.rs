@@ -35,7 +35,7 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn key_of(hex: &str) -> Option<Key> {
+pub(crate) fn key_of(hex: &str) -> Option<Key> {
     let byte = |at: usize| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok();
     let bytes: Vec<u8> = (0..32).map_while(byte).collect();
     bytes.try_into().ok().filter(|_| hex.len() == 64)
@@ -72,6 +72,43 @@ fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
     Ok(key)
 }
 
+/// For a node about to join as one that roams: its interface, up before it is a member, and
+/// the public key the cluster is to know it by (hex). The cluster's addresses come from its
+/// CA, which the join `token` names.
+pub fn key_before_joining(options: &Options, token: &str, name: &str) -> Result<String, String> {
+    let (_, pinned) = crate::pki::token_parts(token)?;
+    let address = kith_mesh::node_address(kith_mesh::prefix(pinned.as_bytes()), name);
+    let up = private_key(&options.key).and_then(|key| {
+        let mut device = Device::ensure(&options.interface, &key, options.port, address)?;
+        device.public_key()
+    });
+    let hint = "--roaming takes the mesh: the kernel's WireGuard and CAP_NET_ADMIN";
+    up.map(|key| hex(&key)).map_err(|e| format!("no mesh: {e} ({hint})"))
+}
+
+/// Where the peers a roaming node was told of as it joined are kept: who to call before
+/// the store (which comes over the mesh) has arrived.
+pub fn first_peers(key: &std::path::Path) -> PathBuf {
+    key.with_file_name("mesh-peers.json")
+}
+
+fn told(path: &std::path::Path) -> Vec<Member> {
+    let read = std::fs::read(path)
+        .ok()
+        .and_then(|text| serde_json::from_slice::<Vec<Value>>(&text).ok());
+    let member = |peer: Value| {
+        Some(Member {
+            name: peer["name"].as_str()?.to_string(),
+            key: key_of(peer["key"].as_str()?)?,
+            endpoint: peer["endpoint"].as_str()?.parse().ok(),
+            edge: false,
+            reached: true,
+            direct_only: false,
+        })
+    };
+    read.unwrap_or_default().into_iter().filter_map(member).collect()
+}
+
 /// The other nodes as the mesh sees them. `shook` has, for the interface's peers, how
 /// long ago each last agreed on keys; `known` remembers since when each has been a peer
 /// (one that is new has its three minutes to answer).
@@ -95,9 +132,14 @@ fn members(
         Some(Member {
             name: node.metadata.name.clone(),
             key,
-            endpoint: at.map(|at| SocketAddr::new(at.ip(), port)),
+            // A node that roams is wherever it last called from: the interface keeps that
+            // address by itself, and an address from the store would put it back where it was.
+            endpoint: at
+                .filter(|_| node.spec["roaming"] != true)
+                .map(|at| SocketAddr::new(at.ip(), port)),
             edge: roles.is_some_and(|roles| roles.contains(&"edge".into())),
             reached: fresh || now.saturating_duration_since(since) < QUIET,
+            direct_only: node.spec["mesh"]["relay"] == "never",
         })
     };
     let mut members: Vec<Member> = store.list(Some("Node")).filter_map(member).collect();
@@ -130,6 +172,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     eprintln!("kithd: mesh address {address} on {}", options.interface);
     let mine = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port });
     let node = format!("Node/{me}");
+    let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();
     let mut generation = shared.generation.subscribe();
     let mut warned = false;
@@ -145,7 +188,12 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
-            let members = members(&state.store, &shook, &mut known, Instant::now());
+            let mut members = members(&state.store, &shook, &mut known, Instant::now());
+            // (Until the store says who the nodes are: those this node was told of as it joined.)
+            // Once it does, they are forgotten: a node that has left since is not called for ever.
+            let nobody = members.iter().all(|member| member.name == me);
+            let more: Vec<Member> = first.iter().filter(|peer| nobody && peer.name != me).cloned().collect();
+            members.extend(more);
             let edge = members.iter().any(|member| member.name == me && member.edge);
             let services = crate::services::addresses(&state.store, prefix);
             (members, said, edge, services.into_values().collect())
@@ -182,6 +230,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                 "address": kith_mesh::node_address(prefix, &member.name).to_string(),
                 "handshake": shook.get(&member.key).copied().flatten().map(|ago| ago.as_secs()),
                 "relayed": peer.allowed.is_empty(),
+                "reached": member.reached,
             }))
         };
         let paths: Vec<Value> = members.iter().filter_map(path).collect();

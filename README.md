@@ -186,6 +186,40 @@ kith node status                                   # who leads the store, who vo
   removes the interface when it stops. `sh ci/mesh_rtt.sh` measures what the
   mesh adds to a round trip between two namespaces on a veth (not a LAN): +0.08 to
   +0.15 ms over the veth's 0.03 ms in five runs here, against the plan's 0.3 ms.
+- A laptop is a node that comes and goes. Join it as one:
+
+  ```sh
+  kithd --join HOME:7443 --token "$(…)" --mesh --roaming
+  ```
+
+  It tells the cluster its mesh key as it joins and is told which nodes to
+  call; from then on the cluster talks to it at its mesh address, through the
+  tunnel the laptop opens from wherever it is, not at the address it joined
+  from. A roaming node never starts to vote (it leaving must not cost the
+  cluster its majority), and what it runs stays its own however long it is
+  away: nothing is started elsewhere after `--lost-after`, and nothing new is
+  placed on it until it is back. That is for ever: for a laptop that is gone
+  for good, `kith delete node/NAME`, or take `roaming` off its Node. (`spec.roaming: true` on the Node; a node
+  that joined without the flag keeps the address it joined with.)
+
+  For this the laptop has to be able to call at least one node directly: one
+  with a public address, or with UDP port 51820 forwarded to it at home. Two
+  nodes that are both behind NAT only meet through an edge node (no hole
+  punching yet), and an edge node sees what it passes on. If that is not
+  acceptable, say so on the Node:
+
+  ```yaml
+  spec:
+    roaming: true
+    mesh: { relay: never }   # straight to the other node, or not at all
+  ```
+
+  Its traffic is then never passed on by an edge node, whichever end asks: a
+  peer it cannot reach directly is unreachable until it can. `kith node
+  status` says of each peer whether it is `direct`, `through an edge node` or
+  `unreachable`. The tunnels are WireGuard between the two nodes' own keys,
+  which never leave them, and what goes through them between kithds is TLS
+  with the cluster's certificates as well.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers

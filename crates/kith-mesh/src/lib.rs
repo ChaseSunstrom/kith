@@ -86,6 +86,8 @@ pub struct Member {
     pub edge: bool,
     /// False once it should have answered directly and has not for some minutes.
     pub reached: bool,
+    /// Its traffic is never to go through an edge node.
+    pub direct_only: bool,
 }
 
 /// A peer as the interface should have it.
@@ -111,7 +113,9 @@ pub struct Peer {
 pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
     let others = || members.iter().filter(|member| member.name != me);
     let relay = others().find(|member| member.edge && member.reached);
-    let through = |member: &Member| relay.filter(|_| !member.reached);
+    // (Either end may say so: one that is not reached then has no path until it answers.)
+    let mine = members.iter().any(|member| member.name == me && member.direct_only);
+    let through = |member: &Member| relay.filter(|_| !member.reached && !member.direct_only && !mine);
     let peer = |member: &Member| {
         let mut allowed = Vec::new();
         if through(member).is_none() {
@@ -136,7 +140,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addresses_and_peers() {
+    fn addresses_peers_and_relay() {
         // One cluster, one /48; one node, one /80 in it; both the same whoever works it out.
         let mesh = prefix(b"some cluster's CA");
         assert_eq!(mesh.segments()[0] >> 8, 0xfd);
@@ -161,6 +165,7 @@ mod tests {
             endpoint: Some(([10, 0, 0, name.as_bytes()[0]], 51820).into()),
             edge,
             reached,
+            direct_only: false,
         };
         let nets = |peers: &[Peer]| -> Vec<(u8, Vec<Ipv6Addr>)> {
             let of = |peer: &Peer| (peer.key[0], peer.allowed.clone());
@@ -182,6 +187,17 @@ mod tests {
         // The edge node itself has nobody to go through: everyone keeps their own.
         let peers = wanted(mesh, "b", &lost);
         assert_eq!(nets(&peers), [(b'a', vec![a]), (b'c', vec![node_net(mesh, "c")])]);
+        // c will not be relayed: it keeps its own /80 (tried directly, reached or not), and
+        // the edge node gets none of it. The same when it is a who says so.
+        let direct = |name: &str, reached| Member {
+            direct_only: true,
+            ..member(name, false, reached)
+        };
+        let never = [all[0].clone(), all[1].clone(), direct("c", false)];
+        let unrelayed = [(b'b', vec![b]), (b'c', vec![node_net(mesh, "c")])];
+        assert_eq!(nets(&wanted(mesh, "a", &never)), unrelayed);
+        let mine = [direct("a", true), all[1].clone(), member("c", false, false)];
+        assert_eq!(nets(&wanted(mesh, "a", &mine)), unrelayed);
         // No edge node that answers: nothing to go through, c keeps its own.
         let alone = [all[0].clone(), member("b", true, false), member("c", false, false)];
         let peers = wanted(mesh, "a", &alone);

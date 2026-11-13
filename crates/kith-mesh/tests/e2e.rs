@@ -42,6 +42,7 @@ fn tool(args: &[&str]) {
                     endpoint: part[2].parse().ok(),
                     edge: part[3] == "1",
                     reached: part[4] == "1",
+                    direct_only: false,
                 }
             };
             let members: Vec<Member> = members.iter().map(member).collect();

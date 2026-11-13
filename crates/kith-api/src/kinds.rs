@@ -174,9 +174,26 @@ spec! {
         /// Cordoned: no new workloads are placed here.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub unschedulable: Option<bool>,
+        /// It comes and goes (a laptop): it does not start to vote, peers reach it wherever
+        /// it last called from (they keep no address for it: it calls them), and what it runs
+        /// is never started elsewhere, however long it is away. Take this off a node that is
+        /// gone for good, or delete the node.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub roaming: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub mesh: Option<NodeMesh>,
     }
 
     pub enum NodeRole { Voter, Worker, Edge }
+
+    pub struct NodeMesh {
+        /// `never`: this node's traffic goes straight to the other node or not at all,
+        /// never through an edge node (which would see it). Defaults to `auto`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub relay: Option<Relay>,
+    }
+
+    pub enum Relay { Auto, Never }
 
     pub struct Taint {
         pub key: String,

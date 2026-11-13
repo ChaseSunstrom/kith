@@ -281,7 +281,12 @@ async fn certificate(
     shared.audit.record(&caller, "certificate", vec![key_of], said);
     done.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let ca = cluster.me.ca.clone();
-    Ok(Json(Joined { ca, cert, key }))
+    Ok(Json(Joined {
+        ca,
+        cert,
+        key,
+        peers: Vec::new(),
+    }))
 }
 
 /// Who leads the store and who votes, as this node sees it. Nodes are named where a
@@ -340,6 +345,16 @@ struct JoinRequest {
     name: String,
     /// The port the new node serves its API on, at the address this request comes from.
     port: u16,
+    /// From a node that roams: it is to be reached on the mesh, and this is its key there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mesh: Option<OnMesh>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct OnMesh {
+    /// The public key, in hex.
+    pub key: String,
+    pub port: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -347,6 +362,10 @@ pub struct Joined {
     pub ca: String,
     pub cert: String,
     pub key: String,
+    /// For a node that roams: the nodes on the mesh (`name`, `key`, `endpoint`), to call
+    /// before it has the store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<serde_json::Value>,
 }
 
 fn node_key(name: &str) -> String {
@@ -423,24 +442,89 @@ async fn join(
         );
         return Err(refuse(StatusCode::CONFLICT, why));
     }
+    // A node that roams is reached on the mesh, wherever it is: the nodes it can call there.
+    let mesh_address = kith_mesh::node_address(crate::mesh::prefix(&cluster.me.ca), &request.name);
+    let peers: Vec<serde_json::Value> = if let Some(said) = &request.mesh {
+        if crate::mesh::key_of(&said.key).is_none() || said.port == 0 {
+            return Err(refuse(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "that is not a mesh key and port",
+            ));
+        }
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        // (Two nodes with one key are both left out of the mesh: a key that is taken is refused.)
+        let has = |node: &kith_api::Resource| {
+            node.status
+                .as_ref()
+                .is_some_and(|status| status["mesh"]["key"] == *said.key)
+        };
+        if store.store.list(Some("Node")).any(has) {
+            return Err(refuse(
+                StatusCode::CONFLICT,
+                "a node of this cluster already has that mesh key",
+            ));
+        }
+        let peer = |node: &kith_api::Resource| {
+            let status = node.status.as_ref()?;
+            let at: SocketAddr = status["address"].as_str()?.parse().ok()?;
+            let port = u16::try_from(status["mesh"]["port"].as_u64()?).ok()?;
+            let (name, key) = (&node.metadata.name, status["mesh"]["key"].as_str()?);
+            let stays = node.spec["roaming"] != true;
+            stays.then(|| serde_json::json!({ "name": name, "key": key, "endpoint": SocketAddr::new(at.ip(), port) }))
+        };
+        store.store.list(Some("Node")).filter_map(peer).collect()
+    } else {
+        Vec::new()
+    };
+    if request.mesh.is_some() && peers.is_empty() {
+        let why = "no node of this cluster is on the mesh (--mesh), and a node that roams is reached there";
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
     let (cert, key) = ca
         .issue(&request.name)
         .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let address = SocketAddr::new(peer.addr.ip(), request.port).to_string();
+    let unavailable = |e| refuse(StatusCode::SERVICE_UNAVAILABLE, e);
+    let address = match &request.mesh {
+        None => SocketAddr::new(peer.addr.ip(), request.port).to_string(),
+        Some(said) => {
+            // Its Node says so before anything is sent to it: the other nodes take it as a
+            // peer by this key, and it calls them.
+            let node = serde_json::json!({
+                "apiVersion": kith_api::API_VERSION, "kind": "Node",
+                "metadata": { "name": request.name }, "spec": { "roaming": true },
+            });
+            let resources = vec![serde_json::from_value(node).expect("a Node with a valid name")];
+            let at = kith_api::store::now();
+            shared
+                .submit(Command::Apply { resources, at })
+                .await
+                .map_err(unavailable)?;
+            let mesh = serde_json::json!({ "key": said.key, "address": mesh_address.to_string(), "port": said.port });
+            let fields = serde_json::Map::from_iter([("mesh".to_string(), mesh)]);
+            let statuses = vec![(node_key(&request.name), fields)];
+            shared.submit(Command::Patch { statuses }).await.map_err(unavailable)?;
+            SocketAddr::new(mesh_address.into(), request.port).to_string()
+        }
+    };
     register(&shared, &request.name, &address, kith_store::node_id(&request.name))
         .await
-        .map_err(|e| refuse(StatusCode::SERVICE_UNAVAILABLE, e))?;
+        .map_err(unavailable)?;
     cluster.tokens.good(&request.token, true);
-    eprintln!("kithd: node {} joined from {address}", request.name);
+    eprintln!(
+        "kithd: node {} joined from {}, to be reached at {address}",
+        request.name,
+        peer.addr.ip()
+    );
     Ok(Json(Joined {
         ca: ca.cert.clone(),
         cert,
         key,
+        peers,
     }))
 }
 
 /// Trade a join token for an identity, at the node `address`.
-pub async fn request_join(address: &str, token: &str, name: &str, port: u16) -> Fallible<Joined> {
+pub async fn request_join(address: &str, token: &str, name: &str, port: u16, mesh: Option<OnMesh>) -> Fallible<Joined> {
     pki::valid_name(name)?;
     let (_, pinned) = pki::token_parts(token)?;
     let failed = |what: &str, e: reqwest::Error| format!("{what} {address}: {e}");
@@ -464,6 +548,7 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16) -> 
         token: token.trim().into(),
         name: name.into(),
         port,
+        mesh,
     };
     let member = client(&ca, None)?
         .post(format!("https://{address}/v1/join"))

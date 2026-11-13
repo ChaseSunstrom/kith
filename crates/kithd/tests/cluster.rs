@@ -517,6 +517,89 @@ fn node_workload_runs_on_every_matching_node() {
     });
 }
 
+/// A node that joins as one that roams (a laptop): the cluster is told its mesh key as it
+/// joins and writes it down at its mesh address, it is told who to call, and the store then
+/// comes to it over the mesh, not at the address it happened to join from.
+#[test]
+fn roaming_node_is_sent_the_store_over_the_mesh() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
+        let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
+        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+            return eprintln!("skipped: no unprivileged user namespaces here (unshare -Urn)");
+        }
+        let me = std::env::current_exe().unwrap();
+        let again = "ip link set lo up && KITH_IN_NAMESPACE=1 exec \"$0\" --exact roaming_node_is_sent_the_store_over_the_mesh --nocapture";
+        let status = unshare(&["sh", "-c", again, me.to_str().unwrap()]).unwrap();
+        assert!(status.success(), "the test failed inside its namespace");
+        return;
+    }
+    let ports = (free_port().to_string(), free_port().to_string());
+    let alpha = Node::start(
+        "roaming",
+        "alpha",
+        &["--mesh", &ports.0, "--mesh-interface", "kith-alpha"],
+    );
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    // (Nobody on the mesh yet, nobody to call: said, not left to time out.)
+    wait_for("alpha to be on the mesh", || {
+        alpha.ok(&["get", "node/alpha", "-o", "json"]).contains("\"mesh\"")
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let join = ["--join", &alpha.address(), "--token", token.trim(), "--roaming"];
+    let mesh = ["--mesh", &ports.1, "--mesh-interface", "kith-roam"];
+    let args = [&join[..], &mesh[..]].concat();
+    let laptop = Node::start_in(None, "[::]", free_port(), "roaming", "laptop", &args);
+
+    // It has the store: sent to its mesh address, which is where its Node says it is.
+    wait_for("the laptop to be sent the store", || {
+        laptop.kith(&["get", "node"]).0 == 0 && laptop.nodes().len() == 2
+    });
+    let node: serde_json::Value = serde_json::from_str(&alpha.ok(&["get", "node/laptop", "-o", "json"])).unwrap();
+    assert_eq!(node["spec"]["roaming"], true, "{node}");
+    let address = node["status"]["address"].as_str().unwrap();
+    assert!(
+        address.starts_with("[fd") && address.ends_with(&format!("]:{}", laptop.port)),
+        "{address}"
+    );
+    let status = alpha.ok(&["node", "status"]);
+    let line = status.lines().find(|line| line.starts_with("mesh:      laptop at fd"));
+    assert!(line.is_some_and(|line| line.ends_with(", direct")), "{status}");
+    // And goes on having it: a change made on alpha arrives.
+    let made = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: seen }\nspec: { data: { a: b } }\n";
+    std::fs::write(alpha.dir.join("seen.yaml"), made).unwrap();
+    alpha.ok(&["apply", "-f", "seen.yaml"]);
+    wait_for("the change to reach the laptop", || {
+        laptop.kith(&["get", "configmap/seen"]).0 == 0
+    });
+    // It does not vote, though it has all of the store.
+    let cluster = alpha.ok(&["node", "status"]);
+    assert!(
+        !cluster
+            .lines()
+            .any(|line| line.starts_with("voters") && line.contains("laptop")),
+        "{cluster}"
+    );
+    // A node that comes with the laptop's mesh key is refused: two with one key would
+    // both be cut off.
+    let twin = Path::new(env!("CARGO_TARGET_TMPDIR")).join("roaming").join("twin");
+    let _ = std::fs::remove_dir_all(&twin);
+    std::fs::create_dir_all(twin.join("state/pki")).unwrap();
+    let key = "state/pki/mesh.key";
+    std::fs::copy(laptop.dir.join(key), twin.join(key)).unwrap();
+    let mesh = ["--mesh", &free_port().to_string(), "--mesh-interface", "kith-twin"];
+    let args = [&join[..], &mesh[..]].concat();
+    let mut child = Node::spawn_in(None, "[::]", &twin, "twin", free_port(), &args);
+    assert!(
+        !child.wait().unwrap().success(),
+        "a second node with the laptop's key joined"
+    );
+    assert_ne!(alpha.kith(&["get", "node/twin"]).0, 0);
+}
+
 /// Two nodes with the mesh on, in a network namespace of their own (this test runs itself
 /// again inside one, where it may make interfaces): each learns the other's key from the
 /// store, they shake hands, and a node that stops takes its interface with it.
@@ -818,4 +901,54 @@ fn rig_nat_node_joins_and_meshes() {
     // No private address reaches in from outside the NAT.
     assert!(!rig.pings("alpha", "192.168.3.2") && !rig.pings("beta", "192.168.3.2"));
     assert!(rig.pings("gamma", "10.0.1.2"));
+}
+
+/// A laptop behind a NAT, with nothing let in to it: it joins as a node that roams, is sent
+/// the store through the tunnel it opened, and still is after it moves (another address
+/// behind the NAT, another one in front of it).
+#[test]
+fn roaming_laptop_behind_nat_keeps_the_store_when_it_moves() {
+    if !in_rig("roaming_laptop_behind_nat_keeps_the_store_when_it_moves") {
+        return;
+    }
+    let rig = Rig::new(&[("alpha", false), ("laptop", true)]);
+    let test = "roaming_nat";
+    let alpha = rig.start(test, "alpha", None, &["--mesh", "51820"]);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    wait_for("alpha to be on the mesh", || {
+        alpha.ok(&["get", "node/alpha", "-o", "json"]).contains("\"mesh\"")
+    });
+    let token = alpha.ok(&["node", "token"]);
+    // (Not the port the rig lets in to a node behind its NAT: nothing reaches this one.)
+    let args = [
+        "--join",
+        &alpha.address(),
+        "--token",
+        token.trim(),
+        "--mesh",
+        "51820",
+        "--roaming",
+    ];
+    let laptop = Node::start_in(Some("laptop"), "[::]", RIG_PORT + 1, test, "laptop", &args);
+    wait_for("the laptop to be sent the store", || {
+        laptop.kith(&["get", "node"]).0 == 0 && laptop.nodes().len() == 2
+    });
+    let address = &alpha.nodes()[1].1;
+    assert!(address.starts_with("[fd"), "{address}");
+
+    // It moves: its own address changes, and so does the one the world sees it at.
+    sh("ip -n laptop addr add 192.168.2.7/24 dev e0");
+    sh("ip -n laptop addr del 192.168.2.2/24 dev e0");
+    sh("ip -n laptop route replace default via 192.168.2.1");
+    sh("ip addr add 10.0.0.9/32 dev lo");
+    sh("iptables -t nat -R POSTROUTING 1 -s 192.168.2.0/24 ! -o r2 -j SNAT --to-source 10.0.0.9");
+    let made = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: later }\nspec: { data: { a: b } }\n";
+    std::fs::write(alpha.dir.join("later.yaml"), made).unwrap();
+    alpha.ok(&["apply", "-f", "later.yaml"]);
+    wait_for("a change made after the move to reach the laptop", || {
+        laptop.kith(&["get", "configmap/later"]).0 == 0
+    });
+    let status = alpha.ok(&["node", "status"]);
+    let line = status.lines().find(|line| line.starts_with("mesh:      laptop at fd"));
+    assert!(line.is_some_and(|line| line.ends_with(", direct")), "{status}");
 }

@@ -274,6 +274,7 @@ fn next_change(
     voters: &BTreeSet<NodeId>,
     current: &BTreeSet<NodeId>,
     lost: &BTreeSet<NodeId>,
+    roaming: &BTreeSet<NodeId>,
 ) -> Option<ChangeMembers<NodeId, BasicNode>> {
     let differ = |(id, node): &(&NodeId, &BasicNode)| known.get(id) != Some(node);
     let (changed, new): (BTreeMap<_, _>, BTreeMap<_, _>) = wanted
@@ -291,8 +292,13 @@ fn next_change(
     // lost comes last, so it votes on only while nobody is there to take its place. A node that
     // is not receiving the store (down, or it gave an address nobody can reach) must not
     // become a voter: with two such voters of three, nothing could be agreed again.
-    let target = if wanted.len() >= VOTERS { VOTERS } else { 1 };
-    let there = |id: &&NodeId| !lost.contains(id);
+    // A node that roams (a laptop) is as good as lost for this: it votes only if it leads
+    // or nobody else can, and the cluster is as large as the nodes that stay.
+    let staying = wanted.keys().filter(|id| !roaming.contains(id)).count();
+    // (Never fewer voters because a node was said to roam: those that vote go on, last in line.)
+    let enough = staying >= VOTERS || voters.len() >= VOTERS;
+    let target = if wanted.len() >= VOTERS && enough { VOTERS } else { 1 };
+    let there = |id: &&NodeId| !lost.contains(id) && !roaming.contains(id);
     let by_preference = [me]
         .into_iter()
         .chain(voters.iter().filter(there).copied())
@@ -358,7 +364,13 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         .filter(|(_, matched)| has_it(matched))
         .map(|(id, _)| *id)
         .collect();
-    let Some(mut change) = next_change(metrics.id, &wanted, &known, &voters, &current, &lost) else {
+    let roaming: BTreeSet<NodeId> = {
+        let store = shared.store.lock().expect("nothing panics holding the store");
+        let roams = |node: &&kith_api::Resource| node.spec["roaming"] == true;
+        let id = |node: &kith_api::Resource| node.status.as_ref()?["raftId"].as_str()?.parse().ok();
+        store.store.list(Some("Node")).filter(roams).filter_map(id).collect()
+    };
+    let Some(mut change) = next_change(metrics.id, &wanted, &known, &voters, &current, &lost, &roaming) else {
         return Ok(());
     };
     // Having the log says a node was there, not that it is: ask the ones about to vote.
@@ -376,7 +388,7 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
                 there.remove(id);
             }
         }
-        match next_change(metrics.id, &wanted, &known, &voters, &there, &lost) {
+        match next_change(metrics.id, &wanted, &known, &voters, &there, &lost, &roaming) {
             Some(with_those_there) => change = with_those_there,
             None => return Ok(()),
         }
@@ -395,13 +407,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn members_follow_the_nodes() {
+    fn members_follow_the_nodes_and_a_roaming_one_never_starts_to_vote() {
         let node = |n: u64| (n, BasicNode::new(format!("10.0.0.{n}:7443")));
         let nodes = |ids: &[u64]| ids.iter().map(|n| node(*n)).collect::<BTreeMap<_, _>>();
         let set = |ids: &[u64]| ids.iter().copied().collect::<BTreeSet<_>>();
         // Every known node has the store, unless said otherwise.
         let next = |wanted: &[u64], known: &[u64], voters: &[u64]| {
-            next_change(1, &nodes(wanted), &nodes(known), &set(voters), &set(known), &set(&[]))
+            next_change(
+                1,
+                &nodes(wanted),
+                &nodes(known),
+                &set(voters),
+                &set(known),
+                &set(&[]),
+                &set(&[]),
+            )
         };
         let voters = |ids: &[u64]| Some(ChangeMembers::ReplaceAllVoters(set(ids)));
 
@@ -425,41 +445,78 @@ mod tests {
         // A node that moved is told to the others.
         let mut moved = nodes(&[1, 2]);
         moved.insert(2, BasicNode::new("10.0.0.9:7443"));
-        let told = next_change(1, &moved, &nodes(&[1, 2]), &set(&[1]), &set(&[2]), &set(&[]));
+        let told = next_change(1, &moved, &nodes(&[1, 2]), &set(&[1]), &set(&[2]), &set(&[]), &set(&[]));
         let there = BTreeMap::from([(2, BasicNode::new("10.0.0.9:7443"))]);
         assert_eq!(told, Some(ChangeMembers::SetNodes(there)));
 
         // A node that does not have the store does not get to vote: not the dead one of
         // three, and not one of two while the third is still catching up.
         let all = nodes(&[1, 2, 3]);
-        assert_eq!(next_change(1, &all, &all, &set(&[1]), &set(&[]), &set(&[])), None);
-        assert_eq!(next_change(1, &all, &all, &set(&[1]), &set(&[3]), &set(&[])), None);
         assert_eq!(
-            next_change(1, &all, &all, &set(&[1]), &set(&[2, 3]), &set(&[])),
+            next_change(1, &all, &all, &set(&[1]), &set(&[]), &set(&[]), &set(&[])),
+            None
+        );
+        assert_eq!(
+            next_change(1, &all, &all, &set(&[1]), &set(&[3]), &set(&[]), &set(&[])),
+            None
+        );
+        assert_eq!(
+            next_change(1, &all, &all, &set(&[1]), &set(&[2, 3]), &set(&[]), &set(&[])),
             voters(&[1, 2, 3])
         );
         // With four, the three that have it; a voter that falls behind stays one.
         let four = nodes(&[1, 2, 3, 4]);
         assert_eq!(
-            next_change(1, &four, &four, &set(&[1]), &set(&[3, 4]), &set(&[])),
+            next_change(1, &four, &four, &set(&[1]), &set(&[3, 4]), &set(&[]), &set(&[])),
             voters(&[1, 3, 4])
         );
         assert_eq!(
-            next_change(1, &four, &four, &set(&[1, 2, 3]), &set(&[4]), &set(&[])),
+            next_change(1, &four, &four, &set(&[1, 2, 3]), &set(&[4]), &set(&[]), &set(&[])),
             None
         );
         // A voter that is lost gives way to a node that is there, and stays when there is none.
-        let lost = |current: &[u64]| next_change(1, &four, &four, &set(&[1, 2, 3]), &set(current), &set(&[2]));
+        // A node that roams does not start to vote, and does not count towards three:
+        // of three nodes with one roaming, one votes; of four, the three that stay.
+        let roams = |all: &BTreeMap<u64, BasicNode>, voters: &[u64], current: &[u64]| {
+            next_change(1, all, all, &set(voters), &set(current), &set(&[]), &set(&[3]))
+        };
+        assert_eq!(roams(&all, &[1], &[2, 3]), None);
+        assert_eq!(roams(&four, &[1], &[2, 3, 4]), voters(&[1, 2, 4]));
+        assert_eq!(roams(&four, &[1, 2, 3], &[2, 3, 4]), voters(&[1, 2, 4]));
+        // Saying that voters roam never leaves fewer of them: the leader (1) and 4, with
+        // only 2 and 3 staying, go on voting as three.
+        let leader = next_change(
+            1,
+            &four,
+            &four,
+            &set(&[1, 2, 3]),
+            &set(&[2, 3, 4]),
+            &set(&[]),
+            &set(&[1, 4]),
+        );
+        assert_eq!(leader, None);
+        let most = next_change(
+            1,
+            &all,
+            &all,
+            &set(&[1, 2, 3]),
+            &set(&[2, 3]),
+            &set(&[]),
+            &set(&[1, 2, 3]),
+        );
+        assert_eq!(most, None);
+        let lost =
+            |current: &[u64]| next_change(1, &four, &four, &set(&[1, 2, 3]), &set(current), &set(&[2]), &set(&[]));
         assert_eq!(lost(&[2, 3, 4]), voters(&[1, 3, 4]));
         assert_eq!(lost(&[2, 3]), None);
         assert_eq!(
-            next_change(1, &all, &all, &set(&[1, 2, 3]), &set(&[2, 3]), &set(&[2])),
+            next_change(1, &all, &all, &set(&[1, 2, 3]), &set(&[2, 3]), &set(&[2]), &set(&[])),
             None
         );
         // When a voter's Node is deleted and nobody is ready to take its place, two go on.
         let left = nodes(&[1, 3, 4]);
         assert_eq!(
-            next_change(1, &left, &four, &set(&[1, 2, 3]), &set(&[]), &set(&[])),
+            next_change(1, &left, &four, &set(&[1, 2, 3]), &set(&[]), &set(&[]), &set(&[])),
             voters(&[1, 3])
         );
     }

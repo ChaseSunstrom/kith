@@ -837,10 +837,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     Some(ago) => format!("handshake {ago} s ago"),
                     None => "no handshake yet".into(),
                 };
-                let how = if peer["relayed"] == true {
-                    ", through an edge node"
-                } else {
-                    ""
+                let how = match (peer["relayed"] == true, peer["reached"] == false) {
+                    (true, _) => ", through an edge node",
+                    (false, true) => ", unreachable",
+                    (false, false) => ", direct",
                 };
                 let (node, address) = (peer["node"].as_str(), peer["address"].as_str());
                 println!(

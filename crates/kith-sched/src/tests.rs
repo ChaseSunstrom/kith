@@ -16,6 +16,8 @@ fn node(name: &str, cpu: f64, mem_gi: f64) -> Node {
         extensions: vec![],
         reserved: None,
         unschedulable: None,
+        roaming: None,
+        mesh: None,
     };
     Node {
         name: name.into(),

@@ -83,6 +83,10 @@ struct Args {
     /// The name of the mesh's network interface
     #[arg(long, env = "KITH_MESH_INTERFACE", value_name = "NAME", default_value = "kith0")]
     mesh_interface: String,
+    /// With --join: this node comes and goes (a laptop). It is reached on the mesh wherever it is,
+    /// never votes, and what it runs is not started elsewhere while it is away
+    #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
+    roaming: bool,
     /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
     #[arg(long, env = "KITH_INGRESS", requires = "mesh")]
     ingress: bool,
@@ -97,6 +101,14 @@ struct Args {
         default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
     acme: Option<String>,
+}
+
+fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Options {
+    mesh::Options {
+        interface: args.mesh_interface.clone(),
+        port,
+        key: state.join("pki").join("mesh.key"),
+    }
 }
 
 /// What the API handlers and the controller share.
@@ -159,7 +171,15 @@ async fn membership(
     if known.is_none() && args.listen.is_none() && args.join.is_none() {
         return Ok((None, None));
     }
-    let listen = args.listen.unwrap_or(([0, 0, 0, 0], 7443).into());
+    // (A node that roams is called at its mesh address, which is an IPv6 one.)
+    // It joined as one if it was told whom to call first; that file stays.
+    let roams = args.roaming || mesh::first_peers(&dir.join("mesh.key")).exists();
+    let anywhere: std::net::IpAddr = if roams {
+        std::net::Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED.into()
+    };
+    let listen = args.listen.unwrap_or((anywhere, 7443).into());
     let tcp = tokio::net::TcpListener::bind(listen).await;
     let tcp = tcp.map_err(|e| format!("listening on {listen}: {e}"))?;
     if let Some((me, ca)) = known {
@@ -196,7 +216,28 @@ async fn membership(
             }
             let port = tcp.local_addr().map_err(|e| e.to_string())?.port();
             let token = args.token.as_deref().expect("clap requires --token with --join");
-            let joined = cluster::request_join(address, token, &name, port).await?;
+            let options = args
+                .mesh
+                .filter(|_| args.roaming)
+                .map(|port| mesh_options(args, state, port));
+            let mesh = match &options {
+                Some(options) => {
+                    let made = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
+                    made.map_err(|e| format!("creating {}: {e}", dir.display()))?;
+                    let key = mesh::key_before_joining(options, token, &name)?;
+                    Some(cluster::OnMesh {
+                        key,
+                        port: options.port,
+                    })
+                }
+                None => None,
+            };
+            let joined = cluster::request_join(address, token, &name, port, mesh).await?;
+            if let Some(options) = &options {
+                let peers = serde_json::to_vec(&joined.peers).expect("JSON values");
+                let path = mesh::first_peers(&options.key);
+                std::fs::write(&path, peers).map_err(|e| format!("writing {}: {e}", path.display()))?;
+            }
             eprintln!("kithd: joined the cluster of {address} as node {name}");
             let me = pki::Identity {
                 name,
@@ -430,12 +471,7 @@ fn run(args: Args) -> Result<(), String> {
         };
         let mesh = async {
             if let Some(port) = args.mesh {
-                let options = mesh::Options {
-                    interface: args.mesh_interface.clone(),
-                    port,
-                    key: state.join("pki").join("mesh.key"),
-                };
-                mesh::run(shared.clone(), options, stopping.clone()).await;
+                mesh::run(shared.clone(), mesh_options(&args, &state, port), stopping.clone()).await;
             }
         };
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();

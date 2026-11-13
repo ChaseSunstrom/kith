@@ -73,10 +73,20 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
     let node = |node: &Resource| {
         let (capacity, lost_for) = seen(&node.metadata.name);
         let (cpu, memory) = capacity.unwrap_or_default();
+        let spec = serde_json::from_value::<NodeSpec>(node.spec.clone()).ok()?;
+        // A node that roams is away, not lost, however long: it keeps what it runs and
+        // gets nothing new until it is back.
+        let lost_for = lost_for.map(|lost| {
+            if spec.roaming == Some(true) {
+                Duration::ZERO
+            } else {
+                lost
+            }
+        });
         Some(Node {
             name: node.metadata.name.clone(),
             labels: node.metadata.labels.clone(),
-            spec: serde_json::from_value::<NodeSpec>(node.spec.clone()).ok()?,
+            spec,
             capacity: Amount { cpu, memory },
             lost_for,
         })
@@ -248,7 +258,7 @@ spec:
 ";
 
     #[test]
-    fn replicas_are_bound_and_follow_the_nodes() {
+    fn replicas_follow_the_nodes_and_stay_on_a_roaming_one() {
         let mut store = Store::default();
         for resource in Resource::from_source(CLUSTER).unwrap() {
             store.apply(resource.unwrap()).unwrap();
@@ -297,6 +307,16 @@ spec:
             "{fields:?}"
         );
         assert_eq!(left, vec![]);
+        // Were b a node that roams (a laptop), it would be away, not lost: nothing moves.
+        let mut roams = store.clone();
+        let mut b = roams.get("Node/b").unwrap().clone();
+        b.spec["roaming"] = true.into();
+        roams.apply(b).unwrap();
+        let (fields, _) = plan(&roams, &lost(600), minutes(5));
+        assert!(
+            fields.iter().all(|(_, changed)| !changed.contains_key("nodes")),
+            "roaming: {fields:?}"
+        );
         let moved = plan(&store, &lost(6), minutes(5));
         write(&mut store, moved);
         let web = status(&store, "Workload/default/web");
