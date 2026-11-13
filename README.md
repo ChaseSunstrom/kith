@@ -261,11 +261,15 @@ kith node status                                   # who leads the store, who vo
   ingress sends it: a client inside the mesh that calls the Service gets
   none, so the backend has to take both. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
-  `expose.host` has to be a domain name (applying anything else is refused).
-  Two Services with one host: the first by key has it, and the other's
+  `expose.host` has to be a domain name a certificate authority issues for:
+  an IP address, a label that starts or ends with `-`, or a `_` is refused
+  when applied. Two Services with one host: the older has it, and the other's
   status says `expose: refused` and why. Each port takes 1024 connections at
-  a time (more are hung up on); one with no byte either way for 5 minutes on
-  443 is closed, and one on 80 after 30 seconds whatever it does.
+  a time, 64 of them from one source (an IPv4 address, or an IPv6 /64); more
+  are hung up on. One with no byte either way for 5 minutes on 443 is closed,
+  and one on 80 after 30 seconds whatever it does. Inside the mesh, a node
+  passes on 4096 connections to Services at a time (1024 for any one other
+  node), and one that is silent both ways for an hour is closed.
 
 Not yet: the nodes still talk to each other at their plain addresses, not
 over the mesh, workloads have no addresses on it, and two nodes that
@@ -954,10 +958,18 @@ changed after signing, and a file that is another version than the release
 says are all refused. The address may be plain HTTP for that reason: what
 comes from it is trusted for the signature alone.
 
-The key is the one the OSRelease names: nothing in a node says which keys it
-accepts, and an older version is taken as readily as a newer one. Whoever may
-apply an OSRelease and an UpdatePlan decides what every node runs, so give
-those two kinds to nobody who is not the cluster's admin.
+A node takes releases from its own keys only, whatever key an OSRelease
+names. Start kithd with `--release-key KEY` (or `KITH_RELEASE_KEY`, commas
+between several) to say which. Without one, the key of the first release a
+node updates to is kept in its state (`os-release-keys`), and a release signed
+by any other is refused from then on; to change keys, start the node with the
+new one (on kith OS: ` -- --release-key KEY` at the end of what its config
+partition says). A node with no state partition keeps nothing, so give it
+its key that way too. A release older than what a node runs is refused too, unless the
+plan says `allowDowngrade: true`. The file is fetched from the address the
+release names and nowhere else: a redirect is not followed. Even so, give
+OSRelease and UpdatePlan to nobody who is not the cluster's admin: they still
+decide when nodes restart, and what a node with no key yet takes first.
 
 The node that leads the cluster picks who goes next: nodes that do not vote
 on the store first, `maxUnavailable` at a time; then the voters, one at a

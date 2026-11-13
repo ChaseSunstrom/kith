@@ -42,6 +42,13 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, watch};
 
+/// A release key as an argument: an Ed25519 public key, 64 hex digits.
+fn release_key(key: &str) -> Result<String, String> {
+    let hex = key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+    hex.then(|| key.to_string())
+        .ok_or("not a key: 64 hex digits, as `kith package keygen` prints".into())
+}
+
 #[derive(Parser)]
 #[command(name = "kithd", version, about = "The kith node daemon")]
 struct Args {
@@ -84,6 +91,10 @@ struct Args {
     /// Seconds between asking registries for newer packages (for Releases that name a Repository)
     #[arg(long, env = "KITH_REPOSITORY_POLL", value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     repository_poll: u64,
+    /// A key (hex) this node takes kith OS releases from; repeat for more. Without one,
+    /// the key of the first release it updates to is kept, and only that one is taken after
+    #[arg(long, env = "KITH_RELEASE_KEY", value_name = "KEY", value_delimiter = ',', value_parser = release_key)]
+    release_key: Vec<String>,
     /// Let a Source name a git repository on this machine (`file://`): for tests
     #[arg(long, hide = true)]
     local_sources: bool,
@@ -568,7 +579,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());
             let controllers = controllers::run(shared.clone(), stopping.clone());
             let plans = update::run(shared.clone(), stopping.clone());
-            let system = update::node(shared.clone(), state.clone(), stopping.clone());
+            let system = update::node(
+                shared.clone(),
+                state.clone(),
+                args.release_key.clone(),
+                stopping.clone(),
+            );
             let key = async {
                 if let Some(((record, config), opened)) = sealed.zip(opened) {
                     crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;

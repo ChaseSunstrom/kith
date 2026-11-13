@@ -129,12 +129,12 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # Two releases, both signed: one that runs, and one whose root is not the one its
         # verity tree was made for. The nodes fetch them from this machine.
-        KITH_OS_VERSION=0.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
+        KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
         mkdir "$work/www"
         cp "$work/next/kith-os.update" "$work/www/next.update"
         cp "$work/next/root.squashfs" "$work/broken.root"
         dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
-        sh "$root/os/update.sh" 0.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
+        sh "$root/os/update.sh" 9.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
             "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
         public=$("$root/target/debug/kith" package keygen "$work/key")
         sign() { sh "$root/os/update.sh" --sign "$work/key" "$work/www/$1.update"; }
@@ -220,20 +220,20 @@ EOF
 
         # A release whose signature is another file's: the first node asked refuses it,
         # writes nothing, and the plan stops there.
-        release forged 0.0.0-next "$(sign broken)" next
+        release forged 9.0.0-next "$(sign broken)" next
         until_says "a release signed for another file refused" "^Paused 0 $was .*signature is not the release's key's"
         [ "$(starts 1 a)$(starts 2 a)$(starts 3 a)" = 111 ] || fail "a node restarted for a release it refused"
 
         # The release, signed: every node takes it, one at a time, and it is one cluster still.
-        release next 0.0.0-next "$(sign next)"
-        until_says "all three on the release" "^Done 0 0.0.0-next,0.0.0-next,0.0.0-next "
+        release next 9.0.0-next "$(sign next)"
+        until_says "all three on the release" "^Done 0 9.0.0-next,9.0.0-next,9.0.0-next "
         [ "$(starts 1 b)$(starts 2 b)$(starts 3 b)" = 111 ] || fail "not every node started its other slot once"
         ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
 
         # A release that cannot start: the first node tries it three times and is back on
         # what it ran; the plan is paused, and no other node is given it.
-        release broken 0.0.0-broken "$(sign broken)"
-        until_says "a release that cannot start stopped at the first node" "^Paused 0 0.0.0-next,0.0.0-next,0.0.0-next .* did not take 0.0.0-broken: it did not come up"
+        release broken 9.0.0-broken "$(sign broken)"
+        until_says "a release that cannot start stopped at the first node" "^Paused 0 9.0.0-next,9.0.0-next,9.0.0-next .* did not take 9.0.0-broken: it did not come up"
         # (It says so once it has called its own slot good, ten seconds after it started.)
         tries=0
         until [ "$(grep -al 'slot a did not come up in 3 tries: this is slot b' "$work"/n?.log | wc -l)" = 1 ]; do

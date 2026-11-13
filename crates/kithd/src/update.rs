@@ -368,12 +368,90 @@ fn version_in(os_release: &str) -> Option<String> {
     Some(value.trim_matches('"').to_string()).filter(|version| !version.is_empty())
 }
 
+/// Whose releases this node becomes: the keys it was started with (`--release-key`), or
+/// else the key of the first release it took, kept in its state. An OSRelease names its
+/// own `publicKey`, and whoever may apply one may name any: the node is who must know.
+pub struct Keys {
+    given: Vec<String>,
+    kept: PathBuf,
+}
+
+impl Keys {
+    pub fn new(given: Vec<String>, state: &Path) -> Keys {
+        let kept = state.join("os-release-keys");
+        Keys { given, kept }
+    }
+
+    /// Refuses a release whose key is not one of this node's. `Ok(true)`: it has none
+    /// yet, and this key is to be kept once it has signed an update.
+    fn refused(&self, public: Option<&str>) -> Result<bool, String> {
+        // (Only a file that is not there is no key yet: one that cannot be read is not.)
+        let kept = match std::fs::read_to_string(&self.kept) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            kept => kept.map_err(|e| format!("reading this node's release keys ({}): {e}", self.kept.display()))?,
+        };
+        let kept = kept.lines().map(str::trim).filter(|key| !key.is_empty());
+        let mine: Vec<&str> = match self.given.is_empty() {
+            true => kept.collect(),
+            false => self.given.iter().map(|key| key.trim()).collect(),
+        };
+        match public {
+            _ if mine.is_empty() => Ok(true),
+            Some(public) if mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())) => Ok(false),
+            _ => Err(format!(
+                "the release is not signed by a key this node takes releases from: start kithd with \
+                 --release-key for a new one (on kith OS: `-- --release-key KEY` in the config \
+                 partition); the key it holds is in {}",
+                self.kept.display()
+            )),
+        }
+    }
+}
+
+/// Is version `a` before `b`? Their numbers compare as numbers (1.9 is before 1.10), and
+/// one with a word after them (`1.0-rc1`) is before the same numbers without.
+// ponytail: two words after the same numbers compare alike (1.0-rc1 is not before
+// 1.0-rc2). Give them semver's order when releases use them.
+fn before(a: &str, b: &str) -> bool {
+    let parts = |version: &str| -> (Vec<u64>, bool) {
+        let mut parts = version
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .map(str::parse::<u64>);
+        let numbers: Vec<u64> = parts.by_ref().map_while(Result::ok).collect();
+        let whole = numbers.len() == version.split(|c: char| !c.is_ascii_alphanumeric()).count();
+        (numbers, whole)
+    };
+    parts(a) < parts(b)
+}
+
+/// Refuses a release older than `floor`, what this node runs (no floor: the plan allows it).
+fn not_back(version: &str, floor: Option<&str>) -> Result<(), String> {
+    match floor {
+        Some(floor) if before(version, floor) => Err(format!(
+            "kith OS {version} is older than the {floor} this node runs: a plan with \
+             `allowDowngrade: true` takes it back"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
 /// by its key, and the version it says.
-async fn fetch(url: &str, wanted: String, release: &Value, slot: char) -> Result<String, String> {
+async fn fetch(
+    url: &str,
+    wanted: String,
+    release: &Value,
+    slot: char,
+    keys: &Keys,
+    floor: Option<&String>,
+) -> Result<String, String> {
     let text = |field: &str| release[field].as_str().map(str::to_string);
     let (signature, public) = (text("signature"), text("publicKey"));
+    let first = keys.refused(public.as_deref())?;
+    let (kept, floor) = (keys.kept.clone(), floor.cloned());
     let client = reqwest::Client::builder()
+        // (The address is the release's, and the release is what was applied: nowhere else.)
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         // (A server that goes quiet is a download that broke, not one to wait out.)
         .read_timeout(Duration::from_secs(60))
@@ -386,6 +464,12 @@ async fn fetch(url: &str, wanted: String, release: &Value, slot: char) -> Result
         .await
         .and_then(|r| r.error_for_status())
         .map_err(failed)?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "fetching {url}: it answers {}, and a redirect is not followed",
+            response.status()
+        ));
+    }
     // What arrives is written as it arrives: an update is tens of megabytes, a node may
     // have little memory, and the writer checks every piece against the signed header.
     let (send, mut pieces) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
@@ -406,12 +490,23 @@ async fn fetch(url: &str, wanted: String, release: &Value, slot: char) -> Result
     }
     let writer = tokio::task::spawn_blocking(move || {
         let running = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+        let public = public.clone();
         let signed = crate::os::signed(signature.as_deref(), public.as_deref());
         let vouched = |header: &[u8]| {
             signed(header)?;
             let named: Value = serde_json::from_slice(header).map_err(|e| format!("the update's header: {e}"))?;
             match named["version"].as_str() {
-                Some(version) if version == wanted => Ok(()),
+                // (The version is the signed header's: what the store says is not asked.)
+                Some(version) if version == wanted => {
+                    not_back(version, floor.as_deref())?;
+                    // (The first release this node takes, signed and the version asked
+                    // for: its key is the one it takes from now on.)
+                    if let (true, Some(public)) = (first, &public) {
+                        let keep = crate::pki::write_whole(&kept, format!("{public}\n").as_bytes());
+                        keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
+                    }
+                    Ok(())
+                }
                 version => Err(format!(
                     "the update at that address is kith OS {}",
                     version.unwrap_or("?")
@@ -447,7 +542,8 @@ async fn fetch(url: &str, wanted: String, release: &Value, slot: char) -> Result
 }
 
 /// A kith OS node's part: say what it runs, and when a plan says so, become the release.
-pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Receiver<bool>) {
+pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut stopping: watch::Receiver<bool>) {
+    let keys = Keys::new(keys, &state);
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let version = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -461,7 +557,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Rece
     loop {
         let said = report(&state, &version, slot);
         // What the store has of this node, and a plan that says it is this node's turn.
-        let (known, turn, named) = {
+        let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let store = &state.store;
             let known = store
@@ -480,7 +576,8 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Rece
                 .iter()
                 .find(|plan| mine(plan).is_some_and(|state| state == "updating"));
             let release = turn.and_then(|plan| store.get(&format!("OSRelease/{}", plan.spec["release"].as_str()?)));
-            (known, release.map(|release| release.spec.clone()), named)
+            let back = turn.is_some_and(|plan| plan.spec["allowDowngrade"] == true);
+            (known, release.map(|release| release.spec.clone()), named, back)
         };
         // (No plan speaks of this node any more: what failed before may be tried again.)
         if said["failed"].is_string() && !named && std::fs::remove_file(tried(&state)).is_ok() {
@@ -513,7 +610,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Rece
             let write =
                 |trying: &Tried| crate::pki::write_whole(&tried(&state), &serde_json::to_vec(trying).expect("text"));
             let wrote = match write(&trying) {
-                Ok(()) => fetch(&url, wanted.clone(), &release, slot).await,
+                Ok(()) => fetch(&url, wanted.clone(), &release, slot, &keys, (!back).then_some(&version)).await,
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
             };
             match wrote {
@@ -550,6 +647,100 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Rece
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty directory of this test's own.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kithd-release-keys-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn release_key_is_the_given_ones_or_the_first_kept() {
+        let dir = scratch("given");
+        let (ours, theirs) = ("aa11", "bb22");
+        // Started with keys: those, however they are cased, and no other; none is kept.
+        let given = Keys::new(vec!["AA11".into(), "cc33".into()], &dir);
+        assert_eq!(given.refused(Some(ours)), Ok(false));
+        let said = given.refused(Some(theirs)).unwrap_err();
+        assert!(said.contains("--release-key"), "{said}");
+        assert!(given.refused(None).is_err());
+        // Started with none: the first is to be kept...
+        let first = Keys::new(Vec::new(), &dir);
+        assert_eq!(first.refused(Some(ours)), Ok(true));
+        // ...and once kept (as an update signed by it does), it is the only one.
+        crate::pki::write_whole(&first.kept, format!("{ours}\n").as_bytes()).unwrap();
+        assert_eq!(first.refused(Some(ours)), Ok(false));
+        assert!(first.refused(Some(theirs)).is_err() && first.refused(None).is_err());
+        // The arguments are over what was kept.
+        let moved = Keys::new(vec![theirs.into()], &dir);
+        assert!(moved.refused(Some(theirs)).is_ok() && moved.refused(Some(ours)).is_err());
+        // A file of keys that cannot be read is not "no key yet".
+        let unread = Keys::new(Vec::new(), &dir.join("unread"));
+        std::fs::create_dir_all(&unread.kept).unwrap();
+        assert!(unread.refused(Some(theirs)).is_err());
+    }
+
+    #[tokio::test]
+    async fn release_key_not_this_nodes_is_refused_before_anything_is_fetched() {
+        let dir = scratch("refused");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
+        let release = json!({ "publicKey": "bb22", "signature": "00" });
+        let keys = Keys::new(vec!["aa11".into()], &dir);
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, None).await.unwrap_err();
+        assert!(said.contains("not signed by a key this node takes"), "{said}");
+        let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(asked.is_err(), "nothing was to be fetched");
+    }
+
+    #[test]
+    fn downgrade_is_an_older_version() {
+        for (a, b) in [
+            ("1.9", "1.10"),
+            ("0.1.0", "0.1.1"),
+            ("2026.11.1", "2026.11.13"),
+            ("1", "1.0"),
+        ] {
+            assert!(before(a, b) && !before(b, a), "{a} {b}");
+        }
+        assert!(!before("1.2.3", "1.2.3"));
+        // Refused, unless the plan allows it (then there is no floor).
+        let said = not_back("1.9", Some("1.10")).unwrap_err();
+        assert!(said.contains("allowDowngrade"), "{said}");
+        assert!(not_back("1.10", Some("1.10")).is_ok() && not_back("1.9", None).is_ok());
+        assert!(!before("0.0.0-broken", "0.0.0-next") && !before("0.0.0-next", "0.0.0-broken"));
+        // A word after the numbers is before the numbers alone, and before greater ones.
+        assert!(before("1.0-rc1", "1.0") && !before("1.0", "1.0-rc1"));
+        assert!(before("0.0.0-next", "0.0.1") && before("1.0", "1.1-rc1"));
+    }
+
+    #[tokio::test]
+    async fn no_redirect_is_followed_for_an_update() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = scratch("redirect");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let to = elsewhere.local_addr().unwrap();
+        let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
+        let answering = tokio::spawn(async move {
+            let (mut asked, _) = listener.accept().await.unwrap();
+            let _ = asked.read(&mut [0; 1024]).await;
+            let moved = format!("HTTP/1.1 302 Found\r\nLocation: http://{to}/x\r\nContent-Length: 0\r\n\r\n");
+            asked.write_all(moved.as_bytes()).await.unwrap();
+        });
+        let release = json!({ "publicKey": "aa11", "signature": "00" });
+        let keys = Keys::new(Vec::new(), &dir);
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, None).await.unwrap_err();
+        assert!(said.contains("302") && said.contains("redirect"), "{said}");
+        answering.await.unwrap();
+        let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;
+        assert!(asked.is_err(), "the redirect was followed");
+        // (And a key is kept only once it has signed the update asked for.)
+        assert!(!keys.kept.exists());
+    }
 
     fn plan(spec: Value, status: Option<&Decided>) -> Resource {
         let mut spec = spec;
