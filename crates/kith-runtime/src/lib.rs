@@ -12,7 +12,7 @@
 mod container;
 mod image;
 
-pub use container::{Handle, Runtime, Unit, exec_shim, reap_orphans};
+pub use container::{Awaited, Handle, Runtime, Unit, exec_shim, reap_orphans, spawn_awaited};
 pub use image::{Image, ImageStore, PullPolicy};
 
 #[derive(Debug)]

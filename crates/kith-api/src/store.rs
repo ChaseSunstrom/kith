@@ -99,6 +99,11 @@ impl Store {
     /// so a `status` in `desired` is ignored.
     pub fn plan(&self, desired: Resource) -> Result<Change, Error> {
         let mut after = desired.validated().map_err(Error::Invalid)?;
+        match after.kind.as_str() {
+            "KindDefinition" => self.definable(&after)?,
+            kind if crate::kind(kind).is_none() => self.custom(&mut after)?,
+            _ => {}
+        }
         let before = self.get(&after.key()).cloned();
         let live_revision = before.as_ref().and_then(|b| b.metadata.revision).unwrap_or(0);
         if let Some(based_on) = after.metadata.revision.filter(|r| *r != live_revision) {
@@ -159,8 +164,87 @@ impl Store {
         live.filter(move |r| kind.is_none_or(|k| r.kind == k))
     }
 
-    /// Removes the resource together with its history.
+    /// The `KindDefinition` that makes `kind` (named exactly), if one does.
+    pub fn definition(&self, kind: &str) -> Option<&Resource> {
+        self.list(Some("KindDefinition"))
+            .find(|definition| definition.spec["kind"] == kind)
+    }
+
+    /// May this `KindDefinition` be? One per kind, and its scope stays while resources
+    /// of the kind are there (their keys say it).
+    fn definable(&self, definition: &Resource) -> Result<(), Error> {
+        let kind = definition.spec["kind"].as_str().unwrap_or_default();
+        // (In any capitals: commands take a kind's name in any.)
+        let same = |other: &&Resource| {
+            let theirs = other.spec["kind"].as_str().unwrap_or_default();
+            theirs.eq_ignore_ascii_case(kind) && other.metadata.name != definition.metadata.name
+        };
+        if let Some(other) = self.list(Some("KindDefinition")).find(same) {
+            let theirs = other.spec["kind"].as_str().unwrap_or_default();
+            return Err(Error::Invalid(format!(
+                "spec.kind: {} already defines `{theirs}`",
+                other.key()
+            )));
+        }
+        let scope = |definition: &Resource| definition.spec["namespaced"] != false;
+        let before = self.get(&definition.key());
+        if let Some(before) = before.filter(|before| before.spec["kind"] != kind || scope(before) != scope(definition))
+        {
+            let was = before.spec["kind"].as_str().unwrap_or_default();
+            let there = self.list(Some(was)).count();
+            if there > 0 {
+                return Err(Error::Conflict(format!(
+                    "{}: {there} `{was}` resources exist: its kind and scope stay until they are deleted",
+                    definition.key()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check a resource whose kind is not kith's own against the `KindDefinition` that
+    /// makes it: its apiVersion, where it lives, and its spec against the schema.
+    fn custom(&self, resource: &mut Resource) -> Result<(), Error> {
+        let kind = &resource.kind;
+        let invalid = |message: String| Err(Error::Invalid(message));
+        let Some(definition) = self.definition(kind) else {
+            return invalid(format!(
+                "unknown kind `{kind}`: no KindDefinition makes it (`kith import k8s` translates Kubernetes manifests)"
+            ));
+        };
+        let text = |field: &str| definition.spec[field].as_str().unwrap_or_default();
+        let version = format!("{}/{}", text("group"), text("version"));
+        if resource.api_version != version {
+            return invalid(format!(
+                "apiVersion: {kind} is `{version}`, not `{}`",
+                resource.api_version
+            ));
+        }
+        match (&resource.metadata.namespace, definition.spec["namespaced"] != false) {
+            (Some(_), false) => return invalid(format!("{kind} is cluster-scoped and takes no namespace")),
+            (None, true) => resource.metadata.namespace = Some(crate::DEFAULT_NAMESPACE.into()),
+            _ => {}
+        }
+        let mut wrong = Vec::new();
+        crate::schema::check(&definition.spec["schema"], &resource.spec, "spec", &mut wrong);
+        match wrong.is_empty() {
+            true => Ok(()),
+            false => invalid(wrong.join("; ")),
+        }
+    }
+
+    /// Removes the resource together with its history. (A `KindDefinition` stays while
+    /// resources of its kind are there.)
     pub fn delete(&mut self, key: &str) -> Result<Resource, Error> {
+        if let Some(definition) = self.get(key).filter(|resource| resource.kind == "KindDefinition") {
+            let kind = definition.spec["kind"].as_str().unwrap_or_default();
+            let there = self.list(Some(kind)).count();
+            if there > 0 {
+                return Err(Error::Conflict(format!(
+                    "{key}: {there} `{kind}` resources exist: delete them first"
+                )));
+            }
+        }
         let mut history = self.resources.remove(key).ok_or_else(|| Error::NotFound(key.into()))?;
         // A hand-edited store can hold an empty history.
         history

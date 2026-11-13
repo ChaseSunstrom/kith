@@ -2,6 +2,7 @@
 //! their JSON Schemas, and the store that keeps them (PLAN.md §4.2, §4.3).
 
 pub mod kinds;
+pub mod schema;
 pub mod store;
 
 use kinds::*;
@@ -223,8 +224,21 @@ impl Resource {
             return fail(node, "missing field `kind`".into());
         };
         let name = kind_node.as_str().unwrap_or_default();
+        let version = node.get("apiVersion").and_then(Node::as_str);
         match KINDS.iter().find(|k| k.kind == name) {
             Some(info) => (info.from_node)(node),
+            // Not one of kith's own: a kind some KindDefinition makes, for the store to say.
+            None if version.is_some_and(|version| version != API_VERSION) => {
+                let typed: Typed<Value> = kith_yaml::from_node(node)?;
+                let resource = Resource {
+                    api_version: typed.api_version,
+                    kind: typed.kind,
+                    metadata: typed.metadata,
+                    spec: typed.spec.unwrap_or_else(|| Value::Object(Default::default())),
+                    status: typed.status,
+                };
+                resource.custom().or_else(|msg| fail(node, msg))
+            }
             None => match kind(name) {
                 Some(close) => fail(
                     kind_node,
@@ -245,11 +259,27 @@ impl Resource {
 
     /// Validate and normalise a resource that did not come from a file.
     pub fn validated(self) -> Result<Resource, String> {
-        let info = KINDS
-            .iter()
-            .find(|k| k.kind == self.kind)
-            .ok_or_else(|| format!("unknown kind `{}`", self.kind))?;
-        (info.from_json)(serde_json::to_value(self).expect("resources serialize to JSON"))
+        match KINDS.iter().find(|k| k.kind == self.kind) {
+            Some(info) => (info.from_json)(serde_json::to_value(self).expect("resources serialize to JSON")),
+            None if self.api_version != API_VERSION => self.custom(),
+            None => Err(format!("unknown kind `{}`", self.kind)),
+        }
+    }
+
+    /// What can be checked of a resource whose kind is not kith's own without the
+    /// `KindDefinition` (the store has that, and checks the rest: see `Store::plan`).
+    fn custom(self) -> Result<Resource, String> {
+        kinds::kind_name(&self.kind)?;
+        // (Nor one of kith's own in other capitals: commands would take it for kith's.)
+        if let Some(own) = kind(&self.kind) {
+            return Err(format!("unknown kind `{}`, did you mean `{}`?", self.kind, own.kind));
+        }
+        check_name(&self.metadata.name)?;
+        self.metadata.namespace.as_deref().map_or(Ok(()), check_name)?;
+        match self.spec.is_object() {
+            true => Ok(self),
+            false => Err("spec: must be a mapping".into()),
+        }
     }
 
     /// `Kind/namespace/name`, or `Kind/name` for cluster-scoped kinds.

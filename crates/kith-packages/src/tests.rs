@@ -73,7 +73,7 @@ fn what_is_wrong_is_said_with_its_place() {
     );
     assert!(wrong.contains("values.port: it must be at least 1"), "{wrong}");
     assert!(
-        wrong.contains("values.colour: is not a value this package has"),
+        wrong.contains("values.colour: is not a field the schema has"),
         "{wrong}"
     );
 

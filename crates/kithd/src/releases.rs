@@ -45,6 +45,15 @@ pub fn origin(store: &Store, name: &str) -> Option<String> {
     Some(format!("{name}@{print}"))
 }
 
+/// The kinds `KindDefinition`s make, and whether each is namespaced.
+pub fn custom_kinds(store: &Store) -> BTreeMap<String, bool> {
+    let made = |definition: &Resource| {
+        let kind = definition.spec["kind"].as_str().unwrap_or_default();
+        (kind.to_string(), definition.spec["namespaced"] != false)
+    };
+    store.list(Some("KindDefinition")).map(made).collect()
+}
+
 /// The ConfigMap (in `kith-system`, in a namespace) whose `values` releases are given.
 const SHARED: &str = "kith-values";
 
@@ -56,6 +65,8 @@ struct Inputs {
     package: (String, Stamp),
     cluster: Stamp,
     namespace: Stamp,
+    /// (A kind made since is a reason to render again what failed for want of it.)
+    kinds: BTreeMap<String, bool>,
 }
 
 type Stamp = Option<(Option<u64>, u64)>;
@@ -72,6 +83,7 @@ struct Job {
     name: String,
     namespace: String,
     owner: String,
+    kinds: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +196,7 @@ fn inputs<'a>(store: &'a Store, release: &Resource) -> Result<(Inputs, &'a Resou
         package: (package.key(), stamp(store, package)),
         cluster,
         namespace: local,
+        kinds: custom_kinds(store),
     };
     let own = Value::Object(spec.values);
     Ok((
@@ -204,8 +217,24 @@ fn render(job: &Job) -> Result<Output, String> {
     };
     let mut rendered = package.render(release, &job.layers)?;
     for resource in &mut rendered.resources {
+        let scoped = match kith_api::kind(&resource.kind) {
+            Some(kind) => kind.namespaced,
+            // A kind a KindDefinition makes: in the release's namespace when it names none.
+            None => {
+                let Some(scoped) = job.kinds.get(&resource.kind).copied() else {
+                    return Err(format!(
+                        "{}: no KindDefinition makes a {}",
+                        resource.key(),
+                        resource.kind
+                    ));
+                };
+                if scoped && resource.metadata.namespace.is_none() {
+                    resource.metadata.namespace = Some(job.namespace.clone());
+                }
+                scoped
+            }
+        };
         let key = resource.key();
-        let scoped = kith_api::kind(&resource.kind).is_some_and(|kind| kind.namespaced);
         if !scoped || KEPT.contains(&resource.kind.as_str()) {
             return Err(format!("{key}: a package does not get to make a {}", resource.kind));
         }
@@ -252,6 +281,7 @@ fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
             name: release.metadata.name.clone(),
             namespace: namespace(release),
             owner: key.clone(),
+            kinds: inputs.kinds.clone(),
         };
         jobs.push((key, inputs, job));
     }
@@ -456,6 +486,9 @@ pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) 
     let mut statuses = Vec::new();
     for mut step in steps {
         let mut done = Ok(());
+        // (A kind is made before what is of it, and unmade after.)
+        step.apply.sort_by_key(|resource| resource.kind != "KindDefinition");
+        step.delete.sort_by_key(|key| key.starts_with("KindDefinition/"));
         if !step.apply.is_empty() {
             let at = kith_api::store::now();
             let applied = shared
