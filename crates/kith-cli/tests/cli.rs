@@ -332,3 +332,128 @@ fn package_render_and_lint() {
     let (code, _, err) = sandbox.kith(&["package", "lint", "nowhere"]);
     assert!(code == 2 && err.contains("nowhere: no package.yaml"), "{err}");
 }
+
+const K8S: &str = "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: { app: web }
+  ports:
+    - port: 80
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: creds
+data:
+  token: aHVudGVyMg==
+";
+
+#[test]
+fn import_k8s_output_applies_and_the_report_gives_the_exit_code() {
+    let sb = Sandbox::new("import-k8s");
+    sb.write("k8s.yaml", K8S);
+    let (code, out, err) = sb.kith(&["import", "k8s", "-f", "k8s.yaml"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err, "3 resources, 0 things not translated\n");
+    assert_eq!(out.matches("---\n").count(), 2, "{out}");
+    sb.write("kith.yaml", &out);
+    let (code, out, err) = sb.kith(&["apply", "-f", "kith.yaml"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.matches("created").count(), 3, "{out}");
+
+    // Something left out: still printed, exit 1, named on stderr.
+    sb.write(
+        "more.yaml",
+        &format!("{K8S}---\napiVersion: v1\nkind: Pod\nmetadata:\n  name: lone\n"),
+    );
+    let (code, out, err) = sb.kith(&["import", "k8s", "-f", "more.yaml"]);
+    assert_eq!(code, 1, "{err}");
+    assert!(out.contains("kind: Workload"), "{out}");
+    assert!(err.contains("not translated: Pod/lone:"), "{err}");
+
+    // Unreadable input.
+    let (code, _, err) = sb.kith(&["import", "k8s", "-f", "nowhere.yaml"]);
+    assert!(code == 2 && err.contains("nowhere.yaml"), "{err}");
+    sb.write("bad.yaml", "a: [unclosed\n");
+    let (code, out, err) = sb.kith(&["import", "k8s", "-f", "bad.yaml"]);
+    assert!(code == 2 && out.is_empty() && err.contains("bad.yaml"), "{err}");
+}
+
+/// `kith` with `path` as the only directory on PATH.
+fn kith_with_path(sb: &Sandbox, path: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_kith"))
+        .args(args)
+        .current_dir(&sb.0)
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    let text = |b: Vec<u8>| String::from_utf8(b).unwrap();
+    (out.status.code().unwrap(), text(out.stdout), text(out.stderr))
+}
+
+#[test]
+fn import_helm_runs_helm_template_and_translates() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("import-helm");
+    // A stand-in `helm`: it records its arguments and prints a rendered chart.
+    let bin = sb.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    sb.write("rendered.yaml", K8S);
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}/args.txt'\nexec /bin/cat '{0}/rendered.yaml'\n",
+        sb.0.display()
+    );
+    std::fs::write(bin.join("helm"), script).unwrap();
+    std::fs::set_permissions(bin.join("helm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, out, err) = kith_with_path(
+        &sb,
+        &bin,
+        &[
+            "import", "helm", "./shop", "--name", "shop", "-n", "store", "-f", "v.yaml",
+        ],
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("kind: Workload") && out.contains("kind: Secret"), "{out}");
+    let args = std::fs::read_to_string(sb.0.join("args.txt")).unwrap();
+    assert_eq!(args, "template\nshop\n./shop\n--namespace\nstore\n-f\nv.yaml\n");
+
+    // A chart that looks like a flag is not handed to helm.
+    let (code, _, err) = kith_with_path(&sb, &bin, &["import", "helm", "--", "-evil"]);
+    assert!(code == 2 && err.contains("starts with `-`"), "{err}");
+}
+
+#[test]
+fn import_helm_without_helm_says_what_to_do() {
+    let sb = Sandbox::new("import-no-helm");
+    let empty = sb.0.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (code, out, err) = kith_with_path(&sb, &empty, &["import", "helm", "./shop"]);
+    assert_eq!(code, 2);
+    assert!(out.is_empty());
+    assert!(
+        err.contains("helm is not installed: install it, or pipe `helm template ... | kith import k8s -f -`"),
+        "{err}"
+    );
+}
