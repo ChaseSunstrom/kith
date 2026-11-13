@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// Set when kithd was told to stop with SIGTERM: the machine is to power off, not restart.
 pub static POWER_OFF: AtomicBool = AtomicBool::new(false);
 
-/// Where a node of kith OS keeps its state.
-// ponytail: in memory until there is a state partition to mount here (T-0072).
+/// Where a node of kith OS keeps its state: the partition labelled `state` is mounted
+/// here, and where there is none (a kernel and kithd alone, as ci/vm.sh boots them) it is
+/// in memory.
 pub const STATE: &str = "/var/lib/kith";
 
 pub fn is_init() -> bool {
@@ -106,9 +107,77 @@ fn first_mac() -> Option<String> {
 
 fn resolvers(servers: &[IpAddr]) {
     let lines: String = servers.iter().map(|server| format!("nameserver {server}\n")).collect();
-    let written = std::fs::create_dir_all("/etc").and_then(|()| std::fs::write("/etc/resolv.conf", lines));
-    if let Err(e) = written {
-        eprintln!("kithd: init: writing /etc/resolv.conf: {e}");
+    // (The image's root is read-only: its /etc/resolv.conf points here. Where the root
+    // can be written and has none, it is pointed here now.)
+    let _ = std::fs::create_dir_all("/etc").and_then(|()| {
+        // (A file already there, on a root that can be written, would win over it.)
+        let _ = std::fs::remove_file("/etc/resolv.conf");
+        std::os::unix::fs::symlink("/run/resolv.conf", "/etc/resolv.conf")
+    });
+    if let Err(e) = std::fs::write("/run/resolv.conf", lines) {
+        eprintln!("kithd: init: writing /run/resolv.conf: {e}");
+    }
+}
+
+/// The device of the partition a GPT names `label`, from what /sys says of one block
+/// device (its `uevent`).
+fn partition<'a>(uevent: &'a str, label: &str) -> Option<&'a str> {
+    let said = |key: &str| uevent.lines().find_map(|line| line.strip_prefix(key));
+    (said("PARTNAME=") == Some(label)).then(|| said("DEVNAME="))?
+}
+
+/// The disk a partition is on: `vda` for `/sys/class/block/vda6`.
+fn disk(partition: &std::path::Path) -> Option<std::ffi::OsString> {
+    Some(std::fs::canonicalize(partition).ok()?.parent()?.file_name()?.to_owned())
+}
+
+/// Mount the state partition, or say that there is none and keep the state in memory.
+/// Where the root is a verity device, only a partition of the disk the root is on will
+/// do: a stick with a partition named `state` must not become the node's store.
+fn state() {
+    let _ = std::fs::create_dir_all(STATE);
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    let entries = |dir: &str| -> Vec<std::path::PathBuf> {
+        let mut all: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        all.sort();
+        all
+    };
+    let ours = entries("/sys/block/dm-0/slaves").first().and_then(|under| disk(under));
+    let found = entries("/sys/class/block").into_iter().find_map(|device| {
+        let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
+        let name = partition(&uevent, "state")?;
+        (ours.is_none() || disk(&device) == ours).then(|| std::path::Path::new("/dev").join(name))
+    });
+    let Some(device) = found else {
+        eprintln!(
+            "kithd: init: no partition is labelled state: this node's state is in memory, and gone when it restarts"
+        );
+        if let Err(e) = mount(Some("tmpfs"), STATE, Some("tmpfs"), flags, Some("mode=0700")) {
+            eprintln!("kithd: init: mounting {STATE}: {e}");
+        }
+        return;
+    };
+    match mount(
+        Some(&device),
+        STATE,
+        Some("ext4"),
+        flags | MsFlags::MS_NOATIME,
+        None::<&str>,
+    ) {
+        Ok(()) => eprintln!("kithd: init: state on {}", device.display()),
+        // (Not in memory instead: the node would come up as a new one, with nothing.)
+        Err(e) => {
+            eprintln!(
+                "kithd: init: mounting {}: {e}: the state partition is damaged",
+                device.display()
+            );
+            end(true)
+        }
     }
 }
 
@@ -166,6 +235,38 @@ fn links(options: &Options) -> Vec<kith_mesh::Card> {
     cards
 }
 
+/// What kithd says goes to every console the kernel has (a screen and a serial line, say),
+/// not to the last one named alone, which is all a first process is given.
+fn consoles() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let active = std::fs::read_to_string("/sys/class/tty/console/active").unwrap_or_default();
+    let open = |name: &str| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/dev/{name}"))
+            .ok()
+    };
+    let mut all: Vec<std::fs::File> = active.split_whitespace().filter_map(open).collect();
+    // (Closed in what kithd starts: a workload must not read what kithd says.)
+    let Ok((read, write)) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC) else {
+        return;
+    };
+    if all.len() < 2 || nix::unistd::dup2(write.as_raw_fd(), 2).is_err() {
+        return;
+    }
+    let _ = nix::unistd::dup2(write.as_raw_fd(), 1);
+    // (A thread that only reads and writes: it holds nothing a forked child could want.)
+    std::thread::spawn(move || {
+        let (mut from, mut some) = (std::fs::File::from(read), [0; 4096]);
+        while let Ok(read @ 1..) = from.read(&mut some) {
+            for console in &mut all {
+                let _ = console.write_all(&some[..read]);
+            }
+        }
+    });
+}
+
 /// The first things, before anything else of kithd runs. Each is tried and said if it
 /// fails: with part of them kithd may still serve, and a console line says what is missing.
 pub fn early() -> Boot {
@@ -207,6 +308,8 @@ pub fn early() -> Boot {
             eprintln!("kithd: init: mounting {at}: {e}");
         }
     }
+    consoles();
+    state();
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let (options, unknown) = options(&line);
     for word in unknown {
@@ -241,8 +344,14 @@ pub fn end(failed: bool) -> ! {
         std::thread::sleep(std::time::Duration::from_secs(10));
     }
     eprintln!("kithd: init: {}", if off { "powering off" } else { "restarting" });
-    // ponytail: nothing on a disk is mounted yet; unmount the state partition here (T-0072).
+    // ponytail: time for that line to reach the consoles (see `consoles`), not a handshake.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Written out, then let go of: by now kithd has closed what it had open there. (If
+    // not, as after a panic, the file system's journal is what keeps it whole.)
     nix::unistd::sync();
+    if let Err(e) = nix::mount::umount(STATE) {
+        eprintln!("kithd: init: unmounting {STATE}: {e}");
+    }
     let mode = if off {
         RebootMode::RB_POWER_OFF
     } else {
@@ -297,6 +406,16 @@ mod tests {
             given(&["/init", "splash", "--listen", "a", "b"]),
             ["/init", "--listen", "a", "b"]
         );
+    }
+
+    #[test]
+    fn init_finds_the_state_partition() {
+        let disk = "MAJOR=254\nMINOR=0\nDEVNAME=vda\nDEVTYPE=disk\n";
+        let root = "MAJOR=254\nMINOR=2\nDEVNAME=vda2\nDEVTYPE=partition\nPARTN=2\nPARTNAME=root-a\n";
+        let state = "MAJOR=259\nMINOR=6\nDEVNAME=nvme0n1p6\nDEVTYPE=partition\nPARTN=6\nPARTNAME=state\n";
+        assert_eq!(partition(disk, "state"), None);
+        assert_eq!(partition(root, "state"), None);
+        assert_eq!(partition(state, "state"), Some("nvme0n1p6"));
     }
 
     #[test]

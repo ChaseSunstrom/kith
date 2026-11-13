@@ -788,14 +788,60 @@ shell. When kithd finds it is process 1 it does what an init does:
   it off on SIGTERM. If kithd fails or panics it says why and restarts the
   machine ten seconds later: process 1 never exits.
 
+- mounts the partition labelled `state` at `/var/lib/kith`, and says so when
+  there is none (the state is then in memory);
+- says what it says on every console the kernel has (a screen and a serial line).
+
 `sh ci/vm.sh --test init` boots exactly that in QEMU (the host's kernel and an
 initramfs holding one file, a static kithd) and prints how long it took to
-serve: under a second here.
+serve: a second or two here.
 
-Not yet: an image to boot a real machine from, a disk for the state (it is in
-memory: `/var/lib/kith`), drivers that are kernel modules (a card whose driver
-is not built into the kernel is not seen), a card plugged in later, IPv6
-addresses from the network, the power button, encrypted state, an installer.
+### The image
+
+```sh
+sh os/build.sh --check     # target/os/kith-os.raw (281 MB) and kith-os.qcow2 (19 MB)
+sh ci/vm.sh --test image   # boot a copy of it under UEFI in QEMU and check it
+```
+
+`os/build.sh` makes the whole operating system of a node, without root and
+without touching a disk:
+
+- a kernel (6.18, 13 MB) built from kernel.org's source at a pinned version and
+  checksum with `os/kernel.config`: no modules and no initramfs. What a machine
+  needs to find its disk, check its root and reach the network is in that one
+  file: NVMe, SATA, USB and SD storage, the common wired network cards, virtio,
+  WireGuard, dm-verity, dm-crypt, what containers need, KVM. The first build
+  compiles it (ten minutes or so); it is kept in `~/.cache/kith-os` after that;
+- a root file system of 5 MB (squashfs, read-only): kithd as `/sbin/init`,
+  `kith`, a CA bundle (curl's, pinned), empty directories. No shell, no libc,
+  no package manager;
+- a dm-verity hash tree for the root. The root's hash is on the kernel command
+  line, which is inside the one EFI file the firmware starts (a unified kernel
+  image: systemd's stub, the kernel, the command line), so a root that was
+  changed is refused block by block: the test changes one and the kernel
+  stops before kithd runs;
+- a GPT disk: `esp` (systemd-boot and the kernel image), `root-a` and
+  `verity-a`, `root-b` and `verity-b` (empty: an update goes there), and `state`
+  (ext4), the only partition a running node writes.
+
+Packed twice from the same kernel and the same kithd, the image is the same
+bytes (`--twice` checks). That is not yet the whole of a reproducible build:
+the kernel is compiled once and kept, kithd is compiled once per run, systemd's
+EFI stub and boot loader are copied from the machine that builds, and where bc
+or mtools is missing they come from nix, unpinned. So another machine, or
+another checkout path, may give other bytes.
+
+In QEMU the image serves other nodes about two seconds after the firmware
+starts. The test passes kithd its arguments through the VM's SMBIOS, which the
+stub adds to the command line; where a real machine's come from is the
+installer's to say, which is not written yet.
+
+Not yet: an installer and anything written to a real disk, updates into the
+other slot and going back when one fails, Secure Boot (the image is not
+signed, so the firmware does not yet check the file that checks the root), the
+state partition growing to its disk and being encrypted, drivers for Wi-Fi,
+sound and graphics, a card plugged in later, IPv6 addresses from the network,
+the power button, arm64.
 
 ## YAML, strictly
 
@@ -845,6 +891,7 @@ x86_64-linux-musl` wrapper.
 KITH_E2E=1 cargo test -q -p kithd --test cluster rig_   # 3 nodes: one behind a NAT, a partition, a heal
 sh ci/vm.sh                                             # the host's kernel, booted with kithd as init
 sh ci/vm.sh --test init                                 # and: it serves, then restarts when told
+sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```

@@ -5,6 +5,7 @@
 #
 #   sh ci/vm.sh [--kernel FILE] [--initrd FILE] [--disk IMAGE] [--append ARGS] [--time SECONDS]
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
+#   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -28,6 +29,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test init      instead: wait for kithd, as the machine's first process, to serve its
                    API, print how long that took (it fails past 10 s), press Ctrl-Alt-Del,
                    and expect kithd to stop and restart the machine; needs socat
+  --test image     instead: build kith OS's image (os/build.sh), boot a copy of it under
+                   UEFI with a network card, and expect: the root mounted through
+                   dm-verity, the state partition mounted, an address by DHCP, TLS
+                   answered on the node's port, the same node after a restart, and a
+                   root with one block changed refused; needs OVMF, socat, openssl
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -50,7 +56,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init) ;; *) echo "vm.sh: --test knows only: init" >&2; exit 2 ;; esac
+case $test in '' | init | image) ;; *) echo "vm.sh: --test knows: init, image" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -62,6 +68,94 @@ fi
 skip() { echo "skipped: $1"; exit 0; }
 command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "no qemu-system-x86_64"
 if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT INT TERM
+said() { grep -aq "$1" "$work/log" 2>/dev/null; }
+fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+
+if [ "$test" = image ]; then
+    command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
+    command -v openssl >/dev/null 2>&1 || skip "no openssl to call the node with"
+    firmware=''
+    for f in /usr/share/edk2-ovmf/x64/OVMF.4m.fd /usr/share/edk2/x64/OVMF.4m.fd /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd; do
+        [ -r "$f" ] && { firmware=$f; break; }
+    done
+    [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
+    command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
+    sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
+    # A copy: the node writes its state to the disk, and this test damages its root.
+    cp "$root/target/os/kith-os.raw" "$work/disk.raw"
+    port=$((20000 + $$ % 20000))
+    # (The stub adds this to the command line of the image: kithd's own arguments.)
+    more='io.systemd.stub.kernel-cmdline-extra=-- --listen 0.0.0.0:7443 --advertise 10.0.2.15:7443'
+    boot() {
+        : >"$work/log"
+        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
+            -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
+            -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443" -device virtio-net-pci,netdev=n0 \
+            -smbios "type=11,value=$more" \
+            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 &
+        vm=$!
+    }
+    up() {
+        until said 'serving other nodes on '; do
+            kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served other nodes"
+            sleep 0.05
+        done
+    }
+    # Who answers on the node's port, through the VM's network card: its certificate,
+    # into $who.
+    who() {
+        tries=0
+        until openssl s_client -connect "127.0.0.1:$port" </dev/null 2>/dev/null >"$work/hello" \
+            && who=$(openssl x509 -noout -fingerprint -sha256 <"$work/hello" 2>/dev/null); do
+            tries=$((tries + 1))
+            [ "$tries" -lt 100 ] || fail "nobody answered TLS on the node's port"
+            sleep 0.2
+        done
+    }
+    restart() {
+        echo sendkey ctrl-alt-delete | socat - "unix-connect:$work/keys" >/dev/null
+        wait "$vm" || fail "the VM did not end within ${time} s of starting"
+        said 'kithd: init: restarting' || fail "kithd did not restart the machine when told"
+        ! said 'Kernel panic' || fail "the kernel panicked"
+    }
+
+    began=$(date +%s%N)
+    boot
+    up
+    took=$((($(date +%s%N) - began) / 1000000))
+    said 'Mounted root (squashfs filesystem) readonly on device 25[0-9]:0' || fail "the root is not the verity device"
+    said 'kithd: init: state on /dev/vda6' || fail "the state partition was not mounted"
+    who
+    first=$who
+    said 'by DHCP' || fail "the network card got no address by DHCP"
+    restart
+    cp "$work/log" "$work/log.first"
+
+    boot
+    up
+    who
+    second=$who
+    restart
+    [ "$first" = "$second" ] || fail "the node came back as another: its state did not survive ($first, then $second)"
+
+    # One block of the root changed: the kernel must refuse it, and kithd never run.
+    start=$(sfdisk -l -o Start,Name "$work/disk.raw" | awk '$2 == "root-a" { print $1 }')
+    dd if=/dev/urandom of="$work/disk.raw" bs=512 seek="$start" count=8 conv=notrunc status=none
+    boot
+    wait "$vm" || true
+    cat "$work/log.first"
+    ! said 'kithd: ' || fail "kithd ran from a root that was tampered with"
+    said 'device-mapper: verity: .* is corrupted' || fail "the kernel did not say the root was corrupted"
+    echo "vm.sh: the image served other nodes ${took} ms after QEMU started (firmware, boot loader and kernel included)"
+    [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }
+    echo "vm.sh: ok: UEFI boot from the image, a verity root, DHCP, TLS answered ($first), state kept across a restart, a tampered root refused"
+    exit 0
+fi
+
 if [ -z "$kernel" ]; then
     for k in "/boot/vmlinuz-$(uname -r)" "/lib/modules/$(uname -r)/vmlinuz" /boot/vmlinuz-* /boot/vmlinuz; do
         [ -r "$k" ] && { kernel=$k; break; }
@@ -70,28 +164,10 @@ if [ -z "$kernel" ]; then
 fi
 [ -r "$kernel" ] || skip "kernel $kernel is not readable"
 
-root=$(cd "$(dirname "$0")/.." && pwd)
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
-
 if [ -z "$initrd" ]; then
     command -v cpio >/dev/null 2>&1 || skip "no cpio to make an initramfs"
     command -v zstd >/dev/null 2>&1 || skip "no zstd to make an initramfs"
-    target=x86_64-unknown-linux-musl
-    var=CC_x86_64_unknown_linux_musl
-    # kithd's TLS (ring) has C in it: a static build needs a musl C compiler.
-    if [ -z "$(printenv "$var" || true)" ] && ! command -v musl-gcc >/dev/null 2>&1 \
-        && ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
-        # (cc-rs passes rustc's target name, which zig spells differently.)
-        # shellcheck disable=SC2016
-        printf '%s\n' '#!/bin/sh' \
-            'for a; do shift; case "$a" in --target=*) ;; *) set -- "$@" "$a";; esac; done' \
-            'exec zig cc -target x86_64-linux-musl "$@"' >"$work/musl-cc"
-        chmod +x "$work/musl-cc"
-        export CC_x86_64_unknown_linux_musl="$work/musl-cc"
-    fi
-    (cd "$root" && cargo build --release --quiet --target "$target" -p kithd) >&2
-    kithd="${CARGO_TARGET_DIR:-$root/target}/$target/release/kithd"
+    kithd=$(sh "$root/ci/musl.sh")/kithd
     mkdir "$work/fs"
     cp "$kithd" "$work/fs/init"
     (cd "$work/fs" && echo init | cpio -o -H newc --quiet | zstd -q -19 >"$work/initrd.zst")
@@ -105,8 +181,6 @@ set -- -enable-kvm -cpu host -m 512 -smp 2 -display none -serial stdio -monitor 
 
 if [ "$test" = init ]; then
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
-    said() { grep -q "$1" "$work/log" 2>/dev/null; }
-    fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
     began=$(date +%s%N)
     shift 13 # (up to -monitor none: here the console goes to a file, and keys come in)
     timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \

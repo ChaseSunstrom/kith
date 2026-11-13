@@ -63,7 +63,7 @@ def idle_rss(kithd, tmp):
         daemon.wait()
 
 
-def musl_cc(env, tmp):
+def musl_cc(env):
     """kithd's TLS (ring) has C in it, so a static build needs a musl C compiler.
 
     CI installs musl-tools. Where there is none but zig is installed, zig is one.
@@ -71,12 +71,7 @@ def musl_cc(env, tmp):
     var = "CC_" + TARGET.replace("-", "_")
     if var in env or shutil.which("musl-gcc") or shutil.which("x86_64-linux-musl-gcc") or not shutil.which("zig"):
         return env
-    wrapper = os.path.join(tmp, "musl-cc")
-    with open(wrapper, "w") as f:
-        # cc-rs passes rustc's target name, which zig spells differently.
-        f.write('#!/bin/sh\nfor a; do shift; case "$a" in --target=*) ;; *) set -- "$@" "$a";; esac; done\n')
-        f.write('exec zig cc -target x86_64-linux-musl "$@"\n')
-    os.chmod(wrapper, 0o755)
+    wrapper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "musl-cc.sh")
     return {**env, var: wrapper}
 
 
@@ -91,7 +86,7 @@ def main():
     os.chdir(root)
     self_test = "--self-test" in sys.argv
     with tempfile.TemporaryDirectory() as tmp:
-        build_env = musl_cc(os.environ.copy(), tmp)
+        build_env = musl_cc(os.environ.copy())
         for binary in SIZE_BUDGETS:
             package = "kith-cli" if binary == "kith" else binary
             build = ["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package]
