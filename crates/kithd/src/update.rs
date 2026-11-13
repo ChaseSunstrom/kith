@@ -340,6 +340,13 @@ fn tried(state: &Path) -> PathBuf {
     state.join("os-update.json")
 }
 
+/// Forget the update that was tried: the note is removed, and the directory written out,
+/// so a power cut does not bring it back (a stale "failed" in the node's status).
+fn forget(state: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(tried(state))?;
+    std::fs::File::open(state)?.sync_all()
+}
+
 /// What this node's status says of its system: what it runs, and an update that did not
 /// take. An update that did is forgotten here.
 fn report(state: &Path, version: &str, slot: char) -> Value {
@@ -348,7 +355,7 @@ fn report(state: &Path, version: &str, slot: char) -> Value {
         .and_then(|text| serde_json::from_slice(&text).ok());
     match was {
         Some(tried) if tried.version == version => {
-            let _ = std::fs::remove_file(self::tried(state));
+            let _ = forget(state);
             json!({ "version": version, "slot": slot.to_string() })
         }
         Some(tried) => {
@@ -580,7 +587,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
             (known, release.map(|release| release.spec.clone()), named, back)
         };
         // (No plan speaks of this node any more: what failed before may be tried again.)
-        if said["failed"].is_string() && !named && std::fs::remove_file(tried(&state)).is_ok() {
+        if said["failed"].is_string() && !named && forget(&state).is_ok() {
             continue;
         }
         if known.is_some_and(|known| known != Some(said.clone())) {
@@ -621,7 +628,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
                 }
                 // (It started moments ago and has not called its own slot good yet: soon.)
                 Err(why) if why == crate::os::TOO_EARLY => {
-                    let _ = std::fs::remove_file(tried(&state));
+                    let _ = forget(&state);
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     continue;
                 }
