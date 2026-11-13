@@ -294,6 +294,50 @@ fn views_replace_the_default_records_for_their_clients() {
 }
 
 #[test]
+fn the_longest_matching_prefix_picks_the_view_whatever_the_order() {
+    let view = |nets: &[&str], last: u8| {
+        let mut records = Records::default();
+        records.add(soa()).unwrap();
+        records
+            .add(rec("web.default.kith", Rdata::A(Ipv4Addr::new(192, 168, 1, last))))
+            .unwrap();
+        View {
+            nets: nets.iter().map(|n| n.parse().unwrap()).collect(),
+            records,
+        }
+    };
+    // 1: a /8, 2: a /24, 3: a view with a short and a long prefix, 4: the same /24 as 2.
+    let views = [
+        view(&["10.0.0.0/8"], 1),
+        view(&["10.1.2.0/24"], 2),
+        view(&["172.16.0.0/12", "10.1.2.128/25"], 3),
+        view(&["10.1.2.0/24"], 4),
+    ];
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]] {
+        let mut z = zones();
+        z.views = order.iter().map(|&i| views[i].clone()).collect();
+        let last = |ip: &str| {
+            let q = query(1, "web.default.kith", A, None);
+            let Answer::Reply(r) = answer(&q, ip.parse().unwrap(), &z, true) else {
+                panic!()
+            };
+            let r = decode(r);
+            r.data(&r.an[0])[3]
+        };
+        let first_24 = order.iter().find(|&&i| i == 1 || i == 3).unwrap() + 1;
+        assert_eq!(last("10.9.9.9"), 1);
+        assert_eq!(
+            last("10.1.2.7"),
+            first_24 as u8,
+            "equal prefixes: the first listed wins"
+        );
+        assert_eq!(last("10.1.2.200"), 3);
+        assert_eq!(last("172.16.0.1"), 3);
+        assert_eq!(last("::ffff:10.1.2.7"), first_24 as u8);
+    }
+}
+
+#[test]
 fn cidr_parses_and_matches() {
     let c: Cidr = "10.1.0.0/16".parse().unwrap();
     assert!(c.contains("10.1.255.255".parse().unwrap()) && !c.contains("10.2.0.0".parse().unwrap()));
@@ -1096,6 +1140,70 @@ async fn a_tcp_connection_ends_after_its_query_limit() {
         let r = decode(frame(&mut s, &query(id as u16, "web.default.kith", A, None)).await);
         assert_eq!(usize::from(u16_at(&r.raw, 0)), id);
     }
+    assert!(closed(&mut s).await);
+}
+
+#[tokio::test]
+async fn a_query_forwarded_over_tcp_reaches_the_upstream_over_tcp_and_returns_whole() {
+    // An upstream that listens on TCP only (a UDP ask would time out into SERVFAIL) and
+    // answers with 60 records, too many for a 512-byte datagram.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up = listener.local_addr().unwrap();
+    let (seen, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut len = [0; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let mut q = vec![0; usize::from(u16::from_be_bytes(len))];
+            s.read_exact(&mut q).await.unwrap();
+            let mut r = upstream_reply(&q, u16_at(&q, 0));
+            r[6..8].copy_from_slice(&60u16.to_be_bytes());
+            for i in 1..60 {
+                r.extend([0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, i]);
+            }
+            s.write_all(&[&(r.len() as u16).to_be_bytes()[..], &r].concat())
+                .await
+                .unwrap();
+            seen.send(q).unwrap();
+        }
+    });
+    let (_, t, _tx) = start(zones(), vec![up]).await;
+    let r = tcp_ask(t, &query(0x2468, "example.com", A, None)).await;
+    assert_eq!((u16_at(&r.raw, 0), r.rcode(), r.flags & 0x0200), (0x2468, 0, 0));
+    assert_eq!(r.an.len(), 60);
+    assert!(r.raw.len() > 512);
+    assert_eq!(r.data(&r.an[59]), [1, 2, 3, 59]);
+    // The upstream was asked once, with its own id, not the client's.
+    let q = seen_rx.try_recv().unwrap();
+    assert_ne!(u16_at(&q, 0), 0x2468);
+    assert!(seen_rx.try_recv().is_err());
+}
+
+/// The TCP limits, on tokio's paused clock: it moves ahead whenever every task waits.
+#[tokio::test(start_paused = true)]
+async fn an_idle_tcp_connection_is_closed_after_ten_seconds() {
+    let (_, t, _tx) = start(zones(), vec![]).await;
+    let mut s = TcpStream::connect(t).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    let r = decode(frame(&mut s, &query(1, "web.default.kith", A, None)).await);
+    assert_eq!(r.rcode(), 0);
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert!(closed(&mut s).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_busy_tcp_connection_is_closed_after_sixty_seconds_in_all() {
+    let (_, t, _tx) = start(zones(), vec![]).await;
+    let mut s = TcpStream::connect(t).await.unwrap();
+    let begun = tokio::time::Instant::now();
+    // One query every 7 seconds never idles, but the 60 s are up before the 10th.
+    for id in 0..9 {
+        let r = decode(frame(&mut s, &query(id, "web.default.kith", A, None)).await);
+        assert_eq!(u16_at(&r.raw, 0), id);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+    }
+    assert!(begun.elapsed() >= Duration::from_secs(60));
     assert!(closed(&mut s).await);
 }
 

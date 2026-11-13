@@ -261,13 +261,21 @@ pub struct View {
 pub struct Zones {
     /// For clients no view claims.
     pub records: Records,
-    /// Checked in order; the first whose network holds the client replaces `records` for it.
+    /// The view with the longest prefix holding the client replaces `records` for it; of equal
+    /// prefixes, the first listed.
     pub views: Vec<View>,
 }
 
 impl Zones {
     pub fn lookup(&self, client: IpAddr, qname: &str, qtype: u16) -> Option<Found> {
-        let view = self.views.iter().find(|v| v.nets.iter().any(|n| n.contains(client)));
+        let prefix = |v: &View| v.nets.iter().filter(|n| n.contains(client)).map(|n| n.bits).max();
+        // min_by_key keeps the first of equals; Reverse makes the longest prefix the smallest.
+        let view = self
+            .views
+            .iter()
+            .filter_map(|v| Some((v, prefix(v)?)))
+            .min_by_key(|&(_, bits)| std::cmp::Reverse(bits))
+            .map(|(v, _)| v);
         view.map_or(&self.records, |v| &v.records).lookup(qname, qtype)
     }
 }
