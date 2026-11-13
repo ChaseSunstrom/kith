@@ -35,6 +35,7 @@ mod services;
 mod sources;
 mod ui;
 mod update;
+mod volumes;
 mod wasm;
 
 use clap::Parser;

@@ -94,8 +94,8 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   `ConfigMap` or `Secret` value in its `env` changes.
 - On SIGTERM it stops everything it started.
 
-Not yet: volumes, ports and `exec` probes are accepted but do nothing
-(the status says so for volumes and `exec` probes), a replica is stopped before
+Not yet: ports and `exec` probes are accepted but do nothing
+(the status says so for `exec` probes), a replica is stopped before
 its replacement starts (so `replicas: 1` is down for a moment during an update;
 `blueGreen` is treated as rolling), containers share the host's
 network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, layers
@@ -875,6 +875,57 @@ spec:
   workload that names it, so the right to apply those is the grant, and there is no other
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
   other kind: give it only to someone you would let hold any hardware of the cluster.
+
+## Storage
+
+A `Volume` is a directory on one node. A container mounts one by naming it, or a
+`VolumeClaim` bound to one, in its `volumeMounts`:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: db-disk }
+spec: { node: n1, path: db, size: 20Gi }
+---
+apiVersion: kith.dev/v1
+kind: VolumeClaim
+metadata: { name: db-data }
+spec: { size: 10Gi }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec:
+  template:
+    containers:
+      - name: run
+        image: example/db
+        volumeMounts: [{ volume: db-data, path: /var/lib/db }]
+```
+
+- The workload runs on the volume's node, and only there. Volumes on two nodes, or
+  a `DeviceClaim` on another node than the volume, leave it unplaced: its `unschedulable`
+  says why. A name that is both a Volume and a VolumeClaim is the Volume.
+- A claim with no volume yet takes the first Volume (by name) of its namespace that no
+  claim has, is at least as big, is on a node with the labels in its `selector`, and is
+  `shared` if the claim asks for that. `kith get volumeclaim db-data -o yaml` shows
+  `status.volume`, the Volume shows `status.claim`, and it stays so while both exist; a claim
+  that finds none says so in `status.message`. Deleting a claim frees its Volume, data
+  kept.
+- The container sees the directory as a bind mount (`readOnly: true` makes it read-only).
+  The directory is made on the node when the unit starts. In a namespace other than
+  `kith-system` it is `<state>/volumes/<namespace>/<name>/<path>`: `path` must be relative,
+  with no `..`, and no part of it may be a symbolic link, so a container cannot reach out of
+  its namespace's directory by planting one. A `path` that breaks this is refused in the
+  Volume's `status.message`. In `kith-system`, `path` is an absolute host path as written;
+  what keeps others out of it is access control (nobody may apply a Volume there without the
+  rule to do so).
+- A container path that is not absolute, has `..`, or is `/`, `/proc`, `/sys` or `/dev`
+  (or under them) stops the unit from starting, and says so.
+- Not yet (ponytail): no dynamic provisioning (a claim binds a Volume somebody made);
+  `shared: true` is not exported over the mesh, such a Volume is mounted on its one node
+  only; `subvolume: true` makes a plain directory, not a btrfs subvolume; `size` is a
+  promise for binding, not a quota; an `exec` unit and a NodeWorkload mount nothing.
 
 ## Web UI
 
