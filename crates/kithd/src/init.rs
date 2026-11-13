@@ -531,23 +531,41 @@ pub fn early() -> Boot {
     }
 }
 
+/// Is a failed start of the machine this kernel command line started counted? One from a
+/// slot is: that is what gets marked good, which clears the count. An installer, or a
+/// kernel and kithd alone, never would be.
+fn counted(line: &str) -> bool {
+    let options = options(line).0;
+    options.slot.is_some() && options.install.is_none()
+}
+
 /// kithd is done (it has stopped what it ran): restart the machine or power it off.
 /// After a failure it restarts, once the reason has had time to be read on a console. A
 /// start that fails again waits longer, the count being on the ESP (see `os::wait`).
 pub fn end(failed: bool) -> ! {
-    let off = !failed && POWER_OFF.load(Ordering::Relaxed);
     if failed {
         // (With no ESP to count on, this is the first wait.)
-        let wait = match crate::os::esp(crate::os::failed) {
-            Ok(count) => crate::os::wait(count),
-            Err(e) => {
+        let counted = std::fs::read_to_string("/proc/cmdline").is_ok_and(|line| counted(&line));
+        let wait = match counted.then(|| crate::os::esp(crate::os::failed)) {
+            Some(Ok(count)) => crate::os::wait(count),
+            Some(Err(e)) => {
                 eprintln!("kithd: init: counting the failed start: {e}");
                 crate::os::wait(0)
             }
+            None => crate::os::wait(0),
         };
         eprintln!("kithd: init: restarting in {} s", wait.as_secs());
-        std::thread::sleep(wait);
+        // The power button is still heard (its thread outlives the runtime): it ends the
+        // wait, and the machine powers off.
+        // ponytail: SIGTERM is not, with the runtime that listened for it gone.
+        for _ in 0..wait.as_secs() {
+            if POWER_OFF.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
+    let off = POWER_OFF.load(Ordering::Relaxed);
     eprintln!("kithd: init: {}", if off { "powering off" } else { "restarting" });
     // ponytail: time for that line to reach the consoles (see `consoles`), not a handshake.
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -615,6 +633,7 @@ mod tests {
         assert_eq!(read("a=b -- --name kith.hostname=x"), (Options::default(), vec![]));
         // The installer: answers from whoever is there, or from a URL.
         assert_eq!(read("kith.slot=a kith.install").0.install, Some(String::new()));
+        assert!(counted("quiet kith.slot=b") && !counted("kith.slot=a kith.install") && !counted("quiet"));
         assert_eq!(
             read("kith.install=http://10.0.2.2/a.yaml").0.install.as_deref(),
             Some("http://10.0.2.2/a.yaml")

@@ -212,9 +212,8 @@ pub fn install(
 
 /// Counts one more failed start in a row on the ESP, and says how many there now are. The
 /// count is written to a file of its own and renamed into place, so a power cut leaves
-/// the old count or the new one. If it cannot be written, the count is still returned.
-// ponytail: only settle clears the count, and settle runs for a slot's start alone: a
-// node that runs from no slot keeps counting. Clear it at any start when that matters.
+/// the old count or the new one (or, FAT having no rename over a file that is one step,
+/// none: the next wait is then the first). If it cannot be written, the count is still returned.
 pub fn failed(esp: &Path) -> u32 {
     let count = std::fs::read_to_string(esp.join(FAILED))
         .ok()
