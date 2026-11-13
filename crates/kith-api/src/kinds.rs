@@ -239,7 +239,20 @@ spec! {
         /// Names of `DeviceClaim`s this replica holds.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub device_claims: Vec<String>,
+        /// Hold this replica back (a sliver of one CPU) while a seat of its node is busy.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub yield_to: Option<YieldTo>,
     }
+
+    pub struct YieldTo {
+        /// Name of the `Seat`.
+        pub seat: String,
+        /// What the seat is doing while this is held back, e.g. `[fullscreen]`.
+        pub when: Vec<Activity>,
+    }
+
+    /// What a session says its seat is doing; a seat that says nothing is idle.
+    pub enum Activity { Active, Idle, Fullscreen }
 
     pub enum RestartPolicy { Always, OnFailure, Never }
 

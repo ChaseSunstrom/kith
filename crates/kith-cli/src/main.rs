@@ -123,9 +123,6 @@ enum Command {
         /// The program that carries the window [default: waypipe]
         #[arg(long, value_name = "PROGRAM")]
         via: Option<String>,
-        /// The namespace to ask for the right to run in
-        #[arg(short, long)]
-        namespace: Option<String>,
         /// The app and its arguments, as written after `--`
         #[arg(last = true, required = true, value_name = "APP")]
         argv: Vec<String>,
@@ -701,16 +698,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             backend()?.delete(&key)?;
             println!("{key} deleted");
         }
-        Command::Run {
-            on,
-            via,
-            namespace,
-            argv,
-        } => {
+        Command::Run { on, via, argv } => {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("remote apps go through kithd: leave out --store");
             };
-            return remote::run(&kithd, &on, via.as_deref(), namespace.as_deref(), &argv);
+            return remote::run(&kithd, &on, via.as_deref(), &argv);
         }
         Command::Logs {
             target,

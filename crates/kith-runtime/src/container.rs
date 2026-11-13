@@ -9,7 +9,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
     LinuxCpuBuilder, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType,
-    LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, Mount, MountBuilder, RootBuilder, Spec,
+    LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, MountBuilder, RootBuilder, Spec,
 };
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
@@ -69,6 +69,18 @@ pub struct Unit {
     /// Host device nodes the container is given (and allowed in its cgroup), e.g. `/dev/dri/card0`.
     /// An exec unit ignores them: it sees all of `/dev` already.
     pub devices: Vec<PathBuf>,
+    /// Host directories bound into the container. An exec unit gets none: it has no mount namespace.
+    pub mounts: Vec<Mount>,
+}
+
+/// A host directory bound into a container: where it is, where the container sees it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mount {
+    /// An absolute path on the host.
+    pub host: PathBuf,
+    /// An absolute path in the container, not `/` nor under `/proc`, `/sys` or `/dev`.
+    pub container: String,
+    pub read_only: bool,
 }
 
 /// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
@@ -293,6 +305,33 @@ pub fn reap_orphans(mains: &[i32]) {
     }
 }
 
+/// The most the kernel takes for `cpu.weight` and `io.weight` (the default is 100): a unit with
+/// a guarantee goes before everything else on the node when they want the same CPU or disk.
+const TOP_WEIGHT: u32 = 10_000;
+
+/// Say in a running unit's cgroup (`Handle::cgroup`) what it is guaranteed and how much CPU it
+/// may use: `guaranteed` bytes of memory that are not reclaimed from it, with the top weights
+/// (none: no guarantee, the default weights), and `cpu_millis` thousandths of a CPU (none: no
+/// limit). What could not be written is returned in plain words, and the rest is written
+/// anyway: a kernel or a cgroup without the io controller still gives the memory and the CPU.
+pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
+    let weight = if guaranteed.is_some() { TOP_WEIGHT } else { 100 };
+    let cpu = cpu_millis.map_or("max".to_string(), |millis| {
+        millis.max(10).saturating_mul(100).to_string()
+    });
+    let files = [
+        ("memory.min", guaranteed.unwrap_or(0).to_string()),
+        ("cpu.weight", weight.to_string()),
+        ("io.weight", format!("default {weight}")),
+        ("cpu.max", format!("{cpu} 100000")),
+    ];
+    let write = |(file, value): &(&str, String)| {
+        let done = fs::write(cgroup.join(file), value);
+        done.err().map(|e| format!("{file} = {value}: {e}"))
+    };
+    files.iter().filter_map(write).collect()
+}
+
 fn manager(cgroup: &str) -> libcgroups::v2::manager::Manager {
     libcgroups::v2::manager::Manager::new("/sys/fs/cgroup".into(), cgroup.into()).expect("joining two absolute paths")
 }
@@ -462,7 +501,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     process.set_terminal(Some(false));
     spec.set_process(Some(process));
 
-    let tmpfs = |at: &str| -> std::result::Result<Mount, Box<dyn std::error::Error>> {
+    let tmpfs = |at: &str| -> std::result::Result<oci_spec::runtime::Mount, Box<dyn std::error::Error>> {
         let options = ["nosuid", "nodev", "mode=1777"].map(String::from).to_vec();
         Ok(MountBuilder::default()
             .destination(at)
@@ -480,6 +519,19 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
         let resolv = MountBuilder::default().destination("/etc/resolv.conf").typ("bind");
         mounts.push(resolv.source("/etc/resolv.conf").options(options).build()?);
     }
+    for volume in &unit.mounts {
+        check_mount(volume)?;
+        // Not over a mount the container already has (/tmp, /run, its resolv.conf, another volume).
+        if mounts.iter().any(|m| m.destination() == Path::new(&volume.container)) {
+            return Err(format!("volume path `{}` in the container is already a mount", volume.container).into());
+        }
+        let mut options = ["rbind", "nosuid", "nodev"].map(String::from).to_vec();
+        if volume.read_only {
+            options.push("ro".into());
+        }
+        let bind = MountBuilder::default().destination(&volume.container).typ("bind");
+        mounts.push(bind.source(&volume.host).options(options).build()?);
+    }
     spec.set_mounts(Some(mounts));
 
     let mut linux = spec.linux().clone().unwrap_or_default();
@@ -493,6 +545,33 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     linux.set_resources(Some(limits));
     spec.set_linux(Some(linux));
     Ok(spec)
+}
+
+/// Whether a volume may be bound where it says: an absolute path of the container's with no `..`,
+/// that is not the root and not the kernel's own `/proc`, `/sys` or `/dev`, which a bind over
+/// would hide or replace; the host side must be absolute too.
+fn check_mount(volume: &Mount) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    use std::path::Component;
+    let at = Path::new(&volume.container);
+    let parts: Vec<Component> = at.components().collect();
+    let plain = volume.container.starts_with('/') && parts.len() > 1;
+    let up = parts.contains(&Component::ParentDir);
+    let kernel = ["/proc", "/sys", "/dev"].iter().any(|own| at.starts_with(own));
+    if !plain || up || kernel {
+        let at = &volume.container;
+        return Err(format!(
+            "volume path `{at}` in the container must be absolute, with no `..`, and not `/` or under /proc, /sys or /dev"
+        )
+        .into());
+    }
+    if !volume.host.is_absolute() {
+        return Err(format!(
+            "volume directory `{}` on the host must be an absolute path",
+            volume.host.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The device nodes at `paths` as the container sees them (made in its `/dev`, or bound there
@@ -636,5 +715,94 @@ mod tests {
             let refused = spec("a", &image, &with(out), "/kith/a").unwrap_err().to_string();
             assert!(refused.contains("device node"), "{out}: {refused}");
         }
+    }
+
+    #[test]
+    fn a_guarantee_and_a_cpu_limit_are_written_to_the_cgroup_and_a_refused_file_is_said() {
+        let cgroup = std::env::temp_dir().join(format!("kith-tune-guarantee-{}", std::process::id()));
+        fs::create_dir_all(&cgroup).unwrap();
+        let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
+        assert!(tune(&cgroup, Some(4 << 30), None).is_empty());
+        assert_eq!(read("memory.min"), "4294967296");
+        assert_eq!(
+            (read("cpu.weight"), read("io.weight")),
+            ("10000".into(), "default 10000".into())
+        );
+        assert_eq!(read("cpu.max"), "max 100000");
+        // Held back to a twentieth of a CPU, with no guarantee: the defaults, and the limit.
+        assert!(tune(&cgroup, None, Some(50)).is_empty());
+        assert_eq!((read("memory.min"), read("cpu.weight")), ("0".into(), "100".into()));
+        assert_eq!(read("cpu.max"), "5000 100000");
+        // A file the kernel will not take (here: a directory in its place) is named; the others are written.
+        fs::remove_file(cgroup.join("io.weight")).unwrap();
+        fs::create_dir(cgroup.join("io.weight")).unwrap();
+        let said = tune(&cgroup, Some(1), Some(500));
+        assert!(said.len() == 1 && said[0].starts_with("io.weight"), "{said:?}");
+        assert_eq!(
+            (read("memory.min"), read("cpu.max")),
+            ("1".into(), "50000 100000".into())
+        );
+        let _ = fs::remove_dir_all(cgroup);
+    }
+
+    fn mounted(mounts: Vec<Mount>) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        spec(
+            "a",
+            &image,
+            &Unit {
+                mounts,
+                ..Unit::default()
+            },
+            "/kith/a",
+        )
+    }
+
+    fn bind(host: &str, at: &str, read_only: bool) -> Mount {
+        Mount {
+            host: host.into(),
+            container: at.into(),
+            read_only,
+        }
+    }
+
+    #[test]
+    fn a_volume_is_a_bind_mount_in_the_spec_and_read_only_when_asked() {
+        let made = mounted(vec![bind("/srv/data", "/data", false), bind("/srv/ro", "/ro/x", true)]).unwrap();
+        let all = made.mounts().clone().unwrap();
+        let at = |dest: &str| all.iter().find(|m| m.destination() == Path::new(dest)).cloned();
+        let data = at("/data").expect("the volume is mounted");
+        assert_eq!(data.typ().as_deref(), Some("bind"));
+        assert_eq!(data.source().as_deref(), Some(Path::new("/srv/data")));
+        let options = data.options().clone().unwrap();
+        assert_eq!(options, ["rbind", "nosuid", "nodev"]);
+        let ro = at("/ro/x").unwrap().options().clone().unwrap();
+        assert_eq!(ro, ["rbind", "nosuid", "nodev", "ro"]);
+        // No volume, no extra mount.
+        let none = mounted(vec![]).unwrap().mounts().clone().unwrap();
+        assert!(none.iter().all(|m| m.destination() != Path::new("/data")));
+    }
+
+    #[test]
+    fn a_volume_path_in_the_container_that_would_hide_the_system_is_refused() {
+        for at in [
+            "data", "", "/", "/proc", "/proc/1", "/sys", "/sys/fs", "/dev", "/dev/shm", "/a/../b", "/a/..",
+        ] {
+            let why = mounted(vec![bind("/srv/data", at, false)]).unwrap_err().to_string();
+            assert!(
+                why.contains("volume") && why.contains(&format!("`{at}`")),
+                "{at:?}: {why}"
+            );
+        }
+        // A name that only starts like one of them is fine.
+        assert!(mounted(vec![bind("/srv/data", "/processing", false)]).is_ok());
+        // A host path that is not absolute would be taken as relative to the runtime's directory.
+        assert!(mounted(vec![bind("srv/data", "/data", false)]).is_err());
+        // Nor over a mount the container already has, nor twice on one path.
+        assert!(mounted(vec![bind("/srv/data", "/tmp", false)]).is_err());
+        assert!(mounted(vec![bind("/srv/a", "/data", false), bind("/srv/b", "/data", false)]).is_err());
     }
 }

@@ -91,26 +91,37 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
             lost_for,
         })
     };
-    let nodes: Vec<Node> = store.list(Some("Node")).filter_map(node).collect();
+    let mut nodes: Vec<Node> = store.list(Some("Node")).filter_map(node).collect();
+    // A seat's reserve is its holder's: the node has that much less for everything else, and
+    // the holder is asked to fit only what it wants beyond it.
+    let (reserved, seated) = crate::seats::reserves(store);
+    let less = |have: Amount, by: Option<&Amount>| Amount {
+        cpu: (have.cpu - by.map_or(0.0, |by| by.cpu)).max(0.0),
+        memory: (have.memory - by.map_or(0.0, |by| by.memory)).max(0.0),
+    };
+    for node in &mut nodes {
+        node.capacity = less(node.capacity, reserved.get(&node.name));
+    }
     let owners = || {
         let kinds = ["Workload", "Job", "NodeWorkload"];
         kinds.into_iter().flat_map(|kind| store.list(Some(kind)))
     };
     let claims = crate::claims::resolve(store).owners;
+    let mounts = crate::volumes::resolve(store).owners;
     let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
     for resource in owners() {
         let Some((count, requests, placement)) = wants(resource) else {
             continue;
         };
         let key = resource.key();
-        // Where its claimed hardware is; one whose claims do not come to a node waits, with the reason.
-        let node = match claims.get(&key) {
-            Some(Ok(held)) => Some(held.node.clone()),
-            Some(Err(why)) => {
+        // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
+        // to one node waits, with the reason.
+        let node = match crate::volumes::together(claims.get(&key), mounts.get(&key)) {
+            Ok(node) => node,
+            Err(why) => {
                 waiting.extend((0..count).map(|replica| (format!("{key}#{replica}"), why.clone())));
                 continue;
             }
-            None => None,
         };
         for replica in 0..count {
             let bound = resource
@@ -120,7 +131,8 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
             replicas.push(Replica {
                 id: format!("{key}#{replica}"),
                 workload: key.clone(),
-                requests,
+                // (A seat's reserve is its holder's first replica's.)
+                requests: less(requests, seated.get(&key).filter(|_| replica == 0)),
                 placement: placement.clone(),
                 bound: bound.map(str::to_string),
                 node: node.clone(),
@@ -212,7 +224,10 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         let (fields, left, claimed) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let (fields, left) = plan(&state.store, &seen, grace);
-            (fields, left, crate::claims::writes(&state.store))
+            let mut claimed = crate::claims::writes(&state.store);
+            claimed.extend(crate::volumes::writes(&state.store));
+            claimed.extend(crate::seats::writes(&state.store));
+            (fields, left, claimed)
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
         let mut commands = Vec::new();
@@ -223,7 +238,8 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         if !fields.is_empty() {
             commands.push(Command::Patch { statuses: fields });
         }
-        // Each DeviceClaim says where it is and who holds it (only when that changed).
+        // Each DeviceClaim says where it is and who holds it, each VolumeClaim and Volume what it is
+        // bound to (only when that changed).
         if !claimed.is_empty() {
             commands.push(Command::Status { statuses: claimed });
         }
@@ -524,5 +540,68 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }], deviceClaims: 
         // Nothing more to write.
         assert_eq!(plan(&store, &there, Duration::from_secs(300)), (vec![], vec![]));
         assert!(crate::claims::writes(&store).is_empty());
+    }
+
+    #[test]
+    fn a_seat_reserve_is_its_holders_and_the_others_fit_in_what_is_left() {
+        let unit = |cpu: u32| format!("exec: [{{ name: run, command: [sleep, inf], resources: {{ cpu: {cpu} }} }}]");
+        let source = format!(
+            "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {{ name: a }}
+spec: {{}}
+---
+apiVersion: kith.dev/v1
+kind: Device
+metadata: {{ name: a-gpu-card0 }}
+spec: {{ node: a, class: gpu, path: /dev/dri/card0 }}
+---
+apiVersion: kith.dev/v1
+kind: Seat
+metadata: {{ name: a-seat0 }}
+spec: {{ node: a, devices: [a-gpu-card0], reserve: {{ cpu: 2 }} }}
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: {{ name: desk }}
+spec: {{ seat: a-seat0 }}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {{ name: desktop }}
+spec: {{ template: {{ {}, deviceClaims: [desk] }} }}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {{ name: fits }}
+spec: {{ template: {{ {} }} }}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {{ name: toobig }}
+spec: {{ template: {{ {} }} }}
+",
+            unit(3),
+            unit(1),
+            unit(3)
+        );
+        let mut store = Store::default();
+        for resource in Resource::from_source(&source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        // Four CPUs, two of them the seat's: its holder (3) has the two and fits its third; of the
+        // other two, one goes to `fits` and three are not there for `toobig`.
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        kith_store::run(&mut store, Command::Patch { statuses: fields }).unwrap();
+        let status = |key: &str| store.get(key).unwrap().status.clone().unwrap();
+        assert_eq!(status("Workload/default/desktop")["nodes"], json!({ "0": "a" }));
+        assert_eq!(status("Workload/default/fits")["nodes"], json!({ "0": "a" }));
+        let toobig = status("Workload/default/toobig");
+        assert!(
+            toobig["nodes"].is_null() && toobig["unschedulable"]["0"].is_string(),
+            "{toobig}"
+        );
     }
 }

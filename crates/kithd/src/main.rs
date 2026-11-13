@@ -31,10 +31,12 @@ mod raft;
 mod registry;
 mod releases;
 mod sched;
+mod seats;
 mod services;
 mod sources;
 mod ui;
 mod update;
+mod volumes;
 mod wasm;
 
 use clap::Parser;

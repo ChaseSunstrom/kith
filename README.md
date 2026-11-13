@@ -94,8 +94,8 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   `ConfigMap` or `Secret` value in its `env` changes.
 - On SIGTERM it stops everything it started.
 
-Not yet: volumes, ports and `exec` probes are accepted but do nothing
-(the status says so for volumes and `exec` probes), a replica is stopped before
+Not yet: ports and `exec` probes are accepted but do nothing
+(the status says so for `exec` probes), a replica is stopped before
 its replacement starts (so `replicas: 1` is down for a moment during an update;
 `blueGreen` is treated as rolling), containers share the host's
 network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, layers
@@ -876,9 +876,104 @@ spec:
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
   other kind: give it only to someone you would let hold any hardware of the cluster.
 
+### What a seat keeps for itself
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Seat
+metadata: { name: desk-seat0 }
+spec:
+  node: desk
+  devices: [desk-gpu-card0]
+  reserve: { cpu: 4, memory: 8Gi }     # kept for whatever holds the seat
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: training }
+spec:
+  template:
+    containers: [{ name: run, image: registry.example/train:1 }]
+    yieldTo: { seat: desk-seat0, when: [fullscreen] }   # step back while a game is up
+```
+
+- A seat's `reserve` comes off its node for every workload that does not hold the seat,
+  whether or not anything holds it just then: other workloads are placed in what is left
+  (ones already placed are not moved). The holder is asked to fit only what it wants
+  beyond the reserve. (Of several that share a seat, the reserve counts for one:
+  the first by name, and its first replica.)
+- The holder's units are guaranteed the reserve's memory (`memory.min`: it is not
+  reclaimed from them) and go first for CPU and disk (`cpu.weight` and `io.weight` at the
+  kernel's most, 10000; everything else has 100). The CPUs are not pinned: an idle
+  session costs the others nothing. Where a cgroup file cannot be written (no `io`
+  controller, say) kithd's log names it and the rest holds.
+- A session says what its seat is doing:
+  `POST /v1/seats/desk-seat0/activity?state=active|idle|fullscreen`, for who may apply
+  `Seat`s (give the session an Identity with a Role for that); it is in the audit log and
+  in `kith get seat desk-seat0 -o yaml` as `status.activity`. A seat nobody holds says
+  nothing, which is idle.
+- A workload with `yieldTo` runs on a twentieth of one CPU on that seat's node while the
+  seat is in one of the states it names, and has its own limit back when the state
+  changes (within the controller's pass, some ten seconds). It is not stopped or moved.
+- Not yet (ponytail): each unit of a holder gets the whole memory guarantee; a session
+  that hangs while fullscreen keeps the others held back until it goes; a GPU is not
+  shared out by this, only CPU, memory and disk.
+
+## Storage
+
+A `Volume` is a directory on one node. A container mounts one by naming it, or a
+`VolumeClaim` bound to one, in its `volumeMounts`:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: db-disk }
+spec: { node: n1, path: db, size: 20Gi }
+---
+apiVersion: kith.dev/v1
+kind: VolumeClaim
+metadata: { name: db-data }
+spec: { size: 10Gi }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec:
+  template:
+    containers:
+      - name: run
+        image: example/db
+        volumeMounts: [{ volume: db-data, path: /var/lib/db }]
+```
+
+- The workload runs on the volume's node, and only there. Volumes on two nodes, or
+  a `DeviceClaim` on another node than the volume, leave it unplaced: its `unschedulable`
+  says why. A name that is both a Volume and a VolumeClaim is the Volume.
+- A claim with no volume yet takes the first Volume (by name) of its namespace that no
+  claim has, is at least as big, is on a node with the labels in its `selector`, and is
+  `shared` if the claim asks for that. `kith get volumeclaim db-data -o yaml` shows
+  `status.volume`, the Volume shows `status.claim`, and it stays so while both exist; a claim
+  that finds none says so in `status.message`. A claim whose Volume is deleted says so and
+  takes no other (the workload would start on empty data): make the Volume again, or delete
+  the claim and apply it again. Every replica of a workload shares the one directory. Deleting a claim frees its Volume, data
+  kept.
+- The container sees the directory as a bind mount (`readOnly: true` makes it read-only).
+  The directory is made on the node when the unit starts. In a namespace other than
+  `kith-system` it is `<state>/volumes/<namespace>/<name>/<path>`: `path` must be relative,
+  with no `..`, and no part of it may be a symbolic link, so a container cannot reach out of
+  its namespace's directory by planting one. A `path` that breaks this is refused in the
+  Volume's `status.message`. In `kith-system`, `path` is an absolute host path as written;
+  what keeps others out of it is access control (nobody may apply a Volume there without the
+  rule to do so).
+- A container path that is not absolute, has `..`, or is `/`, `/proc`, `/sys` or `/dev`
+  (or under them) stops the unit from starting, and says so.
+- Not yet (ponytail): no dynamic provisioning (a claim binds a Volume somebody made);
+  `shared: true` is not exported over the mesh, such a Volume is mounted on its one node
+  only; `subvolume: true` makes a plain directory, not a btrfs subvolume; `size` is a
+  promise for binding, not a quota; an `exec` unit and a NodeWorkload mount nothing.
+
 ### Remote apps
 
-`kith run --on NODE|SELECTOR [--via PROGRAM] [-n NAMESPACE] -- APP [ARGS…]` runs a
+`kith run --on NODE|SELECTOR [--via PROGRAM] -- APP [ARGS…]` runs a
 graphical app on another node and opens its window on this machine, through
 [waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) over the mesh.
 `--on` is a node's name, or labels (`role=display,zone=lab`) for the first ready Node,
@@ -887,11 +982,12 @@ by name, that has them. `--via` names the program that carries the window (defau
 
 - **waypipe must be installed on both ends** (here, and on the node that runs the app):
   kith does not ship it. A missing program is refused with its name and the node's.
-- **Who may:** whoever may apply a Job in the namespace (`-n`, default `default`). That is
-  checked on the node you ask, before anything starts or is forwarded; `admin` has it. The
-  other node accepts the hop only from a cluster node, never from a client token, and
-  writes its own audit entry (`GET /v1/audit`) with the name of the caller who asked. The app runs as kithd's user on the node: this is the right to run
-  programs there, so give it as you would a Job.
+- **Who may:** only who may run the node itself: a Role rule with `verbs: [exec]` on
+  `kinds: [Node]` and no `namespaces` (`admin` has it). The app runs as kithd's user on
+  the node, outside any container, so a right in one namespace is never enough. It is
+  checked on the node you ask, before anything starts or is forwarded. The other node
+  accepts the hop only from a cluster node, never from a client token, and writes its own
+  audit entry (`GET /v1/audit`) with the name of the caller who asked.
 - **How:** the `kith` command asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app
   there with `waypipe --socket S server -- APP…`, S in a private (0700) directory with a name
   nobody can guess, and joins it to the tunnel; `kith` runs `waypipe --socket L client` and

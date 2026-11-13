@@ -1,8 +1,8 @@
 //! Remote apps: `POST /v1/run` opens a byte tunnel to an app that runs on a node.
 //!
 //! ```text
-//! POST /v1/run      {on, via?, argv, namespace?}            -> 101, then bytes both ways   caller that may apply Jobs
-//! POST /v1/run-hop  {on, via?, argv, namespace?, caller}    -> 101, then bytes both ways   nodes only
+//! POST /v1/run      {on, via?, argv}            -> 101, then bytes both ways   caller that may exec on Nodes
+//! POST /v1/run-hop  {on, via?, argv, caller}    -> 101, then bytes both ways   nodes only
 //! ```
 //! `on` is a node's name, or `key=value[,key=value]` for the first ready Node (by name)
 //! with those labels. The first node checks the caller (it may apply a Job in
@@ -25,9 +25,9 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use hyper::upgrade::{OnUpgrade, Upgraded};
 use hyper_util::rt::TokioIo;
+use kith_api::Resource;
 use kith_api::kinds::Verb;
 use kith_api::store::Error;
-use kith_api::{DEFAULT_NAMESPACE, Resource};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -51,7 +51,6 @@ pub struct Spec {
     pub on: String,
     pub via: Option<String>,
     pub argv: Vec<String>,
-    pub namespace: Option<String>,
     /// On the hop only: who asked the first node.
     #[serde(default)]
     pub caller: String,
@@ -146,8 +145,9 @@ pub async fn run(
         Ok(taken) => taken,
         Err((status, why)) => return say(status, why),
     };
-    let namespace = spec.namespace.clone().unwrap_or_else(|| DEFAULT_NAMESPACE.into());
-    if let Err(refused) = permit(&shared, &caller, Verb::Apply, |_| vec![("Job".into(), Some(namespace))]) {
+    // The app runs as kithd's user, outside any container: that is the run of the node, so it
+    // takes a rule for the whole cluster (`exec` on `Node`, no namespaces), never one namespace's.
+    if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
         return refused.into_response();
     }
     let (node, address) = match resolve(&shared, &spec.on) {
@@ -182,7 +182,6 @@ async fn forward(
         on: spec.on.clone(),
         via: spec.via.clone(),
         argv: spec.argv.clone(),
-        namespace: spec.namespace.clone(),
     };
     let send = cluster
         .client
@@ -418,14 +417,15 @@ kind: Role
 metadata: {name: jobber}
 spec:
   rules:
-    - {kinds: [Job], verbs: [apply]}
+    - {kinds: [Node], verbs: [exec]}
 ---
 apiVersion: kith.dev/v1
 kind: Role
 metadata: {name: other-jobber}
 spec:
   rules:
-    - {kinds: [Job], verbs: [apply], namespaces: [other]}
+    - {kinds: [Node], verbs: [exec], namespaces: [other]}
+    - {kinds: [Job], verbs: [apply]}
 ---
 apiVersion: kith.dev/v1
 kind: RoleBinding
@@ -622,29 +622,18 @@ spec: {role: other-jobber, subjects: [carol]}
         let bob = world.user("bob");
         let (status, why) = tunnel(&bob, world.a_port, "/v1/run", spec.clone()).await.unwrap_err();
         assert_eq!(status, 403);
-        assert!(why.contains("bob may not apply Job"), "{why}");
-        // Carol may apply Jobs in `other`, not in `default`.
+        assert!(why.contains("bob may not exec Node"), "{why}");
+        // Carol may apply Jobs anywhere, and exec in one namespace: neither is the run of a node.
         let carol = world.user("carol");
         let (status, _) = tunnel(&carol, world.a_port, "/v1/run", spec.clone()).await.unwrap_err();
         assert_eq!(status, 403);
-        let there = json!({"on": "b", "via": "/nonexistent/waypipe", "argv": ["true"], "namespace": "other"});
-        let (status, _) = tunnel(&carol, world.a_port, "/v1/run", there).await.unwrap_err();
-        assert_eq!(
-            status, 422,
-            "carol passes the check in her namespace and fails on the program"
-        );
         // The refusals are written down on the first node; the second never heard of them.
         let entries = world.a.audit.tail(10).unwrap();
         let refused: Vec<_> = entries.iter().filter(|entry| entry["ok"] == false).collect();
         assert_eq!(refused[0]["who"], "bob");
         assert_eq!(refused[1]["who"], "carol");
-        // The second node heard only of carol's allowed one (written, then failed on the program).
         let there = world.b.audit.tail(10).unwrap();
-        assert!(
-            there.iter().all(|entry| entry["who"] == "carol via node a"),
-            "{there:?}"
-        );
-        assert_eq!(there.len(), 2);
+        assert!(there.is_empty(), "{there:?}");
     }
 
     #[tokio::test]

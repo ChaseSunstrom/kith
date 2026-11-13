@@ -62,6 +62,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/run", post(run::run))
         .route("/v1/tokens", post(crate::cluster::token))
         .route("/v1/lock/{name}", post(crate::crypt::set))
+        .route("/v1/seats/{name}/activity", post(crate::seats::activity))
         // (The network boot file is 40 MB.)
         .route(
             "/v1/netboot",

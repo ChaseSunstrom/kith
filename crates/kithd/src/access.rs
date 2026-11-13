@@ -101,7 +101,8 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 15] = [
+const FOR_IDENTITIES: [&str; 16] = [
+    "/v1/seats",
     "/v1/tokens",
     "/v1/run",
     "/v1/lock",
@@ -118,6 +119,15 @@ const FOR_IDENTITIES: [&str; 15] = [
     "/v1/convert",
     "/v1/diff",
 ];
+
+/// Is `path` one an Identity can reach (one of [`FOR_IDENTITIES`], or under one)?
+pub fn for_identities(path: &str) -> bool {
+    let open = |route: &&str| {
+        let rest = path.strip_prefix(route);
+        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    FOR_IDENTITIES.iter().any(open)
+}
 
 /// The public key (DER) of the certificate a request came with, for an Identity: a watch
 /// asks again whether it still stands for the Identity once its wait is over.
@@ -164,11 +174,7 @@ pub fn who(
             .record(&caller, method, vec![path.into()], Err(why.clone()));
         return Err((StatusCode::UNAUTHORIZED, why));
     }
-    let open = |route: &&str| {
-        let rest = path.strip_prefix(route);
-        rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    };
-    if !FOR_IDENTITIES.iter().any(open) {
+    if !for_identities(path) {
         let why = format!("{path} is for the cluster's nodes, not for an Identity");
         shared
             .audit

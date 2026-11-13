@@ -95,13 +95,7 @@ fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<UnixStream, String> {
     fail(said.unwrap_or_else(|| head.lines().next().unwrap_or("kithd refused").to_string()))
 }
 
-pub fn run(
-    kithd: &Kithd,
-    on: &str,
-    via: Option<&str>,
-    namespace: Option<&str>,
-    argv: &[String],
-) -> Result<ExitCode, String> {
+pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {
     let program = via.unwrap_or("waypipe");
     let dir = Dir::make()?;
     let socket = dir.0.join("c");
@@ -115,7 +109,7 @@ pub fn run(
         std::io::ErrorKind::NotFound => fail(format!("{program} is not installed here (kith does not ship it)")),
         _ => fail(format!("cannot start {program}: {e}")),
     })?);
-    let body = serde_json::json!({ "on": on, "via": via, "argv": argv, "namespace": namespace });
+    let body = serde_json::json!({ "on": on, "via": via, "argv": argv });
     let tunnel = open(kithd, &body)?;
     // The client listens on its socket a moment after it starts.
     let started = Instant::now();
@@ -237,7 +231,7 @@ c.sendall(c.makefile("rb").readline().upper())
     fn run_on_joins_the_local_client_to_the_tunnel() {
         let (kithd, served) = fake_kithd("tunnel", SWITCH);
         let argv = ["two words".to_string(), "$(touch pwned)".to_string()];
-        let code = run(&kithd, "role=display", Some(stand_in()), Some("work"), &argv).unwrap();
+        let code = run(&kithd, "role=display", Some(stand_in()), &argv).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
         let (asked, through) = served.join().unwrap();
         assert!(asked.starts_with("POST /v1/run HTTP/1.1\r\n"), "{asked}");
@@ -246,7 +240,7 @@ c.sendall(c.makefile("rb").readline().upper())
         let via = stand_in();
         assert_eq!(
             body,
-            serde_json::json!({"on": "role=display", "via": via, "argv": argv, "namespace": "work"})
+            serde_json::json!({"on": "role=display", "via": via, "argv": argv})
         );
         // "hello" went to the client, which answered in capitals.
         assert_eq!(through, "HELLO\n");
@@ -256,7 +250,7 @@ c.sendall(c.makefile("rb").readline().upper())
     fn run_on_says_why_kithd_refused() {
         let reply = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"error\":\"bob may not apply Job in here\"}";
         let (kithd, served) = fake_kithd("refused", reply);
-        let said = run(&kithd, "b", Some(stand_in()), None, &["true".to_string()]).unwrap_err();
+        let said = run(&kithd, "b", Some(stand_in()), &["true".to_string()]).unwrap_err();
         assert_eq!(said, "error: bob may not apply Job in here");
         drop(served.join());
     }
@@ -267,7 +261,7 @@ c.sendall(c.makefile("rb").readline().upper())
             socket: "/nonexistent/kithd.sock".into(),
             timeout: Duration::from_secs(1),
         };
-        let said = run(&kithd, "b", Some("/nonexistent/waypipe"), None, &["true".to_string()]).unwrap_err();
+        let said = run(&kithd, "b", Some("/nonexistent/waypipe"), &["true".to_string()]).unwrap_err();
         assert!(said.contains("/nonexistent/waypipe is not installed here"), "{said}");
     }
 }
