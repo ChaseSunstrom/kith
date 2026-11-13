@@ -259,6 +259,9 @@ kith get dnsrecord                   # each one says `served`, or why not
   (`--dns-upstream 1.1.1.1,9.9.9.9` to say which), for clients on private
   networks only, so a kithd reachable from the internet is not an open
   resolver. Point your router's DHCP at a node and the whole house uses it.
+  A CNAME in a zone to a name outside it is answered with the target's
+  addresses from those resolvers too, so stub resolvers get one reply to use
+  (the CNAME alone when they do not answer).
 - In a cluster every node started with `--dns` answers the same names.
 
 Not yet: `<service>.<namespace>.kith` (with the load balancer), DNSSEC, zone

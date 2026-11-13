@@ -1003,8 +1003,8 @@ fn resolve_over(tcp: bool, port: u16, name: &str) -> Result<[u8; 4], u8> {
     };
     assert_eq!(reply[..2], query[..2]);
     match (reply[3] & 0x0f, reply[7]) {
-        // The address is the last thing in a reply with one A record.
-        (0, 1) => Ok(reply[reply.len() - 4..].try_into().unwrap()),
+        // The address is the last thing in a reply whose last record is an A.
+        (0, 1..) => Ok(reply[reply.len() - 4..].try_into().unwrap()),
         (0, _) => Err(0),
         (code, _) => Err(code),
     }
@@ -1053,6 +1053,14 @@ fn dns_answers_from_the_store() {
     // Our names over TCP too.
     assert_eq!(resolve_over(true, port, "nas.home.example"), Ok([192, 168, 1, 20]));
     assert_eq!(resolve_over(true, port, "printer.home.example"), Err(3));
+
+    // A CNAME to a name outside the zone comes with the address the other resolver gives for it.
+    daemon.apply(
+        "apiVersion: kith.dev/v1\nkind: DNSRecord\nmetadata:\n  name: www\n\
+         spec:\n  zone: home\n  name: www\n  type: CNAME\n  values: [example.org]\n",
+    );
+    wait_for("the CNAME", || daemon.status("dnsrecord/www")["state"] == "served");
+    assert_eq!(resolve(port, "www.home.example"), Ok([198, 51, 100, 7]));
 
     // A record that changes is answered anew; one in a zone that is not there says so.
     daemon.apply(

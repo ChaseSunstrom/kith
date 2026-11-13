@@ -10,6 +10,7 @@ mod zones;
 
 use std::net::IpAddr;
 use wire::{FORMERR, Query, REFUSED, build, failure};
+use zones::{Found, key};
 
 pub use server::serve;
 pub use wire::SERVFAIL;
@@ -22,8 +23,65 @@ pub enum Answer {
     Reply(Vec<u8>),
     /// Not ours: ask the upstream resolvers.
     Forward,
+    /// Ours, but a CNAME leaves our zones: ask the upstreams for the rest (see `Chase`).
+    Chase(Chase),
     /// Say nothing.
     Drop,
+}
+
+/// The most records one chase takes from the upstream.
+const CHASE_MAX: usize = 100;
+
+/// A zone answer that ends in a CNAME to a name outside our zones. A stub resolver does not
+/// follow that CNAME, so the server asks the upstreams for the target and adds what belongs.
+#[derive(Debug, PartialEq)]
+pub struct Chase {
+    q: Query,
+    found: Found,
+    limit: usize,
+}
+
+impl Chase {
+    /// The question to put to the upstreams: the CNAME's target, with the type asked.
+    pub fn ask(&self) -> Vec<u8> {
+        wire::ask(&self.target(), self.q.qtype)
+    }
+
+    fn target(&self) -> String {
+        match self.found.answers.last().map(|r| &r.data) {
+            Some(Rdata::Cname(t)) => key(t),
+            _ => unreachable!("a chase ends in a CNAME"),
+        }
+    }
+
+    /// The answer as the zones give it, the CNAME alone: for when the upstreams cannot be asked.
+    pub fn plain(&self) -> Vec<u8> {
+        build(&self.q, 0, &self.found.answers, &[], self.limit)
+    }
+
+    /// The answer with the records from the upstreams' `reply` that belong: the target's CNAMEs
+    /// and records of the asked type, following the chain of names. Anything else, and a reply
+    /// that is an error or has nothing, leaves the answer as `plain`.
+    // ponytail: records are taken in the order sent (resolvers send a chain in order), a name
+    // in our own zones reached through the chain is not special-cased (the upstream is trusted).
+    pub fn finish(&self, reply: &[u8]) -> Vec<u8> {
+        let mut chain = vec![self.target()];
+        let mut all = self.found.answers.clone();
+        let mut room = CHASE_MAX;
+        for r in wire::answers(reply) {
+            if room == 0 || !chain.contains(&key(&r.name)) {
+                continue;
+            }
+            match &r.data {
+                Rdata::Cname(t) => chain.push(key(t)),
+                d if d.rtype() == self.q.qtype => {}
+                _ => continue,
+            }
+            all.push(r);
+            room -= 1;
+        }
+        build(&self.q, 0, &all, &[], self.limit)
+    }
 }
 
 /// Decides what to do with `query` from `client`. `udp` limits the reply to the client's size
@@ -44,6 +102,21 @@ pub fn answer(query: &[u8], client: IpAddr, zones: &Zones, udp: bool) -> Answer 
     }
     let limit = if udp { q.udp_limit() } else { usize::from(u16::MAX) };
     match zones.lookup(client, &q.qname, q.qtype) {
+        // NOERROR with no SOA and a CNAME last (and not asked for): the chain left our zones.
+        Some(f)
+            if f.rcode == 0
+                && f.authority.is_empty()
+                && q.qtype != 5
+                && matches!(
+                    f.answers.last(),
+                    Some(Record {
+                        data: Rdata::Cname(_),
+                        ..
+                    })
+                ) =>
+        {
+            Answer::Chase(Chase { q, found: f, limit })
+        }
         Some(f) => Answer::Reply(build(&q, f.rcode, &f.answers, &f.authority, limit)),
         None => Answer::Forward,
     }

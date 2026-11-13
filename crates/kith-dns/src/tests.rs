@@ -214,14 +214,19 @@ fn missing_names_get_nxdomain_or_nodata_with_the_soa() {
 }
 
 #[test]
-fn cnames_are_chased_inside_zones_and_left_alone_outside() {
+fn cnames_are_chased_inside_zones_and_handed_on_for_the_upstream_outside() {
     let z = zones();
     let r = ask(&z, "alias.kith", A);
     assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, A]);
     assert_eq!(r.an[1].name, "web.default.kith");
-    let r = ask(&z, "out.kith", A);
+    // Outside, the server has to ask: the zone's own answer is the CNAME alone.
+    let Answer::Chase(c) = answer(&query(7, "out.kith", A, None), LOCAL, &z, true) else {
+        panic!("not a chase")
+    };
+    let r = decode(c.plain());
     assert_eq!((r.rcode(), r.an.len()), (0, 1));
     assert_eq!(ask(&z, "alias.kith", CNAME).an.len(), 1);
+    assert_eq!(ask(&z, "out.kith", CNAME).an.len(), 1);
     assert_eq!(ask(&z, "loop1.kith", A).rcode(), 2);
 }
 
@@ -452,7 +457,7 @@ fn random_bytes_never_panic() {
         parsed += usize::from(wire::Query::parse(&p).is_some());
         match answer(&p, LOCAL, &z, i % 3 == 0) {
             Answer::Reply(r) => assert!(r.len() >= 12 && r[2] & 0x80 != 0),
-            Answer::Forward | Answer::Drop => {}
+            Answer::Forward | Answer::Drop | Answer::Chase(_) => {}
         }
         let _ = servfail(&p);
         // Upstream replies are hostile too.
@@ -723,6 +728,142 @@ async fn names_resolve_over_udp_and_tcp_and_unknown_names_go_upstream() {
             (0x4321, 0, false)
         );
         assert_eq!(r.data(&r.an[0]), [1, 2, 3, 4]);
+    }
+}
+
+/// One resource record, written out: a plain name, the type, IN, `ttl` and the data.
+fn rr(name: &str, ty: u16, ttl: u32, data: &[u8]) -> Vec<u8> {
+    let mut r = vec![];
+    for label in name.split('.') {
+        r.push(label.len() as u8);
+        r.extend(label.as_bytes());
+    }
+    r.push(0);
+    r.extend(ty.to_be_bytes());
+    r.extend(1u16.to_be_bytes());
+    r.extend(ttl.to_be_bytes());
+    r.extend((data.len() as u16).to_be_bytes());
+    r.extend(data);
+    r
+}
+
+/// An upstream on one port for UDP and TCP that answers every question with `rcode` and the
+/// `an` records in `records`, after the question.
+async fn canned_upstream(rcode: u16, an: u16, records: Vec<u8>) -> SocketAddr {
+    let (tcp, udp) = loop {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
+            break (tcp, udp);
+        }
+    };
+    let addr = udp.local_addr().unwrap();
+    let reply = move |q: &[u8]| {
+        let mut r = [u16_at(q, 0), 0x8180 | rcode, 1, an, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>();
+        r.extend(&q[12..]);
+        r.extend(&records);
+        r
+    };
+    let again = reply.clone();
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(&reply(&buf[..n]), from).await.unwrap();
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = tcp.accept().await.unwrap();
+            let mut len = [0; 2];
+            s.read_exact(&mut len).await.unwrap();
+            let mut q = vec![0; usize::from(u16::from_be_bytes(len))];
+            s.read_exact(&mut q).await.unwrap();
+            let r = again(&q);
+            s.write_all(&[&(r.len() as u16).to_be_bytes()[..], &r].concat())
+                .await
+                .unwrap();
+        }
+    });
+    addr
+}
+
+/// The TTL of a record of a decoded reply.
+fn ttl(r: &Reply, rr: &Rr) -> u32 {
+    u32::from_be_bytes(r.raw[rr.at - 6..rr.at - 2].try_into().unwrap())
+}
+
+#[tokio::test]
+async fn a_cname_that_leaves_the_zones_gets_its_targets_records_from_the_upstream() {
+    // What a recursive resolver says for example.com: a CNAME on, then two addresses for the end
+    // of it. An address for another name and a TXT for the right one do not belong.
+    let mut records = rr("example.com", CNAME, 120, b"\x04edge\x07example\x03net\x00");
+    records.extend(rr("edge.example.net", A, 300, &[9, 9, 9, 9]));
+    records.extend(rr("other.example.net", A, 300, &[6, 6, 6, 6]));
+    records.extend(rr("edge.example.net", TXT, 300, b"\x01x"));
+    records.extend(rr("EDGE.example.net", A, 300, &[9, 9, 9, 8]));
+    let up = canned_upstream(0, 5, records).await;
+    let (u, t, _tx) = start(zones(), vec![dead_upstream(), up]).await;
+    let q = query(0x55, "out.kith", A, None);
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!((u16_at(&r.raw, 0), r.rcode()), (0x55, 0));
+        assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, CNAME, A, A]);
+        assert_eq!(r.an[0].name, "out.kith");
+        assert_eq!(r.name_at(&r.an[1]), "edge.example.net");
+        assert_eq!(r.data(&r.an[2]), [9, 9, 9, 9]);
+        assert_eq!(r.data(&r.an[3]), [9, 9, 9, 8]);
+        assert_eq!((ttl(&r, &r.an[0]), ttl(&r, &r.an[2])), (60, 300));
+    }
+    // A question for the CNAME itself, or for a name inside the zones, is not sent upstream.
+    assert_eq!(udp_ask(u, &query(1, "out.kith", CNAME, None)).await.an.len(), 1);
+    assert_eq!(udp_ask(u, &query(1, "alias.kith", A, None)).await.an.len(), 2);
+}
+
+#[test]
+fn upstream_replies_cut_or_corrupted_anywhere_never_panic() {
+    let mut records = rr("example.com", CNAME, 120, b"\x04edge\x07example\x03net\x00");
+    records.extend(rr("edge.example.net", A, 300, &[9, 9, 9, 9]));
+    records.extend(rr("edge.example.net", TXT, 300, b"\x01x"));
+    let mut reply = [1u16, 0x8180, 1, 3, 0, 0]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect::<Vec<_>>();
+    reply.extend(&wire::ask("example.com", A)[12..]);
+    reply.extend(&records);
+    assert_eq!(wire::answers(&reply).len(), 3);
+    for cut in 0..reply.len() {
+        wire::answers(&reply[..cut]);
+        for bad in [0, 0x7F, 0xC0, 0xFF] {
+            let mut r = reply.clone();
+            r[cut] = bad;
+            wire::answers(&r);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cname_that_leaves_the_zones_stays_alone_when_the_upstream_cannot_help() {
+    let one = |r: &Reply| (r.rcode(), r.an.len(), r.an[0].ty);
+    let q = query(3, "out.kith", A, None);
+    let (u, t, _tx) = start(zones(), vec![dead_upstream()]).await;
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(one(&r), (0, 1, CNAME));
+    }
+    // No such name upstream, or an address for something else, or a client that may not forward.
+    let nx = canned_upstream(3, 0, vec![]).await;
+    let (u, t, _tx) = start(zones(), vec![nx]).await;
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(one(&r), (0, 1, CNAME));
+    }
+    let other = canned_upstream(0, 1, rr("other.example.net", A, 300, &[6, 6, 6, 6])).await;
+    let (u, _, _tx) = start(zones(), vec![other]).await;
+    assert_eq!(one(&udp_ask(u, &q).await), (0, 1, CNAME));
+    let up = canned_upstream(0, 1, rr("example.com", A, 300, &[9, 9, 9, 9])).await;
+    let (u, t, _tx) = start_for(zones(), vec![up], vec!["10.0.0.0/8".parse().unwrap()]).await;
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(one(&r), (0, 1, CNAME));
     }
 }
 
