@@ -9,13 +9,14 @@
 //! challenge: the answer takes only the account's key, which is the Secret
 //! `kith-system/acme-account`.
 //
-// ponytail: TLS ends here and the bytes go on as they are: no HTTP is read on 443, so the
-// backend is not told who the client is (no X-Forwarded-For), and to a NetworkPolicy the
-// connection comes from this node. Two nodes can order for one host at the same moment
+// ponytail: TLS ends here and the bytes go on as they are: no HTTP is read on 443, so
+// there is no X-Forwarded-For; a Service that asks (`expose.proxyProtocol`) gets the
+// client's address in a PROXY v1 line instead, and to a NetworkPolicy the connection
+// still comes from this node. Two nodes can order for one host at the same moment
 // (both then get one; the later Secret stays). A connection is cut after a time with no
 // byte either way, but one that trickles a byte inside that time keeps its place in the
 // room (port 80 has no limit on how slowly a request may come, only on how many).
-// Read HTTP here when a backend needs the client's address.
+// Read HTTP here when a backend needs the address in a header.
 
 use crate::{Shared, acme};
 use axum::extract::State;
@@ -30,12 +31,12 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::{Instant, Sleep};
@@ -59,6 +60,8 @@ pub struct Exposed {
     service: String,
     namespace: String,
     to: SocketAddr,
+    /// Does the backend want the PROXY protocol line (`expose.proxyProtocol`)?
+    proxy: bool,
 }
 
 /// The exposed hosts, and the Services refused one: Service key to why. (Two Services
@@ -84,6 +87,7 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
             continue;
         }
         let to = SocketAddr::new(address.into(), port.port);
+        let proxy = expose.proxy_protocol == Some(true);
         let namespace = namespace.to_string();
         hosts.insert(
             host,
@@ -91,6 +95,7 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
                 namespace,
                 service: key,
                 to,
+                proxy,
             },
         );
     }
@@ -332,51 +337,105 @@ impl axum::serve::Listener for Capped {
     }
 }
 
+/// The PROXY protocol v1 line for a client `from` that reached us at `to`. (A client
+/// of one address family at an address of the other is `UNKNOWN`, which the protocol
+/// allows: the backend then takes the connection as it is.)
+fn proxy_line(from: SocketAddr, to: SocketAddr) -> String {
+    match (from.ip().to_canonical(), to.ip().to_canonical()) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => format!("PROXY TCP4 {src} {dst} {} {}\r\n", from.port(), to.port()),
+        (IpAddr::V6(src), IpAddr::V6(dst)) => format!("PROXY TCP6 {src} {dst} {} {}\r\n", from.port(), to.port()),
+        _ => "PROXY UNKNOWN\r\n".to_string(),
+    }
+}
+
+/// Bytes both ways between the client and the Service; with a `line`, the Service gets
+/// it first, before any byte of the client's.
+async fn carry<C, S>(client: &mut C, service: &mut S, line: Option<String>)
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(line) = line
+        && service.write_all(line.as_bytes()).await.is_err()
+    {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(client, service).await;
+}
+
 /// Port 443: TLS for the host asked for, then the bytes go to its Service and back.
 async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
     let room = Arc::new(Semaphore::new(CONNECTIONS));
     loop {
         // (Accepting goes on when the room is full, for what is a Service's; a client
         // there is no room for is hung up on.)
-        let (stream, _) = door.accept().await;
+        let (stream, from) = door.accept().await;
         let Ok(turn) = room.clone().try_acquire_owned() else {
             continue;
         };
         let (tls, web) = (tls.clone(), web.clone());
         tokio::spawn(async move {
             let _turn = turn;
+            // (Where the client reached us: the line's destination.)
+            let at = stream.local_addr();
             let stream = Idle::new(stream, IDLE, None);
             let hello = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream));
             let Ok(Ok(mut client)) = hello.await else {
                 return;
             };
             let host = client.get_ref().1.server_name().map(str::to_ascii_lowercase);
-            let to = host.and_then(|host| Some(web.hosts.lock().ok()?.get(&host)?.to));
-            let Some(to) = to else { return };
-            let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(to));
+            let of = host.and_then(|host| Some(web.hosts.lock().ok()?.get(&host)?.clone()));
+            let Some(of) = of else { return };
+            let line = of
+                .proxy
+                .then(|| at.map_or_else(|_| "PROXY UNKNOWN\r\n".into(), |at| proxy_line(from, at)));
+            let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(of.to));
             if let Ok(Ok(service)) = reached.await {
                 // (A Service that stops taking bytes does not hold the place either.)
                 let mut service = Idle::new(service, IDLE, None);
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut service).await;
+                carry(&mut client, &mut service, line).await;
             }
         });
     }
 }
 
 /// What the store says now: the hosts, their certificates (and which are due for
-/// another), and the account key if there is one.
-fn look(store: &Store, prefix: Ipv6Addr, web: &Web) -> (Vec<(String, Exposed)>, Option<acme::Account>) {
+/// another), the account key if there is one, and the Services whose status does not yet
+/// name the Secret of the certificate that serves them (service key and what to say).
+#[allow(clippy::type_complexity)]
+fn look(
+    store: &Store,
+    prefix: Ipv6Addr,
+    web: &Web,
+) -> (Vec<(String, Exposed)>, Option<acme::Account>, Vec<(String, Value)>) {
     let hosts = exposed(store, prefix).0;
     let mut certificates = BTreeMap::new();
     let mut wanting = Vec::new();
+    let mut naming = Vec::new();
     let at = now();
     for (host, exposed) in &hosts {
-        let held = secret(store, &tls_secret(host, exposed));
+        let key = tls_secret(host, exposed);
+        let held = secret(store, &key);
         let read = held.get("tls.crt").zip(held.get("tls.key"));
         let read = read.and_then(|(chain, key)| crate::pki::certified(chain, key).ok());
         let good = read.as_ref().and_then(|read| validity(read.cert.first()?));
         if good.is_none_or(|(from, until)| due(from, until, at)) {
             wanting.push((host.clone(), exposed.clone()));
+        } else {
+            // One that is good was applied by hand or ordered earlier: either way the
+            // status says which Secret it is, once.
+            let status = store.get(&exposed.service).and_then(|service| service.status.as_ref());
+            // (Not while a node's order is under way: that node says so itself, as `acme`,
+            // and two answers would race.)
+            let ordering = status.is_some_and(|status| {
+                let asked = status["tls"]["at"].as_u64();
+                status["tls"]["state"] == "ordering"
+                    && asked.is_some_and(|asked| at.saturating_sub(asked) < BETWEEN_ORDERS)
+            });
+            if !ordering && status.is_none_or(|status| status["tls"]["secret"] != key.as_str()) {
+                let said = json!({ "state": "ready", "secret": key, "source": "applied" });
+                naming.push((exposed.service.clone(), said));
+            }
         }
         // (One that has run out is still shown: the client then says what is wrong.)
         if let Some(read) = read {
@@ -389,7 +448,7 @@ fn look(store: &Store, prefix: Ipv6Addr, web: &Web) -> (Vec<(String, Exposed)>, 
     *web.hosts.lock().expect("nothing panics holding it") = hosts;
     *web.certificates.0.lock().expect("nothing panics holding it") = certificates;
     *web.thumbprint.lock().expect("nothing panics holding it") = account.as_ref().map(acme::Account::thumbprint);
-    (wanting, account)
+    (wanting, account, naming)
 }
 
 fn a_secret(key: &str, data: Value) -> Result<Resource, String> {
@@ -480,7 +539,7 @@ async fn order(
         Err(e) => Err(e),
     };
     let tls = match ordered {
-        Ok(()) => json!({ "state": "ready", "by": me, "at": now() }),
+        Ok(()) => json!({ "state": "ready", "secret": tls_secret(host, of), "source": "acme", "by": me, "at": now() }),
         Err(e) => {
             eprintln!("kithd: ingress: no certificate for {host}: {e}");
             json!({ "state": "error", "message": e, "by": me, "at": now() })
@@ -531,10 +590,13 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
     loop {
-        let (wanting, account) = {
+        let (wanting, account, naming) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             look(&state.store, prefix, &web)
         };
+        for (service, tls) in naming {
+            say(&shared, &service, tls).await;
+        }
         if let Some(directory) = acme.as_deref().filter(|_| !wanting.is_empty()) {
             let orders = async {
                 match account {
@@ -706,6 +768,87 @@ mod tests {
             let _ = write.write_all(b"x").await;
         }
         assert_eq!(reader.await.unwrap().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_certificate_applied_by_hand_is_named_in_the_status() {
+        let mut params = rcgen::CertificateParams::new(vec!["shop.example.org".to_string()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2020, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2999, 1, 1);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = params.self_signed(&key).unwrap();
+        let data = json!({ "tls.crt": certificate.pem(), "tls.key": key.serialize_pem() });
+        let secret = json!({ "apiVersion": "kith.dev/v1", "kind": "Secret",
+                             "metadata": { "name": "tls-shop.example.org", "namespace": "shop" }, "spec": { "data": data } });
+        let service = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: web, namespace: shop }\nspec:\n  \
+                       selector: { app: web }\n  ports: [{ port: 8080 }]\n  \
+                       expose: { host: shop.example.org, via: edge, proxyProtocol: true }\n";
+        let mut store = Store::default();
+        store
+            .apply(Resource::from_source(service).unwrap().remove(0).unwrap())
+            .unwrap();
+        let prefix = kith_mesh::prefix(b"ca");
+        let web = Web::default();
+        // No certificate: it is wanted, and nothing is named.
+        let (wanting, _, naming) = look(&store, prefix, &web);
+        assert_eq!((wanting.len(), naming.len()), (1, 0));
+        assert!(wanting[0].1.proxy);
+        // (Only a Service that asks gets the line.)
+        let quiet = Resource::from_source(&service.replace("proxyProtocol: true", "proxyProtocol: false"));
+        let mut other = store.clone();
+        other.apply(quiet.unwrap().remove(0).unwrap()).unwrap();
+        assert!(!look(&other, prefix, &web).0[0].1.proxy);
+        // One applied by hand: not wanted, and the status is to name its Secret.
+        store.apply(serde_json::from_value(secret).unwrap()).unwrap();
+        let (wanting, _, naming) = look(&store, prefix, &web);
+        assert!(wanting.is_empty());
+        assert_eq!(naming.len(), 1);
+        let (to, said) = &naming[0];
+        assert_eq!(to, "Service/shop/web");
+        assert_eq!(said["secret"], "Secret/shop/tls-shop.example.org");
+        assert_eq!(said["state"], "ready");
+        // Once the status says so, it is not said again.
+        store.set_status(to, Some(json!({ "tls": said }))).unwrap();
+        assert!(look(&store, prefix, &web).2.is_empty());
+    }
+
+    #[test]
+    fn proxy_protocol_lines() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let line = proxy_line(at("203.0.113.7:51000"), at("192.0.2.1:443"));
+        assert_eq!(line, "PROXY TCP4 203.0.113.7 192.0.2.1 51000 443\r\n");
+        let line = proxy_line(at("[2001:db8::7]:51000"), at("[2001:db8::1]:443"));
+        assert_eq!(line, "PROXY TCP6 2001:db8::7 2001:db8::1 51000 443\r\n");
+        // (A v4 client of the dual-stack socket shows as a mapped address.)
+        let line = proxy_line(at("[::ffff:203.0.113.7]:51000"), at("[::ffff:192.0.2.1]:443"));
+        assert_eq!(line, "PROXY TCP4 203.0.113.7 192.0.2.1 51000 443\r\n");
+        let line = proxy_line(at("203.0.113.7:51000"), at("[2001:db8::1]:443"));
+        assert_eq!(line, "PROXY UNKNOWN\r\n");
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_line_comes_before_the_clients_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // The backend, over loopback, reads all it is sent; the client sends "GET /".
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let to = backend.local_addr().unwrap();
+        for line in [Some("PROXY TCP4 203.0.113.7 192.0.2.1 51000 443\r\n".to_string()), None] {
+            let (mut client, theirs) = tokio::io::duplex(64);
+            let mut service = TcpStream::connect(to).await.unwrap();
+            let (mut seen, _) = backend.accept().await.unwrap();
+            let wanted = line.clone().unwrap_or_default() + "GET /";
+            let carried = {
+                let mut theirs = theirs;
+                tokio::spawn(async move { carry(&mut theirs, &mut service, line).await })
+            };
+            client.write_all(b"GET /").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut got = String::new();
+            seen.read_to_string(&mut got).await.unwrap();
+            assert_eq!(got, wanted);
+            drop(seen);
+            let _ = carried.await;
+        }
     }
 
     #[tokio::test]

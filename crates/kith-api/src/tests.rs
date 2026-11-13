@@ -424,6 +424,23 @@ fn expose_host_is_a_domain_name() {
 }
 
 #[test]
+fn expose_asks_for_the_proxy_protocol() {
+    let service = |expose: &str| {
+        let yaml = format!(
+            "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  \
+             selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {expose}\n"
+        );
+        let resource = Resource::from_source(&yaml).unwrap().remove(0).map_err(|e| e.msg)?;
+        serde_json::from_value::<kinds::ServiceSpec>(resource.spec).map_err(|e| e.to_string())
+    };
+    let on = service("{ host: a.example.org, via: edge, proxyProtocol: true }").unwrap();
+    assert_eq!(on.expose.unwrap().proxy_protocol, Some(true));
+    let off = service("{ host: a.example.org, via: edge }").unwrap();
+    assert_eq!(off.expose.unwrap().proxy_protocol, None);
+    assert!(service("{ host: a.example.org, via: edge, proxyProtocol: yes please }").is_err());
+}
+
+#[test]
 fn dns_kinds_are_checked() {
     let zone = |spec: &str| format!("apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: {{ name: z }}\nspec: {spec}\n");
     let record =
