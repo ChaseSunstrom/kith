@@ -84,7 +84,7 @@ fn kept(mut backups: Vec<Value>, new: Value, keep: usize) -> (Vec<Value>, Vec<Va
 }
 
 /// `dir` as a tar in the blob store at `blobs`: the blob's name and size.
-fn archive(dir: &Path, blobs: &Path) -> Result<(String, u64), String> {
+pub(crate) fn archive(dir: &Path, blobs: &Path) -> Result<(String, u64), String> {
     let failed = |e: std::io::Error| format!("archiving {}: {e}", dir.display());
     let mut tar = tar::Builder::new(Incoming::new(blobs).map_err(failed)?);
     // (A link is kept as a link: what it points at is not this volume's to read.)
@@ -102,6 +102,24 @@ fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
     if std::fs::read_dir(dir).map_err(failed)?.next().is_some() {
         return Err(full());
     }
+    // (An archive may come from a bucket others can write: nothing in it becomes a program
+    // that runs as its owner.)
+    unpack_beside(archive, dir, 0o6000).and_then(|beside| {
+        // (`remove_dir` takes only a directory that is still empty.)
+        let moved = std::fs::remove_dir(dir).map_err(|_| full());
+        let moved = moved.and_then(|()| std::fs::rename(&beside, dir).map_err(failed));
+        if moved.is_err() {
+            let _ = std::fs::remove_dir_all(&beside);
+            let _ = std::fs::create_dir(dir);
+        }
+        moved
+    })
+}
+
+/// The tar at `archive` unpacked into a new directory beside `dir`: where it is. Nothing is
+/// left there if it fails.
+pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32) -> Result<PathBuf, String> {
+    let failed = |e: std::io::Error| format!("unpacking for {}: {e}", dir.display());
     let mut beside = dir.as_os_str().to_owned();
     beside.push(".restoring");
     let beside = PathBuf::from(beside);
@@ -111,9 +129,7 @@ fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
         let mut tar = tar::Archive::new(std::fs::File::open(archive)?);
         tar.set_preserve_permissions(true);
         tar.set_preserve_mtime(true);
-        // (An archive may come from a bucket others can write: nothing in it becomes a
-        // program that runs as its owner.)
-        tar.set_mask(0o6000);
+        tar.set_mask(mask);
         // (Whose each file is, where kithd may say: as root, which it is on a node.)
         tar.set_preserve_ownerships(std::fs::metadata("/proc/self").is_ok_and(|me| {
             use std::os::unix::fs::MetadataExt;
@@ -123,16 +139,10 @@ fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
         // no way through a link.)
         tar.unpack(&beside)
     })();
-    // (`remove_dir` takes only a directory that is still empty.)
-    let moved = unpacked.map_err(failed).and_then(|()| {
-        std::fs::remove_dir(dir).map_err(|_| full())?;
-        std::fs::rename(&beside, dir).map_err(failed)
-    });
-    if moved.is_err() {
+    if unpacked.is_err() {
         let _ = std::fs::remove_dir_all(&beside);
-        let _ = std::fs::create_dir(dir);
     }
-    moved
+    unpacked.map(|()| beside).map_err(failed)
 }
 
 // ---- S3 ----
@@ -284,7 +294,7 @@ async fn s3(
         .resolve(&name, at)
         .build()
         .map_err(said)?;
-    let stamp = stamp(kith_api::store::now() / 1000);
+    let stamp = stamp(kith_api::store::now());
     // (The body is not hashed into the signature: it is as long as a volume, and goes over TLS.)
     let payload = "UNSIGNED-PAYLOAD";
     let headers = [
@@ -427,7 +437,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
             _ = tokio::time::sleep(ROUND) => {}
             _ = stopping.changed() => return,
         }
-        let now = kith_api::store::now() / 1000;
+        let now = kith_api::store::now();
         let jobs = {
             let state = shared.store.lock().expect("a handler panicked holding the store");
             due(&state.store, &me, now)
@@ -735,6 +745,8 @@ mod tests {
     fn an_s3_signature_is_the_one_amazons_own_example_has() {
         // "Example: GET Object" of Amazon's "Signature Calculations for the Authorization Header".
         assert_eq!(stamp(1_369_353_600), "20130524T000000Z");
+        // (The store's clock is in seconds, which is what a stamp is made of.)
+        assert!(stamp(kith_api::store::now()).as_str() > "2025");
         let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let headers = [
             ("host", "examplebucket.s3.amazonaws.com"),
@@ -814,8 +826,10 @@ mod tests {
                 ];
                 let mut bucket = example();
                 bucket.endpoint = String::new();
-                if header("authorization")
-                    != authorization(method.as_str(), uri.path(), &signed, &payload, &date, &bucket)
+                // (And nothing dated long ago: a real bucket takes a request of the last minutes only.)
+                if date.as_str() < "2025"
+                    || header("authorization")
+                        != authorization(method.as_str(), uri.path(), &signed, &payload, &date, &bucket)
                 {
                     return (StatusCode::FORBIDDEN, Vec::new());
                 }

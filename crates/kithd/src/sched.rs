@@ -227,6 +227,10 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let mut claimed = crate::claims::writes(&state.store);
             claimed.extend(crate::volumes::writes(&state.store));
             claimed.extend(crate::seats::writes(&state.store));
+            // Where each replicated volume is now, and on which nodes its copies are.
+            let lost = |name: &str| seen(name).1;
+            let mut fields = fields;
+            fields.extend(crate::replicas::writes(&state.store, &lost, grace));
             (fields, left, claimed)
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
@@ -235,13 +239,14 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let statuses = vec![(key, None)];
             commands.push(Command::Report { node, statuses });
         }
-        if !fields.is_empty() {
-            commands.push(Command::Patch { statuses: fields });
-        }
         // Each DeviceClaim says where it is and who holds it, each VolumeClaim and Volume what it is
-        // bound to (only when that changed).
+        // bound to (only when that changed). Before the fields: a Volume's whole status, worked
+        // out from what was there, must not undo where its copies were just said to be.
         if !claimed.is_empty() {
             commands.push(Command::Status { statuses: claimed });
+        }
+        if !fields.is_empty() {
+            commands.push(Command::Patch { statuses: fields });
         }
         for command in commands {
             if let Err(e) = shared.submit(command).await {

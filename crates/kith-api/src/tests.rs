@@ -716,3 +716,28 @@ fn a_backup_says_how_often_and_sends_keys_over_tls_only() {
     );
     assert!(s3("https://s3.example.org", "a/../b").unwrap_err().contains("bucket"));
 }
+
+#[test]
+fn a_volumes_replicas_are_at_least_itself_and_synced_no_more_often_than_every_ten_seconds() {
+    let volume = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Volume\nmetadata: {{ name: data }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    volume("{ node: a, path: d, replicas: 2, sync: 10s }").unwrap();
+    assert!(
+        volume("{ node: a, path: d, replicas: 0 }")
+            .unwrap_err()
+            .contains("replicas:")
+    );
+    assert!(
+        volume("{ node: a, path: d, replicas: 2, sync: 9s }")
+            .unwrap_err()
+            .contains("under 10s")
+    );
+    assert!(
+        volume("{ node: a, path: d, replicas: 2, sync: often }")
+            .unwrap_err()
+            .contains("sync:")
+    );
+}

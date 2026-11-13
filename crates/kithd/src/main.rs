@@ -32,6 +32,7 @@ mod probe;
 mod raft;
 mod registry;
 mod releases;
+mod replicas;
 mod sched;
 mod seats;
 mod services;
@@ -661,8 +662,10 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let shares = share::run(shared.clone(), state.clone(), stopping.clone());
         let blobs = blobs::run(shared.clone(), stopping.clone());
         let backups = backups::run(shared.clone(), state.clone(), stopping.clone());
-        let (served, nodes, (), (), (), (), (), (), (), ()) =
-            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, shares, blobs, backups);
+        let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
+        let storage = async { tokio::join!(shares, blobs, backups, replicas) };
+        let (served, nodes, (), (), (), (), (), _) =
+            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, storage);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });

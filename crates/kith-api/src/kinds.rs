@@ -501,6 +501,13 @@ spec! {
         pub shared: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub size: Option<Quantity>,
+        /// Keep this many copies in all, the others on other nodes, one of which takes
+        /// over when the volume's node is lost.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub replicas: Option<u32>,
+        /// How often the other copies are brought up to date [default: 5m].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sync: Option<String>,
     }
 
     /// Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3
@@ -830,7 +837,6 @@ no_checks!(
     NodeSpec,
     NamespaceSpec,
     NetworkPolicySpec,
-    VolumeSpec,
     VolumeClaimSpec,
     ConfigMapSpec,
     SecretSpec,
@@ -877,6 +883,22 @@ pub fn every(text: &str) -> Option<u64> {
         .ok()
         .filter(|n| digits && *n > 0)?
         .checked_mul(unit)
+}
+
+impl Spec for VolumeSpec {
+    fn check(&self) -> Result<(), String> {
+        if self.replicas == Some(0) {
+            return Err("replicas: at least 1 (the volume itself)".into());
+        }
+        match &self.sync {
+            Some(sync) if every(sync).is_none() => {
+                Err(format!("sync: `{sync}` is not a number and s, m, h or d (`5m`)"))
+            }
+            // (Each sync reads the whole volume on its node.)
+            Some(sync) if every(sync) < Some(10) => Err(format!("sync: `{sync}` is under 10s")),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl Spec for BackupSpec {

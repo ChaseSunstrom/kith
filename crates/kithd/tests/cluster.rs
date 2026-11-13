@@ -426,6 +426,67 @@ fn a_backup_of_a_volume_is_held_by_two_nodes_and_restored_through_another() {
 }
 
 #[test]
+fn a_volumes_replica_has_its_files_and_takes_over_when_its_node_is_lost() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "replica";
+    let mut alpha = Node::start(test, "alpha", &["--lost-after", "3"]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        let args = ["--join", &alpha.address(), "--token", token.trim(), "--lost-after", "3"];
+        Node::start(test, name, &args)
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    wait_for("three voters", || {
+        beta.ok(&["node", "status"]).contains("voters:    alpha, beta, gamma")
+    });
+
+    let data = |node: &Node| node.dir.join("state/volumes/default/data/d");
+    std::fs::create_dir_all(data(&alpha)).unwrap();
+    std::fs::write(data(&alpha).join("file"), "first").unwrap();
+    let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: alpha, path: d, replicas: 2, sync: 10s }\n";
+    std::fs::write(beta.dir.join("volume.yaml"), yaml).unwrap();
+    beta.ok(&["apply", "-f", "volume.yaml"]);
+
+    // One of the other two is picked, and has the file; then what the file became.
+    let status = |node: &Node| {
+        let found: serde_json::Value =
+            serde_json::from_str(&node.ok(&["get", "volume", "data", "-o", "json"])).unwrap();
+        found.as_array().map_or(found.clone(), |found| found[0].clone())["status"].clone()
+    };
+    wait_for("a replica to be picked", || status(&beta)["replicas"][0].is_string());
+    assert_eq!(status(&beta)["primary"], "alpha");
+    let picked = status(&beta)["replicas"][0].as_str().unwrap().to_string();
+    let (replica, other) = if picked == "beta" {
+        (&beta, &gamma)
+    } else {
+        (&gamma, &beta)
+    };
+    let has = |node: &Node, text: &str| std::fs::read_to_string(data(node).join("file")).is_ok_and(|file| file == text);
+    wait_for("the replica to have the file", || has(replica, "first"));
+    std::fs::write(data(&alpha).join("file"), "second").unwrap();
+    wait_for("the replica to have what the file became", || has(replica, "second"));
+    assert!(!data(other).exists(), "a node that is no replica has no copy");
+
+    // The volume's node is lost: the replica has the volume now, and the third node the copy.
+    alpha.stop();
+    wait_for("the replica to take over", || {
+        other.kith(&["get", "node"]).0 == 0 && status(other)["primary"] == picked.as_str()
+    });
+    assert!(has(replica, "second"));
+    let third = other.dir.file_name().unwrap().to_string_lossy().into_owned();
+    wait_for("the third node to be the replica", || {
+        status(other)["replicas"][0] == third.as_str()
+    });
+    wait_for("the third node to have the file", || has(other, "second"));
+}
+
+#[test]
 fn a_node_that_is_down_is_not_made_a_voter() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

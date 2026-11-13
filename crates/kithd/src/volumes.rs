@@ -52,6 +52,8 @@ pub struct Volumes {
 /// A Volume as read: what binding needs to know and whether its path is allowed.
 struct Vol {
     dir: Dir,
+    /// More than one: kept on other nodes too ([`crate::replicas`]).
+    replicas: u32,
     size: Option<f64>,
     shared: bool,
     refused: Option<String>,
@@ -94,15 +96,25 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
         let vol = match serde_json::from_value::<VolumeSpec>(volume.spec.clone()) {
             Ok(spec) => {
                 dir.path = spec.path;
-                dir.node = spec.node;
+                let replicas = spec.replicas.unwrap_or(1);
+                // A volume that had replicas is where its status says: on the node that took
+                // over when the one it was made on was lost (and stays there with `replicas`
+                // lowered again, until `node` names that node: never back to the old copy).
+                let primary = volume.status.as_ref().and_then(|status| status["primary"].as_str());
+                dir.node = primary.map_or(spec.node, String::from);
                 let shared = spec.shared == Some(true);
                 // ponytail: what a node serves to the others is under its state directory only
                 // (`crate::share`); a path anywhere on the host is not. Lift it by serving each
                 // such path from a root of its own.
                 let anywhere = (shared && namespace == SYSTEM)
                     .then(|| format!("a shared volume cannot be in {SYSTEM}: its path is anywhere on the host"));
+                // ponytail: one served to the others, or anywhere on a host, has no copies yet:
+                // the nodes that mount it would have to follow it, and a host path is one node's.
+                let alone = (replicas > 1 && (shared || namespace == SYSTEM))
+                    .then(|| format!("a volume with replicas cannot be shared or in {SYSTEM} yet"));
                 Vol {
-                    refused: check_path(namespace, &dir.path).err().or(anywhere),
+                    refused: check_path(namespace, &dir.path).err().or(anywhere).or(alone),
+                    replicas,
                     dir,
                     size: spec.size.map(|size| size.value()),
                     shared,
@@ -110,6 +122,7 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
             }
             Err(e) => Vol {
                 dir,
+                replicas: 1,
                 size: None,
                 shared: false,
                 refused: Some(e.to_string()),
@@ -258,6 +271,28 @@ pub fn resolve(store: &Store) -> Volumes {
             (None, Some(claim)) => Some(json!({ "claim": claim })),
             (None, None) => None,
         };
+        // (What is said of its copies is the replicas' and the leader's to say: it stays.)
+        let was = store.get(key).and_then(|volume| volume.status.as_ref()?.as_object());
+        let copies = was
+            .into_iter()
+            .flatten()
+            .filter(|(field, _)| crate::replicas::FIELDS.contains(&field.as_str()));
+        let copies: serde_json::Map<String, Value> =
+            copies.map(|(field, value)| (field.clone(), value.clone())).collect();
+        // (Without replicas any more, only where it is, while that is not where `node` says.)
+        let home = store.get(key).and_then(|volume| volume.spec["node"].as_str());
+        let mut copies = copies;
+        if vol.replicas < 2 {
+            copies.retain(|field, node| field == "primary" && node.as_str() != home);
+        }
+        let status = match (status, copies.is_empty()) {
+            (status, true) => status,
+            (status, false) => {
+                let mut all = copies;
+                all.extend(status.as_ref().and_then(Value::as_object).cloned().unwrap_or_default());
+                Some(all.into())
+            }
+        };
         found.status.insert(key.clone(), status);
     }
     for (key, outcome) in &bound {
@@ -329,6 +364,13 @@ pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>
         settled.then_some((key, held.volumes))
     });
     mine.collect()
+}
+
+/// The Volumes kept on more than one node: key, where each is now, and how many copies in all.
+pub fn replicated(store: &Store) -> Vec<(String, Dir, u32)> {
+    let kept =
+        |(key, vol): (String, Vol)| (vol.replicas > 1 && vol.refused.is_none()).then_some((key, vol.dir, vol.replicas));
+    volumes(store).into_iter().filter_map(kept).collect()
 }
 
 /// Where the Volume `name` of `namespace` is, if there is one that is not refused.

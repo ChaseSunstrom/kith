@@ -1007,6 +1007,44 @@ spec: { node: n1, path: media, shared: true }
   up to two minutes; locks held when the volume's node restarts must be taken again within
   30 seconds; VMs (virtiofs) and machines that are not nodes cannot mount one.
 
+### Replicas
+
+A Volume can be kept on more than one node, and move when its node is lost:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data }
+spec:
+  node: alpha     # where it is to begin with
+  path: d
+  replicas: 2     # copies in all: this one, and one on another node
+  sync: 5m        # how often the others are brought up to date (5m unless said)
+```
+
+- The cluster picks the other nodes (`status.replicas`). Every `sync`, each of them asks the
+  node that has the volume (`status.primary`) for its directory over the cluster's mutual
+  TLS, and puts what it gets in the place of its own copy; `status.synced` says when each
+  last did. Nothing is sent when nothing changed.
+- When the primary is not heard from for as long as a lost node's workloads wait
+  (`--lost-after`), the replica that synced last becomes the primary. Workloads that mount
+  the volume are placed there, and another node is picked to hold a copy.
+- **A failover loses what was written after the last sync.** The copies are not written
+  together: for data that must not lose a second, this is not yet the tool. A copy is the
+  directory as it was read while in use, file by file: a database caught in the middle of a
+  write may need its own recovery, as after a power cut. The replica that takes over is the
+  one that synced last, however long ago that was: `status.synced` says when.
+- With `replicas` lowered to 1 after a failover, the volume stays where it took over
+  (`status.primary`) until `node` names that node; it never goes back by itself to the old
+  copy. `sync` is at least `10s`.
+- A node that comes back after its volume moved is not given it back. If it is later picked
+  to hold a copy, what it still had is kept beside the copy as `PATH.was-TIME`, not deleted.
+- Not yet: each sync reads the whole volume and sends all of it when anything changed, so
+  this is for data of modest size; a volume with replicas cannot be `shared` or in
+  `kith-system`; a node sends one copy at a time; `PATH.was-TIME` directories are yours to
+  delete; a replica that never synced takes nothing over (the volume waits for its
+  node); moving a volume back is done by hand.
+
 ### Blobs
 
 Bytes the cluster keeps by what they are, on more than one node:
