@@ -140,7 +140,11 @@ impl Store {
                 resource: change.after.clone(),
             });
             // A Package carries its files (up to 4 MB), so it keeps few revisions.
-            let limit = if change.after.kind == "Package" { PACKAGE_HISTORY_LIMIT } else { HISTORY_LIMIT };
+            let limit = if change.after.kind == "Package" {
+                PACKAGE_HISTORY_LIMIT
+            } else {
+                HISTORY_LIMIT
+            };
             while history.len() > limit {
                 history.remove(0);
             }
