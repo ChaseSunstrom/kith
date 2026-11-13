@@ -68,6 +68,9 @@ struct Slot {
     /// What its containers mount: the Volume's directory, where in the container, and read-only
     /// (a changed one replaces the unit, as a changed value does). An exec unit mounts nothing.
     volumes: Vec<(crate::volumes::Dir, String, bool)>,
+    /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
+    /// anything; none again each time it starts.
+    tuned: Option<(Option<u64>, Option<u64>)>,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -294,7 +297,8 @@ impl Controller {
         // And, per workload this node may run that holds DeviceClaims, the device nodes of its own
         // Devices they come to (`granted` knows no other node's).
         // And, the same way, the Volumes of this node they mount.
-        let (resources, granted, mounted): (Vec<Resource>, _, _) = {
+        // And what its seats ask of each workload's cgroups here (a guarantee, or holding back).
+        let (resources, granted, mounted, tunes): (Vec<Resource>, _, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let kinds = ["Workload", "NodeWorkload", "Job"];
@@ -306,7 +310,13 @@ impl Controller {
             let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
             let granted = me.map(|me| crate::claims::granted(store, me, Path::new("/sys")));
             let mounted = me.map(|me| crate::volumes::mounts(store, me));
-            (resources, granted.unwrap_or_default(), mounted.unwrap_or_default())
+            let tunes = me.map(|me| crate::seats::tunes(store, me));
+            (
+                resources,
+                granted.unwrap_or_default(),
+                mounted.unwrap_or_default(),
+                tunes.unwrap_or_default(),
+            )
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
@@ -455,6 +465,7 @@ impl Controller {
                             probes: None,
                             devices: devices.clone(),
                             volumes: mounts_of(unit, &volumes),
+                            tuned: None,
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -595,6 +606,7 @@ impl Controller {
                 match started {
                     Ok(handle) => {
                         slot.handle = Some(handle);
+                        slot.tuned = None;
                         (slot.state, slot.message, slot.start_at, slot.started) =
                             ("running", None, None, Instant::now());
                         if let Run::Container(c) = &slot.run {
@@ -609,6 +621,36 @@ impl Controller {
                         job_moved |= self.jobs.contains_key(&slot.owner);
                     }
                 }
+            }
+        }
+
+        // What the node's seats ask of the running units: the holder's guarantee, and a sliver of
+        // CPU for who yields while the seat is busy. Said again only when it changes; a unit
+        // never told anything is left as the runtime made it.
+        for (id, slot) in self.slots.iter_mut() {
+            let Some(handle) = &slot.handle else { continue };
+            let asked = tunes.get(&slot.owner).copied();
+            if asked.is_none() && slot.tuned.is_none() {
+                continue;
+            }
+            let (guaranteed, held_back) = asked.unwrap_or_default();
+            let resources = match &slot.run {
+                Run::Container(c) => &c.resources,
+                Run::Exec(e) => &e.resources,
+            };
+            let own = resources.as_ref().and_then(|r| r.cpu.as_ref());
+            let own = own.map(|q| (q.value() * 1000.0).round() as u64);
+            let sliver = crate::seats::YIELD_MILLIS;
+            let cpu = if held_back {
+                Some(own.map_or(sliver, |own| own.min(sliver)))
+            } else {
+                own
+            };
+            if slot.tuned != Some((guaranteed, cpu)) {
+                for refused in kith_runtime::tune(&handle.cgroup, guaranteed, cpu) {
+                    eprintln!("kithd: {id}: its seat's arrangement is not all in place: {refused}");
+                }
+                slot.tuned = Some((guaranteed, cpu));
             }
         }
 

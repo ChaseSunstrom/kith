@@ -876,6 +876,48 @@ spec:
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
   other kind: give it only to someone you would let hold any hardware of the cluster.
 
+### What a seat keeps for itself
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Seat
+metadata: { name: desk-seat0 }
+spec:
+  node: desk
+  devices: [desk-gpu-card0]
+  reserve: { cpu: 4, memory: 8Gi }     # kept for whatever holds the seat
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: training }
+spec:
+  template:
+    containers: [{ name: run, image: registry.example/train:1 }]
+    yieldTo: { seat: desk-seat0, when: [fullscreen] }   # step back while a game is up
+```
+
+- A seat's `reserve` comes off its node for every workload that does not hold the seat,
+  whether or not anything holds it just then: other workloads are placed in what is left
+  (ones already placed are not moved). The holder is asked to fit only what it wants
+  beyond the reserve. (Of several that share a seat, the reserve counts for one:
+  the first by name, and its first replica.)
+- The holder's units are guaranteed the reserve's memory (`memory.min`: it is not
+  reclaimed from them) and go first for CPU and disk (`cpu.weight` and `io.weight` at the
+  kernel's most, 10000; everything else has 100). The CPUs are not pinned: an idle
+  session costs the others nothing. Where a cgroup file cannot be written (no `io`
+  controller, say) kithd's log names it and the rest holds.
+- A session says what its seat is doing:
+  `POST /v1/seats/desk-seat0/activity?state=active|idle|fullscreen`, for who may apply
+  `Seat`s (give the session an Identity with a Role for that); it is in the audit log and
+  in `kith get seat desk-seat0 -o yaml` as `status.activity`. A seat nobody holds says
+  nothing, which is idle.
+- A workload with `yieldTo` runs on a twentieth of one CPU on that seat's node while the
+  seat is in one of the states it names, and has its own limit back when the state
+  changes (within the controller's pass, some ten seconds). It is not stopped or moved.
+- Not yet (ponytail): each unit of a holder gets the whole memory guarantee; a session
+  that hangs while fullscreen keeps the others held back until it goes; a GPU is not
+  shared out by this, only CPU, memory and disk.
+
 ## Storage
 
 A `Volume` is a directory on one node. A container mounts one by naming it, or a

@@ -305,6 +305,33 @@ pub fn reap_orphans(mains: &[i32]) {
     }
 }
 
+/// The most the kernel takes for `cpu.weight` and `io.weight` (the default is 100): a unit with
+/// a guarantee goes before everything else on the node when they want the same CPU or disk.
+const TOP_WEIGHT: u32 = 10_000;
+
+/// Say in a running unit's cgroup (`Handle::cgroup`) what it is guaranteed and how much CPU it
+/// may use: `guaranteed` bytes of memory that are not reclaimed from it, with the top weights
+/// (none: no guarantee, the default weights), and `cpu_millis` thousandths of a CPU (none: no
+/// limit). What could not be written is returned in plain words, and the rest is written
+/// anyway: a kernel or a cgroup without the io controller still gives the memory and the CPU.
+pub fn tune(cgroup: &Path, guaranteed: Option<u64>, cpu_millis: Option<u64>) -> Vec<String> {
+    let weight = if guaranteed.is_some() { TOP_WEIGHT } else { 100 };
+    let cpu = cpu_millis.map_or("max".to_string(), |millis| {
+        millis.max(10).saturating_mul(100).to_string()
+    });
+    let files = [
+        ("memory.min", guaranteed.unwrap_or(0).to_string()),
+        ("cpu.weight", weight.to_string()),
+        ("io.weight", format!("default {weight}")),
+        ("cpu.max", format!("{cpu} 100000")),
+    ];
+    let write = |(file, value): &(&str, String)| {
+        let done = fs::write(cgroup.join(file), value);
+        done.err().map(|e| format!("{file} = {value}: {e}"))
+    };
+    files.iter().filter_map(write).collect()
+}
+
 fn manager(cgroup: &str) -> libcgroups::v2::manager::Manager {
     libcgroups::v2::manager::Manager::new("/sys/fs/cgroup".into(), cgroup.into()).expect("joining two absolute paths")
 }
@@ -688,6 +715,34 @@ mod tests {
             let refused = spec("a", &image, &with(out), "/kith/a").unwrap_err().to_string();
             assert!(refused.contains("device node"), "{out}: {refused}");
         }
+    }
+
+    #[test]
+    fn a_guarantee_and_a_cpu_limit_are_written_to_the_cgroup_and_a_refused_file_is_said() {
+        let cgroup = std::env::temp_dir().join(format!("kith-tune-guarantee-{}", std::process::id()));
+        fs::create_dir_all(&cgroup).unwrap();
+        let read = |file: &str| fs::read_to_string(cgroup.join(file)).unwrap();
+        assert!(tune(&cgroup, Some(4 << 30), None).is_empty());
+        assert_eq!(read("memory.min"), "4294967296");
+        assert_eq!(
+            (read("cpu.weight"), read("io.weight")),
+            ("10000".into(), "default 10000".into())
+        );
+        assert_eq!(read("cpu.max"), "max 100000");
+        // Held back to a twentieth of a CPU, with no guarantee: the defaults, and the limit.
+        assert!(tune(&cgroup, None, Some(50)).is_empty());
+        assert_eq!((read("memory.min"), read("cpu.weight")), ("0".into(), "100".into()));
+        assert_eq!(read("cpu.max"), "5000 100000");
+        // A file the kernel will not take (here: a directory in its place) is named; the others are written.
+        fs::remove_file(cgroup.join("io.weight")).unwrap();
+        fs::create_dir(cgroup.join("io.weight")).unwrap();
+        let said = tune(&cgroup, Some(1), Some(500));
+        assert!(said.len() == 1 && said[0].starts_with("io.weight"), "{said:?}");
+        assert_eq!(
+            (read("memory.min"), read("cpu.max")),
+            ("1".into(), "50000 100000".into())
+        );
+        let _ = fs::remove_dir_all(cgroup);
     }
 
     fn mounted(mounts: Vec<Mount>) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
