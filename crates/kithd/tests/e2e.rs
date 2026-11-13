@@ -1947,7 +1947,8 @@ fn web_ui_is_served_and_asks_as_its_caller() {
             args.extend(["--cert", cert.to_str().unwrap(), "--key", key.to_str().unwrap()]);
         }
         if let Some(body) = body {
-            args.extend(["-H", "Content-Type: application/json", "-d", body]);
+            // (No "Expect: 100-continue" curl adds to a big body: the status asked for is the last.)
+            args.extend(["-H", "Content-Type: application/json", "-H", "Expect:", "-d", body]);
         }
         args.push(&url);
         fetch(&args)
@@ -2006,6 +2007,11 @@ fn web_ui_is_served_and_asks_as_its_caller() {
     assert_eq!(status, 200, "{body}");
     let resources = json(&body)["resources"].clone();
     assert_eq!(resources[0]["spec"]["map"], "ice");
+    // It is text a person typed: over 1 MB is refused before it is read (a file: an argument is too short).
+    let big = daemon.dir.join("big.json");
+    std::fs::write(&big, serde_json::json!({ "yaml": "#".repeat(1 << 20) }).to_string()).unwrap();
+    let (status, _, body) = tls("/v1/convert", true, Some(&format!("@{}", big.display())));
+    assert_eq!(status, 413, "{body}");
     let (status, _, body) = tls("/v1/diff", true, Some(&resources.to_string()));
     let plan = json(&body);
     assert_eq!(status, 200, "{body}");

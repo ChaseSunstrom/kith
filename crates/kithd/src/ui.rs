@@ -11,7 +11,7 @@
 use crate::Shared;
 use crate::access::{Caller, Grants};
 use crate::api::{ApiError, Reply};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -70,7 +70,8 @@ async fn page(Path(file): Path<String>) -> Response {
 pub fn router() -> Router<Arc<Shared>> {
     Router::new()
         .route("/v1/schemas", get(schemas))
-        .route("/v1/convert", post(convert))
+        // A page's text, not a package: 1 MB is far past any manifest typed into a form.
+        .route("/v1/convert", post(convert).layer(DefaultBodyLimit::max(1 << 20)))
         .route("/v1/diff", post(diff))
 }
 

@@ -8,11 +8,16 @@
 Opt-in, like the e2e tests: it pulls an image and needs a delegated cgroup.
 
     python3 ci/budgets.py && python3 ci/bench.py     # budgets.py builds the static binaries
+
+`--dry-run` alone measures what a dry run costs (time, peak RSS) with 1 000 and 10 000
+resources in the store; it needs no image and no cgroup.
 """
 import glob
+import http.client
 import json
 import os
 import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -37,12 +42,69 @@ spec:
 """
 
 
+class Unix(http.client.HTTPConnection):
+    """HTTP over kithd's unix socket."""
+
+    def __init__(self, path):
+        super().__init__("kithd")
+        self.path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.connect(self.path)
+
+
+def dry_run(bins, tmp):
+    """What one dry run (`POST /v1/apply?dryRun=true`, which /v1/diff is too) costs kithd
+    with 1 000 and with 10 000 resources in its store: time (median of 20) and peak RSS."""
+    path = os.path.join(tmp, "kithd.sock")
+    daemon = subprocess.Popen([os.path.join(bins, "kithd"), "--state", os.path.join(tmp, "state"), "--socket", path])
+
+    def post(url, body):
+        conn = Unix(path)
+        conn.request("POST", url, json.dumps(body), {"Content-Type": "application/json"})
+        reply = conn.getresponse()
+        text = reply.read()
+        conn.close()
+        if reply.status != 200:
+            sys.exit(f"{url}: {reply.status} {text[:200]!r}")
+
+    def config(i, value="x"):
+        return {"apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": {"name": f"c{i}"}, "spec": {"data": {"k": value}}}
+
+    try:
+        while not os.path.exists(path):
+            if daemon.poll() is not None:
+                sys.exit("kithd did not start")
+            time.sleep(0.01)
+        time.sleep(0.5)
+        filled = 0
+        for size in (1000, 10000):
+            for start in range(filled, size, 500):
+                post("/v1/apply", [config(i) for i in range(start, min(start + 500, size))])
+            filled = size
+            times = []
+            for _ in range(20):
+                began = time.monotonic()
+                post("/v1/apply?dryRun=true", [config(0, "changed")])
+                times.append(time.monotonic() - began)
+            with open(f"/proc/{daemon.pid}/status") as status:
+                rss = int(next(l for l in status if l.startswith("VmHWM:")).split()[1]) * 1024
+            print(f"dry run with {size} resources: {statistics.median(times) * 1000:.1f} ms (median of 20), kithd peak RSS {rss / 2**20:.1f} MB")
+    finally:
+        daemon.send_signal(signal.SIGTERM)
+        daemon.wait()
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # The binaries ci/budgets.py just built.
     target = os.path.join(root, os.environ.get("CARGO_TARGET_DIR", "target"))
     bins = os.path.join(target, "x86_64-unknown-linux-musl", "release")
     os.makedirs(os.path.join(root, "target", "tmp"), exist_ok=True)
+    if "--dry-run" in sys.argv:
+        with tempfile.TemporaryDirectory(dir=os.path.join(root, "target", "tmp")) as tmp:
+            return dry_run(bins, tmp)
     # Under target/: a unix socket path has to stay short.
     with tempfile.TemporaryDirectory(dir=os.path.join(root, "target", "tmp")) as tmp:
         socket = os.path.join(tmp, "kithd.sock")

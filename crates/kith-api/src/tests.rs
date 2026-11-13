@@ -619,3 +619,42 @@ fn custom_kind_definitions_are_checked() {
     assert!(wrong("type: object", "oneOf: []").contains("`oneOf` is not a keyword kith checks"));
     assert!(wrong("path: spec.map", "path: 'spec..map'").contains("dotted path"));
 }
+
+/// A batch is all or nothing and a dry run changes nothing, without a copy of the store:
+/// what they put back is the histories they touched.
+#[test]
+fn batches_and_dry_runs_leave_the_store_as_it_was() {
+    let cm = |name: &str, value: &str| {
+        one(&format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ k: {value} }} }}"
+        ))
+    };
+    let mut store = Store::default();
+    store.apply_all(vec![cm("a", "1"), cm("b", "1")]).unwrap();
+    let before = store.clone();
+    // A dry run says what would happen (a later one sees an earlier) and changes nothing.
+    let said = store
+        .dry_run(vec![cm("a", "2"), cm("a", "3"), cm("c", "1"), cm("b", "1")])
+        .unwrap();
+    let actions: Vec<_> = said.iter().map(|c| (c.after.metadata.revision, c.action)).collect();
+    let (updated, created, unchanged) = (Action::Updated, Action::Created, Action::Unchanged);
+    assert_eq!(
+        actions,
+        [
+            (Some(2), updated),
+            (Some(3), updated),
+            (Some(1), created),
+            (Some(1), unchanged)
+        ]
+    );
+    assert_eq!(store, before);
+    // A refused one takes back the ones before it: an update, a new key.
+    let mut refused = one("apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: d }");
+    refused.metadata.revision = Some(7);
+    assert!(store.apply_all(vec![cm("a", "2"), cm("e", "1"), refused]).is_err());
+    assert_eq!(store, before);
+    // And a good one is kept.
+    store.apply_all(vec![cm("a", "2"), cm("e", "1")]).unwrap();
+    assert_eq!(store.get("ConfigMap/default/a").unwrap().metadata.revision, Some(2));
+    assert!(store.get("ConfigMap/default/e").is_some());
+}
