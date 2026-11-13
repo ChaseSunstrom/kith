@@ -22,6 +22,12 @@ pub const TOO_EARLY: &str = "the slot this node runs from is not marked good yet
 /// How often the boot loader starts a new slot before it gives up on it.
 const TRIES: u32 = 3;
 const ESP: &str = "/run/esp";
+/// The wait before a restart after a failed start: ten seconds, doubled for each failed
+/// start in a row before it, and ten minutes at most.
+const WAIT: u64 = 10;
+const WAIT_MAX: u64 = 600;
+/// How many starts in a row have failed. Beside the kernel images, not one of them.
+const FAILED: &str = "kith.failed";
 
 #[derive(Deserialize)]
 struct Header {
@@ -204,10 +210,48 @@ pub fn install(
     Ok(Some(header.version))
 }
 
+/// Counts one more failed start in a row on the ESP, and says how many there now are. The
+/// count is written to a file of its own and renamed into place, so a power cut leaves
+/// the old count or the new one. If it cannot be written, the count is still returned.
+// ponytail: only settle clears the count, and settle runs for a slot's start alone: a
+// node that runs from no slot keeps counting. Clear it at any start when that matters.
+pub fn failed(esp: &Path) -> u32 {
+    let count = std::fs::read_to_string(esp.join(FAILED))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let new = esp.join("kith.failed.new");
+    let written = std::fs::File::create(&new)
+        .and_then(|mut file| {
+            file.write_all(format!("{count}\n").as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&new, esp.join(FAILED)))
+        .and_then(|()| std::fs::File::open(esp)?.sync_all());
+    if let Err(e) = written {
+        eprintln!("kithd: init: counting the failed start: {e}");
+    }
+    count
+}
+
+/// How long to wait before a restart after the `failures`th failed start in a row. Zero
+/// failures is the first wait: ten seconds, then doubling, to ten minutes.
+pub fn wait(failures: u32) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    std::time::Duration::from_secs((WAIT << doublings).min(WAIT_MAX))
+}
+
 /// This node came up from `slot`: mark it good (the boot loader stops counting its
 /// tries), and say what became of a slot that did not come up. What to say is returned.
+/// The count of failed starts is cleared too: this start came up.
 pub fn settle(slot: char, esp: &Path) -> Vec<String> {
     let mut said = Vec::new();
+    match std::fs::remove_file(esp.join(FAILED)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => said.push(format!("clearing the count of failed starts: {e}")),
+    }
     for (name, generation, its, tries) in entries(esp) {
         match tries {
             Some(_) if its == slot => {
@@ -474,5 +518,26 @@ mod tests {
             "{}",
             said[0]
         );
+    }
+
+    #[test]
+    fn os_waits_longer_after_each_failed_start_up_to_ten_minutes() {
+        let secs = |failures| wait(failures).as_secs();
+        assert_eq!([secs(0), secs(1), secs(2), secs(3), secs(4)], [10, 10, 20, 40, 80]);
+        assert_eq!([secs(6), secs(7), secs(8), secs(u32::MAX)], [320, 600, 600, 600]);
+    }
+
+    #[test]
+    fn os_counts_failed_starts_on_the_esp_until_one_comes_up() {
+        let places = places("counts");
+        assert_eq!([failed(&places.esp), failed(&places.esp)], [1, 2]);
+        assert_eq!(failed(&places.esp), 3);
+        assert!(places.esp.join("kith.failed").is_file());
+        // Not a kernel image: the boot loader does not start from it.
+        assert_eq!(names(&places.esp), ["kith-1-a.efi"]);
+        // A start that comes up (settle runs for it) clears the count.
+        assert!(settle('a', &places.esp).is_empty());
+        assert!(!places.esp.join("kith.failed").exists());
+        assert_eq!(failed(&places.esp), 1);
     }
 }

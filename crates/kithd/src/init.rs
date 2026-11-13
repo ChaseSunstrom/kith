@@ -532,12 +532,21 @@ pub fn early() -> Boot {
 }
 
 /// kithd is done (it has stopped what it ran): restart the machine or power it off.
-/// After a failure it restarts, once the reason has had time to be read on a console.
+/// After a failure it restarts, once the reason has had time to be read on a console. A
+/// start that fails again waits longer, the count being on the ESP (see `os::wait`).
 pub fn end(failed: bool) -> ! {
     let off = !failed && POWER_OFF.load(Ordering::Relaxed);
     if failed {
-        eprintln!("kithd: init: restarting in 10 s");
-        std::thread::sleep(std::time::Duration::from_secs(10));
+        // (With no ESP to count on, this is the first wait.)
+        let wait = match crate::os::esp(crate::os::failed) {
+            Ok(count) => crate::os::wait(count),
+            Err(e) => {
+                eprintln!("kithd: init: counting the failed start: {e}");
+                crate::os::wait(0)
+            }
+        };
+        eprintln!("kithd: init: restarting in {} s", wait.as_secs());
+        std::thread::sleep(wait);
     }
     eprintln!("kithd: init: {}", if off { "powering off" } else { "restarting" });
     // ponytail: time for that line to reach the consoles (see `consoles`), not a handshake.

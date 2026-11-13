@@ -912,6 +912,9 @@ the other, so the system that runs is never the one being changed:
    start) is restarted until its tries are gone. The boot loader then starts
    the slot that worked, and kithd says so on each start:
    `slot a did not come up in 3 tries: this is slot b, which ran before it`.
+   Each start that fails in a row waits longer before its restart: 10 seconds,
+   then 20, 40, and so on, up to ten minutes. The count is kept on the ESP
+   (`kith.failed`), and a start that comes up clears it.
 
 A damaged update, one cut short, or one too big for the slot is refused, and
 then no kernel image offers the half-written slot: the node starts as before.
