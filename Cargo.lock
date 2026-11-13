@@ -1244,6 +1244,7 @@ dependencies = [
  "kith-api",
  "kith-yaml",
  "minijinja",
+ "ring",
  "serde",
  "serde_json",
 ]
@@ -1308,6 +1309,7 @@ dependencies = [
  "kith-sched",
  "kith-store",
  "kith-yaml",
+ "oci-client",
  "rcgen",
  "reqwest",
  "ring",

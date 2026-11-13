@@ -18,6 +18,8 @@
 // from (Repository). The schema check knows the keywords in `KEYWORDS`, and says so
 // about any other; the jsonschema crate if packages come to need more.
 
+pub mod artifact;
+
 use kith_api::Resource;
 use kith_api::kinds::PackageRef;
 use minijinja::{Environment, ErrorKind, UndefinedBehavior};
@@ -267,11 +269,7 @@ fn template_error(error: &minijinja::Error) -> String {
 impl Package {
     /// A package from its files, by path from its directory.
     pub fn from_files(mut files: BTreeMap<String, String>) -> Fallible<Package> {
-        if files.len() > FILES_LIMIT || files.values().map(String::len).sum::<usize>() > PACKAGE_LIMIT {
-            return Err(format!(
-                "more than {FILES_LIMIT} files, or more than {PACKAGE_LIMIT} bytes in them"
-            ));
-        }
+        artifact::plain(&files)?;
         let all = files.clone();
         let meta = files.remove("package.yaml").ok_or("no package.yaml")?;
         let meta: Meta = kith_yaml::from_str(&meta).map_err(|e| e.render("package.yaml", &meta))?;

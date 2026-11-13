@@ -30,6 +30,21 @@ pub const OWNER: &str = "kith.dev/owned-by";
 /// What no package gets to make, besides anything that is in no namespace (nodes,
 /// packages, repositories): what installs things.
 const KEPT: [&str; 2] = ["Release", "Source"];
+/// The annotation on a Package fetched from a Repository: the Repository's name. A
+/// Release that names a Repository installs only those, and one that names none only
+/// what was pushed here.
+pub const REPOSITORY: &str = "kith.dev/repository";
+/// What a Package fetched from the Repository `name` is annotated with: the name, and
+/// a print of where the Repository points and the key it checks with, so that what
+/// was fetched under another key or from elsewhere is no longer taken for its.
+pub fn origin(store: &Store, name: &str) -> Option<String> {
+    let repository = store.get(&format!("Repository/{name}"))?;
+    let about = format!("{}\n{}", repository.spec["url"], repository.spec["publicKey"]);
+    let print = ring::digest::digest(&ring::digest::SHA256, about.as_bytes());
+    let print: String = print.as_ref()[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("{name}@{print}"))
+}
+
 /// The ConfigMap (in `kith-system`, in a namespace) whose `values` releases are given.
 const SHARED: &str = "kith-values";
 
@@ -70,11 +85,12 @@ type Renders = BTreeMap<String, (Inputs, Result<Output, String>)>;
 
 /// What to do for one Release, in this order; the status only if the rest went well.
 #[derive(Debug, PartialEq)]
-struct Step {
-    release: String,
-    apply: Vec<Resource>,
-    delete: Vec<String>,
-    status: Option<Map<String, Value>>,
+pub struct Step {
+    /// The Release (or the Source: they are carried out alike).
+    pub release: String,
+    pub apply: Vec<Resource>,
+    pub delete: Vec<String>,
+    pub status: Option<Map<String, Value>>,
 }
 
 /// What to do to the store.
@@ -89,24 +105,51 @@ fn namespace(resource: &Resource) -> String {
     resource.key().split('/').nth(1).unwrap_or_default().to_string()
 }
 
-/// The Package a release asks for: that version, or the newest there is (a version
-/// that is no semver is older than any that is; `1.0.0-rc1` is older than `1.0.0`).
-fn package<'a>(store: &'a Store, spec: &ReleaseSpec) -> Result<&'a Resource, String> {
-    let name = &spec.package.name;
-    let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
-    let found = match &spec.package.version {
-        Some(version) => store.get(&format!("Package/{name}-{version}")),
-        None => {
-            let named = |package: &&Resource| package.metadata.name == format!("{name}-{}", version(package));
-            let packages = store.list(Some("Package")).filter(named);
-            packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
-        }
+/// Does `version` fit what a Release asks for? One version asked for is that one; a
+/// range (`^1.2`, `>=1, <3`, `*`) is any in it; nothing asked for is any that is not a
+/// pre-release.
+pub fn fits(asked: Option<&str>, version: &str) -> bool {
+    let asked = asked.unwrap_or("*");
+    let Ok(version) = semver::Version::parse(version) else {
+        return asked == version;
     };
-    let wanted = spec.package.version.as_deref();
-    let wanted = wanted.map_or(String::new(), |version| format!("-{version}"));
-    found.ok_or(format!(
-        "there is no Package {name}{wanted}: `kith package push` puts one here"
-    ))
+    match semver::Version::parse(asked) {
+        Ok(exactly) => exactly == version,
+        Err(_) => semver::VersionReq::parse(asked).is_ok_and(|range| range.matches(&version)),
+    }
+}
+
+/// The Package a release is on: of those that fit what it asks for (and came from the
+/// Repository it names, if it names one), the one it has installed, or the newest when
+/// it has none or follows the newest (`autoUpgrade`). `1.0.0-rc1` is older than `1.0.0`.
+fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec) -> Result<&'a Resource, String> {
+    let (name, asked) = (&spec.package.name, spec.package.version.as_deref());
+    let version = |package: &Resource| package.spec["version"].as_str().unwrap_or_default().to_string();
+    let from = spec
+        .package
+        .repo
+        .as_ref()
+        .map(|repo| origin(store, repo).unwrap_or_default());
+    let fitting = |package: &&Resource| {
+        package.metadata.name == format!("{name}-{}", version(package))
+            && package.metadata.annotations.get(REPOSITORY) == from.as_ref()
+            && fits(asked, &version(package))
+    };
+    let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
+    let kept = installed.filter(|_| spec.auto_upgrade != Some(true));
+    let kept = kept.and_then(|installed| store.get(&format!("Package/{name}-{installed}")));
+    let newest = || {
+        let packages = store.list(Some("Package")).filter(fitting);
+        packages.max_by_key(|package| semver::Version::parse(&version(package)).ok())
+    };
+    let wanted = asked.map_or(String::new(), |version| format!(" {version}"));
+    kept.filter(fitting).or_else(newest).ok_or(match &spec.package.repo {
+        None => format!("there is no Package {name}{wanted}: `kith package push` puts one here"),
+        Some(repo) if store.get(&format!("Repository/{repo}")).is_none() => format!("there is no Repository/{repo}"),
+        Some(repo) => format!(
+            "there is no Package {name}{wanted} from Repository/{repo} (yet): its status says if it cannot be asked"
+        ),
+    })
 }
 
 /// The `values` of the ConfigMap `key`, if there is one: its stamp too.
@@ -133,7 +176,7 @@ fn shared_values(store: &Store, key: &str) -> Result<(Stamp, Option<Value>), Str
 /// every change to the store.)
 fn inputs<'a>(store: &'a Store, release: &Resource) -> Result<(Inputs, &'a Resource, Vec<Value>), String> {
     let spec: ReleaseSpec = serde_json::from_value(release.spec.clone()).map_err(|e| e.to_string())?;
-    let package = package(store, &spec)?;
+    let package = package(store, release, &spec)?;
     let (cluster, everywhere) = shared_values(store, "ConfigMap/kith-system/kith-values")?;
     let (local, here) = shared_values(store, &format!("ConfigMap/{}/{SHARED}", namespace(release)))?;
     let inputs = Inputs {
@@ -215,7 +258,7 @@ fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
     jobs
 }
 
-fn owner(resource: &Resource) -> Option<&str> {
+pub fn owner(resource: &Resource) -> Option<&str> {
     resource.metadata.annotations.get(OWNER).map(String::as_str)
 }
 
@@ -223,6 +266,12 @@ fn owner(resource: &Resource) -> Option<&str> {
 /// not there (nor comes with it): it would be deleted as that Release's leftovers.
 pub fn claims(store: &Store, resources: &[Resource]) -> Result<(), String> {
     for resource in resources {
+        if resource.metadata.annotations.contains_key(REPOSITORY) {
+            let key = resource.key();
+            return Err(format!(
+                "{key} is annotated {REPOSITORY}, which says kithd fetched and checked it: apply it without"
+            ));
+        }
         let coming = |owner: &str| {
             resources
                 .iter()
@@ -238,13 +287,76 @@ pub fn claims(store: &Store, resources: &[Resource]) -> Result<(), String> {
     Ok(())
 }
 
+/// What it takes to make `resources` (marked as `key`'s) what `key` has in the store.
+pub struct Reconciled {
+    pub apply: Vec<Resource>,
+    pub delete: Vec<String>,
+    /// The keys of `resources`.
+    pub kept: BTreeSet<String>,
+    /// Those that are there and its own, and not as `resources` has them.
+    pub differ: Vec<String>,
+}
+
+/// What the owner `key` (a Release, a Source) put in the store, by its own account in
+/// its status: only that is pruned (not a copy someone made, annotation and all), and
+/// that is still its own when someone applied over it and the annotation went.
+pub fn recorded(owner: &Resource) -> BTreeSet<&str> {
+    let listed = owner.status.as_ref().and_then(|status| status["resources"].as_array());
+    listed.into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// Compare `resources` with the store for the owner `key`. Nothing of someone else's
+/// is taken over: one resource that is there already and not `key`'s refuses them all.
+pub fn reconcile(
+    store: &Store,
+    key: &str,
+    recorded: &BTreeSet<&str>,
+    resources: &[Resource],
+    prune: bool,
+) -> Result<Reconciled, String> {
+    let mine = |live: &Resource| owner(live) == Some(key) || recorded.contains(live.key().as_str());
+    let others = resources.iter().map(Resource::key);
+    let others: Vec<String> = others
+        .filter(|resource| store.get(resource).is_some_and(|live| !mine(live)))
+        .collect();
+    if !others.is_empty() {
+        return Err(format!("{} is there already and is not {key}'s", others.join(", ")));
+    }
+    let mut done = Reconciled {
+        apply: Vec::new(),
+        delete: Vec::new(),
+        kept: BTreeSet::new(),
+        differ: Vec::new(),
+    };
+    for resource in resources {
+        done.kept.insert(resource.key());
+        let live = store.get(&resource.key());
+        let same = live.is_some_and(|live| {
+            (&live.spec, &live.metadata.labels, &live.metadata.annotations)
+                == (
+                    &resource.spec,
+                    &resource.metadata.labels,
+                    &resource.metadata.annotations,
+                )
+        });
+        if !same {
+            done.apply.push(resource.clone());
+            done.differ.extend(live.map(Resource::key));
+        }
+    }
+    if prune {
+        let gone = recorded.iter().filter(|resource| !done.kept.contains(**resource));
+        let gone = gone.filter(|resource| store.get(resource).is_some_and(|live| owner(live) == Some(key)));
+        done.delete.extend(gone.map(|resource| resource.to_string()));
+    }
+    Ok(done)
+}
+
 /// What the store needs done for its Releases, given the renders there are.
 fn plan(store: &Store, renders: &Renders) -> Plan {
     let mut plan = Plan::default();
-    let mut releases = BTreeSet::new();
     for release in store.list(Some("Release")) {
         let key = release.key();
-        releases.insert(key.clone());
         let output = match inputs(store, release) {
             Err(e) => Err(e),
             Ok((now, ..)) => match renders.get(&key) {
@@ -253,57 +365,23 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
                 _ => continue,
             },
         };
-        // What the release put there, by its own account: only that is pruned (not a
-        // copy someone made, annotation and all), and that is still its own when
-        // someone applied over it and the annotation went.
         let live = release.status.as_ref();
-        let recorded = live.and_then(|status| status["resources"].as_array());
-        let recorded: BTreeSet<&str> = recorded.into_iter().flatten().filter_map(Value::as_str).collect();
-        // Nothing of someone else's is taken over.
-        let taken = |output: &Output| {
-            let others = output.resources.iter().map(Resource::key).filter(|resource| {
-                let mine = |live: &Resource| owner(live) == Some(&key) || recorded.contains(resource.as_str());
-                store.get(resource).is_some_and(|live| !mine(live))
-            });
-            let others: Vec<String> = others.collect();
-            match others.is_empty() {
-                true => Ok(()),
-                false => Err(format!(
-                    "{} is there already and is not this release's",
-                    others.join(", ")
-                )),
-            }
-        };
-        let output = output.and_then(|output| taken(&output).map(|()| output));
+        let done = output.and_then(|output| {
+            let done = reconcile(store, &key, &recorded(release), &output.resources, true)?;
+            Ok((output, done))
+        });
         let mut step = Step {
             release: key.clone(),
             apply: Vec::new(),
             delete: Vec::new(),
             status: None,
         };
-        let status = match output {
-            Ok(output) => {
-                let mut kept = BTreeSet::new();
-                for resource in &output.resources {
-                    kept.insert(resource.key());
-                    let same = store.get(&resource.key()).is_some_and(|live| {
-                        (&live.spec, &live.metadata.labels, &live.metadata.annotations)
-                            == (
-                                &resource.spec,
-                                &resource.metadata.labels,
-                                &resource.metadata.annotations,
-                            )
-                    });
-                    if !same {
-                        step.apply.push(resource.clone());
-                    }
-                }
-                let gone = recorded.iter().filter(|resource| !kept.contains(**resource));
-                let gone = gone.filter(|resource| store.get(resource).is_some_and(|live| owner(live) == Some(&key)));
-                step.delete.extend(gone.map(|resource| resource.to_string()));
+        let status = match done {
+            Ok((output, done)) => {
+                (step.apply, step.delete) = (done.apply, done.delete);
                 json!({
                     "state": "installed", "message": null, "version": output.version,
-                    "resources": kept, "notes": output.notes, "observedRevision": release.metadata.revision,
+                    "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
                 })
             }
             // (What was installed before stays as it is.)
@@ -322,10 +400,10 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
             plan.steps.push(step);
         }
     }
-    // What belonged to a Release that is gone goes too.
+    // What belonged to a Release or a Source that is gone goes too.
     let orphans = store
         .list(None)
-        .filter(|resource| owner(resource).is_some_and(|owner| !releases.contains(owner)));
+        .filter(|resource| owner(resource).is_some_and(|owner| store.get(owner).is_none()));
     plan.orphans.extend(orphans.map(Resource::key));
     plan
 }
@@ -357,7 +435,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let state = shared.store.lock().expect("nothing panics holding the store");
                 plan(&state.store, &renders)
             };
-            carry_out(&shared, plan).await;
+            carry_out(&shared, plan.steps, plan.orphans).await;
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -368,7 +446,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
 }
 
 /// Each Release for itself: one that cannot be applied says so and stops no other.
-async fn carry_out(shared: &Shared, plan: Plan) {
+pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) {
     use kith_api::store::Error;
     use kith_store::Command;
     let delete = async |key: String| match shared.submit(Command::Delete { key }).await {
@@ -376,7 +454,7 @@ async fn carry_out(shared: &Shared, plan: Plan) {
         Err(e) => Err(e),
     };
     let mut statuses = Vec::new();
-    for mut step in plan.steps {
+    for mut step in steps {
         let mut done = Ok(());
         if !step.apply.is_empty() {
             let at = kith_api::store::now();
@@ -411,7 +489,7 @@ async fn carry_out(shared: &Shared, plan: Plan) {
             (Err(e), _) => eprintln!("kithd: releases: {}: {e}", step.release),
         }
     }
-    for key in plan.orphans {
+    for key in orphans {
         if let Err(e) = delete(key).await {
             eprintln!("kithd: releases: {e}");
         }
@@ -450,7 +528,7 @@ mod tests {
                        {% if values.extra %}---\napiVersion: kith.dev/v1\nkind: ConfigMap\n\
                        metadata: { name: {{ name }}-extra }\nspec: { data: { a: b } }\n{% endif %}";
     const RELEASE: &str = "apiVersion: kith.dev/v1\nkind: Release\nmetadata: { name: mine, namespace: shop }\n\
-                           spec: { package: { name: maps }, values: { extra: true } }\n";
+                           spec: { package: { name: maps }, autoUpgrade: true, values: { extra: true } }\n";
 
     /// Render what is pending and carry the plan out, until there is nothing to do.
     fn settle(store: &mut Store, renders: &mut Renders) -> usize {
@@ -692,5 +770,50 @@ mod tests {
         assert!(refused.contains("there is no Release/shop/mine"), "{refused}");
         let release = Resource::from_source(RELEASE).unwrap().remove(0).unwrap();
         assert_eq!(claims(&store, &[copy, release]), Ok(()));
+    }
+
+    #[test]
+    fn a_release_stays_on_its_version_unless_it_follows() {
+        assert!(fits(None, "1.0.0") && !fits(None, "1.0.0-rc1") && fits(Some("1.0.0-rc1"), "1.0.0-rc1"));
+        assert!(
+            fits(Some("1.2.0"), "1.2.0") && !fits(Some("1.2.0"), "1.2.1"),
+            "one version is that one"
+        );
+        assert!(fits(Some("^1.2"), "1.9.0") && !fits(Some("^1.2"), "2.0.0") && fits(Some(">=1, <3"), "2.5.0"));
+        assert!(!fits(Some("nonsense"), "1.0.0") && fits(Some("nightly"), "nightly"));
+
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        let version =
+            |store: &Store| store.get("Release/shop/mine").unwrap().status.clone().unwrap()["version"].clone();
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        let pinned = RELEASE.replace("autoUpgrade: true", "autoUpgrade: false");
+        apply(&mut store, &pinned.replace("name: maps }", "name: maps, version: ^1 }"));
+        settle(&mut store, &mut renders);
+        // Newer ones come: it stays; told to follow, it goes to the newest in its range.
+        store.apply(package("1.5.0", &[("map.yaml", MAP)])).unwrap();
+        store.apply(package("2.0.0", &[("map.yaml", MAP)])).unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "1.0.0");
+        apply(
+            &mut store,
+            &RELEASE.replace("name: maps }", "name: maps, version: ^1 }"),
+        );
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "1.5.0");
+        // A range the installed one is outside of moves it, following or not.
+        apply(
+            &mut store,
+            &pinned.replace("name: maps }", "name: maps, version: '>=2' }"),
+        );
+        settle(&mut store, &mut renders);
+        assert_eq!(version(&store), "2.0.0");
+        // What was pushed here is not what a Repository supplied.
+        apply(&mut store, &pinned.replace("name: maps }", "name: maps, repo: ours }"));
+        settle(&mut store, &mut renders);
+        let status = store.get("Release/shop/mine").unwrap().status.clone().unwrap();
+        assert_eq!(
+            (&status["state"], &status["message"]),
+            (&json!("error"), &json!("there is no Repository/ours"))
+        );
     }
 }

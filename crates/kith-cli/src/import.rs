@@ -70,9 +70,9 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
     let mut out = std::io::stdout();
     for (i, resource) in resources.iter().enumerate() {
         let separator = if i == 0 { "" } else { "---\n" };
-        // A closed stdout (`| head`) ends quietly.
+        // A closed stdout (`| head`) ends the resources, not the report.
         if write!(out, "{separator}{}", resource.to_yaml()).is_err() {
-            return Ok(ExitCode::SUCCESS);
+            break;
         }
     }
     for line in &report {
@@ -93,10 +93,21 @@ fn documents(name: &str, src: &str) -> Result<Vec<Value>, String> {
 
 /// What `helm template` prints. No shell: the arguments go to helm as they are.
 fn helm(chart: &str, name: Option<String>, namespace: Option<String>, values: &[PathBuf]) -> Result<String, String> {
-    // ponytail: the release is named for the chart's last path component; `--name` overrides.
+    // ponytail: the release is named for the chart's last path component (of where `.`
+    // is, too), made a name Helm takes; `--name` overrides.
     let name = name.unwrap_or_else(|| {
-        let last = chart.trim_end_matches('/').rsplit('/').next().unwrap_or(chart);
-        last.strip_suffix(".tgz").unwrap_or(last).to_string()
+        let full = std::fs::canonicalize(chart).ok();
+        let full = full.as_deref().and_then(|full| full.to_str()).unwrap_or(chart);
+        let last = full.trim_end_matches('/').rsplit('/').next().unwrap_or(full);
+        let plain = |c: char| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        };
+        let name: String = last.strip_suffix(".tgz").unwrap_or(last).chars().map(plain).collect();
+        name.trim_matches('-').to_string()
     });
     // A name or chart that looks like a flag would be read by helm as one.
     if let Some(bad) = [&name, chart].into_iter().find(|s| s.starts_with('-')) {
@@ -303,6 +314,14 @@ impl Cx {
     /// Labels or annotations, less what is noise.
     fn strings(&mut self, m: &mut Map, key: &str, at: &str) -> Strings {
         let mut found = self.string_map(m, key, at);
+        // (Noise, but for these: they change when and whether Helm applies the object.)
+        let hooks = found
+            .keys()
+            .filter(|k| k.starts_with("helm.sh/hook") || *k == "helm.sh/resource-policy");
+        for k in hooks.cloned().collect::<Vec<_>>() {
+            let why = "not translated: kith has no Helm hooks, this is applied with the rest";
+            self.note(&format!("{}[{k}]", join(at, key)), why);
+        }
         found.retain(|k, _| !noisy(k));
         found
     }
@@ -697,7 +716,7 @@ fn workload(cx: &mut Cx, root: &mut Map, mut meta: Metadata, kind: &str, out: Ou
             let template = std::mem::take(&mut claim.name);
             claim.name = format!("{template}-{}", meta.name);
             claim.namespace.clone_from(&meta.namespace);
-            if replicas.is_none_or(|n| n > 1) {
+            if replicas.is_some_and(|n| n > 1) {
                 cx.note(&tp, "becomes one claim shared by all replicas");
             }
             let s = cx.map(&mut t, "spec", &tp);
@@ -825,12 +844,14 @@ fn service(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
 }
 
 fn unbase64(s: &str) -> Option<Vec<u8>> {
+    // Strictly: a value that is not base64 to its end is an error, never a shorter value.
+    let s: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let data = s.strip_suffix("==").or(s.strip_suffix('=')).unwrap_or(&s);
+    if data.len() % 4 == 1 || (data.len() != s.len() && !s.len().is_multiple_of(4)) {
+        return None;
+    }
     let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0);
-    for b in s
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .take_while(|&b| b != b'=')
-    {
+    for b in data.bytes() {
         let v = match b {
             b'A'..=b'Z' => b - b'A',
             b'a'..=b'z' => b - b'a' + 26,
@@ -847,7 +868,7 @@ fn unbase64(s: &str) -> Option<Vec<u8>> {
             acc &= (1 << bits) - 1;
         }
     }
-    Some(out)
+    (acc == 0).then_some(out)
 }
 
 fn config_map(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
@@ -920,12 +941,30 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
             cx.rest(backend, &bp);
             cx.rest(path, &pp);
             if route.is_some_and(|r| r != "/") {
-                cx.note(&join(&pp, "path"), "not translated: the whole host goes to the Service");
+                // (Exposing this backend too would have two Services claim one host.)
+                cx.note(
+                    &pp,
+                    "not translated: kith sends a whole host to one Service, the one behind `/`",
+                );
+                continue;
             }
             let (Some(host), Some(name)) = (&host, name) else {
                 cx.note(&pp, "needs a host and a Service backend: not translated");
                 continue;
             };
+            let taken = out.iter().find(|r| {
+                let other =
+                    r.metadata.name != name || r.metadata.namespace.as_deref().unwrap_or("default") != namespace;
+                r.kind == "Service" && other && r.spec["expose"]["host"] == host.as_str()
+            });
+            if let Some(taken) = taken {
+                let why = format!(
+                    "not translated: {host} already goes to Service `{}`",
+                    taken.metadata.name
+                );
+                cx.note(&pp, &why);
+                continue;
+            }
             let found = out.iter_mut().find(|r| {
                 r.kind == "Service"
                     && r.metadata.name == name
@@ -1480,5 +1519,56 @@ items:
         assert_eq!(unbase64("aGk").unwrap(), b"hi");
         assert_eq!(unbase64("").unwrap(), b"");
         assert!(unbase64("a$b").is_none());
+        for bad in ["A", "QUJD=zzzz", "aGk=x", "aGl=", "aGk==="] {
+            assert!(unbase64(bad).is_none(), "{bad}");
+        }
+        assert_eq!(unbase64("aGk=\n").unwrap(), b"hi");
+    }
+
+    #[test]
+    fn import_says_what_helm_hooks_and_shared_hosts_lose() {
+        let service = |name: &str| {
+            format!(
+                "apiVersion: v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec: {{ selector: {{ app: {name} }}, ports: [{{ port: 80 }}] }}\n---\n"
+            )
+        };
+        let path = |path: &str, to: &str| {
+            format!(
+                "{{ path: {path}, pathType: Prefix, backend: {{ service: {{ name: {to}, port: {{ number: 80 }} }} }} }}"
+            )
+        };
+        let ingress = |name: &str, paths: &str| {
+            format!(
+                "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: {{ name: {name} }}\nspec:\n  rules:\n    - host: shop.example.com\n      http: {{ paths: [{paths}] }}\n---\n"
+            )
+        };
+        let hook = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: migrate\n  annotations: { helm.sh/hook: pre-install, helm.sh/chart: x-1 }\ndata: { a: b }\n";
+        let all = [
+            service("web"),
+            service("api"),
+            service("other"),
+            ingress("one", &format!("{}, {}", path("/", "web"), path("/api", "api"))),
+            ingress("two", &path("/", "other")),
+            hook.to_string(),
+        ]
+        .concat();
+        let (resources, report) = run(&all);
+        let host =
+            |name: &str| resources.iter().find(|r| r.metadata.name == name).unwrap().spec["expose"]["host"].clone();
+        assert_eq!(
+            (host("web"), host("api"), host("other")),
+            (json!("shop.example.com"), Value::Null, Value::Null)
+        );
+        let said = |what: &str| report.iter().filter(|line| line.contains(what)).count();
+        assert_eq!(
+            (
+                said("the one behind `/`"),
+                said("already goes to Service `web`"),
+                said("helm.sh/hook")
+            ),
+            (1, 1, 1),
+            "{report:?}"
+        );
+        assert_eq!(said("helm.sh/chart"), 0);
     }
 }

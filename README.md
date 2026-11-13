@@ -337,13 +337,108 @@ spec:
   and no `kith-values` ConfigMap; any of these (or a template that fails) is
   `state: error` with the reason in `message`, and what was installed before
   stays as it was.
-- With no `version`, the newest pushed package is used (semver: `1.0.0-rc1`
-  is older than `1.0.0`), also after a rollback: name the version to stay on
-  one. Pushing a version again replaces it.
+- `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
+  any version that is not a pre-release. A Release goes on the newest
+  package that fits and stays on it; with `autoUpgrade: true` it follows
+  newer ones as they come. Pushing a version again replaces it.
+
+### Repositories
+
+Packages travel as OCI artifacts in any registry, signed:
+
+```sh
+kith package keygen signing.key        # the secret into the file; prints the public key
+kith package push packages/web --to oci://registry.example/packages --key signing.key
+kith package pull oci://registry.example/packages web 0.1.0 --public-key 3f9c…
+```
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Repository
+metadata: { name: ours }
+spec: { url: oci://registry.example/packages, publicKey: 3f9c… }
+---
+apiVersion: kith.dev/v1
+kind: Release
+metadata: { name: shop }
+spec:
+  package: { repo: ours, name: web, version: ^0.1 }
+  autoUpgrade: true
+```
+
+- The package `web` is the repository `packages/web` there, each version a
+  tag. The artifact is one blob (the package's files) and a signature
+  (Ed25519, over the package's name, version and the blob's SHA-256) as the
+  annotation `dev.kith.signature`.
+- For a Release that names a Repository, the node that leads the store asks
+  the registry for the versions, fetches the newest that fits, checks it
+  against the Repository's `publicKey` and stores it as a Package (annotated
+  `kith.dev/repository`); the Release installs only Packages from its
+  Repository. A package that is unsigned or signed with another key is
+  refused, and the Repository's status says so (`state: error`, `message`).
+  A newer version that does not check out is passed over for the newest
+  that does (the status says which). A Repository without a `publicKey`
+  takes packages as they come. Change a Repository's `url` or `publicKey`
+  and what was fetched before is no longer taken for its: it is fetched and
+  checked again.
+- A version is fetched once: pushing it to the registry again changes
+  nothing here. A registry can also keep quiet about newer versions; the
+  signature says a package is the publisher's, not that it is the newest.
+- Registries are asked when a Release wants something new and every
+  `--repository-poll` seconds (300) for Releases with `autoUpgrade`.
+- `kith` reaches a registry through kithd (push and pull need a running
+  kithd). No registry logins yet; plain HTTP only to a registry on the same
+  machine.
 
 Not yet: `dependencies` are read and nothing more; no hooks, no looking up
-what is in the cluster from a template, no version ranges, no repositories
-(a package gets into a cluster by `package push`).
+what is in the cluster from a template, no registry credentials.
+
+## Sources (GitOps)
+
+A `Source` keeps what is in a git repository (or an OCI artifact) applied:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Source
+metadata: { name: cluster, namespace: kith-system }
+spec:
+  git: { url: https://example.org/ops/cluster.git, rev: main }
+  path: clusters/home        # the YAML and JSON files under it
+  intervalSeconds: 60
+  prune: true                # delete what the source no longer has
+  approval: manual           # hold each new revision until approved [auto]
+```
+
+```sh
+kith get source/cluster -n kith-system -o yaml   # status: state, revision, pending, drift
+kith source approve cluster -n kith-system       # apply the revision that waits
+kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.oci`
+```
+
+- The node that leads the store fetches the source every `intervalSeconds`
+  (5 at least) and applies its resources, marked `kith.dev/owned-by` like a
+  Release's. A resource that names no namespace goes in the Source's. A
+  Source applies only into its own namespace; one in `kith-system` applies
+  anywhere and any kind (it is the cluster's own). It does not take over what
+  is there and not its own.
+- `status.state` is `synced` (at `revision`), `pending` (`pending.revision`
+  waits for `kith source approve`, with what it would change) or `error`
+  (with `message`; what was applied stays). When the source moves on, a
+  manual Source waits again.
+- What a Source applied and someone changed since is put back, and listed in
+  `status.drift`: the source is what is true. Deleting a Source deletes what
+  it applied.
+- git is the node's `git` program (it must be installed), over `https://`
+  or `ssh://` only, with no credentials but what ssh has; nothing is checked
+  out, so links in a repository are skipped (`status.skipped`), and a
+  source is 2000 files and 4 MB at most.
+- Only a Source in `kith-system` is fetched over `ssh://` (it is the node's
+  own keys that open the door) or from this node and its own networks
+  (loopback, private, link-local and shared addresses, by whatever name).
+- An approval is for a revision: a Source whose `path` or `prune` you change
+  applies the revision already approved the new way.
+
+Not yet: signed-commit verification, credentials for private repositories.
 
 ## Importing from Kubernetes and Helm
 

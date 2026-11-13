@@ -17,9 +17,11 @@ mod mesh;
 mod pki;
 mod probe;
 mod raft;
+mod registry;
 mod releases;
 mod sched;
 mod services;
+mod sources;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -64,6 +66,12 @@ struct Args {
     /// Seconds a node may be out of contact before what it runs is started on other nodes
     #[arg(long, env = "KITH_LOST_AFTER", value_name = "SECONDS", default_value_t = 300)]
     lost_after: u64,
+    /// Seconds between asking registries for newer packages (for Releases that name a Repository)
+    #[arg(long, env = "KITH_REPOSITORY_POLL", value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+    repository_poll: u64,
+    /// Let a Source name a git repository on this machine (`file://`): for tests
+    #[arg(long, hide = true)]
+    local_sources: bool,
     /// Join the cluster's WireGuard mesh, on this UDP port (needs CAP_NET_ADMIN)
     #[arg(long, env = "KITH_MESH", value_name = "PORT", num_args = 0..=1, default_missing_value = "51820")]
     mesh: Option<u16>,
@@ -393,10 +401,11 @@ fn run(args: Args) -> Result<(), String> {
         };
         let work = async {
             let releases = releases::run(shared.clone(), stopping.clone());
-            tokio::join!(
-                controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()),
-                releases
-            );
+            let poll = std::time::Duration::from_secs(args.repository_poll);
+            let repositories = registry::run(shared.clone(), poll, stopping.clone());
+            let units = controller::run(shared.clone(), runtime, args.log_cap, stopping.clone());
+            let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());
+            tokio::join!(units, releases, repositories, sources);
         };
         let names = async {
             if let Some(sockets) = names {

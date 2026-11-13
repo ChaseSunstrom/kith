@@ -1148,3 +1148,355 @@ fn release_installs_a_package() {
     });
     assert!(there("Package/maps-1.0.0"));
 }
+
+/// Stops a helper process when the test is over.
+struct Stop(Child);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A fake OCI registry on this machine: it, and its port.
+fn registry(dir: &Path) -> (Stop, u16) {
+    let port = free_port();
+    let ready = dir.join("registry.ready");
+    let registry = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_registry.py"))
+        .arg(port.to_string())
+        .arg(&ready)
+        .spawn()
+        .unwrap();
+    let registry = Stop(registry);
+    wait_for("the registry to listen", || ready.exists());
+    (registry, port)
+}
+
+/// Packages in a registry (a fake one, here): signed, pushed, pulled and checked through
+/// the CLI; and a Release that names a Repository gets the newest version its range
+/// allows, checked against the Repository's key, and follows newer ones.
+#[test]
+fn repository_supplies_releases() {
+    let daemon = Daemon::start_with("repository", &["--repository-poll", "1"]);
+    let (_registry, port) = registry(&daemon.dir);
+    let url = format!("oci://127.0.0.1:{port}/packages");
+
+    let package = |version: &str, colour: &str| {
+        let dir = daemon.dir.join(format!("src-{version}"));
+        std::fs::create_dir_all(dir.join("templates")).unwrap();
+        std::fs::write(dir.join("package.yaml"), format!("name: maps\nversion: {version}\n")).unwrap();
+        let map = format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {{{{ name }}}} }}\nspec: {{ data: {{ colour: {colour} }} }}\n"
+        );
+        std::fs::write(dir.join("templates/map.yaml"), map).unwrap();
+        format!("src-{version}")
+    };
+    let public = daemon.ok(&["package", "keygen", "signing.key"]);
+    let public = public.trim();
+    let other = daemon.ok(&["package", "keygen", "other.key"]);
+    let (code, _, err) = daemon.kith(&["package", "keygen", "signing.key"]);
+    assert_eq!(code, 2, "a key is not written over: {err}");
+
+    let pushed = daemon.ok(&[
+        "package",
+        "push",
+        &package("1.0.0", "red"),
+        "--to",
+        &url,
+        "--key",
+        "signing.key",
+    ]);
+    assert_eq!(
+        pushed,
+        format!("127.0.0.1:{port}/packages/maps:1.0.0 pushed (signed)\n")
+    );
+    daemon.ok(&[
+        "package",
+        "push",
+        &package("1.2.0", "green"),
+        "--to",
+        &url,
+        "--key",
+        "signing.key",
+    ]);
+    // (2.0.0 is outside what the Release will ask for; 1.3.0 is signed by someone else.)
+    daemon.ok(&[
+        "package",
+        "push",
+        &package("2.0.0", "black"),
+        "--to",
+        &url,
+        "--key",
+        "signing.key",
+    ]);
+
+    // Pulled back: the same files, checked against the key; not against another.
+    let pulled = daemon.ok(&[
+        "package",
+        "pull",
+        &url,
+        "maps",
+        "1.2.0",
+        "--public-key",
+        public,
+        "-o",
+        "back",
+    ]);
+    assert_eq!(pulled, "maps 1.2.0 in back (signature checked)\n");
+    let same = |file: &str| {
+        std::fs::read(daemon.dir.join("back").join(file)).unwrap()
+            == std::fs::read(daemon.dir.join("src-1.2.0").join(file)).unwrap()
+    };
+    assert!(same("package.yaml") && same("templates/map.yaml"));
+    let (code, _, err) = daemon.kith(&[
+        "package",
+        "pull",
+        &url,
+        "maps",
+        "1.2.0",
+        "--public-key",
+        other.trim(),
+        "-o",
+        "not",
+    ]);
+    assert!(code == 2 && err.contains("the signature is not this key's"), "{err}");
+    assert!(!daemon.dir.join("not").exists());
+    let (code, _, err) = daemon.kith(&["package", "pull", &url, "maps", "1.2.0", "-o", "back"]);
+    assert!(
+        code == 2 && err.contains("back"),
+        "a directory that is there is left alone: {err}"
+    );
+
+    // A Release from the Repository, on 1.x: 1.2.0 it is.
+    daemon.apply(&format!("apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: ours }}\nspec: {{ url: '{url}', publicKey: {public} }}\n"));
+    let release = |auto: bool| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ repo: ours, name: maps, version: ^1 }}, autoUpgrade: {auto} }}\n"
+        )
+    };
+    daemon.apply(&release(false));
+    let on = |version: &str| {
+        daemon.status("Release/mine")["version"] == version && daemon.status("Release/mine")["state"] == "installed"
+    };
+    wait_for("the release to be on 1.2.0", || on("1.2.0"));
+    assert!(
+        daemon
+            .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
+            .contains("colour: green")
+    );
+    assert_eq!(daemon.status("Repository/ours")["state"], "ok");
+
+    // A newer one in its range: left alone until the Release follows (autoUpgrade).
+    daemon.ok(&[
+        "package",
+        "push",
+        &package("1.3.0", "blue"),
+        "--to",
+        &url,
+        "--key",
+        "signing.key",
+    ]);
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(on("1.2.0"));
+    daemon.apply(&release(true));
+    wait_for("the release to follow to 1.3.0", || on("1.3.0"));
+    assert!(
+        daemon
+            .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
+            .contains("colour: blue")
+    );
+
+    // A newer one still, signed with another key: passed over, the Repository says so,
+    // and the release stays where it is; a new Release gets the newest that checks out.
+    daemon.ok(&[
+        "package",
+        "push",
+        &package("1.4.0", "stolen"),
+        "--to",
+        &url,
+        "--key",
+        "other.key",
+    ]);
+    let said = || daemon.status("Repository/ours")["message"].to_string();
+    wait_for("the repository to say what it passed over", || {
+        said().contains("passed over: maps 1.4.0: the signature is not this key's")
+    });
+    assert!(on("1.3.0") && daemon.kith(&["get", "Package/maps-1.4.0"]).0 != 0);
+    daemon.apply(&release(false).replace("name: mine", "name: second"));
+    wait_for("a second release to be on 1.3.0", || {
+        daemon.status("Release/second")["version"] == "1.3.0"
+    });
+
+    // What kithd fetched and checked is marked so; nobody marks a Package so by hand.
+    let fetched = daemon.ok(&["get", "Package/maps-1.3.0", "-o", "yaml"]);
+    assert!(fetched.contains("kith.dev/repository: ours@"), "{fetched}");
+    std::fs::write(
+        daemon.dir.join("forged.yaml"),
+        fetched
+            .replace("maps-1.3.0", "maps-1.9.0")
+            .replace("version: 1.3.0", "version: 1.9.0"),
+    )
+    .unwrap();
+    let (code, _, err) = daemon.kith(&["apply", "-f", "forged.yaml"]);
+    assert!(
+        code == 2 && err.contains("which says kithd fetched and checked it"),
+        "{err}"
+    );
+
+    // The Repository checks with another key from now on: what was fetched under the
+    // old one is no longer its, and nothing in the registry is signed with the new one.
+    daemon.apply(&format!("apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: ours }}\nspec: {{ url: '{url}', publicKey: {} }}\n", other.trim()));
+    wait_for("the newest signed with the new key to be fetched", || on("1.4.0"));
+}
+
+/// A Source: a commit to a git repository changes what is in the store (applied,
+/// pruned, put back when someone changes it), a manual one waits to be approved, and
+/// an OCI artifact syncs the same way.
+#[test]
+fn source_syncs_git_and_oci() {
+    let daemon = Daemon::start_with("source", &["--local-sources"]);
+    let repo = daemon.dir.join("repo");
+    std::fs::create_dir_all(repo.join("conf")).unwrap();
+    let git = |args: &[&str]| {
+        let ran = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.org",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    };
+    let map = |name: &str, colour: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ colour: {colour} }} }}\n"
+        )
+    };
+    let commit = |files: &[(&str, Option<String>)]| {
+        for (path, text) in files {
+            match text {
+                Some(text) => std::fs::write(repo.join(path), text).unwrap(),
+                None => std::fs::remove_file(repo.join(path)).unwrap(),
+            }
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "change"]);
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    // (Outside the Source's path, and a link out of the repository: neither is read.)
+    std::fs::write(repo.join("elsewhere.yaml"), map("elsewhere", "red")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", repo.join("conf/link.yaml")).unwrap();
+    commit(&[("conf/a.yaml", Some(map("a", "red")))]);
+
+    let source = |more: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo }}\nspec:\n  git: {{ url: 'file://{}', rev: main }}\n  path: conf\n  intervalSeconds: 5\n  prune: true\n{more}",
+            repo.display()
+        )
+    };
+    let colour = |name: &str| {
+        let (code, out, _) = daemon.kith(&["get", &format!("ConfigMap/{name}"), "-o", "json"]);
+        (code == 0).then(|| serde_json::from_str::<serde_json::Value>(&out).unwrap()["spec"]["data"]["colour"].clone())
+    };
+    daemon.apply(&source(""));
+    wait_for("the source to be applied", || colour("a") == Some("red".into()));
+    let status = daemon.status("Source/repo");
+    assert_eq!(status["state"], "synced");
+    assert!(
+        status["skipped"][0].as_str().unwrap().contains("conf/link.yaml"),
+        "{status}"
+    );
+    assert_eq!(colour("elsewhere"), None);
+
+    // A commit: one map changes, another comes; the next: one goes.
+    commit(&[
+        ("conf/a.yaml", Some(map("a", "blue"))),
+        ("conf/b.yaml", Some(map("b", "red"))),
+    ]);
+    wait_for("the commit to be applied", || {
+        colour("a") == Some("blue".into()) && colour("b").is_some()
+    });
+    commit(&[("conf/b.yaml", None)]);
+    wait_for("what the source dropped to go", || colour("b").is_none());
+
+    // Someone applies over what the source says: put back, and said.
+    daemon.apply(&map("a", "pink"));
+    wait_for("the map to be put back", || colour("a") == Some("blue".into()));
+    wait_for("the drift to be said", || {
+        daemon.status("Source/repo")["drift"][0] == "ConfigMap/default/a"
+    });
+
+    // Manual approval: a commit waits, and is applied once approved.
+    daemon.apply(&source("  approval: manual\n"));
+    let (code, _, err) = daemon.kith(&["source", "approve", "repo"]);
+    assert!(code == 2 && err.contains("nothing waiting"), "{err}");
+    commit(&[("conf/a.yaml", Some(map("a", "green")))]);
+    wait_for("the commit to wait", || {
+        daemon.status("Source/repo")["state"] == "pending"
+    });
+    assert_eq!(
+        daemon.status("Source/repo")["pending"]["changes"][0],
+        "ConfigMap/default/a"
+    );
+    assert_eq!(colour("a"), Some("blue".into()));
+    assert!(daemon.ok(&["source", "approve", "repo"]).contains("approved"));
+    wait_for("the approved commit to be applied", || {
+        colour("a") == Some("green".into())
+    });
+
+    // A git URL that is no repository over the network is refused when not told otherwise
+    // (here it is told otherwise: what is refused is a transport that runs a program).
+    daemon.apply(
+        &source("")
+            .replace("name: repo", "name: bad")
+            .replace("file://", "ext::sh -c id "),
+    );
+    wait_for("the bad URL to be refused", || {
+        daemon.status("Source/bad")["message"]
+            .to_string()
+            .contains("a git URL is https:// or ssh://")
+    });
+
+    // The same from a registry.
+    let (_registry, port) = registry(&daemon.dir);
+    let to = format!("oci://127.0.0.1:{port}/sources/conf:v1");
+    std::fs::remove_file(repo.join("conf/link.yaml")).unwrap();
+    std::fs::write(repo.join("conf/o.yaml"), map("from-oci", "red")).unwrap();
+    std::fs::remove_file(repo.join("conf/a.yaml")).unwrap();
+    assert!(
+        daemon
+            .ok(&["source", "push", "repo/conf", "--to", &to])
+            .contains("pushed (1 files)")
+    );
+    daemon.apply(&format!("apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: artifact, namespace: kith-system }}\nspec: {{ oci: '{to}', intervalSeconds: 5 }}\n"));
+    let there = || daemon.kith(&["get", "ConfigMap/from-oci", "-n", "kith-system"]).0 == 0;
+    wait_for("the artifact to be applied", there);
+    // (Only the cluster's own Source is fetched from this very machine.)
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: inward }}\nspec: {{ oci: '{to}' }}\n"
+    ));
+    wait_for("a namespace's Source to be refused this machine", || {
+        daemon.status("Source/inward")["message"]
+            .to_string()
+            .contains("only a Source in kith-system")
+    });
+
+    // A Source gone takes what it applied with it.
+    daemon.ok(&["delete", "Source/repo"]);
+    wait_for("what the source applied to go", || colour("a").is_none());
+    assert!(there());
+}
