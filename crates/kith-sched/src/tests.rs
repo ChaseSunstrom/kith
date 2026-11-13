@@ -359,10 +359,15 @@ fn requests_sum_every_container_and_exec_unit() {
             {"name": "b", "image": "i"},
         ],
         "exec": [{"name": "e", "command": ["x"], "resources": {"cpu": "1", "memory": "512Mi"}}],
+        // A machine costs what it says, or else what it is given.
+        "vms": [
+            {"name": "v", "kernel": "/k", "cpus": 2, "memory": "1Gi"},
+            {"name": "w", "kernel": "/k", "cpus": 8, "memory": "4Gi", "resources": {"cpu": "1", "memory": "5Gi"}},
+        ],
     }))
     .unwrap();
     let a = Amount::of_template(&t);
-    assert_eq!((a.cpu, a.memory), (1.5, 1.5 * GI));
+    assert_eq!((a.cpu, a.memory), (4.5, 7.5 * GI));
 }
 
 #[test]

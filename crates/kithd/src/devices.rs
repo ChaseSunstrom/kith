@@ -122,6 +122,29 @@ pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
         labels.extend(id(&dir.join("idProduct")).map(|model| ("model", model)));
         found.push(("usb", name, Some(format!("/dev/bus/usb/{bus:03}/{device:03}")), labels));
     }
+    // PCI devices set aside for virtual machines (bound to `vfio-pci`): they have no device
+    // node; their path is their place on the bus, which a `vms` unit passes through.
+    let pci = sys.join("bus/pci/devices");
+    for name in names(&pci) {
+        let dir = pci.join(&name);
+        let driver = std::fs::read_link(dir.join("driver")).ok();
+        if driver.as_deref().and_then(Path::file_name) != Some("vfio-pci".as_ref()) {
+            continue;
+        }
+        let kind = read(&dir.join("class")).unwrap_or_default();
+        // (Its class is `pci`, never `gpu`: a selector for a GPU to draw with must not come
+        // to a card that only a machine can use. What it is, is in its `function` label.)
+        let function = match kind.get(2..6) {
+            Some(display) if display.starts_with("03") => "gpu",
+            Some(sound) if sound.starts_with("04") => "audio",
+            Some("0c03") => "usb",
+            _ => "other",
+        };
+        let mut labels = vec![("driver", "vfio-pci".to_string()), ("function", function.to_string())];
+        labels.extend(id(&dir.join("vendor")).map(|vendor| ("vendor", vendor)));
+        labels.extend(id(&dir.join("device")).map(|model| ("model", model)));
+        found.push(("pci", name.clone(), Some(format!("{}/{name}", crate::vm::PCI)), labels));
+    }
     let made = |kind: &str, name: String, labels: BTreeMap<String, String>, spec: Value| Resource {
         api_version: kith_api::API_VERSION.into(),
         kind: kind.into(),
@@ -376,6 +399,59 @@ mod tests {
             store.apply(resource).unwrap();
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A PCI device bound to vfio-pci is a Device a vm unit can be given: named for its place
+    /// on the bus, which is its path; no part of the seat. One with any other driver is not.
+    #[test]
+    fn a_pci_device_set_aside_for_vm_units_is_a_device_and_not_of_the_seat() {
+        let root = tree("vfio");
+        laptop(&root);
+        for (address, class, driver) in [
+            ("0000:01:00.0", "0x030000", "vfio-pci"),
+            ("0000:01:00.1", "0x040300", "vfio-pci"),
+            ("0000:02:00.0", "0x020000", "e1000e"),
+        ] {
+            let dir = format!("bus/pci/devices/{address}");
+            put(&root, &format!("{dir}/class"), &format!("{class}\n"));
+            put(&root, &format!("{dir}/vendor"), "0x10de\n");
+            put(&root, &format!("{dir}/device"), "0x2684\n");
+            std::fs::create_dir_all(root.join("bus/pci/drivers").join(driver)).unwrap();
+            let link = root.join(&dir).join("driver");
+            std::os::unix::fs::symlink(root.join("bus/pci/drivers").join(driver), link).unwrap();
+        }
+        let found = scan(&root, "n1");
+        let gpu = get(&found, "n1-pci-0000-01-00.0");
+        assert_eq!(
+            gpu.spec,
+            json!({ "node": "n1", "class": "pci", "path": "/sys/bus/pci/devices/0000:01:00.0" })
+        );
+        assert_eq!(gpu.metadata.labels["driver"], "vfio-pci");
+        assert_eq!(
+            (
+                gpu.metadata.labels["class"].as_str(),
+                gpu.metadata.labels["function"].as_str()
+            ),
+            ("pci", "gpu")
+        );
+        assert_eq!(
+            (
+                gpu.metadata.labels["vendor"].as_str(),
+                gpu.metadata.labels["model"].as_str()
+            ),
+            ("10de", "2684")
+        );
+        assert_eq!(get(&found, "n1-pci-0000-01-00.1").metadata.labels["function"], "audio");
+        assert!(!found.iter().any(|device| device.metadata.name.contains("0000-02")));
+        let seat = get(&found, "n1-seat0");
+        let seated = seat.spec["devices"].as_array().unwrap();
+        assert!(
+            !seated.iter().any(|name| name.as_str().unwrap().contains("-pci-")),
+            "{seated:?}"
+        );
+        // And it is what a vm unit is given.
+        let path = std::path::PathBuf::from(gpu.spec["path"].as_str().unwrap());
+        assert_eq!(crate::vm::pci(&[path]), ["0000:01:00.0"]);
     }
 
     #[test]

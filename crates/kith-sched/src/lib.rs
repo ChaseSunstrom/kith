@@ -33,15 +33,24 @@ impl Amount {
         }
     }
 
-    /// The sum of every container's and exec unit's resources.
+    /// The sum of every container's, exec unit's and VM's resources. A VM that names none
+    /// is counted as what the machine is given: its CPUs and its memory.
     pub fn of_template(t: &Template) -> Amount {
         let each = t
             .containers
             .iter()
             .map(|c| &c.resources)
             .chain(t.exec.iter().map(|e| &e.resources));
+        let machines = t.vms.iter().map(|vm| match &vm.resources {
+            Some(resources) => Amount::of_resources(resources),
+            None => Amount {
+                cpu: vm.cpus.unwrap_or(1) as f64,
+                memory: vm.memory.value(),
+            },
+        });
         each.flatten()
             .map(Amount::of_resources)
+            .chain(machines)
             .fold(Amount::default(), |a, b| Amount {
                 cpu: a.cpu + b.cpu,
                 memory: a.memory + b.memory,

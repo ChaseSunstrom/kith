@@ -234,6 +234,9 @@ spec! {
         /// Plain supervised processes in a cgroup.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub exec: Vec<ExecUnit>,
+        /// Virtual machines, each run by a hypervisor on the node.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub vms: Vec<VmUnit>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub restart_policy: Option<RestartPolicy>,
         /// Names of `DeviceClaim`s this replica holds.
@@ -292,6 +295,46 @@ spec! {
         pub env: Vec<EnvVar>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub resources: Option<Resources>,
+    }
+
+    /// A virtual machine. It starts `kernel` if there is one, or else what its firmware
+    /// finds on `disks`. Each PCI Device a DeviceClaim of the replica holds is passed
+    /// through to it (VFIO).
+    pub struct VmUnit {
+        pub name: String,
+        /// What runs it [default: qemu].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub hypervisor: Option<Hypervisor>,
+        /// A kernel on the node, by absolute path.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub kernel: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub initrd: Option<String>,
+        /// The kernel's command line.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cmdline: Option<String>,
+        /// A firmware image on the node (UEFI), for a machine that starts from a disk.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub firmware: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub disks: Vec<VmDisk>,
+        /// [default: 1]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cpus: Option<u32>,
+        /// The machine's memory (`2Gi`).
+        pub memory: Quantity,
+        /// What the hypervisor's process is held to on the node.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub resources: Option<Resources>,
+    }
+
+    pub enum Hypervisor { Qemu, CloudHypervisor }
+
+    pub struct VmDisk {
+        /// A raw disk image on the node, by absolute path.
+        pub path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub read_only: Option<bool>,
     }
 
     /// Exactly one of `value`, `secret` or `configMap`.
@@ -1052,18 +1095,67 @@ fn exactly_one(at: &str, options: &[(&str, bool)]) -> Result<(), String> {
     Err(format!("{at}: set exactly one of {}", names.join(", ")))
 }
 
+impl VmUnit {
+    fn check(&self) -> Result<(), String> {
+        if self.kernel.is_none() && self.disks.is_empty() {
+            return Err("it has nothing to start: name a `kernel` or `disks`".into());
+        }
+        if (self.initrd.is_some() || self.cmdline.is_some()) && self.kernel.is_none() {
+            return Err("`initrd` and `cmdline` are a `kernel`'s".into());
+        }
+        // (A comma ends a value in a hypervisor's options.)
+        let paths = [
+            ("kernel", &self.kernel),
+            ("initrd", &self.initrd),
+            ("firmware", &self.firmware),
+        ];
+        let paths = paths
+            .into_iter()
+            .filter_map(|(field, path)| Some((field, path.as_deref()?)));
+        let disks = self.disks.iter().map(|disk| ("disks", disk.path.as_str()));
+        for (field, path) in paths.chain(disks) {
+            if !path.starts_with('/') || path.contains(',') || path.chars().any(char::is_control) {
+                return Err(format!(
+                    "{field}: `{path}` must be an absolute path with no comma in it"
+                ));
+            }
+        }
+        if self
+            .cmdline
+            .as_deref()
+            .is_some_and(|line| line.chars().any(char::is_control))
+        {
+            return Err("cmdline: one line".into());
+        }
+        if !(1..=512).contains(&self.cpus.unwrap_or(1)) {
+            return Err("cpus: 1 to 512".into());
+        }
+        if self.memory.value() < f64::from(1 << 24) {
+            return Err("memory: at least 16Mi".into());
+        }
+        Ok(())
+    }
+}
+
 impl Template {
+    /// The names of its units, in the order they are numbered: containers, exec units, VMs.
+    pub fn units(&self) -> impl Iterator<Item = &String> {
+        let containers = self.containers.iter().map(|c| &c.name);
+        let exec = self.exec.iter().map(|e| &e.name);
+        containers.chain(exec).chain(self.vms.iter().map(|vm| &vm.name))
+    }
+
     fn check(&self, at: &str) -> Result<(), String> {
-        if self.containers.is_empty() && self.exec.is_empty() {
-            return Err(format!("{at}: needs at least one entry in `containers` or `exec`"));
+        if self.containers.is_empty() && self.exec.is_empty() && self.vms.is_empty() {
+            return Err(format!(
+                "{at}: needs at least one entry in `containers`, `exec` or `vms`"
+            ));
+        }
+        for vm in &self.vms {
+            vm.check().map_err(|e| format!("{at}, vm `{}`: {e}", vm.name))?;
         }
         let mut names = std::collections::BTreeSet::new();
-        for name in self
-            .containers
-            .iter()
-            .map(|c| &c.name)
-            .chain(self.exec.iter().map(|e| &e.name))
-        {
+        for name in self.units() {
             if !names.insert(name) {
                 return Err(format!("{at}: two units are named `{name}`"));
             }

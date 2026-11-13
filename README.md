@@ -918,6 +918,58 @@ spec:
   that hangs while fullscreen keeps the others held back until it goes; a GPU is not
   shared out by this, only CPU, memory and disk.
 
+### Virtual machines
+
+A template's `vms` are virtual machines, beside (or instead of) its `containers` and
+`exec` units, in a Workload, a Job or anything else that has a template:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: windows }
+spec:
+  placement: { nodeSelector: { kith.dev/node: desk } }
+  template:
+    deviceClaims: [card]              # a DeviceClaim for a GPU set aside for machines
+    vms:
+      - name: machine
+        firmware: /usr/share/edk2/x64/OVMF.4m.fd
+        disks: [{ path: /var/lib/machines/windows.raw }]
+        cpus: 8
+        memory: 16Gi
+        resources: { cpu: 8, memory: 17Gi }   # what it costs the node; else its cpus and memory
+```
+
+- A machine starts from a `kernel` (with an `initrd` and a `cmdline` if it needs them: a
+  microVM) or from its `disks` through `firmware`. `memory` is needed (16Mi at least),
+  `cpus` is 1 unless said. Every path is a file on the node, written whole; a disk is a raw
+  image, `readOnly: true` if the machine must not write it.
+- kithd runs the node's hypervisor as a supervised process, as an `exec` unit is: its own
+  cgroup, restarted as `restartPolicy` says, done when the machine powers off or restarts.
+  The machine's serial console (`console=ttyS0`) is the unit's log: `kith logs
+  Workload/windows --unit machine`. `hypervisor: qemu` (the default, with KVM) or
+  `cloudHypervisor`; the node needs `qemu-system-x86_64` (`-aarch64` on arm64) or
+  `cloud-hypervisor` on its PATH and `/dev/kvm`.
+- **Passing a device through (VFIO).** A PCI device bound to the `vfio-pci` driver is a
+  `Device` of class `pci` (`desk-pci-0000-01-00.0`; labels `driver: vfio-pci`, `vendor`,
+  `model`, and `function`: `gpu`, `audio`, `usb` or `other`) whose path is its place on the
+  bus. It is no part of the node's seat, and a selector for `class: gpu` never comes to it:
+  claim it by name, or by `class: pci` and its `function`. A `vms` unit is given every such Device the template's
+  `deviceClaims` hold; a container is never given one. Binding is the node owner's doing,
+  before kithd starts (`vfio-pci.ids=10de:2684,10de:22ba` on the kernel's command line, with
+  the IOMMU on); a card usually wants its sound function claimed and passed too.
+- The scheduler counts a machine as its `cpus` and `memory`, or as its `resources` when it
+  names them (the hypervisor needs somewhat more memory than the machine has: say so there).
+- Not yet (ponytail): Firecracker (it wants a tap device and an API socket; QEMU and
+  cloud-hypervisor take one command line); a network beyond QEMU's own NAT (the machine
+  reaches out, nothing reaches it; none under cloud-hypervisor); a disk from a Volume; kithd
+  binding a device to `vfio-pci` itself; kith OS has no hypervisor in its image and no VFIO
+  in its kernel, so `vms` run on agent-mode nodes only; a machine that powers off is
+  started again under `restartPolicy: always`, as one that restarted is. Tested: a Job boots a kernel under KVM and its
+  console is read back with `kith logs`. Not tested: cloud-hypervisor (its command line is
+  built, never run here) and a real GPU passed through, which needs a machine with a spare
+  card and its owner's say.
+
 ## Storage
 
 A `Volume` is a directory on one node. A container mounts one by naming it, or a

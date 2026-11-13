@@ -2274,3 +2274,60 @@ fn claim_makes_the_first_admin_over_tls() {
     });
     assert_eq!(token_in("said-again"), None);
 }
+
+/// A `vms` unit is a real machine: a Job boots a kernel under KVM, the machine's console is
+/// the unit's log, and the Job is done when the machine ends (with no disk the kernel has no
+/// root, gives up and restarts, which ends the hypervisor). Skipped where there is no KVM,
+/// QEMU or kernel to boot (`KITH_E2E_KERNEL`, else the host's own).
+#[test]
+fn a_vm_unit_boots_a_kernel_and_its_console_is_the_log() {
+    if !e2e() {
+        return;
+    }
+    let kernel = std::env::var("KITH_E2E_KERNEL").ok().or_else(|| {
+        let boot = std::fs::read_dir("/boot").ok()?;
+        let mut found: Vec<_> = boot.flatten().map(|entry| entry.path()).collect();
+        found.sort();
+        let kernel = found.into_iter().find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("vmlinuz"))
+                && std::fs::File::open(path).is_ok()
+        })?;
+        Some(kernel.to_string_lossy().into_owned())
+    });
+    let qemu = Command::new("qemu-system-x86_64").arg("--version").output().is_ok();
+    let kvm = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .is_ok();
+    let (Some(kernel), true, true) = (kernel, qemu, kvm) else {
+        eprintln!("skipped: needs /dev/kvm, qemu-system-x86_64 and a kernel (KITH_E2E_KERNEL)");
+        return;
+    };
+    let daemon = Daemon::start("vm");
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1
+kind: Job
+metadata:
+  name: boot
+spec:
+  timeoutSeconds: 120
+  template:
+    restartPolicy: never
+    vms:
+      - name: machine
+        kernel: {kernel}
+        cmdline: console=ttyS0 loglevel=7 panic=-1
+        cpus: 1
+        memory: 256Mi
+"
+    ));
+    wait_for("the machine to end", || daemon.status("Job/boot")["succeeded"] == 1);
+    let console = daemon.ok(&["logs", "Job/boot", "--unit", "machine"]);
+    assert!(console.contains("Linux version"), "{console}");
+    assert!(
+        console.contains("Kernel panic"),
+        "it had no root to go on with: {console}"
+    );
+}

@@ -766,3 +766,45 @@ fn a_share_names_who_may_use_it_and_no_range_wider_than_a_slash_eight() {
         assert!(refused.unwrap_err().contains("not an IPv4 address or range"), "{bad}");
     }
 }
+
+#[test]
+fn a_vm_unit_names_what_it_starts_by_absolute_paths_and_its_memory() {
+    let job = |vm: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: boot }}\nspec:\n  template:\n    vms:\n      - {vm}\n"
+        );
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    job("{ name: vm, kernel: /boot/vmlinuz, cmdline: 'console=ttyS0', memory: 256Mi }").unwrap();
+    job("{ name: vm, hypervisor: cloudHypervisor, disks: [{ path: /var/lib/vm/disk.raw, readOnly: true }], cpus: 4, memory: 2Gi }").unwrap();
+    for (bad, why) in [
+        ("{ name: vm, memory: 256Mi }", "nothing to start"),
+        (
+            "{ name: vm, disks: [{ path: /d.raw }], cmdline: quiet, memory: 256Mi }",
+            "are a `kernel`'s",
+        ),
+        ("{ name: vm, kernel: vmlinuz, memory: 256Mi }", "absolute path"),
+        ("{ name: vm, kernel: '/boot/a,b', memory: 256Mi }", "no comma"),
+        (
+            "{ name: vm, disks: [{ path: '/d.raw,format=qcow2' }], memory: 256Mi }",
+            "no comma",
+        ),
+        (
+            "{ name: vm, kernel: /k, cmdline: \"a\\nb\", memory: 256Mi }",
+            "one line",
+        ),
+        ("{ name: vm, kernel: /k, cpus: 0, memory: 256Mi }", "cpus:"),
+        ("{ name: vm, kernel: /k, memory: 8Mi }", "at least 16Mi"),
+        (
+            "{ name: vm, kernel: /k, hypervisor: xen, memory: 256Mi }",
+            "unknown variant `xen`",
+        ),
+    ] {
+        let refused = job(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    // A VM's name is a unit's name, like a container's.
+    let twice = "{ name: vm, kernel: /k, memory: 256Mi }\n      - { name: vm, kernel: /k, memory: 256Mi }";
+    assert!(job(twice).unwrap_err().contains("two units are named `vm`"));
+}

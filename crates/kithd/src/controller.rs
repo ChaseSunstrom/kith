@@ -248,8 +248,7 @@ fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
 /// stored resource, never from what the caller sent.
 pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(String, bool), Error> {
     let (template, replicas) = template_of(resource).map_err(Error::Invalid)?;
-    let mut names = template.containers.iter().map(|c| &c.name);
-    let mut names = names.by_ref().chain(template.exec.iter().map(|e| &e.name));
+    let mut names = template.units();
     let name = match unit {
         Some(unit) => names.find(|name| *name == unit),
         None => names.next(),
@@ -405,8 +404,7 @@ impl Controller {
                         note.push("restartPolicy is ignored: a Job retries whole runs (`retries`)".into());
                     }
                     // The units a run really has: a name counts once, and only if it can be an id.
-                    let names = template.containers.iter().map(|c| &c.name);
-                    let names: BTreeSet<_> = names.chain(template.exec.iter().map(|e| &e.name)).collect();
+                    let names: BTreeSet<_> = template.units().collect();
                     let units = names.iter().filter(|name| unit_id(&prefix, 0, name).is_ok()).count();
                     let (runs, not_before) = self.job_runs(&key, resource, replicas, units);
                     // A Job retries whole runs, so a unit that exits stays exited.
@@ -423,7 +421,12 @@ impl Controller {
                 ours.insert(key.clone());
             }
             let containers = template.containers.iter().cloned().map(Run::Container);
-            let units: Vec<Run> = containers.chain(template.exec.iter().cloned().map(Run::Exec)).collect();
+            // (A VM is the process of its hypervisor: an exec unit, with the command line made here.)
+            let vms = template.vms.iter().map(|vm| Run::Exec(crate::vm::exec(vm, &devices)));
+            let units: Vec<Run> = containers
+                .chain(template.exec.iter().cloned().map(Run::Exec))
+                .chain(vms)
+                .collect();
             if units.is_empty() {
                 note.push("the template has nothing to run".into());
             }
@@ -937,8 +940,14 @@ async fn start(
     };
     let mut unit = Unit {
         env: slot.env.clone()?,
-        // (An exec unit is given none: it sees all of `/dev`.)
-        devices: slot.devices.clone(),
+        // (An exec unit is given none: it sees all of `/dev`. A PCI device held for a VM is
+        // no device node: a container gets nothing of it.)
+        devices: slot
+            .devices
+            .iter()
+            .filter(|path| !path.starts_with(crate::vm::PCI))
+            .cloned()
+            .collect(),
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the

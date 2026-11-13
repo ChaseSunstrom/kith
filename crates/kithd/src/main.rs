@@ -40,6 +40,7 @@ mod share;
 mod sources;
 mod ui;
 mod update;
+mod vm;
 mod volumes;
 mod wasm;
 
