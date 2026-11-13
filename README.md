@@ -803,6 +803,53 @@ within 30 seconds). `kith get device` lists them.
   you wrote yourself is never changed or deleted. A machine without `/sys/class`
   (some containers) has no devices, and kithd says so once.
 
+### Claiming hardware
+
+A workload holds hardware by naming `DeviceClaim`s (same namespace) in its template's
+`deviceClaims`. A claim names one `seat`, or one `device`, or a `selector` over
+`Device` labels, and says `access: exclusive` (the default) or `shared`:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: render }
+spec:
+  selector: { class: gpu, kith.dev/node: n1 }
+  access: exclusive
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: renderer }
+spec:
+  template:
+    containers: [{ name: run, image: example/renderer }]
+    deviceClaims: [render]
+```
+
+- The workload runs on the node of the `Device`s its claims come to, and only there.
+  Claims that come to Devices of two nodes (a selector over a whole cluster) hold
+  nothing: the status says so, and `kith.dev/node` in the selector fixes it.
+- One workload holds a Device at a time, however many claims reach it. A second
+  exclusive holder waits, and its `unschedulable` says `waiting for DeviceClaim render,
+  held by Workload/default/renderer`; it takes over when the first is gone, and the first
+  never loses it to one that came later. `shared` claims on one Device may have any number
+  of holders, none of them beside an exclusive one. All replicas of one workload hold what
+  it holds together.
+- `kith get deviceclaim render -o yaml` shows `status.node`, `status.devices` and
+  `status.holders`; a claim that comes to nothing has a `status.message` instead.
+- A container is given the device nodes of its Devices in its own `/dev` and the
+  cgroup's device list allows reading and writing them and nothing else. A GPU brings its
+  render node (`/dev/dri/renderD*`) with its card; a `display` has no device node and gives
+  nothing. A Device or claim that is missing, or a path that is not a device node, stops the
+  unit from starting, and says which. An `exec` unit runs on the host and sees all of
+  `/dev` as it is.
+- Not yet: a NodeWorkload cannot claim (it runs nothing, and says so); there is no hot-plug
+  (a changed set of device nodes starts the unit over at the next scan).
+- Who may claim is ordinary access control: to claim, you apply a `DeviceClaim` and a
+  workload that names it, so the right to apply those is the grant, and there is no other
+  permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
+  other kind: give it only to someone you would let hold any hardware of the cluster.
+
 ## Web UI
 
 Every node serves a page that shows the cluster and changes it: what is

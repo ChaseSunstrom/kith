@@ -45,7 +45,27 @@ fn replica(id: &str, workload: &str) -> Replica {
         requests: Amount { cpu: 1.0, memory: GI },
         placement: None,
         bound: None,
+        node: None,
     }
+}
+
+#[test]
+fn a_replica_with_a_node_goes_there_and_nowhere_else() {
+    let nodes = [node("a", 4.0, 8.0), node("b", 4.0, 8.0)];
+    // (b is the node with more room, and still not where it may go; a bound replica moves.)
+    let pinned = |id: &str, on: &str| Replica {
+        node: Some(on.into()),
+        ..replica(id, "w")
+    };
+    let plan = schedule(&nodes, &[pinned("w#0", "a"), pinned("w#1", "c")], GRACE);
+    assert_eq!(home(&plan, "w#0"), "a");
+    let why = plan.unschedulable.get("w#1").expect("c is no node");
+    assert!(why.contains("2 not the node it needs"), "{why}");
+    let moved = Replica {
+        bound: Some("b".into()),
+        ..pinned("w#0", "a")
+    };
+    assert_eq!(home(&schedule(&nodes, &[moved], GRACE), "w#0"), "a");
 }
 
 fn placement(require: &[(&str, &str)], prefer: &[(u32, &str, &str)]) -> Option<Placement> {

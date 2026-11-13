@@ -24,7 +24,7 @@ use tokio::sync::watch;
 type Writes = (Vec<(String, Map<String, Value>)>, Vec<(String, String)>);
 
 /// The replicas `resource` wants placed: how many, what each asks for, where each may go.
-fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api::kinds::Placement>)> {
+pub(crate) fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api::kinds::Placement>)> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
         "Workload" => {
@@ -96,12 +96,22 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         let kinds = ["Workload", "Job", "NodeWorkload"];
         kinds.into_iter().flat_map(|kind| store.list(Some(kind)))
     };
-    let mut replicas = Vec::new();
+    let claims = crate::claims::resolve(store).owners;
+    let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
     for resource in owners() {
         let Some((count, requests, placement)) = wants(resource) else {
             continue;
         };
         let key = resource.key();
+        // Where its claimed hardware is; one whose claims do not come to a node waits, with the reason.
+        let node = match claims.get(&key) {
+            Some(Ok(held)) => Some(held.node.clone()),
+            Some(Err(why)) => {
+                waiting.extend((0..count).map(|replica| (format!("{key}#{replica}"), why.clone())));
+                continue;
+            }
+            None => None,
+        };
         for replica in 0..count {
             let bound = resource
                 .status
@@ -113,10 +123,12 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
                 requests,
                 placement: placement.clone(),
                 bound: bound.map(str::to_string),
+                node: node.clone(),
             });
         }
     }
-    let made = kith_sched::schedule(&nodes, &replicas, grace);
+    let mut made = kith_sched::schedule(&nodes, &replicas, grace);
+    made.unschedulable.extend(waiting);
     let of = |key: &str, by_id: &BTreeMap<String, String>| {
         let mine = by_id.iter().filter_map(|(id, value)| {
             let (owner, replica) = id.rsplit_once('#')?;
@@ -197,9 +209,10 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let capacity = shared.members.capacity(name);
             (capacity, lost.or(capacity.is_none().then_some(Duration::ZERO)))
         };
-        let (fields, left) = {
+        let (fields, left, claimed) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            plan(&state.store, &seen, grace)
+            let (fields, left) = plan(&state.store, &seen, grace);
+            (fields, left, crate::claims::writes(&state.store))
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
         let mut commands = Vec::new();
@@ -209,6 +222,10 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         }
         if !fields.is_empty() {
             commands.push(Command::Patch { statuses: fields });
+        }
+        // Each DeviceClaim says where it is and who holds it (only when that changed).
+        if !claimed.is_empty() {
+            commands.push(Command::Status { statuses: claimed });
         }
         for command in commands {
             if let Err(e) = shared.submit(command).await {
@@ -447,5 +464,65 @@ spec:
         assert_eq!(left, vec![("b".to_string(), "NodeWorkload/default/agent".to_string())]);
         kith_store::run(&mut store, Command::Patch { statuses: fields }).unwrap();
         assert_eq!(status(&store)["nodes"], json!({ "0": "a", "2": "c" }));
+    }
+
+    #[test]
+    fn a_workload_with_a_claim_goes_to_its_devices_node_and_a_second_holder_waits() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: b-gpu-card0 }
+spec: { node: b, class: gpu, path: /dev/dri/card0 }
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: gpu }
+spec: { device: b-gpu-card0 }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: one }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }], deviceClaims: [gpu] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: two }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }], deviceClaims: [gpu] } }
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        kith_store::run(&mut store, Command::Patch { statuses: fields }).unwrap();
+        let statuses = crate::claims::writes(&store);
+        kith_store::run(&mut store, Command::Status { statuses }).unwrap();
+        let status = |key: &str| store.get(key).unwrap().status.clone().unwrap();
+        assert_eq!(status("Workload/default/one")["nodes"], json!({ "0": "b" }));
+        let two = status("Workload/default/two");
+        assert!(two["nodes"].is_null(), "no node yet: {two}");
+        assert_eq!(
+            two["unschedulable"]["0"],
+            "waiting for DeviceClaim gpu, held by Workload/default/one"
+        );
+        let held = status("DeviceClaim/default/gpu");
+        assert_eq!(
+            held,
+            json!({ "node": "b", "devices": ["b-gpu-card0"], "holders": ["Workload/default/one"] })
+        );
+        // Nothing more to write.
+        assert_eq!(plan(&store, &there, Duration::from_secs(300)), (vec![], vec![]));
+        assert!(crate::claims::writes(&store).is_empty());
     }
 }

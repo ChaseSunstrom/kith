@@ -72,6 +72,8 @@ pub struct Replica {
     pub placement: Option<Placement>,
     /// The node it is bound to now, if any.
     pub bound: Option<String>,
+    /// The one node it may run on, where the hardware it claims is.
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -136,6 +138,8 @@ fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
         "cordoned"
     } else if tainted(n, &[TaintEffect::NoSchedule, TaintEffect::NoExecute]) > 0 {
         "tainted"
+    } else if r.node.as_ref().is_some_and(|node| *node != n.name) {
+        "not the node it needs"
     } else if require.is_some_and(|q| !matches(&n.labels, q)) {
         "missing required labels"
     } else if !fits(r.requests.cpu, left.cpu) {
@@ -152,6 +156,7 @@ fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
 fn keeps(n: &Node, r: &Replica, grace: Duration) -> bool {
     !gone(n, grace)
         && tainted(n, &[TaintEffect::NoExecute]) == 0
+        && r.node.as_ref().is_none_or(|node| *node == n.name)
         && r.placement.as_ref().is_none_or(|p| matches(&n.labels, &p.require))
 }
 

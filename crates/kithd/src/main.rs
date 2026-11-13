@@ -10,6 +10,7 @@ mod access;
 mod acme;
 mod api;
 mod audit;
+mod claims;
 mod cluster;
 mod controller;
 mod controllers;
