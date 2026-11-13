@@ -19,8 +19,11 @@ MB = 1024 * 1024
 
 # Measured 6.5 MB and 4.0 MB when kithd first ran workloads (API server, store,
 # controller, container runtime, registry client with TLS); 8.2 MB and 5.7 MB with
-# the replicated store (openraft and redb, Phase 2b), which raised the size budget from 8.
-KITHD_SIZE = 10
+# the replicated store (openraft and redb, Phase 2b), which raised the size budget from 8;
+# 10.0 MB with mesh, ingress, ACME, packages and Sources (Phases 2-3), which raised it
+# from 10 for Phase 4 (access control, WASM, the web UI). The plan's own ceilings are
+# on memory (30 MB for kithd), which the idle RSS budget below stays far under.
+KITHD_SIZE = 12
 KITHD_IDLE_RSS = 8 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
