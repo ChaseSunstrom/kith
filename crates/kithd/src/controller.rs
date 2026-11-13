@@ -3,7 +3,7 @@
 //! what it sees in each one's status.
 //!
 // ponytail: one node. Not handled yet, each said so in the status where it
-// matters: volumes, ports (units share the host's network) and exec probes.
+// matters: ports (units share the host's network) and exec probes.
 // A rolling update replaces one replica at a time, the old one stopped before the
 // new one starts: unit ids (cgroup, log file) are per replica, so two generations
 // of a replica cannot run side by side. Images are pulled one at a time.
@@ -65,6 +65,9 @@ struct Slot {
     probes: Option<crate::probe::Probes>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
     devices: Vec<PathBuf>,
+    /// What its containers mount: the Volume's directory, where in the container, and read-only
+    /// (a changed one replaces the unit, as a changed value does). An exec unit mounts nothing.
+    volumes: Vec<(crate::volumes::Dir, String, bool)>,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -290,7 +293,8 @@ impl Controller {
         // 1. What should run, from a snapshot of the store.
         // And, per workload this node may run that holds DeviceClaims, the device nodes of its own
         // Devices they come to (`granted` knows no other node's).
-        let (resources, granted): (Vec<Resource>, _) = {
+        // And, the same way, the Volumes of this node they mount.
+        let (resources, granted, mounted): (Vec<Resource>, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let kinds = ["Workload", "NodeWorkload", "Job"];
@@ -301,7 +305,8 @@ impl Controller {
                 .collect();
             let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
             let granted = me.map(|me| crate::claims::granted(store, me, Path::new("/sys")));
-            (resources, granted.unwrap_or_default())
+            let mounted = me.map(|me| crate::volumes::mounts(store, me));
+            (resources, granted.unwrap_or_default(), mounted.unwrap_or_default())
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
@@ -340,6 +345,16 @@ impl Controller {
                 note.push("a NodeWorkload cannot hold DeviceClaims: it runs nothing (use a Workload)".into());
             } else if claimed && me.is_none() {
                 note.push("DeviceClaims need a node with a name in a cluster: this one runs nothing".into());
+            }
+            // The same for its volumes: it runs where they are (the scheduler has put it there), and
+            // not as a NodeWorkload, nor alone (a Volume names a node).
+            let volumes = mounted.get(&key).cloned().unwrap_or_default();
+            let mounts = template.containers.iter().any(|c| !c.volume_mounts.is_empty());
+            let allowed = allowed && (!mounts || (resource.kind != "NodeWorkload" && mounted.contains_key(&key)));
+            if mounts && resource.kind == "NodeWorkload" {
+                note.push("a NodeWorkload cannot mount volumes: it runs nothing (use a Workload)".into());
+            } else if mounts && me.is_none() {
+                note.push("volumes need a node with a name in a cluster: this one runs nothing".into());
             }
             let here = |replica: u32| {
                 let bound = |status: &Value| status["nodes"][replica.to_string()] == *me.unwrap_or_default();
@@ -409,9 +424,6 @@ impl Controller {
                         unit.name()
                     ));
                 }
-                if matches!(unit, Run::Container(c) if !c.volume_mounts.is_empty()) {
-                    note.push(format!("{}: volumes are not mounted yet", unit.name()));
-                }
                 if let Run::Container(c) = unit {
                     note.extend(crate::probe::problems(c));
                 }
@@ -442,6 +454,7 @@ impl Controller {
                             rolling,
                             probes: None,
                             devices: devices.clone(),
+                            volumes: mounts_of(unit, &volumes),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -465,7 +478,11 @@ impl Controller {
         let differs = |new: &Slot, slot: &Slot| {
             // A Job's run is not started over because a value changed under it.
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
-            new.run != slot.run || new.policy != slot.policy || new.devices != slot.devices || new_values
+            new.run != slot.run
+                || new.policy != slot.policy
+                || new.devices != slot.devices
+                || new.volumes != slot.volumes
+                || new_values
         };
         for (id, slot) in &self.slots {
             let Some(new) = wanted.get(id) else {
@@ -838,6 +855,20 @@ fn env_value(shared: &Shared, namespace: &str, var: &EnvVar) -> Result<String, S
         .ok_or(format!("env `{}`: {key} has no key `{}`", var.name, key_ref.key))
 }
 
+/// What a unit mounts, from the Volumes its workload's mounts come to: only a container mounts.
+fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec<(crate::volumes::Dir, String, bool)> {
+    let Run::Container(c) = unit else { return Vec::new() };
+    let mounts = c.volume_mounts.iter();
+    let found = mounts.filter_map(|m| {
+        Some((
+            volumes.get(&m.volume)?.clone(),
+            m.path.clone(),
+            m.read_only == Some(true),
+        ))
+    });
+    found.collect()
+}
+
 async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<Handle, String> {
     let resources = match &slot.run {
         Run::Container(c) => &c.resources,
@@ -849,6 +880,18 @@ async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<
         devices: slot.devices.clone(),
         ..Unit::default()
     };
+    // The volumes' directories are made here, on the node, under the state directory (the
+    // logs', parent), now and not when planned: a directory made for a replica that never starts
+    // would be left behind.
+    let state = logs.parent().unwrap_or(logs);
+    for (dir, at, read_only) in &slot.volumes {
+        let host = crate::volumes::host_dir(state, dir).map_err(|e| format!("volume {}: {e}", dir.name))?;
+        unit.mounts.push(kith_runtime::Mount {
+            host,
+            container: at.clone(),
+            read_only: *read_only,
+        });
+    }
     if let Some(Resources { cpu, memory, .. }) = resources {
         unit.memory_bytes = memory.as_ref().map(|q| q.value() as u64);
         unit.cpu_millis = cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);

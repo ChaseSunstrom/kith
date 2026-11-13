@@ -97,20 +97,21 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         kinds.into_iter().flat_map(|kind| store.list(Some(kind)))
     };
     let claims = crate::claims::resolve(store).owners;
+    let mounts = crate::volumes::resolve(store).owners;
     let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
     for resource in owners() {
         let Some((count, requests, placement)) = wants(resource) else {
             continue;
         };
         let key = resource.key();
-        // Where its claimed hardware is; one whose claims do not come to a node waits, with the reason.
-        let node = match claims.get(&key) {
-            Some(Ok(held)) => Some(held.node.clone()),
-            Some(Err(why)) => {
+        // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
+        // to one node waits, with the reason.
+        let node = match crate::volumes::together(claims.get(&key), mounts.get(&key)) {
+            Ok(node) => node,
+            Err(why) => {
                 waiting.extend((0..count).map(|replica| (format!("{key}#{replica}"), why.clone())));
                 continue;
             }
-            None => None,
         };
         for replica in 0..count {
             let bound = resource
@@ -212,7 +213,9 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         let (fields, left, claimed) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let (fields, left) = plan(&state.store, &seen, grace);
-            (fields, left, crate::claims::writes(&state.store))
+            let mut claimed = crate::claims::writes(&state.store);
+            claimed.extend(crate::volumes::writes(&state.store));
+            (fields, left, claimed)
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
         let mut commands = Vec::new();
@@ -223,7 +226,8 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         if !fields.is_empty() {
             commands.push(Command::Patch { statuses: fields });
         }
-        // Each DeviceClaim says where it is and who holds it (only when that changed).
+        // Each DeviceClaim says where it is and who holds it, each VolumeClaim and Volume what it is
+        // bound to (only when that changed).
         if !claimed.is_empty() {
             commands.push(Command::Status { statuses: claimed });
         }
