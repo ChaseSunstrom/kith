@@ -600,6 +600,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let mesh = async {
             if let Some(port) = args.mesh {
                 mesh::run(shared.clone(), mesh_options(&args, &state, port), stopping.clone()).await;
+            } else {
+                mesh::left(shared.clone(), stopping.clone()).await;
             }
         };
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();

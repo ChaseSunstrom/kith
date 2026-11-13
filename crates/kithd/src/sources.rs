@@ -219,6 +219,9 @@ async fn git(limit: u64, dir: &Path, local: bool, pins: &[String], args: &[&str]
     ] {
         command.args(["-c", setting]);
     }
+    // (Every fetch into one pack file, which the file limit bounds: left to itself git
+    // unpacks a small pack into as many loose files as it has objects.)
+    command.args(["-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1"]);
     for pin in pins {
         command.args(["-c", &format!("http.curloptResolve={pin}")]);
     }
@@ -336,7 +339,8 @@ async fn fetch_within(
     url_allowed(url, local)?;
     if !pins.is_empty() {
         // (An older git takes the setting that pins it for nothing, and says nothing.)
-        let version = git(limit, dir.parent().unwrap_or(dir), local, &[], &["version"]).await?;
+        // (Asked from a directory that is there: the clone's may not be yet.)
+        let version = git(limit, Path::new("/"), local, &[], &["version"]).await?;
         if !pinnable(&String::from_utf8_lossy(&version)) {
             return Err("this node's git is older than 2.37: it cannot be held to the address that was checked".into());
         }
@@ -737,7 +741,8 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
                     due.push((key.clone(), source, about));
                 }
             }
-            // (Several at once: a slow or dead one does not hold the rest.)
+            // (Several at once: a slow or dead one holds the rest no longer than its own
+            // time. A fetch that panicked is not in `done`, and is tried again next time.)
             let (mut waiting, mut running, mut done) = (due.into_iter(), tokio::task::JoinSet::new(), Vec::new());
             loop {
                 while running.len() < FETCHES_AT_ONCE

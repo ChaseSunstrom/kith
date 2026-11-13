@@ -344,8 +344,9 @@ async fn watch(
     }
     // The wait may have been long: an Identity deleted, or given another key, meanwhile is
     // told no more, and that is written down.
-    if let (Caller::Identity(name), Some(Extension(Certificate(der)))) = (&caller, &certificate)
-        && !access::stands(&shared, name, der)
+    // (An Identity with no certificate on record is not taken on trust.)
+    if let Caller::Identity(name) = &caller
+        && !certificate.is_some_and(|Extension(Certificate(der))| access::stands(&shared, name, &der))
     {
         let why = format!("this certificate does not stand for an Identity {name} any more");
         shared

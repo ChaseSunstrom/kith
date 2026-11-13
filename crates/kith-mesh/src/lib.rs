@@ -120,9 +120,7 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
         if member.reached || member.direct_only || mine {
             return None;
         }
-        let edges: Vec<&Member> = others()
-            .filter(|edge| edge.edge && edge.reached && edge.name != member.name)
-            .collect();
+        let edges: Vec<&Member> = others().filter(|edge| edge.edge && edge.reached).collect();
         let says = |edge: &Member| {
             [me, &member.name]
                 .iter()

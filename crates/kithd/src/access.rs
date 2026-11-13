@@ -145,9 +145,11 @@ pub fn who(
         Some(pki::Subject::User(name, key)) => (name, key),
         None => {
             let why = "a certificate from this cluster's CA is needed".to_string();
-            shared
-                .audit
-                .record(&"no certificate", method, vec![path.into()], Err(why.clone()));
+            if shared.audit.stranger() {
+                shared
+                    .audit
+                    .record(&"no certificate", method, vec![path.into()], Err(why.clone()));
+            }
             return Err((StatusCode::UNAUTHORIZED, why));
         }
     };
@@ -224,6 +226,9 @@ mod tests {
         );
         assert_eq!(entries[0]["what"][0], "/v1/apply");
         assert_eq!(entries[1]["who"], "no certificate");
+        // One such line a minute: whoever has no certificate does not fill the log.
+        assert!(who(&shared, None, "GET", "/v1/watch").is_err());
+        assert_eq!(shared.audit.tail(10).unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

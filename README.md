@@ -477,8 +477,9 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   Release's. A resource that names no namespace goes in the Source's. A
   Source applies only into its own namespace; one in `kith-system` applies
   anywhere and any kind (it is the cluster's own). It does not take over what
-  is there and not its own; of two Sources that name one resource the first
-  by name gets it and the other says `error`. Sources are fetched several at
+  is there and not its own; of two Sources that name one resource the one
+  that has it keeps it (the first by name, if they come together) and the
+  other says `error`. Sources are fetched several at
   once, and one that keeps failing is fetched less and less often (its
   interval doubled each time, to an hour).
 - `status.state` is `synced` (at `revision`), `pending` (`pending.revision`
@@ -754,9 +755,15 @@ one that could give itself every right anyway.
   applied it.
 
 Every change made through a node, and every refusal, is one line in that
-node's audit log (`audit.log` in its state directory, 4 MB and the 4 MB
-before): when, who, what, and how it went. Refusals past sixty a minute are
-counted rather than written. `kith audit` shows the last of it,
+node's audit log (`audit.log` in its state directory, 4 MB and the four
+files of 4 MB before it, `audit.log.1` to `.4`): when, who, what, and how it
+went. A certificate that no longer stands for its Identity is a refusal too,
+and so is no certificate at all (one line a minute of those). Refusals past
+sixty a minute are counted rather than written. A watch ends when its
+Identity is deleted or given another certificate. `Audit` is not a name a
+custom kind may take. Permission is asked when a request arrives, not again
+when its write is committed: a Role removed in between does not stop a write
+already under way. `kith audit` shows the last of it,
 as does `GET /v1/audit` for an Identity with `get` on `Audit`.
 
 ```

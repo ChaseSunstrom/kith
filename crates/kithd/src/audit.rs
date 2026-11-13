@@ -31,6 +31,8 @@ struct Log {
     minute: u64,
     refused: u32,
     unwritten: u64,
+    /// The minute a refusal of someone with no certificate was last written in.
+    stranger: u64,
 }
 
 pub struct Audit(Mutex<Log>);
@@ -42,7 +44,17 @@ impl Audit {
             minute: 0,
             refused: 0,
             unwritten: 0,
+            stranger: 0,
         }))
+    }
+
+    /// Is a refusal of someone with no certificate to be written? One a minute is:
+    /// anyone at all can be refused so, and is not to fill the log or use up what is
+    /// kept for the refusals of those the cluster knows.
+    pub fn stranger(&self) -> bool {
+        let minute = kith_api::store::now() / 60;
+        let mut log = self.0.lock().expect("nothing panics holding the audit log");
+        minute != std::mem::replace(&mut log.stranger, minute)
     }
 
     /// Write down that `who` did `verb` to `what`, or why not.

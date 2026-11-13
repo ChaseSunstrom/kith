@@ -225,11 +225,14 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let nobody = members.iter().all(|member| member.name == me);
             let more: Vec<Member> = first.iter().filter(|peer| nobody && peer.name != me).cloned().collect();
             members.extend(more);
-            // What this node says of itself, with who it reaches (written only when it changed).
-            let mut mine = base.clone();
-            mine["reaches"] = json!(reaching(&members, &shook));
-            let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let edge = members.iter().any(|member| member.name == me && member.edge);
+            // What this node says of itself (written only when it changed). An edge node
+            // says who it reaches too: it is asked when a relay is picked, the others are not.
+            let mut mine = base.clone();
+            if edge {
+                mine["reaches"] = json!(reaching(&members, &shook));
+            }
+            let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
             (members, mine, said, edge, services.into_values().collect())
         };
@@ -272,17 +275,37 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             _ = stopping.changed() => break,
         }
     }
-    // Left: the others are not to keep calling a node that is not on the mesh.
-    // ponytail: a few seconds' wait at most; a node that dies instead is dropped by the
-    // others when it stops answering (and a stale `mesh` stays in its Node).
-    let cleared = say(&shared, &node, Value::Null);
-    match tokio::time::timeout(Duration::from_secs(3), cleared).await {
-        Ok(Err(e)) => eprintln!("kithd: mesh: clearing this node's mesh status: {e}"),
-        Err(_) => eprintln!("kithd: mesh: clearing this node's mesh status: no answer"),
-        Ok(Ok(())) => {}
-    }
+    // (What this node said of itself stays: it is back with the same key when kithd
+    // starts again, and the others need not forget it for a restart. See `left`.)
     if let Err(e) = device.remove() {
         eprintln!("kithd: mesh: removing {}: {e}", options.interface);
+    }
+}
+
+/// A node started without the mesh that still says it is on it has left: take back what
+/// it said, so the others stop calling it.
+pub async fn left(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+    let Some(cluster) = &shared.cluster else { return };
+    let node = format!("Node/{}", cluster.me.name);
+    loop {
+        // (Not known until the store has this node: asked again until it does.)
+        let says = {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            let own = state.store.get(&node).map(|own| own.status.as_ref());
+            own.map(|status| status.is_some_and(|status| !status["mesh"].is_null()))
+        };
+        match says {
+            Some(false) => return,
+            Some(true) => match say(&shared, &node, Value::Null).await {
+                Ok(()) => return,
+                Err(e) => eprintln!("kithd: mesh: taking back this node's mesh status: {e}"),
+            },
+            None => {}
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = stopping.changed() => return,
+        }
     }
 }
 
