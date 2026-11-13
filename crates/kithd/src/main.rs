@@ -6,8 +6,10 @@
 //! this node a member of another node's cluster (see `cluster.rs`). The store is
 //! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
+mod access;
 mod acme;
 mod api;
+mod audit;
 mod cluster;
 mod controller;
 mod dns;
@@ -103,6 +105,8 @@ pub struct Shared {
     pub changed: Arc<Notify>,
     /// Where the output of every unit goes: `<unit id>.out` and `.err`.
     pub logs: PathBuf,
+    /// Who changed what, and who was refused.
+    pub audit: audit::Audit,
     /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
     /// locked, so a reader under the lock sees the generation that matches what it reads.
     /// Starts at the clock (ms) so a restarted kithd never repeats a number a client holds.
@@ -234,6 +238,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         raft: replica.raft,
         changed,
         logs: state.join("logs"),
+        audit: audit::Audit::new(state.join("audit.log")),
         generation,
         members: members::Members::new(name),
         mesh: Mutex::default(),
@@ -361,7 +366,10 @@ fn run(args: Args) -> Result<(), String> {
             watched.stop.send_replace(true);
         });
         let mut server_stop = stopping.clone();
-        let local = api::router(shared.clone()).merge(cluster::admin_router(shared.clone()));
+        // Whoever can open the socket is the machine's admin.
+        let local = api::router(shared.clone())
+            .layer(axum::Extension(access::Caller::Admin))
+            .merge(cluster::admin_router(shared.clone()));
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         // The same API for other nodes, over TLS.

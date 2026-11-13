@@ -120,6 +120,17 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Identities: who may call the API over the network, as their Roles allow
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
+    /// Show who changed what through this node, and who was refused
+    Audit {
+        /// How many of the last entries to show (1000 at most)
+        #[arg(long, default_value_t = 100)]
+        tail: u64,
+    },
     /// Work on a package: a directory of resource templates and default values
     Package {
         #[command(subcommand)]
@@ -134,6 +145,18 @@ enum Command {
     Import {
         #[command(subcommand)]
         command: import::Import,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCommand {
+    /// Write a certificate and key for an Identity (made if it is not there) as NAME.crt,
+    /// NAME.key and ca.crt; a certificate it had before stops working
+    Cert {
+        name: String,
+        /// The directory to write them in
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
     },
 }
 
@@ -653,6 +676,58 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let reply: serde_json::Value = request(&kithd, "POST", "/v1/tokens", b"")?;
             println!("{}", reply["token"].as_str().unwrap_or_default());
+        }
+        Command::Identity {
+            command: IdentityCommand::Cert { name, out },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("certificates are made by kithd: leave out --store");
+            };
+            let made: serde_json::Value = request(&kithd, "POST", &format!("/v1/identities/{name}/certificate"), b"")?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            for (file, part) in [
+                (format!("{name}.key"), "key"),
+                (format!("{name}.crt"), "cert"),
+                ("ca.crt".into(), "ca"),
+            ] {
+                let path = out.join(file);
+                // (The mode is for the key; it does the others no harm.)
+                let mut options = std::fs::OpenOptions::new();
+                let opened = options.write(true).create(true).truncate(true).mode(0o600).open(&path);
+                let text = made[part].as_str().unwrap_or_default();
+                let written = opened.and_then(|mut file| file.write_all(text.as_bytes()));
+                written.map_err(|e| format!("error: writing {}: {e}", path.display()))?;
+            }
+            let out = out.display();
+            println!(
+                "Identity/{name} can call the API with {out}/{name}.crt and {out}/{name}.key (nodes show {out}/ca.crt, as `kith`)"
+            );
+            println!("It may do what Roles bound to it allow: nothing, until a RoleBinding names it.");
+        }
+        Command::Audit { tail } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("the audit log is kithd's: leave out --store");
+            };
+            let entries: Vec<serde_json::Value> = request(&kithd, "GET", &format!("/v1/audit?tail={tail}"), b"")?;
+            let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_string();
+            let rows = entries.iter().map(|entry| {
+                let what = entry["what"].as_array().into_iter().flatten().map(text);
+                let outcome = if entry["ok"] == true {
+                    "ok".into()
+                } else {
+                    text(&entry["error"])
+                };
+                let at = rfc3339(entry["at"].as_u64().unwrap_or(0));
+                [
+                    at,
+                    text(&entry["who"]),
+                    text(&entry["verb"]),
+                    what.collect::<Vec<_>>().join(" "),
+                    outcome,
+                ]
+            });
+            print_table(["WHEN", "WHO", "DID", "WHAT", "OUTCOME"], rows.collect());
         }
         Command::Node {
             command: NodeCommand::Status,

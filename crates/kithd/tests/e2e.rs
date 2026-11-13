@@ -1578,3 +1578,141 @@ fn source_syncs_git_and_oci() {
     wait_for("what the source applied to go", || colour("a").is_none());
     assert!(there());
 }
+
+/// An Identity with a certificate does over TLS what its Roles allow, and the audit
+/// log says who did what. (Loopback and curl are all this needs.)
+#[test]
+fn rbac_is_enforced_and_audited() {
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--name", "alpha", "--listen", listen]));
+    let daemon = Daemon::start_with("rbac", args);
+    // As whoever holds the certificate in `dir`: the status and the reply.
+    let call = |dir: &str, method: &str, path: &str, body: &str| {
+        let file = |name: &str| daemon.dir.join(dir).join(name);
+        let mut curl = Command::new("curl");
+        curl.args(["-s", "--max-time", "10", "-w", "\n%{http_code}", "-X", method])
+            .arg("--cacert")
+            .arg(file("ca.crt"))
+            .args(["--resolve", &format!("kith:{port}:127.0.0.1")]);
+        if dir != "nobody" {
+            curl.arg("--cert").arg(file("alice.crt"));
+            curl.arg("--key").arg(file("alice.key"));
+        }
+        if !body.is_empty() {
+            curl.args(["-H", "Content-Type: application/json", "-d", body]);
+        }
+        let out = curl.arg(format!("https://kith:{port}{path}")).output().unwrap();
+        let out = String::from_utf8(out.stdout).unwrap();
+        let (reply, status) = out.rsplit_once('\n').unwrap_or_default();
+        let reply = serde_json::from_str(reply).unwrap_or(serde_json::Value::Null);
+        (status.parse::<u16>().unwrap_or(0), reply)
+    };
+    for dir in ["first", "second", "nobody"] {
+        std::fs::create_dir_all(daemon.dir.join(dir)).unwrap();
+    }
+    let said = daemon.ok(&["identity", "cert", "alice", "--out", "first"]);
+    assert!(said.contains("nothing, until a RoleBinding names it"), "{said}");
+    std::fs::copy(daemon.dir.join("first/ca.crt"), daemon.dir.join("nobody/ca.crt")).unwrap();
+    wait_for("the TLS port to answer", || {
+        call("nobody", "GET", "/v1/ca", "").0 == 200
+    });
+    use std::os::unix::fs::PermissionsExt;
+    let key = std::fs::metadata(daemon.dir.join("first/alice.key")).unwrap();
+    assert_eq!(key.permissions().mode() & 0o777, 0o600);
+
+    // No certificate: nobody. A certificate and no Role: known, and allowed nothing.
+    assert_eq!(call("nobody", "GET", "/v1/resources", "").0, 401);
+    let (status, reply) = call("first", "GET", "/v1/resources", "");
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(
+        reply["error"],
+        "alice may not list anything: no Role bound to it allows that"
+    );
+
+    let map = |namespace: &str, name: &str, value: &str| {
+        serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+            "metadata": { "name": name, "namespace": namespace }, "spec": { "data": { "k": value } },
+        })
+    };
+    let admin = serde_json::json!([
+        { "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": "web-editor" }, "spec": { "rules": [
+            { "kinds": ["ConfigMap"], "verbs": ["get", "list", "apply"], "namespaces": ["web"] },
+        ] } },
+        { "apiVersion": "kith.dev/v1", "kind": "RoleBinding", "metadata": { "name": "alice-web" },
+          "spec": { "role": "web-editor", "subjects": ["alice"] } },
+        map("web", "site", "one"),
+        map("default", "other", "one"),
+    ]);
+    // (A JSON list is YAML too, but `kith apply` takes documents: one each.)
+    let documents: Vec<String> = admin.as_array().unwrap().iter().map(|r| r.to_string()).collect();
+    daemon.apply(&documents.join("\n---\n"));
+
+    // She lists what she may see, and gets the same; the rest is refused with the reason.
+    let (status, reply) = call("first", "GET", "/v1/resources", "");
+    let keys = |reply: &serde_json::Value| -> Vec<String> {
+        let all = reply.as_array().into_iter().flatten();
+        let key = |r: &serde_json::Value| {
+            let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+            format!("{}/{}", text(&r["metadata"]["namespace"]), text(&r["metadata"]["name"]))
+        };
+        all.map(key).collect()
+    };
+    assert_eq!((status, keys(&reply)), (200, vec!["web/site".to_string()]), "{reply}");
+    assert_eq!(call("first", "GET", "/v1/resources/ConfigMap/web/site", "").0, 200);
+    let (status, reply) = call("first", "GET", "/v1/resources/ConfigMap/default/other", "");
+    assert_eq!(status, 403);
+    assert_eq!(
+        reply["error"],
+        "alice may not get ConfigMap in namespace default: no Role bound to it allows that"
+    );
+    assert_eq!(call("first", "GET", "/v1/resources?kind=Role", "").0, 403);
+    assert_eq!(call("first", "GET", "/v1/watch", "").0, 403);
+    assert_eq!(call("first", "GET", "/v1/audit", "").0, 403);
+    assert_eq!(call("first", "DELETE", "/v1/resources/ConfigMap/web/site", "").0, 403);
+    // What is the nodes' own is not hers, whatever a Role says.
+    assert_eq!(call("first", "POST", "/v1/ping", "{}").0, 403);
+
+    // She applies where she may; one resource she may not refuses the whole body.
+    let body = serde_json::json!([map("web", "site", "two")]);
+    let (status, reply) = call("first", "POST", "/v1/apply", &body.to_string());
+    assert_eq!(status, 200, "{reply}");
+    let both = serde_json::json!([map("web", "site", "three"), map("default", "other", "three")]);
+    assert_eq!(call("first", "POST", "/v1/apply", &both.to_string()).0, 403);
+    let grant = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "RoleBinding", "metadata": { "name": "mine" },
+        "spec": { "role": "web-editor", "subjects": ["alice"] } }]);
+    assert_eq!(call("first", "POST", "/v1/apply", &grant.to_string()).0, 403);
+    let site = daemon.ok(&["get", "configmap/site", "-n", "web", "-o", "json"]);
+    let site: serde_json::Value = serde_json::from_str(&site).unwrap();
+    assert_eq!(site["spec"]["data"]["k"], "two");
+
+    // The audit log: her change, her refusals, and the admin's own.
+    let audit = daemon.ok(&["audit"]);
+    let line = |who: &str, did: &str, what: &str, outcome: &str| {
+        let found = audit.lines().any(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            words.get(1..3) == Some(&[who, did]) && line.contains(what) && line.contains(outcome)
+        });
+        assert!(found, "no `{who} {did} {what} {outcome}` in:\n{audit}");
+    };
+    line("alice", "apply", "ConfigMap/web/site", "ok");
+    line(
+        "alice",
+        "apply",
+        "ConfigMap in namespace default",
+        "alice may not apply ConfigMap",
+    );
+    line("alice", "delete", "ConfigMap in namespace web", "alice may not delete");
+    line("alice", "apply", "RoleBinding", "alice may not apply RoleBinding");
+    line("local", "socket", "Identity/alice", "ok");
+    assert!(audit.contains("Role/web-editor"), "{audit}");
+
+    // A new certificate ends the old one's access; deleting the Identity ends it all.
+    daemon.ok(&["identity", "cert", "alice", "--out", "second"]);
+    let (status, reply) = call("first", "GET", "/v1/resources", "");
+    assert_eq!(status, 401, "{reply}");
+    assert_eq!(call("second", "GET", "/v1/resources/ConfigMap/web/site", "").0, 200);
+    daemon.ok(&["delete", "identity/alice"]);
+    assert_eq!(call("second", "GET", "/v1/resources/ConfigMap/web/site", "").0, 401);
+}

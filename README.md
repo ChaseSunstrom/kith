@@ -524,6 +524,79 @@ spec: { map: dust, players: 8 }
 Not yet: several versions of a kind side by side, a schema for `status`,
 rules beyond the schema subset.
 
+## Who may do what
+
+On a node, whoever can open kithd's socket is the admin: `kith` there may do
+everything. From anywhere else, a person or a program calls a node's TLS port
+(`--listen`) as an **Identity**, with a certificate from the cluster's CA,
+and may do what the **Roles** bound to it allow. Nothing, to begin with.
+
+```sh
+kith identity cert alice --out ~/alice    # on the node the cluster was started on
+```
+
+writes `alice.crt`, `alice.key` and `ca.crt`, and makes `Identity/alice` if it
+is not there. Then say what she may do:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Role
+metadata: { name: web-editor }
+spec:
+  rules:
+    - kinds: [Workload, Service, ConfigMap]   # or ['*']
+      verbs: [get, list, watch, apply, delete]
+      namespaces: [web]                        # left out: everywhere
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: { name: alice-web }
+spec:
+  role: web-editor
+  subjects: [alice]        # Identities by name, or `group:ops` for spec.groups
+```
+
+```sh
+curl --cacert ca.crt --cert alice.crt --key alice.key \
+     --resolve kith:7443:10.0.0.7 https://kith:7443/v1/resources?kind=Workload
+```
+
+(Every node's certificate is good for the name `kith`. `kith` itself only
+talks to the local socket so far.)
+
+- What is not allowed is refused with 403 and the reason. `list` and `watch`
+  show what the caller may see and no more. An apply is all or nothing: one
+  resource it may not apply refuses the whole body.
+- `get` covers a resource, its history and its output (`/v1/logs`); `apply`
+  covers rollback; pushing to or pulling from a registry through kithd takes
+  `apply` on `Package` (kithd then calls whatever registry is named: grant
+  it to those you would let do that).
+- A rule that names namespaces says nothing of kinds that are in none (Node,
+  Role, KindDefinition…): those take a rule without `namespaces`.
+- The certificate stands for the Identity while the Identity's `publicKey` is
+  the certificate's key. `kith identity cert` again gives a new key and ends
+  the old certificate's access; `kith delete identity/alice` ends it all.
+- Grant with care: `apply` on Role, RoleBinding or Identity is the power to
+  grant oneself anything, and whoever may apply a Workload runs programs on
+  your nodes. A Release or Source acts for the cluster, not for whoever
+  applied it.
+
+Every change made through a node, and every refusal, is one line in that
+node's audit log (`audit.log` in its state directory, 4 MB and the 4 MB
+before): when, who, what, and how it went. Refusals past sixty a minute are
+counted rather than written. `kith audit` shows the last of it,
+as does `GET /v1/audit` for an Identity with `get` on `Audit`.
+
+```
+WHEN                  WHO           DID     WHAT                            OUTCOME
+2026-11-12T10:02:11Z  local socket  apply   Role/web-editor                 ok
+2026-11-12T10:03:40Z  alice         apply   Workload/web/site               ok
+2026-11-12T10:03:55Z  alice         delete  Node                            alice may not delete Node: no Role bound to it allows that
+```
+
+Not yet: `kith` over TLS, logging in through an identity provider (OIDC),
+certificates that expire before ten years, one audit log for the cluster.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):
