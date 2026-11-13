@@ -271,7 +271,8 @@ impl Proxy {
             let table = self.table.lock().expect("nothing panics holding the table");
             table.get(&key).cloned().unwrap_or_default()
         };
-        let first = self.turns.next(key);
+        // (No turn is taken, or kept, for what has nothing behind it.)
+        let first = if backends.is_empty() { 0 } else { self.turns.next(key) };
         for at in 0..backends.len() {
             if let Ok(mut backend) = self.reach(&backends[(first + at) % backends.len()]).await {
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;

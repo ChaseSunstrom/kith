@@ -224,7 +224,7 @@ kith node status                                   # who leads the store, who vo
   Two Services with one host: the first by key has it, and the other's
   status says `expose: refused` and why. Each port takes 1024 connections at
   a time (more are hung up on); one with no byte either way for 5 minutes on
-  443, or 30 seconds on 80, is closed.
+  443 is closed, and one on 80 after 30 seconds whatever it does.
 
 Not yet: the nodes still talk to each other at their plain addresses, not
 over the mesh, workloads have no addresses on it, and two nodes that

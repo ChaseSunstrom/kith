@@ -45,11 +45,12 @@ const ACCOUNT: &str = "Secret/kith-system/acme-account";
 /// A host is asked a certificate for once in this many seconds at most, so that a setup
 /// that cannot work does not use up what the authority allows.
 const BETWEEN_ORDERS: u64 = 3600;
-/// How many connections from outside at a time; the ones over it wait.
+/// How many connections from outside at a time on each port; one over it is hung up on.
 const CONNECTIONS: usize = 1024;
 /// A connection on port 443 with no byte either way for this long is closed.
 const IDLE: Duration = Duration::from_secs(300);
-/// The same on port 80, where a request is small.
+/// On port 80, where a request is small, this is all the time a connection gets,
+/// bytes or no bytes: one that drips a byte now and then does not keep its place.
 const IDLE_PLAIN: Duration = Duration::from_secs(30);
 
 /// A host that is exposed: its Service, and where on the mesh that answers.
@@ -222,6 +223,8 @@ struct Idle<T> {
     inner: T,
     timer: Pin<Box<Sleep>>,
     idle: Duration,
+    /// Do bytes moved start the time over?
+    renews: bool,
     _room: Option<OwnedSemaphorePermit>,
 }
 
@@ -232,14 +235,24 @@ impl<T> Idle<T> {
             inner,
             timer,
             idle,
+            renews: true,
             _room: room,
+        }
+    }
+
+    /// The same, but `life` is all it gets, idle or not.
+    fn lasting(inner: T, life: Duration, room: Option<OwnedSemaphorePermit>) -> Self {
+        Idle {
+            renews: false,
+            ..Idle::new(inner, life, room)
         }
     }
 
     /// Bytes moved start the time over; a poll that has to wait asks the time.
     fn watch<R>(&mut self, cx: &mut Context<'_>, polled: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
         match polled {
-            Poll::Ready(_) => self.timer.as_mut().reset(Instant::now() + self.idle),
+            Poll::Ready(_) if self.renews => self.timer.as_mut().reset(Instant::now() + self.idle),
+            Poll::Ready(_) => {}
             Poll::Pending if self.timer.as_mut().poll(cx).is_ready() => {
                 return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
             }
@@ -309,7 +322,7 @@ impl axum::serve::Listener for Capped {
         loop {
             let (stream, from) = self.0.accept().await;
             if let Ok(turn) = self.1.clone().try_acquire_owned() {
-                return (Idle::new(stream, IDLE_PLAIN, Some(turn)), from);
+                return (Idle::lasting(stream, IDLE_PLAIN, Some(turn)), from);
             }
         }
     }
@@ -341,7 +354,9 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
             let to = host.and_then(|host| Some(web.hosts.lock().ok()?.get(&host)?.to));
             let Some(to) = to else { return };
             let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(to));
-            if let Ok(Ok(mut service)) = reached.await {
+            if let Ok(Ok(service)) = reached.await {
+                // (A Service that stops taking bytes does not hold the place either.)
+                let mut service = Idle::new(service, IDLE, None);
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut service).await;
             }
         });
@@ -666,21 +681,31 @@ mod tests {
     async fn an_idle_connection_is_cut_and_one_that_moves_bytes_is_not() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (ours, mut theirs) = tokio::io::duplex(64);
-        let (mut read, mut write) = tokio::io::split(Idle::new(ours, Duration::from_millis(400), None));
+        let (mut read, mut write) = tokio::io::split(Idle::new(ours, Duration::from_secs(2), None));
         let reader = tokio::spawn(async move { read.read_u8().await });
         // Bytes written to the client keep it open past the idle time...
         for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             write.write_all(b"x").await.unwrap();
             assert!(!reader.is_finished());
         }
         // ...and then nothing for the time cuts it.
-        let cut = tokio::time::timeout(Duration::from_secs(5), reader)
+        let cut = tokio::time::timeout(Duration::from_secs(10), reader)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(theirs.read_u8().await.unwrap(), b'x');
+
+        // On port 80 bytes buy no time.
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let (mut read, mut write) = tokio::io::split(Idle::lasting(ours, Duration::from_millis(300), None));
+        let reader = tokio::spawn(async move { read.read_u8().await });
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = write.write_all(b"x").await;
+        }
+        assert_eq!(reader.await.unwrap().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
