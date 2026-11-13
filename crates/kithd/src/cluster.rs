@@ -240,7 +240,11 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     let ping = ping.layer(DefaultBodyLimit::max(64 << 10)).with_state(shared.clone());
     let callers = axum::middleware::from_fn_with_state(shared.clone(), crate::access::caller);
     let api = api::router(shared.clone()).layer(callers);
-    let members = crate::raft::router(shared).merge(ping);
+    // (The second hop of `kith run`: the caller was checked on the first node.)
+    let hop = Router::new()
+        .route("/v1/run-hop", post(api::run::hop))
+        .with_state(shared.clone());
+    let members = crate::raft::router(shared).merge(ping).merge(hop);
     open.merge(crate::ui::pages())
         .merge(api)
         .merge(members.layer(axum::middleware::from_fn(members_only)))

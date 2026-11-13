@@ -11,6 +11,7 @@
 //!                                                -> {data, next, more}
 //! GET    /v1/watch[?after=G&kind=Kind&wait=S]    -> {generation, resources}
 //! GET    /v1/audit[?tail=LINES]                  -> [{at, who, verb, what, ok, error}]
+//! POST   /v1/run {on, via?, argv, namespace?}    -> 101, then a byte tunnel (see `run.rs`)
 //! ```
 //! Every handler takes the [`Caller`] and asks what it may do (`access.rs`): an
 //! Identity gets 403 with the reason, and lists only what it may see. Changes, and
@@ -28,6 +29,8 @@
 //! otherwise it waits up to `wait` seconds (default and cap 25) for a change
 //! and replies with the current resources either way: compare, then ask again
 //! with the new generation. Without `after` it replies at once.
+
+pub(crate) mod run;
 
 use crate::Shared;
 use crate::access::{self, Caller, Certificate, Grants};
@@ -56,6 +59,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))
+        .route("/v1/run", post(run::run))
         .route("/v1/tokens", post(crate::cluster::token))
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/seats/{name}/activity", post(crate::seats::activity))

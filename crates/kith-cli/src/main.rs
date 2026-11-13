@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod import;
+mod remote;
 mod ui;
 
 #[derive(Parser)]
@@ -113,6 +114,18 @@ enum Command {
         /// Keep printing as output arrives, until the unit is done
         #[arg(short, long)]
         follow: bool,
+    },
+    /// Run an app on a node and show its window here, through waypipe (installed on both ends)
+    Run {
+        /// The node's name, or labels (KEY=VALUE[,KEY=VALUE]) for the first ready node that has them
+        #[arg(long, value_name = "NODE|SELECTOR")]
+        on: String,
+        /// The program that carries the window [default: waypipe]
+        #[arg(long, value_name = "PROGRAM")]
+        via: Option<String>,
+        /// The app and its arguments, as written after `--`
+        #[arg(last = true, required = true, value_name = "APP")]
+        argv: Vec<String>,
     },
     /// Print the JSON Schema of a kind, or list the kinds
     Schema { kind: Option<String> },
@@ -684,6 +697,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let key = target.key(&backend)?;
             backend()?.delete(&key)?;
             println!("{key} deleted");
+        }
+        Command::Run { on, via, argv } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("remote apps go through kithd: leave out --store");
+            };
+            return remote::run(&kithd, &on, via.as_deref(), &argv);
         }
         Command::Logs {
             target,
