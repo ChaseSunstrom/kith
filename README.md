@@ -477,7 +477,10 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   Release's. A resource that names no namespace goes in the Source's. A
   Source applies only into its own namespace; one in `kith-system` applies
   anywhere and any kind (it is the cluster's own). It does not take over what
-  is there and not its own.
+  is there and not its own; of two Sources that name one resource the first
+  by name gets it and the other says `error`. Sources are fetched several at
+  once, and one that keeps failing is fetched less and less often (its
+  interval doubled each time, to an hour).
 - `status.state` is `synced` (at `revision`), `pending` (`pending.revision`
   waits for `kith source approve`, with what it would change) or `error`
   (with `message`; what was applied stays). When the source moves on, a
@@ -488,7 +491,8 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
 - git is the node's `git` program (it must be installed), over `https://`
   or `ssh://` only, with no credentials but what ssh has; nothing is checked
   out, so links in a repository are skipped (`status.skipped`), and a
-  source is 2000 files and 4 MB at most.
+  source is 2000 files and 4 MB at most. git is run by `sh` (under `ulimit -f`)
+  and writes no file over 256 MB; a repository that takes more is dropped.
 - Only a Source in `kith-system` is fetched over `ssh://` (it is the node's
   own keys that open the door) or from this node and its own networks
   (loopback, private, link-local and shared addresses, by whatever name).
