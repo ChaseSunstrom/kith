@@ -44,6 +44,31 @@ fn signed(name: &str, version: &str, blob: &[u8]) -> Vec<u8> {
     format!("kith package v1\n{name}\n{version}\n{}\n", hex(digest.as_ref())).into_bytes()
 }
 
+/// Are `files` few and small enough, and every path one inside a directory? (Paths come
+/// from registries too, and are written to disk by `package pull`.)
+pub fn plain(files: &BTreeMap<String, String>) -> Fallible<()> {
+    let (most, bytes) = (crate::FILES_LIMIT, crate::PACKAGE_LIMIT);
+    if files.len() > most || files.values().map(String::len).sum::<usize>() > bytes {
+        return Err(format!("more than {most} files, or more than {bytes} bytes in them"));
+    }
+    let plain = |path: &str| {
+        let part = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['\\', '\0']);
+        path.split('/').all(part)
+    };
+    match files.keys().find(|path| !plain(path)) {
+        Some(path) => Err(format!("{path:?}: not a path inside a package")),
+        None => Ok(()),
+    }
+}
+
+/// The files in a blob that need not be a package's (a Source's artifact), checked
+/// the same way.
+pub fn files(blob: &[u8]) -> Fallible<BTreeMap<String, String>> {
+    let files: BTreeMap<String, String> =
+        serde_json::from_slice(blob).map_err(|e| format!("not files by path: {e}"))?;
+    plain(&files).map(|()| files)
+}
+
 impl Package {
     /// The package as one blob: the same bytes for the same files.
     pub fn blob(&self) -> Vec<u8> {

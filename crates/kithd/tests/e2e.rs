@@ -1157,29 +1157,38 @@ fn release_installs_a_package() {
     assert!(there("Package/maps-1.0.0"));
 }
 
-/// Packages in a registry (a fake one, here): signed, pushed, pulled and checked through
-/// the CLI; and a Release that names a Repository gets the newest version its range
-/// allows, checked against the Repository's key, and follows newer ones.
-#[test]
-fn repository_supplies_releases() {
-    let daemon = Daemon::start_with("repository", &["--repository-poll", "1"]);
+/// Stops a helper process when the test is over.
+struct Stop(Child);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A fake OCI registry on this machine: it, and its port.
+fn registry(dir: &Path) -> (Stop, u16) {
     let port = free_port();
-    let ready = daemon.dir.join("registry.ready");
+    let ready = dir.join("registry.ready");
     let registry = Command::new("python3")
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_registry.py"))
         .arg(port.to_string())
         .arg(&ready)
         .spawn()
         .unwrap();
-    struct Stop(Child);
-    impl Drop for Stop {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _registry = Stop(registry);
+    let registry = Stop(registry);
     wait_for("the registry to listen", || ready.exists());
+    (registry, port)
+}
+
+/// Packages in a registry (a fake one, here): signed, pushed, pulled and checked through
+/// the CLI; and a Release that names a Repository gets the newest version its range
+/// allows, checked against the Repository's key, and follows newer ones.
+#[test]
+fn repository_supplies_releases() {
+    let daemon = Daemon::start_with("repository", &["--repository-poll", "1"]);
+    let (_registry, port) = registry(&daemon.dir);
     let url = format!("oci://127.0.0.1:{port}/packages");
 
     let package = |version: &str, colour: &str| {
@@ -1348,4 +1357,154 @@ fn repository_supplies_releases() {
     // old one is no longer its, and nothing in the registry is signed with the new one.
     daemon.apply(&format!("apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: ours }}\nspec: {{ url: '{url}', publicKey: {} }}\n", other.trim()));
     wait_for("the newest signed with the new key to be fetched", || on("1.4.0"));
+}
+
+/// A Source: a commit to a git repository changes what is in the store (applied,
+/// pruned, put back when someone changes it), a manual one waits to be approved, and
+/// an OCI artifact syncs the same way.
+#[test]
+fn source_syncs_git_and_oci() {
+    let daemon = Daemon::start_with("source", &["--local-sources"]);
+    let repo = daemon.dir.join("repo");
+    std::fs::create_dir_all(repo.join("conf")).unwrap();
+    let git = |args: &[&str]| {
+        let ran = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.org",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    };
+    let map = |name: &str, colour: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ colour: {colour} }} }}\n"
+        )
+    };
+    let commit = |files: &[(&str, Option<String>)]| {
+        for (path, text) in files {
+            match text {
+                Some(text) => std::fs::write(repo.join(path), text).unwrap(),
+                None => std::fs::remove_file(repo.join(path)).unwrap(),
+            }
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "change"]);
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    // (Outside the Source's path, and a link out of the repository: neither is read.)
+    std::fs::write(repo.join("elsewhere.yaml"), map("elsewhere", "red")).unwrap();
+    std::os::unix::fs::symlink("/etc/hostname", repo.join("conf/link.yaml")).unwrap();
+    commit(&[("conf/a.yaml", Some(map("a", "red")))]);
+
+    let source = |more: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: repo }}\nspec:\n  git: {{ url: 'file://{}', rev: main }}\n  path: conf\n  intervalSeconds: 5\n  prune: true\n{more}",
+            repo.display()
+        )
+    };
+    let colour = |name: &str| {
+        let (code, out, _) = daemon.kith(&["get", &format!("ConfigMap/{name}"), "-o", "json"]);
+        (code == 0).then(|| serde_json::from_str::<serde_json::Value>(&out).unwrap()["spec"]["data"]["colour"].clone())
+    };
+    daemon.apply(&source(""));
+    wait_for("the source to be applied", || colour("a") == Some("red".into()));
+    let status = daemon.status("Source/repo");
+    assert_eq!(status["state"], "synced");
+    assert!(
+        status["skipped"][0].as_str().unwrap().contains("conf/link.yaml"),
+        "{status}"
+    );
+    assert_eq!(colour("elsewhere"), None);
+
+    // A commit: one map changes, another comes; the next: one goes.
+    commit(&[
+        ("conf/a.yaml", Some(map("a", "blue"))),
+        ("conf/b.yaml", Some(map("b", "red"))),
+    ]);
+    wait_for("the commit to be applied", || {
+        colour("a") == Some("blue".into()) && colour("b").is_some()
+    });
+    commit(&[("conf/b.yaml", None)]);
+    wait_for("what the source dropped to go", || colour("b").is_none());
+
+    // Someone applies over what the source says: put back, and said.
+    daemon.apply(&map("a", "pink"));
+    wait_for("the map to be put back", || colour("a") == Some("blue".into()));
+    wait_for("the drift to be said", || {
+        daemon.status("Source/repo")["drift"][0] == "ConfigMap/default/a"
+    });
+
+    // Manual approval: a commit waits, and is applied once approved.
+    daemon.apply(&source("  approval: manual\n"));
+    let (code, _, err) = daemon.kith(&["source", "approve", "repo"]);
+    assert!(code == 2 && err.contains("nothing waiting"), "{err}");
+    commit(&[("conf/a.yaml", Some(map("a", "green")))]);
+    wait_for("the commit to wait", || {
+        daemon.status("Source/repo")["state"] == "pending"
+    });
+    assert_eq!(
+        daemon.status("Source/repo")["pending"]["changes"][0],
+        "ConfigMap/default/a"
+    );
+    assert_eq!(colour("a"), Some("blue".into()));
+    assert!(daemon.ok(&["source", "approve", "repo"]).contains("approved"));
+    wait_for("the approved commit to be applied", || {
+        colour("a") == Some("green".into())
+    });
+
+    // A git URL that is no repository over the network is refused when not told otherwise
+    // (here it is told otherwise: what is refused is a transport that runs a program).
+    daemon.apply(
+        &source("")
+            .replace("name: repo", "name: bad")
+            .replace("file://", "ext::sh -c id "),
+    );
+    wait_for("the bad URL to be refused", || {
+        daemon.status("Source/bad")["message"]
+            .to_string()
+            .contains("a git URL is https:// or ssh://")
+    });
+
+    // The same from a registry.
+    let (_registry, port) = registry(&daemon.dir);
+    let to = format!("oci://127.0.0.1:{port}/sources/conf:v1");
+    std::fs::remove_file(repo.join("conf/link.yaml")).unwrap();
+    std::fs::write(repo.join("conf/o.yaml"), map("from-oci", "red")).unwrap();
+    std::fs::remove_file(repo.join("conf/a.yaml")).unwrap();
+    assert!(
+        daemon
+            .ok(&["source", "push", "repo/conf", "--to", &to])
+            .contains("pushed (1 files)")
+    );
+    daemon.apply(&format!("apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: artifact, namespace: kith-system }}\nspec: {{ oci: '{to}', intervalSeconds: 5 }}\n"));
+    let there = || daemon.kith(&["get", "ConfigMap/from-oci", "-n", "kith-system"]).0 == 0;
+    wait_for("the artifact to be applied", there);
+    // (Only the cluster's own Source is fetched from this very machine.)
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1\nkind: Source\nmetadata: {{ name: inward }}\nspec: {{ oci: '{to}' }}\n"
+    ));
+    wait_for("a namespace's Source to be refused this machine", || {
+        daemon.status("Source/inward")["message"]
+            .to_string()
+            .contains("only a Source in kith-system")
+    });
+
+    // A Source gone takes what it applied with it.
+    daemon.ok(&["delete", "Source/repo"]);
+    wait_for("what the source applied to go", || colour("a").is_none());
+    assert!(there());
 }

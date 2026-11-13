@@ -342,14 +342,27 @@ struct Push {
     to: String,
     files: std::collections::BTreeMap<String, String>,
     signature: Option<String>,
+    /// Not a package but files for a Source to sync: the name and tag to push them as.
+    source: Option<(String, String)>,
 }
 
-/// Put a package in a registry, from here: kithd has what it takes to talk to one, and
-/// `kith` does not. The signature is made by whoever asks; no key comes here.
+/// Put a package (or a Source's files) in a registry, from here: kithd has what it
+/// takes to talk to one, and `kith` does not. The signature is made by whoever asks;
+/// no key comes here.
 async fn push(Json(asked): Json<Push>) -> Reply<String> {
     let invalid = |e| ApiError(Error::Invalid(e));
-    let package = kith_packages::Package::from_files(asked.files).map_err(invalid)?;
-    let pushed = crate::registry::push(&asked.to, &package, asked.signature).await;
+    let (name, version, blob) = match asked.source {
+        Some((name, tag)) => {
+            kith_packages::artifact::plain(&asked.files).map_err(invalid)?;
+            (name, tag, serde_json::to_vec(&asked.files).expect("text by text"))
+        }
+        None => {
+            let package = kith_packages::Package::from_files(asked.files).map_err(invalid)?;
+            let blob = package.blob();
+            (package.meta.name, package.meta.version, blob)
+        }
+    };
+    let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature).await;
     pushed.map(Json).map_err(|e| ApiError(Error::Io(e)))
 }
 

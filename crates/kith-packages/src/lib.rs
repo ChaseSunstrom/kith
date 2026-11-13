@@ -269,19 +269,7 @@ fn template_error(error: &minijinja::Error) -> String {
 impl Package {
     /// A package from its files, by path from its directory.
     pub fn from_files(mut files: BTreeMap<String, String>) -> Fallible<Package> {
-        if files.len() > FILES_LIMIT || files.values().map(String::len).sum::<usize>() > PACKAGE_LIMIT {
-            return Err(format!(
-                "more than {FILES_LIMIT} files, or more than {PACKAGE_LIMIT} bytes in them"
-            ));
-        }
-        // (Paths come from registries too, and are written to disk by `package pull`.)
-        let plain = |path: &str| {
-            let part = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['\\', '\0']);
-            path.split('/').all(part)
-        };
-        if let Some(path) = files.keys().find(|path| !plain(path)) {
-            return Err(format!("{path:?}: not a path inside a package"));
-        }
+        artifact::plain(&files)?;
         let all = files.clone();
         let meta = files.remove("package.yaml").ok_or("no package.yaml")?;
         let meta: Meta = kith_yaml::from_str(&meta).map_err(|e| e.render("package.yaml", &meta))?;

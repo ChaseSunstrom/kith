@@ -10,6 +10,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod import;
+
 #[derive(Parser)]
 #[command(
     name = "kith",
@@ -122,6 +124,33 @@ enum Command {
     Package {
         #[command(subcommand)]
         command: PackageCommand,
+    },
+    /// Sources: what a cluster keeps synced from git or a registry
+    Source {
+        #[command(subcommand)]
+        command: SourceCommand,
+    },
+    /// Translate Kubernetes manifests or a Helm chart into kith resources
+    Import {
+        #[command(subcommand)]
+        command: import::Import,
+    },
+}
+
+#[derive(Subcommand)]
+enum SourceCommand {
+    /// Let a Source with `approval: manual` apply the revision that waits in its status
+    Approve {
+        name: String,
+        #[arg(short, long)]
+        namespace: Option<String>,
+    },
+    /// Put a directory's YAML and JSON files in a registry, for a Source to sync (`oci:`)
+    Push {
+        dir: PathBuf,
+        /// Where: `oci://HOST/PATH/NAME[:TAG]`
+        #[arg(long, value_name = "URL")]
+        to: String,
     },
 }
 
@@ -435,6 +464,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
     };
     match cli.command {
+        Command::Import { command } => return import::run(command),
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });
@@ -758,6 +788,55 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let written = made.and_then(|mut made| writeln!(made, "{secret}"));
             written.or_else(|e| fail(format!("{}: {e}", file.display())))?;
             println!("{public}");
+        }
+        Command::Source {
+            command: SourceCommand::Approve { name, namespace },
+        } => {
+            let backend = backend()?;
+            let mut source = backend.get(&key(find_kind("Source")?, &name, namespace.as_deref()))?;
+            let pending = source
+                .status
+                .as_ref()
+                .and_then(|status| status["pending"]["revision"].as_str());
+            let Some(revision) = pending.map(str::to_string) else {
+                return fail(format!("{} has nothing waiting to be approved", source.key()));
+            };
+            source.spec["approve"] = serde_json::json!(revision);
+            (source.metadata.revision, source.status) = (None, None);
+            backend.apply(vec![source.validated().or_else(fail)?], false)?;
+            println!("{name}: revision {revision} approved");
+        }
+        Command::Source {
+            command: SourceCommand::Push { dir, to },
+        } => {
+            // (Files themselves, not links: nothing from elsewhere on this machine goes out.)
+            fn read(
+                dir: &std::path::Path,
+                under: &str,
+                files: &mut std::collections::BTreeMap<String, String>,
+            ) -> std::io::Result<()> {
+                for entry in std::fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let name = format!("{under}{}", entry.file_name().to_string_lossy());
+                    let kind = entry.file_type()?;
+                    if kind.is_dir() {
+                        read(&entry.path(), &format!("{name}/"), files)?;
+                    } else if kind.is_file() && [".yaml", ".yml", ".json"].iter().any(|suffix| name.ends_with(suffix)) {
+                        files.insert(name, std::fs::read_to_string(entry.path())?);
+                    }
+                }
+                Ok(())
+            }
+            let mut files = std::collections::BTreeMap::new();
+            read(&dir, "", &mut files).or_else(|e| fail(format!("{}: {e}", dir.display())))?;
+            let Some((url, name)) = to.rsplit_once('/') else {
+                return fail("--to is oci://HOST/PATH/NAME[:TAG]");
+            };
+            let (name, tag) = name.split_once(':').unwrap_or((name, "latest"));
+            let count = files.len();
+            let asked = serde_json::json!({ "to": url, "files": files, "source": [name, tag] });
+            let pushed: String = backend()?.registry("push", &asked)?;
+            println!("{pushed} pushed ({count} files)");
         }
         Command::Schema { kind: None } => {
             let rows = KINDS
