@@ -1,0 +1,24 @@
+# The Volume to give, in the release's namespace. Set it.
+volume: data
+# Nobody may write.
+readOnly: false
+# Whoever uses the share is this user on the volume's files (65534 is nobody: make the
+# volume's directory theirs, or name the user whose it is).
+uid: 65534
+gid: 65534
+# The Identities that may use it over SMB. Each one's password is under its name in the
+# Secret `passwords`. None: no SMB server runs.
+users: []
+passwords: ""
+# The image the SMB server runs from. kith ships none: name one you built or trust, with
+# Samba 4.15 or later and nss_wrapper in it (on Alpine: samba-server, samba-common-tools,
+# nss_wrapper).
+image: registry.example/nas/samba:1
+# What the server is promised on its node (CPUs, memory).
+reserve:
+  cpu: "1"
+  memory: 256Mi
+nfs:
+  # The IPv4 addresses and ranges that may mount it over NFS 4.2 from the volume's node
+  # (192.168.1.0/24). None: no NFS.
+  clients: []

@@ -552,6 +552,33 @@ spec! {
         pub secret: String,
     }
 
+    /// A Volume given to machines that are not nodes: over NFS by the volume's node, and
+    /// over SMB by the `nas` package's file server.
+    pub struct ShareSpec {
+        /// The Volume, in this namespace.
+        pub volume: String,
+        /// Nobody may write.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub read_only: Option<bool>,
+        /// Whoever uses the share is this user on the volume's files [default: 65534, nobody].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub uid: Option<u32>,
+        /// [default: 65534]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub gid: Option<u32>,
+        /// Serve it over NFS 4.2 from the volume's node.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub nfs: Option<ShareNfs>,
+        /// The Identities that may use it over SMB.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub users: Vec<String>,
+    }
+
+    pub struct ShareNfs {
+        /// Who may mount it: IPv4 addresses (`192.168.1.20`) or ranges (`192.168.1.0/24`).
+        pub clients: Vec<String>,
+    }
+
     pub struct VolumeClaimSpec {
         pub size: Quantity,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -898,6 +925,35 @@ impl Spec for VolumeSpec {
             Some(sync) if every(sync) < Some(10) => Err(format!("sync: `{sync}` is under 10s")),
             _ => Ok(()),
         }
+    }
+}
+
+/// An IPv4 address or range a Share's NFS clients are in, as (network, prefix length).
+pub fn share_client(text: &str) -> Option<(std::net::Ipv4Addr, u32)> {
+    let (address, length) = text.split_once('/').unwrap_or((text, "32"));
+    let plain = length.bytes().all(|b| b.is_ascii_digit());
+    let length = length.parse().ok().filter(|length| plain && *length <= 32)?;
+    Some((address.parse().ok()?, length))
+}
+
+impl Spec for ShareSpec {
+    fn check(&self) -> Result<(), String> {
+        let clients = self.nfs.as_ref().map(|nfs| nfs.clients.as_slice());
+        // (An Identity's name, and nothing a file server's own files would read as more.)
+        let plain =
+            |user: &&String| !user.is_empty() && user.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b));
+        if let Some(user) = self.users.iter().find(|user| !plain(user)) {
+            return Err(format!("users: `{user}` is not an Identity's name"));
+        }
+        for client in clients.unwrap_or_default() {
+            match share_client(client) {
+                None => return Err(format!("nfs.clients: `{client}` is not an IPv4 address or range")),
+                // (A range that is most of the internet is a slip, not a LAN.)
+                Some((_, length)) if length < 8 => return Err(format!("nfs.clients: `{client}` is wider than a /8")),
+                Some(_) => {}
+            }
+        }
+        Ok(())
     }
 }
 

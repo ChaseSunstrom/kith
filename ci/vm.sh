@@ -71,7 +71,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test share     instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
-                   other way round; and no NFS is answered from outside the mesh
+                   other way round; no NFS is answered from outside the mesh until a
+                   Share names this machine, which then makes a directory in the
+                   Share's volume and cannot write a read-only one
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -326,8 +328,48 @@ try:
 except OSError:
     sys.exit(0)
 EOF
+
+            # A Share names this machine (10.0.2.2 to the node, through its other card): it
+            # is no node and not on the mesh, and speaks NFS 4.2 to the first node itself.
+            probe() { python3 "$root/ci/nfs_probe.py" 127.0.0.1 "$@" | tr '\n' ' '; }
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Share","metadata":{"name":"mine"},"spec":{"volume":"on1","uid":0,"gid":0,"nfs":{"clients":["10.0.2.2"]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Share","metadata":{"name":"look"},"spec":{"volume":"data","readOnly":true,"nfs":{"clients":["10.0.2.0/24"]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Shares were not applied"
+            waited=0
+            until grep -aq 'kithd: serving 1 shared volume.*; 2 Share(s) to the addresses they name' "$work/n1.log"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the first node did not say it serves the Shares"
+                sleep 1
+            done
+            said=$(probe "$((port + 5))" /default/on1/own mkdir from-lan) || fail "the first node did not speak NFS to a machine its Share names"
+            [ "$said" = '0 0 ' ] || fail "a machine the Share names did not make a directory in its volume: NFS said $said"
+            # The directory is in the volume, for a container on that node: a key goes in it.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"lan"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/here/from-lan/key"],
+   "volumeMounts":[{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job lan was not applied"
+            until_job lan succeeded
+            said=$(probe "$((port + 5))" /default/data/all mkdir nope) || fail "the first node stopped speaking NFS"
+            [ "$said" = '0 30 ' ] || fail "a read-only Share was not read-only (30): NFS said $said"
+            said=$(probe "$((port + 5))" /default/on2) || fail "the first node stopped speaking NFS"
+            [ "$said" = '2 ' ] || fail "a Share's client saw something that is no Share's (2 is no such thing): NFS said $said"
+            # The second node has no Share: it still answers nothing outside the mesh.
+            ! python3 "$root/ci/nfs_probe.py" 127.0.0.1 "$((port + 6))" / >/dev/null 2>&1 || fail "the second node, with no Share, spoke NFS outside the mesh"
+            any GET /v1/resources >"$work/all.json" || fail "the resources could not be read"
+            python3 - "$work/all.json" <<'EOF' || fail "the Share mine does not say where it is"
+import json, sys
+
+found = json.load(open(sys.argv[1]))
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+status = next(r.get("status") for r in found if r["kind"] == "Share" and r["metadata"]["name"] == "mine")
+sys.exit(0 if status == {"node": "n1", "path": "/default/on1/own"} else 1)
+EOF
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else"
             exit 0
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "

@@ -1007,6 +1007,64 @@ spec: { node: n1, path: media, shared: true }
   up to two minutes; locks held when the volume's node restarts must be taken again within
   30 seconds; VMs (virtiofs) and machines that are not nodes cannot mount one.
 
+### Shares: a volume for machines that are not nodes
+
+A `Share` gives a Volume to the laptops, televisions and phones on your network:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Share
+metadata: { name: films }
+spec:
+  volume: media          # in this namespace
+  readOnly: false        # [false]
+  uid: 1000              # whoever uses the share is this user on the files [65534, nobody]
+  gid: 1000
+  nfs:
+    clients: [192.168.1.0/24, 192.168.2.7]   # who may mount it over NFS
+  users: [ada, grace]    # the Identities that may use it over SMB
+```
+
+- **NFS** is served by the volume's node itself, with the kernel server it already drives
+  for shared volumes: NFS 4.2 on port 2049 of the node's IPv4 addresses, to the addresses
+  `nfs.clients` names and nobody else. `kith get share films -o yaml` says the `node` and the
+  `path`; on a client, `mount -t nfs4 NODE:PATH /mnt`. Every client is the Share's `uid` and
+  `gid` on the files, whoever it says it is; a client sees its Shares' volumes and nothing
+  beside them. The cluster's own nodes are never a Share's clients, whatever range it
+  names: a container has its node's address, and mounts volumes the cluster's way. One
+  Share gives a volume over NFS (the first by name; a second says so in its `status`).
+- **SMB** is served by a Samba container that the `nas` package runs on the volume's node,
+  port 445:
+
+  ```sh
+  kith apply -f passwords.yaml    # a Secret with a password under each user's name
+  kith package render packages/nas --name films \
+      --set volume=media --set 'users=[ada,grace]' --set passwords=nas-passwords \
+      --set image=registry.example/nas/samba:1 | kith apply -f -
+  ```
+
+  The package makes the Share too (`--set 'nfs.clients=[192.168.1.0/24]'` for NFS beside
+  it, or alone with no `users`). kith ships no Samba image: name one you built or trust, with
+  Samba 4.15 or later and `nss_wrapper` in it (on Alpine: `samba-server`,
+  `samba-common-tools`, `nss_wrapper`).
+- The `status` of a Share says why it is given to nobody: no such Volume, an Identity in
+  `users` that does not exist, or nobody named. Whoever applies a Share (or rolls one
+  back) must be allowed to apply the Volume it gives; a Release or a Source that renders
+  one gives a Volume of its own namespace, as it may run a workload that mounts it.
+- `uid` is who writes: with the default, nobody (65534), make the volume's directory
+  theirs or writable by them first, or name the user whose files they are.
+- Not yet: NFS trusts an address to be who it says (no Kerberos), so name single addresses
+  or a network you trust; a range wider than a /8 is refused; IPv6 clients that are not
+  nodes are not served; once a node has served a Share over NFS it keeps listening on port
+  2049 of its IPv4 addresses until it restarts (answering nobody when no Share names them);
+  SMB users all write as the Share's one user; the SMB server listens on port 445 of every
+  address of its node, so a node runs one `nas` release; an NFS client that moves a file
+  between directories while another has it open may see that one's handle go stale; a
+  Volume in `kith-system` cannot be given;
+  the SMB server is not announced on the network (name the node in your file manager); and
+  **the Samba half has been rendered and its start script run against stand-ins, not run
+  with a real Samba here** (no image to run it from yet).
+
 ### Replicas
 
 A Volume can be kept on more than one node, and move when its node is lost:

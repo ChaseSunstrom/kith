@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["volume"],
+  "properties": {
+    "volume": { "type": "string", "minLength": 1 },
+    "readOnly": { "type": "boolean" },
+    "uid": { "type": "integer", "minimum": 0 },
+    "gid": { "type": "integer", "minimum": 0 },
+    "users": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "passwords": { "type": "string" },
+    "image": { "type": "string", "minLength": 1 },
+    "reserve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } }
+    },
+    "nfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "clients": { "type": "array", "items": { "type": "string", "minLength": 1 } } }
+    }
+  }
+}

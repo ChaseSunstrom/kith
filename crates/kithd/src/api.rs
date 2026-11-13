@@ -229,6 +229,34 @@ struct ApplyOptions {
     dry_run: bool,
 }
 
+/// What a resource reaches into besides itself, which whoever writes it must be allowed too.
+fn reach(shared: &Shared, caller: &Caller, resources: &[Resource]) -> Result<(), ApiError> {
+    let placed = |store: &Store| -> Vec<(String, Option<String>)> {
+        let placed = |resource: &Resource| (resource.kind.clone(), place(store, resource));
+        resources.iter().map(placed).collect()
+    };
+    let written = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        placed(&state.store)
+    };
+    reach_of(shared, caller, &written)
+}
+
+/// [`reach`], of resources known by kind and namespace alone (a revision gone back to).
+fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
+    let of = |kind: &str, into: &[&str]| -> Vec<(String, Option<String>)> {
+        let of = written.iter().filter(|(written, _)| written == kind);
+        of.flat_map(|(_, place)| into.iter().map(|kind| (kind.to_string(), place.clone())))
+            .collect()
+    };
+    // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
+    // writes one must be allowed to read both.
+    permit(shared, caller, Verb::Get, |_| of("Backup", &["Volume", "Secret"]))?;
+    // A Share gives a Volume's files, to read and to write, to whom it names: whoever
+    // writes one must be allowed to write the Volume.
+    permit(shared, caller, Verb::Apply, |_| of("Share", &["Volume"]))
+}
+
 /// What applying `resources` would do, if `caller` may: a dry run.
 pub(crate) async fn plan(
     shared: &Arc<Shared>,
@@ -239,13 +267,7 @@ pub(crate) async fn plan(
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(target).collect()
     })?;
-    // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
-    // writes one must be allowed to read both.
-    permit(shared, caller, Verb::Get, |store| {
-        let backups = resources.iter().filter(|resource| resource.kind == "Backup");
-        let read = |backup: &Resource| ["Volume", "Secret"].map(|kind| (kind.to_string(), place(store, backup)));
-        backups.flat_map(read).collect()
-    })?;
+    reach(shared, caller, &resources)?;
     // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
     let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
     let claimed = {
@@ -297,6 +319,7 @@ async fn apply(
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(target).collect()
     })?;
+    reach(&shared, &caller, &resources)?;
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
@@ -421,6 +444,7 @@ async fn rollback(
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
+    reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
     let what = vec![format!("{key} to revision {to}")];
     match change(&shared, &caller, "rollback", what, Command::Rollback { key, to, at }).await? {
@@ -585,6 +609,49 @@ mod tests {
     use super::*;
     use rustls::pki_types::pem::PemObject;
     use std::time::Duration;
+
+    /// Writing a Share or a Backup takes more than leave to write that kind: a Share gives
+    /// a Volume away (leave to write it), a Backup reads a Volume and a Secret.
+    #[tokio::test]
+    async fn a_share_or_a_backup_reaches_no_further_than_its_writer_may() {
+        let dir = std::env::temp_dir().join(format!("kithd-reach-{}", std::process::id()));
+        let shared = crate::replica(None, &dir).await.unwrap();
+        let roles = "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: sharer}
+spec:
+  rules:
+    - {kinds: [Share, Backup], verbs: [apply]}
+    - {kinds: [Volume], verbs: [get]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: bob-sharer}
+spec: {role: sharer, subjects: [bob]}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let one = |text: &str| -> Vec<Resource> {
+            let read = kith_api::Resource::from_source(text).unwrap();
+            read.into_iter().map(Result::unwrap).collect()
+        };
+        let share = one("apiVersion: kith.dev/v1\nkind: Share\nmetadata: {name: s}\nspec: {volume: v, users: [bob]}\n");
+        let backup = one("apiVersion: kith.dev/v1\nkind: Backup\nmetadata: {name: b}\nspec: {volume: v, every: 1d}\n");
+        let bob = Caller::Identity("bob".into());
+        assert!(reach(&shared, &bob, &share).is_err(), "bob may not write Volumes");
+        assert!(reach(&shared, &bob, &backup).is_err(), "bob may not read Secrets");
+        assert!(reach(&shared, &Caller::Admin, &share).is_ok());
+        assert!(reach(&shared, &Caller::Admin, &backup).is_ok());
+        // Going back to a revision of one is writing it.
+        assert!(reach_of(&shared, &bob, &[place_of("Share/default/s")]).is_err());
+        assert!(reach_of(&shared, &bob, &[place_of("ConfigMap/default/c")]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A watch ends (401) once its Identity is deleted or given another key while it waits,
     /// and what it ended for is written down.

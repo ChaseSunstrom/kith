@@ -24,7 +24,7 @@ pub const SYSTEM: &str = "kith-system";
 /// Where a volume's data is, as the Volume says: its namespace and name, its `spec.path`, and
 /// the node that is on. A node other than that one mounts it only if it is `shared`
 /// (`crate::share`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Dir {
     pub namespace: String,
     pub name: String,

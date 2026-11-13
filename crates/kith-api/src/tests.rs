@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 31);
+    assert_eq!(KINDS.len(), 32);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -740,4 +740,29 @@ fn a_volumes_replicas_are_at_least_itself_and_synced_no_more_often_than_every_te
             .unwrap_err()
             .contains("sync:")
     );
+}
+
+#[test]
+fn a_share_names_who_may_use_it_and_no_range_wider_than_a_slash_eight() {
+    let share = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Share\nmetadata: {{ name: films }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    share("{ volume: media, nfs: { clients: [192.168.1.20, 192.168.1.0/24] }, readOnly: true }").unwrap();
+    share("{ volume: media, users: [ada], uid: 1000, gid: 1000 }").unwrap();
+    for bad in ["a:b", "@wheel", "+staff", "a b", ""] {
+        let refused = share(&format!("{{ volume: media, users: ['{bad}'] }}"));
+        assert!(refused.unwrap_err().contains("not an Identity's name"), "{bad}");
+    }
+    // (Given to nobody yet: its status says so.)
+    share("{ volume: media }").unwrap();
+    for bad in ["0.0.0.0/0", "10.0.0.0/7"] {
+        let refused = share(&format!("{{ volume: media, nfs: {{ clients: [{bad}] }} }}"));
+        assert!(refused.unwrap_err().contains("wider than a /8"), "{bad}");
+    }
+    for bad in ["lan", "fd00::1", "10.0.0.1/33", "10.0.0.1/+8", "10.0.0/24"] {
+        let refused = share(&format!("{{ volume: media, nfs: {{ clients: ['{bad}'] }} }}"));
+        assert!(refused.unwrap_err().contains("not an IPv4 address or range"), "{bad}");
+    }
 }

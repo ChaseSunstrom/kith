@@ -1,0 +1,7 @@
+{{ name }} gives the volume {{ values.volume }} to machines that are not nodes.
+{%- if values.users %}
+SMB: \\NODE\{{ name }} on the node the volume is on, port 445, for {{ values.users | join(", ") }} (passwords: the Secret {{ values.passwords }}).
+{%- endif %}
+{%- if values.nfs.clients %}
+NFS 4.2: `kith get share {{ name }} -o yaml` says the node and the path; mount NODE:PATH from {{ values.nfs.clients | join(", ") }}.
+{%- endif %}

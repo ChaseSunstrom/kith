@@ -227,6 +227,7 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let mut claimed = crate::claims::writes(&state.store);
             claimed.extend(crate::volumes::writes(&state.store));
             claimed.extend(crate::seats::writes(&state.store));
+            claimed.extend(crate::share::writes(&state.store));
             // Where each replicated volume is now, and on which nodes its copies are.
             let lost = |name: &str| seen(name).1;
             let mut fields = fields;

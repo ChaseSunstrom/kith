@@ -1,0 +1,31 @@
+{%- if values.users %}
+# The SMB server: one container on the volume's node (its mount puts it there), on the
+# node's own addresses, port 445.
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: 1
+  template:
+    containers:
+      - name: smbd
+        image: {{ values.image | tojson }}
+        {%- set script %}{% include "templates/_serve.sh" %}{% endset %}
+        command: ["/bin/sh", "-c", {{ script | tojson }}]
+        resources: {{ values.reserve | tojson }}
+        volumeMounts:
+          - { volume: {{ values.volume | tojson }}, path: /share, readOnly: {{ values.readOnly | tojson }} }
+        env:
+          - { name: KITH_SHARE_NAME, value: {{ name | tojson }} }
+          - { name: KITH_SHARE_READ_ONLY, value: {{ "yes" if values.readOnly else "no" }} }
+          - { name: KITH_SHARE_UID, value: "{{ values.uid }}" }
+          - { name: KITH_SHARE_GID, value: "{{ values.gid }}" }
+          - { name: KITH_SMB_USERS, value: {{ values.users | join(" ") | tojson }} }
+          {%- for user in values.users %}
+          - name: KITH_SMB_PASSWORD_{{ loop.index }}
+            secret: { name: {{ values.passwords | tojson }}, key: {{ user | tojson }} }
+          {%- endfor %}
+{%- endif %}

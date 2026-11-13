@@ -23,10 +23,13 @@
 // the grace period after a restart are 30 seconds, with no record of clients kept across one.
 
 use crate::volumes::Dir;
+use kith_api::kinds::ShareSpec;
+use kith_api::store::Store;
 use nix::mount::{MntFlags, MsFlags};
-use std::collections::BTreeSet;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,8 +39,12 @@ use std::time::Duration;
 pub const PORT: u16 = 2049;
 /// The one client the kernel is told of: any node of the cluster.
 const CLIENT: &str = "kith";
+/// What the client of machines that are not nodes starts with: then the Shares that name it.
+const LAN: &str = "share:";
 /// How long the kernel may keep an answer, in seconds.
 const GOOD_FOR: u64 = 120;
+/// Who a Share's clients are on its files unless it says.
+const NOBODY: u32 = 65534;
 /// How often what is served is worked out again.
 const ROUND: Duration = Duration::from_secs(3);
 /// Says the kernel's server on this machine is the one kithd started (gone at a reboot, as it is).
@@ -46,6 +53,9 @@ const OURS: &str = "/run/kith-nfsd";
 // The kernel's export flags (include/uapi/linux/nfsd/export.h).
 const READONLY: u32 = 0x1;
 const ROOTSQUASH: u32 = 0x4;
+const ALLSQUASH: u32 = 0x8;
+/// From any port of the client: what is not Linux (macOS, Windows) mounts from a high one.
+const ANYPORT: u32 = 0x2;
 const NOSUBTREECHECK: u32 = 0x400;
 const FSID: u32 = 0x2000;
 const V4ROOT: u32 = 0x10000;
@@ -59,6 +69,32 @@ pub struct Table {
     pub served: BTreeSet<PathBuf>,
     /// The mesh addresses of the cluster's nodes.
     pub clients: BTreeSet<Ipv6Addr>,
+    /// The Shares (`NAMESPACE/NAME`) of volumes on this node that name NFS clients.
+    pub shares: BTreeMap<String, Lan>,
+    /// The IPv4 addresses of this node and of the cluster's other nodes: never a Share's
+    /// client, whatever range a Share names (a container has its node's address).
+    pub nodes: BTreeSet<Ipv4Addr>,
+}
+
+/// A Share's volume as this node serves it to machines that are not nodes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Lan {
+    pub dir: PathBuf,
+    /// IPv4 networks and their prefix lengths.
+    pub clients: Vec<(Ipv4Addr, u32)>,
+    pub read_only: bool,
+    /// Who every client is on the volume's files, whoever it says it is.
+    pub owner: (u32, u32),
+}
+
+impl Lan {
+    fn has(&self, address: Ipv4Addr) -> bool {
+        let within = |(net, length): &(Ipv4Addr, u32)| {
+            let shift = 32 - length.min(&32);
+            u32::from(*net).checked_shr(shift) == u32::from(address).checked_shr(shift)
+        };
+        self.clients.iter().any(within)
+    }
 }
 
 /// A field as the kernel writes and reads one: `\ooo` for a space, tab, newline or backslash.
@@ -105,25 +141,55 @@ impl Table {
         digest.as_ref()[..16].try_into().expect("a SHA-256 is 32 bytes")
     }
 
-    /// The directories strictly between the root and a served volume: shown, and nothing in them.
-    fn on_the_way(&self) -> BTreeSet<&Path> {
+    /// What `client` is served: every shared volume if it is the cluster's nodes, the volumes
+    /// of the Shares it is named for if it is `share:…`, nothing otherwise.
+    fn dirs(&self, client: &str) -> Vec<&Path> {
+        let shares = client.strip_prefix(LAN).into_iter().flat_map(|names| names.split(','));
+        let shares = shares.filter_map(|name| Some(self.shares.get(name)?.dir.as_path()));
+        let nodes = self.served.iter().map(PathBuf::as_path);
+        nodes.filter(|_| client == CLIENT).chain(shares).collect()
+    }
+
+    /// The directories strictly between the root and a volume served to `client`: shown, and
+    /// nothing in them.
+    fn on_the_way(&self, client: &str) -> BTreeSet<&Path> {
         let mut found = BTreeSet::new();
-        for dir in &self.served {
+        for dir in self.dirs(client) {
             let above = dir.ancestors().skip(1);
             found.extend(above.take_while(|up| *up != self.root && up.starts_with(&self.root)));
         }
         found
     }
 
-    /// `auth.unix.ip` asks `CLASS ADDRESS`: a node's mesh address is the client `kith`, and
-    /// anything else is nobody.
+    /// `auth.unix.ip` asks `CLASS ADDRESS`: a node's mesh address is the client `kith`, an
+    /// IPv4 address some Shares name is the client `share:` and those Shares, and anything
+    /// else is nobody.
     fn who(&self, asked: &str, until: u64) -> Option<String> {
         let (class, address) = asked.split_once(' ')?;
-        let node = class == "nfsd"
-            && address
-                .parse()
-                .is_ok_and(|address: Ipv6Addr| self.clients.contains(&address));
-        let client = if node { format!(" {CLIENT}") } else { String::new() };
+        let parsed = address.parse::<IpAddr>().ok().filter(|_| class == "nfsd");
+        let client = match parsed {
+            Some(IpAddr::V6(address)) if self.clients.contains(&address) => format!(" {CLIENT}"),
+            Some(address) => {
+                let address = match address {
+                    IpAddr::V4(address) => Some(address),
+                    IpAddr::V6(address) => address.to_ipv4_mapped(),
+                };
+                let address = address.filter(|address| !address.is_loopback() && !self.nodes.contains(address));
+                let named = |(_, lan): &(&String, &Lan)| address.is_some_and(|address| lan.has(address));
+                let names: Vec<&str> = self
+                    .shares
+                    .iter()
+                    .filter(named)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {LAN}{}", names.join(","))
+                }
+            }
+            None => String::new(),
+        };
         Some(format!("{class} {address} {until}{client}"))
     }
 
@@ -133,15 +199,26 @@ impl Table {
     fn export(&self, asked: &str, until: u64) -> Option<String> {
         let (client, quoted) = asked.split_once(' ')?;
         let path = PathBuf::from(unquote(quoted)?);
-        let way = READONLY | ROOTSQUASH | NOSUBTREECHECK | V4ROOT;
+        let any = if client.starts_with(LAN) { ANYPORT } else { 0 };
+        let way = READONLY | ROOTSQUASH | NOSUBTREECHECK | V4ROOT | any;
         let id = || format!("uuid \\x{}", crate::pki::hex(&self.id(&path)));
-        let served = if client != CLIENT {
+        let dirs = self.dirs(client);
+        // A Share's volume: every client is the Share's one user, and (the kernel checking
+        // that a file handle names something under the volume) reaches nothing beside it.
+        let shares = client.strip_prefix(LAN).into_iter().flat_map(|names| names.split(','));
+        let lan = shares
+            .filter_map(|name| self.shares.get(name))
+            .find(|lan| lan.dir == path);
+        let served = if dirs.is_empty() {
             String::new()
         } else if path == self.root {
             format!(" {} 65534 65534 0", way | FSID)
-        } else if self.served.contains(&path) {
+        } else if let Some(lan) = lan {
+            let flags = ALLSQUASH | ANYPORT | if lan.read_only { READONLY } else { 0 };
+            format!(" {flags} {} {} 0 {}", lan.owner.0, lan.owner.1, id())
+        } else if dirs.contains(&path.as_path()) {
             format!(" {NOSUBTREECHECK} 65534 65534 0 {}", id())
-        } else if self.on_the_way().contains(path.as_path()) {
+        } else if self.on_the_way(client).contains(path.as_path()) {
             format!(" {way} 65534 65534 0 {}", id())
         } else {
             String::new()
@@ -157,11 +234,11 @@ impl Table {
         let bytes = unhex(key)?;
         let known = || {
             let id = bytes.get(bytes.len().checked_sub(16)?..)?;
-            let all = self.served.iter().map(PathBuf::as_path).chain(self.on_the_way());
+            let all = self.dirs(client).into_iter().chain(self.on_the_way(client));
             all.into_iter().find(|path| self.id(path) == id)
         };
         let path = match kind {
-            _ if client != CLIENT => None,
+            _ if self.dirs(client).is_empty() => None,
             "1" if bytes == [0; 4] => Some(self.root.as_path()),
             "6" | "7" => known(),
             _ => None,
@@ -303,16 +380,95 @@ fn start(address: Ipv6Addr) -> Result<(), String> {
     let tell = |name: &str, text: &str| std::fs::write(control.join(name), text).map_err(|e| format!("{name}: {e}"));
     let listening = std::fs::read_to_string(control.join("portlist")).unwrap_or_default();
     // (All but the threads cannot be said twice: an earlier try may have got that far.)
-    if !listening.lines().any(|line| line.ends_with(&format!(" {PORT}"))) {
+    if !listening.lines().any(|line| line.starts_with("ipv6 ")) {
         tell("versions", "-3 +4 -4.0 -4.1 +4.2\n")?;
         tell("nfsv4leasetime", "30\n")?;
         tell("nfsv4gracetime", "30\n")?;
-        let listener = std::net::TcpListener::bind((address, PORT))
-            .map_err(|e| format!("listening on [{address}]:{PORT}: {e}"))?;
-        tell("portlist", &format!("{}\n", listener.as_raw_fd()))?;
+        listen(IpAddr::V6(address))?;
     }
     std::fs::write(OURS, "").map_err(|e| format!("{OURS}: {e}"))?;
     tell("threads", "4\n")
+}
+
+/// Have the kernel's server listen on `address` too (a socket bound here and handed over).
+fn listen(address: IpAddr) -> Result<(), String> {
+    let listener =
+        std::net::TcpListener::bind((address, PORT)).map_err(|e| format!("listening on {address} port {PORT}: {e}"))?;
+    let told = std::fs::write("/proc/fs/nfsd/portlist", format!("{}\n", listener.as_raw_fd()));
+    told.map_err(|e| format!("portlist: {e}"))
+}
+
+/// The Shares of volumes on `me` that name NFS clients: each one's name, its volume, and what
+/// [`Table`] has of it but for where the volume's directory is on this node.
+fn lans(store: &Store, me: &str) -> Vec<(String, Dir, Lan)> {
+    let mut found: Vec<(String, Dir, Lan)> = Vec::new();
+    for share in store.list(Some("Share")) {
+        let Ok(spec) = serde_json::from_value::<ShareSpec>(share.spec.clone()) else {
+            continue;
+        };
+        let namespace = share.metadata.namespace.as_deref().unwrap_or("default");
+        let clients = spec.nfs.iter().flat_map(|nfs| &nfs.clients);
+        let clients: Vec<_> = clients
+            .filter_map(|client| kith_api::kinds::share_client(client))
+            .collect();
+        let dir = crate::volumes::dir(store, namespace, &spec.volume).filter(|dir| dir.node == me);
+        // (One in `kith-system` is anywhere on the host, not under what is served: not given.)
+        let dir = dir.filter(|dir| dir.namespace != crate::volumes::SYSTEM && !clients.is_empty());
+        // (One Share gives a volume over NFS: the first by name; a second says so in its status.)
+        let dir = dir.filter(|dir| !found.iter().any(|(_, given, _)| given == dir));
+        if let Some(dir) = dir {
+            let lan = Lan {
+                dir: PathBuf::new(),
+                clients,
+                read_only: spec.read_only == Some(true),
+                owner: (spec.uid.unwrap_or(NOBODY), spec.gid.unwrap_or(NOBODY)),
+            };
+            found.push((format!("{namespace}/{}", share.metadata.name), dir, lan));
+        }
+    }
+    found
+}
+
+/// The leader's part: what each Share's status should say, where it says otherwise. Where
+/// its volume is (`node`, and `path` as an NFS client names it), or why it is given to nobody.
+pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
+    let mut writes = Vec::new();
+    // Which Share gives each volume over NFS: the first by name.
+    let mut nfs: BTreeMap<Dir, String> = BTreeMap::new();
+    for share in store.list(Some("Share")) {
+        let Ok(spec) = serde_json::from_value::<ShareSpec>(share.spec.clone()) else {
+            continue;
+        };
+        let namespace = share.metadata.namespace.as_deref().unwrap_or("default");
+        let unknown = |user: &&String| store.get(&format!("Identity/{user}")).is_none();
+        let names = spec.nfs.as_ref().is_some_and(|nfs| !nfs.clients.is_empty());
+        if let (true, Some(dir)) = (names, crate::volumes::dir(store, namespace, &spec.volume)) {
+            nfs.entry(dir).or_insert_with(|| share.metadata.name.clone());
+        }
+        let status = match (
+            crate::volumes::dir(store, namespace, &spec.volume),
+            spec.users.iter().find(unknown),
+        ) {
+            (None, _) => json!({ "message": format!("there is no Volume {} it can give", spec.volume) }),
+            (Some(dir), _) if dir.namespace == crate::volumes::SYSTEM => {
+                json!({ "message": format!("a Volume in {} cannot be given", crate::volumes::SYSTEM) })
+            }
+            (Some(_), Some(user)) => json!({ "message": format!("there is no Identity {user}") }),
+            (Some(dir), None) if names && nfs.get(&dir).is_some_and(|first| *first != share.metadata.name) => {
+                json!({ "message": format!("the Share {} gives that volume over NFS already: one does", nfs[&dir]) })
+            }
+            (Some(_), None) if spec.users.is_empty() && spec.nfs.is_none_or(|nfs| nfs.clients.is_empty()) => {
+                json!({ "message": "it is given to nobody: name `nfs.clients` or `users`" })
+            }
+            (Some(dir), None) => {
+                json!({ "node": dir.node, "path": format!("/{}/{}/{}", dir.namespace, dir.name, dir.path) })
+            }
+        };
+        if share.status.as_ref() != Some(&status) {
+            writes.push((share.key(), Some(status)));
+        }
+    }
+    writes
 }
 
 /// Answer the kernel's questions from `table`, for as long as this process lives.
@@ -385,16 +541,33 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
             _ = tokio::time::sleep(ROUND) => {}
             _ = stopping.changed() => return,
         }
-        let (dirs, clients) = {
+        let (dirs, clients, shares, mut nodes) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let address = |node: &kith_api::Resource| kith_mesh::node_address(prefix, &node.metadata.name);
+            // Where each node says it is reached, when that is an IPv4 address.
+            let reached = |node: &kith_api::Resource| -> Option<Ipv4Addr> {
+                let address: std::net::SocketAddr = node.status.as_ref()?["address"].as_str()?.parse().ok()?;
+                match address.ip() {
+                    IpAddr::V4(address) => Some(address),
+                    IpAddr::V6(address) => address.to_ipv4_mapped(),
+                }
+            };
             (
                 crate::volumes::served(store, me),
                 store.list(Some("Node")).map(address).collect(),
+                lans(store, me),
+                store
+                    .list(Some("Node"))
+                    .filter_map(reached)
+                    .collect::<BTreeSet<Ipv4Addr>>(),
             )
         };
-        if dirs.is_empty() && !answering {
+        // And every address this node has itself: what a container here comes from.
+        let own = nix::ifaddrs::getifaddrs().into_iter().flatten();
+        let own = own.filter_map(|card| Some(card.address?.as_sockaddr_in()?.ip()));
+        nodes.extend(own);
+        if dirs.is_empty() && shares.is_empty() && !answering {
             continue;
         }
         let serve = || -> Result<String, String> {
@@ -408,8 +581,21 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
                     Err(e) => not.push_str(&format!("; {}/{} is not served: {e}", dir.namespace, dir.name)),
                 }
             }
-            let count = served.len();
-            *table.lock().expect("nothing panics holding the table") = Table { root, served, clients };
+            let mut given = BTreeMap::new();
+            for (name, dir, lan) in shares.clone() {
+                match crate::volumes::host_dir(&state, &dir) {
+                    Ok(made) => drop(given.insert(name, Lan { dir: made, ..lan })),
+                    Err(e) => not.push_str(&format!("; the Share {name} is not served: {e}")),
+                }
+            }
+            let (count, shares, given) = (served.len(), given.clone(), given.len());
+            *table.lock().expect("nothing panics holding the table") = Table {
+                root,
+                served,
+                clients,
+                shares,
+                nodes: nodes.clone(),
+            };
             let up = running()?;
             // (Listening for the questions before there is anybody to ask them.)
             if !answering {
@@ -419,8 +605,21 @@ pub async fn run(shared: Arc<crate::Shared>, state: PathBuf, mut stopping: tokio
             if !up {
                 start(kith_mesh::node_address(prefix, me))?;
             }
+            // ponytail: once a Share here names NFS clients the server listens on every IPv4
+            // address of this node until it restarts, answering only whom a Share names;
+            // IPv6 clients that are not nodes are not served. Listen per address, and stop,
+            // when a node has networks a Share should not be heard on.
+            let listening = std::fs::read_to_string("/proc/fs/nfsd/portlist").unwrap_or_default();
+            if given > 0 && !listening.lines().any(|line| line.starts_with("ipv4 ")) {
+                listen(IpAddr::V4(Ipv4Addr::UNSPECIFIED))?;
+            }
+            let lan = if given > 0 {
+                format!("; {given} Share(s) to the addresses they name")
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "serving {count} shared volume(s) to the cluster's nodes (NFS 4.2, mesh only){not}"
+                "serving {count} shared volume(s) to the cluster's nodes (NFS 4.2, mesh only){lan}{not}"
             ))
         };
         let saying = serve().unwrap_or_else(|e| format!("shared volumes are not served: {e}"));
@@ -445,7 +644,196 @@ mod tests {
             .map(PathBuf::from)
             .into(),
             clients: ["fd00:1::1", "fd00:1::2"].map(|a| a.parse().unwrap()).into(),
+            shares: BTreeMap::new(),
+            nodes: BTreeSet::new(),
         }
+    }
+
+    /// The table with one Share on it: the films, to one LAN and one more machine, as uid 1000.
+    fn given(read_only: bool) -> Table {
+        let lan = Lan {
+            dir: "/var/lib/kith/volumes/default/media/films".into(),
+            clients: vec![("192.168.1.0".parse().unwrap(), 24), ("10.0.2.2".parse().unwrap(), 32)],
+            read_only,
+            owner: (1000, 100),
+        };
+        Table {
+            shares: [("default/films".to_string(), lan)].into(),
+            ..table()
+        }
+    }
+
+    /// A machine a Share names is the client of that Share, whichever way the kernel writes
+    /// its address; its neighbours, and anybody when no Share names them, are nobody.
+    #[test]
+    fn a_share_is_served_to_the_addresses_it_names_only() {
+        let table = given(false);
+        for named in ["192.168.1.20", "192.168.1.255", "10.0.2.2", "::ffff:192.168.1.20"] {
+            assert_eq!(
+                table.who(&format!("nfsd {named}"), 99).unwrap(),
+                format!("nfsd {named} 99 share:default/films"),
+            );
+        }
+        for other in ["192.168.2.20", "10.0.2.3", "2001:db8::1", "::ffff:192.168.2.20"] {
+            assert_eq!(
+                table.who(&format!("nfsd {other}"), 99).unwrap(),
+                format!("nfsd {other} 99")
+            );
+        }
+        // A node's own address is never a Share's client, though a Share's range has it: a
+        // container there, which has that address, is not a machine the Share named.
+        let among = Table {
+            nodes: ["192.168.1.20".parse().unwrap()].into(),
+            ..given(false)
+        };
+        assert_eq!(among.who("nfsd 192.168.1.20", 99).unwrap(), "nfsd 192.168.1.20 99");
+        assert!(
+            among
+                .who("nfsd 192.168.1.21", 99)
+                .unwrap()
+                .ends_with(" share:default/films")
+        );
+        assert_eq!(table.who("nfsd 127.0.0.1", 99).unwrap(), "nfsd 127.0.0.1 99");
+        // A node is still a node, and gets what nodes get.
+        assert!(table.who("nfsd fd00:1::2", 99).unwrap().ends_with(" kith"));
+        assert_eq!(
+            self::table().who("nfsd 192.168.1.20", 99).unwrap(),
+            "nfsd 192.168.1.20 99"
+        );
+    }
+
+    /// A Share's client sees the way to its volume and the volume: as the Share's one user
+    /// whoever it says it is and from any port (0xa), read-only when the Share says (0xb), and with the kernel
+    /// checking each file handle is under the volume (no 0x400). Not the nodes' other volume,
+    /// and not as a Share that does not name it or is gone.
+    #[test]
+    fn a_shares_client_gets_its_volume_as_the_shares_user_and_nothing_else() {
+        let (table, client) = (given(false), "share:default/films");
+        let export = |table: &Table, client: &str, path: &str| {
+            let said = table.export(&format!("{client} {path}"), 99).unwrap();
+            said.strip_prefix(&format!("{client} {path} 99")).unwrap().to_string()
+        };
+        let films = "/var/lib/kith/volumes/default/media/films";
+        assert!(export(&table, client, films).starts_with(" 10 1000 100 0 uuid \\x"));
+        assert!(export(&given(true), client, films).starts_with(" 11 1000 100 0 uuid \\x"));
+        assert_eq!(
+            export(&table, client, "/var/lib/kith/volumes"),
+            format!(" {} 65534 65534 0", 0x12407)
+        );
+        assert!(export(&table, client, "/var/lib/kith/volumes/default/media").starts_with(&format!(" {} ", 0x10407)));
+        for not in [
+            "/var/lib/kith/volumes/shop",
+            "/var/lib/kith/volumes/shop/my\\040data/x",
+            "/var/lib/kith",
+            "/",
+        ] {
+            assert_eq!(export(&table, client, not), "", "{not}");
+        }
+        for nobody in ["share:default/other", "share:", "lan", ""] {
+            assert_eq!(export(&table, nobody, films), "", "{nobody}");
+            assert_eq!(export(&table, nobody, "/var/lib/kith/volumes"), "", "{nobody}");
+        }
+        // The nodes get it as they did: theirs is the volume being `shared`, not the Share.
+        assert!(export(&table, CLIENT, films).starts_with(&format!(" {NOSUBTREECHECK} 65534 65534 0 uuid")));
+        // A file handle of the nodes' other volume names nothing to a Share's client.
+        let id = crate::pki::hex(&table.id(Path::new("/var/lib/kith/volumes/shop/my data/x")));
+        let asked = format!("{client} 6 \\x{id}");
+        assert_eq!(table.handle(&asked, 99).unwrap(), format!("{asked} 99"));
+        let id = crate::pki::hex(&table.id(Path::new(films)));
+        let asked = format!("{client} 6 \\x{id}");
+        assert_eq!(table.handle(&asked, 99).unwrap(), format!("{asked} 99 {films}"));
+    }
+
+    /// A Share is served by the node its volume is on, to the clients it names; its status
+    /// says where a client finds it, or why nobody does.
+    #[test]
+    fn a_share_is_its_volumes_nodes_to_serve_and_says_where_it_is() {
+        let mut store = Store::default();
+        let text = "
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: {name: media}
+spec: {node: a, path: films}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: ada}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: films}
+spec: {volume: media, readOnly: true, uid: 1000, nfs: {clients: [192.168.1.0/24]}, users: [ada]}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: smb-only}
+spec: {volume: media, users: [ada, bob]}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: second}
+spec: {volume: media, nfs: {clients: [192.168.1.0/24]}}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: nobodys}
+spec: {volume: media}
+---
+apiVersion: kith.dev/v1
+kind: Share
+metadata: {name: lost}
+spec: {volume: gone, nfs: {clients: [192.168.1.9]}}
+";
+        for resource in kith_api::Resource::from_source(text).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let mine = lans(&store, "a");
+        assert_eq!(mine.len(), 1, "only the one with NFS clients and a volume");
+        let (name, dir, lan) = &mine[0];
+        assert_eq!((name.as_str(), dir.path.as_str()), ("default/films", "films"));
+        assert_eq!((lan.read_only, lan.owner), (true, (1000, NOBODY)));
+        assert!(lan.has("192.168.1.7".parse().unwrap()) && !lan.has("192.168.2.7".parse().unwrap()));
+        assert!(lans(&store, "b").is_empty(), "not the node its volume is on");
+        // (`second` gives the same volume over NFS: the first by name does, and it says so.)
+        let again = writes(&store)
+            .into_iter()
+            .find(|(key, _)| key == "Share/default/second");
+        let again = again.unwrap().1.unwrap();
+        assert!(
+            again["message"]
+                .as_str()
+                .unwrap()
+                .contains("the Share films gives that volume"),
+            "{again}"
+        );
+
+        let said: BTreeMap<String, Value> = writes(&store)
+            .into_iter()
+            .map(|(key, status)| (key, status.unwrap()))
+            .collect();
+        assert_eq!(
+            said["Share/default/films"],
+            json!({ "node": "a", "path": "/default/media/films" })
+        );
+        assert_eq!(
+            said["Share/default/smb-only"],
+            json!({ "message": "there is no Identity bob" })
+        );
+        assert!(
+            said["Share/default/nobodys"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("given to nobody")
+        );
+        assert_eq!(
+            said["Share/default/lost"],
+            json!({ "message": "there is no Volume gone it can give" })
+        );
+        // Said once.
+        let statuses = writes(&store);
+        kith_store::run(&mut store, kith_store::Command::Status { statuses }).unwrap();
+        assert!(writes(&store).is_empty());
     }
 
     /// Only a node's mesh address is a client: any other address of the mesh's /48 (a

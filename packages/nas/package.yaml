@@ -1,0 +1,5 @@
+# A NAS: a volume given to machines that are not nodes, over SMB and NFS.
+name: nas
+version: 0.1.0
+description: A volume for the machines on your network, over SMB and NFS
+kithVersion: ">=0.0.1"

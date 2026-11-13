@@ -263,7 +263,7 @@ fn examples_and_schemas() {
     assert_eq!(sb.kith(&["diff", "-f", examples]).0, 0);
 
     let (_, out, _) = sb.kith(&["schema"]);
-    assert_eq!(out.lines().count(), 32);
+    assert_eq!(out.lines().count(), 33);
     let (_, out, _) = sb.kith(&["schema", "workload"]);
     let schema: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(schema["title"], "Workload");
@@ -290,6 +290,104 @@ fn a_silent_daemon_times_out() {
         "error: kithd has not answered for 1 s (--timeout sets how long to wait)\n"
     );
     assert!(began.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// The nas package: a Share for the volume, and (when it names SMB users) the Samba
+/// container with the volume mounted and each user's password from the Secret.
+#[test]
+fn the_nas_package_renders_a_share_and_its_smb_server() {
+    let sandbox = Sandbox::new("nas");
+    let nas = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/nas");
+    let (code, out, err) = sandbox.kith(&["package", "lint", nas]);
+    assert_eq!((code, out.as_str()), (0, "nas 0.1.0 ok\n"), "{err}");
+    // NFS alone: the Share, and no server of the package's.
+    let nfs = [
+        "package",
+        "render",
+        nas,
+        "--name",
+        "films",
+        "--set",
+        "nfs.clients=[192.168.1.0/24]",
+    ];
+    let (code, out, err) = sandbox.kith(&nfs);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("kind: Share") && out.contains("- 192.168.1.0/24"), "{out}");
+    assert!(!out.contains("kind: Workload"), "{out}");
+    // With users: the server, as the volume's user, each password from the Secret by name.
+    let mine = "volume: media\nusers: [ada, bob]\npasswords: nas-passwords\nuid: 1000\nreadOnly: true\n";
+    sandbox.write("mine.yaml", mine);
+    let (code, out, notes) = sandbox.kith(&["package", "render", nas, "--name", "films", "-f", "mine.yaml"]);
+    assert_eq!(code, 0, "{notes}");
+    assert!(out.contains("kind: Workload") && out.contains("exec smbd"), "{out}");
+    assert!(
+        out.contains("volume: media\n            path: /share\n            readOnly: true"),
+        "{out}"
+    );
+    let password =
+        "name: KITH_SMB_PASSWORD_2\n            secret:\n              name: nas-passwords\n              key: bob";
+    assert!(out.contains(password), "{out}");
+    assert!(
+        out.contains("users:\n    - ada\n    - bob") && out.contains("uid: 1000"),
+        "{out}"
+    );
+    assert!(notes.contains("port 445, for ada, bob"), "{notes}");
+    // And it is what `kith apply` takes.
+    sandbox.write("rendered.yaml", &out);
+    let (code, out, err) = sandbox.kith(&["apply", "-f", "rendered.yaml"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.matches("created").count(), 2, "{out}");
+
+    // What the container runs, with stand-ins for Samba's two programs and a directory
+    // here for /run/samba: each user is given its own password, and the server its share.
+    let script = std::fs::read_to_string(format!("{nas}/templates/_serve.sh")).unwrap();
+    let run = sandbox.0.join("run");
+    let bin = sandbox.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let stand_in = |name: &str, does: &str| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(bin.join(name), format!("#!/bin/sh\n{does}\n")).unwrap();
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    stand_in(
+        "smbpasswd",
+        &format!("echo \"$* $(tr '\\n' ' ')\" >>{}/added", run.display()),
+    );
+    stand_in("smbd", &format!("echo \"$*\" >{}/served", run.display()));
+    let script = script.replace("d=/run/samba", &format!("d={}", run.display()));
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let ran = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .env("PATH", path)
+        .env("KITH_SHARE_NAME", "films-nas")
+        .env("KITH_SHARE_READ_ONLY", "yes")
+        .env("KITH_SHARE_UID", "1000")
+        .env("KITH_SHARE_GID", "100")
+        .env("KITH_SMB_USERS", "ada bob")
+        .env("KITH_SMB_PASSWORD_1", "one $HOME `id`")
+        .env("KITH_SMB_PASSWORD_2", "two")
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+    let read = |name: &str| std::fs::read_to_string(run.join(name)).unwrap();
+    let conf = read("smb.conf");
+    assert!(
+        conf.contains("[films-nas]\npath = /share\nread only = yes\nvalid users = ada bob\n"),
+        "{conf}"
+    );
+    assert!(
+        conf.contains("force user = kith-share") && conf.contains("map to guest = never"),
+        "{conf}"
+    );
+    let passwd = read("passwd");
+    assert!(
+        passwd.contains("kith-share:x:1000:100:") && passwd.contains("bob:x:60002:100:"),
+        "{passwd}"
+    );
+    let added = read("added");
+    assert!(added.contains("-s -a ada one $HOME `id` one $HOME `id`"), "{added}");
+    assert!(added.contains("-s -a bob two two"), "{added}");
+    assert!(read("served").contains("--foreground"));
 }
 
 #[test]

@@ -1,0 +1,18 @@
+# Who the volume is given to. kithd checks it: `kith get share` says where an NFS client
+# finds it, or why nobody does.
+apiVersion: kith.dev/v1
+kind: Share
+metadata:
+  name: {{ name }}
+spec:
+  volume: {{ values.volume | tojson }}
+  readOnly: {{ values.readOnly | tojson }}
+  uid: {{ values.uid }}
+  gid: {{ values.gid }}
+  {%- if values.users %}
+  users: {{ values.users | tojson }}
+  {%- endif %}
+  {%- if values.nfs.clients %}
+  nfs:
+    clients: {{ values.nfs.clients | tojson }}
+  {%- endif %}
