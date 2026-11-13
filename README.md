@@ -778,6 +778,31 @@ WHEN                  WHO           DID     WHAT                            OUTC
 Not yet: `kith` over TLS, logging in through an identity provider (OIDC),
 certificates that expire before ten years, one audit log for the cluster.
 
+## Hardware
+
+Every node of a cluster lists its own hardware from `/sys` and keeps one `Device`
+per piece of it in the store, applied when it turns up and deleted when it is
+gone (a rescan every half minute, not hot-plug events: a plugged device shows
+within 30 seconds). `kith get device` lists them.
+
+- A `Device` is named `NODE-CLASS-NAME` (lower case, cut to 63 characters), and its
+  `spec` has the `node`, the `class` (`gpu`, `display`, `input`, `audio`, `usb`
+  or `camera`) and the device node as `path` (`/dev/dri/card0`, `/dev/input/event3`,
+  `/dev/snd/controlC0`, `/dev/video0`, `/dev/bus/usb/001/004`; a `display` has none).
+- GPUs are the DRM cards; a `display` is a connector with a screen on it, an `input`
+  an `event` device, `audio` a sound card, `camera` a video4linux device, and `usb`
+  a USB device that is not a hub.
+- Labels: `kith.dev/node`, `class` and `kith.dev/discovered: "true"` on all; GPUs and
+  USB devices also `vendor` and `model` (the hex ids, so `1002` and `73bf`), a GPU
+  `driver` and, where its driver says, `vram` in bytes; inputs and sound cards `model`
+  (letters, digits, `.`, `_` and `-`). A selector can name them.
+- `NODE-seat0` is a `Seat` naming the node's displays, inputs, sound cards and GPUs; a
+  node with none has no seat.
+- Only what carries `kith.dev/discovered` and the node's name is kept in step: it
+  is rewritten if you edit it and deleted when the hardware goes. A `Device` or `Seat`
+  you wrote yourself is never changed or deleted. A machine without `/sys/class`
+  (some containers) has no devices, and kithd says so once.
+
 ## Web UI
 
 Every node serves a page that shows the cluster and changes it: what is

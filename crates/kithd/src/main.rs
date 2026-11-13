@@ -14,6 +14,7 @@ mod cluster;
 mod controller;
 mod controllers;
 mod crypt;
+mod devices;
 mod dhcp;
 mod dns;
 mod ingress;
@@ -614,7 +615,18 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     crypt::keep(shared.clone(), config, record, opened, stopping.clone()).await;
                 }
             };
-            tokio::join!(units, releases, repositories, sources, controllers, plans, system, key);
+            let hardware = devices::run(shared.clone(), stopping.clone());
+            tokio::join!(
+                units,
+                releases,
+                repositories,
+                sources,
+                controllers,
+                plans,
+                system,
+                key,
+                hardware
+            );
         };
         let names = async {
             if let Some(sockets) = names {
