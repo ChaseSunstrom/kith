@@ -90,8 +90,8 @@ fn resolve_one(store: &Store, claim: &DeviceClaimSpec) -> Result<Held, String> {
 fn claimants(store: &Store) -> Vec<(String, String, Vec<String>)> {
     let owners = ["Workload", "Job"].into_iter().flat_map(|kind| store.list(Some(kind)));
     owners
-        // (A Job that is over holds nothing.)
-        .filter(|owner| crate::sched::wants(owner).is_some())
+        // (A Job that is over holds nothing, nor does a Workload of no replicas.)
+        .filter(|owner| crate::sched::wants(owner).is_some_and(|(replicas, ..)| replicas > 0))
         .filter_map(|owner| {
             let names = owner.spec["template"]["deviceClaims"].as_array()?;
             let names: Vec<String> = names.iter().filter_map(|n| Some(n.as_str()?.to_string())).collect();
@@ -192,7 +192,15 @@ pub fn resolve(store: &Store) -> Claims {
                 let holding = holders.remove(&claim).unwrap_or_default();
                 json!({ "node": held.node, "devices": held.devices, "holders": holding })
             }
-            Err(message) => json!({ "message": message }),
+            // (Who held it still does when it is back: a Device gone for a moment, a USB
+            // one plugged in again, is not the holder's turn lost.)
+            Err(message) => {
+                let live = store.get(&claim).and_then(|claim| claim.status.as_ref());
+                match live.map(|status| &status["holders"]).filter(|held| held.is_array()) {
+                    Some(held) => json!({ "message": message, "holders": held }),
+                    None => json!({ "message": message }),
+                }
+            }
         };
         claims.status.insert(claim, status);
     }
@@ -395,6 +403,23 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
             again.owners[key],
             Err("waiting for DeviceClaim gpu, held by Workload/default/two".into())
         );
+        // The Device gone for a moment: nobody holds it, and `two` has it again when it is back.
+        let mut device = gone.get("Device/a-gpu-card0").unwrap().clone();
+        device.metadata.revision = None;
+        gone.delete("Device/a-gpu-card0").unwrap();
+        assert!(settle(&mut gone).owners["Workload/default/two"].is_err());
+        let status = gone.get("DeviceClaim/default/gpu").unwrap().status.clone().unwrap();
+        assert_eq!(status["holders"], json!(["Workload/default/two"]));
+        assert!(status["message"].is_string());
+        gone.apply(device).unwrap();
+        let back = settle(&mut gone);
+        assert!(back.owners["Workload/default/two"].is_ok() && back.owners[key].is_err());
+        // `two` scaled to nothing runs nothing and holds nothing: `one` has its turn.
+        let mut idle = gone.get("Workload/default/two").unwrap().clone();
+        idle.metadata.revision = None;
+        idle.spec["replicas"] = 0.into();
+        gone.apply(idle).unwrap();
+        assert!(settle(&mut gone).owners[key].is_ok());
     }
 
     #[test]

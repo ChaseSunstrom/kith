@@ -866,8 +866,11 @@ spec:
   nothing. A Device or claim that is missing, or a path that is not a device node, stops the
   unit from starting, and says which. An `exec` unit runs on the host and sees all of
   `/dev` as it is.
-- Not yet: a NodeWorkload cannot claim (it runs nothing, and says so); there is no hot-plug
-  (a changed set of device nodes starts the unit over at the next scan).
+- Not yet: a NodeWorkload cannot claim (one that names a claim is refused); there is no
+  hot-plug (a changed set of device nodes starts the unit over at the next scan, and a
+  Device gone even for a moment stops what claimed it until it is back: its holder keeps
+  its turn). The device nodes are given as root's: a container that runs as another user
+  cannot open one whose mode does not let it.
 - Who may claim is ordinary access control: to claim, you apply a `DeviceClaim` and a
   workload that names it, so the right to apply those is the grant, and there is no other
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any

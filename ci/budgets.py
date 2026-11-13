@@ -23,8 +23,10 @@ MB = 1024 * 1024
 # 10.0 MB with mesh, ingress, ACME, packages and Sources (Phases 2-3), which raised it
 # from 10 for Phase 4 (access control, WASM, the web UI). The plan's own ceilings are
 # on memory (30 MB for kithd), which the idle RSS budget below stays far under.
+# Idle RSS measured 7.80 MB before device claims and 8.00 MB with them (Phase 6): nearly
+# all of the rise is pages of the binary itself, not heap, which raised its budget from 8.
 KITHD_SIZE = 12
-KITHD_IDLE_RSS = 8 * MB
+KITHD_IDLE_RSS = 9 * MB
 # binary -> max size in bytes. kith measured 2.0 MB before it rendered packages and
 # 2.7 MB with the template engine (minijinja, Phase 3a), which raised its budget from 2.5.
 SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}

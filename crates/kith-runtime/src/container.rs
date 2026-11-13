@@ -497,7 +497,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
 
 /// The device nodes at `paths` as the container sees them (made in its `/dev`, or bound there
 /// when rootless) and the cgroup rules that let it read and write them. A path that is not
-/// there, or is not a character or block device, is an error: the unit is not made without it.
+/// there, or is not a character device, is an error: the unit is not made without it.
 ///
 /// An exec unit is not given these: it runs on the host and sees all of `/dev` already.
 fn device_nodes(
@@ -506,17 +506,18 @@ fn device_nodes(
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let (mut nodes, mut allowed) = (Vec::new(), Vec::new());
     for path in paths {
-        // Device nodes live in `/dev`: a path from a resource is not trusted to point elsewhere.
-        let plain = path.starts_with("/dev") && !path.components().any(|c| c == std::path::Component::ParentDir);
-        if !plain {
+        // Device nodes live in `/dev`: a path from a resource is not trusted to point elsewhere,
+        // by `..` or by a link (`/dev/disk/by-id/…`, `/dev/stdin`): it must be its own real path.
+        let real = fs::canonicalize(path).map_err(|e| format!("device {}: {e}", path.display()))?;
+        if !path.starts_with("/dev") || real != *path {
             return Err(format!("{} is not a device node under /dev", path.display()).into());
         }
         let meta = fs::metadata(path).map_err(|e| format!("device {}: {e}", path.display()))?;
-        let kind = match meta.file_type() {
-            t if t.is_char_device() => LinuxDeviceType::C,
-            t if t.is_block_device() => LinuxDeviceType::B,
-            _ => return Err(format!("{} is not a device node", path.display()).into()),
-        };
+        // A character device only: a disk is not handed out this way (that is a Volume's part).
+        if !meta.file_type().is_char_device() {
+            return Err(format!("{} is not a character device node", path.display()).into());
+        }
+        let kind = LinuxDeviceType::C;
         let (major, minor) = (
             i64::try_from(nix::sys::stat::major(meta.rdev()))?,
             i64::try_from(nix::sys::stat::minor(meta.rdev()))?,
@@ -631,7 +632,9 @@ mod tests {
         assert!(missing.to_string().contains("/dev/kith-no-such-device"), "{missing}");
         let file = spec("a", &image, &with("/etc"), "/kith/a");
         assert!(file.unwrap_err().to_string().contains("not a device node"));
-        let out = spec("a", &image, &with("/dev/../dev/null"), "/kith/a");
-        assert!(out.unwrap_err().to_string().contains("not a device node"));
+        for out in ["/dev/../dev/null", "/dev/fd", "/dev/shm"] {
+            let refused = spec("a", &image, &with(out), "/kith/a").unwrap_err().to_string();
+            assert!(refused.contains("device node"), "{out}: {refused}");
+        }
     }
 }

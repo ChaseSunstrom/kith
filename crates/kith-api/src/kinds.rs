@@ -938,6 +938,10 @@ impl Spec for WorkloadSpec {
 
 impl Spec for NodeWorkloadSpec {
     fn check(&self) -> Result<(), String> {
+        // (A copy on every node, a device on one.)
+        if !self.template.device_claims.is_empty() {
+            return Err("template.deviceClaims: a NodeWorkload cannot hold DeviceClaims (use a Workload)".into());
+        }
         self.template.check("template")
     }
 }
