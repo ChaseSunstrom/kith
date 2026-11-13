@@ -308,7 +308,7 @@ async fn membership(
             if let Some(options) = &options {
                 let peers = serde_json::to_vec(&joined.peers).expect("JSON values");
                 let path = mesh::first_peers(&options.key);
-                std::fs::write(&path, peers).map_err(|e| format!("writing {}: {e}", path.display()))?;
+                pki::write_whole(&path, &peers).map_err(|e| format!("writing {}: {e}", path.display()))?;
             }
             eprintln!("kithd: joined the cluster of {address} as node {name}");
             let me = pki::Identity {

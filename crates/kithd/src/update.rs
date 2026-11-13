@@ -510,7 +510,8 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Rece
                 version: wanted.clone(),
                 why: String::new(),
             };
-            let write = |trying: &Tried| std::fs::write(tried(&state), serde_json::to_vec(trying).expect("text"));
+            let write =
+                |trying: &Tried| crate::pki::write_whole(&tried(&state), &serde_json::to_vec(trying).expect("text"));
             let wrote = match write(&trying) {
                 Ok(()) => fetch(&url, wanted.clone(), &release, slot).await,
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
@@ -790,5 +791,20 @@ mod tests {
             Some("0.0.1")
         );
         assert_eq!(version_in("NAME=x\n"), None);
+    }
+
+    #[test]
+    fn whole_torn_or_empty_marker_is_read_as_none() {
+        let state = std::env::temp_dir().join(format!("kith-whole-update-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        for torn in ["", "{", r#"{"version":"2","why":"the rel"#] {
+            crate::pki::write_whole(&tried(&state), torn.as_bytes()).unwrap();
+            assert_eq!(
+                report(&state, "1", 'a'),
+                json!({ "version": "1", "slot": "a" }),
+                "{torn:?}"
+            );
+        }
+        std::fs::remove_dir_all(&state).unwrap();
     }
 }

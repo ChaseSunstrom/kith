@@ -139,6 +139,28 @@ fn write_private(path: &Path, text: &str) -> Fallible<()> {
     )
 }
 
+/// `bytes` into `path` whole or not at all: a temp file beside it, synced, renamed over it, and
+/// the directory synced after. A power cut leaves the old file or the new one, never a torn
+/// one, and a read of a torn or empty file (from before) is the caller's to call none.
+pub fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let new = path.with_extension("new");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&new)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&new, path)?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// Load what `save` wrote into `dir`: the identity, and the CA if this node holds its key.
 pub fn load(dir: &Path) -> Fallible<Option<(Identity, Option<Ca>)>> {
     if !dir.join("node.crt").exists() {
@@ -485,5 +507,24 @@ mod tests {
         assert!(tokens.good(&token, false));
         assert!(tokens.good(&token, true));
         assert!(!tokens.good(&token, true));
+    }
+
+    #[test]
+    fn whole_write_replaces_the_file_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("kith-whole-pki-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marker.json");
+        // A torn file from before is replaced whole.
+        std::fs::write(&path, r#"{"version":"2"#).unwrap();
+        write_whole(&path, br#"{"version":"3"}"#).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"version":"3"}"#);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("marker.json")]);
+        // Into a directory that is not there: an error, and nothing made.
+        assert!(write_whole(&dir.join("gone/marker.json"), b"x").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
