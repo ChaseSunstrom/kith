@@ -2214,7 +2214,7 @@ fn claim_makes_the_first_admin_over_tls() {
     );
 
     // With the certificate, and the node checked against the CA: everything.
-    let call = |method: &str, path: &str, body: &str| {
+    let call = |who: &str, method: &str, path: &str, body: &str| {
         let mut curl = Command::new("curl");
         curl.args([
             "-s",
@@ -2230,9 +2230,9 @@ fn claim_makes_the_first_admin_over_tls() {
         .arg("--cacert")
         .arg(dir.join("ca.crt"))
         .arg("--cert")
-        .arg(dir.join("root.crt"))
+        .arg(dir.join(format!("{who}.crt")))
         .arg("--key")
-        .arg(dir.join("root.key"))
+        .arg(dir.join(format!("{who}.key")))
         .args(["--resolve", &format!("kith:{port}:127.0.0.1")]);
         if !body.is_empty() {
             curl.args(["-H", "Content-Type: application/json", "-d", body]);
@@ -2240,14 +2240,30 @@ fn claim_makes_the_first_admin_over_tls() {
         let out = curl.arg(format!("https://kith:{port}{path}")).output().unwrap();
         String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(call("GET", "/v1/resources", ""), "200");
+    assert_eq!(call("root", "GET", "/v1/resources", ""), "200");
     let role = serde_json::json!([{
         "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": "reader" },
         "spec": { "rules": [{ "kinds": ["*"], "verbs": ["get", "list"] }] },
     }]);
-    assert_eq!(call("POST", "/v1/apply", &role.to_string()), "200");
+    assert_eq!(call("root", "POST", "/v1/apply", &role.to_string()), "200");
     assert!(daemon.ok(&["get", "identity"]).contains("root"));
     assert!(daemon.ok(&["audit"]).contains("claim"), "the claim is in the audit log");
+    // A join token, without the node's socket: for who may apply Nodes, and nobody else.
+    assert_eq!(call("root", "POST", "/v1/tokens", ""), "200");
+    daemon.ok(&["identity", "cert", "alice", "--out", "."]);
+    assert_eq!(call("alice", "POST", "/v1/tokens", ""), "403");
+    // Nor for one that may apply Nodes and no more: a node may do everything, so a
+    // join token is for who could give itself every right anyway.
+    let noder = serde_json::json!([
+        { "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": "noder" },
+          "spec": { "rules": [{ "kinds": ["Node"], "verbs": ["get", "list", "apply"] }] } },
+        { "apiVersion": "kith.dev/v1", "kind": "RoleBinding", "metadata": { "name": "noder-alice" },
+          "spec": { "role": "noder", "subjects": ["alice"] } },
+    ]);
+    assert_eq!(call("root", "POST", "/v1/apply", &noder.to_string()), "200");
+    assert_eq!(call("alice", "POST", "/v1/tokens", ""), "403");
+    assert_eq!(post("/v1/tokens", serde_json::json!({})).0, 401);
+    assert!(daemon.ok(&["node", "token"]).contains("kith1."));
 
     // There is an Identity now: a restart prints no token.
     daemon.stop();

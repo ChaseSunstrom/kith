@@ -7,6 +7,7 @@
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
+#   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -39,6 +40,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    (refused), a good one (it restarts into its other slot, marks it
                    good, and is the same node), then one whose root is broken (three
                    tries, and it is back on the slot that worked); same needs
+  --test rollout   instead: three nodes on a network of their own, claimed and joined
+                   over TLS; a release with another file's signature (refused), a signed
+                   one (each node takes it in turn, one cluster throughout), then one
+                   that cannot start (one node tries, comes back, the plan is paused);
+                   also needs curl, python3, xxd
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -61,7 +67,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update) ;; *) echo "vm.sh: --test knows: init, image, update" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout) ;; *) echo "vm.sh: --test knows: init, image, update, rollout" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -76,11 +82,13 @@ if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT INT TERM
+vms='' web=''
+# (What a test left running goes with it.)
+trap 'kill $vms $web 2>/dev/null; rm -rf "$work"' EXIT INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
-if [ "$test" = image ] || [ "$test" = update ]; then
+if [ "$test" = image ] || [ "$test" = update ] || [ "$test" = rollout ]; then
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
     command -v openssl >/dev/null 2>&1 || skip "no openssl to call the node with"
     firmware=''
@@ -90,6 +98,132 @@ if [ "$test" = image ] || [ "$test" = update ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
+    if [ "$test" = rollout ]; then
+        for tool in curl python3 xxd; do
+            command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
+        done
+        [ "$time" -gt 60 ] || time=900
+        port=$((20000 + $$ % 20000))
+        fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+        cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
+        # Two releases, both signed: one that runs, and one whose root is not the one its
+        # verity tree was made for. The nodes fetch them from this machine.
+        KITH_OS_VERSION=0.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
+        mkdir "$work/www"
+        cp "$work/next/kith-os.update" "$work/www/next.update"
+        cp "$work/next/root.squashfs" "$work/broken.root"
+        dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
+        sh "$root/os/update.sh" 0.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
+            "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
+        public=$("$root/target/debug/kith" package keygen "$work/key")
+        sign() { sh "$root/os/update.sh" --sign "$work/key" "$work/www/$1.update"; }
+        (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
+        web=$!
+
+        # Each node: a card on a network the three share (QEMU passes it over multicast on
+        # this machine's loopback), with a fixed address, and one out to this machine.
+        node() { # N [kithd's further arguments]
+            [ -f "$work/n$1.raw" ] || cp "$root/target/os/kith-os.raw" "$work/n$1.raw"
+            timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+                -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" \
+                -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 ${2:-}" \
+                -serial "file:$work/n$1.log" -monitor none </dev/null >/dev/null 2>&1 &
+            vms="$vms $!"
+        }
+        field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
+        api() { # N METHOD PATH [FILE to send]: as the cluster's admin, to node N
+            set -- "$@" ''
+            curl -sf --max-time 10 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" \
+                --resolve "kith:$((port + $1)):127.0.0.1" -X "$2" -H 'Content-Type: application/json' ${4:+-d "@$4"} "https://kith:$((port + $1))$3"
+        }
+        any() { api 1 "$@" || api 2 "$@" || api 3 "$@"; }
+        # What the cluster says, from whichever node answers:
+        # "PHASE HOW-MANY-UPDATING VERSION,VERSION,VERSION REASON"; nothing while nobody does.
+        see() {
+            any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+nodes = sorted((r for r in found if r["kind"] == "Node"), key=lambda r: r["metadata"]["name"])
+versions = ",".join(((n.get("status") or {}).get("os") or {}).get("version", "?") for n in nodes)
+status = next(((r.get("status") or {}) for r in found if r["kind"] == "UpdatePlan"), {})
+updating = sum(1 for state in (status.get("nodes") or {}).values() if state == "updating")
+print(status.get("phase", "-"), updating, versions or "-", status.get("reason", ""))
+'
+        }
+        until_says() { # WHAT, a pattern for see's line: wait for it; never two nodes updating at once
+            waited=0
+            until line=$(see) && printf '%s\n' "$line" | grep -Eq "$2"; do
+                case $line in '' | *' 0 '* | *' 1 '*) ;; *) fail "more than one node updating at once: $line" ;; esac
+                waited=$((waited + 1))
+                [ "$waited" -lt $((time / 2)) ] || fail "waited for $1; the cluster says: $line"
+                sleep 1
+            done
+            echo "vm.sh: $1: $line" >&2
+        }
+        release() { # NAME VERSION SIGNATURE: that release, and a plan that gives it to every node
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"OSRelease","metadata":{"name":"$1"},
+  "spec":{"version":"$2","image":"http://10.0.2.2:$((port + 9))/${4:-$1}.update","publicKey":"$public","signature":"$3"}},
+ {"apiVersion":"kith.dev/v1","kind":"UpdatePlan","metadata":{"name":"all"},"spec":{"release":"$1"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the release $1 was not applied"
+        }
+        starts() { grep -ac "Kernel command line:.*kith.slot=$2" "$work/n$1.log"; }
+
+        # Nobody can log in to these nodes: the first says a token on its console, and
+        # who sends it back is the cluster's admin; the others join with tokens it asks for.
+        node 1 --claim
+        tries=0
+        until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
+            && [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' -d '{"token":"x","name":"root"}' "https://127.0.0.1:$((port + 1))/v1/claim")" = 403 ]; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 300 ] || fail "the first node offered no claim, or did not answer"
+            sleep 0.2
+        done
+        claimed=$(curl -sk --max-time 10 -H 'Content-Type: application/json' -d "{\"token\":\"${token##* }\",\"name\":\"root\"}" "https://127.0.0.1:$((port + 1))/v1/claim")
+        for part in ca cert key; do
+            printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
+        done
+        for n in 2 3; do
+            join=$(api 1 POST /v1/tokens | field token) || fail "no join token over TLS"
+            node "$n" "--join 10.9.0.1:7443 --token $join"
+        done
+        until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
+        was=${line#- 0 } was=${was%% *}
+
+        # A release whose signature is another file's: the first node asked refuses it,
+        # writes nothing, and the plan stops there.
+        release forged 0.0.0-next "$(sign broken)" next
+        until_says "a release signed for another file refused" "^Paused 0 $was .*signature is not the release's key's"
+        [ "$(starts 1 a)$(starts 2 a)$(starts 3 a)" = 111 ] || fail "a node restarted for a release it refused"
+
+        # The release, signed: every node takes it, one at a time, and it is one cluster still.
+        release next 0.0.0-next "$(sign next)"
+        until_says "all three on the release" "^Done 0 0.0.0-next,0.0.0-next,0.0.0-next "
+        [ "$(starts 1 b)$(starts 2 b)$(starts 3 b)" = 111 ] || fail "not every node started its other slot once"
+        ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+
+        # A release that cannot start: the first node tries it three times and is back on
+        # what it ran; the plan is paused, and no other node is given it.
+        release broken 0.0.0-broken "$(sign broken)"
+        until_says "a release that cannot start stopped at the first node" "^Paused 0 0.0.0-next,0.0.0-next,0.0.0-next .* did not take 0.0.0-broken: it did not come up"
+        # (It says so once it has called its own slot good, ten seconds after it started.)
+        tries=0
+        until [ "$(grep -al 'slot a did not come up in 3 tries: this is slot b' "$work"/n?.log | wc -l)" = 1 ]; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 30 ] || fail "not exactly one node tried the broken release"
+            sleep 1
+        done
+        [ "$(($(starts 1 a) + $(starts 2 a) + $(starts 3 a)))" = 6 ] || fail "expected three tries of the broken release on one node"
+        echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster; one that cannot start tried by one node, which came back, and the plan paused: $line"
+        exit 0
+    fi
     # A copy: the node writes its state to the disk, and this test damages its root.
     cp "$root/target/os/kith-os.raw" "$work/disk.raw"
     port=$((20000 + $$ % 20000))

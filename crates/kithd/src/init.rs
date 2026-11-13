@@ -239,8 +239,8 @@ impl Boot {
     }
 }
 
-/// Links up, and the address the command line gives the first card; without one, every
-/// card is left to ask its network.
+/// Links up, and the address the command line gives the first card. The cards returned
+/// are left to ask their networks: all of them, or with such an address all but the first.
 //
 // ponytail: the cards there at this moment. One plugged in later, or whose driver loads
 // later, stays down: watch the kernel's link messages when a machine needs that.
@@ -264,7 +264,8 @@ fn links(options: &Options) -> Vec<kith_mesh::Card> {
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
-        return Vec::new();
+        // (The other cards still ask their networks: a second network is not the first's.)
+        return cards.into_iter().skip(1).collect();
     }
     cards
 }

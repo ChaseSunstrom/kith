@@ -29,6 +29,7 @@ mod sched;
 mod services;
 mod sources;
 mod ui;
+mod update;
 mod wasm;
 
 use clap::Parser;
@@ -500,7 +501,9 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
             let units = controller::run(shared.clone(), runtime, args.log_cap, stopping.clone());
             let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());
             let controllers = controllers::run(shared.clone(), stopping.clone());
-            tokio::join!(units, releases, repositories, sources, controllers);
+            let plans = update::run(shared.clone(), stopping.clone());
+            let system = update::node(shared.clone(), state.clone(), stopping.clone());
+            tokio::join!(units, releases, repositories, sources, controllers, plans, system);
         };
         let names = async {
             if let Some(sockets) = names {

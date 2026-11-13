@@ -163,8 +163,6 @@ spec! {
         pub roles: Vec<NodeRole>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub taints: Vec<Taint>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub os_version: Option<String>,
         /// System extensions layered on at boot.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub extensions: Vec<String>,
@@ -627,10 +625,14 @@ spec! {
 
     pub struct OsReleaseSpec {
         pub version: String,
-        /// Where the signed image lives.
+        /// URL of the signed update file.
         pub image: String,
+        /// The signing key (hex); required.
         #[serde(skip_serializing_if = "Option::is_none")]
-        pub digest: Option<String>,
+        pub public_key: Option<String>,
+        /// Its signature of the file's header.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub signature: Option<String>,
     }
 
     pub struct UpdatePlanSpec {

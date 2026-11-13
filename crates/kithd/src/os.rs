@@ -7,15 +7,18 @@
 //! left is passed over, and the machine is back on the slot that worked.
 //!
 //! An update is one file: a 4096-byte header (a line of JSON, padded: os/update.sh) and
-//! then the pieces it names, in order. Who made it is not checked here.
-// ponytail: no signature. The cluster checks one before a node is given an update
-// (OSRelease, T-0073); `kith.update=` is for whoever is at the machine's boot menu.
+//! then the pieces it names, in order. An update the cluster hands out (an OSRelease, see
+//! `update`) must have its header signed by the release's key ([`signed`]); one given
+//! with `kith.update=` is taken on the word of whoever is at the machine's boot menu.
 
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const HEADER: usize = 4096;
+/// Why an update is not written yet: nothing is wrong with it, and it may be tried again.
+pub const TOO_EARLY: &str = "the slot this node runs from is not marked good yet: an update waits for that";
+
 /// How often the boot loader starts a new slot before it gives up on it.
 const TRIES: u32 = 3;
 const ESP: &str = "/run/esp";
@@ -98,6 +101,22 @@ fn piece(from: &mut impl Read, to: &mut impl Write, piece: &Piece) -> Result<(),
     Ok(())
 }
 
+/// For [`install`]: the header must be signed (`signature`, hex) by the key `public`.
+pub fn signed<'a>(
+    signature: Option<&'a str>,
+    public: Option<&'a str>,
+) -> impl FnOnce(&[u8]) -> Result<(), String> + 'a {
+    move |header| {
+        let (Some(signature), Some(public)) = (signature, public) else {
+            return Err("the release is not signed: it names no publicKey, or no signature".into());
+        };
+        match kith_packages::artifact::signed_by(header, signature, public)? {
+            true => Ok(()),
+            false => Err("the signature is not the release's key's over this update".into()),
+        }
+    }
+}
+
 /// Where a slot is: its two partitions and the ESP's directory of kernel images.
 pub struct Places {
     pub root: PathBuf,
@@ -112,10 +131,20 @@ pub struct Places {
 /// The slot's old kernel image goes first and its new one comes last, by a rename: stopped
 /// anywhere in between, the boot loader knows nothing of this slot and the node starts as
 /// it did before.
-pub fn install(from: &mut impl Read, running: &str, into: char, places: &Places) -> Result<Option<String>, String> {
+///
+/// `vouched` is asked about the header before anything is touched: the header names every
+/// piece's hash, so whoever vouches for it vouches for all of the update.
+pub fn install(
+    from: &mut impl Read,
+    running: &str,
+    into: char,
+    places: &Places,
+    vouched: impl FnOnce(&[u8]) -> Result<(), String>,
+) -> Result<Option<String>, String> {
     let mut block = [0; HEADER];
     from.read_exact(&mut block)
         .map_err(|e| format!("this is not a kith OS update: {e}"))?;
+    vouched(&block)?;
     let header = header(&block)?;
     if running.contains(&header.hash) {
         return Ok(None);
@@ -128,7 +157,7 @@ pub fn install(from: &mut impl Read, running: &str, into: char, places: &Places)
         .iter()
         .any(|(_, _, slot, tries)| *slot != into && tries.is_none())
     {
-        return Err("the slot this node runs from is not marked good yet: an update waits for that".into());
+        return Err(TOO_EARLY.into());
     }
     let new = places.esp.join("kith.new");
     let _ = std::fs::remove_file(&new);
@@ -215,9 +244,8 @@ pub fn esp<T>(with: impl FnOnce(&Path) -> T) -> Result<T, String> {
 }
 
 /// `kith.update=DEVICE`: the update on that disk (a stick, a second disk) goes into the
-/// slot this node does not run from.
+/// slot this node does not run from. Nobody vouches for it but whoever plugged it in.
 pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>, String> {
-    let into = if slot == 'a' { 'b' } else { 'a' };
     let device = Path::new("/dev").join(device);
     // ponytail: a stick takes a moment to be there; ten seconds of looking, not an event.
     for _ in 0..100 {
@@ -227,6 +255,19 @@ pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>,
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let mut from = std::fs::File::open(&device).map_err(|e| format!("{}: {e}", device.display()))?;
+    into_other_slot(&mut from, slot, running, |_| Ok(()))
+}
+
+/// The update read from `from` goes into the slot this node (running from `slot`) does not
+/// run from, if `vouched` says its header may. Says the version written; `None` when it
+/// is what runs here already.
+pub fn into_other_slot(
+    from: &mut impl Read,
+    slot: char,
+    running: &str,
+    vouched: impl FnOnce(&[u8]) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    let into = if slot == 'a' { 'b' } else { 'a' };
     let part = |name: String| crate::init::labelled(&name).ok_or(format!("no partition is labelled {name}"));
     let (root, verity) = (part(format!("root-{into}"))?, part(format!("verity-{into}"))?);
     esp(|esp| {
@@ -235,7 +276,7 @@ pub fn update(device: &str, slot: char, running: &str) -> Result<Option<String>,
             verity,
             esp: esp.into(),
         };
-        install(&mut from, running, into, &places)
+        install(from, running, into, &places, vouched)
     })?
 }
 
@@ -321,7 +362,7 @@ mod tests {
         let places = places("writes");
         std::fs::write(places.esp.join("kith-0-b+0-3.efi"), "a b that failed").unwrap();
         let update = packed(&PIECES, HASH);
-        let wrote = install(&mut update.as_slice(), "kith.slot=a", 'b', &places).unwrap();
+        let wrote = install(&mut update.as_slice(), "kith.slot=a", 'b', &places, |_| Ok(())).unwrap();
         assert_eq!(wrote.as_deref(), Some("9.9"));
         assert!(std::fs::read(&places.root).unwrap().starts_with(b"a root"));
         assert!(std::fs::read(&places.verity).unwrap().starts_with(b"its tree"));
@@ -335,6 +376,7 @@ mod tests {
             "kith.slot=b",
             'a',
             &places,
+            |_| Ok(()),
         );
         assert!(early.unwrap_err().contains("not marked good yet"));
         assert_eq!(names(&places.esp), ["kith-1-a.efi", "kith-2-b+3.efi"]);
@@ -345,6 +387,7 @@ mod tests {
             &format!("verity {HASH} kith.slot=b"),
             'a',
             &places,
+            |_| Ok(()),
         );
         assert_eq!(again, Ok(None));
         assert_eq!(names(&places.esp), ["kith-1-a.efi", "kith-2-b+3.efi"]);
@@ -354,7 +397,7 @@ mod tests {
     fn os_refuses_an_update_that_is_damaged_cut_short_too_big_or_unknown() {
         let refused = |update: &[u8], test: &str| {
             let places = places(test);
-            let why = install(&mut &*update, "kith.slot=a", 'b', &places).unwrap_err();
+            let why = install(&mut &*update, "kith.slot=a", 'b', &places, |_| Ok(())).unwrap_err();
             // The slot the node runs from is as it was, and no kernel image offers the other.
             assert_eq!(names(&places.esp), ["kith-1-a.efi"], "{why}");
             why
@@ -370,6 +413,48 @@ mod tests {
         assert!(refused(&packed(&PIECES[..3], HASH), "kind").contains("does not know"));
         assert!(refused(&packed(&PIECES, "short"), "hash").contains("does not know"));
         assert!(refused(b"not an update", "other").contains("not a kith OS update"));
+    }
+
+    #[test]
+    fn os_writes_a_release_only_when_its_key_signed_the_header() {
+        let (secret, public) = kith_packages::artifact::keygen().unwrap();
+        let (_, another) = kith_packages::artifact::keygen().unwrap();
+        let update = packed(&PIECES, HASH);
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&unhex(&secret)).unwrap();
+        let signature = crate::pki::hex(pair.sign(&update[..HEADER]).as_ref());
+        let run = |update: &[u8], signature: Option<&str>, public: Option<&str>, test: &str| {
+            let places = places(test);
+            let done = install(&mut &*update, "kith.slot=a", 'b', &places, signed(signature, public));
+            // Refused before anything is touched: slot b's partitions are as they were.
+            if done.is_err() {
+                assert_eq!(std::fs::read(&places.root).unwrap(), [0; 64]);
+                assert_eq!(names(&places.esp), ["kith-1-a.efi"]);
+            }
+            done
+        };
+        assert_eq!(
+            run(&update, Some(&signature), Some(&public), "signed"),
+            Ok(Some("9.9".into()))
+        );
+        let not = |done: Result<Option<String>, String>, why: &str| assert!(done.unwrap_err().contains(why));
+        not(run(&update, None, Some(&public), "unsigned"), "not signed");
+        not(run(&update, Some(&signature), None, "keyless"), "not signed");
+        not(
+            run(&update, Some(&signature), Some(&another), "other-key"),
+            "not the release's key's",
+        );
+        not(run(&update, Some("zz"), Some(&public), "not-hex"), "not hex");
+        // A header that says other hashes than the one that was signed.
+        let other: [(&str, &[u8]); 4] = [("root", b"b root"), PIECES[1], PIECES[2], PIECES[3]];
+        not(
+            run(&packed(&other, HASH), Some(&signature), Some(&public), "altered"),
+            "not the release's key's",
+        );
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        let pair = |at| u8::from_str_radix(&text[at..at + 2], 16).unwrap();
+        (0..text.len()).step_by(2).map(pair).collect()
     }
 
     #[test]

@@ -12,7 +12,6 @@ fn node(name: &str, cpu: f64, mem_gi: f64) -> Node {
     let spec = NodeSpec {
         roles: vec![],
         taints: vec![],
-        os_version: None,
         extensions: vec![],
         reserved: None,
         unschedulable: None,

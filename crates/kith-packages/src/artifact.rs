@@ -97,10 +97,18 @@ pub fn verified(blob: &[u8], signature: Option<&str>, public: &str) -> Fallible<
     let package = Package::from_blob(blob)?;
     let (name, version) = (&package.meta.name, &package.meta.version);
     let signature = signature.ok_or(format!("{name} {version} is not signed"))?;
-    let key = UnparsedPublicKey::new(&ED25519, unhex(public, "the public key")?);
-    key.verify(&signed(name, version, blob), &unhex(signature, "the signature")?)
-        .map_err(|_| format!("{name} {version}: the signature is not this key's over this package"))?;
+    if !signed_by(&signed(name, version, blob), signature, public)? {
+        return Err(format!(
+            "{name} {version}: the signature is not this key's over this package"
+        ));
+    }
     Ok(package)
+}
+
+/// Is `signature` (hex) the key `public`'s (hex, from [`keygen`]) over `message`?
+pub fn signed_by(message: &[u8], signature: &str, public: &str) -> Fallible<bool> {
+    let key = UnparsedPublicKey::new(&ED25519, unhex(public, "the public key")?);
+    Ok(key.verify(message, &unhex(signature, "the signature")?).is_ok())
 }
 
 #[cfg(test)]

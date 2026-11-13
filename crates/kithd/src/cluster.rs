@@ -5,7 +5,7 @@
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/claim {token, name}         -> {ca, cert, key}              no certificate needed
-//! POST /v1/tokens                      -> {token}                      local socket only
+//! POST /v1/tokens                      -> {token}                      local socket, or an Identity that may apply Nodes, Roles and RoleBindings
 //! POST /v1/identities/<name>/certificate -> {ca, cert, key}            local socket only
 //! GET  /v1/cluster                    -> {node, leader, voters, learners, applied, mesh}   local socket only
 //! ```
@@ -247,8 +247,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
 
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
-    let admin = Router::new().route("/v1/tokens", post(token));
-    let admin = admin.route("/v1/identities/{name}/certificate", post(certificate));
+    let admin = Router::new().route("/v1/identities/{name}/certificate", post(certificate));
     admin.route("/v1/cluster", get(status)).with_state(shared)
 }
 
@@ -416,8 +415,34 @@ async fn ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
     Ok(cluster(&shared)?.me.ca.clone())
 }
 
-async fn token(State(shared): State<Arc<Shared>>) -> Result<Json<serde_json::Value>, Refusal> {
-    let cluster = cluster(&shared)?;
+/// A join token: for the local socket, and for an Identity that may apply Nodes, Roles
+/// and RoleBindings (a node nobody can log in to has no socket to ask). A node may do
+/// everything, so who brings one in must be someone who could give itself every right
+/// anyway. Not for a node: one that is taken over must not be able to bring others in.
+pub async fn token(
+    State(shared): State<Arc<Shared>>,
+    axum::Extension(caller): axum::Extension<crate::access::Caller>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if matches!(caller, crate::access::Caller::Node(_)) {
+        return refuse(StatusCode::FORBIDDEN, "a node may not make join tokens").into_response();
+    }
+    let node = |_: &_| {
+        ["Node", "Role", "RoleBinding"]
+            .map(|kind| (kind.to_string(), None))
+            .to_vec()
+    };
+    if let Err(refused) = api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, node) {
+        return refused.into_response();
+    }
+    let minted = mint(&shared);
+    let said = minted.as_ref().map(drop).map_err(|_| "no token".to_string());
+    shared.audit.record(&caller, "token", vec!["Node".into()], said);
+    minted.into_response()
+}
+
+fn mint(shared: &Shared) -> Result<Json<serde_json::Value>, Refusal> {
+    let cluster = cluster(shared)?;
     let Some(ca) = &cluster.ca else {
         return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };

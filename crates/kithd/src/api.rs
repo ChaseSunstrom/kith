@@ -56,6 +56,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))
+        .route("/v1/tokens", post(crate::cluster::token))
         .merge(crate::ui::router())
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
@@ -130,7 +131,7 @@ fn place_of(key: &str) -> (String, Option<String>) {
 
 /// A refusal, with the reason, unless `caller` may do `verb` to each of `targets` (a
 /// kind and where). The refusal goes in the audit log.
-fn permit(
+pub(crate) fn permit(
     shared: &Shared,
     caller: &Caller,
     verb: Verb,

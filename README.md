@@ -718,6 +718,12 @@ compare `openssl x509 -noout -fingerprint -sha256` of it with that part, and
 claim with `--cacert` instead. The token is on the node's console: who can
 read that, or its logs, within the hour can claim the cluster.
 
+Such a cluster has no socket to ask for a join token either, so its admin
+asks over TLS: `curl --cacert ca.crt --cert root.crt --key root.key -X POST
+https://10.0.0.7:7443/v1/tokens`. A node may do everything in its cluster, so
+this is only for an Identity that may apply Nodes, Roles and RoleBindings:
+one that could give itself every right anyway.
+
 - What is not allowed is refused with 403 and the reason. `list` and `watch`
   show what the caller may see and no more. An apply is all or nothing: one
   resource it may not apply refuses the whole body.
@@ -890,17 +896,97 @@ then no kernel image offers the half-written slot: the node starts as before.
 The state partition is not part of a slot, so the node is the same node after
 an update, and after going back.
 
-For now an update reaches a node from a disk: put `kith-os.update` on a stick
+An update can reach one node from a disk: put `kith-os.update` on a stick
 (`dd if=kith-os.update of=/dev/sdX`) and start the node once with
 `kith.update=sdX` on its kernel command line (its name on the node, which may
 differ). It writes the other slot and restarts into it, whether the release
 is newer or older than what runs. An update that is what the node runs
 already is skipped, and one given to a node whose own slot is not yet marked
-good is refused: the slot it would replace is the only one known to start. Nothing checks who made the file yet:
-signed releases handed out by the cluster are the next step.
+good is refused: the slot it would replace is the only one known to start.
+Nothing checks who made a file given that way: whoever can plug a disk in and
+change the kernel command line has the machine anyway.
 
-Not yet: an installer and anything written to a real disk, updates signed and
-rolled out by the cluster, a watchdog for a slot that hangs without
+### Rolling a release through the cluster
+
+```sh
+sh ci/vm.sh --test rollout             # three nodes in QEMU take a release in turn
+```
+
+Sign the update with a key of your own, put the file where every node can
+fetch it (any web server), and tell the cluster:
+
+```sh
+kith package keygen release.key                  # prints the public key; keep release.key to yourself
+sh os/update.sh --sign release.key kith-os.update   # prints the signature
+```
+
+```yaml
+apiVersion: kith.dev/v1
+kind: OSRelease
+metadata:
+  name: v0-0-2
+spec:
+  version: 0.0.2
+  image: http://files.example/kith-os-0.0.2.update
+  publicKey: <what keygen printed>
+  signature: <what --sign printed>
+---
+apiVersion: kith.dev/v1
+kind: UpdatePlan
+metadata:
+  name: everyone
+spec:
+  release: v0-0-2
+  selector: { ring: stable }       # nodes with these labels; without it, every node
+  maxUnavailable: 2                # how many at a time (1 unless said)
+  windows: ["Sat,Sun 02:00-05:00"] # UTC; `23:00-04:00` is every night; none: any time
+  drain: true                      # place no new workloads on a node while it updates
+```
+
+The signature is over the update's header, which names the SHA-256 of every
+piece, so a node checks the signature before it writes a byte and each piece as
+it writes it. A release without a key, one signed by another key, a file
+changed after signing, and a file that is another version than the release
+says are all refused. The address may be plain HTTP for that reason: what
+comes from it is trusted for the signature alone.
+
+The key is the one the OSRelease names: nothing in a node says which keys it
+accepts, and an older version is taken as readily as a newer one. Whoever may
+apply an OSRelease and an UpdatePlan decides what every node runs, so give
+those two kinds to nobody who is not the cluster's admin.
+
+The node that leads the cluster picks who goes next: nodes that do not vote
+on the store first, `maxUnavailable` at a time; then the voters, one at a
+time, each only while every other voter is up, and itself last. A node whose
+turn it is fetches the file, writes its other slot and restarts; every kith OS
+node says what it runs in its Node's status (`os.version`, `os.slot`), and
+the plan's status says where the rollout is:
+
+```
+status:
+  phase: Progressing      # or Done, Waiting (outside its windows, no such release), Paused
+  nodes: { n2: done, n3: updating }
+```
+
+`Paused`, with a `reason`, means a node did not take the release: it refused
+the file, or it restarted into the new slot three times, the boot loader gave
+up, and it is back on the system it had (`os.failed` in its Node's status).
+Nobody else is given that release. The plan stays paused until the OSRelease
+is changed (signed properly, another address) or the plan names another
+release, and then starts over. `paused: true` in the plan's spec stops it by
+hand, for as long as it is there; a node already told to go finishes.
+
+With fewer than three voting nodes the store cannot be written while one of
+them restarts, as with any restart of such a node. While a voting node is
+away, no other is restarted, and the plan's `reason` says it is waiting.
+
+A node told to update that says nothing for fifteen minutes counts as failed
+(and as done after all if it then turns up running the release). `waitForIdleSeats` is accepted and does nothing yet (there are no seats),
+`drain` stops new placements but moves nothing that already runs there, and a
+download that breaks counts as a refusal: nothing was written, and the plan
+is paused.
+
+Not yet: an installer and anything written to a real disk, a watchdog for a slot that hangs without
 stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk and being encrypted, drivers for Wi-Fi,
