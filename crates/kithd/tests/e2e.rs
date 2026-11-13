@@ -49,6 +49,12 @@ impl Daemon {
             // A relative state directory has to work too.
             .current_dir(dir)
             .args(["--state", "state"])
+            // (No two of these on one machine serve Images on one port: only who asks does.)
+            .args(if args.contains(&"--registry-port") {
+                vec![]
+            } else {
+                vec!["--registry-port", "0"]
+            })
             .arg("--socket")
             .arg(dir.join("kithd.sock"))
             .args(args)
@@ -2329,5 +2335,116 @@ spec:
     assert!(
         console.contains("Kernel panic"),
         "it had no root to go on with: {console}"
+    );
+}
+
+/// The cluster makes an image of its own and runs it: a Job fills a Volume, an Image packs
+/// the volume when the Job has succeeded, the node's registry serves it, and a Job whose
+/// container is that image runs what was built. (The container needs a program with no
+/// libraries: kith built for musl, `sh ci/musl.sh`, or `KITH_E2E_STATIC`; without one the
+/// test ends once the registry has served the image.)
+#[test]
+fn an_image_built_in_the_cluster_is_pulled_from_its_registry_and_run() {
+    use std::io::{Read, Write};
+    if !e2e() {
+        return;
+    }
+    let port = free_port();
+    let args: &'static [&'static str] = Box::leak(Box::new([
+        "--registry-port",
+        Box::leak(port.to_string().into_boxed_str()),
+    ]));
+    let daemon = Daemon::start_with("image", args);
+    let musl = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/x86_64-unknown-linux-musl/release/kith");
+    let fixed = std::env::var("KITH_E2E_STATIC")
+        .ok()
+        .map(PathBuf::from)
+        .or(musl.exists().then_some(musl));
+    let program = fixed.clone().unwrap_or(daemon.kith.clone());
+    let root = daemon.dir.join("state/volumes/default/out/root");
+    let build = format!(
+        "mkdir -p {0}/bin && cp {1} {0}/bin/kith",
+        root.display(),
+        program.display()
+    );
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1
+kind: Volume
+metadata: {{ name: out }}
+spec: {{ node: local, path: root }}
+---
+{}---
+apiVersion: kith.dev/v1
+kind: Image
+metadata: {{ name: hello }}
+spec:
+  volume: out
+  tag: '1'
+  job: build
+  entrypoint: [/bin/kith]
+  cmd: [schema]
+",
+        exec("Job", "build", &build, "")
+    ));
+    wait_for("the image to be made", || {
+        daemon.status("Image/hello")["digest"].is_string()
+    });
+    let status = daemon.status("Image/hello");
+    let digest = status["digest"].as_str().unwrap();
+    assert_eq!(status["blobs"].as_object().unwrap().len(), 3, "{status}");
+
+    // The registry: the manifest by its tag, under its digest; nothing under another tag.
+    let get = |path: &str| {
+        let mut registry = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(
+            registry,
+            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut reply = String::new();
+        registry.read_to_string(&mut reply).unwrap();
+        reply
+    };
+    assert!(get("/v2/").starts_with("HTTP/1.1 200"));
+    let manifest = get("/v2/default/hello/manifests/1");
+    assert!(manifest.starts_with("HTTP/1.1 200"), "{manifest}");
+    assert!(
+        manifest.contains(&format!("docker-content-digest: {digest}")),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("application/vnd.oci.image.layer.v1.tar"),
+        "{manifest}"
+    );
+    assert!(get("/v2/default/hello/manifests/2").starts_with("HTTP/1.1 404"));
+    assert!(get("/v2/other/hello/manifests/1").starts_with("HTTP/1.1 404"));
+
+    if fixed.is_none() {
+        return eprintln!("the image was not run: no static program (sh ci/musl.sh, or KITH_E2E_STATIC)");
+    }
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1
+kind: Job
+metadata: {{ name: run }}
+spec:
+  template:
+    containers:
+      - name: main
+        image: 127.0.0.1:{port}/default/hello:1
+"
+    ));
+    wait_for("what was built to run", || {
+        let status = daemon.status("Job/run");
+        assert_ne!(
+            status["state"],
+            "failed",
+            "{status} {}",
+            daemon.log("j_default_run_0_main")
+        );
+        status["state"] == "succeeded"
+    });
+    assert!(
+        daemon.log("j_default_run_0_main").contains("Workload"),
+        "it ran `kith schema`"
     );
 }

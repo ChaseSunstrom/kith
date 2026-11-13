@@ -388,15 +388,19 @@ async fn make(shared: &Shared, state: &Path, job: &Job, at: u64) -> Result<Value
     Ok(json!({ "at": at, "size": size, "object": object }))
 }
 
-/// Does a Backup of `namespace` other than `but` still list `blob`?
-fn listed(store: &Store, namespace: &str, but: &str, blob: &str) -> bool {
-    let lists = |backup: &kith_api::Resource| {
-        let backups = backup.status.as_ref().and_then(|status| status["backups"].as_array());
-        backups.into_iter().flatten().any(|entry| entry["blob"] == blob)
+/// Does a Backup or an Image of `namespace` other than `but` still list `blob`? (The same
+/// bytes are one blob, whichever of them made it first.)
+pub(crate) fn listed(store: &Store, namespace: &str, but: &str, blob: &str) -> bool {
+    let lists = |other: &kith_api::Resource| {
+        let Some(status) = &other.status else { return false };
+        let backups = status["backups"].as_array().into_iter().flatten();
+        let pieces = status["blobs"].as_object().into_iter().flatten();
+        backups.into_iter().any(|entry| entry["blob"] == blob) || pieces.into_iter().any(|(_, piece)| piece == blob)
     };
-    let others = store.list(Some("Backup")).filter(|backup| backup.key() != but);
+    let others = store.list(Some("Backup")).chain(store.list(Some("Image")));
     others
-        .filter(|backup| backup.metadata.namespace.as_deref().unwrap_or("default") == namespace)
+        .filter(|other| other.key() != but)
+        .filter(|other| other.metadata.namespace.as_deref().unwrap_or("default") == namespace)
         .any(lists)
 }
 

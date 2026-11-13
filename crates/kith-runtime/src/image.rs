@@ -145,7 +145,10 @@ impl ImageStore {
                 "image `{reference}` is not here and its pull policy is `never`"
             ));
         }
-        let client = Client::new(ClientConfig::default());
+        let client = Client::new(ClientConfig {
+            protocol: protocol(reference.registry()),
+            ..ClientConfig::default()
+        });
         let auth = RegistryAuth::Anonymous;
         let (manifest, digest, config) = client
             .pull_manifest_and_config(&reference, &auth)
@@ -215,6 +218,19 @@ impl ImageStore {
             }
         }
         Ok(image)
+    }
+}
+
+/// How `registry` (`host[:port]`) is asked: with TLS, but for one on this very machine (as
+/// container tools do), which is where a node serves the cluster's own Images.
+fn protocol(registry: &str) -> oci_client::client::ClientProtocol {
+    let host = match registry.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+        Some((v6, _)) => v6,
+        None => registry.rsplit_once(':').map_or(registry, |(host, _)| host),
+    };
+    match ["localhost", "127.0.0.1", "::1"].contains(&host) {
+        true => oci_client::client::ClientProtocol::Http,
+        false => oci_client::client::ClientProtocol::Https,
     }
 }
 
@@ -652,6 +668,24 @@ mod tests {
         .unwrap_err();
         assert!(e.to_string().contains("unsupported layer type"), "{e}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only a registry on this machine is asked without TLS.
+    #[test]
+    fn image_pulls_use_plain_http_for_this_machine_only() {
+        use oci_client::client::ClientProtocol::{Http, Https};
+        for local in ["localhost:5000", "127.0.0.1:5000", "localhost", "[::1]:5000", "[::1]"] {
+            assert!(matches!(protocol(local), Http), "{local}");
+        }
+        for far in [
+            "registry.example:5000",
+            "docker.io",
+            "localhost.example.org",
+            "127.0.0.1.example:80",
+            "10.0.0.1:5000",
+        ] {
+            assert!(matches!(protocol(far), Https), "{far}");
+        }
     }
 
     #[test]

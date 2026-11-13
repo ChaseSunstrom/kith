@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["node", "builder", "script"],
+  "properties": {
+    "node": { "type": "string" },
+    "builder": { "type": "string", "minLength": 1 },
+    "script": { "type": "string" },
+    "tag": { "type": "string", "minLength": 1 },
+    "entrypoint": { "type": "array", "items": { "type": "string" } },
+    "cmd": { "type": "array", "items": { "type": "string" } },
+    "env": { "type": "array", "items": { "type": "string" } },
+    "copies": { "type": "integer", "minimum": 1 },
+    "reserve": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } }
+    }
+  }
+}

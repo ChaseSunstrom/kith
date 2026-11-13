@@ -563,6 +563,32 @@ spec! {
         pub copies: Option<u32>,
     }
 
+    /// A container image made in the cluster: a Volume's directory, packed by the volume's
+    /// node as the image's one layer and kept as Blobs. Every node serves it to itself as
+    /// `localhost:PORT/NAMESPACE/NAME:TAG`.
+    pub struct ImageSpec {
+        /// The Volume, in this namespace, whose directory is the image's root.
+        pub volume: String,
+        /// [default: latest] Made once for a spec: a new tag is a new image.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tag: Option<String>,
+        /// A Job, in this namespace, that fills the volume: the image is made when it has succeeded.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub job: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub entrypoint: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub cmd: Vec<String>,
+        /// `NAME=value` entries.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub env: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub working_dir: Option<String>,
+        /// How many nodes keep the image's blobs [default: 2].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub copies: Option<u32>,
+    }
+
     /// A Volume's directory as an archive, made every so often by the volume's node and
     /// kept as a blob (on other nodes too) or in an S3 bucket.
     pub struct BackupSpec {
@@ -995,6 +1021,35 @@ impl Spec for ShareSpec {
                 Some((_, length)) if length < 8 => return Err(format!("nfs.clients: `{client}` is wider than a /8")),
                 Some(_) => {}
             }
+        }
+        Ok(())
+    }
+}
+
+impl ImageSpec {
+    /// The tag it is served under.
+    pub fn tag(&self) -> &str {
+        self.tag.as_deref().unwrap_or("latest")
+    }
+}
+
+impl Spec for ImageSpec {
+    fn check(&self) -> Result<(), String> {
+        // (A tag as registries have them: it is part of a URL's path.)
+        let tag = self.tag();
+        let plain = |b: u8| b.is_ascii_alphanumeric() || b"._-".contains(&b);
+        if tag.is_empty() || tag.len() > 128 || !tag.bytes().all(plain) || tag.starts_with(['.', '-']) {
+            return Err(format!("tag: `{tag}` is not a tag (letters, digits, `.`, `_`, `-`)"));
+        }
+        if let Some(bad) = self
+            .env
+            .iter()
+            .find(|entry| !entry.split_once('=').is_some_and(|(name, _)| !name.is_empty()))
+        {
+            return Err(format!("env: `{bad}` is not NAME=value"));
+        }
+        if self.working_dir.as_ref().is_some_and(|dir| !dir.starts_with('/')) {
+            return Err("workingDir: an absolute path".into());
         }
         Ok(())
     }

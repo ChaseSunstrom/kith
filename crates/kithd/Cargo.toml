@@ -49,6 +49,7 @@ futures-util = "0.3"
 tar = { version = "0.4", default-features = false }
 # The blob store's names. `pure`: no C or assembly to build for musl.
 blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
+sha2 = "0.11"
 
 [dev-dependencies]
 serde_json.workspace = true

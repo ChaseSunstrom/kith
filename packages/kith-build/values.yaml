@@ -1,0 +1,23 @@
+# The node the build runs on: its volume, with what the build leaves, is there. Set it.
+node: ""
+# The image the build's steps run in: one with the tools the script needs. It may be an
+# image this package built before (localhost:5000/NAMESPACE/NAME:TAG).
+builder: registry.example/tools:1
+# The steps: a shell script, run in the builder with /out mounted. Whatever it leaves under
+# /out is the whole root of the image (no base image is put under it): programs with their
+# libraries, or static ones.
+script: ""
+# The image is served as localhost:5000/NAMESPACE/RELEASE:TAG. A node keeps a tag it has
+# pulled: give each build that should roll out a new tag.
+tag: "1"
+# What a container of the image runs, when its workload says nothing else.
+entrypoint: []
+cmd: []
+# NAME=value entries.
+env: []
+# How many nodes keep the image's bytes.
+copies: 2
+# What the build is promised on its node (CPUs, memory).
+reserve:
+  cpu: "1"
+  memory: 512Mi

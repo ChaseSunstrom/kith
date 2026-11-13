@@ -1,0 +1,5 @@
+# Builds a container image inside the cluster and serves it from the cluster's registry.
+name: kith-build
+version: 0.1.0
+description: Build a container image in the cluster and run it from the cluster's own registry
+kithVersion: ">=0.0.1"

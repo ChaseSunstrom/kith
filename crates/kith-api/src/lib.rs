@@ -113,6 +113,7 @@ kinds! {
     VolumeClaim: VolumeClaimSpec, namespaced, "A request for storage";
     Blob: BlobSpec, namespaced, "Bytes named by their BLAKE3 hash, kept on several nodes";
     Backup: BackupSpec, namespaced, "A Volume archived on a schedule, to blobs or S3";
+    Image: ImageSpec, namespaced, "A container image made from a Volume and served by the cluster's registry";
     Share: ShareSpec, namespaced, "A Volume given to machines that are not nodes, over NFS and SMB";
     Secret: SecretSpec, namespaced, "Secrets, delivered as files or env vars";
     ConfigMap: ConfigMapSpec, namespaced, "Configuration, delivered as files or env vars";

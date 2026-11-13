@@ -263,7 +263,7 @@ fn examples_and_schemas() {
     assert_eq!(sb.kith(&["diff", "-f", examples]).0, 0);
 
     let (_, out, _) = sb.kith(&["schema"]);
-    assert_eq!(out.lines().count(), 33);
+    assert_eq!(out.lines().count(), 34);
     let (_, out, _) = sb.kith(&["schema", "workload"]);
     let schema: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(schema["title"], "Workload");
@@ -294,6 +294,38 @@ fn a_silent_daemon_times_out() {
 
 /// The nas package: a Share for the volume, and (when it names SMB users) the Samba
 /// container with the volume mounted and each user's password from the Secret.
+/// The kith-build package: a Volume for what the build leaves, a Job that runs the steps
+/// with it at /out, and an Image of that volume, made when that Job has succeeded.
+#[test]
+fn the_kith_build_package_renders_a_volume_a_job_and_an_image() {
+    let sandbox = Sandbox::new("kith-build");
+    let package = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/kith-build");
+    let (code, out, err) = sandbox.kith(&["package", "lint", package]);
+    assert_eq!((code, out.as_str()), (0, "kith-build 0.1.0 ok\n"), "{err}");
+    let mine = "node: n1\nbuilder: localhost:5000/default/tools:3\nscript: |\n  cp /bin/hello /out/hello\n  echo 'it''s \"done\"'\ntag: v2\nentrypoint: [/hello]\nenv: [A=b]\n";
+    sandbox.write("mine.yaml", mine);
+    let (code, out, notes) = sandbox.kith(&["package", "render", package, "--name", "hello", "-f", "mine.yaml"]);
+    assert_eq!(code, 0, "{notes}");
+    let kinds: Vec<&str> = out.lines().filter(|line| line.starts_with("kind: ")).collect();
+    assert_eq!(kinds, ["kind: Volume", "kind: Job", "kind: Image"], "{out}");
+    let name = "hello-kith-build";
+    assert!(out.contains("  node: n1\n  path: root\n"), "{out}");
+    assert!(
+        out.contains(&format!("          - volume: {name}-root\n            path: /out\n")),
+        "{out}"
+    );
+    assert!(out.contains("image: localhost:5000/default/tools:3"), "{out}");
+    // (The script is one argument, whatever is in it.)
+    let script =
+        "          - |\n            cp /bin/hello /out/hello\n            echo 'it''s \"done\"'\n        resources:";
+    assert!(out.contains(script), "{out}");
+    let image = format!(
+        "  volume: {name}-root\n  tag: v2\n  job: {name}-build\n  entrypoint:\n    - /hello\n  env:\n    - A=b\n  copies: 2\n"
+    );
+    assert!(out.contains(&image), "{out}");
+    assert!(notes.contains(&format!("localhost:5000/default/{name}:v2")), "{notes}");
+}
+
 #[test]
 fn the_nas_package_renders_a_share_and_its_smb_server() {
     let sandbox = Sandbox::new("nas");

@@ -252,6 +252,8 @@ fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>
     // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
     // writes one must be allowed to read both.
     permit(shared, caller, Verb::Get, |_| of("Backup", &["Volume", "Secret"]))?;
+    // An Image is a Volume's files, for every process of every node to read.
+    permit(shared, caller, Verb::Get, |_| of("Image", &["Volume"]))?;
     // A Share gives a Volume's files, to read and to write, to whom it names: whoever
     // writes one must be allowed to write the Volume.
     permit(shared, caller, Verb::Apply, |_| of("Share", &["Volume"]))
@@ -629,6 +631,11 @@ apiVersion: kith.dev/v1
 kind: RoleBinding
 metadata: {name: bob-sharer}
 spec: {role: sharer, subjects: [bob]}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: bob}
+spec: {}
 ";
         {
             let mut state = shared.store.lock().unwrap();
@@ -647,6 +654,10 @@ spec: {role: sharer, subjects: [bob]}
         assert!(reach(&shared, &bob, &backup).is_err(), "bob may not read Secrets");
         assert!(reach(&shared, &Caller::Admin, &share).is_ok());
         assert!(reach(&shared, &Caller::Admin, &backup).is_ok());
+        // An Image gives a Volume's files to every process of every node: leave to read it.
+        let image = one("apiVersion: kith.dev/v1\nkind: Image\nmetadata: {name: i}\nspec: {volume: v}\n");
+        assert!(reach(&shared, &bob, &image).is_ok(), "bob may read Volumes");
+        assert!(reach(&shared, &Caller::Identity("eve".into()), &image).is_err());
         // Going back to a revision of one is writing it.
         assert!(reach_of(&shared, &bob, &[place_of("Share/default/s")]).is_err());
         assert!(reach_of(&shared, &bob, &[place_of("ConfigMap/default/c")]).is_ok());

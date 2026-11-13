@@ -1,0 +1,2 @@
+{{ name }} is built on {{ values.node }} and served to every node as localhost:5000/{{ release.namespace }}/{{ name }}:{{ values.tag }}.
+`kith get job {{ name }}-build` says how the build went (`kith logs Job/{{ name }}-build`); `kith get image {{ name }} -o yaml` has the image's digest once it is made.

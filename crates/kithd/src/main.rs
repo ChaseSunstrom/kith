@@ -20,6 +20,7 @@ mod crypt;
 mod devices;
 mod dhcp;
 mod dns;
+mod images;
 mod ingress;
 mod init;
 mod install;
@@ -100,6 +101,10 @@ struct Args {
     /// Seconds between asking registries for newer packages (for Releases that name a Repository)
     #[arg(long, env = "KITH_REPOSITORY_POLL", value_name = "SECONDS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
     repository_poll: u64,
+    /// The port on 127.0.0.1 where this node serves the cluster's Images to itself, as a
+    /// registry to pull from (0: not served)
+    #[arg(long, env = "KITH_REGISTRY_PORT", value_name = "PORT", default_value_t = 5000)]
+    registry_port: u16,
     /// A key (hex) this node takes kith OS releases from; repeat for more. Without one,
     /// the key of the first release it updates to is kept, and only that one is taken after
     #[arg(long, env = "KITH_RELEASE_KEY", value_name = "KEY", value_delimiter = ',', value_parser = release_key)]
@@ -664,7 +669,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let blobs = blobs::run(shared.clone(), stopping.clone());
         let backups = backups::run(shared.clone(), state.clone(), stopping.clone());
         let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
-        let storage = async { tokio::join!(shares, blobs, backups, replicas) };
+        let images = images::run(shared.clone(), state.clone(), stopping.clone());
+        let registry = images::serve(shared.clone(), args.registry_port, stopping.clone());
+        let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry) };
         let (served, nodes, (), (), (), (), (), _) =
             tokio::join!(server, nodes, work, names, mesh, proxy, ingress, storage);
         let _ = shared.raft.shutdown().await;

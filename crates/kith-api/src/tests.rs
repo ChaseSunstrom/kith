@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 32);
+    assert_eq!(KINDS.len(), 33);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -682,6 +682,41 @@ fn batches_and_dry_runs_leave_the_store_as_it_was() {
     store.apply_all(vec![cm("a", "2"), cm("e", "1")]).unwrap();
     assert_eq!(store.get("ConfigMap/default/a").unwrap().metadata.revision, Some(2));
     assert!(store.get("ConfigMap/default/e").is_some());
+}
+
+#[test]
+fn an_image_kind_names_a_volume_and_a_tag_a_registry_can_serve() {
+    let image = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Image\nmetadata: {{ name: hello }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    image("{ volume: out }").unwrap();
+    image("{ volume: out, tag: v1.2_rc-3, job: build, entrypoint: [/bin/hello], env: ['A=b=c', 'EMPTY='], workingDir: /srv }").unwrap();
+    assert!(image("{ tag: '1' }").unwrap_err().contains("volume"));
+    for bad in ["a/b", "a:b", "-a", ".a", "é", "'a b'", "''"] {
+        assert!(
+            image(&format!("{{ volume: out, tag: {bad} }}"))
+                .unwrap_err()
+                .contains("tag:"),
+            "{bad}"
+        );
+    }
+    assert!(
+        image("{ volume: out, env: [NOPE] }")
+            .unwrap_err()
+            .contains("NAME=value")
+    );
+    assert!(
+        image("{ volume: out, env: ['=x'] }")
+            .unwrap_err()
+            .contains("NAME=value")
+    );
+    assert!(
+        image("{ volume: out, workingDir: srv }")
+            .unwrap_err()
+            .contains("workingDir")
+    );
 }
 
 #[test]

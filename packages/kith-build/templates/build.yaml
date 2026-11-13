@@ -1,0 +1,45 @@
+# Where the build leaves the image's root.
+apiVersion: kith.dev/v1
+kind: Volume
+metadata:
+  name: {{ name }}-root
+spec:
+  node: {{ values.node | tojson }}
+  path: root
+---
+# The build: the steps, in the builder, with the volume at /out. (Its mount puts it on the
+# volume's node.) Changed, it runs again.
+apiVersion: kith.dev/v1
+kind: Job
+metadata:
+  name: {{ name }}-build
+spec:
+  template:
+    restartPolicy: never
+    containers:
+      - name: build
+        image: {{ values.builder | tojson }}
+        command: ["/bin/sh", "-c", {{ values.script | tojson }}]
+        resources: {{ values.reserve | tojson }}
+        volumeMounts:
+          - { volume: {{ name }}-root, path: /out }
+---
+# The image: the volume, packed by its node when the build has succeeded.
+apiVersion: kith.dev/v1
+kind: Image
+metadata:
+  name: {{ name }}
+spec:
+  volume: {{ name }}-root
+  job: {{ name }}-build
+  tag: {{ values.tag | tojson }}
+  copies: {{ values.copies }}
+  {%- if values.entrypoint %}
+  entrypoint: {{ values.entrypoint | tojson }}
+  {%- endif %}
+  {%- if values.cmd %}
+  cmd: {{ values.cmd | tojson }}
+  {%- endif %}
+  {%- if values.env %}
+  env: {{ values.env | tojson }}
+  {%- endif %}

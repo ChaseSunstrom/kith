@@ -1237,6 +1237,72 @@ spec:
   archive goes to a bucket in one request (5 GiB at most on Amazon's S3). Deleting a Backup
   leaves the blobs and objects it made.
 
+### Images made in the cluster
+
+The cluster can build a container image and run it without asking any registry outside it.
+A build is an ordinary Job that leaves the image's files in a Volume; an `Image` is that
+volume, packed:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Image
+metadata: { name: hello }
+spec:
+  volume: hello-root          # its directory is the image's root
+  job: hello-build            # made when this Job has succeeded (leave out: made at once)
+  tag: "1"                    # latest, unless said
+  entrypoint: [/bin/hello]    # and cmd, env (NAME=value), workingDir
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: hello }
+spec:
+  template:
+    containers: [{ name: run, image: "localhost:5000/default/hello:1" }]
+```
+
+- The volume's node packs the directory as the image's one layer and keeps the layer, the
+  image's config and its manifest as Blobs (`copies` nodes hold them, 2 unless said).
+  `kith get image hello -o yaml` has the `digest` when it is made, or a `message` saying why
+  it was not (tried again every minute).
+- **The registry.** Every node's kithd serves the cluster's Images to its own machine, on
+  `127.0.0.1:5000` (`--registry-port`; 0 turns it off), as an OCI registry that can only be
+  read: `localhost:5000/NAMESPACE/NAME:TAG` is the Image `NAME` of `NAMESPACE` on whichever
+  node asks, fetched from a node that holds its Blobs. kith pulls from a registry on
+  `localhost` without TLS, as container tools do (`docker pull localhost:5000/default/hello:1`
+  works on a node too).
+- **The `kith-build` package** renders the three pieces from a few values: a Volume on the
+  node you name, a Job that runs your script in a builder image with the volume at `/out`,
+  and the Image.
+
+  ```sh
+  kith package render packages/kith-build --name hello --set node=n1 \
+      --set builder=registry.example/tools:1 --set tag=2 --set 'entrypoint=[/hello]' \
+      --set 'script=cc -static -o /out/hello /src/hello.c' | kith apply -f -
+  ```
+
+  The builder can be an image built this way before, so a cluster that has one image with
+  tools in it needs nothing from outside for the next.
+- Nothing privileged builds: no daemon, no nested containers. The steps are a Job's
+  containers, sandboxed like any other, and packing is reading a directory (a link in it
+  stays a link).
+- An Image is made once for its spec and for a run of its Job: change the Job and it is
+  made again when the Job has succeeded again. A node keeps a tag it has pulled, so give
+  what should roll out a new tag (the tag it had is then served no more). A Job deleted
+  and applied again just as it was is not seen as a new run: change the tag.
+- Who may: writing an Image takes leave to read its Volume (checked on `kith apply` and a
+  rollback; an Image a Release renders is written by the release, as a Backup is). Every process on a node
+  (containers too: they share its network) can read every Image of the cluster from the
+  registry: put no secrets in one.
+- Not yet (ponytail): a base image under the layer (`FROM`): the volume holds the whole
+  root, programs with their libraries or static ones; Dockerfiles; pushing into the
+  registry with `docker push`; a registry other machines can reach; deleting an Image
+  leaves its Blobs (`kith delete blob`); an Image that waits for its Volume or its Job says
+  nothing in its status. Tested: a Job fills a Volume, the Image is made, the registry
+  serves it and a Job whose container is that image runs it, on one node; not tested: a
+  pull on another node than the one that built (the Blobs travel as any Blob does), and
+  building kith OS this way.
+
 ### Remote apps
 
 `kith run --on NODE|SELECTOR [--via PROGRAM] -- APP [ARGS…]` runs a
