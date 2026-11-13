@@ -74,9 +74,9 @@ struct Args {
     /// This node's name in the cluster [default: the hostname]
     #[arg(long, env = "KITH_NAME", value_name = "NAME")]
     name: Option<String>,
-    /// The address other nodes reach this one at, when it is not the one it listens on
+    /// The address other nodes reach this one at, when it is not the one it listens on (an IP address: a name is not looked up)
     #[arg(long, env = "KITH_ADVERTISE", value_name = "ADDR:PORT")]
-    advertise: Option<String>,
+    advertise: Option<std::net::SocketAddr>,
     /// While the cluster has no Identity, print a one-time token at start: whoever sends it to /v1/claim on --listen becomes its admin (for a node nobody can log in to)
     #[arg(long, env = "KITH_CLAIM")]
     claim: bool,
@@ -553,7 +553,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             };
             let address = tcp.local_addr().map_err(|e| fail("listening", &e))?;
             // A machine that asked its network for an address says the one it was given.
-            let mut advertise = args.advertise.clone();
+            let mut advertise = args.advertise.map(|at| at.to_string());
             if first_process && advertise.is_none() && address.ip().is_unspecified() && cluster.ca.is_some() {
                 for _ in 0..600 {
                     if init::ADDRESS.get().is_some() || *stopping.borrow() {
@@ -662,6 +662,15 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advertise_is_an_address_not_a_name() {
+        use clap::Parser;
+        let parse = |at: &str| super::Args::try_parse_from(["kithd", "--advertise", at]);
+        assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
+        assert!(parse("10.0.0.5:7443").is_ok());
+        assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
 
