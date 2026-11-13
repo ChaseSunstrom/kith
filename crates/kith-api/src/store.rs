@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Revisions kept per resource; older ones are dropped.
 pub const HISTORY_LIMIT: usize = 100;
+pub const PACKAGE_HISTORY_LIMIT: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Error {
@@ -138,7 +139,13 @@ impl Store {
                 at: self.clock.unwrap_or_else(now),
                 resource: change.after.clone(),
             });
-            if history.len() > HISTORY_LIMIT {
+            // A Package carries its files (up to 4 MB), so it keeps few revisions.
+            let limit = if change.after.kind == "Package" {
+                PACKAGE_HISTORY_LIMIT
+            } else {
+                HISTORY_LIMIT
+            };
+            while history.len() > limit {
                 history.remove(0);
             }
         }

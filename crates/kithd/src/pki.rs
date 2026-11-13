@@ -29,6 +29,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const ANY_NODE: &str = "kith";
 /// What a node's own name is filed under in its certificate.
 const NODE_SUFFIX: &str = ".node.kith";
+/// And an Identity's. A name is one label, so neither can be made to look like the other.
+const USER_SUFFIX: &str = ".user.kith";
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
 
 type Fallible<T> = Result<T, String>;
@@ -37,7 +39,8 @@ fn tls<T>(what: &str, result: Result<T, impl std::fmt::Display>) -> Fallible<T> 
     result.map_err(|e| format!("{what}: {e}"))
 }
 
-/// A node name is one DNS label: it becomes `<name>.node.kith`.
+/// A node name is one DNS label: it becomes `<name>.node.kith` (and that of an Identity
+/// with a certificate `<name>.user.kith`).
 pub fn valid_name(name: &str) -> Fallible<()> {
     let ok = (1..=63).contains(&name.len())
         && name
@@ -46,7 +49,7 @@ pub fn valid_name(name: &str) -> Fallible<()> {
         && !name.starts_with('-')
         && !name.ends_with('-');
     ok.then_some(()).ok_or(format!(
-        "`{name}` cannot be a node name: use 1 to 63 of a-z, 0-9 and `-`, not starting or ending with `-`"
+        "`{name}` cannot be named in a certificate: use 1 to 63 of a-z, 0-9 and `-`, not starting or ending with `-`"
     ))
 }
 
@@ -89,19 +92,38 @@ impl Ca {
 
     /// A key pair and certificate for the node `name`, as (certificate, key).
     pub fn issue(&self, name: &str) -> Fallible<(String, String)> {
+        let names = vec![format!("{name}{NODE_SUFFIX}"), ANY_NODE.into()];
+        let both = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        let (cert, key) = self.sign(name, names, both)?;
+        Ok((cert, key.serialize_pem()))
+    }
+
+    /// A key pair and certificate for the Identity `name`: good for calling the API, not
+    /// for being a node. As (certificate, key, public key), the last to go in the Identity.
+    pub fn issue_user(&self, name: &str) -> Fallible<(String, String, String)> {
+        let names = vec![format!("{name}{USER_SUFFIX}")];
+        let (cert, key) = self.sign(name, names, vec![ExtendedKeyUsagePurpose::ClientAuth])?;
+        Ok((cert, key.serialize_pem(), key.public_key_pem()))
+    }
+
+    fn sign(
+        &self,
+        name: &str,
+        names: Vec<String>,
+        usages: Vec<ExtendedKeyUsagePurpose>,
+    ) -> Fallible<(String, KeyPair)> {
         valid_name(name)?;
-        let names = [format!("{name}{NODE_SUFFIX}"), ANY_NODE.into()];
         let mut params = tls("naming the certificate", CertificateParams::new(names))?;
         params.distinguished_name.push(DnType::CommonName, name);
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+        params.extended_key_usages = usages;
         params.use_authority_key_identifier_extension = true;
         params.not_after = rcgen::date_time_ymd(year_in(10), 1, 1);
-        let key = tls("making the node key", KeyPair::generate())?;
+        let key = tls("making the key", KeyPair::generate())?;
         // The issuer is rebuilt from the same parameters the CA certificate was made with.
         let issuer = Issuer::new(ca_params(), &self.key);
-        let cert = tls("signing the node certificate", params.signed_by(&key, &issuer))?;
-        Ok((cert.pem(), key.serialize_pem()))
+        let cert = tls("signing the certificate", params.signed_by(&key, &issuer))?;
+        Ok((cert.pem(), key))
     }
 }
 
@@ -290,11 +312,28 @@ pub fn client_config(ca: &str, me: Option<&Identity>) -> Fallible<ClientConfig> 
     }
 }
 
-/// The node a verified client certificate belongs to.
-pub fn node_of(cert: &CertificateDer<'_>) -> Option<String> {
+/// Whose a verified client certificate is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Subject {
+    Node(String),
+    /// An Identity, and the public key (DER) the certificate is for: it stands for the
+    /// Identity only while that names the same key.
+    User(String, Vec<u8>),
+}
+
+pub fn subject_of(cert: &CertificateDer<'_>) -> Option<Subject> {
     let cert = webpki::EndEntityCert::try_from(cert).ok()?;
-    let mut names = cert.valid_dns_names();
-    names.find_map(|name| name.strip_suffix(NODE_SUFFIX).map(String::from))
+    let named = |suffix| cert.valid_dns_names().find_map(|name| name.strip_suffix(suffix));
+    match (named(NODE_SUFFIX), named(USER_SUFFIX)) {
+        (Some(node), _) => Some(Subject::Node(node.into())),
+        (None, Some(user)) => Some(Subject::User(user.into(), cert.subject_public_key_info().to_vec())),
+        (None, None) => None,
+    }
+}
+
+/// Is `pem` (an Identity's `publicKey`) the key `der`?
+pub fn same_key(pem: &str, der: &[u8]) -> bool {
+    rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).is_ok_and(|key| key.as_ref() == der)
 }
 
 /// Join tokens: `kith1.<secret>.<CA fingerprint>`. The secret is good once, for an hour,
@@ -355,7 +394,17 @@ mod tests {
         let ca = Ca::create().unwrap();
         let (cert, key) = ca.issue("alpha").unwrap();
         let der = certs(&cert).unwrap().remove(0);
-        assert_eq!(node_of(&der).as_deref(), Some("alpha"));
+        assert_eq!(subject_of(&der), Some(Subject::Node("alpha".into())));
+
+        // An Identity's certificate names it and its key, and no server would be believed with it.
+        let (user, _, public) = ca.issue_user("alice").unwrap();
+        let user = certs(&user).unwrap().remove(0);
+        let Some(Subject::User(name, shown)) = subject_of(&user) else {
+            panic!("not a user's certificate")
+        };
+        assert!(name == "alice" && same_key(&public, &shown));
+        let other = ca.issue_user("alice").unwrap().2;
+        assert!(!same_key(&other, &shown) && !same_key("not a key", &shown));
 
         let me = Identity {
             name: "alpha".into(),
@@ -372,6 +421,11 @@ mod tests {
             AnyNode(verifier.build().unwrap()).verify_server_cert(&der, &[], &dialled, &[], UnixTime::now())
         };
         assert!(verify(&ca.cert).is_ok());
+        let verifier = WebPkiServerVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider());
+        let dialled = ServerName::try_from("kith").unwrap();
+        let as_server =
+            AnyNode(verifier.build().unwrap()).verify_server_cert(&user, &[], &dialled, &[], UnixTime::now());
+        assert!(as_server.is_err());
         assert!(verify(&Ca::create().unwrap().cert).is_err());
 
         // Two CAs in one text are not a CA: the second would be trusted unpinned.

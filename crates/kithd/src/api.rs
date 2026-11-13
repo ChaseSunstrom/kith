@@ -10,7 +10,11 @@
 //! GET    /v1/logs/<key>[?unit=&replica=&stderr=true&previous=true&offset=N|tail=LINES]
 //!                                                -> {data, next, more}
 //! GET    /v1/watch[?after=G&kind=Kind&wait=S]    -> {generation, resources}
+//! GET    /v1/audit[?tail=LINES]                  -> [{at, who, verb, what, ok, error}]
 //! ```
+//! Every handler takes the [`Caller`] and asks what it may do (`access.rs`): an
+//! Identity gets 403 with the reason, and lists only what it may see. Changes, and
+//! refusals, go in the audit log (`audit.rs`); reading that takes `get` on `Audit`.
 //! Logs: `data` is output from byte `offset` on (or the last `tail` lines), `next`
 //! the offset to ask for next, `more` whether the unit may still write. Following
 //! is asking again; `previous` reads the file that was moved aside at the size cap.
@@ -26,12 +30,15 @@
 //! with the new generation. Without `after` it replies at once.
 
 use crate::Shared;
+use crate::access::{Caller, Grants};
+use axum::Extension;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use kith_api::Resource;
+use kith_api::kinds::Verb;
 use kith_api::store::{Change, Error, Revision, Store};
 use kith_store::{Command, Done};
 use serde::Deserialize;
@@ -48,22 +55,33 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/logs/{*key}", get(logs))
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
+        .route("/v1/audit", get(audit))
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(shared)
 }
 
-pub struct ApiError(pub Error);
+pub enum ApiError {
+    Store(Error),
+    /// The caller may not: why.
+    Refused(String),
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
-            Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Error::NotFound(_) => StatusCode::NOT_FOUND,
-            Error::Conflict(_) => StatusCode::CONFLICT,
-            Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, why) = match self {
+            ApiError::Refused(why) => (StatusCode::FORBIDDEN, why),
+            ApiError::Store(e) => {
+                let status = match e {
+                    Error::Invalid(_) => StatusCode::UNPROCESSABLE_ENTITY,
+                    Error::NotFound(_) => StatusCode::NOT_FOUND,
+                    Error::Conflict(_) => StatusCode::CONFLICT,
+                    Error::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, e.to_string())
+            }
         };
-        (status, Json(serde_json::json!({ "error": self.0.to_string() }))).into_response()
+        (status, Json(serde_json::json!({ "error": why }))).into_response()
     }
 }
 
@@ -71,7 +89,7 @@ type Reply<T> = Result<Json<T>, ApiError>;
 
 /// A command answered with another command's kind of reply: a bug, said as an error.
 fn odd() -> ApiError {
-    ApiError(Error::Io(
+    ApiError::Store(Error::Io(
         "the store gave an answer that does not fit the request".into(),
     ))
 }
@@ -79,7 +97,107 @@ fn odd() -> ApiError {
 fn read<T>(shared: &Shared, look: impl FnOnce(&Store) -> Result<T, Error>) -> Reply<T> {
     look(&shared.store.lock().expect("a handler panicked holding the store").store)
         .map(Json)
-        .map_err(ApiError)
+        .map_err(ApiError::Store)
+}
+
+fn word(verb: &Verb) -> String {
+    format!("{verb:?}").to_lowercase()
+}
+
+/// Where a resource is, or would be once applied: its namespace, or none.
+fn place(store: &Store, resource: &Resource) -> Option<String> {
+    let namespaced = || match kith_api::kind(&resource.kind) {
+        Some(kind) => kind.namespaced,
+        // A kind nobody has defined (yet) is taken to be in no namespace: only a rule for everywhere covers it.
+        None => store
+            .definition(&resource.kind)
+            .is_some_and(|definition| definition.spec["namespaced"] != false),
+    };
+    let default = || namespaced().then(|| kith_api::DEFAULT_NAMESPACE.to_string());
+    resource.metadata.namespace.clone().or_else(default)
+}
+
+/// The kind and namespace a key is of: `Kind/namespace/name`, or `Kind/name`.
+fn place_of(key: &str) -> (String, Option<String>) {
+    let mut parts = key.split('/');
+    let kind = parts.next().unwrap_or_default().to_string();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(namespace), Some(_), None) => (kind, Some(namespace.to_string())),
+        _ => (kind, None),
+    }
+}
+
+/// A refusal, with the reason, unless `caller` may do `verb` to each of `targets` (a
+/// kind and where). The refusal goes in the audit log.
+fn permit(
+    shared: &Shared,
+    caller: &Caller,
+    verb: Verb,
+    targets: impl FnOnce(&Store) -> Vec<(String, Option<String>)>,
+) -> Result<(), ApiError> {
+    let refused = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let grants = Grants::of(caller, &state.store);
+        let mut targets = targets(&state.store).into_iter();
+        targets.find(|(kind, namespace)| !grants.may(&verb, kind, namespace.as_deref()))
+    };
+    let Some((kind, namespace)) = refused else {
+        return Ok(());
+    };
+    let verb = word(&verb);
+    let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
+    let why = format!("{caller} may not {verb} {kind}{place}: no Role bound to it allows that");
+    shared
+        .audit
+        .record(caller, &verb, vec![format!("{kind}{place}")], Err(why.clone()));
+    Err(ApiError::Refused(why))
+}
+
+/// For `list` and `watch`: a refusal if `caller` may see nothing of the kind anywhere.
+/// What it may see of it is then picked resource by resource ([`seen`]).
+fn sight(shared: &Shared, caller: &Caller, verb: Verb, kind: Option<&str>) -> Result<(), ApiError> {
+    let any = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        Grants::of(caller, &state.store).anywhere(&verb, kind)
+    };
+    if any {
+        return Ok(());
+    }
+    let (verb, kind) = (word(&verb), kind.unwrap_or("anything"));
+    let why = format!("{caller} may not {verb} {kind}: no Role bound to it allows that");
+    shared.audit.record(caller, &verb, vec![kind.into()], Err(why.clone()));
+    Err(ApiError::Refused(why))
+}
+
+fn seen<'a>(
+    store: &'a Store,
+    caller: &Caller,
+    verb: Verb,
+    kind: Option<&'a str>,
+) -> impl Iterator<Item = &'a Resource> {
+    let grants = Grants::of(caller, store);
+    let may = move |resource: &&Resource| grants.may(&verb, &resource.kind, resource.metadata.namespace.as_deref());
+    store.list(kind).filter(may)
+}
+
+/// Make a change, and write down who did and how it went. On a task of its own: a
+/// caller that hangs up while the store works neither stops the change nor escapes the log.
+async fn change(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    verb: &'static str,
+    what: Vec<String>,
+    command: Command,
+) -> Result<Done, ApiError> {
+    let (shared, caller) = (shared.clone(), caller.clone());
+    let done = tokio::spawn(async move {
+        let done = shared.submit(command).await;
+        let said = done.as_ref().map(drop).map_err(Error::to_string);
+        shared.audit.record(&caller, verb, what, said);
+        done
+    });
+    let stopped = |e| ApiError::Store(Error::Io(format!("the change stopped: {e}")));
+    done.await.map_err(stopped)?.map_err(ApiError::Store)
 }
 
 #[derive(Deserialize)]
@@ -91,20 +209,33 @@ struct ApplyOptions {
 
 async fn apply(
     State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
     Query(options): Query<ApplyOptions>,
     Json(resources): Json<Vec<Resource>>,
 ) -> Reply<Vec<Change>> {
-    let Json(()) = read(&shared, |store| {
-        crate::releases::claims(store, &resources).map_err(Error::Invalid)
+    // Each resource of the body is asked about: one that is not allowed refuses them all.
+    permit(&shared, &caller, Verb::Apply, |store| {
+        let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
+        resources.iter().map(target).collect()
     })?;
+    let keys: Vec<String> = resources.iter().map(Resource::key).collect();
+    let claimed = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::releases::claims(&state.store, &resources)
+    };
+    if let Err(why) = claimed {
+        if !options.dry_run {
+            shared.audit.record(&caller, "apply", keys, Err(why.clone()));
+        }
+        return Err(ApiError::Store(Error::Invalid(why)));
+    }
     if options.dry_run {
         return read(&shared, |store| store.clone().apply_all(resources));
     }
     let at = kith_api::store::now();
-    match shared.submit(Command::Apply { resources, at }).await {
-        Ok(Done::Changes(changes)) => Ok(Json(changes)),
-        Ok(_) => Err(odd()),
-        Err(e) => Err(ApiError(e)),
+    match change(&shared, &caller, "apply", keys, Command::Apply { resources, at }).await? {
+        Done::Changes(changes) => Ok(Json(changes)),
+        _ => Err(odd()),
     }
 }
 
@@ -113,9 +244,15 @@ struct ListOptions {
     kind: Option<String>,
 }
 
-async fn list(State(shared): State<Arc<Shared>>, Query(options): Query<ListOptions>) -> Reply<Vec<Resource>> {
+async fn list(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Query(options): Query<ListOptions>,
+) -> Reply<Vec<Resource>> {
+    let kind = options.kind.as_deref();
+    sight(&shared, &caller, Verb::List, kind)?;
     read(&shared, |store| {
-        Ok(store.list(options.kind.as_deref()).cloned().collect())
+        Ok(seen(store, &caller, Verb::List, kind).cloned().collect())
     })
 }
 
@@ -129,7 +266,13 @@ struct WatchOptions {
     wait: Option<u64>,
 }
 
-async fn watch(State(shared): State<Arc<Shared>>, Query(options): Query<WatchOptions>) -> Reply<serde_json::Value> {
+async fn watch(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Query(options): Query<WatchOptions>,
+) -> Reply<serde_json::Value> {
+    let kind = options.kind.as_deref();
+    sight(&shared, &caller, Verb::Watch, kind)?;
     if let Some(after) = options.after {
         let secs = options.wait.unwrap_or(MAX_WATCH_SECS).min(MAX_WATCH_SECS);
         let (mut generation, mut stop) = (shared.generation.subscribe(), shared.stop.subscribe());
@@ -143,24 +286,39 @@ async fn watch(State(shared): State<Arc<Shared>>, Query(options): Query<WatchOpt
     read(&shared, |store| {
         Ok(serde_json::json!({
             "generation": *shared.generation.borrow(),
-            "resources": store.list(options.kind.as_deref()).collect::<Vec<_>>(),
+            // (What it may see is asked again here: the wait may have been long.)
+            "resources": seen(store, &caller, Verb::Watch, kind).collect::<Vec<_>>(),
         }))
     })
 }
 
-async fn get_one(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> Reply<Resource> {
+async fn get_one(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(key): Path<String>,
+) -> Reply<Resource> {
+    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
     read(&shared, |store| store.get(&key).cloned().ok_or(Error::NotFound(key)))
 }
 
-async fn delete(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> Reply<Resource> {
-    match shared.submit(Command::Delete { key }).await {
-        Ok(Done::Deleted(resource)) => Ok(Json(*resource)),
-        Ok(_) => Err(odd()),
-        Err(e) => Err(ApiError(e)),
+async fn delete(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(key): Path<String>,
+) -> Reply<Resource> {
+    permit(&shared, &caller, Verb::Delete, |_| vec![place_of(&key)])?;
+    match change(&shared, &caller, "delete", vec![key.clone()], Command::Delete { key }).await? {
+        Done::Deleted(resource) => Ok(Json(*resource)),
+        _ => Err(odd()),
     }
 }
 
-async fn history(State(shared): State<Arc<Shared>>, Path(key): Path<String>) -> Reply<Vec<Revision>> {
+async fn history(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(key): Path<String>,
+) -> Reply<Vec<Revision>> {
+    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
     read(&shared, |store| store.history(&key).map(<[Revision]>::to_vec))
 }
 
@@ -171,14 +329,16 @@ struct RollbackOptions {
 
 async fn rollback(
     State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
+    permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
-    match shared.submit(Command::Rollback { key, to, at }).await {
-        Ok(Done::Changes(mut changes)) if changes.len() == 1 => Ok(Json(changes.remove(0))),
-        Ok(_) => Err(odd()),
-        Err(e) => Err(ApiError(e)),
+    let what = vec![format!("{key} to revision {to}")];
+    match change(&shared, &caller, "rollback", what, Command::Rollback { key, to, at }).await? {
+        Done::Changes(mut changes) if changes.len() == 1 => Ok(Json(changes.remove(0))),
+        _ => Err(odd()),
     }
 }
 
@@ -204,10 +364,13 @@ const LOG_CHUNK: u64 = 256 << 10;
 
 async fn logs(
     State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
     Query(options): Query<LogOptions>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Reply<serde_json::Value> {
+    // What a unit wrote is read by who may read the resource that runs it.
+    permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
     // A replica that runs on another node: its output is there.
     let elsewhere = shared.cluster.as_ref().filter(|_| !options.here).and_then(|cluster| {
         let state = shared.store.lock().expect("a handler panicked holding the store");
@@ -225,7 +388,7 @@ async fn logs(
         ))
     });
     if let (Some((node, url)), Some(cluster)) = (elsewhere, &shared.cluster) {
-        let failed = |e: reqwest::Error| ApiError(Error::Io(format!("asking node {node} for the output: {e}")));
+        let failed = |e: reqwest::Error| ApiError::Store(Error::Io(format!("asking node {node} for the output: {e}")));
         let asked = cluster
             .client
             .get(url)
@@ -245,14 +408,36 @@ async fn logs(
     let path = shared.logs.join(format!("{id}.{stream}{old}"));
     // ponytail: read on the async thread; a chunk is small and local. Move to spawn_blocking if logs land on slow disks.
     let (data, next) = log_chunk(&path, options.offset, options.tail)
-        .map_err(|e| ApiError(Error::Io(format!("reading {}: {e}", path.display()))))?;
+        .map_err(|e| ApiError::Store(Error::Io(format!("reading {}: {e}", path.display()))))?;
     Ok(Json(
         serde_json::json!({ "data": data, "next": next, "more": more && !options.previous }),
     ))
 }
 
+#[derive(Deserialize)]
+struct AuditOptions {
+    tail: Option<u64>,
+}
+
+/// The last entries of this node's audit log (100, or `tail`), oldest first.
+async fn audit(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Query(options): Query<AuditOptions>,
+) -> Reply<Vec<serde_json::Value>> {
+    permit(&shared, &caller, Verb::Get, |_| vec![("Audit".into(), None)])?;
+    let entries = shared.audit.tail(options.tail.unwrap_or(100));
+    entries
+        .map(Json)
+        .map_err(|e| ApiError::Store(Error::Io(format!("reading the audit log: {e}"))))
+}
+
 /// Up to [`LOG_CHUNK`] bytes of a log file as text, and the offset just after them.
-fn log_chunk(path: &std::path::Path, offset: Option<u64>, tail: Option<u64>) -> std::io::Result<(String, u64)> {
+pub(crate) fn log_chunk(
+    path: &std::path::Path,
+    offset: Option<u64>,
+    tail: Option<u64>,
+) -> std::io::Result<(String, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -349,8 +534,14 @@ struct Push {
 /// Put a package (or a Source's files) in a registry, from here: kithd has what it
 /// takes to talk to one, and `kith` does not. The signature is made by whoever asks;
 /// no key comes here.
-async fn push(Json(asked): Json<Push>) -> Reply<String> {
-    let invalid = |e| ApiError(Error::Invalid(e));
+// Reaching a registry through kithd, either way, takes `apply` on `Package`.
+async fn push(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Json(asked): Json<Push>,
+) -> Reply<String> {
+    permit(&shared, &caller, Verb::Apply, |_| vec![("Package".into(), None)])?;
+    let invalid = |e| ApiError::Store(Error::Invalid(e));
     let (name, version, blob) = match asked.source {
         Some((name, tag)) => {
             kith_packages::artifact::plain(&asked.files).map_err(invalid)?;
@@ -362,8 +553,12 @@ async fn push(Json(asked): Json<Push>) -> Reply<String> {
             (package.meta.name, package.meta.version, blob)
         }
     };
+    let what = vec![format!("{name}:{version} to {}", asked.to)];
     let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature).await;
-    pushed.map(Json).map_err(|e| ApiError(Error::Io(e)))
+    shared
+        .audit
+        .record(&caller, "push", what, pushed.as_ref().map(drop).map_err(String::clone));
+    pushed.map(Json).map_err(|e| ApiError::Store(Error::Io(e)))
 }
 
 #[derive(Deserialize)]
@@ -377,9 +572,14 @@ struct Pull {
 }
 
 /// A package's files from a registry, its signature checked when a key is given.
-async fn pull(Json(asked): Json<Pull>) -> Reply<std::collections::BTreeMap<String, String>> {
+async fn pull(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Json(asked): Json<Pull>,
+) -> Reply<std::collections::BTreeMap<String, String>> {
+    permit(&shared, &caller, Verb::Apply, |_| vec![("Package".into(), None)])?;
     let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version).await;
-    let (blob, signature) = fetched.map_err(|e| ApiError(Error::Io(e)))?;
+    let (blob, signature) = fetched.map_err(|e| ApiError::Store(Error::Io(e)))?;
     let package = crate::registry::checked(
         &blob,
         signature.as_deref(),
@@ -389,5 +589,5 @@ async fn pull(Json(asked): Json<Pull>) -> Reply<std::collections::BTreeMap<Strin
     );
     package
         .map(|package| Json(package.files))
-        .map_err(|e| ApiError(Error::Invalid(e)))
+        .map_err(|e| ApiError::Store(Error::Invalid(e)))
 }

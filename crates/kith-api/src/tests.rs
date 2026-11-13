@@ -298,6 +298,35 @@ fn history_is_bounded() {
 }
 
 #[test]
+fn package_history() {
+    let package = |n: usize| {
+        one(&format!(
+            "apiVersion: kith.dev/v1\nkind: Package\nmetadata:\n  name: web\nspec:\n  version: 1.0.0\n  files:\n    package.yaml: \"n{n}\"\n"
+        ))
+    };
+    let mut store = Store::default();
+    for n in 0..10 {
+        store.apply(package(n)).unwrap();
+    }
+    let history = store.history("Package/web").unwrap();
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].resource.metadata.revision, Some(8));
+
+    // Rolling back within what is kept works; further back is refused.
+    assert!(store.rollback("Package/web", 7).is_err());
+    store.rollback("Package/web", 8).unwrap();
+    let live = store.get("Package/web").unwrap();
+    assert_eq!(live.metadata.revision, Some(11));
+    assert_eq!(live.spec["files"]["package.yaml"], json!("n7"));
+
+    // Other kinds keep the full limit.
+    for n in 0..HISTORY_LIMIT + 5 {
+        store.apply(one(&workload(&format!("  replicas: {n}\n")))).unwrap();
+    }
+    assert_eq!(store.history("Workload/default/web").unwrap().len(), HISTORY_LIMIT);
+}
+
+#[test]
 fn timestamps() {
     assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
     assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");

@@ -5,10 +5,12 @@
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket only
-//! GET  /v1/cluster                     -> {node, leader, voters, learners, applied, mesh}   local socket only
+//! POST /v1/identities/<name>/certificate -> {ca, cert, key}            local socket only
+//! GET  /v1/cluster                    -> {node, leader, voters, learners, applied, mesh}   local socket only
 //! ```
-//! Everything else on the TCP port is for members only: the resource API and Raft
-//! (`raft.rs`), which gives every node its own copy of the store.
+//! Raft (`raft.rs`), which gives every node its own copy of the store, is for members
+//! only. The resource API is for members and for Identities with a certificate, who
+//! may do what their Roles allow (`access.rs`).
 //
 
 use crate::pki::{self, Identity};
@@ -70,8 +72,8 @@ impl Cluster {
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub addr: SocketAddr,
-    /// The node its certificate names; `None` when it showed none.
-    pub node: Option<String>,
+    /// Whose certificate it showed; `None` when it showed none.
+    pub subject: Option<pki::Subject>,
 }
 
 /// A TLS connection. One from a caller without a certificate (a guest) keeps one of the
@@ -151,10 +153,13 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
                 let shaken = tokio::time::timeout(GUEST_TIME, acceptor.accept(stream)).await;
                 if let Ok(Ok(stream)) = shaken {
                     let certs = stream.get_ref().1.peer_certificates();
-                    let node = certs.and_then(|certs| pki::node_of(certs.first()?));
-                    // A member gives its slot back; a guest keeps it, for a short while.
-                    let guest = node.is_none().then(|| (slot, Box::pin(tokio::time::sleep(GUEST_TIME))));
-                    let _ = tx.send((Connection { stream, guest }, Peer { addr, node })).await;
+                    let subject = certs.and_then(|certs| pki::subject_of(certs.first()?));
+                    // Whoever the CA vouches for gives the slot back; a guest keeps it, for a short while.
+                    // ponytail: that includes an Identity since deleted, until certificates expire or are revoked by more than the store.
+                    let guest = subject
+                        .is_none()
+                        .then(|| (slot, Box::pin(tokio::time::sleep(GUEST_TIME))));
+                    let _ = tx.send((Connection { stream, guest }, Peer { addr, subject })).await;
                 }
             });
         }
@@ -176,7 +181,7 @@ impl axum::serve::Listener for TlsListener {
     fn local_addr(&self) -> std::io::Result<Peer> {
         Ok(Peer {
             addr: self.local,
-            node: None,
+            subject: None,
         })
     }
 }
@@ -189,7 +194,7 @@ impl Connected<IncomingStream<'_, TlsListener>> for Peer {
 
 type Refusal = (StatusCode, Json<serde_json::Value>);
 
-fn refuse(status: StatusCode, why: impl std::fmt::Display) -> Refusal {
+pub(crate) fn refuse(status: StatusCode, why: impl std::fmt::Display) -> Refusal {
     (status, Json(serde_json::json!({ "error": why.to_string() })))
 }
 
@@ -204,14 +209,18 @@ fn cluster(shared: &Shared) -> Result<&Cluster, Refusal> {
 }
 
 async fn members_only(ConnectInfo(peer): ConnectInfo<Peer>, request: Request, next: Next) -> Response {
-    match peer.node {
-        Some(_) => next.run(request).await,
-        None => refuse(
+    let (status, why) = match peer.subject {
+        Some(pki::Subject::Node(_)) => return next.run(request).await,
+        Some(pki::Subject::User(..)) => (
+            StatusCode::FORBIDDEN,
+            "this is for the cluster's nodes, not for an Identity",
+        ),
+        None => (
             StatusCode::UNAUTHORIZED,
             "a certificate from this cluster's CA is needed",
-        )
-        .into_response(),
-    }
+        ),
+    };
+    refuse(status, why).into_response()
 }
 
 /// What is served on the TCP port.
@@ -223,16 +232,55 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .with_state(shared.clone());
     let ping = Router::new().route("/v1/ping", post(crate::members::ping));
     let ping = ping.layer(DefaultBodyLimit::max(64 << 10)).with_state(shared.clone());
-    let members = api::router(shared.clone())
-        .merge(crate::raft::router(shared))
-        .merge(ping);
-    open.merge(members.layer(axum::middleware::from_fn(members_only)))
+    let callers = axum::middleware::from_fn_with_state(shared.clone(), crate::access::caller);
+    let api = api::router(shared.clone()).layer(callers);
+    let members = crate::raft::router(shared).merge(ping);
+    open.merge(api)
+        .merge(members.layer(axum::middleware::from_fn(members_only)))
 }
 
 /// What only the local socket serves.
 pub fn admin_router(shared: Arc<Shared>) -> Router {
     let admin = Router::new().route("/v1/tokens", post(token));
+    let admin = admin.route("/v1/identities/{name}/certificate", post(certificate));
     admin.route("/v1/cluster", get(status)).with_state(shared)
+}
+
+const CA_ELSEWHERE: &str =
+    "only the node that holds the cluster CA key can do this: the one the cluster was started on";
+
+/// A certificate and key for the Identity `name`, which is made if it is not there. Its
+/// `publicKey` becomes this key: a certificate it had before stops standing for it.
+async fn certificate(
+    State(shared): State<Arc<Shared>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<Joined>, Refusal> {
+    let cluster = cluster(&shared)?;
+    let Some(ca) = &cluster.ca else {
+        return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
+    };
+    let issued = ca.issue_user(&name);
+    let (cert, key, public) = issued.map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    let key_of = format!("Identity/{name}");
+    let identity = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        state.store.get(&key_of).cloned()
+    };
+    let mut identity = identity.unwrap_or_else(|| {
+        let new = serde_json::json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Identity", "metadata": { "name": name }, "spec": {},
+        });
+        serde_json::from_value(new).expect("an Identity with a valid name")
+    });
+    identity.spec["publicKey"] = public.into();
+    let (resources, at) = (vec![identity], kith_api::store::now());
+    let done = shared.submit(Command::Apply { resources, at }).await;
+    let said = done.as_ref().map(drop).map_err(ToString::to_string);
+    let caller = crate::access::Caller::Admin;
+    shared.audit.record(&caller, "certificate", vec![key_of], said);
+    done.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let ca = cluster.me.ca.clone();
+    Ok(Json(Joined { ca, cert, key }))
 }
 
 /// Who leads the store and who votes, as this node sees it. Nodes are named where a
@@ -278,8 +326,7 @@ async fn ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
 async fn token(State(shared): State<Arc<Shared>>) -> Result<Json<serde_json::Value>, Refusal> {
     let cluster = cluster(&shared)?;
     let Some(ca) = &cluster.ca else {
-        let why = "only the node that holds the cluster CA key can admit nodes: the one the cluster was started on";
-        return Err(refuse(StatusCode::CONFLICT, why));
+        return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };
     let token = cluster.tokens.mint(&ca.cert);
     let token = token.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
