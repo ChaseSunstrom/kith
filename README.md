@@ -265,8 +265,10 @@ kith get dnsrecord                   # each one says `served`, or why not
   zone itself. Names in values are full names (`nas.home.example`).
 - Split horizon: a zone with `clients: [192.168.0.0/16]` is what those clients
   get, in place of a zone for everyone with the same domain. A client inside
-  two different `clients` lists gets only one of them: give zones that belong
-  together the same list.
+  two different `clients` lists gets only one of them, the list with the
+  longest matching prefix (`10.1.2.0/24` beats `10.0.0.0/8`; equal prefixes
+  go to the list that sorts first): give zones that belong together the same
+  list.
 - Every other name is passed to the resolvers in `/etc/resolv.conf`
   (`--dns-upstream 1.1.1.1,9.9.9.9` to say which), for clients on private
   networks only, so a kithd reachable from the internet is not an open
