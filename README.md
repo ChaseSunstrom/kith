@@ -389,6 +389,8 @@ spec:
   takes packages as they come. Change a Repository's `url` or `publicKey`
   and what was fetched before is no longer taken for its: it is fetched and
   checked again.
+- A Package keeps its last 3 revisions (other kinds keep 100), because it
+  carries its files; push a new version rather than rolling far back.
 - A version is fetched once: pushing it to the registry again changes
   nothing here. A registry can also keep quiet about newer versions; the
   signature says a package is the publisher's, not that it is the newest.
