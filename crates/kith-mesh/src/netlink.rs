@@ -328,3 +328,86 @@ impl Device {
         ask(protocols::NETLINK_ROUTE, gone, NLM_F_ACK).map(drop)
     }
 }
+
+fn ask_route(message: RouteNetlinkMessage, flags: u16) -> Result<Vec<RouteNetlinkMessage>> {
+    ask(protocols::NETLINK_ROUTE, message, flags)
+}
+
+/// A network card of this machine (what the kernel calls Ethernet: wired, Wi-Fi, a veth).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Card {
+    pub index: u32,
+    pub name: String,
+    pub mac: [u8; 6],
+}
+
+/// The machine's network cards, in the kernel's order, and the loopback's index.
+pub fn cards() -> Result<(Vec<Card>, Option<u32>)> {
+    use netlink_packet_route::link::LinkLayerType;
+    let links = ask_route(RouteNetlinkMessage::GetLink(LinkMessage::default()), NLM_F_DUMP)?;
+    let (mut cards, mut loopback) = (Vec::new(), None);
+    for link in links {
+        let RouteNetlinkMessage::NewLink(link) = link else {
+            continue;
+        };
+        let name = link.attributes.iter().find_map(|attribute| match attribute {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        });
+        let mac = link.attributes.iter().find_map(|attribute| match attribute {
+            LinkAttribute::Address(mac) => <[u8; 6]>::try_from(&mac[..]).ok(),
+            _ => None,
+        });
+        match (link.header.link_layer_type, name, mac) {
+            (LinkLayerType::Loopback, ..) => loopback = Some(link.header.index),
+            (LinkLayerType::Ether, Some(name), Some(mac)) => cards.push(Card {
+                index: link.header.index,
+                name,
+                mac,
+            }),
+            _ => {}
+        }
+    }
+    Ok((cards, loopback))
+}
+
+/// Bring a link up.
+pub fn up(index: u32) -> Result<()> {
+    let mut up = link(index, None);
+    up.header.flags = LinkFlags::Up;
+    up.header.change_mask = LinkFlags::Up;
+    ask_route(RouteNetlinkMessage::SetLink(up), NLM_F_ACK).map(drop)
+}
+
+/// Give a link an IPv4 address (again does no harm), and send what is for elsewhere
+/// through `gateway` if there is one.
+pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Option<std::net::Ipv4Addr>) -> Result<()> {
+    use netlink_packet_route::route::{
+        RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
+    };
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+    message.header.prefix_len = bits;
+    message.header.index = index;
+    let mask = u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
+    let broadcast = std::net::Ipv4Addr::from(u32::from(address) | !mask);
+    message.attributes.extend([
+        AddressAttribute::Local(address.into()),
+        AddressAttribute::Address(address.into()),
+        AddressAttribute::Broadcast(broadcast),
+    ]);
+    let flags = NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    ask_route(RouteNetlinkMessage::NewAddress(message), flags)?;
+    let Some(gateway) = gateway else { return Ok(()) };
+    let mut route = RouteMessage::default();
+    route.header.address_family = AddressFamily::Inet;
+    route.header.table = 254; // main
+    route.header.protocol = RouteProtocol::Boot;
+    route.header.scope = RouteScope::Universe;
+    route.header.kind = RouteType::Unicast;
+    route.attributes.extend([
+        RouteAttribute::Gateway(RouteAddress::Inet(gateway)),
+        RouteAttribute::Oif(index),
+    ]);
+    ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
+}

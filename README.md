@@ -769,6 +769,34 @@ The page itself is open; everything it asks is not.
 Not yet: logging in without a certificate (OIDC), secrets hidden on screen
 until asked for, metrics.
 
+## kith OS: kithd as the machine's first process (in progress)
+
+On a kith OS machine there is the kernel and kithd, nothing else: no systemd, no
+shell. When kithd finds it is process 1 it does what an init does:
+
+- mounts `/proc`, `/sys`, `/dev`, `/run`, `/tmp` and the cgroup tree;
+- names the machine: `kith.hostname=NAME` on the kernel command line, or else
+  `kith-` and the last six digits of its first network card's address;
+- brings the loopback and every network card up, and asks each card's network
+  for an address (DHCP, renewed for as long as it runs). A machine on a network
+  that gives none says `kith.ip=10.0.0.5/24,10.0.0.1` (address, then the
+  gateway) and `kith.dns=9.9.9.9`;
+- reads its own arguments after ` -- ` on the kernel command line:
+  `console=ttyS0 kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
+- collects the processes nobody waits for;
+- stops what it runs and then restarts the machine on Ctrl-Alt-Del, or powers
+  it off on SIGTERM. If kithd fails or panics it says why and restarts the
+  machine ten seconds later: process 1 never exits.
+
+`sh ci/vm.sh --test init` boots exactly that in QEMU (the host's kernel and an
+initramfs holding one file, a static kithd) and prints how long it took to
+serve: under a second here.
+
+Not yet: an image to boot a real machine from, a disk for the state (it is in
+memory: `/var/lib/kith`), drivers that are kernel modules (a card whose driver
+is not built into the kernel is not seen), a card plugged in later, IPv6
+addresses from the network, the power button, encrypted state, an installer.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):
@@ -816,6 +844,8 @@ x86_64-linux-musl` wrapper.
 ```sh
 KITH_E2E=1 cargo test -q -p kithd --test cluster rig_   # 3 nodes: one behind a NAT, a partition, a heal
 sh ci/vm.sh                                             # the host's kernel, booted with kithd as init
+sh ci/vm.sh --test init                                 # and: it serves, then restarts when told
+KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```
 

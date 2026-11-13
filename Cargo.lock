@@ -1324,6 +1324,7 @@ dependencies = [
  "kith-sched",
  "kith-store",
  "kith-yaml",
+ "nix 0.29.0",
  "oci-client",
  "rcgen",
  "reqwest",

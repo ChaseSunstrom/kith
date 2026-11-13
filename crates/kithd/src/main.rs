@@ -13,8 +13,10 @@ mod audit;
 mod cluster;
 mod controller;
 mod controllers;
+mod dhcp;
 mod dns;
 mod ingress;
+mod init;
 mod members;
 mod mesh;
 mod pki;
@@ -147,12 +149,25 @@ const DRY_RUNS: usize = 4;
 fn main() -> ExitCode {
     // Started again by the runtime as an exec unit's helper? Then this never returns.
     kith_runtime::exec_shim();
-    match run(Args::parse()) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(msg) => {
-            eprintln!("kithd: {msg}");
-            ExitCode::FAILURE
-        }
+    let first = init::is_init();
+    let boot = first.then(init::early);
+    // (As the first process, a mistake in its arguments is clap's to say, and then a restart.)
+    let args = if first {
+        Args::try_parse_from(init::arguments(std::env::args())).map_err(|e| e.to_string())
+    } else {
+        Ok(Args::parse())
+    };
+    let done = args.and_then(|args| run(args, boot));
+    if let Err(msg) = &done {
+        eprintln!("kithd: {msg}");
+    }
+    if first {
+        init::end(done.is_err());
+    }
+    if done.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -336,10 +351,11 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
     Ok(shared)
 }
 
-fn run(args: Args) -> Result<(), String> {
+fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
     let state = args
         .state
         .clone()
+        .or_else(|| init::is_init().then(|| init::STATE.into()))
         .or_else(default_state)
         .ok_or("no state directory: set --state")?;
     let socket = args
@@ -380,6 +396,10 @@ fn run(args: Args) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| fail("starting", &e))?;
+    if let Some(boot) = boot {
+        let _in = rt.enter();
+        boot.network();
+    }
     let upstream = |address: &String| {
         let with_port = address.parse().ok();
         let bare = || address.parse().ok().map(|ip| std::net::SocketAddr::new(ip, 53));
@@ -406,17 +426,21 @@ fn run(args: Args) -> Result<(), String> {
         let listener = tokio::net::UnixListener::bind(&socket).map_err(|e| fail("binding the socket", &e))?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| fail("securing the socket", &e))?;
+        // (Heard before it says it serves: a first process is not sent what it does not handle.)
+        use tokio::signal::unix::{SignalKind, signal};
+        let (mut term, mut int) = (
+            signal(SignalKind::terminate()).unwrap(),
+            signal(SignalKind::interrupt()).unwrap(),
+        );
         eprintln!("kithd: serving {} (state in {})", socket.display(), state.display());
 
         let stopping = shared.stop.subscribe();
         let watched = shared.clone();
         tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
-            let (mut term, mut int) = (
-                signal(SignalKind::terminate()).unwrap(),
-                signal(SignalKind::interrupt()).unwrap(),
-            );
-            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+            tokio::select! {
+                _ = term.recv() => init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
+                _ = int.recv() => {}
+            }
             watched.stop.send_replace(true);
         });
         let mut server_stop = stopping.clone();

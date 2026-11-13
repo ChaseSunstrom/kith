@@ -17,6 +17,8 @@ kith-dns = { path = "../kith-dns" }
 kith-sched = { path = "../kith-sched" }
 kith-mesh = { path = "../kith-mesh" }
 kith-runtime = { path = "../kith-runtime" }
+# (In the tree through kith-runtime.) What the first process of a machine does: init.rs.
+nix = { version = "0.29", features = ["mount", "reboot", "hostname", "fs", "net"] }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
