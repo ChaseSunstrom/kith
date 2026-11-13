@@ -11,7 +11,8 @@
 //! `console=ttyS0 kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`.
 //!
 //! Ctrl-Alt-Del (the kernel turns it into SIGINT) restarts the machine, SIGTERM powers it
-//! off, each after kithd has stopped what it runs.
+//! off, each after kithd has stopped what it runs. So does the power button (what a VPS
+//! panel's shutdown presses): kithd reads it from the input devices.
 
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot, set_cad_enabled};
@@ -20,6 +21,69 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set when kithd was told to stop with SIGTERM: the machine is to power off, not restart.
 pub static POWER_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Woken when the power button is pressed: to be waited for beside SIGTERM, which it is.
+pub static BUTTON: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The kernel's `EV_KEY` event type, and the code of the power button.
+const EV_KEY: u16 = 1;
+const KEY_POWER: u16 = 116;
+/// One `input_event` as a 64-bit kernel writes it: two 8-byte time fields, then a u16 type,
+/// a u16 code and an i32 value (1 is a press).
+const EVENT: usize = 24;
+
+/// Input events as a device gives them, in whatever pieces a read returns.
+#[derive(Default)]
+struct Events(Vec<u8>);
+
+impl Events {
+    /// Takes the next bytes; whether they complete a press of the power button.
+    fn power_pressed(&mut self, bytes: &[u8]) -> bool {
+        self.0.extend_from_slice(bytes);
+        let whole = self.0.len() / EVENT * EVENT;
+        let pressed = self.0.as_chunks::<EVENT>().0.iter().any(|event| {
+            event[16..18] == EV_KEY.to_ne_bytes()
+                && event[18..20] == KEY_POWER.to_ne_bytes()
+                && event[20..24] == 1i32.to_ne_bytes()
+        });
+        self.0.drain(..whole);
+        pressed
+    }
+}
+
+/// Reads one input device until it goes away; a press of the power button is SIGTERM's.
+fn listen(mut device: std::fs::File) {
+    use std::io::{ErrorKind, Read};
+    let (mut events, mut buf) = (Events::default(), [0u8; EVENT * 16]);
+    loop {
+        match device.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                if events.power_pressed(&buf[..n]) {
+                    eprintln!("kithd: init: the power button is pressed");
+                    POWER_OFF.store(true, Ordering::Relaxed);
+                    BUTTON.notify_one();
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // (Nothing more, or the device is gone.)
+            _ => return,
+        }
+    }
+}
+
+/// Listens on every input device there is, each in a thread of its own (a read of one
+/// waits as long as it takes). Only as the first process; nothing else opens /dev/input.
+//
+// ponytail: the devices there at this moment. A button that appears later (hot-plug) is
+// not heard: watch /dev/input with inotify when a machine needs that.
+fn power_button() {
+    let found = std::fs::read_dir("/dev/input").into_iter().flatten().flatten();
+    for entry in found.filter(|entry| entry.file_name().as_encoded_bytes().starts_with(b"event")) {
+        if let Ok(device) = std::fs::File::open(entry.path()) {
+            std::thread::spawn(move || listen(device));
+        }
+    }
+}
 
 /// Where a node of kith OS keeps its state: the partition labelled `state` is mounted
 /// here, and where there is none (a kernel and kithd alone, as ci/vm.sh boots them) it is
@@ -268,6 +332,7 @@ pub struct Boot {
 impl Boot {
     /// Ask for as long as kithd runs (it serves meanwhile). Call inside the runtime.
     pub fn network(self) {
+        power_button();
         for card in self.asking {
             // (A name server on the command line is one the network's own may not replace.)
             let told = self.dns;
@@ -599,5 +664,30 @@ mod tests {
         assert_eq!(name_from(Some("00:00:00:00:00:00")), "kith");
         assert_eq!(name_from(Some("not one")), "kith");
         assert_eq!(name_from(None), "kith");
+    }
+
+    /// An `input_event` with the time left zero.
+    fn event(kind: u16, code: u16, value: i32) -> Vec<u8> {
+        let mut record = vec![0u8; 16];
+        record.extend(kind.to_ne_bytes());
+        record.extend(code.to_ne_bytes());
+        record.extend(value.to_ne_bytes());
+        record
+    }
+
+    #[test]
+    fn power_button_press_is_told_from_other_events() {
+        let (sync, key_a, press, release) = (event(0, 0, 0), event(1, 30, 1), event(1, 116, 1), event(1, 116, 0));
+        let mut events = Events::default();
+        assert!(!events.power_pressed(&[sync.clone(), key_a.clone(), release.clone()].concat()));
+        // The code of the power button under another type is not a press, nor is a repeat.
+        assert!(!events.power_pressed(&event(2, 116, 1)));
+        assert!(!events.power_pressed(&event(1, 116, 2)));
+        assert!(events.power_pressed(&[sync, key_a, press.clone(), release].concat()));
+        // Split across reads: the press is heard when its last byte comes, and once.
+        assert!(!events.power_pressed(&press[..10]));
+        assert!(!events.power_pressed(&press[10..23]));
+        assert!(events.power_pressed(&press[23..]));
+        assert!(!events.power_pressed(&[]));
     }
 }
