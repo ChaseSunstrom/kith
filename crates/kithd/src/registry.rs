@@ -67,10 +67,11 @@ async fn patiently<T>(what: &Reference, asked: impl Future<Output = oci_client::
     }
 }
 
-/// Put `package` in the repository `url`, with its signature if it has one. Says where.
-pub async fn push(url: &str, package: &Package, signature: Option<String>) -> Fallible<String> {
-    let (client, reference) = place(url, &package.meta.name, &package.meta.version)?;
-    let layers = [ImageLayer::new(package.blob(), LAYER.to_string(), None)];
+/// Put a blob (a package's, a Source's files) in the repository `url` as `name` at
+/// `version`, with its signature if it has one. Says where.
+pub async fn push(url: &str, name: &str, version: &str, blob: Vec<u8>, signature: Option<String>) -> Fallible<String> {
+    let (client, reference) = place(url, name, version)?;
+    let layers = [ImageLayer::new(blob, LAYER.to_string(), None)];
     let config = Config::new(b"{}".to_vec(), CONFIG.to_string(), None);
     let annotations = signature.map(|signature| BTreeMap::from([(SIGNATURE.to_string(), signature)]));
     let manifest = OciImageManifest::build(&layers, &config, annotations);

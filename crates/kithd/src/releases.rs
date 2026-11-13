@@ -85,11 +85,12 @@ type Renders = BTreeMap<String, (Inputs, Result<Output, String>)>;
 
 /// What to do for one Release, in this order; the status only if the rest went well.
 #[derive(Debug, PartialEq)]
-struct Step {
-    release: String,
-    apply: Vec<Resource>,
-    delete: Vec<String>,
-    status: Option<Map<String, Value>>,
+pub struct Step {
+    /// The Release (or the Source: they are carried out alike).
+    pub release: String,
+    pub apply: Vec<Resource>,
+    pub delete: Vec<String>,
+    pub status: Option<Map<String, Value>>,
 }
 
 /// What to do to the store.
@@ -257,7 +258,7 @@ fn pending(store: &Store, renders: &Renders) -> Vec<(String, Inputs, Job)> {
     jobs
 }
 
-fn owner(resource: &Resource) -> Option<&str> {
+pub fn owner(resource: &Resource) -> Option<&str> {
     resource.metadata.annotations.get(OWNER).map(String::as_str)
 }
 
@@ -286,13 +287,76 @@ pub fn claims(store: &Store, resources: &[Resource]) -> Result<(), String> {
     Ok(())
 }
 
+/// What it takes to make `resources` (marked as `key`'s) what `key` has in the store.
+pub struct Reconciled {
+    pub apply: Vec<Resource>,
+    pub delete: Vec<String>,
+    /// The keys of `resources`.
+    pub kept: BTreeSet<String>,
+    /// Those that are there and its own, and not as `resources` has them.
+    pub differ: Vec<String>,
+}
+
+/// What the owner `key` (a Release, a Source) put in the store, by its own account in
+/// its status: only that is pruned (not a copy someone made, annotation and all), and
+/// that is still its own when someone applied over it and the annotation went.
+pub fn recorded(owner: &Resource) -> BTreeSet<&str> {
+    let listed = owner.status.as_ref().and_then(|status| status["resources"].as_array());
+    listed.into_iter().flatten().filter_map(Value::as_str).collect()
+}
+
+/// Compare `resources` with the store for the owner `key`. Nothing of someone else's
+/// is taken over: one resource that is there already and not `key`'s refuses them all.
+pub fn reconcile(
+    store: &Store,
+    key: &str,
+    recorded: &BTreeSet<&str>,
+    resources: &[Resource],
+    prune: bool,
+) -> Result<Reconciled, String> {
+    let mine = |live: &Resource| owner(live) == Some(key) || recorded.contains(live.key().as_str());
+    let others = resources.iter().map(Resource::key);
+    let others: Vec<String> = others
+        .filter(|resource| store.get(resource).is_some_and(|live| !mine(live)))
+        .collect();
+    if !others.is_empty() {
+        return Err(format!("{} is there already and is not {key}'s", others.join(", ")));
+    }
+    let mut done = Reconciled {
+        apply: Vec::new(),
+        delete: Vec::new(),
+        kept: BTreeSet::new(),
+        differ: Vec::new(),
+    };
+    for resource in resources {
+        done.kept.insert(resource.key());
+        let live = store.get(&resource.key());
+        let same = live.is_some_and(|live| {
+            (&live.spec, &live.metadata.labels, &live.metadata.annotations)
+                == (
+                    &resource.spec,
+                    &resource.metadata.labels,
+                    &resource.metadata.annotations,
+                )
+        });
+        if !same {
+            done.apply.push(resource.clone());
+            done.differ.extend(live.map(Resource::key));
+        }
+    }
+    if prune {
+        let gone = recorded.iter().filter(|resource| !done.kept.contains(**resource));
+        let gone = gone.filter(|resource| store.get(resource).is_some_and(|live| owner(live) == Some(key)));
+        done.delete.extend(gone.map(|resource| resource.to_string()));
+    }
+    Ok(done)
+}
+
 /// What the store needs done for its Releases, given the renders there are.
 fn plan(store: &Store, renders: &Renders) -> Plan {
     let mut plan = Plan::default();
-    let mut releases = BTreeSet::new();
     for release in store.list(Some("Release")) {
         let key = release.key();
-        releases.insert(key.clone());
         let output = match inputs(store, release) {
             Err(e) => Err(e),
             Ok((now, ..)) => match renders.get(&key) {
@@ -301,57 +365,23 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
                 _ => continue,
             },
         };
-        // What the release put there, by its own account: only that is pruned (not a
-        // copy someone made, annotation and all), and that is still its own when
-        // someone applied over it and the annotation went.
         let live = release.status.as_ref();
-        let recorded = live.and_then(|status| status["resources"].as_array());
-        let recorded: BTreeSet<&str> = recorded.into_iter().flatten().filter_map(Value::as_str).collect();
-        // Nothing of someone else's is taken over.
-        let taken = |output: &Output| {
-            let others = output.resources.iter().map(Resource::key).filter(|resource| {
-                let mine = |live: &Resource| owner(live) == Some(&key) || recorded.contains(resource.as_str());
-                store.get(resource).is_some_and(|live| !mine(live))
-            });
-            let others: Vec<String> = others.collect();
-            match others.is_empty() {
-                true => Ok(()),
-                false => Err(format!(
-                    "{} is there already and is not this release's",
-                    others.join(", ")
-                )),
-            }
-        };
-        let output = output.and_then(|output| taken(&output).map(|()| output));
+        let done = output.and_then(|output| {
+            let done = reconcile(store, &key, &recorded(release), &output.resources, true)?;
+            Ok((output, done))
+        });
         let mut step = Step {
             release: key.clone(),
             apply: Vec::new(),
             delete: Vec::new(),
             status: None,
         };
-        let status = match output {
-            Ok(output) => {
-                let mut kept = BTreeSet::new();
-                for resource in &output.resources {
-                    kept.insert(resource.key());
-                    let same = store.get(&resource.key()).is_some_and(|live| {
-                        (&live.spec, &live.metadata.labels, &live.metadata.annotations)
-                            == (
-                                &resource.spec,
-                                &resource.metadata.labels,
-                                &resource.metadata.annotations,
-                            )
-                    });
-                    if !same {
-                        step.apply.push(resource.clone());
-                    }
-                }
-                let gone = recorded.iter().filter(|resource| !kept.contains(**resource));
-                let gone = gone.filter(|resource| store.get(resource).is_some_and(|live| owner(live) == Some(&key)));
-                step.delete.extend(gone.map(|resource| resource.to_string()));
+        let status = match done {
+            Ok((output, done)) => {
+                (step.apply, step.delete) = (done.apply, done.delete);
                 json!({
                     "state": "installed", "message": null, "version": output.version,
-                    "resources": kept, "notes": output.notes, "observedRevision": release.metadata.revision,
+                    "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
                 })
             }
             // (What was installed before stays as it is.)
@@ -370,10 +400,10 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
             plan.steps.push(step);
         }
     }
-    // What belonged to a Release that is gone goes too.
+    // What belonged to a Release or a Source that is gone goes too.
     let orphans = store
         .list(None)
-        .filter(|resource| owner(resource).is_some_and(|owner| !releases.contains(owner)));
+        .filter(|resource| owner(resource).is_some_and(|owner| store.get(owner).is_none()));
     plan.orphans.extend(orphans.map(Resource::key));
     plan
 }
@@ -405,7 +435,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 let state = shared.store.lock().expect("nothing panics holding the store");
                 plan(&state.store, &renders)
             };
-            carry_out(&shared, plan).await;
+            carry_out(&shared, plan.steps, plan.orphans).await;
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -416,7 +446,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
 }
 
 /// Each Release for itself: one that cannot be applied says so and stops no other.
-async fn carry_out(shared: &Shared, plan: Plan) {
+pub async fn carry_out(shared: &Shared, steps: Vec<Step>, orphans: Vec<String>) {
     use kith_api::store::Error;
     use kith_store::Command;
     let delete = async |key: String| match shared.submit(Command::Delete { key }).await {
@@ -424,7 +454,7 @@ async fn carry_out(shared: &Shared, plan: Plan) {
         Err(e) => Err(e),
     };
     let mut statuses = Vec::new();
-    for mut step in plan.steps {
+    for mut step in steps {
         let mut done = Ok(());
         if !step.apply.is_empty() {
             let at = kith_api::store::now();
@@ -459,7 +489,7 @@ async fn carry_out(shared: &Shared, plan: Plan) {
             (Err(e), _) => eprintln!("kithd: releases: {}: {e}", step.release),
         }
     }
-    for key in plan.orphans {
+    for key in orphans {
         if let Err(e) = delete(key).await {
             eprintln!("kithd: releases: {e}");
         }

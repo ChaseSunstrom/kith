@@ -585,6 +585,10 @@ spec! {
         /// Delete resources that are no longer in the source.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub prune: Option<bool>,
+        /// With `approval: manual`: the revision that may be applied (the one in
+        /// `status.pending`, as `kith source approve` puts here).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub approve: Option<String>,
     }
 
     pub struct GitSource {

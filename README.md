@@ -393,6 +393,53 @@ spec:
 Not yet: `dependencies` are read and nothing more; no hooks, no looking up
 what is in the cluster from a template, no registry credentials.
 
+## Sources (GitOps)
+
+A `Source` keeps what is in a git repository (or an OCI artifact) applied:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Source
+metadata: { name: cluster, namespace: kith-system }
+spec:
+  git: { url: https://example.org/ops/cluster.git, rev: main }
+  path: clusters/home        # the YAML and JSON files under it
+  intervalSeconds: 60
+  prune: true                # delete what the source no longer has
+  approval: manual           # hold each new revision until approved [auto]
+```
+
+```sh
+kith get source/cluster -n kith-system -o yaml   # status: state, revision, pending, drift
+kith source approve cluster -n kith-system       # apply the revision that waits
+kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.oci`
+```
+
+- The node that leads the store fetches the source every `intervalSeconds`
+  (5 at least) and applies its resources, marked `kith.dev/owned-by` like a
+  Release's. A resource that names no namespace goes in the Source's. A
+  Source applies only into its own namespace; one in `kith-system` applies
+  anywhere and any kind (it is the cluster's own). It does not take over what
+  is there and not its own.
+- `status.state` is `synced` (at `revision`), `pending` (`pending.revision`
+  waits for `kith source approve`, with what it would change) or `error`
+  (with `message`; what was applied stays). When the source moves on, a
+  manual Source waits again.
+- What a Source applied and someone changed since is put back, and listed in
+  `status.drift`: the source is what is true. Deleting a Source deletes what
+  it applied.
+- git is the node's `git` program (it must be installed), over `https://`
+  or `ssh://` only, with no credentials but what ssh has; nothing is checked
+  out, so links in a repository are skipped (`status.skipped`), and a
+  source is 2000 files and 4 MB at most.
+- Only a Source in `kith-system` is fetched over `ssh://` (it is the node's
+  own keys that open the door) or from this node and its own networks
+  (loopback, private, link-local and shared addresses, by whatever name).
+- An approval is for a revision: a Source whose `path` or `prune` you change
+  applies the revision already approved the new way.
+
+Not yet: signed-commit verification, credentials for private repositories.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):
