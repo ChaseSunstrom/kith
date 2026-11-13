@@ -46,6 +46,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/history/{*key}", get(history))
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
+        // (A package is 4 MB of files at most, and JSON makes them longer.)
+        .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(shared)
 }
 
@@ -90,6 +92,9 @@ async fn apply(
     Query(options): Query<ApplyOptions>,
     Json(resources): Json<Vec<Resource>>,
 ) -> Reply<Vec<Change>> {
+    let Json(()) = read(&shared, |store| {
+        crate::releases::claims(store, &resources).map_err(Error::Invalid)
+    })?;
     if options.dry_run {
         return read(&shared, |store| store.clone().apply_all(resources));
     }

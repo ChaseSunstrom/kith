@@ -66,6 +66,8 @@ pub struct Package {
     /// Every file under `templates/`, by its path from the package (`templates/web.yaml`).
     pub templates: BTreeMap<String, String>,
     pub notes: Option<String>,
+    /// Every file it was made from, as it was.
+    pub files: BTreeMap<String, String>,
 }
 
 /// What a package is rendered for.
@@ -270,6 +272,7 @@ impl Package {
                 "more than {FILES_LIMIT} files, or more than {PACKAGE_LIMIT} bytes in them"
             ));
         }
+        let all = files.clone();
         let meta = files.remove("package.yaml").ok_or("no package.yaml")?;
         let meta: Meta = kith_yaml::from_str(&meta).map_err(|e| e.render("package.yaml", &meta))?;
         let defaults = match files.remove("values.yaml") {
@@ -288,6 +291,7 @@ impl Package {
             defaults,
             schema: schema.transpose()?,
             notes: files.remove(NOTES),
+            files: all,
             templates: files
                 .into_iter()
                 .filter(|(path, _)| path.starts_with("templates/"))
@@ -327,6 +331,17 @@ impl Package {
             }
         }
         Package::from_files(files).map_err(|e| format!("{}: {e}", dir.display()))
+    }
+
+    /// The package as a `Package` resource, to keep in a cluster: `<name>-<version>`.
+    pub fn resource(&self) -> Fallible<Resource> {
+        let resource = json!({
+            "apiVersion": "kith.dev/v1", "kind": "Package",
+            "metadata": { "name": format!("{}-{}", self.meta.name, self.meta.version) },
+            "spec": { "version": self.meta.version, "files": self.files },
+        });
+        let resource: Resource = serde_json::from_value(resource).map_err(|e| e.to_string())?;
+        resource.validated()
     }
 
     /// The default values with each of `layers` on top, in turn; checked against the

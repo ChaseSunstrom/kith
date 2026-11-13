@@ -538,6 +538,10 @@ spec! {
         pub kith_version: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub dependencies: Vec<PackageRef>,
+        /// The package itself: its files by path (`package.yaml`, `templates/web.yaml`),
+        /// as `kith package push` puts them here.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub files: BTreeMap<String, String>,
     }
 
     pub struct PackageRef {

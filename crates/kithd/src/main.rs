@@ -17,6 +17,7 @@ mod mesh;
 mod pki;
 mod probe;
 mod raft;
+mod releases;
 mod sched;
 mod services;
 
@@ -391,7 +392,11 @@ fn run(args: Args) -> Result<(), String> {
             served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {
-            controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()).await;
+            let releases = releases::run(shared.clone(), stopping.clone());
+            tokio::join!(
+                controller::run(shared.clone(), runtime, args.log_cap, stopping.clone()),
+                releases
+            );
         };
         let names = async {
             if let Some(sockets) = names {

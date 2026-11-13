@@ -300,9 +300,50 @@ kith package render packages/web --name shop | kith apply -f -
   `type`, `properties`, `required`, `additionalProperties`, `items`, `enum`
   and the `minimum`/`maximum` family; `lint` says so about any other keyword.
 
-Not yet: `dependencies` are read and nothing more, and there is no `Release`
-in the cluster yet (rendering and applying is by hand, as above), nor
-repositories.
+### Releases
+
+A cluster installs a package itself: push the package, apply a `Release`.
+
+```sh
+kith package push packages/web      # the package, as Package/web-0.1.0 in the store
+kith apply -f release.yaml
+kith get release/shop -n store -o yaml   # status: state, version, resources, notes
+```
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Release
+metadata: { name: shop, namespace: store }
+spec:
+  package: { name: web, version: 0.1.0 }   # no version: the newest pushed
+  values: { replicas: 3 }
+```
+
+- The node that leads the store renders the package and applies what comes
+  out; a change to the Release, to the package or to shared values is rendered
+  and applied again, and what is no longer rendered is deleted. Deleting the
+  Release deletes what it installed. `kith rollback release/shop --to N`
+  goes back to an earlier Release, and so to what that installed.
+- Values, later over earlier: the package's defaults, the key `values` (YAML)
+  of the ConfigMap `kith-system/kith-values`, the same in the Release's
+  namespace, the Release's `spec.values`.
+- What a release installed is annotated `kith.dev/owned-by` with the Release's
+  key and listed in the Release's status; only what is both is deleted when
+  it is no longer rendered, and everything so annotated goes when the Release
+  does (so `kith apply` refuses a resource annotated as a Release's when
+  there is no such Release). A release does not take over a resource that is
+  there already and not its own, stays in its own namespace, and makes
+  nothing that is in no namespace (a Node, a Package), no Release or Source,
+  and no `kith-values` ConfigMap; any of these (or a template that fails) is
+  `state: error` with the reason in `message`, and what was installed before
+  stays as it was.
+- With no `version`, the newest pushed package is used (semver: `1.0.0-rc1`
+  is older than `1.0.0`), also after a rollback: name the version to stay on
+  one. Pushing a version again replaces it.
+
+Not yet: `dependencies` are read and nothing more; no hooks, no looking up
+what is in the cluster from a template, no version ranges, no repositories
+(a package gets into a cluster by `package push`).
 
 ## YAML, strictly
 

@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+semver = "1"
+kith-yaml.workspace = true
+kith-packages = { path = "../kith-packages" }
 kith-api.workspace = true
 kith-store = { path = "../kith-store" }
 kith-dns = { path = "../kith-dns" }

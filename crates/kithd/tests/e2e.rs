@@ -1072,3 +1072,79 @@ fn dns_answers_from_the_store() {
     daemon.ok(&["delete", "dnsrecord/nas"]);
     wait_for("the name to be gone", || resolve(port, "nas.home.example") == Err(3));
 }
+
+/// A package pushed to the daemon, and a Release of it: installed, upgraded (what is no
+/// longer rendered goes), rolled back, uninstalled. Only ConfigMaps: nothing is pulled.
+#[test]
+fn release_installs_a_package() {
+    let daemon = Daemon::start("release");
+    let package = daemon.dir.join("maps");
+    std::fs::create_dir_all(package.join("templates")).unwrap();
+    std::fs::write(package.join("package.yaml"), "name: maps\nversion: 1.0.0\n").unwrap();
+    std::fs::write(package.join("values.yaml"), "colour: red\nextra: true\n").unwrap();
+    let map = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\n\
+               spec: { data: { colour: {{ values.colour }} } }\n\
+               {% if values.extra %}---\napiVersion: kith.dev/v1\nkind: ConfigMap\n\
+               metadata: { name: {{ name }}-extra }\nspec: { data: { a: b } }\n{% endif %}";
+    std::fs::write(package.join("templates/map.yaml"), map).unwrap();
+    assert_eq!(daemon.ok(&["package", "push", "maps"]), "Package/maps-1.0.0 created\n");
+    assert_eq!(
+        daemon.ok(&["package", "push", "maps"]),
+        "Package/maps-1.0.0 unchanged\n"
+    );
+
+    let release = |values: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: mine }}\nspec: {{ package: {{ name: maps }}, values: {values} }}\n"
+        )
+    };
+    let installed = |daemon: &Daemon, revision: u64| {
+        wait_for("the release to be installed", || {
+            let status = daemon.status("Release/mine");
+            status["state"] == "installed" && status["observedRevision"] == revision
+        });
+    };
+    let there = |target: &str| daemon.kith(&["get", target]).0 == 0;
+    daemon.apply(&release("{}"));
+    installed(&daemon, 1);
+    assert!(
+        daemon
+            .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
+            .contains("colour: red")
+    );
+    assert!(there("ConfigMap/mine-maps-extra"));
+    assert_eq!(daemon.status("Release/mine")["version"], "1.0.0");
+
+    // New values: one map changes, the other is no longer rendered and goes.
+    daemon.apply(&release("{ colour: blue, extra: false }"));
+    installed(&daemon, 2);
+    assert!(
+        daemon
+            .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
+            .contains("colour: blue")
+    );
+    assert!(!there("ConfigMap/mine-maps-extra"));
+
+    // Back to how it was: a rollback of the Release is a rollback of what it installed.
+    daemon.ok(&["rollback", "Release/mine", "--to", "1"]);
+    installed(&daemon, 3);
+    assert!(
+        daemon
+            .ok(&["get", "ConfigMap/mine-maps", "-o", "yaml"])
+            .contains("colour: red")
+    );
+    assert!(there("ConfigMap/mine-maps-extra"));
+
+    // Values the package's templates cannot take: said in the status, nothing torn down.
+    daemon.apply(&release("{ colour: { not: text }, extra: [] }"));
+    wait_for("the release to say what is wrong", || {
+        daemon.status("Release/mine")["state"] == "error"
+    });
+    assert!(there("ConfigMap/mine-maps-extra"));
+
+    daemon.ok(&["delete", "Release/mine"]);
+    wait_for("what the release installed to go", || {
+        !there("ConfigMap/mine-maps") && !there("ConfigMap/mine-maps-extra")
+    });
+    assert!(there("Package/maps-1.0.0"));
+}

@@ -150,6 +150,11 @@ enum PackageCommand {
         /// The package's directory
         dir: PathBuf,
     },
+    /// Put a package in the cluster, as the Package `NAME-VERSION`, for Releases to install
+    Push {
+        /// The package's directory
+        dir: PathBuf,
+    },
 }
 
 /// `a.b=1` as values: `{a: {b: 1}}`. The value is read as YAML, and is text if it is none.
@@ -632,6 +637,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 return fail(wrong.join("\n"));
             }
             println!("{} {} ok", package.meta.name, package.meta.version);
+        }
+        Command::Package {
+            command: PackageCommand::Push { dir },
+        } => {
+            let package = kith_packages::Package::load(&dir).or_else(fail)?;
+            let wrong = package.lint();
+            if !wrong.is_empty() {
+                return fail(wrong.join("\n"));
+            }
+            for change in backend()?.apply(vec![package.resource().or_else(fail)?], false)? {
+                let what = match change.action {
+                    Action::Created => "created",
+                    Action::Updated => "updated",
+                    Action::Unchanged => "unchanged",
+                };
+                println!("{} {what}", change.after.key());
+            }
         }
         Command::Schema { kind: None } => {
             let rows = KINDS
