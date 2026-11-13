@@ -25,11 +25,18 @@ struct Node {
     child: Child,
     dir: PathBuf,
     port: u16,
+    /// The address it listens on.
+    host: String,
 }
 
 impl Node {
     /// Start a kithd named `name` with its state under `test`, plus `args`.
     fn start(test: &str, name: &str, args: &[&str]) -> Node {
+        Node::start_in(None, "127.0.0.1", free_port(), test, name, args)
+    }
+
+    /// The same, listening on `host:port`, in the network namespace `ns` if there is one.
+    fn start_in(ns: Option<&str>, host: &str, port: u16, test: &str, name: &str, args: &[&str]) -> Node {
         let built = Command::new(env!("CARGO"))
             .args(["build", "--quiet", "-p", "kith-cli"])
             .status()
@@ -38,21 +45,35 @@ impl Node {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let port = free_port();
         let node = Node {
-            child: Node::spawn(&dir, name, port, args),
+            child: Node::spawn_in(ns, host, &dir, name, port, args),
             dir,
             port,
+            host: host.to_string(),
         };
         wait_for("kithd to serve", || node.dir.join("kithd.sock").exists());
         node
     }
 
     fn spawn(dir: &Path, name: &str, port: u16, args: &[&str]) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_kithd"))
+        Node::spawn_in(None, "127.0.0.1", dir, name, port, args)
+    }
+
+    fn spawn_in(ns: Option<&str>, host: &str, dir: &Path, name: &str, port: u16, args: &[&str]) -> Child {
+        let kithd = env!("CARGO_BIN_EXE_kithd");
+        let mut command = match ns {
+            // (nsenter, not `ip netns exec`: that hides the cgroups kithd puts its units in.)
+            Some(ns) => {
+                let mut command = Command::new("nsenter");
+                command.arg(format!("--net=/run/netns/{ns}")).arg(kithd);
+                command
+            }
+            None => Command::new(kithd),
+        };
+        command
             .current_dir(dir)
             .args(["--state", "state", "--socket", "kithd.sock", "--name", name])
-            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--listen", &format!("{host}:{port}")])
             .args(args)
             .stdin(Stdio::null())
             .spawn()
@@ -60,7 +81,7 @@ impl Node {
     }
 
     fn address(&self) -> String {
-        format!("127.0.0.1:{}", self.port)
+        format!("{}:{}", self.host, self.port)
     }
 
     /// Run `kith` against this node; returns (exit code, stdout, stderr).
@@ -558,4 +579,243 @@ fn nodes_mesh() {
     assert!(there("kith-beta") && there("kith-alpha"));
     beta.stop();
     assert!(!there("kith-beta") && there("kith-alpha"));
+}
+
+// The rig: a network namespace for each node, and the namespace the test itself runs in
+// as the router between them. Node N is on a link of its own (`r<N>` on the router's side,
+// `e0` on its), which `cut` and `heal` take down and up. A node is public (10.0.N.2) or
+// behind a NAT (192.168.N.2): out of the NAT everything leaves as 10.0.0.N, in through it
+// only TCP to the node's API port, as with a router that forwards one port. Nothing here
+// needs root: `unshare -Urnm`, and `ip`, `iptables` and `nsenter` in what it makes.
+// Run by hand: `KITH_E2E=1 cargo test -p kithd --test cluster rig_`.
+const RIG_PORT: u16 = 7443;
+
+/// Run a command, given as words, and say what it said if it fails.
+fn sh(command: &str) {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let out = Command::new(words[0]).args(&words[1..]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{command}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Run this test again in new user, network and mount namespaces, where it may make
+/// interfaces and namespaces; true in that second run. False when that was it, or
+/// the test is skipped (the reason is on stderr).
+fn in_rig(test: &str) -> bool {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return false;
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_some() {
+        return true;
+    }
+    let unshare = |args: &[&str]| Command::new("unshare").arg("-Urnm").args(args).status();
+    if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+        eprintln!("skipped: no unprivileged user namespaces here (unshare -Urnm)");
+        return false;
+    }
+    for tool in ["ip", "iptables", "nsenter"] {
+        if Command::new(tool).arg("--version").output().is_err() {
+            eprintln!("skipped: no {tool}");
+            return false;
+        }
+    }
+    let me = std::env::current_exe().unwrap();
+    // (A tmpfs on /run: `ip netns add` writes there.)
+    let again = format!(
+        "mount -t tmpfs none /run && ip link set lo up && KITH_IN_NAMESPACE=1 exec \"$0\" --exact {test} --nocapture"
+    );
+    let status = unshare(&["sh", "-c", &again, me.to_str().unwrap()]).unwrap();
+    assert!(status.success(), "the test failed inside its namespaces");
+    false
+}
+
+struct Rig {
+    /// The nodes in order, and whether each is behind a NAT.
+    nodes: Vec<(String, bool)>,
+}
+
+impl Rig {
+    fn new(nodes: &[(&str, bool)]) -> Rig {
+        sh("sysctl -qw net.ipv4.ip_forward=1");
+        for (n, (name, nat)) in (1..).zip(nodes) {
+            let net = if *nat {
+                format!("192.168.{n}")
+            } else {
+                format!("10.0.{n}")
+            };
+            sh(&format!("ip netns add {name}"));
+            sh(&format!("ip -n {name} link set lo up"));
+            sh(&format!("ip link add r{n} type veth peer name e0 netns {name}"));
+            sh(&format!("ip addr add {net}.1/24 dev r{n}"));
+            sh(&format!("ip link set r{n} up"));
+            sh(&format!("ip -n {name} addr add {net}.2/24 dev e0"));
+            sh(&format!("ip -n {name} link set e0 up"));
+            sh(&format!("ip -n {name} route add default via {net}.1"));
+            if !nat {
+                continue;
+            }
+            let public = format!("10.0.0.{n}");
+            sh(&format!("ip addr add {public}/32 dev lo"));
+            sh(&format!(
+                "iptables -t nat -A POSTROUTING -s {net}.0/24 ! -o r{n} -j SNAT --to-source {public}"
+            ));
+            let dnat = format!("-d {public} -p tcp --dport {RIG_PORT} -j DNAT --to-destination {net}.2");
+            sh(&format!("iptables -t nat -A PREROUTING {dnat}"));
+            // Nothing else goes in, not even from a neighbour that knows the private address.
+            sh(&format!(
+                "iptables -A FORWARD -o r{n} -m conntrack --ctstate NEW -m conntrack ! --ctstate DNAT -j DROP"
+            ));
+        }
+        let nodes = nodes.iter().map(|(name, nat)| (name.to_string(), *nat));
+        Rig { nodes: nodes.collect() }
+    }
+
+    fn number(&self, name: &str) -> usize {
+        1 + self.nodes.iter().position(|(node, _)| node == name).unwrap()
+    }
+
+    /// The address a node listens on, in its namespace, and the one others reach it at.
+    fn addresses(&self, name: &str) -> (String, String) {
+        let n = self.number(name);
+        match self.nodes[n - 1].1 {
+            true => (format!("192.168.{n}.2"), format!("10.0.0.{n}")),
+            false => (format!("10.0.{n}.2"), format!("10.0.{n}.2")),
+        }
+    }
+
+    /// Start the node `name` in its namespace; with `join`, in the cluster of that node.
+    fn start(&self, test: &str, name: &str, join: Option<&Node>, args: &[&str]) -> Node {
+        let (host, public) = self.addresses(name);
+        let advertise = format!("{public}:{RIG_PORT}");
+        let mut all = vec!["--advertise", &advertise];
+        let token = join.map(|node| node.ok(&["node", "token"]));
+        let join = join.map(|node| node.address());
+        if let (Some(join), Some(token)) = (&join, &token) {
+            all.extend(["--join", join, "--token", token.trim()]);
+        }
+        all.extend(args);
+        Node::start_in(Some(name), &host, RIG_PORT, test, name, &all)
+    }
+
+    fn cut(&self, name: &str) {
+        sh(&format!("ip link set r{} down", self.number(name)));
+    }
+
+    fn heal(&self, name: &str) {
+        sh(&format!("ip link set r{} up", self.number(name)));
+    }
+
+    /// Latency on a node's link where the kernel has netem; says so where it has not.
+    fn delay(&self, name: &str, ms: u32) {
+        let link = format!("r{}", self.number(name));
+        let tc = format!("tc qdisc add dev {link} root netem delay {ms}ms");
+        let words: Vec<&str> = tc.split_whitespace().collect();
+        let out = Command::new(words[0]).args(&words[1..]).output();
+        if !out.is_ok_and(|out| out.status.success()) {
+            eprintln!("skipped: no netem (`tc qdisc add ... netem` fails here), so no added latency");
+        }
+    }
+
+    /// Whether `from` can reach this address (one ping).
+    fn pings(&self, from: &str, address: &str) -> bool {
+        let net = format!("--net=/run/netns/{from}");
+        let ping = Command::new("nsenter")
+            .args([&net, "ping", "-c1", "-W1", address])
+            .output();
+        ping.unwrap().status.success()
+    }
+}
+
+/// Three nodes, one behind a NAT. The leader's link is cut: the others pick another leader
+/// and go on, and when the link is back the old leader follows, with what it missed.
+#[test]
+fn rig_partition_moves_the_leader() {
+    if !in_rig("rig_partition_moves_the_leader") {
+        return;
+    }
+    // (A short test name: a socket's path may be 107 bytes, and the state sits deep in a worktree.)
+    let test = "rig_cut";
+    let rig = Rig::new(&[("alpha", false), ("beta", false), ("gamma", true)]);
+    let alpha = rig.start(test, "alpha", None, &[]);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let beta = rig.start(test, "beta", Some(&alpha), &[]);
+    let gamma = rig.start(test, "gamma", Some(&alpha), &[]);
+    let status = |node: &Node| node.kith(&["node", "status"]).1;
+    wait_for("three voters", || {
+        [&alpha, &beta, &gamma]
+            .iter()
+            .all(|node| status(node).contains("voters:    alpha, beta, gamma"))
+    });
+    assert!(status(&gamma).contains("leader:    alpha"), "{}", status(&gamma));
+    // Latency where the kernel has netem; the rest runs with it.
+    rig.delay("beta", 20);
+
+    // alpha is cut off. The others agree on a leader and a change made through one of
+    // them reaches the other; alpha hears nothing.
+    rig.cut("alpha");
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: after }\nspec: { data: { a: b } }\n";
+    std::fs::write(beta.dir.join("after.yaml"), config).unwrap();
+    wait_for("a change without alpha", || {
+        beta.kith(&["apply", "-f", "after.yaml"]).0 == 0
+    });
+    wait_for("that change on gamma", || {
+        gamma.kith(&["get", "ConfigMap/after"]).0 == 0
+    });
+    let leader = status(&beta);
+    assert!(
+        leader.contains("leader:    beta") || leader.contains("leader:    gamma"),
+        "{leader}"
+    );
+    assert!(
+        alpha.kith(&["get", "ConfigMap/after"]).0 != 0,
+        "alpha has a change made while it was cut off"
+    );
+
+    // The link is back: alpha has the change, and no longer leads.
+    rig.heal("alpha");
+    wait_for("alpha to catch up", || alpha.kith(&["get", "ConfigMap/after"]).0 == 0);
+    wait_for("alpha to follow", || !status(&alpha).contains("leader:    alpha"));
+    assert!(
+        status(&alpha).contains("voters:    alpha, beta, gamma"),
+        "{}",
+        status(&alpha)
+    );
+}
+
+/// A node behind a NAT, with no way in but its API port, joins and takes part in the mesh:
+/// it dials out, shakes hands with both others, and they with it, though neither can
+/// reach its mesh port or its private address.
+///
+/// Not covered: the relay through an edge node. A member silent for three minutes
+/// (`QUIET` in mesh.rs, not a flag) is routed through an edge node, and a test of that would
+/// wait three minutes; the choice of the relay has its unit tests in kith-mesh.
+#[test]
+fn rig_nat_node_joins_and_meshes() {
+    if !in_rig("rig_nat_node_joins_and_meshes") {
+        return;
+    }
+    let rig = Rig::new(&[("alpha", false), ("beta", false), ("gamma", true)]);
+    let test = "rig_nat";
+    let mesh = ["--mesh", "51820"];
+    let alpha = rig.start(test, "alpha", None, &mesh);
+    wait_for("alpha to lead", || alpha.kith(&["get", "node"]).0 == 0);
+    let beta = rig.start(test, "beta", Some(&alpha), &mesh);
+    let gamma = rig.start(test, "gamma", Some(&alpha), &mesh);
+    let shook = |node: &Node, other: &str| {
+        let status = node.kith(&["node", "status"]).1;
+        let line = status
+            .lines()
+            .find(|line| line.starts_with(&format!("mesh:      {other} at fd")));
+        line.is_some_and(|line| line.contains(", handshake ") && !line.contains("edge node"))
+    };
+    wait_for("gamma and the others to shake hands", || {
+        shook(&gamma, "alpha") && shook(&gamma, "beta") && shook(&alpha, "gamma") && shook(&beta, "gamma")
+    });
+    // No private address reaches in from outside the NAT.
+    assert!(!rig.pings("alpha", "192.168.3.2") && !rig.pings("beta", "192.168.3.2"));
+    assert!(rig.pings("gamma", "10.0.1.2"));
 }
