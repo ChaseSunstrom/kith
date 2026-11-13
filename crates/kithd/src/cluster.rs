@@ -4,6 +4,7 @@
 //! ```text
 //! GET  /v1/ca                          -> the CA certificate (PEM)     no certificate needed
 //! POST /v1/join {token, name, port}    -> {ca, cert, key}              no certificate needed
+//! POST /v1/claim {token, name}         -> {ca, cert, key}              no certificate needed
 //! POST /v1/tokens                      -> {token}                      local socket only
 //! POST /v1/identities/<name>/certificate -> {ca, cert, key}            local socket only
 //! GET  /v1/cluster                    -> {node, leader, voters, learners, applied, mesh}   local socket only
@@ -41,6 +42,8 @@ pub struct Cluster {
     /// Held by the node that can admit others.
     pub ca: Option<pki::Ca>,
     pub tokens: pki::Tokens,
+    /// Tokens of another use: who sends one becomes the cluster's first admin (`--claim`).
+    pub claims: pki::Tokens,
     joining: tokio::sync::Mutex<()>,
     /// Calls other nodes as this one.
     pub client: reqwest::Client,
@@ -63,6 +66,7 @@ impl Cluster {
             me,
             ca,
             tokens: pki::Tokens::default(),
+            claims: pki::Tokens::default(),
             joining: tokio::sync::Mutex::new(()),
         })
     }
@@ -228,6 +232,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     let open = Router::new()
         .route("/v1/ca", get(ca))
         .route("/v1/join", post(join))
+        .route("/v1/claim", post(claim))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(shared.clone());
     let ping = Router::new().route("/v1/ping", post(crate::members::ping));
@@ -256,11 +261,89 @@ async fn certificate(
     State(shared): State<Arc<Shared>>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<Joined>, Refusal> {
+    issue(&shared, &name, Vec::new(), crate::access::Caller::Admin, "certificate").await
+}
+
+#[derive(Deserialize)]
+struct ClaimRequest {
+    token: String,
+    name: String,
+}
+
+/// The cluster's first admin, on a node nobody can log in to (kith OS): whoever sends the
+/// token kithd printed at its start (`--claim`) is given a certificate for a new Identity
+/// that may do everything. The token is good once.
+async fn claim(State(shared): State<Arc<Shared>>, Json(request): Json<ClaimRequest>) -> Result<Json<Joined>, Refusal> {
     let cluster = cluster(&shared)?;
+    // The token first: someone without one learns nothing about the cluster.
+    let refused = "the claim token is wrong, already used, or older than an hour";
+    if !cluster.claims.good(&request.token, false) {
+        return Err(refuse(StatusCode::FORBIDDEN, refused));
+    }
+    pki::valid_name(&request.name).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
+    // Only a cluster nobody administers yet: a token printed before the socket's admin
+    // made an Identity must not give that Identity's name, or a Role, to someone else.
+    if claimed(&shared) {
+        let why = "this cluster has an Identity already: its admin gives out certificates (`kith identity cert`)";
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
+    // (Spent here, and once: of two who send it together, one is refused.)
+    if !cluster.claims.good(&request.token, true) {
+        return Err(refuse(StatusCode::FORBIDDEN, refused));
+    }
+    let grant = serde_json::json!([
+        { "apiVersion": kith_api::API_VERSION, "kind": "Role", "metadata": { "name": "cluster-admin" },
+          "spec": { "rules": [{ "kinds": ["*"], "verbs": ["get", "list", "watch", "apply", "delete", "exec"] }] } },
+        { "apiVersion": kith_api::API_VERSION, "kind": "RoleBinding",
+          "metadata": { "name": format!("cluster-admin-{}", request.name) },
+          "spec": { "role": "cluster-admin", "subjects": [request.name] } },
+    ]);
+    let grant = serde_json::from_value(grant).expect("a Role and a RoleBinding with valid names");
+    let caller = crate::access::Caller::Identity(request.name.clone());
+    let done = issue(&shared, &request.name, grant, caller, "claim").await;
+    // (The token is spent: where nothing came of it, the console gets another.)
+    let done = done.inspect_err(|_| offer_claim(&shared))?;
+    eprintln!("kithd: {} claimed this cluster: it may do everything", request.name);
+    Ok(done)
+}
+
+fn claimed(shared: &Shared) -> bool {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    state.store.list(Some("Identity")).next().is_some()
+}
+
+/// `--claim`: while the cluster has no Identity, say how its first admin is made.
+pub fn offer_claim(shared: &Shared) {
+    let Some(Cluster {
+        ca: Some(ca), claims, ..
+    }) = &shared.cluster
+    else {
+        return eprintln!("kithd: --claim is for the node the cluster was started on: this one cannot make its admin");
+    };
+    if claimed(shared) {
+        return;
+    }
+    match claims.mint(&ca.cert) {
+        Ok(token) => eprintln!(
+            "kithd: nobody administers this cluster from outside yet. For an hour, whoever sends this token to /v1/claim does: {token}"
+        ),
+        Err(e) => eprintln!("kithd: no claim token: {e}"),
+    }
+}
+
+/// A certificate for Identity `name`, applied together with `more` (what it is granted).
+async fn issue(
+    shared: &Arc<Shared>,
+    name: &str,
+    more: Vec<kith_api::Resource>,
+    caller: crate::access::Caller,
+    what: &str,
+) -> Result<Json<Joined>, Refusal> {
+    let cluster = cluster(shared)?;
     let Some(ca) = &cluster.ca else {
         return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };
-    let issued = ca.issue_user(&name);
+    let issued = ca.issue_user(name);
     let (cert, key, public) = issued.map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let key_of = format!("Identity/{name}");
     let identity = {
@@ -274,11 +357,15 @@ async fn certificate(
         serde_json::from_value(new).expect("an Identity with a valid name")
     });
     identity.spec["publicKey"] = public.into();
-    let (resources, at) = (vec![identity], kith_api::store::now());
-    let done = shared.submit(Command::Apply { resources, at }).await;
+    let resources = std::iter::once(identity).chain(more).collect();
+    let done = shared
+        .submit(Command::Apply {
+            resources,
+            at: kith_api::store::now(),
+        })
+        .await;
     let said = done.as_ref().map(drop).map_err(ToString::to_string);
-    let caller = crate::access::Caller::Admin;
-    shared.audit.record(&caller, "certificate", vec![key_of], said);
+    shared.audit.record(&caller, what, vec![key_of], said);
     done.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let ca = cluster.me.ca.clone();
     Ok(Json(Joined {

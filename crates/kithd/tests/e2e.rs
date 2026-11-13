@@ -2118,3 +2118,143 @@ fn web_ui_is_served_and_asks_as_its_caller() {
     forwarder.kill().unwrap();
     forwarder.wait().unwrap();
 }
+
+/// A node with no shell (kith OS): its first admin is made over TLS, by whoever has the
+/// token `--claim` prints while the cluster has no Identity.
+#[test]
+fn claim_makes_the_first_admin_over_tls() {
+    let port = free_port();
+    let listen = format!("127.0.0.1:{port}");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("claim");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let kithd = Path::new(env!("CARGO_BIN_EXE_kithd"));
+    // (Its own start: what kithd says is what is read here.)
+    let spawn = |said: &str| {
+        Command::new(kithd)
+            .current_dir(&dir)
+            .args(["--state", "state", "--name", "alpha", "--listen", &listen, "--claim"])
+            .arg("--socket")
+            .arg(dir.join("kithd.sock"))
+            .stdin(Stdio::null())
+            .stderr(std::fs::File::create(dir.join(said)).unwrap())
+            .spawn()
+            .unwrap()
+    };
+    let mut daemon = Daemon {
+        child: spawn("said"),
+        dir: dir.clone(),
+        args: &[],
+        kith: kithd.with_file_name("kith"),
+    };
+    let token_in = |said: &str| {
+        let said = std::fs::read_to_string(dir.join(said)).unwrap_or_default();
+        let token = said.split_whitespace().find(|word| word.starts_with("kith1."));
+        token.map(str::to_string)
+    };
+    wait_for("kithd to print a claim token", || token_in("said").is_some());
+    let token = token_in("said").unwrap();
+
+    let post = |path: &str, body: serde_json::Value| {
+        let mut curl = Command::new("curl");
+        curl.args(["-s", "-k", "--max-time", "10", "-w", "\n%{http_code}"])
+            .args(["-H", "Content-Type: application/json", "-d", &body.to_string()])
+            .arg(format!("https://127.0.0.1:{port}{path}"));
+        let out = String::from_utf8(curl.output().unwrap().stdout).unwrap();
+        let (reply, status) = out.rsplit_once('\n').unwrap_or_default();
+        let reply = serde_json::from_str(reply).unwrap_or(serde_json::Value::Null);
+        (status.parse::<u16>().unwrap_or(0), reply)
+    };
+    wait_for("the TLS port to answer", || {
+        post("/v1/claim", serde_json::json!({ "token": "x", "name": "root" })).0 == 403
+    });
+    // Only a cluster with no Identity can be claimed: once the socket's admin has made
+    // one, the token on the console is worth nothing (and takes nobody's name over).
+    daemon.ok(&["identity", "cert", "alice", "--out", "."]);
+    for name in ["alice", "root"] {
+        let (status, reply) = post("/v1/claim", serde_json::json!({ "token": token, "name": name }));
+        assert_eq!(status, 409, "{reply}");
+    }
+    assert!(!daemon.ok(&["get", "rolebinding"]).contains("cluster-admin"));
+    daemon.ok(&["delete", "identity/alice"]);
+    // Each token for its own use: one that admits a node makes no admin, and the reverse.
+    let join = daemon.ok(&["node", "token"]);
+    let join = join.split_whitespace().find(|word| word.starts_with("kith1.")).unwrap();
+    let (status, reply) = post("/v1/claim", serde_json::json!({ "token": join, "name": "root" }));
+    assert_eq!(status, 403, "{reply}");
+    let (status, reply) = post(
+        "/v1/join",
+        serde_json::json!({ "token": token, "name": "beta", "port": 1 }),
+    );
+    assert_eq!(status, 403, "{reply}");
+    // A name that cannot be an Identity's does not spend the token.
+    let (status, reply) = post("/v1/claim", serde_json::json!({ "token": token, "name": "Not A Name" }));
+    assert_eq!(status, 422, "{reply}");
+
+    let (status, reply) = post("/v1/claim", serde_json::json!({ "token": token, "name": "root" }));
+    assert_eq!(status, 200, "{reply}");
+    for (file, field) in [("ca.crt", "ca"), ("root.crt", "cert"), ("root.key", "key")] {
+        std::fs::write(dir.join(file), reply[field].as_str().unwrap()).unwrap();
+    }
+    // The token's last part is the CA's fingerprint, as openssl prints it: who claims
+    // can tell the node is the one whose console showed the token.
+    let print = Command::new("openssl")
+        .args(["x509", "-noout", "-fingerprint", "-sha256", "-in"])
+        .arg(dir.join("ca.crt"))
+        .output()
+        .unwrap();
+    let print = String::from_utf8(print.stdout).unwrap().replace(':', "").to_lowercase();
+    assert!(print.trim().ends_with(token.rsplit('.').next().unwrap()), "{print}");
+    // Good once.
+    let (status, reply) = post("/v1/claim", serde_json::json!({ "token": token, "name": "other" }));
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(
+        reply["error"],
+        "the claim token is wrong, already used, or older than an hour"
+    );
+
+    // With the certificate, and the node checked against the CA: everything.
+    let call = |method: &str, path: &str, body: &str| {
+        let mut curl = Command::new("curl");
+        curl.args([
+            "-s",
+            "--max-time",
+            "10",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "-X",
+            method,
+        ])
+        .arg("--cacert")
+        .arg(dir.join("ca.crt"))
+        .arg("--cert")
+        .arg(dir.join("root.crt"))
+        .arg("--key")
+        .arg(dir.join("root.key"))
+        .args(["--resolve", &format!("kith:{port}:127.0.0.1")]);
+        if !body.is_empty() {
+            curl.args(["-H", "Content-Type: application/json", "-d", body]);
+        }
+        let out = curl.arg(format!("https://kith:{port}{path}")).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(call("GET", "/v1/resources", ""), "200");
+    let role = serde_json::json!([{
+        "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": "reader" },
+        "spec": { "rules": [{ "kinds": ["*"], "verbs": ["get", "list"] }] },
+    }]);
+    assert_eq!(call("POST", "/v1/apply", &role.to_string()), "200");
+    assert!(daemon.ok(&["get", "identity"]).contains("root"));
+    assert!(daemon.ok(&["audit"]).contains("claim"), "the claim is in the audit log");
+
+    // There is an Identity now: a restart prints no token.
+    daemon.stop();
+    std::fs::remove_file(dir.join("kithd.sock")).ok();
+    daemon.child = spawn("said-again");
+    wait_for("kithd to serve again", || {
+        std::fs::read_to_string(dir.join("said-again")).is_ok_and(|said| said.contains("serving other nodes"))
+    });
+    assert_eq!(token_in("said-again"), None);
+}

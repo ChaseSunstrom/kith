@@ -693,6 +693,31 @@ curl --cacert ca.crt --cert alice.crt --key alice.key \
 (Every node's certificate is good for the name `kith`. `kith` itself only
 talks to the local socket so far.)
 
+A node nobody can log in to (kith OS has no shell) has no socket to run that
+on. Start its kithd with `--claim`: while the cluster has no Identity, it
+prints a token at each start,
+
+```
+kithd: nobody administers this cluster from outside yet. For an hour, whoever sends this token to /v1/claim does: kith1.<secret>.<the CA's fingerprint>
+```
+
+and whoever sends it first becomes an Identity that may do everything (a Role
+`cluster-admin` is bound to it):
+
+```sh
+curl -k -d "{\"token\":\"$TOKEN\",\"name\":\"root\"}" -H 'Content-Type: application/json' \
+     https://10.0.0.7:7443/v1/claim       # {"ca": …, "cert": …, "key": …}: save as ca.crt, root.crt, root.key
+```
+
+Once the cluster has an Identity, however it was made, the token claims
+nothing. The token is good once, for an hour, and for nothing else (it admits no node,
+and a join token claims nothing). `-k` there means curl does not know the
+node yet: the token's last part is the SHA-256 of the cluster's CA, so to be
+sure nobody sits in between, fetch `https://10.0.0.7:7443/v1/ca` first,
+compare `openssl x509 -noout -fingerprint -sha256` of it with that part, and
+claim with `--cacert` instead. The token is on the node's console: who can
+read that, or its logs, within the hour can claim the cluster.
+
 - What is not allowed is refused with 403 and the reason. `list` and `watch`
   show what the caller may see and no more. An apply is all or nothing: one
   resource it may not apply refuses the whole body.

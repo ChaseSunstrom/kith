@@ -65,6 +65,9 @@ struct Args {
     /// The address other nodes reach this one at, when it is not the one it listens on
     #[arg(long, env = "KITH_ADVERTISE", value_name = "ADDR:PORT")]
     advertise: Option<String>,
+    /// While the cluster has no Identity, print a one-time token at start: whoever sends it to /v1/claim on --listen becomes its admin (for a node nobody can log in to)
+    #[arg(long, env = "KITH_CLAIM")]
+    claim: bool,
     /// Serve DNS here, on UDP and TCP: node names, DNSZone and DNSRecord resources, and the rest from upstream
     #[arg(long, env = "KITH_DNS", value_name = "ADDR:PORT")]
     dns: Option<std::net::SocketAddr>,
@@ -462,6 +465,9 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
                 return Err(format!(
                     "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
                 ));
+            }
+            if args.claim {
+                cluster::offer_claim(&shared);
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
             let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
