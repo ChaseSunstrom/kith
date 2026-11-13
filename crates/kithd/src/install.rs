@@ -11,6 +11,10 @@
 //!    every start;
 //! 4. powers the machine off.
 //!
+//! Where a machine cannot be started from a stick (a rented one), os/vps.sh starts the
+//! same thing from the system that runs there, with the image and the answers in the
+//! kernel's memory disk; the machine then restarts into what was installed.
+//!
 //! Everything on the chosen disk is lost. Without a person there, a disk is only chosen
 //! by name, or as `only` when the machine has exactly one.
 //
@@ -88,6 +92,10 @@ pub struct Answers {
     pub ip: Option<String>,
     #[serde(default)]
     pub dns: Option<String>,
+    /// How many bytes the disk holds, where its name was looked up under another kernel
+    /// (os/vps.sh): a disk of that name and another size is not the one that was meant.
+    #[serde(default)]
+    pub size: Option<u64>,
     /// Join this cluster; without, the node starts a new one.
     #[serde(default)]
     pub join: Option<Join>,
@@ -99,6 +107,11 @@ pub struct Join {
     pub address: String,
     pub token: String,
 }
+
+/// The image, where the installer runs from memory (os/build.sh puts it there).
+const CARRIED: &str = "/payload";
+
+static IN_MEMORY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The port a node's kithd serves other nodes and its admins on.
 const PORT: u16 = 7443;
@@ -119,6 +132,11 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
             _ => format!("no disk {name} to install on; there is: {}", listed()),
         })?,
     };
+    if let Some(size) = answers.size.filter(|size| *size != disk.bytes) {
+        return Err(format!(
+            "{disk} is not the disk that was named: that one held {size} bytes. This kernel names the disks otherwise"
+        ));
+    }
     if disk.bytes < image {
         return Err(format!(
             "{disk} is smaller than kith OS ({} MB)",
@@ -207,6 +225,7 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
         hostname,
         ip,
         dns: None,
+        size: None,
         join,
     })
 }
@@ -343,6 +362,14 @@ fn keyboard() -> std::sync::mpsc::Receiver<String> {
 /// Nothing more is done, and the machine stays as it is for someone to read why.
 async fn stop(why: &str) -> ! {
     eprintln!("kithd: install: nothing was installed: {why}");
+    // Nobody sits at a machine installed from its own memory, and its way in went with the
+    // system that ran: started again, that system is back if its disk was not written yet.
+    if IN_MEMORY.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "kithd: install: starting the machine again: what its disk held starts, unless the disk was being written"
+        );
+        crate::init::end(true)
+    }
     eprintln!("kithd: install: power the machine off, or press Ctrl-Alt-Del to start it again");
     std::future::pending().await
 }
@@ -350,8 +377,14 @@ async fn stop(why: &str) -> ! {
 /// Install mode, start to end. `source` is the URL of the answers, or empty.
 pub async fn run(source: String) -> ! {
     eprintln!("kithd: install: this is the kith OS installer: it erases a disk of this machine and puts kith OS on it");
-    let Some(payload) = crate::init::labelled("payload") else {
-        stop("this installer carries no image (no partition named payload)").await
+    // Started from a stick, the image is a partition of it. Started in place of a running
+    // system (os/vps.sh), all there is is in memory: the image and the answers are files.
+    let memory = Path::new(CARRIED).exists();
+    IN_MEMORY.store(memory, std::sync::atomic::Ordering::Relaxed);
+    let payload = match crate::init::labelled("payload").filter(|_| !memory) {
+        Some(partition) => partition,
+        None if memory => CARRIED.into(),
+        None => stop("this installer carries no image (no partition named payload)").await,
     };
     let image = match File::open(&payload)
         .map_err(|e| e.to_string())
@@ -376,7 +409,10 @@ pub async fn run(source: String) -> ! {
         }
     }
     // Answers from a URL or from the stick mean nobody is asked anything.
-    let file = crate::os::esp(|esp| std::fs::read_to_string(esp.join("../../kith-install.yaml")).ok());
+    let file = match memory {
+        true => Ok(std::fs::read_to_string("/kith-install.yaml").ok()),
+        false => crate::os::esp(|esp| std::fs::read_to_string(esp.join("../../kith-install.yaml")).ok()),
+    };
     let given = if source.is_empty() {
         file.ok().flatten().map(Ok)
     } else {
@@ -435,8 +471,14 @@ pub async fn run(source: String) -> ! {
     });
     match wrote.await.map_err(|e| e.to_string()).and_then(|wrote| wrote) {
         Ok(()) => {
-            eprintln!("kithd: install: kith OS is on {disk}. Take the installer out and start the machine.");
-            crate::init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+            // (Nothing to take out of a machine installed from its own memory: it starts at once.)
+            let then = if memory {
+                "Starting it."
+            } else {
+                "Take the installer out and start the machine."
+            };
+            eprintln!("kithd: install: kith OS is on {disk}. {then}");
+            crate::init::POWER_OFF.store(!memory, std::sync::atomic::Ordering::Relaxed);
             crate::init::end(false)
         }
         Err(e) => {
@@ -547,6 +589,10 @@ mod tests {
             args,
             ["--listen", "0.0.0.0:7443", "--advertise", "10.0.0.5:7443", "--claim"]
         );
+        // A disk looked up under another kernel is the one of that size, or none.
+        assert!(config("disk: sda\nsize: 8000000000\n", &two).is_ok());
+        let other = config("disk: sda\nsize: 256000000000\n", &two).unwrap_err();
+        assert!(other.contains("is not the disk that was named"), "{other}");
         let (_, joined) = config(
             "disk: /dev/sda\njoin: { address: 10.0.0.7:7443, token: kith1.ab.cd }\n",
             &two,

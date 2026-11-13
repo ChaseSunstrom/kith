@@ -1054,7 +1054,52 @@ The installed disk is the image as built: the state partition is 32 MB until
 it can grow, and the kernel notes at each start that the spare partition
 table is not at the disk's end.
 
-Not yet: a CD image, a watchdog for a slot that hangs without
+### Installing on a rented machine
+
+A machine that cannot be started from a stick, but runs some Linux you can log
+in to as root, is installed from that system: `os/vps.sh` loads kith OS's
+kernel with the installer and the image in a memory disk, and starts it in
+place of the running kernel (kexec). **The disk named is erased, the system
+that ran with it**, and the machine restarts as a kith OS node. As with the
+stick, you run it, on that machine; nothing here does.
+
+```sh
+sh os/build.sh                         # also writes vmlinuz, kith-install.cpio.zst and vps.sh
+scp target/os/vmlinuz target/os/kith-install.cpio.zst target/os/vps.sh root@machine:
+scp answers.yaml root@machine:
+ssh root@machine sh vps.sh --answers answers.yaml --erase vda
+sh ci/vm.sh --test vps                 # the same, in QEMU, on a disk that is a file
+```
+
+`answers.yaml` is [the installer's](#installing-on-a-machine), with the disk
+by its name (`lsblk -d` shows them). Rented machines mostly have a fixed
+address and no DHCP: give `ip:` the address and gateway the machine has now
+(`ip addr`, `ip route`), or it comes back with no network and no way in.
+`--erase` says the disk's name a second time; without it the script asks.
+
+**Have another way in ready** (the provider's console or rescue system) before
+you run it. Once the installer's kernel starts, the old system and your login
+are gone. If the installer then refuses the answers it starts the machine
+again, and the old system comes back, its disk untouched; if the disk was
+already being written, or the node comes up with a wrong address, the console
+is all there is. The kernel has drivers for virtio, NVMe and AHCI disks and
+for virtio, Intel (e1000, e1000e, igb), Realtek r8169 and Broadcom tg3 and
+bnx2 network cards, and none for Xen, Hyper-V, VMware or AWS ENA devices: on
+such a machine the node has no network. The installer is told the size of the
+disk named and writes no disk of another size, as its kernel may name the
+disks in another order.
+
+The script refuses, with nothing done, a machine that starts by BIOS (kith OS
+starts by UEFI only: `ls /sys/firmware/efi` tells), one with less than 1 GB of
+memory (the image sits in memory while it is written), one without `kexec` or
+`cpio`, and a disk that is not there. The test starts the kernel and memory
+disk the way kexec does; the `kexec` call itself has only been read, not run.
+
+For a cloud that takes uploaded disk images, `kith-os.raw` and
+`kith-os.qcow2` are that image: such a node asks its network for an address
+and names itself after its network card, as nothing has written its config.
+
+Not yet: a CD image, starting by BIOS, a watchdog for a slot that hangs without
 stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk and being encrypted, drivers for Wi-Fi,

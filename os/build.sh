@@ -37,6 +37,8 @@ usage: sh os/build.sh [--out DIR] [--check] [--twice]
 
 Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-installer.raw
 (default DIR: target/os).
+For a machine that is only reached through the system it runs: DIR/vmlinuz,
+DIR/kith-install.cpio.zst and DIR/vps.sh (see os/vps.sh).
 Beside them, DIR/kith-os.update: what a running node is given to become this version
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
 the workspace's).
@@ -52,7 +54,7 @@ The first build compiles the kernel (ten minutes or so) and keeps it in
 $KITH_OS_CACHE (default ~/.cache/kith-os), keyed by its version, its config and the
 compiler; later builds take seconds. Needs: gcc, make, flex, bison, bc, cargo, a musl C
 compiler or zig, mksquashfs, veritysetup, objcopy, systemd-repart with systemd's EFI
-stub and systemd-boot, mkfs.vfat, mcopy (mtools), mkfs.ext4, qemu-img, curl. Where bc
+stub and systemd-boot, mkfs.vfat, mcopy (mtools), mkfs.ext4, qemu-img, curl, cpio, zstd. Where bc
 or mcopy is missing and nix is there, they come from nix.
 EOF
 }
@@ -90,7 +92,7 @@ if ! command -v bc >/dev/null 2>&1 || ! command -v mcopy >/dev/null 2>&1; then
     fi
     lacks "bc and mcopy (mtools)"
 fi
-for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat mkfs.ext4 qemu-img curl; do
+for tool in gcc make flex bison cargo flock objdump sfdisk mksquashfs veritysetup objcopy systemd-repart mkfs.vfat mkfs.ext4 qemu-img curl cpio zstd; do
     command -v "$tool" >/dev/null 2>&1 || lacks "$tool"
 done
 if ! [ -r "$efi/linuxx64.efi.stub" ] || ! [ -r "$efi/systemd-bootx64.efi" ]; then lacks "systemd's EFI stub and systemd-boot in $efi"; fi
@@ -254,6 +256,22 @@ assemble() { # DIR
     part 50-payload linux-generic payload "$(($(stat -c %s "$w/kith-os.raw") / 1048576 + 1))M" "CopyBlocks=$w/kith-os.raw"
     systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os-installer.raw" >"$w/repart-install.log" 2>&1 \
         || { cat "$w/repart-install.log" >&2; die "systemd-repart failed (the installer)"; }
+
+    # The installer for a machine that can only be reached through the system it runs
+    # (os/vps.sh): the kernel, and a memory disk with the same root and the image as a
+    # file. The kernel unpacks it and starts /init: no disk is needed to get there.
+    i=$w/initramfs
+    mkdir "$i"
+    cp -a "$r/." "$i/"
+    ln -s sbin/init "$i/init"
+    cp "$w/kith-os.raw" "$i/payload"
+    find "$i" -exec touch -h -d @0 {} +
+    # (To a file first: in a pipe, a cpio that failed would leave half an archive unnoticed.)
+    (cd "$i" && find . | LC_ALL=C sort | cpio -o -H newc --reproducible --owner=0:0 --quiet) >"$w/kith-install.cpio"
+    zstd -19 -T1 -q --rm "$w/kith-install.cpio"
+    find "$i" -delete
+    cp "$kernel" "$w/vmlinuz"
+    cp "$root/os/vps.sh" "$w/vps.sh"
 }
 
 assemble "$out"
@@ -265,7 +283,7 @@ if [ -n "$check" ]; then
 fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
-    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw; do
+    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     find "$out/again" -delete
