@@ -2,7 +2,7 @@
 // (the Rust test `ui_forms` writes that file from the real schemas and runs this).
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { at, blank, diffLines, health, keyOf, lamps, prune, resolve, resourceOf, shape, summary, written } from './forms.js';
+import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, prune, resolve, resourceOf, shape, summary, written } from './forms.js';
 
 const kinds = JSON.parse(readFileSync(process.argv[2], 'utf8'));
 assert.ok(kinds.length > 10, 'every kind of kith is here');
@@ -74,6 +74,12 @@ assert.equal(prune({ a: [{}] }), undefined);
 const was = { rules: [], volume: { emptyDir: {} }, note: '', gone: 'x' };
 assert.deepEqual(prune({ rules: [], volume: { emptyDir: {} }, note: '', gone: '', more: [] }, was), { rules: [], volume: { emptyDir: {} }, note: '' });
 assert.deepEqual(resourceOf({ kind: 'K', metadata: { name: 'n' }, spec: { rules: [] } }, { spec: { rules: [] } }).spec, { rules: [] });
+// A null a nullable field already held stays null; one the form never had is not made.
+assert.deepEqual(resourceOf({ kind: 'K', metadata: { name: 'n' }, spec: { ttl: null, env: { A: null }, none: null } }, { spec: { ttl: null, env: { A: null } } }).spec, { ttl: null, env: { A: null } });
+// Map rows: an empty or repeated name is an error on that row.
+assert.deepEqual(entriesCheck([['a', 1], ['b', 2]]), [null, null]);
+assert.equal(entriesCheck([['', 1]])[0].includes('Name it'), true);
+assert.deepEqual(entriesCheck([['a', 1], ['a', 2], ['b', 3]]).map(Boolean), [true, true, false]);
 assert.equal('spec' in resourceOf(blank(game)), false);
 assert.equal(blank(kinds.find((kind) => kind.kind === 'Node')).metadata.namespace, undefined);
 

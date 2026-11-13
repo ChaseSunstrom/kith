@@ -234,6 +234,7 @@ textarea { padding: calc(var(--unit) * 1.5) calc(var(--unit) * 2.5); resize: ver
 output { display: inline-flex; align-items: center; color: var(--dim); border-style: dashed; }
 input[readonly] { color: var(--dim); border-style: dashed; }
 [aria-invalid="true"] { border-color: var(--bad); }
+.row-error { color: var(--bad); }
 button { cursor: pointer; background: var(--raised); font-weight: 600; }
 button:hover { border-color: var(--dim); transform: translateY(-1px); }
 button:active { transform: translateY(0); }

@@ -85,6 +85,16 @@ export function prune(value, base) {
   return value;
 }
 
+/** What is wrong with each row of a map's `entries` (`[name, value]` pairs): an error, or null where it is fine. */
+export function entriesCheck(entries) {
+  const seen = new Map();
+  entries.forEach(([name]) => seen.set(name, (seen.get(name) ?? 0) + 1));
+  return entries.map(([name]) =>
+    name === '' ? 'Name it, or remove the row: a row without a name is not written.'
+    : seen.get(name) > 1 ? `“${name}” is named twice: only one row can be written.`
+    : null);
+}
+
 /** A resource as one writes it: no status, no revision. */
 export function written(resource) {
   const { status, metadata = {}, ...rest } = resource;
