@@ -53,6 +53,15 @@ fn limit(socket: &Socket, wait: Duration) -> Result<()> {
     std::net::UdpSocket::from(copy).set_read_timeout(Some(wait))
 }
 
+/// A read that gave up, said as what it is (the kernel's own word for it is "Resource
+/// temporarily unavailable").
+fn silent(e: Error) -> Error {
+    match e.kind() {
+        ErrorKind::WouldBlock => Error::new(ErrorKind::TimedOut, "the kernel did not answer (netlink)"),
+        _ => e,
+    }
+}
+
 fn socket(protocol: isize) -> Result<Socket> {
     let mut socket = Socket::new(protocol)?;
     socket.bind_auto()?;
@@ -78,7 +87,7 @@ where
     socket.send(&bytes, 0)?;
     let mut answers = Vec::new();
     loop {
-        let (bytes, _) = socket.recv_from_full()?;
+        let (bytes, _) = socket.recv_from_full().map_err(silent)?;
         let mut rest = &bytes[..];
         while !rest.is_empty() {
             let answer = NetlinkMessage::<T>::deserialize(rest);
@@ -196,13 +205,23 @@ impl Device {
     pub fn set_addresses(&mut self, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
         // All are tried; the first that failed is told. (One that would not go, because it
         // was gone already, say, is not tried again.)
+        // A kernel that does not answer is not asked the rest: each would wait as long.
+        let silent = |tried: &Result<()>| matches!(tried, Err(e) if e.kind() == ErrorKind::TimedOut);
         let mut failed = Ok(());
         for gone in self.held.clone().difference(wanted) {
-            failed = failed.and(self.address(*gone, 128, false));
+            let tried = self.address(*gone, 128, false);
+            if silent(&tried) {
+                return tried;
+            }
+            failed = failed.and(tried);
             self.held.remove(gone);
         }
         for new in wanted.difference(&self.held.clone()) {
-            match self.address(*new, 128, true) {
+            let tried = self.address(*new, 128, true);
+            if silent(&tried) {
+                return tried;
+            }
+            match tried {
                 Ok(()) => drop(self.held.insert(*new)),
                 Err(e) => failed = failed.and(Err(e)),
             }
@@ -438,7 +457,12 @@ mod tests {
         limit(&socket, Duration::from_millis(50)).unwrap();
         let started = std::time::Instant::now();
         let read = socket.recv_from_full();
-        assert_eq!(read.unwrap_err().kind(), ErrorKind::WouldBlock);
+        let e = silent(read.unwrap_err());
+        assert_eq!(
+            (e.kind(), e.to_string().as_str()),
+            (ErrorKind::TimedOut, "the kernel did not answer (netlink)")
+        );
+        assert_eq!(silent(Error::from(ErrorKind::NotFound)).kind(), ErrorKind::NotFound);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
