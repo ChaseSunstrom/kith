@@ -62,6 +62,7 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// The first question of a query and what the reply must copy from it.
+#[derive(Debug, PartialEq)]
 pub struct Query {
     pub id: u16,
     pub flags: u16,
@@ -270,6 +271,66 @@ pub fn for_upstream(query: &[u8], id: u16) -> Option<Vec<u8>> {
         out[q.edns_at..q.edns_at + 2].copy_from_slice(&size.min(EDNS_MAX).to_be_bytes());
     }
     Some(out)
+}
+
+/// A recursive query for `name` and `qtype` (class IN), with id 0: the forwarder gives it its own.
+// ponytail: no EDNS, so a UDP upstream answers in 512 bytes at most; a longer one comes back
+// truncated and the CNAME goes out alone (clients that use TCP are asked over TCP).
+pub fn ask(name: &str, qtype: u16) -> Vec<u8> {
+    let mut w = Writer {
+        buf: Vec::new(),
+        seen: HashMap::new(),
+    };
+    for v in [0, 0x0100, 1, 0, 0, 0] {
+        w.u16(v);
+    }
+    w.name(name);
+    w.u16(qtype);
+    w.u16(1);
+    w.buf
+}
+
+/// The record at `p` of an answer section and where the next one starts. The record is `None`
+/// for a type we cannot hold (or data that is not well formed); `None` overall ends the section.
+fn record_at(b: &[u8], p: usize) -> Option<(Option<Record>, usize)> {
+    let (name, p) = read_name(b, p)?;
+    let (ty, class, len) = (u16_at(b, p)?, u16_at(b, p + 2)?, usize::from(u16_at(b, p + 8)?));
+    let ttl = u32::from(u16_at(b, p + 4)?) << 16 | u32::from(u16_at(b, p + 6)?);
+    let rd = b.get(p + 10..p + 10 + len)?;
+    let data = match (ty, class) {
+        (1, 1) => <[u8; 4]>::try_from(rd).ok().map(|a| Rdata::A(a.into())),
+        (28, 1) => <[u8; 16]>::try_from(rd).ok().map(|a| Rdata::Aaaa(a.into())),
+        (5, 1) => read_name(b, p + 10).map(|n| Rdata::Cname(n.0)),
+        (16, 1) => txt(rd),
+        _ => None,
+    };
+    Some((data.map(|data| Record { name, ttl, data }), p + 10 + len))
+}
+
+/// The strings of a TXT record joined, if they are UTF-8.
+fn txt(mut rd: &[u8]) -> Option<Rdata> {
+    let mut text = Vec::new();
+    while let [n, rest @ ..] = rd {
+        text.extend(rest.get(..usize::from(*n))?);
+        rd = &rest[usize::from(*n)..];
+    }
+    Some(Rdata::Txt(String::from_utf8(text).ok()?))
+}
+
+/// The A, AAAA, CNAME and TXT records in the answer section of a NOERROR response, in order. Other
+/// types are skipped; so is everything after the first record that cannot be read.
+pub fn answers(b: &[u8]) -> Vec<Record> {
+    let mut out = vec![];
+    let Some((.., mut p)) = question(b) else { return out };
+    if b[2] & 0x80 == 0 || b[3] & 0xF != 0 {
+        return out;
+    }
+    for _ in 0..u16_at(b, 6).unwrap_or(0) {
+        let Some((r, next)) = record_at(b, p) else { break };
+        out.extend(r);
+        p = next;
+    }
+    out
 }
 
 /// An upstream `reply` for a UDP client with room for `limit` bytes: a longer one is cut to its

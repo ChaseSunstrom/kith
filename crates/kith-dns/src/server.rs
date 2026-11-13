@@ -1,7 +1,7 @@
 //! The UDP and TCP servers and the forwarder.
 
 use crate::wire::{self, Query, REFUSED};
-use crate::{Answer, Cidr, Zones, answer, servfail};
+use crate::{Answer, Chase, Cidr, Zones, answer, servfail};
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::io;
@@ -15,6 +15,8 @@ use tokio::time::{sleep, timeout};
 
 /// How long each upstream gets to answer.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long an answer of ours waits for the upstreams to add to it.
+const CHASE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a TCP client gets to send a query, or to take a reply.
 const IDLE: Duration = Duration::from_secs(10);
 const MAX_TCP_CONNECTIONS: usize = 64;
@@ -121,6 +123,28 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
             Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => {
                 let _ = sock.send_to(&wire::failure(&buf[..n], REFUSED), from).await;
             }
+            Answer::Chase(c) => {
+                // Asking upstream costs a forward slot; with none to spare (or for a client that
+                // may not forward) the CNAME goes out alone.
+                let held = may_forward(from.ip(), &sh.forwarders)
+                    .then(|| {
+                        slots
+                            .clone()
+                            .try_acquire_owned()
+                            .ok()
+                            .zip(sh.forwards.take(from.ip(), FORWARDS_PER_IP))
+                    })
+                    .flatten();
+                let Some(held) = held else {
+                    let _ = sock.send_to(&c.plain(), from).await;
+                    continue;
+                };
+                let (sock, upstreams) = (sock.clone(), sh.upstreams.clone());
+                tokio::spawn(async move {
+                    let _ = sock.send_to(&chase(&c, &upstreams, false).await, from).await;
+                    drop(held);
+                });
+            }
             Answer::Forward => {
                 let (Ok(permit), Some(held)) = (
                     slots.clone().try_acquire_owned(),
@@ -174,6 +198,13 @@ async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::R
         let reply = match answer(&query, from.ip(), &zs, false) {
             Answer::Drop => return Ok(()),
             Answer::Reply(r) => r,
+            Answer::Chase(c) => match may_forward(from.ip(), &sh.forwarders)
+                .then(|| sh.forwards.take(from.ip(), FORWARDS_PER_IP))
+                .flatten()
+            {
+                Some(_held) => chase(&c, &sh.upstreams, true).await,
+                None => c.plain(),
+            },
             Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => wire::failure(&query, REFUSED),
             Answer::Forward => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
                 Some(_held) => forward(&query, &sh.upstreams, true).await,
@@ -229,6 +260,16 @@ async fn forward(query: &[u8], upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
         }
     }
     servfail(query)
+}
+
+/// The zone's answer with what the upstreams say for its CNAME's target (one question, over TCP
+/// when the client used it); the CNAME alone when they say nothing useful.
+async fn chase(c: &Chase, upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
+    // (The CNAME is ours to give: it does not wait on every upstream's full patience.)
+    match timeout(CHASE_TIMEOUT, forward(&c.ask(), upstreams, tcp)).await {
+        Ok(reply) => c.finish(&reply),
+        Err(_) => c.plain(),
+    }
 }
 
 /// Whether `reply` answers `sent`: a response with the same id and the same question.

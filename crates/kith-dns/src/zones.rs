@@ -73,7 +73,7 @@ pub struct Record {
 }
 
 /// A name as we compare it: lowercase, no trailing dot.
-fn key(name: &str) -> String {
+pub(crate) fn key(name: &str) -> String {
     name.trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -83,6 +83,7 @@ fn suffixes(name: &str) -> impl Iterator<Item = &str> {
 }
 
 /// What a lookup found inside our zones.
+#[derive(Debug, PartialEq)]
 pub struct Found {
     pub rcode: u16,
     pub answers: Vec<Record>,
@@ -159,7 +160,7 @@ impl Records {
         let mut answers = Vec::new();
         for _ in 0..MAX_CHAIN {
             let Some(soa) = self.apex(&name) else {
-                // A CNAME that left our zones: the resolver follows it.
+                // A CNAME that left our zones: `answer` has the upstreams follow it (a `Chase`).
                 return if answers.is_empty() {
                     None
                 } else {
