@@ -38,7 +38,8 @@ usage: sh os/build.sh [--out DIR] [--check] [--twice]
 Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-installer.raw
 (default DIR: target/os).
 For a machine that is only reached through the system it runs: DIR/vmlinuz,
-DIR/kith-install.cpio.zst and DIR/vps.sh (see os/vps.sh).
+DIR/kith-install.cpio.zst and DIR/vps.sh (see os/vps.sh). For machines started from
+the network by a node (`kith node netboot`): DIR/kith-netboot.efi.
 Beside them, DIR/kith-os.update: what a running node is given to become this version
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
 the workspace's).
@@ -272,6 +273,27 @@ assemble() { # DIR
     find "$i" -delete
     cp "$kernel" "$w/vmlinuz"
     cp "$root/os/vps.sh" "$w/vps.sh"
+
+    # For a machine started from the network (crates/kithd/src/netboot.rs): one file its
+    # firmware fetches and starts. The kernel, and as its memory disk the installer's
+    # with, before it and not compressed, an answers file of 4096 bytes that says
+    # nothing: the node that serves the file writes each machine's answers over it.
+    a=$w/answers
+    mkdir "$a"
+    { printf '#kith-netboot-answers#\n'; head -c 4072 /dev/zero | tr '\0' '#'; printf '\n'; } >"$a/kith-install.yaml"
+    touch -h -d @0 "$a" "$a/kith-install.yaml"
+    (cd "$a" && echo kith-install.yaml | cpio -o -H newc --reproducible --owner=0:0 --quiet) >"$w/answers.cpio"
+    cat "$w/answers.cpio" "$w/kith-install.cpio.zst" >"$w/netboot.initrd"
+    find "$a" -delete
+    [ "$(stat -c %s "$kernel")" -lt $((0x1000000)) ] || die "the kernel has outgrown the room before the memory disk in the network boot file"
+    printf 'console=ttyS0 console=tty0 kith.install' >"$w/cmdline-netboot"
+    objcopy \
+        --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
+        --add-section .cmdline="$w/cmdline-netboot" --change-section-vma .cmdline=0x14dfd0000 \
+        --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
+        --add-section .initrd="$w/netboot.initrd" --change-section-vma .initrd=0x14f000000 \
+        "$efi/linuxx64.efi.stub" "$w/kith-netboot.efi"
+    touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-netboot.efi"
 }
 
 assemble "$out"
@@ -283,7 +305,7 @@ if [ -n "$check" ]; then
 fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
-    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst; do
+    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw kith-install.cpio.zst kith-netboot.efi; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     find "$out/again" -delete

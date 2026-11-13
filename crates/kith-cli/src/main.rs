@@ -288,6 +288,27 @@ enum NodeCommand {
     Token,
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
+    /// Have this node install machines that start from the network (PXE): each erases its disk and joins
+    ///
+    /// For an hour at most, and only the machines whose network cards are named. Without
+    /// arguments: whether it is on, and which machines have fetched the installer.
+    Netboot {
+        /// The network boot file (os/build.sh writes target/os/kith-netboot.efi): turns it on
+        #[arg(long, value_name = "FILE", requires = "mac")]
+        image: Option<PathBuf>,
+        /// A machine to install, by its network card's address (52:54:00:12:34:56); may repeat
+        #[arg(long, value_name = "ADDRESS", requires = "image")]
+        mac: Vec<String>,
+        /// Turn it off after this many minutes
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=60))]
+        minutes: u64,
+        /// The disk each machine installs on: a name, or `only` for machines with one disk
+        #[arg(long, default_value = "only", value_name = "NAME")]
+        disk: String,
+        /// Turn it off now
+        #[arg(long, conflicts_with = "image")]
+        off: bool,
+    },
 }
 
 #[derive(Args)]
@@ -717,6 +738,43 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let reply: serde_json::Value = request(&kithd, "POST", "/v1/tokens", b"")?;
             println!("{}", reply["token"].as_str().unwrap_or_default());
+        }
+        Command::Node {
+            command:
+                NodeCommand::Netboot {
+                    image,
+                    mac,
+                    minutes,
+                    disk,
+                    off,
+                },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("machines are installed by kithd: leave out --store");
+            };
+            let now: serde_json::Value = match (image, off) {
+                (Some(image), _) => {
+                    let file = std::fs::read(&image).or_else(|e| fail(format!("{}: {e}", image.display())))?;
+                    let path = format!("/v1/netboot?macs={}&minutes={minutes}&disk={disk}", mac.join(","));
+                    request(&kithd, "PUT", &path, &file)?
+                }
+                (None, true) => request(&kithd, "DELETE", "/v1/netboot", b"")?,
+                (None, false) => request(&kithd, "GET", "/v1/netboot", b"")?,
+            };
+            match now["on"].as_bool() {
+                Some(true) => {
+                    println!(
+                        "netboot is on for {} more minutes",
+                        now["secondsLeft"].as_u64().unwrap_or(0).div_ceil(60)
+                    );
+                    for machine in now["machines"].as_array().into_iter().flatten() {
+                        let served = machine["served"].as_bool().unwrap_or(false);
+                        let mac = machine["mac"].as_str().unwrap_or_default();
+                        println!("  {mac}  {}", if served { "has the installer" } else { "not seen yet" });
+                    }
+                }
+                _ => println!("netboot is off"),
+            }
         }
         Command::Identity {
             command: IdentityCommand::Cert { name, out },

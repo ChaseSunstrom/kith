@@ -1054,6 +1054,52 @@ The installed disk is the image as built: the state partition is 32 MB until
 it can grow, and the kernel notes at each start that the spare partition
 table is not at the disk's end.
 
+### Installing from the network
+
+A node installs the machines beside it: told their network cards' addresses,
+it answers those machines when they start from the network, hands each the
+installer once, and the machine installs kith OS on its disk, starts from it
+and joins the node's cluster. No stick, and no change to the network's own
+DHCP server: the node only adds the boot file's name to what that server says.
+
+```sh
+sh os/build.sh                         # also writes kith-netboot.efi
+kith node netboot --image target/os/kith-netboot.efi --mac 52:54:00:12:34:56 --mac 52:54:00:12:34:57
+kith node netboot                      # is it on, and which machines have the installer
+kith node netboot --off
+sh ci/vm.sh --test netboot             # the same, in QEMU, on a disk that is a file
+```
+
+Then set each machine to start from the network (PXE, IPv4) once, or first in
+its boot order: a machine that has the installer is not answered again and goes
+on to its disk. **Everything on that disk is lost**, and nobody is asked at the
+machine: name only cards of machines you mean to erase. `--disk only` (the
+default) installs on a machine's one disk and refuses a machine with several;
+`--disk nvme0n1` names it. Netboot turns itself off after `--minutes` (30; at
+most 60), when the node restarts, or with `--off`.
+
+The node must be the one that started the cluster (it holds the CA, which
+makes the join tokens) and be run with `--listen`, as the machines join it
+there. On a kith OS node, where nobody logs in, an Identity that may apply
+Nodes, Roles and RoleBindings sends the same over TLS:
+
+```sh
+curl --cacert ca.pem --cert cert.pem --key key.pem --data-binary @target/os/kith-netboot.efi \
+    -X PUT 'https://NODE:7443/v1/netboot?macs=52:54:00:12:34:56,52:54:00:12:34:57&minutes=30&disk=only'
+```
+
+(`GET` says where it stands, `DELETE` turns it off.)
+
+What to know before turning it on: the boot file goes over TFTP, unencrypted
+and unsigned, with the machine's join token in it. Anyone on that network
+segment who claims a named card's address while netboot is on gets that token
+(it lets one node join, for an hour), and anyone there who answers network
+boots faster than the node can hand the machine something else: use it on a
+network you trust, for as short as it takes. Machines must start by UEFI on
+x86-64 and have 1 GB of memory (the image sits in memory while it is written);
+the node answers on every card it has an address on. UEFI HTTP boot is not
+answered yet.
+
 ### Installing on a rented machine
 
 A machine that cannot be started from a stick, but runs some Linux you can log

@@ -10,6 +10,7 @@
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
+#   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -57,6 +58,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    (and wants the disk named twice); kernel and memory disk started
                    as kexec starts them, over a disk that held something else; the
                    disk then starts as the node; also needs cpio
+  --test netboot   instead: a node, on a network with a DHCP server of its own, is told
+                   to install a machine by its card's address; that machine, with an
+                   empty disk, starts from the network (PXE), installs, starts from
+                   its disk and joins the node's cluster
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -79,7 +84,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -236,7 +241,7 @@ EOF
         echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster; one that cannot start tried by one node, which came back, and the plan paused: $line"
         exit 0
     fi
-    if [ "$test" = install ] || [ "$test" = vps ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ]; then
         for tool in curl python3 cpio; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -338,6 +343,83 @@ EOF
             hears delta 'kithd: node delta serving other nodes on 0.0.0.0:7443'
             print $((port + 5))
             echo "vm.sh: ok: os/vps.sh wants the disk named twice; the kernel and memory disk it packs, started as kexec starts them over a disk that held something else, installed kith OS there and restarted; the disk then started as node delta ($who)"
+            exit 0
+        fi
+
+        if [ "$test" = netboot ]; then
+            # A network as in a house: one with a DHCP server of its own (ci/dhcpd.py), on a
+            # hub with a node's card and a socket that a second machine's card connects to.
+            # The node is told to install that machine; the machine, with an empty disk, is
+            # set to start from the network. The node's second card is this script's way in.
+            out=$root/target/os
+            [ "$time" -gt 300 ] || time=600
+            mac=52:54:00:00:09:02
+            python3 "$root/ci/dhcpd.py" "$((port + 9))" 52:54:00:00:09:01=10.9.0.1 "$mac=10.9.0.2" &
+            vms="$vms $!"
+            sleep 0.5
+            cp "$out/kith-os.raw" "$work/alpha.disk"
+            # shellcheck disable=SC2046
+            vm alpha $(drive alpha.disk) \
+                -netdev "socket,id=d,connect=127.0.0.1:$((port + 9))" -netdev hubport,id=h0,hubid=0,netdev=d \
+                -netdev "socket,id=s,listen=127.0.0.1:$((port + 8))" -netdev hubport,id=h1,hubid=0,netdev=s \
+                -netdev hubport,id=h2,hubid=0 -device virtio-net-pci,netdev=h2,mac=52:54:00:00:09:01 \
+                -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 1))-10.0.2.15:7443" -device virtio-net-pci,netdev=u \
+                -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.9.0.1:7443 --claim'
+            hears alpha 'kithd: node alpha serving other nodes on 0.0.0.0:7443'
+            hears alpha 'sends this token to /v1/claim does: kith1.'
+            token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/alpha.log")
+            tries=0
+            until claimed=$(curl -sfk --max-time 10 -H 'Content-Type: application/json' -d "{\"token\":\"${token##* }\",\"name\":\"root\"}" "https://127.0.0.1:$((port + 1))/v1/claim"); do
+                tries=$((tries + 1))
+                [ "$tries" -lt 50 ] || fail "the node's cluster could not be claimed"
+                sleep 0.2
+            done
+            field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
+            for part in ca cert key; do
+                printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
+            done
+            api() { # METHOD PATH [curl's further arguments]: as the cluster's admin, to alpha
+                method=$1 path=$2
+                shift 2
+                curl -s --max-time 60 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" \
+                    --resolve "kith:$((port + 1)):127.0.0.1" -X "$method" "$@" "https://kith:$((port + 1))$path"
+            }
+            # Off until told; not turned on by a file that is not the boot file, nor for no machine.
+            now=$(api GET /v1/netboot)
+            [ "$(printf '%s' "$now" | field on)" = False ] || fail "netboot is on before anyone turned it on: $now"
+            api PUT "/v1/netboot?macs=$mac" --data-binary "@$out/vmlinuz" | grep -qF "not kith's network boot file" || fail "netboot took a file that is not the boot file"
+            api PUT '/v1/netboot?minutes=10' --data-binary "@$out/kith-netboot.efi" | grep -qF "a machine's card address" || fail "netboot went on for no machine"
+            [ "$(api GET /v1/netboot | field on)" = False ] || fail "netboot is on after two refusals"
+            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot did not go on"
+            # (Again while on: the second takes the ports the first held.)
+            [ "$(api PUT "/v1/netboot?macs=$mac&minutes=10" --data-binary "@$out/kith-netboot.efi" | field on)" = True ] || fail "netboot, on, could not be turned on anew"
+            hears alpha 'kithd: netboot: on for 10 minutes'
+
+            beta() { # LOG: the machine: an empty disk at first, and its card, which it starts from
+                # shellcheck disable=SC2046
+                vm "$1" -m 1024 $(drive beta.disk) -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" \
+                    -device "virtio-net-pci,netdev=n,mac=$mac,bootindex=1"
+            }
+            blank beta
+            beta install-beta
+            wait "$vm" || fail "the machine started from the network did not install and start again"
+            grep -aqF 'kithd: install: kith OS is on vda' "$work/install-beta.log" || fail "the machine started from the network did not install"
+            hears alpha "kithd: netboot: $mac has the installer"
+            api GET /v1/netboot | grep -q '"served": *true' || fail "the node does not say the machine was served"
+            # Started again, still from the network first: it is not answered a second time,
+            # goes on to its disk, and joins the node's cluster with the token it was given.
+            beta beta
+            hears beta 'kithd: init: kith-000902 is up'
+            tries=0
+            until api GET /v1/resources/Node/kith-000902 -f >/dev/null; do
+                tries=$((tries + 1))
+                [ "$tries" -lt 300 ] || fail "the machine installed from the network is not in the node's cluster"
+                sleep 0.2
+            done
+            ! grep -aqF 'kithd: install:' "$work/beta.log" || fail "the machine was installed a second time"
+            [ "$(api DELETE /v1/netboot | field on)" = False ] || fail "netboot did not go off"
+            hears alpha 'kithd: netboot: off'
+            echo "vm.sh: ok: a node told to install the machine with card $mac answered its network boot (beside the network's own DHCP server), served it the installer once over TFTP; the machine installed on its only disk, started from it and joined the node's cluster; netboot off again"
             exit 0
         fi
 

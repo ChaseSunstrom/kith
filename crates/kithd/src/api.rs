@@ -57,6 +57,14 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))
         .route("/v1/tokens", post(crate::cluster::token))
+        // (The network boot file is 40 MB.)
+        .route(
+            "/v1/netboot",
+            get(crate::cluster::netboot)
+                .delete(crate::cluster::netboot)
+                .put(crate::cluster::netboot)
+                .layer(axum::extract::DefaultBodyLimit::max(96 << 20)),
+        )
         .merge(crate::ui::router())
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))

@@ -441,6 +441,74 @@ pub async fn token(
     minted.into_response()
 }
 
+/// `/v1/netboot`: GET says whether this node answers machines that start from the
+/// network; PUT turns it on (the body is the network boot file; `?macs=` the cards'
+/// addresses, with commas, `minutes=` and `disk=`); DELETE turns it off. See netboot.rs.
+/// It makes join tokens and has machines erase their disks: for who may make tokens.
+pub async fn netboot(
+    State(shared): State<Arc<Shared>>,
+    axum::Extension(caller): axum::Extension<crate::access::Caller>,
+    method: axum::http::Method,
+    axum::extract::Query(asked): axum::extract::Query<std::collections::BTreeMap<String, String>>,
+    image: axum::body::Body,
+) -> Response {
+    use crate::netboot;
+    if matches!(caller, crate::access::Caller::Node(_)) {
+        return refuse(StatusCode::FORBIDDEN, "a node may not turn netboot on or off").into_response();
+    }
+    let node = |_: &_| {
+        ["Node", "Role", "RoleBinding"]
+            .map(|kind| (kind.to_string(), None))
+            .to_vec()
+    };
+    if let Err(refused) = api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, node) {
+        return refused.into_response();
+    }
+    if method == axum::http::Method::GET {
+        return Json(netboot::status()).into_response();
+    }
+    let done = if method == axum::http::Method::DELETE {
+        netboot::off();
+        Ok(netboot::status())
+    } else {
+        async {
+            // (Read only now: who may not turn it on has sent 96 MB to nobody.)
+            let image = axum::body::to_bytes(image, 96 << 20).await;
+            let image = image.map_err(|_| "the boot file did not arrive whole, or is more than 96 MB")?;
+            let ca = cluster(&shared)
+                .ok()
+                .and_then(|cluster| Some((cluster, cluster.ca.as_ref()?)));
+            let (cluster, ca) = ca.ok_or(CA_ELSEWHERE)?;
+            let macs = asked.get("macs").map(String::as_str).unwrap_or_default();
+            let mut machines = Vec::new();
+            for mac in macs.split(',').filter(|mac| !mac.is_empty()) {
+                let card =
+                    netboot::mac(mac).ok_or(format!("`{mac}` is not a network card's address (52:54:00:12:34:56)"))?;
+                machines.push(card);
+            }
+            let minutes = asked.get("minutes").map_or(Ok(30), |minutes| minutes.parse());
+            let minutes = minutes.map_err(|_| "minutes is a number")?;
+            let disk = asked.get("disk").map_or("only", String::as_str);
+            netboot::on(image.to_vec(), machines, minutes, disk, || {
+                cluster.tokens.mint(&ca.cert)
+            })
+            .await
+        }
+        .await
+    };
+    let said = done.as_ref().map(drop).map_err(String::clone);
+    shared.audit.record(
+        &caller,
+        "netboot",
+        vec![format!("{method} {}", asked.get("macs").map_or("", String::as_str))],
+        said,
+    );
+    match done {
+        Ok(status) => Json(status).into_response(),
+        Err(why) => refuse(StatusCode::BAD_REQUEST, why).into_response(),
+    }
+}
+
 fn mint(shared: &Shared) -> Result<Json<serde_json::Value>, Refusal> {
     let cluster = cluster(shared)?;
     let Some(ca) = &cluster.ca else {
@@ -647,8 +715,22 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16, mes
         .timeout(Duration::from_secs(15))
         .no_proxy();
     let anyone = anyone.build().map_err(|e| failed("setting up to reach", e))?;
-    let reply = anyone.get(format!("https://{address}/v1/ca")).send().await;
-    let reply = reply.and_then(reqwest::Response::error_for_status);
+    // (A machine that has just started may have no address yet, and the node may be starting
+    // too: giving up at once restarts a kith OS machine, over and over.)
+    let mut tries = 0;
+    let reply = loop {
+        let reply = anyone.get(format!("https://{address}/v1/ca")).send().await;
+        match reply.and_then(reqwest::Response::error_for_status) {
+            Err(e) if e.is_connect() && tries < 60 => {
+                if tries == 0 {
+                    eprintln!("kithd: {address} cannot be reached yet ({e}): trying for a minute");
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await
+            }
+            reply => break reply,
+        }
+        tries += 1;
+    };
     let ca = reply.map_err(|e| failed("reaching", e))?.text().await;
     let ca = ca.map_err(|e| failed("reading the CA from", e))?;
     if pki::fingerprint(&ca).ok().as_deref() != Some(pinned) {

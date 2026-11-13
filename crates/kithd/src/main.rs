@@ -20,6 +20,7 @@ mod init;
 mod install;
 mod members;
 mod mesh;
+mod netboot;
 mod os;
 mod pki;
 mod probe;
@@ -527,6 +528,7 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
                 cluster::offer_claim(&shared);
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
+            let _ = netboot::PORT.set(address.port());
             let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();

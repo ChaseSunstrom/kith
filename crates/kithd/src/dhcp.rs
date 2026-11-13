@@ -118,22 +118,27 @@ async fn hear(socket: &UdpSocket, xid: u32, mac: [u8; 6], wanted: u8) -> Result<
         .map_err(none)?
 }
 
-/// Ask once, on `card` (which is up): what a server gives it.
-pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
+/// A socket on `port` of the card named `card` alone, that may send to everyone on its network.
+pub fn socket(card: &str, port: u16) -> Result<UdpSocket> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrIn, bind, setsockopt, socket, sockopt};
     use std::os::fd::AsRawFd;
-    // Tied to the card before it is bound: so every card can have port 68 at once.
+    // Tied to the card before it is bound: so every card can have the port at once.
     let fd = socket(
         AddressFamily::Inet,
         SockType::Datagram,
         SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK,
         None,
     )?;
-    setsockopt(&fd, sockopt::BindToDevice, &std::ffi::OsString::from(&card.name))?;
+    setsockopt(&fd, sockopt::BindToDevice, &std::ffi::OsString::from(card))?;
     setsockopt(&fd, sockopt::ReuseAddr, &true)?;
     setsockopt(&fd, sockopt::Broadcast, &true)?;
-    bind(fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, 68))?;
-    let socket = UdpSocket::from_std(fd.into())?;
+    bind(fd.as_raw_fd(), &SockaddrIn::new(0, 0, 0, 0, port))?;
+    UdpSocket::from_std(fd.into())
+}
+
+/// Ask once, on `card` (which is up): what a server gives it.
+pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
+    let socket = socket(&card.name, 68)?;
     let mut xid = [0; 4];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut xid)?;
     let xid = u32::from_be_bytes(xid);

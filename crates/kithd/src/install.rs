@@ -410,7 +410,12 @@ pub async fn run(source: String) -> ! {
     }
     // Answers from a URL or from the stick mean nobody is asked anything.
     let file = match memory {
-        true => Ok(std::fs::read_to_string("/kith-install.yaml").ok()),
+        // (A file of comments says nothing: the network boot file before a node has
+        // written a machine's answers into it, see os/build.sh. Then someone is asked.)
+        true => Ok(std::fs::read_to_string("/kith-install.yaml").ok().filter(|yaml| {
+            yaml.lines()
+                .any(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+        })),
         false => crate::os::esp(|esp| std::fs::read_to_string(esp.join("../../kith-install.yaml")).ok()),
     };
     let given = if source.is_empty() {
