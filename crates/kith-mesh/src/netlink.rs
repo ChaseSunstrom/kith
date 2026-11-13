@@ -41,10 +41,23 @@ pub struct Device {
     held: BTreeSet<Ipv6Addr>,
 }
 
+/// How long a read of the kernel's answer waits: it answers at once, or not at all.
+const WAIT: Duration = Duration::from_secs(10);
+
+/// Make reads on `socket` give up (`WouldBlock`) after `wait`.
+//
+// ponytail: the read timeout is set through a std socket made of a copy of the descriptor
+// (std has the setsockopt, and unsafe code is forbidden here); it is the same open socket.
+fn limit(socket: &Socket, wait: Duration) -> Result<()> {
+    let copy = std::os::fd::AsFd::as_fd(socket).try_clone_to_owned()?;
+    std::net::UdpSocket::from(copy).set_read_timeout(Some(wait))
+}
+
 fn socket(protocol: isize) -> Result<Socket> {
     let mut socket = Socket::new(protocol)?;
     socket.bind_auto()?;
     socket.connect(&SocketAddr::new(0, 0))?;
+    limit(&socket, WAIT)?;
     Ok(socket)
 }
 
@@ -410,4 +423,22 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
         RouteAttribute::Oif(index),
     ]);
     ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_kernel_is_a_timeout() {
+        // Nothing asked, so nothing to read: the read gives up.
+        let Ok(socket) = socket(protocols::NETLINK_ROUTE) else {
+            return eprintln!("skipped: no netlink here");
+        };
+        limit(&socket, Duration::from_millis(50)).unwrap();
+        let started = std::time::Instant::now();
+        let read = socket.recv_from_full();
+        assert_eq!(read.unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 }

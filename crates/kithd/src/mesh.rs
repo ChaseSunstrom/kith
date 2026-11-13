@@ -104,9 +104,27 @@ fn told(path: &std::path::Path) -> Vec<Member> {
             edge: false,
             reached: true,
             direct_only: false,
+            reaches: Vec::new(),
         })
     };
     read.unwrap_or_default().into_iter().filter_map(member).collect()
+}
+
+/// Did this peer agree on keys with the interface lately?
+fn shook_lately(shook: &BTreeMap<Key, Option<Duration>>, key: &Key) -> bool {
+    shook.get(key).copied().flatten().is_some_and(|ago| ago < QUIET)
+}
+
+/// The names of the members this node shook hands with lately, in order: what it tells the
+/// others it reaches (they pick the relay by it).
+fn reaching(members: &[Member], shook: &BTreeMap<Key, Option<Duration>>) -> Vec<String> {
+    let mut names: Vec<String> = members
+        .iter()
+        .filter(|member| shook_lately(shook, &member.key))
+        .map(|member| member.name.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// The other nodes as the mesh sees them. `shook` has, for the interface's peers, how
@@ -127,7 +145,8 @@ fn members(
             .filter(|port| *port != 0)?;
         let at = status["address"].as_str().and_then(|at| at.parse::<SocketAddr>().ok());
         let since = *known.entry(key).or_insert(now);
-        let fresh = shook.get(&key).copied().flatten().is_some_and(|ago| ago < QUIET);
+        let fresh = shook_lately(shook, &key);
+        let reaches = status["mesh"]["reaches"].as_array();
         let roles = node.spec["roles"].as_array();
         Some(Member {
             name: node.metadata.name.clone(),
@@ -140,6 +159,11 @@ fn members(
             edge: roles.is_some_and(|roles| roles.contains(&"edge".into())),
             reached: fresh || now.saturating_duration_since(since) < QUIET,
             direct_only: node.spec["mesh"]["relay"] == "never",
+            reaches: reaches
+                .into_iter()
+                .flatten()
+                .filter_map(|name| name.as_str().map(str::to_string))
+                .collect(),
         })
     };
     let mut members: Vec<Member> = store.list(Some("Node")).filter_map(member).collect();
@@ -148,6 +172,14 @@ fn members(
     members.retain(|member| keys.iter().filter(|key| **key == member.key).count() == 1);
     known.retain(|key, _| members.iter().any(|member| member.key == *key));
     members
+}
+
+/// Set `mesh` in the status of Node `node`: what this node says of itself, or null to take it back.
+async fn say(shared: &Shared, node: &str, mesh: Value) -> Result<(), String> {
+    let fields = serde_json::Map::from_iter([("mesh".to_string(), mesh)]);
+    let statuses = vec![(node.to_string(), fields)];
+    let patch = shared.submit(kith_store::Command::Patch { statuses }).await;
+    patch.map(drop).map_err(|e| e.to_string())
 }
 
 /// Keep the interface as the Nodes say, until stopped; then take it away.
@@ -170,7 +202,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         }
     };
     eprintln!("kithd: mesh address {address} on {}", options.interface);
-    let mine = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port });
+    let base = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port });
     let node = format!("Node/{me}");
     let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();
@@ -184,31 +216,30 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
                 BTreeMap::new()
             }
         };
-        let (members, said, edge, services) = {
+        let (members, mine, said, edge, services) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
-            let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let mut members = members(&state.store, &shook, &mut known, Instant::now());
             // (Until the store says who the nodes are: those this node was told of as it joined.)
             // Once it does, they are forgotten: a node that has left since is not called for ever.
             let nobody = members.iter().all(|member| member.name == me);
             let more: Vec<Member> = first.iter().filter(|peer| nobody && peer.name != me).cloned().collect();
             members.extend(more);
+            // What this node says of itself, with who it reaches (written only when it changed).
+            let mut mine = base.clone();
+            mine["reaches"] = json!(reaching(&members, &shook));
+            let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let edge = members.iter().any(|member| member.name == me && member.edge);
             let services = crate::services::addresses(&state.store, prefix);
-            (members, said, edge, services.into_values().collect())
+            (members, mine, said, edge, services.into_values().collect())
         };
         // Every node has every Service's address (crate::services listens on them).
         if let Err(e) = device.set_addresses(&services) {
             eprintln!("kithd: mesh: the services' addresses on {}: {e}", options.interface);
         }
         // (Its own Node may not be there yet, right after joining: next time round.)
-        if !said {
-            let fields = serde_json::Map::from_iter([("mesh".to_string(), mine.clone())]);
-            let statuses = vec![(node.clone(), fields)];
-            if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
-                eprintln!("kithd: mesh: telling the cluster this node's key: {e}");
-            }
+        if !said && let Err(e) = say(&shared, &node, mine).await {
+            eprintln!("kithd: mesh: telling the cluster this node's key: {e}");
         }
         let forwards = || std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding");
         if edge && !warned && forwards().is_ok_and(|on| on.trim() == "0") {
@@ -241,6 +272,15 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             _ = stopping.changed() => break,
         }
     }
+    // Left: the others are not to keep calling a node that is not on the mesh.
+    // ponytail: a few seconds' wait at most; a node that dies instead is dropped by the
+    // others when it stops answering (and a stale `mesh` stays in its Node).
+    let cleared = say(&shared, &node, Value::Null);
+    match tokio::time::timeout(Duration::from_secs(3), cleared).await {
+        Ok(Err(e)) => eprintln!("kithd: mesh: clearing this node's mesh status: {e}"),
+        Err(_) => eprintln!("kithd: mesh: clearing this node's mesh status: no answer"),
+        Ok(Ok(())) => {}
+    }
     if let Err(e) = device.remove() {
         eprintln!("kithd: mesh: removing {}: {e}", options.interface);
     }
@@ -250,11 +290,16 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
 mod tests {
     use super::*;
 
+    /// `store` with what `node` says replaced.
+    fn store_with_node(store: &Store, node: &str, status: Value) -> Store {
+        let mut store = store.clone();
+        store.set_status(node, Some(status)).unwrap();
+        store
+    }
+
     /// `store` with what Node c says replaced.
     fn store_with(store: &Store, status: Value) -> Store {
-        let mut store = store.clone();
-        store.set_status("Node/c", Some(status)).unwrap();
-        store
+        store_with_node(store, "Node/c", status)
     }
 
     #[test]
@@ -288,6 +333,13 @@ mod tests {
         assert_eq!(got[0].endpoint, Some("10.0.0.1:51820".parse().unwrap()));
         assert_eq!(got[1].endpoint, Some("[2001:db8::2]:51820".parse().unwrap()));
         assert_eq!((got[0].edge, got[1].edge, got[0].key), (false, true, [1; 32]));
+        // What a node says it reaches is its `reaches`; what this node says is the ones it shook hands with.
+        assert!(got.iter().all(|member| member.reaches.is_empty()));
+        let said = json!({ "address": "10.0.0.2:7443", "mesh": { "key": key(2), "port": 51820, "reaches": ["a", 3] } });
+        let with = store_with_node(&store, "Node/b", said);
+        assert_eq!(members(&with, &none, &mut BTreeMap::new(), start)[1].reaches, ["a"]);
+        let heard = BTreeMap::from([([1; 32], Some(Duration::from_secs(20))), ([2; 32], Some(QUIET))]);
+        assert_eq!(reaching(&got, &heard), ["a"]);
         // New peers have three minutes to answer; after that only one that shook hands
         // lately counts as reached.
         assert!(got.iter().all(|member| member.reached));
@@ -307,6 +359,8 @@ mod tests {
         assert_eq!(named(&c(json!({ "key": key(3), "port": 65536 }))), ["a", "b"]);
         assert_eq!(named(&c(json!({ "key": key(3), "port": 0 }))), ["a", "b"]);
         assert_eq!(named(&c(mesh(0))), ["a", "b"]);
+        // A node that left the mesh has its `mesh` cleared (null): no member.
+        assert_eq!(named(&c(Value::Null)), ["a", "b"]);
         assert_eq!(named(&c(mesh(1))), ["b"]);
         // A key that is no key is no member, and a node that is gone is forgotten.
         assert_eq!(key_of("zz"), None);

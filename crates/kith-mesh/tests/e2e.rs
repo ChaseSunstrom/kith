@@ -43,6 +43,7 @@ fn tool(args: &[&str]) {
                     edge: part[3] == "1",
                     reached: part[4] == "1",
                     direct_only: false,
+                    reaches: Vec::new(),
                 }
             };
             let members: Vec<Member> = members.iter().map(member).collect();

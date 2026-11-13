@@ -88,6 +88,9 @@ pub struct Member {
     pub reached: bool,
     /// Its traffic is never to go through an edge node.
     pub direct_only: bool,
+    /// The names of the nodes it says it shook hands with lately (a node that does not say
+    /// has none).
+    pub reaches: Vec<String>,
 }
 
 /// A peer as the interface should have it.
@@ -105,26 +108,35 @@ pub struct Peer {
 /// is one: its /80 goes to that peer. (It stays a peer, so it is tried directly all the
 /// while, and gets its /80 back when it answers.)
 //
-// ponytail: the first edge node that this node reaches; whether that one reaches the
-// other end is not known here. With several edge nodes of which the first does not reach
-// the other end, the two ends can pick different ones and not hear each other: pick by
-// what the edge nodes report. An edge node sees what it passes on (it is the end of both
-// tunnels).
+// ponytail: the relay is the first edge node this node reaches that says it reaches both
+// this node and the other end; none that says so (older nodes say nothing): the first
+// edge node this node reaches. Reports are a few minutes old at worst, and the two ends
+// read them at different times: they can pick different ones for a while.
 pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
     let others = || members.iter().filter(|member| member.name != me);
-    let relay = others().find(|member| member.edge && member.reached);
     // (Either end may say so: one that is not reached then has no path until it answers.)
     let mine = members.iter().any(|member| member.name == me && member.direct_only);
-    let through = |member: &Member| relay.filter(|_| !member.reached && !member.direct_only && !mine);
+    let through = |member: &Member| {
+        if member.reached || member.direct_only || mine {
+            return None;
+        }
+        let edges: Vec<&Member> = others()
+            .filter(|edge| edge.edge && edge.reached && edge.name != member.name)
+            .collect();
+        let says = |edge: &Member| {
+            [me, &member.name]
+                .iter()
+                .all(|name| edge.reaches.iter().any(|r| r == name))
+        };
+        edges.iter().copied().find(|edge| says(edge)).or(edges.first().copied())
+    };
     let peer = |member: &Member| {
         let mut allowed = Vec::new();
         if through(member).is_none() {
             allowed.push(node_net(prefix, &member.name));
         }
-        if relay.is_some_and(|relay| relay.key == member.key) {
-            let relayed = others().filter(|other| through(other).is_some());
-            allowed.extend(relayed.map(|other| node_net(prefix, &other.name)));
-        }
+        let relayed = others().filter(|other| through(other).is_some_and(|relay| relay.key == member.key));
+        allowed.extend(relayed.map(|other| node_net(prefix, &other.name)));
         Peer {
             key: member.key,
             endpoint: member.endpoint,
@@ -166,6 +178,7 @@ mod tests {
             edge,
             reached,
             direct_only: false,
+            reaches: Vec::new(),
         };
         let nets = |peers: &[Peer]| -> Vec<(u8, Vec<Ipv6Addr>)> {
             let of = |peer: &Peer| (peer.key[0], peer.allowed.clone());
@@ -202,5 +215,28 @@ mod tests {
         let alone = [all[0].clone(), member("b", true, false), member("c", false, false)];
         let peers = wanted(mesh, "a", &alone);
         assert_eq!(nets(&peers), [(b'b', vec![b]), (b'c', vec![node_net(mesh, "c")])]);
+        // Two edge nodes, the first (b) not reaching c: c goes through d, which reaches a and c.
+        let sees = |member: Member, names: &[&str]| Member {
+            reaches: names.iter().map(|name| name.to_string()).collect(),
+            ..member
+        };
+        let blind = [
+            all[0].clone(),
+            sees(member("b", true, true), &["a"]),
+            member("c", false, false),
+            sees(member("d", true, true), &["a", "c"]),
+        ];
+        let d = node_net(mesh, "d");
+        let peers = wanted(mesh, "a", &blind);
+        assert_eq!(
+            nets(&peers),
+            [(b'b', vec![b]), (b'c', vec![]), (b'd', vec![d, node_net(mesh, "c")])]
+        );
+        // An edge node that reports nothing about c (one that has not yet): the first that answers.
+        let silent = [all[0].clone(), member("b", true, true), member("c", false, false)];
+        assert_eq!(
+            nets(&wanted(mesh, "a", &silent))[0],
+            (b'b', vec![b, node_net(mesh, "c")])
+        );
     }
 }
