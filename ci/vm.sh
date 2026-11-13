@@ -31,7 +31,7 @@ compiler when there is no musl-gcc, as ci/budgets.py does) and needs cpio and zs
 EOF
 }
 
-kernel= initrd= disk= time=60
+kernel='' initrd='' disk='' time=60
 append="console=ttyS0 panic=-1"
 while [ $# -gt 0 ]; do
     case $1 in
@@ -56,7 +56,7 @@ fi
 
 skip() { echo "skipped: $1"; exit 0; }
 command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "no qemu-system-x86_64"
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || skip "no usable /dev/kvm"
+if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 if [ -z "$kernel" ]; then
     for k in "/boot/vmlinuz-$(uname -r)" "/lib/modules/$(uname -r)/vmlinuz" /boot/vmlinuz-* /boot/vmlinuz; do
         [ -r "$k" ] && { kernel=$k; break; }
@@ -78,6 +78,7 @@ if [ -z "$initrd" ]; then
     if [ -z "$(printenv "$var" || true)" ] && ! command -v musl-gcc >/dev/null 2>&1 \
         && ! command -v x86_64-linux-musl-gcc >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
         # (cc-rs passes rustc's target name, which zig spells differently.)
+        # shellcheck disable=SC2016
         printf '%s\n' '#!/bin/sh' \
             'for a; do shift; case "$a" in --target=*) ;; *) set -- "$@" "$a";; esac; done' \
             'exec zig cc -target x86_64-linux-musl "$@"' >"$work/musl-cc"
