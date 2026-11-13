@@ -390,6 +390,10 @@ spec! {
     pub struct Expose {
         pub host: String,
         pub via: ExposeVia,
+        /// Send the backend a PROXY protocol v1 line with the client's address before the
+        /// client's bytes. Off unless true: a backend that does not expect the line breaks.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub proxy_protocol: Option<bool>,
     }
 
     pub enum ExposeVia { Edge }

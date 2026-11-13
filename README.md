@@ -215,10 +215,15 @@ kith node status                                   # who leads the store, who vo
   and another before it runs out. The host's DNS has to point at the ingress
   nodes first: the authority checks by asking port 80 there, and any node
   with `--ingress` can answer. `kith get service/NAME -o yaml` shows how it
-  went (`tls`); after a failure kithd tries again an hour later, not sooner.
-  TLS ends at the ingress and the bytes go on as they are: the backend is not
-  told the client's address, and to a NetworkPolicy the connection comes from
-  the ingress node. Certificate keys and the ACME account key
+  went (`tls`: its `secret` names the Secret whose certificate serves the
+  host, one applied by hand included); after a failure kithd tries again an
+  hour later, not sooner.
+  TLS ends at the ingress and the bytes go on as they are: no header is added,
+  and to a NetworkPolicy the connection comes from the ingress node. With
+  `expose.proxyProtocol: true` the backend is sent a PROXY protocol v1 line
+  (`PROXY TCP4 <client> <ingress> <port> <port>`) with the client's address
+  before the client's bytes; it is off unless asked for, because a backend
+  that does not expect the line will break on it. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
   `expose.host` has to be a domain name (applying anything else is refused).
   Two Services with one host: the first by key has it, and the other's
@@ -462,7 +467,7 @@ installed `helm template` and translates what it prints (no helm: pipe
 | Deployment, StatefulSet | Workload (a StatefulSet's `volumeClaimTemplates` become one shared VolumeClaim `<template>-<name>`) |
 | DaemonSet | NodeWorkload |
 | Service | Service |
-| Ingress | `expose: {host, via: edge}` on the Service behind each host |
+| Ingress | `expose: {host, via: edge, proxyProtocol}` on the Service behind each host |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
 | PersistentVolumeClaim | VolumeClaim |
 | Job, CronJob | Job, CronJob |
