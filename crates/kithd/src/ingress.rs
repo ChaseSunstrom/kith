@@ -12,8 +12,10 @@
 // ponytail: TLS ends here and the bytes go on as they are: no HTTP is read on 443, so the
 // backend is not told who the client is (no X-Forwarded-For), and to a NetworkPolicy the
 // connection comes from this node. Two nodes can order for one host at the same moment
-// (both then get one; the later Secret stays). Port 80 has no limit on how slowly a
-// request may come. Read HTTP here when a backend needs the client's address.
+// (both then get one; the later Secret stays). A connection is cut after a time with no
+// byte either way, but one that trickles a byte inside that time keeps its place in the
+// room (port 80 has no limit on how slowly a request may come, only on how many).
+// Read HTTP here when a backend needs the client's address.
 
 use crate::{Shared, acme};
 use axum::extract::State;
@@ -29,18 +31,27 @@ use rustls::sign::CertifiedKey;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsAcceptor;
 
 const ACCOUNT: &str = "Secret/kith-system/acme-account";
 /// A host is asked a certificate for once in this many seconds at most, so that a setup
 /// that cannot work does not use up what the authority allows.
 const BETWEEN_ORDERS: u64 = 3600;
-/// How many connections from outside at a time; the ones over it wait.
+/// How many connections from outside at a time on each port; one over it is hung up on.
 const CONNECTIONS: usize = 1024;
+/// A connection on port 443 with no byte either way for this long is closed.
+const IDLE: Duration = Duration::from_secs(300);
+/// On port 80, where a request is small, this is all the time a connection gets,
+/// bytes or no bytes: one that drips a byte now and then does not keep its place.
+const IDLE_PLAIN: Duration = Duration::from_secs(30);
 
 /// A host that is exposed: its Service, and where on the mesh that answers.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,9 +61,11 @@ pub struct Exposed {
     to: SocketAddr,
 }
 
-/// The exposed hosts. (Two Services with one host: the first by name has it.)
-pub fn exposed(store: &Store, prefix: Ipv6Addr) -> BTreeMap<String, Exposed> {
-    let mut hosts = BTreeMap::new();
+/// The exposed hosts, and the Services refused one: Service key to why. (Two Services
+/// with one host: the first by key has it, the others are refused.)
+pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
+    let mut hosts: BTreeMap<String, Exposed> = BTreeMap::new();
+    let mut refused = BTreeMap::new();
     for service in store.list(Some("Service")) {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
             continue;
@@ -64,13 +77,24 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> BTreeMap<String, Exposed> {
         let key = service.key();
         let namespace = key.split('/').nth(1).unwrap_or_default();
         let address = kith_mesh::service_address(prefix, namespace, &service.metadata.name);
-        hosts.entry(expose.host.to_ascii_lowercase()).or_insert(Exposed {
-            namespace: namespace.to_string(),
-            service: service.key(),
-            to: SocketAddr::new(address.into(), port.port),
-        });
+        let host = expose.host.to_ascii_lowercase();
+        if let Some(first) = hosts.get(&host) {
+            let message = format!("the host {host} is already exposed by {}", first.service);
+            refused.insert(key, message);
+            continue;
+        }
+        let to = SocketAddr::new(address.into(), port.port);
+        let namespace = namespace.to_string();
+        hosts.insert(
+            host,
+            Exposed {
+                namespace,
+                service: key,
+                to,
+            },
+        );
     }
-    hosts
+    (hosts, refused)
 }
 
 fn secret(store: &Store, key: &str) -> BTreeMap<String, String> {
@@ -193,6 +217,73 @@ async fn plain(State(web): State<Arc<Web>>, headers: HeaderMap, uri: Uri) -> Res
 /// room for another listener on that port of one address.) The Service proxy takes them.
 pub type Strays = mpsc::UnboundedSender<TcpStream>;
 
+/// A connection that is closed once `idle` goes by with no byte read or written, and
+/// that keeps its place in the room (if it has one) while it lasts.
+struct Idle<T> {
+    inner: T,
+    timer: Pin<Box<Sleep>>,
+    idle: Duration,
+    /// Do bytes moved start the time over?
+    renews: bool,
+    _room: Option<OwnedSemaphorePermit>,
+}
+
+impl<T> Idle<T> {
+    fn new(inner: T, idle: Duration, room: Option<OwnedSemaphorePermit>) -> Self {
+        let timer = Box::pin(tokio::time::sleep(idle));
+        Idle {
+            inner,
+            timer,
+            idle,
+            renews: true,
+            _room: room,
+        }
+    }
+
+    /// The same, but `life` is all it gets, idle or not.
+    fn lasting(inner: T, life: Duration, room: Option<OwnedSemaphorePermit>) -> Self {
+        Idle {
+            renews: false,
+            ..Idle::new(inner, life, room)
+        }
+    }
+
+    /// Bytes moved start the time over; a poll that has to wait asks the time.
+    fn watch<R>(&mut self, cx: &mut Context<'_>, polled: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
+        match polled {
+            Poll::Ready(_) if self.renews => self.timer.as_mut().reset(Instant::now() + self.idle),
+            Poll::Ready(_) => {}
+            Poll::Pending if self.timer.as_mut().poll(cx).is_ready() => {
+                return Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+            }
+            Poll::Pending => {}
+        }
+        polled
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Idle<T> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.watch(cx, polled)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.watch(cx, polled)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 /// A port open to everyone, less what is a Service's.
 struct Door {
     listener: TcpListener,
@@ -219,16 +310,25 @@ impl Door {
     }
 }
 
-impl axum::serve::Listener for Door {
-    type Io = TcpStream;
+/// Port 80 for axum: at most `CONNECTIONS` at a time, each cut when idle. (Past that, a
+/// client is hung up on, as on port 443.)
+struct Capped(Door, Arc<Semaphore>);
+
+impl axum::serve::Listener for Capped {
+    type Io = Idle<TcpStream>;
     type Addr = SocketAddr;
 
-    async fn accept(&mut self) -> (TcpStream, SocketAddr) {
-        Door::accept(self).await
+    async fn accept(&mut self) -> (Idle<TcpStream>, SocketAddr) {
+        loop {
+            let (stream, from) = self.0.accept().await;
+            if let Ok(turn) = self.1.clone().try_acquire_owned() {
+                return (Idle::lasting(stream, IDLE_PLAIN, Some(turn)), from);
+            }
+        }
     }
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.0.listener.local_addr()
     }
 }
 
@@ -245,6 +345,7 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
         let (tls, web) = (tls.clone(), web.clone());
         tokio::spawn(async move {
             let _turn = turn;
+            let stream = Idle::new(stream, IDLE, None);
             let hello = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream));
             let Ok(Ok(mut client)) = hello.await else {
                 return;
@@ -253,7 +354,9 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
             let to = host.and_then(|host| Some(web.hosts.lock().ok()?.get(&host)?.to));
             let Some(to) = to else { return };
             let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(to));
-            if let Ok(Ok(mut service)) = reached.await {
+            if let Ok(Ok(service)) = reached.await {
+                // (A Service that stops taking bytes does not hold the place either.)
+                let mut service = Idle::new(service, IDLE, None);
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut service).await;
             }
         });
@@ -263,7 +366,7 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
 /// What the store says now: the hosts, their certificates (and which are due for
 /// another), and the account key if there is one.
 fn look(store: &Store, prefix: Ipv6Addr, web: &Web) -> (Vec<(String, Exposed)>, Option<acme::Account>) {
-    let hosts = exposed(store, prefix);
+    let hosts = exposed(store, prefix).0;
     let mut certificates = BTreeMap::new();
     let mut wanting = Vec::new();
     let at = now();
@@ -413,6 +516,7 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
     let (https, http) = (door(https), door(http));
     let secure = tokio::spawn(secure(https, tls, web.clone()));
     let router = axum::Router::new().fallback(plain).with_state(web.clone());
+    let http = Capped(http, Arc::new(Semaphore::new(CONNECTIONS)));
     let plain = tokio::spawn(async move {
         let _ = axum::serve(http, router).await;
     });
@@ -484,7 +588,8 @@ mod tests {
             store.apply(resource.unwrap()).unwrap();
         }
         let prefix = kith_mesh::prefix(b"ca");
-        let hosts = exposed(&store, prefix);
+        let (hosts, refused) = exposed(&store, prefix);
+        assert!(refused.is_empty());
         let to = SocketAddr::new(kith_mesh::service_address(prefix, "shop", "web").into(), 8080);
         assert_eq!(hosts.len(), 1);
         let shop = &hosts["shop.example.org"];
@@ -542,5 +647,101 @@ mod tests {
         assert_eq!(time(0x17, b"7001010000Z"), None);
         assert_eq!(validity(b"\x30\x03\x30\x01"), None);
         assert_eq!(validity(&[0x30, 0x84, 0xff, 0xff, 0xff, 0xff]), None);
+    }
+
+    #[test]
+    fn a_second_service_on_one_host_is_refused() {
+        let mut store = Store::default();
+        let service = |name: &str, host: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: {host}, via: edge }}\n---\n"
+            )
+        };
+        // (Applied last to first: the key decides, not the order.)
+        let source = [
+            service("b", "Shop.example.org"),
+            service("c", "other.example.org"),
+            service("a", "shop.example.org"),
+        ];
+        for resource in Resource::from_source(&source.concat()).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let (hosts, refused) = exposed(&store, kith_mesh::prefix(b"ca"));
+        assert_eq!(hosts["shop.example.org"].service, "Service/default/a");
+        assert_eq!(hosts["other.example.org"].service, "Service/default/c");
+        let said = "the host shop.example.org is already exposed by Service/default/a";
+        assert_eq!(
+            refused,
+            BTreeMap::from([("Service/default/b".to_string(), said.to_string())])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_is_cut_and_one_that_moves_bytes_is_not() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (ours, mut theirs) = tokio::io::duplex(64);
+        let (mut read, mut write) = tokio::io::split(Idle::new(ours, Duration::from_secs(2), None));
+        let reader = tokio::spawn(async move { read.read_u8().await });
+        // Bytes written to the client keep it open past the idle time...
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            write.write_all(b"x").await.unwrap();
+            assert!(!reader.is_finished());
+        }
+        // ...and then nothing for the time cuts it.
+        let cut = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(theirs.read_u8().await.unwrap(), b'x');
+
+        // On port 80 bytes buy no time.
+        let (ours, _theirs) = tokio::io::duplex(64);
+        let (mut read, mut write) = tokio::io::split(Idle::lasting(ours, Duration::from_millis(300), None));
+        let reader = tokio::spawn(async move { read.read_u8().await });
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = write.write_all(b"x").await;
+        }
+        assert_eq!(reader.await.unwrap().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn port_80_takes_so_many_connections_at_a_time() {
+        use axum::serve::Listener;
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let (strays, _kept) = mpsc::unbounded_channel();
+        let me = Ipv6Addr::LOCALHOST;
+        let door = Door {
+            listener,
+            prefix: kith_mesh::prefix(b"ca"),
+            me,
+            strays,
+        };
+        let mut capped = Capped(door, Arc::new(Semaphore::new(1)));
+        let first = TcpStream::connect(at).await.unwrap();
+        let (held, _) = capped.accept().await;
+        // With the room full, the next client is hung up on, and the one after it, with
+        // the room free again, is taken.
+        let mut second = TcpStream::connect(at).await.unwrap();
+        let next = tokio::spawn(async move {
+            let taken = capped.accept().await;
+            (capped, taken)
+        });
+        let hung_up = tokio::time::timeout(Duration::from_secs(5), second.read_u8())
+            .await
+            .unwrap();
+        assert!(hung_up.is_err());
+        drop(held);
+        let _third = TcpStream::connect(at).await.unwrap();
+        let (_, (taken, _)) = tokio::time::timeout(Duration::from_secs(5), next)
+            .await
+            .unwrap()
+            .unwrap();
+        drop((taken, first));
     }
 }

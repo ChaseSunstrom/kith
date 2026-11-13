@@ -16,7 +16,7 @@ use kith_api::store::Store;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -163,6 +163,18 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
     !chosen
 }
 
+/// What a NetworkPolicy's status is to be told, if it is not already.
+fn policy_unsaid(policy: &Resource) -> Option<serde_json::Map<String, Value>> {
+    let report = policy_report(policy);
+    if policy.status.as_ref() == Some(&report) {
+        return None;
+    }
+    let Value::Object(fields) = report else {
+        unreachable!("an object")
+    };
+    Some(fields)
+}
+
 /// What a NetworkPolicy's status says: whether all of it is enforced.
 fn policy_report(policy: &Resource) -> Value {
     let Ok(spec) = serde_json::from_value::<NetworkPolicySpec>(policy.spec.clone()) else {
@@ -190,12 +202,33 @@ fn policy_report(policy: &Resource) -> Value {
     }
 }
 
+/// Counts the connections of each Service port, so each goes to the next backend of its
+/// own Service (one busy Service does not move the others' turns).
+#[derive(Default)]
+struct Turns(Mutex<BTreeMap<(Ipv6Addr, u16), usize>>);
+
+impl Turns {
+    fn next(&self, key: (Ipv6Addr, u16)) -> usize {
+        let mut turns = self.0.lock().expect("nothing panics holding the turns");
+        let turn = turns.entry(key).or_default();
+        *turn = turn.wrapping_add(1);
+        *turn - 1
+    }
+
+    /// Forget the ports that are gone.
+    fn keep(&self, table: &Table) {
+        self.0
+            .lock()
+            .expect("nothing panics holding the turns")
+            .retain(|key, _| table.contains_key(key));
+    }
+}
+
 struct Proxy {
     shared: Arc<Shared>,
     prefix: Ipv6Addr,
     table: Mutex<Table>,
-    /// Counts connections, so each goes to the next backend.
-    turn: AtomicUsize,
+    turns: Turns,
 }
 
 impl Proxy {
@@ -238,7 +271,8 @@ impl Proxy {
             let table = self.table.lock().expect("nothing panics holding the table");
             table.get(&key).cloned().unwrap_or_default()
         };
-        let first = self.turn.fetch_add(1, Ordering::Relaxed);
+        // (No turn is taken, or kept, for what has nothing behind it.)
+        let first = if backends.is_empty() { 0 } else { self.turns.next(key) };
         for at in 0..backends.len() {
             if let Ok(mut backend) = self.reach(&backends[(first + at) % backends.len()]).await {
                 let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
@@ -341,7 +375,7 @@ pub async fn run(
         shared: shared.clone(),
         prefix,
         table: Mutex::default(),
-        turn: AtomicUsize::new(0),
+        turns: Turns::default(),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -368,11 +402,18 @@ pub async fn run(
         let (wanted, reports) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix);
+            // (A Service that was refused its host says so, in `expose`; the others say nothing.)
+            let refused = crate::ingress::exposed(&state.store, prefix).1;
             // What `kith get service` shows; written by the node that leads the store.
             let stale = |(key, address): (String, Ipv6Addr)| {
                 let backends = table.iter().filter(|((at, _), _)| *at == address);
                 let backends: BTreeSet<&Backend> = backends.flat_map(|(_, backends)| backends).collect();
-                let report = json!({ "address": address.to_string(), "backends": backends.len() });
+                let expose = refused
+                    .get(&key)
+                    .map(|message| json!({ "state": "refused", "message": message }));
+                let report = json!({
+                    "address": address.to_string(), "backends": backends.len(), "expose": expose,
+                });
                 let live = state.store.get(&key).and_then(|service| service.status.as_ref());
                 let Value::Object(fields) = report else {
                     unreachable!("an object")
@@ -383,13 +424,7 @@ pub async fn run(
             };
             let mut reports: Vec<_> = addresses(&state.store, prefix).into_iter().filter_map(stale).collect();
             for policy in state.store.list(Some("NetworkPolicy")) {
-                let report = policy_report(policy);
-                if policy.status.as_ref() != Some(&report) {
-                    let Value::Object(fields) = report else {
-                        unreachable!("an object")
-                    };
-                    reports.push((policy.key(), fields));
-                }
+                reports.extend(policy_unsaid(policy).map(|fields| (policy.key(), fields)));
             }
             (table, reports)
         };
@@ -406,6 +441,7 @@ pub async fn run(
         let elsewhere = elsewhere.load(Ordering::Relaxed);
         keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
         keys.insert((me, port));
+        proxy.turns.keep(&wanted);
         *proxy.table.lock().expect("nothing panics holding the table") = wanted;
         listening.retain(|key, task| {
             let keep = keys.contains(key) && !task.is_finished();
@@ -506,6 +542,58 @@ spec:
             .lookup("10.0.0.1".parse().unwrap(), "web.default.kith", 28)
             .unwrap();
         assert_eq!(found.answers[0].data, kith_dns::Rdata::Aaaa(address));
+    }
+
+    #[test]
+    fn ingress_proxy_turns_are_each_services_own() {
+        let turns = Turns::default();
+        let (a, b) = ((Ipv6Addr::LOCALHOST, 80), (Ipv6Addr::LOCALHOST, 81));
+        assert_eq!([turns.next(a), turns.next(a), turns.next(a)], [0, 1, 2]);
+        assert_eq!([turns.next(b), turns.next(b)], [0, 1]);
+        // A port that is gone starts over if it comes back.
+        turns.keep(&Table::from([(b, vec![])]));
+        assert_eq!([turns.next(a), turns.next(b)], [0, 2]);
+    }
+
+    #[test]
+    fn ingress_proxy_policy_status_settles_from_partial_to_enforced() {
+        let policy = |ingress: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: p }}\n\
+                 spec:\n  selector: {{ app: web }}\n  ingress: {ingress}\n"
+            )
+        };
+        let mut store = Store::default();
+        let key = "NetworkPolicy/default/p";
+        // What the leader does: write what is not said yet, merged into the status as a Patch does.
+        let settle = |store: &mut Store| -> Option<Value> {
+            let fields = policy_unsaid(store.get(key).unwrap())?;
+            let mut status = match store.get(key).unwrap().status.clone() {
+                Some(Value::Object(status)) => status,
+                _ => serde_json::Map::new(),
+            };
+            status.extend(fields);
+            store.set_status(key, Some(status.into())).unwrap();
+            store.get(key).unwrap().status.clone()
+        };
+        let apply = |store: &mut Store, source: &str| {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        };
+        apply(
+            &mut store,
+            &policy("[{ action: allow, peers: [{ selector: { app: other } }] }]"),
+        );
+        assert_eq!(settle(&mut store).unwrap()["state"], "partial");
+        assert!(settle(&mut store).is_none());
+
+        // The rules change to ones that can all be enforced: the status says so once, with
+        // no message left over, and then nothing more is written.
+        apply(&mut store, &policy("[{ action: allow, peers: [{ node: a }] }]"));
+        let settled = settle(&mut store).unwrap();
+        assert_eq!(settled, json!({ "state": "enforced", "message": null }));
+        assert!(settle(&mut store).is_none());
     }
 
     #[test]

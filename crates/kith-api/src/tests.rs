@@ -364,6 +364,37 @@ fn quantities_have_values() {
 }
 
 #[test]
+fn expose_host_is_a_domain_name() {
+    let service = |host: &str| {
+        let spec =
+            format!("selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: '{host}', via: edge }}");
+        let yaml = format!("apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  {spec}\n");
+        Resource::from_source(&yaml)
+            .map_err(|e| e.msg)?
+            .into_iter()
+            .try_for_each(|doc| doc.map(drop).map_err(|e| e.msg))
+    };
+    assert_eq!(service("shop.example.org"), Ok(()));
+    for bad in [
+        "",
+        "https://shop.example.org",
+        "shop.example.org:443",
+        "shop example",
+        "*.example.org",
+        "a..b",
+        ".a",
+    ] {
+        let said = service(bad).unwrap_err();
+        assert!(
+            said.contains("expose.host") && said.contains("not a domain name"),
+            "{bad}: {said}"
+        );
+    }
+    let long = vec!["a".repeat(60); 5].join(".");
+    assert!(service(&long).unwrap_err().contains("expose.host"));
+}
+
+#[test]
 fn dns_kinds_are_checked() {
     let zone = |spec: &str| format!("apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: {{ name: z }}\nspec: {spec}\n");
     let record =
