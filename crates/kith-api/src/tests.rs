@@ -425,6 +425,26 @@ fn expose_host_is_a_domain_name() {
 }
 
 #[test]
+fn expose_host_is_one_a_certificate_authority_issues_for() {
+    for bad in [
+        "203.0.113.7",
+        "2130706433",
+        "shop.example.123",
+        "-shop.example.org",
+        "shop-.example.org",
+        "shop.-a.org",
+    ] {
+        let spec =
+            format!("selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: '{bad}', via: edge }}");
+        let yaml = format!("apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  {spec}\n");
+        let said = Resource::from_source(&yaml).unwrap().remove(0).unwrap_err().msg;
+        assert!(said.contains("expose.host") && said.contains(bad), "{bad}: {said}");
+    }
+    assert_eq!(crate::kinds::expose_host_refused("shop.example.org"), None);
+    assert_eq!(crate::kinds::expose_host_refused("a-b.c1.org"), None);
+}
+
+#[test]
 fn expose_asks_for_the_proxy_protocol() {
     let service = |expose: &str| {
         let yaml = format!(

@@ -10,6 +10,7 @@
 // The kernel takes this over (nftables or eBPF) behind the same addresses.
 
 use crate::Shared;
+use crate::ingress::{Idle, Limits};
 use kith_api::Resource;
 use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PortRef, Protocol, ServiceSpec, WorkloadSpec};
 use kith_api::store::Store;
@@ -29,6 +30,16 @@ type Backend = (String, u16, String);
 type Table = BTreeMap<(Ipv6Addr, u16), Vec<Backend>>;
 
 const CONNECT: Duration = Duration::from_secs(3);
+/// A connection to a Service with no byte either way for this long is closed (a client
+/// that is gone without a word, a backend that stopped answering).
+const IDLE: Duration = Duration::from_secs(3600);
+/// How many connections to Services this node passes on at a time, from its own side and
+/// (for the other nodes together, so no node can take them all) from the mesh; one
+/// over is hung up on.
+const SERVING: usize = 4096;
+const RELAYING: usize = 4096;
+/// How many of the relayed ones one other node may hold.
+const RELAYING_PER_NODE: usize = 1024;
 
 fn namespace(resource: &Resource) -> String {
     resource.key().split('/').nth(1).unwrap_or_default().to_string()
@@ -229,6 +240,10 @@ struct Proxy {
     prefix: Ipv6Addr,
     table: Mutex<Table>,
     turns: Turns,
+    /// Places for the connections of this node's own clients, and for those another node
+    /// passes on to a replica here.
+    serving: Limits,
+    relaying: Limits,
 }
 
 impl Proxy {
@@ -266,7 +281,11 @@ impl Proxy {
 
     /// Someone connected to a Service: pass the connection to its next backend that
     /// takes it.
-    async fn serve(&self, key: (Ipv6Addr, u16), mut client: TcpStream) {
+    async fn serve(&self, key: (Ipv6Addr, u16), client: TcpStream) {
+        // (The place is held while the connection lasts.)
+        let Some(_place) = client.peer_addr().ok().and_then(|from| self.serving.take(from.ip())) else {
+            return;
+        };
         let backends = {
             let table = self.table.lock().expect("nothing panics holding the table");
             table.get(&key).cloned().unwrap_or_default()
@@ -274,8 +293,8 @@ impl Proxy {
         // (No turn is taken, or kept, for what has nothing behind it.)
         let first = if backends.is_empty() { 0 } else { self.turns.next(key) };
         for at in 0..backends.len() {
-            if let Ok(mut backend) = self.reach(&backends[(first + at) % backends.len()]).await {
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+            if let Ok(backend) = self.reach(&backends[(first + at) % backends.len()]).await {
+                let _ = pass(client, backend, IDLE).await;
                 return;
             }
         }
@@ -298,13 +317,19 @@ impl Proxy {
         let IpAddr::V6(caller) = from.peer_addr().ok()?.ip() else {
             return None;
         };
-        let mut line = Vec::new();
-        while line.last() != Some(&b'\n') {
-            line.push(within(from.read_u8()).await.ok()?);
-            if line.len() > 300 {
-                return None;
+        let _place = self.relaying.take(caller.into())?;
+        // (All of it in the time, not each byte: a line that drips does not hold the place.)
+        let reading = async {
+            let mut line = Vec::new();
+            while line.last() != Some(&b'\n') {
+                line.push(from.read_u8().await?);
+                if line.len() > 300 {
+                    return Err(std::io::Error::other("a line too long"));
+                }
             }
-        }
+            Ok(line)
+        };
+        let line = within(reading).await.ok()?;
         let line = std::str::from_utf8(&line).ok()?.trim();
         let (port, workload) = line.split_once(' ')?;
         let port: u16 = port.parse().ok()?;
@@ -316,12 +341,9 @@ impl Proxy {
         if !asked_for || !self.admits(workload, caller, port) {
             return None;
         }
-        let mut replica = local(port).await.ok()?;
+        let replica = local(port).await.ok()?;
         from.write_all(b"+").await.ok()?;
-        tokio::io::copy_bidirectional(&mut from, &mut replica)
-            .await
-            .ok()
-            .map(drop)
+        pass(from, replica, IDLE).await.ok().map(drop)
     }
 
     /// Accept on `listener` for good, each connection from the mesh handled by `with`.
@@ -342,6 +364,13 @@ impl Proxy {
             }
         }
     }
+}
+
+/// Bytes both ways between a client and a backend, until either ends or `idle` goes by
+/// with no byte moved on one of them.
+async fn pass(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io::Result<(u64, u64)> {
+    let (mut client, mut backend) = (Idle::new(client, idle, None), Idle::new(backend, idle, None));
+    tokio::io::copy_bidirectional(&mut client, &mut backend).await
 }
 
 async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
@@ -376,6 +405,8 @@ pub async fn run(
         prefix,
         table: Mutex::default(),
         turns: Turns::default(),
+        serving: Limits::new(SERVING, SERVING),
+        relaying: Limits::new(RELAYING, RELAYING_PER_NODE),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -651,5 +682,36 @@ spec:
         assert!(within_cidr("0.0.0.0/0", "11.0.0.1".parse().unwrap()));
         assert!(!within_cidr("0.0.0.0/0", from) && !within_cidr("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
         assert!(!within_cidr("nonsense", from));
+    }
+
+    /// Two connected loopback sockets: (the one a client holds, the one the proxy holds).
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        (ours, listener.accept().await.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn an_idle_connection_between_a_client_and_a_service_ends() {
+        use tokio::io::AsyncReadExt;
+        let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+        let passing = tokio::spawn(pass(held, backend, Duration::from_millis(600)));
+        // Bytes both ways keep it going past the idle time...
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            client.write_all(b"q").await.unwrap();
+            assert_eq!(replica.read_u8().await.unwrap(), b'q');
+            replica.write_all(b"a").await.unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'a');
+            assert!(!passing.is_finished());
+        }
+        // ...and then silence ends it, and both ends see the hang-up.
+        let ended = tokio::time::timeout(Duration::from_secs(10), passing).await;
+        assert_eq!(
+            ended.unwrap().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(client.read_u8().await.is_err());
+        assert!(replica.read_u8().await.is_err());
     }
 }

@@ -15,7 +15,9 @@
 // still comes from this node. Two nodes can order for one host at the same moment
 // (both then get one; the later Secret stays). A connection is cut after a time with no
 // byte either way, but one that trickles a byte inside that time keeps its place in the
-// room (port 80 has no limit on how slowly a request may come, only on how many).
+// room (port 80 has no limit on how slowly a request may come, only on how many). A source
+// (an IPv4 address, an IPv6 /64) holds at most `PER_SOURCE` of a port's places: many
+// clients behind one NAT share that.
 // Read HTTP here when a backend needs the address in a header.
 
 use crate::{Shared, acme};
@@ -48,6 +50,9 @@ const ACCOUNT: &str = "Secret/kith-system/acme-account";
 const BETWEEN_ORDERS: u64 = 3600;
 /// How many connections from outside at a time on each port; one over it is hung up on.
 const CONNECTIONS: usize = 1024;
+/// How many of them one source may hold at a time on a port (a source: an IPv4 address,
+/// or the /64 of an IPv6 one).
+const PER_SOURCE: usize = 64;
 /// A connection on port 443 with no byte either way for this long is closed.
 const IDLE: Duration = Duration::from_secs(300);
 /// On port 80, where a request is small, this is all the time a connection gets,
@@ -65,11 +70,23 @@ pub struct Exposed {
 }
 
 /// The exposed hosts, and the Services refused one: Service key to why. (Two Services
-/// with one host: the first by key has it, the others are refused.)
+/// with one host: the older has it, the others are refused; one name for a host no
+/// certificate authority issues for is refused too.)
+//
+// ponytail: "older" is the time of the oldest revision the store still keeps of the
+// Service (all nodes agree on it), so a Service edited more than `HISTORY_LIMIT` times
+// looks as new as its oldest kept edit. A creation time in the metadata would fix that.
 pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
     let mut hosts: BTreeMap<String, Exposed> = BTreeMap::new();
     let mut refused = BTreeMap::new();
-    for service in store.list(Some("Service")) {
+    let born = |service: &Resource| {
+        let kept = store.history(&service.key()).ok();
+        kept.and_then(|kept| kept.first()).map_or(u64::MAX, |first| first.at)
+    };
+    let mut services: Vec<&Resource> = store.list(Some("Service")).collect();
+    // (Stable: of the same age, by key.)
+    services.sort_by_key(|service| born(service));
+    for service in services {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
             continue;
         };
@@ -81,6 +98,10 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
         let namespace = key.split('/').nth(1).unwrap_or_default();
         let address = kith_mesh::service_address(prefix, namespace, &service.metadata.name);
         let host = expose.host.to_ascii_lowercase();
+        if let Some(message) = kith_api::kinds::expose_host_refused(&host) {
+            refused.insert(key, message);
+            continue;
+        }
         if let Some(first) = hosts.get(&host) {
             let message = format!("the host {host} is already exposed by {}", first.service);
             refused.insert(key, message);
@@ -222,19 +243,86 @@ async fn plain(State(web): State<Arc<Web>>, headers: HeaderMap, uri: Uri) -> Res
 /// room for another listener on that port of one address.) The Service proxy takes them.
 pub type Strays = mpsc::UnboundedSender<TcpStream>;
 
+/// How many connections are held at a time, in all and by each source.
+#[derive(Clone)]
+pub struct Limits {
+    room: Arc<Semaphore>,
+    sources: Arc<Mutex<BTreeMap<IpAddr, usize>>>,
+    per_source: usize,
+}
+
+/// One connection's place under the `Limits`; given back when dropped.
+pub struct Place {
+    _room: OwnedSemaphorePermit,
+    source: IpAddr,
+    sources: Arc<Mutex<BTreeMap<IpAddr, usize>>>,
+}
+
+impl Limits {
+    pub fn new(connections: usize, per_source: usize) -> Self {
+        Limits {
+            room: Arc::new(Semaphore::new(connections)),
+            sources: Arc::default(),
+            per_source,
+        }
+    }
+
+    /// A place for a connection from `from`, unless it or its source has none left.
+    pub fn take(&self, from: IpAddr) -> Option<Place> {
+        // (A client of IPv6 has a /64 to itself: its addresses are one source. A v4
+        // client of the dual-stack socket shows as a mapped address.)
+        let source = match from.to_canonical() {
+            IpAddr::V6(ip) => IpAddr::V6(Ipv6Addr::from(u128::from(ip) & (u128::MAX << 64))),
+            ip => ip,
+        };
+        let mut sources = self.sources.lock().expect("nothing panics holding the sources");
+        let held = sources.entry(source).or_default();
+        if *held >= self.per_source {
+            return None;
+        }
+        // (Not until the source is known to be under its limit, nor left counted if the
+        // room is full: the count only holds what is held, so the map is no bigger than
+        // the room.)
+        let Ok(room) = self.room.clone().try_acquire_owned() else {
+            if *held == 0 {
+                sources.remove(&source);
+            }
+            return None;
+        };
+        *held += 1;
+        Some(Place {
+            _room: room,
+            source,
+            sources: self.sources.clone(),
+        })
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let mut sources = self.sources.lock().expect("nothing panics holding the sources");
+        if let Some(held) = sources.get_mut(&self.source) {
+            *held -= 1;
+            if *held == 0 {
+                sources.remove(&self.source);
+            }
+        }
+    }
+}
+
 /// A connection that is closed once `idle` goes by with no byte read or written, and
 /// that keeps its place in the room (if it has one) while it lasts.
-struct Idle<T> {
+pub struct Idle<T> {
     inner: T,
     timer: Pin<Box<Sleep>>,
     idle: Duration,
     /// Do bytes moved start the time over?
     renews: bool,
-    _room: Option<OwnedSemaphorePermit>,
+    _room: Option<Place>,
 }
 
 impl<T> Idle<T> {
-    fn new(inner: T, idle: Duration, room: Option<OwnedSemaphorePermit>) -> Self {
+    pub fn new(inner: T, idle: Duration, room: Option<Place>) -> Self {
         let timer = Box::pin(tokio::time::sleep(idle));
         Idle {
             inner,
@@ -246,7 +334,7 @@ impl<T> Idle<T> {
     }
 
     /// The same, but `life` is all it gets, idle or not.
-    fn lasting(inner: T, life: Duration, room: Option<OwnedSemaphorePermit>) -> Self {
+    fn lasting(inner: T, life: Duration, room: Option<Place>) -> Self {
         Idle {
             renews: false,
             ..Idle::new(inner, life, room)
@@ -315,9 +403,9 @@ impl Door {
     }
 }
 
-/// Port 80 for axum: at most `CONNECTIONS` at a time, each cut when idle. (Past that, a
-/// client is hung up on, as on port 443.)
-struct Capped(Door, Arc<Semaphore>);
+/// Port 80 for axum: at most `CONNECTIONS` at a time (`PER_SOURCE` from one source),
+/// each cut when idle. (Past that, a client is hung up on, as on port 443.)
+struct Capped(Door, Limits);
 
 impl axum::serve::Listener for Capped {
     type Io = Idle<TcpStream>;
@@ -326,7 +414,7 @@ impl axum::serve::Listener for Capped {
     async fn accept(&mut self) -> (Idle<TcpStream>, SocketAddr) {
         loop {
             let (stream, from) = self.0.accept().await;
-            if let Ok(turn) = self.1.clone().try_acquire_owned() {
+            if let Some(turn) = self.1.take(from.ip()) {
                 return (Idle::lasting(stream, IDLE_PLAIN, Some(turn)), from);
             }
         }
@@ -364,13 +452,12 @@ where
 }
 
 /// Port 443: TLS for the host asked for, then the bytes go to its Service and back.
-async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>) {
-    let room = Arc::new(Semaphore::new(CONNECTIONS));
+async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>, limits: Limits) {
     loop {
         // (Accepting goes on when the room is full, for what is a Service's; a client
-        // there is no room for is hung up on.)
+        // there is no room for, or that holds its share already, is hung up on.)
         let (stream, from) = door.accept().await;
-        let Ok(turn) = room.clone().try_acquire_owned() else {
+        let Some(turn) = limits.take(from.ip()) else {
             continue;
         };
         let (tls, web) = (tls.clone(), web.clone());
@@ -573,9 +660,9 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
         strays: strays.clone(),
     };
     let (https, http) = (door(https), door(http));
-    let secure = tokio::spawn(secure(https, tls, web.clone()));
+    let secure = tokio::spawn(secure(https, tls, web.clone(), Limits::new(CONNECTIONS, PER_SOURCE)));
     let router = axum::Router::new().fallback(plain).with_state(web.clone());
-    let http = Capped(http, Arc::new(Semaphore::new(CONNECTIONS)));
+    let http = Capped(http, Limits::new(CONNECTIONS, PER_SOURCE));
     let plain = tokio::spawn(async move {
         let _ = axum::serve(http, router).await;
     });
@@ -865,7 +952,7 @@ mod tests {
             me,
             strays,
         };
-        let mut capped = Capped(door, Arc::new(Semaphore::new(1)));
+        let mut capped = Capped(door, Limits::new(1, 100));
         let first = TcpStream::connect(at).await.unwrap();
         let (held, _) = capped.accept().await;
         // With the room full, the next client is hung up on, and the one after it, with
@@ -886,5 +973,179 @@ mod tests {
             .unwrap()
             .unwrap();
         drop((taken, first));
+    }
+
+    /// Port 443 on loopback with `limits`; the task that serves it.
+    async fn open_443(limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let (strays, _kept) = mpsc::unbounded_channel();
+        let door = Door {
+            listener,
+            prefix: kith_mesh::prefix(b"ca"),
+            me: Ipv6Addr::LOCALHOST,
+            strays,
+        };
+        let web = Arc::new(Web::default());
+        let tls = TlsAcceptor::from(crate::pki::ingress_config(web.certificates.clone()).unwrap());
+        (at, tokio::spawn(secure(door, tls, web, limits)))
+    }
+
+    /// Is the connection hung up on (not held open) within a moment?
+    async fn hung_up(client: &mut TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+        let read = tokio::time::timeout(Duration::from_millis(400), client.read_u8()).await;
+        read.is_ok()
+    }
+
+    #[tokio::test]
+    async fn port_443_takes_so_many_connections_at_a_time() {
+        let (at, task) = open_443(Limits::new(1, 100)).await;
+        let first = TcpStream::connect(at).await.unwrap();
+        // With the room full, the next client is hung up on...
+        let mut second = TcpStream::connect(at).await.unwrap();
+        assert!(hung_up(&mut second).await);
+        // ...and once the room is free again, one is taken (and held, silent as it is,
+        // until the hello time runs out).
+        drop(first);
+        let mut taken = false;
+        for _ in 0..30 {
+            let mut client = TcpStream::connect(at).await.unwrap();
+            if !hung_up(&mut client).await {
+                taken = true;
+                break;
+            }
+        }
+        assert!(taken);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn port_443_takes_so_many_connections_from_one_source() {
+        // Everyone here is 127.0.0.1: two at a time, however much room there is.
+        let (at, task) = open_443(Limits::new(100, 2)).await;
+        let held = [
+            TcpStream::connect(at).await.unwrap(),
+            TcpStream::connect(at).await.unwrap(),
+        ];
+        let mut third = TcpStream::connect(at).await.unwrap();
+        assert!(hung_up(&mut third).await);
+        drop(held);
+        let mut taken = false;
+        for _ in 0..30 {
+            let mut client = TcpStream::connect(at).await.unwrap();
+            if !hung_up(&mut client).await {
+                taken = true;
+                break;
+            }
+        }
+        assert!(taken);
+        task.abort();
+    }
+
+    #[test]
+    fn a_source_over_its_limit_is_refused_while_others_connect() {
+        let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+        let limits = Limits::new(10, 2);
+        let (a1, a2) = (
+            limits.take(at("203.0.113.7:1000").ip()),
+            limits.take(at("203.0.113.7:1001").ip()),
+        );
+        assert!(a1.is_some() && a2.is_some());
+        // The same address (v4 on a dual-stack socket too) is over; another is not.
+        assert!(limits.take(at("203.0.113.7:1002").ip()).is_none());
+        assert!(limits.take(at("[::ffff:203.0.113.7]:1003").ip()).is_none());
+        let other = limits.take(at("203.0.113.8:1000").ip());
+        assert!(other.is_some());
+        // A v6 client has a /64 to itself, so its other addresses are the same source.
+        let (b1, b2) = (
+            limits.take(at("[2001:db8:0:1::1]:1").ip()),
+            limits.take(at("[2001:db8:0:1::2]:1").ip()),
+        );
+        assert!(b1.is_some() && b2.is_some());
+        assert!(limits.take(at("[2001:db8:0:1::3]:1").ip()).is_none());
+        assert!(limits.take(at("[2001:db8:0:2::1]:1").ip()).is_some());
+        // One that goes frees its place, and the room is still counted too.
+        drop(a1);
+        assert!(limits.take(at("203.0.113.7:1004").ip()).is_some());
+        let full = Limits::new(1, 5);
+        let _one = full.take(at("203.0.113.7:1").ip());
+        assert!(full.take(at("203.0.113.9:1").ip()).is_none());
+        // (And a refusal for want of room does not keep a count against its source.)
+        drop(_one);
+        assert!(full.take(at("203.0.113.9:1").ip()).is_some());
+    }
+
+    #[test]
+    fn the_older_service_keeps_a_host_two_claim() {
+        let service = |name: &str, port: u16, host: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: {port} }}]\n  expose: {{ host: {host}, via: edge }}\n"
+            )
+        };
+        let mut store = Store::default();
+        let mut apply = |at: u64, source: String| {
+            store.at(Some(at));
+            store
+                .apply(Resource::from_source(&source).unwrap().remove(0).unwrap())
+                .unwrap();
+        };
+        // "z" is the older one, though "a" comes first by key; an edit to "z" later does not make it newer.
+        apply(100, service("z", 80, "shop.example.org"));
+        apply(200, service("a", 80, "Shop.example.org"));
+        apply(300, service("z", 81, "shop.example.org"));
+        let (hosts, refused) = exposed(&store, kith_mesh::prefix(b"ca"));
+        assert_eq!(hosts["shop.example.org"].service, "Service/default/z");
+        let said = "the host shop.example.org is already exposed by Service/default/z";
+        assert_eq!(
+            refused,
+            BTreeMap::from([("Service/default/a".to_string(), said.to_string())])
+        );
+    }
+
+    #[test]
+    fn a_host_acme_would_refuse_is_refused() {
+        let hosts = [
+            ("ip", "203.0.113.7"),
+            ("num", "2130706433"),
+            ("dash", "-shop.example.org"),
+            ("dashed", "shop-.example.org"),
+            ("ok", "shop.example.org"),
+        ];
+        let service = |name: &str, host: &str| {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: '{host}', via: edge }}\n"
+            );
+            Resource::from_source(&source).unwrap().remove(0)
+        };
+        // Applying one is refused...
+        let mut store = Store::default();
+        for (name, host) in hosts {
+            let said = service(name, host).map_err(|e| e.msg).err();
+            let said = said.or_else(|| store.apply(service(name, host).unwrap()).err().map(|e| e.to_string()));
+            assert_eq!(said.is_some(), name != "ok", "{name}: {said:?}");
+            assert!(said.is_none_or(|said| said.contains("expose.host")));
+        }
+        // ...and one stored before that was (here: the same names, the hosts put in after) is
+        // not ordered for, and says why.
+        let mut store = Store::default();
+        for (name, _) in hosts {
+            store.apply(service(name, "shop.example.org").unwrap()).unwrap();
+        }
+        let mut stored = serde_json::to_value(&store).unwrap();
+        for (name, host) in hosts {
+            let key = format!("Service/default/{name}");
+            stored["resources"][&key][0]["resource"]["spec"]["expose"]["host"] = host.into();
+        }
+        let store: Store = serde_json::from_value(stored).unwrap();
+        let (hosts, refused) = exposed(&store, kith_mesh::prefix(b"ca"));
+        assert_eq!(hosts.keys().collect::<Vec<_>>(), ["shop.example.org"]);
+        for name in ["ip", "num", "dash", "dashed"] {
+            let said = &refused[&format!("Service/default/{name}")];
+            assert!(said.contains("expose.host"), "{name}: {said}");
+        }
+        assert_eq!(refused.len(), 4);
     }
 }

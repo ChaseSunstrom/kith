@@ -957,9 +957,28 @@ impl Spec for ServiceSpec {
                 "expose.host: `{}` is not a domain name like `shop.example.org`",
                 expose.host
             )),
-            _ => Ok(()),
+            Some(expose) => expose_host_refused(&expose.host).map_or(Ok(()), Err),
+            None => Ok(()),
         }
     }
+}
+
+/// Why a certificate authority would not issue for `host` (a name that passes
+/// `dns_name`), if it would not: an IP address (a last label of digits only, which no
+/// top-level domain is), or a label that starts or ends with `-`.
+pub fn expose_host_refused(host: &str) -> Option<String> {
+    let numeric = |label: &str| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit());
+    let dashed = |label: &str| label.starts_with('-') || label.ends_with('-');
+    let why = if host.rsplit('.').next().is_some_and(numeric) {
+        "an IP address (or a number), not a name"
+    } else if host.split('.').any(dashed) {
+        "a label that starts or ends with `-`"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "expose.host: `{host}` is {why}: no certificate authority issues for it"
+    ))
 }
 
 /// Is `name` a domain name: labels of letters, digits, `-` and `_`, at most 63 long, 253 in all?
