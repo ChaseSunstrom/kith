@@ -44,6 +44,39 @@ pub struct Options {
     pub slot: Option<char>,
     /// A disk under /dev with an update on it, for the other slot (see `os`).
     pub update: Option<String>,
+    /// This is the installer (see `install`): the URL of its answers, or empty.
+    pub install: Option<String>,
+}
+
+/// The address this machine was given: by its command line, or else the first its network
+/// handed out. (kithd tells other nodes where it is, and a node that asks its network
+/// does not know before.)
+pub static ADDRESS: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
+
+/// What a node's `config` partition says (the installer wrote it): more of the kernel
+/// command line, as its `kith.` words and kithd's own arguments. Of the first only a
+/// name and addresses: which slot runs, and whether to install, is the image's to say.
+pub fn configured(text: &str) -> (String, Vec<String>) {
+    let text = text.split(['\0', '\n']).next().unwrap_or_default();
+    // (` -- ` as a word of its own: a name may end in dashes.)
+    let text = format!(" {text} ");
+    let (kernel, arguments) = text.split_once(" -- ").unwrap_or((&text, ""));
+    let ours = |word: &&str| {
+        ["kith.hostname=", "kith.ip=", "kith.dns="]
+            .iter()
+            .any(|key| word.starts_with(key))
+    };
+    let kernel: Vec<&str> = kernel.split_whitespace().filter(ours).collect();
+    (
+        kernel.join(" "),
+        arguments.split_whitespace().map(str::to_string).collect(),
+    )
+}
+
+/// The disk this system runs from (`vda`), where its root is a verity device.
+pub fn booted() -> Option<String> {
+    let under = std::fs::read_dir("/sys/block/dm-0/slaves").ok()?.flatten().next()?;
+    disk(&under.path())?.into_string().ok()
 }
 
 fn static_ip(value: &str) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
@@ -74,6 +107,10 @@ pub fn options(line: &str) -> (Options, Vec<String>) {
     // (After ` -- ` come the first process's arguments, which are clap's to read.)
     let kernel = line.split(" -- ").next().unwrap_or_default();
     for word in kernel.split_whitespace().filter(|word| word.starts_with("kith.")) {
+        if word == "kith.install" {
+            options.install.get_or_insert_default();
+            continue;
+        }
         let name = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
         match word.split_once('=') {
             // A hostname is a DNS label, as a Node's name is.
@@ -88,6 +125,9 @@ pub fn options(line: &str) -> (Options, Vec<String>) {
             // (A name in /dev, not a path out of it.)
             Some(("kith.update", value)) if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric()) => {
                 options.update = Some(value.into());
+            }
+            Some(("kith.install", url)) if url.starts_with("http://") || url.starts_with("https://") => {
+                options.install = Some(url.into());
             }
             _ => unknown.push(word.into()),
         }
@@ -209,6 +249,10 @@ pub struct Boot {
     asking: Vec<kith_mesh::Card>,
     dns: Option<IpAddr>,
     slot: Option<char>,
+    /// kithd's arguments from the node's config partition: ahead of the command line's.
+    pub args: Vec<String>,
+    /// Set in the installer: the URL of its answers, or empty.
+    pub install: Option<String>,
 }
 
 impl Boot {
@@ -217,9 +261,12 @@ impl Boot {
         for card in self.asking {
             // (A name server on the command line is one the network's own may not replace.)
             let told = self.dns;
-            let got = move |lease: &crate::dhcp::Lease| match told {
-                Some(server) => resolvers(&[server]),
-                None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
+            let got = move |lease: &crate::dhcp::Lease| {
+                let _ = ADDRESS.set(lease.address);
+                match told {
+                    Some(server) => resolvers(&[server]),
+                    None => resolvers(&lease.dns.iter().copied().map(IpAddr::from).collect::<Vec<_>>()),
+                }
             };
             tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
         }
@@ -260,7 +307,10 @@ fn links(options: &Options) -> Vec<kith_mesh::Card> {
     }
     if let (Some((address, bits, gateway)), Some(card)) = (options.ip, cards.first()) {
         match kith_mesh::address4(card.index, address, bits, gateway) {
-            Ok(()) => eprintln!("kithd: init: {} has {address}/{bits}", card.name),
+            Ok(()) => {
+                let _ = ADDRESS.set(address);
+                eprintln!("kithd: init: {} has {address}/{bits}", card.name);
+            }
             Err(e) => eprintln!("kithd: init: giving {} {address}/{bits}: {e}", card.name),
         }
         resolvers(&options.dns.into_iter().collect::<Vec<_>>());
@@ -344,9 +394,22 @@ pub fn early() -> Boot {
         }
     }
     consoles();
-    state();
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let (options, unknown) = options(&line);
+    let installing = options(&line).0.install.is_some();
+    // What the installer was told of this node, from the disk the node runs from. (The
+    // installer itself has none, and keeps nothing: its state is in memory.)
+    let config = labelled("config").filter(|_| !installing).and_then(|device| {
+        use std::io::Read;
+        let mut text = Vec::new();
+        let read = std::fs::File::open(device).ok()?.take(64 << 10).read_to_end(&mut text);
+        read.ok().map(|_| configured(&String::from_utf8_lossy(&text)))
+    });
+    let (config, args) = config.unwrap_or_default();
+    if !installing {
+        state();
+    }
+    // (The command line after the config: what is typed at a boot menu is the last word.)
+    let (options, unknown) = options(&format!("{config} {}", line.split(" -- ").next().unwrap_or_default()));
     for word in unknown {
         eprintln!("kithd: init: `{word}` on the kernel command line is not understood");
     }
@@ -376,8 +439,10 @@ pub fn early() -> Boot {
     Boot {
         asking: links(&options),
         dns: options.dns,
-        slot: options.slot,
+        slot: options.slot.filter(|_| !installing),
         name,
+        args,
+        install: options.install,
     }
 }
 
@@ -395,7 +460,9 @@ pub fn end(failed: bool) -> ! {
     // Written out, then let go of: by now kithd has closed what it had open there. (If
     // not, as after a panic, the file system's journal is what keeps it whole.)
     nix::unistd::sync();
-    if let Err(e) = nix::mount::umount(STATE) {
+    // (EINVAL: nothing is mounted there, as in the installer.)
+    if let Err(e) = nix::mount::umount(STATE).or_else(|e| if e == nix::errno::Errno::EINVAL { Ok(()) } else { Err(e) })
+    {
         eprintln!("kithd: init: unmounting {STATE}: {e}");
     }
     let mode = if off {
@@ -429,6 +496,7 @@ mod tests {
             dns: Some([9, 9, 9, 9].into()),
             slot: Some('b'),
             update: Some("sdb".into()),
+            install: None,
         };
         let line =
             "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.slot=b kith.update=sdb";
@@ -440,12 +508,48 @@ mod tests {
         for bad in bad
             .into_iter()
             .chain(["kith.ip=10.0.0.5", "kith.ip=10.0.0.5/33", "kith.ip=x/8", "kith.dns=x"])
-            .chain(["kith.slot=c", "kith.update=../sda", "kith.update="])
+            .chain([
+                "kith.slot=c",
+                "kith.update=../sda",
+                "kith.update=",
+                "kith.install=ftp://x",
+            ])
         {
             assert_eq!(read(bad), (Options::default(), vec![bad.to_string()]), "{bad}");
         }
         // What follows ` -- ` is kithd's own arguments.
         assert_eq!(read("a=b -- --name kith.hostname=x"), (Options::default(), vec![]));
+        // The installer: answers from whoever is there, or from a URL.
+        assert_eq!(read("kith.slot=a kith.install").0.install, Some(String::new()));
+        assert_eq!(
+            read("kith.install=http://10.0.2.2/a.yaml").0.install.as_deref(),
+            Some("http://10.0.2.2/a.yaml")
+        );
+    }
+
+    #[test]
+    fn init_reads_the_node_config_the_installer_wrote() {
+        // A name and addresses for the kernel's side, and kithd's arguments; to the first NUL.
+        let text = "kith.hostname=alpha kith.ip=10.0.0.5/24 -- --listen 0.0.0.0:7443 --claim\0\0old --junk";
+        let (kernel, args) = configured(text);
+        assert_eq!(kernel, "kith.hostname=alpha kith.ip=10.0.0.5/24");
+        assert_eq!(args, ["--listen", "0.0.0.0:7443", "--claim"]);
+        assert_eq!(options(&kernel).0.hostname.as_deref(), Some("alpha"));
+        // Which slot runs, what updates it and whether to install are not a config's to say.
+        let (kernel, args) = configured("kith.slot=b kith.update=sdb kith.install kith.dns=9.9.9.9 quiet");
+        assert_eq!((kernel.as_str(), args.len()), ("kith.dns=9.9.9.9", 0));
+        // An empty partition, and one with arguments only.
+        assert_eq!(configured("\0\0\0"), (String::new(), vec![]));
+        assert_eq!(configured("-- --claim").1, ["--claim"]);
+        // A name that ends in dashes is a name, not where the arguments start.
+        let (kernel, args) = configured("kith.hostname=a-- -- --claim");
+        assert_eq!(
+            (kernel.as_str(), args),
+            ("kith.hostname=a--", vec!["--claim".to_string()])
+        );
+        // The command line comes after the config, and is the last word.
+        let both = format!("{} {}", configured(text).0, "kith.hostname=beta");
+        assert_eq!(options(&both).0.hostname.as_deref(), Some("beta"));
     }
 
     #[test]

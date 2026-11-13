@@ -17,6 +17,7 @@ mod dhcp;
 mod dns;
 mod ingress;
 mod init;
+mod install;
 mod members;
 mod mesh;
 mod os;
@@ -155,10 +156,24 @@ fn main() -> ExitCode {
     // Started again by the runtime as an exec unit's helper? Then this never returns.
     kith_runtime::exec_shim();
     let first = init::is_init();
-    let boot = first.then(init::early);
+    let mut boot = first.then(init::early);
+    if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
+        installer(boot.expect("there is one"), source);
+    }
     // (As the first process, a mistake in its arguments is clap's to say, and then a restart.)
     let args = if first {
-        Args::try_parse_from(init::arguments(std::env::args())).map_err(|e| e.to_string())
+        use clap::{CommandFactory, FromArgMatches};
+        // What the node's config says, then the command line's own, which is the last word.
+        let mut given = init::arguments(std::env::args());
+        let config = boot
+            .as_mut()
+            .map(|boot| std::mem::take(&mut boot.args))
+            .unwrap_or_default();
+        given.splice(1..1, config);
+        let matched = Args::command().args_override_self(true).try_get_matches_from(given);
+        matched
+            .and_then(|matched| Args::from_arg_matches(&matched))
+            .map_err(|e| e.to_string())
     } else {
         Ok(Args::parse())
     };
@@ -173,6 +188,35 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+/// The installer (kith OS started with `kith.install`): nothing is served, a disk is
+/// written, and the machine is powered off.
+fn installer(boot: init::Boot, source: String) -> ! {
+    let made = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    match made {
+        Ok(runtime) => runtime.block_on(async {
+            // As a node does: Ctrl-Alt-Del starts the machine again, SIGTERM powers it off.
+            tokio::spawn(async {
+                use tokio::signal::unix::{SignalKind, signal};
+                let (Ok(mut off), Ok(mut again)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+                else {
+                    return;
+                };
+                tokio::select! {
+                    _ = off.recv() => init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
+                    _ = again.recv() => {}
+                }
+                init::end(false)
+            });
+            boot.network();
+            install::run(source).await
+        }),
+        Err(e) => {
+            eprintln!("kithd: install: {e}");
+            init::end(true)
+        }
     }
 }
 
@@ -401,6 +445,7 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| fail("starting", &e))?;
+    let first_process = boot.is_some();
     if let Some(boot) = boot {
         let _in = rt.enter();
         boot.network();
@@ -462,7 +507,18 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
                 return Ok(());
             };
             let address = tcp.local_addr().map_err(|e| fail("listening", &e))?;
-            if address.ip().is_unspecified() && args.advertise.is_none() && cluster.ca.is_some() {
+            // A machine that asked its network for an address says the one it was given.
+            let mut advertise = args.advertise.clone();
+            if first_process && advertise.is_none() && address.ip().is_unspecified() && cluster.ca.is_some() {
+                for _ in 0..600 {
+                    if init::ADDRESS.get().is_some() || *stopping.borrow() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                advertise = init::ADDRESS.get().map(|ip| format!("{ip}:{}", address.port()));
+            }
+            if address.ip().is_unspecified() && advertise.is_none() && cluster.ca.is_some() {
                 return Err(format!(
                     "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
                 ));
@@ -480,7 +536,7 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
             // ponytail: so a joined node that moves has to be deleted and joined again.
             let registered = async {
                 if cluster.ca.is_some() {
-                    let reachable = args.advertise.clone().unwrap_or(address.to_string());
+                    let reachable = advertise.clone().unwrap_or(address.to_string());
                     let id = shared.raft.metrics().borrow().id;
                     // Not fatal: the address the cluster has for this node is the one from last time.
                     if let Err(e) = cluster::register(&shared, &cluster.me.name, &reachable, id).await {
@@ -533,4 +589,22 @@ fn run(args: Args, boot: Option<init::Boot>) -> Result<(), String> {
     });
     let _ = std::fs::remove_file(&socket);
     served
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn args_from_the_config_give_way_to_the_command_lines_and_lists_stay_lists() {
+        let given = "kithd --listen 0.0.0.0:7443 --dns-upstream 9.9.9.9 --listen 127.0.0.1:1 --dns-upstream 1.1.1.1";
+        let matched = Args::command()
+            .args_override_self(true)
+            .try_get_matches_from(given.split(' '))
+            .unwrap();
+        let args = Args::from_arg_matches(&matched).unwrap();
+        assert_eq!(args.dns_upstream, ["9.9.9.9", "1.1.1.1"]);
+        assert_eq!(args.listen.map(|at| at.to_string()).as_deref(), Some("127.0.0.1:1"));
+    }
 }

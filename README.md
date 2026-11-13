@@ -986,7 +986,75 @@ A node told to update that says nothing for fifteen minutes counts as failed
 download that breaks counts as a refusal: nothing was written, and the plan
 is paused.
 
-Not yet: an installer and anything written to a real disk, a watchdog for a slot that hangs without
+### Installing on a machine
+
+```sh
+sh os/build.sh                         # also writes target/os/kith-os-installer.raw (460 MB)
+sh ci/vm.sh --test install             # the installer in QEMU, onto disks that are files
+```
+
+**The installer erases the disk it is given.** Nothing in this repository
+starts it on a real machine: the test attaches files as disks to VMs. Putting
+it on a machine of yours is your decision, machine by machine.
+
+Write `kith-os-installer.raw` to a USB stick (`dd if=kith-os-installer.raw
+of=/dev/sdX`, where sdX is the stick), or attach it to a VM as its first disk,
+and start the machine from it (UEFI). It is kith OS started with
+`kith.install`: it serves nothing, and asks on the screen and on the serial
+line alike:
+
+```
+This machine's disks:
+  nvme0n1 (256.1 GB, Samsung SSD 970)
+  sda (2000.4 GB, WDC WD20EZRZ)
+Install kith OS on which (its name)?
+The node's name (empty: one made from its network card's address)?
+Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?
+Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)
+The join token (`kith node token` there)?
+Everything on nvme0n1 (256.1 GB, Samsung SSD 970) will be erased. Type its name again to go on:
+```
+
+The disk it was started from is never in the list. A name not typed the same
+twice writes nothing and the questions start over. It then copies kith OS to
+the disk, reads the disk back to see that it holds what was written, and
+powers the machine off: take the stick out and start it.
+
+Without anyone there, put the answers on the stick, as `kith-install.yaml` on
+its first partition (FAT: any system can write it), or at a URL given on the
+kernel command line (`kith.install=https://10.0.0.2/alpha.yaml`; a hypervisor
+gives it as the SMBIOS string `io.systemd.stub.kernel-cmdline-extra=`). Over
+plain `http` whoever sits between the machine and the URL can change the
+answers, and so name the disk and the cluster: use it on a network that is
+yours alone.
+
+```yaml
+disk: nvme0n1        # or `only`: the one disk of a machine that has one
+hostname: alpha
+ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
+dns: 10.0.0.1
+join:                         # without it the node starts a new cluster
+  address: 10.0.0.7:7443
+  token: $TOKEN
+```
+
+Then nothing is asked, and nothing confirmed: a stick with answers on it
+erases the disk they name in whatever machine it starts. A disk that is not there, `only` on a machine with
+several, or a field it does not know stops it with the reason on the console
+and nothing written.
+
+What it was told goes into a small partition of the new disk (`config`), which
+the node reads at every start as more of its kernel command line: its name,
+its address, and kithd's arguments (`--listen 0.0.0.0:7443`, and `--claim` for
+a new cluster or `--join` with the token). A node that starts a cluster
+[offers a claim on its console](#who-may-do-what); one that asked its network
+for an address tells other nodes the address it was given.
+
+The installed disk is the image as built: the state partition is 32 MB until
+it can grow, and the kernel notes at each start that the spare partition
+table is not at the disk's end.
+
+Not yet: a CD image, a watchdog for a slot that hangs without
 stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk and being encrypted, drivers for Wi-Fi,

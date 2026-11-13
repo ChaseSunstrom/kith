@@ -219,7 +219,17 @@ where
     let id = match std::fs::read_to_string(&id_file) {
         Ok(text) => text.trim().parse().map_err(|e| format!("{}: {e}", id_file.display()))?,
         Err(_) => {
-            std::fs::write(&id_file, id.to_string()).map_err(|e| format!("writing {}: {e}", id_file.display()))?;
+            // Whole or not at all: a node that lost power with an empty id file would never start again.
+            let new = dir.join("id.new");
+            let written = (|| {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&new)?;
+                file.write_all(id.to_string().as_bytes())?;
+                file.sync_all()?;
+                std::fs::rename(&new, &id_file)?;
+                std::fs::File::open(dir)?.sync_all()
+            })();
+            written.map_err(|e: std::io::Error| format!("writing {}: {e}", id_file.display()))?;
             id
         }
     };

@@ -10,10 +10,12 @@
 #     bundle and empty directories, with a dm-verity hash tree beside it;
 #   - a unified kernel image (systemd's stub, the kernel, and the command line that
 #     names the root's hash), started by systemd-boot from the ESP;
-#   - a GPT disk: esp, root-a, root-b, verity-a, verity-b, state (ext4).
+#   - a GPT disk: esp, root-a, root-b, verity-a, verity-b, config, state (ext4);
+#   - the installer: a second disk image that starts kith OS with `kith.install` and
+#     carries the first one whole, to copy to a machine's disk.
 #
 # Nothing needs root, nothing outside --out and the cache is written, and no disk is
-# touched: the result is two files, kith-os.raw and kith-os.qcow2.
+# touched: the result is files, kith-os.raw, kith-os.qcow2 and kith-os-installer.raw.
 set -eu
 
 kernel_version=6.18.63
@@ -33,7 +35,8 @@ usage() {
     cat <<'EOF'
 usage: sh os/build.sh [--out DIR] [--check] [--twice]
 
-Builds DIR/kith-os.raw and DIR/kith-os.qcow2 (default DIR: target/os).
+Builds DIR/kith-os.raw, DIR/kith-os.qcow2 and the installer, DIR/kith-os-installer.raw
+(default DIR: target/os).
 Beside them, DIR/kith-os.update: what a running node is given to become this version
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
 the workspace's).
@@ -187,12 +190,22 @@ assemble() { # DIR
             "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
         touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
     done
+    # The installer's: slot a's, told to install and not to serve (crates/kithd/src/install.rs).
+    printf '%s kith.install' "$(cat "$w/cmdline-a")" >"$w/cmdline-install"
+    objcopy \
+        --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
+        --add-section .cmdline="$w/cmdline-install" --change-section-vma .cmdline=0x14dfd0000 \
+        --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
+        "$efi/linuxx64.efi.stub" "$w/kith-install.efi"
+    touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-install.efi"
     # What a node of an older version is given to become this one (os/update.sh).
     sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" >"$w/kith-os.update"
 
     # The ESP, made here and not by repart: FAT16 at 64 MB, where repart insists on 260.
-    truncate -s 64M "$w/esp.img"
+    # The installer's is the same with its own kernel image.
+    truncate -s 64M "$w/esp.img" "$w/esp-install.img"
     mkfs.vfat --invariant -i 6B697468 -n KITH-ESP "$w/esp.img" >/dev/null
+    mkfs.vfat --invariant -i 6B697469 -n KITH-INST "$w/esp-install.img" >/dev/null
     printf 'timeout 0\n' >"$w/loader.conf"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf"
     cp -p "$efi/systemd-bootx64.efi" "$w/boot.efi"
@@ -203,6 +216,10 @@ assemble() { # DIR
     # is added as N+1 with three tries, see crates/kithd/src/os.rs.)
     mcopy -m -i "$w/esp.img" "$w/kith-a.efi" ::EFI/Linux/kith-1-a.efi
     mcopy -m -i "$w/esp.img" "$w/loader.conf" ::loader/loader.conf
+    mmd -i "$w/esp-install.img" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
+    mcopy -m -i "$w/esp-install.img" "$w/boot.efi" ::EFI/BOOT/BOOTX64.EFI
+    mcopy -m -i "$w/esp-install.img" "$w/kith-install.efi" ::EFI/Linux/kith-install.efi
+    mcopy -m -i "$w/esp-install.img" "$w/loader.conf" ::loader/loader.conf
 
     # The disk. root-b and verity-b are empty: an update fills them (and has room to
     # be bigger than this one).
@@ -219,10 +236,24 @@ assemble() { # DIR
     part 21-root-b root-x86-64 root-b 88M
     part 30-verity-a root-x86-64-verity verity-a 4M "CopyBlocks=$w/root.verity"
     part 31-verity-b root-x86-64-verity verity-b 4M
+    # (config: what the installer was told of this node, read at each start as more of
+    # the kernel command line. Empty here.)
+    part 35-config linux-generic config 1M
     part 40-state linux-generic state 32M "Format=ext4"
     systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os.raw" >"$w/repart.log" 2>&1 \
         || { cat "$w/repart.log" >&2; die "systemd-repart failed"; }
     qemu-img convert -f raw -O qcow2 "$w/kith-os.raw" "$w/kith-os.qcow2"
+
+    # The installer: enough of kith OS to start (its ESP, a root and its verity tree), and
+    # the image above, whole, in a partition: installing is copying that to a disk.
+    d=$w/repart-install.d
+    mkdir "$d"
+    part 10-esp esp esp 64M "CopyBlocks=$w/esp-install.img"
+    part 20-root-a root-x86-64 root-a 88M "CopyBlocks=$w/root.squashfs"
+    part 30-verity-a root-x86-64-verity verity-a 4M "CopyBlocks=$w/root.verity"
+    part 50-payload linux-generic payload "$(($(stat -c %s "$w/kith-os.raw") / 1048576 + 1))M" "CopyBlocks=$w/kith-os.raw"
+    systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os-installer.raw" >"$w/repart-install.log" 2>&1 \
+        || { cat "$w/repart-install.log" >&2; die "systemd-repart failed (the installer)"; }
 }
 
 assemble "$out"
@@ -234,7 +265,7 @@ if [ -n "$check" ]; then
 fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
-    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-os.update esp.img kith-os.raw; do
+    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-install.efi kith-os.update esp.img kith-os.raw kith-os-installer.raw; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     find "$out/again" -delete

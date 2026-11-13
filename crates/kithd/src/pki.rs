@@ -133,7 +133,9 @@ fn write_private(path: &Path, text: &str) -> Fallible<()> {
     let file = options.write(true).create(true).truncate(true).mode(0o600).open(path);
     tls(
         &format!("writing {}", path.display()),
-        file.and_then(|mut file| file.write_all(text.as_bytes())),
+        // (On the disk before the next file: a machine that loses power a moment after
+        // its first start must not come back with a certificate and half a key.)
+        file.and_then(|mut file| file.write_all(text.as_bytes()).and_then(|()| file.sync_all())),
     )
 }
 
@@ -172,7 +174,11 @@ pub fn save(dir: &Path, identity: &Identity, ca: Option<&Ca>) -> Fallible<()> {
     write_private(&dir.join("ca.crt"), &identity.ca)?;
     write_private(&dir.join("name"), &identity.name)?;
     // Last: `load` takes its presence to mean the rest is there.
-    write_private(&dir.join("node.crt"), &identity.cert)
+    write_private(&dir.join("node.crt"), &identity.cert)?;
+    tls(
+        &format!("writing {}", dir.display()),
+        std::fs::File::open(dir).and_then(|dir| dir.sync_all()),
+    )
 }
 
 fn certs(pem: &str) -> Fallible<Vec<CertificateDer<'static>>> {
