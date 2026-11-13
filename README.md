@@ -1007,6 +1007,38 @@ spec: { node: n1, path: media, shared: true }
   up to two minutes; locks held when the volume's node restarts must be taken again within
   30 seconds; VMs (virtiofs) and machines that are not nodes cannot mount one.
 
+### Blobs
+
+Bytes the cluster keeps by what they are, on more than one node:
+
+```sh
+kith blob put backup.tar          # prints the name the bytes are kept under
+kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
+```
+
+- A blob's name is the first 62 hex digits of the BLAKE3 hash of its bytes (what `b3sum`
+  prints, less its last two digits: a resource's name is at most 63 long). The same bytes
+  put twice, by anyone and in any namespace, are one file on a node.
+- `put` makes a `Blob` resource (`spec.size`, `spec.copies`: on how many nodes, 2 unless
+  `--copies` says). Every node works out the same holders from the name and the nodes it
+  hears from, fetches what it should hold from a node that has it over the cluster's mutual
+  TLS, and writes itself into the Blob's `status.nodes`. A copy whose bytes do not hash to
+  its name is thrown away, and so is an upload that ends early.
+- `get` on a node that holds none of it passes on the bytes of one that does. Reading needs
+  `get` on `Blob` in its namespace, putting needs `apply`.
+  A Blob cannot be made with `kith apply`: only putting the bytes makes one, so knowing a
+  blob's name does not let another namespace read it.
+- When a holder is not heard from for a minute, another node takes its place and fetches a
+  copy. The node a blob was put on keeps it until the holders say they have it.
+- `kith delete blob NAME` forgets it; a node removes a file that no Blob names once it is
+  ten minutes old.
+- `put` answers once the bytes are on the node it was asked on; the other copies follow
+  within seconds. Until a second node is in `status.nodes`, that node's disk is the only
+  place they are.
+- Not yet: nothing else uses blobs (images, packages and revisions are kept as before); a
+  blob passes through the CLI's memory whole; no size limit or quota but the disk; a holder
+  does not read its copies again to find one the disk has spoiled.
+
 ### Remote apps
 
 `kith run --on NODE|SELECTOR [--via PROGRAM] -- APP [ARGS…]` runs a

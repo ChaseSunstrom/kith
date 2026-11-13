@@ -43,13 +43,15 @@ base64 = "0.22"
 # portable-dispatch: a loop, not tail calls the compiler has to turn into jumps: without that
 # guarantee (a debug build) the other way overflows the stack of whoever runs a module.
 wasmi = { version = "2", default-features = false, features = ["std", "validate", "portable-dispatch"] }
+# A body read and sent a piece at a time (blobs.rs; a test's request too); in the tree already.
+futures-util = "0.3"
+# The blob store's names. `pure`: no C or assembly to build for musl.
+blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
 
 [dev-dependencies]
 serde_json.workspace = true
 # Test modules are written as text.
 wat = "1"
-# A request body a test makes as a stream (cluster.rs); in the tree already.
-futures-util = "0.3"
 
 [lints]
 workspace = true

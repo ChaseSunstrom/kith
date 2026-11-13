@@ -503,6 +503,16 @@ spec! {
         pub size: Option<Quantity>,
     }
 
+    /// Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3
+    /// hash, and `kith blob put` makes it.
+    pub struct BlobSpec {
+        /// How many bytes.
+        pub size: u64,
+        /// How many nodes keep a copy [default: 2].
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub copies: Option<u32>,
+    }
+
     pub struct VolumeClaimSpec {
         pub size: Quantity,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -783,6 +793,7 @@ macro_rules! no_checks {
 }
 
 no_checks!(
+    BlobSpec,
     ClusterSpec,
     NodeSpec,
     NamespaceSpec,

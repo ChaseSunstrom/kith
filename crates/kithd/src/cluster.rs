@@ -243,6 +243,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
+        .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .with_state(shared.clone());
     let members = crate::raft::router(shared).merge(ping).merge(hop);
     open.merge(crate::ui::pages())

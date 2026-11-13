@@ -296,6 +296,82 @@ fn the_store_survives_its_leader() {
 }
 
 #[test]
+fn a_blob_put_on_one_node_is_held_by_two_and_read_through_any() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "blob";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    let nodes = [&alpha, &beta, &gamma];
+    wait_for("three nodes with addresses", || {
+        nodes
+            .iter()
+            .all(|node| node.nodes().iter().filter(|(_, at)| !at.is_empty()).count() == 3)
+    });
+
+    // Not text, and long enough to come in more than one piece.
+    let bytes: Vec<u8> = (0..300_000u32)
+        .flat_map(|n| n.wrapping_mul(2_654_435_761).to_be_bytes())
+        .collect();
+    std::fs::write(alpha.dir.join("in"), &bytes).unwrap();
+    let name = alpha.ok(&["blob", "put", "in"]).trim().to_string();
+    assert_eq!(name.len(), 62, "{name}");
+    // The same bytes again, through another node: the same name, and still one Blob.
+    std::fs::write(gamma.dir.join("in"), &bytes).unwrap();
+    assert_eq!(gamma.ok(&["blob", "put", "in"]).trim(), name);
+
+    // Two nodes hold it in the end, whichever it was put on, and say so.
+    let has = |node: &Node| node.dir.join("state/blobs").join(&name).exists();
+    let holders = |node: &Node| {
+        let blob: serde_json::Value = serde_json::from_str(&node.ok(&["get", "blob", &name, "-o", "json"])).unwrap();
+        let blob = blob.as_array().map_or(blob.clone(), |found| found[0].clone());
+        let nodes = blob["status"]["nodes"].as_array().cloned().unwrap_or_default();
+        nodes
+            .iter()
+            .map(|node| node.as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    wait_for("two nodes to hold the blob", || {
+        nodes.iter().filter(|node| has(node)).count() == 2 && holders(&beta).len() == 2
+    });
+    for node in nodes {
+        let named = node.dir.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(holders(&beta).contains(&named), has(node), "{named}");
+        // Read through every node: the one that holds none passes on another's.
+        node.ok(&["blob", "get", &name, "-o", "out"]);
+        assert!(std::fs::read(node.dir.join("out")).unwrap() == bytes, "through {named}");
+    }
+
+    // Knowing a blob's name is not having its bytes: a Blob for it in another namespace
+    // cannot be applied, so nothing reads them through one.
+    let stolen = format!(
+        "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: {{ name: other }}\n---\napiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: {name}, namespace: other }}\nspec: {{ size: 1 }}\n"
+    );
+    std::fs::write(beta.dir.join("stolen.yaml"), stolen).unwrap();
+    let (code, _, err) = beta.kith(&["apply", "-f", "stolen.yaml"]);
+    assert!(
+        code != 0 && err.contains("a Blob is made by putting its bytes"),
+        "{err}"
+    );
+    assert!(beta.kith(&["blob", "get", &name, "-n", "other"]).0 != 0);
+
+    // Bytes on a node's disk that are not the blob's are never taken for it.
+    let (code, _, err) = alpha.kith(&["blob", "get", &"0".repeat(62)]);
+    assert!(code != 0 && err.contains("not found"), "{err}");
+    let (code, _, err) = alpha.kith(&["blob", "get", "../../kithd.sock"]);
+    assert!(code != 0, "{err}");
+}
+
+#[test]
 fn a_node_that_is_down_is_not_made_a_voter() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

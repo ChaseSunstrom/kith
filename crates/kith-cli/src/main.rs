@@ -156,6 +156,11 @@ enum Command {
         #[command(subcommand)]
         command: ControllerCommand,
     },
+    /// Blobs: bytes the cluster keeps under their hash, on several nodes
+    Blob {
+        #[command(subcommand)]
+        command: BlobCommand,
+    },
     /// Work on a package: a directory of resource templates and default values
     Package {
         #[command(subcommand)]
@@ -211,6 +216,27 @@ enum IdentityCommand {
         /// The directory to write them in
         #[arg(long, default_value = ".")]
         out: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum BlobCommand {
+    /// Keep FILE's bytes in the cluster; prints the name they are kept under
+    Put {
+        file: PathBuf,
+        #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
+        /// On how many nodes [default: 2]
+        #[arg(long)]
+        copies: Option<u32>,
+    },
+    /// The bytes kept under NAME, to standard output or into a file
+    Get {
+        name: String,
+        #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -513,6 +539,12 @@ fn escape(key: &str) -> String {
 // (the size and RSS budgets). It relies on `Connection: close` and kithd never
 // chunking these replies; swap in a client library when the API goes over the network.
 fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<T, String> {
+    let reply = raw(kithd, method, path, body)?;
+    serde_json::from_slice(&reply).or_else(|e| fail(format!("reading kithd's reply: {e}")))
+}
+
+/// The same, the reply's body as it came.
+fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     let socket = &kithd.socket;
     use std::io::Write;
     let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
@@ -563,7 +595,15 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
         let message = message.as_ref().and_then(|m| m["error"].as_str()).map(String::from);
         return fail(message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned()));
     }
-    serde_json::from_slice(body).or_else(|e| fail(format!("reading kithd's reply: {e}")))
+    // (A reply cut short is not the reply: a blob that came through another node, say.)
+    let said = head.lines().find_map(|line| line.strip_prefix("content-length:"));
+    if said
+        .and_then(|length| length.trim().parse().ok())
+        .is_some_and(|length: usize| length != body.len())
+    {
+        return fail("kithd's reply was cut short");
+    }
+    Ok(body.to_vec())
 }
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
@@ -761,6 +801,40 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     "{key} rolled back to revision {to} (now revision {})",
                     change.after.metadata.revision.unwrap_or(0)
                 ),
+            }
+        }
+        Command::Blob { command } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("blobs are kept by kithd: leave out --store");
+            };
+            // ponytail: a blob passes through memory whole, as a netboot image does;
+            // stream it when blobs outgrow that.
+            match command {
+                BlobCommand::Put {
+                    file,
+                    namespace,
+                    copies,
+                } => {
+                    let bytes = std::fs::read(&file).or_else(|e| fail(format!("{}: {e}", file.display())))?;
+                    let copies = copies.map_or(String::new(), |copies| format!("&copies={copies}"));
+                    let path = format!("/v1/blobs?namespace={}{copies}", escape(&namespace));
+                    let kept: serde_json::Value = request(&kithd, "PUT", &path, &bytes)?;
+                    println!("{}", kept["name"].as_str().unwrap_or_default());
+                }
+                BlobCommand::Get {
+                    name,
+                    namespace,
+                    output,
+                } => {
+                    use std::io::Write;
+                    let path = format!("/v1/blobs/{}/{}", escape(&namespace), escape(&name));
+                    let bytes = raw(&kithd, "GET", &path, b"")?;
+                    let written = match &output {
+                        Some(file) => std::fs::write(file, &bytes),
+                        None => std::io::stdout().write_all(&bytes),
+                    };
+                    written.or_else(|e| fail(format!("writing the blob: {e}")))?;
+                }
             }
         }
         Command::Node {

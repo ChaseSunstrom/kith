@@ -154,6 +154,15 @@ impl Shared {
     // "not found", an apply that names a revision "conflict". Request ids kept in the
     // state machine are the fix when that matters.
     pub async fn submit(&self, command: Command) -> Result<Done, Error> {
+        if let Command::Apply { resources, .. } = &command {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            crate::blobs::put_first(&state.store, resources).map_err(Error::Invalid)?;
+        }
+        self.write(command).await
+    }
+
+    /// [`Shared::submit`] for the blob store's own Blobs: the bytes were just put.
+    pub async fn write(&self, command: Command) -> Result<Done, Error> {
         // Whoever applies, here is where a kind's admission module is asked.
         let command = match command {
             Command::Apply { resources, at } => {

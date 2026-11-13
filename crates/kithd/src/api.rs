@@ -56,6 +56,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/history/{*key}", get(history))
         .route("/v1/rollback/{*key}", post(rollback))
         .route("/v1/logs/{*key}", get(logs))
+        .route("/v1/blobs", axum::routing::put(crate::blobs::put))
+        .route("/v1/blobs/{namespace}/{name}", get(crate::blobs::get))
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))
@@ -240,7 +242,8 @@ pub(crate) async fn plan(
     let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        crate::releases::claims(&state.store, &resources)
+        let put = crate::blobs::put_first(&state.store, &resources);
+        put.and_then(|()| crate::releases::claims(&state.store, &resources))
     };
     claimed.map_err(|why| ApiError::Store(Error::Invalid(why)))?;
     // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
