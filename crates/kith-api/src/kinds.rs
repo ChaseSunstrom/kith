@@ -824,9 +824,15 @@ impl Spec for CronJobSpec {
 impl Spec for ServiceSpec {
     fn check(&self) -> Result<(), String> {
         if self.ports.is_empty() {
-            Err("ports: needs at least one port".into())
-        } else {
-            Ok(())
+            return Err("ports: needs at least one port".into());
+        }
+        // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
+        match &self.expose {
+            Some(expose) if !dns_name(&expose.host) => Err(format!(
+                "expose.host: `{}` is not a domain name like `shop.example.org`",
+                expose.host
+            )),
+            _ => Ok(()),
         }
     }
 }

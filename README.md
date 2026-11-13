@@ -220,6 +220,11 @@ kith node status                                   # who leads the store, who vo
   told the client's address, and to a NetworkPolicy the connection comes from
   the ingress node. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
+  `expose.host` has to be a domain name (applying anything else is refused).
+  Two Services with one host: the first by key has it, and the other's
+  status says `expose: refused` and why. Each port takes 1024 connections at
+  a time (more are hung up on); one with no byte either way for 5 minutes on
+  443, or 30 seconds on 80, is closed.
 
 Not yet: the nodes still talk to each other at their plain addresses, not
 over the mesh, workloads have no addresses on it, and two nodes that
