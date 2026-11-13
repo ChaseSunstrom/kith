@@ -344,7 +344,12 @@ pub fn reconcile(
     resources: &[Resource],
     prune: bool,
 ) -> Result<Reconciled, String> {
-    let mine = |live: &Resource| owner(live) == Some(key) || recorded.contains(live.key().as_str());
+    // (Recorded and unmarked is still its own; recorded and marked another's is the
+    // other's now: two owners of one resource do not take it from each other for ever.)
+    let mine = |live: &Resource| match owner(live) {
+        Some(owner) => owner == key,
+        None => recorded.contains(live.key().as_str()),
+    };
     let others = resources.iter().map(Resource::key);
     let others: Vec<String> = others
         .filter(|resource| store.get(resource).is_some_and(|live| !mine(live)))
@@ -590,6 +595,31 @@ mod tests {
             }
         }
         panic!("the releases never settle");
+    }
+
+    /// What an owner once recorded and another has since marked as its own is the
+    /// other's: neither takes it back from the other, round after round.
+    #[test]
+    fn a_recorded_resource_another_owns_now_is_not_taken_back() {
+        let map = |owner: Option<&str>| -> Resource {
+            let marks = owner.map_or(serde_json::json!({}), |owner| serde_json::json!({ OWNER: owner }));
+            let map = serde_json::json!({
+                "apiVersion": kith_api::API_VERSION, "kind": "ConfigMap",
+                "metadata": { "name": "a", "namespace": "shop", "annotations": marks },
+                "spec": { "data": { "k": "v" } },
+            });
+            serde_json::from_value(map).unwrap()
+        };
+        let recorded = BTreeSet::from(["ConfigMap/shop/a"]);
+        let mut store = Store::default();
+        store.apply(map(Some("Release/shop/two"))).unwrap();
+        let wanted = [map(Some("Release/shop/one"))];
+        let said = reconcile(&store, "Release/shop/one", &recorded, &wanted, true).map(|_| ());
+        assert!(said.unwrap_err().contains("is not Release/shop/one's"));
+        // One that lost its mark (someone applied it bare) and is recorded is still its own.
+        let mut store = Store::default();
+        store.apply(map(None)).unwrap();
+        assert!(reconcile(&store, "Release/shop/one", &recorded, &wanted, true).is_ok());
     }
 
     #[test]
