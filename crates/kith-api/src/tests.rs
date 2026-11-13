@@ -425,3 +425,120 @@ fn dns_kinds_are_checked() {
         assert!(said.contains(why), "{bad}: {said}");
     }
 }
+
+const GAME: &str = "
+apiVersion: kith.dev/v1
+kind: KindDefinition
+metadata: { name: gameserver }
+spec:
+  group: games.example.com
+  version: v1
+  kind: GameServer
+  schema:
+    type: object
+    required: [map]
+    additionalProperties: false
+    properties:
+      map: { type: string }
+      players: { type: integer, minimum: 1, maximum: 64 }
+  columns:
+    - { name: Map, path: spec.map }
+";
+
+#[test]
+fn custom_kinds_are_checked_by_the_store() {
+    let mut store = Store::default();
+    let server =
+        |rest: &str| format!("apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: one }}\n{rest}");
+    let refused = |store: &mut Store, src: &str| store.apply(one(src)).unwrap_err().to_string();
+
+    // No definition, no kind; and kith's own apiVersion is for kith's own kinds.
+    assert!(refused(&mut store, &server("spec: { map: dust }")).contains("no KindDefinition makes it"));
+    assert!(
+        err("apiVersion: kith.dev/v1\nkind: GameServer\nmetadata: { name: one }\n")
+            .2
+            .contains("unknown kind")
+    );
+
+    store.apply(one(GAME)).unwrap();
+    let made = store
+        .apply(one(&server("spec: { map: dust, players: 8 }")))
+        .unwrap()
+        .after;
+    assert_eq!(
+        (made.key().as_str(), made.api_version.as_str()),
+        ("GameServer/default/one", "games.example.com/v1")
+    );
+    // One of kith's own kinds in other capitals is no kind of anyone's.
+    let shouted = server("spec: {}").replace("GameServer", "WORKLOAD");
+    assert!(err(&shouted).2.contains("did you mean `Workload`"));
+    let mut forged = made.clone();
+    (forged.kind, forged.metadata.revision) = ("SOURCE".into(), None);
+    assert!(
+        store
+            .apply(forged)
+            .unwrap_err()
+            .to_string()
+            .contains("did you mean `Source`")
+    );
+    assert_eq!(one(&made.to_yaml()), made);
+
+    // What the schema says, with the path; the apiVersion; a spec that is no mapping.
+    let wrong = refused(&mut store, &server("spec: { players: 99, cheats: true }"));
+    for said in [
+        "spec.map: is required",
+        "spec.players: it must be at most 64",
+        "spec.cheats: is not a field the schema has",
+    ] {
+        assert!(wrong.contains(said), "{wrong}");
+    }
+    let other = server("spec: { map: dust }").replace("example.com/v1", "example.com/v2");
+    assert!(refused(&mut store, &other).contains("GameServer is `games.example.com/v1`"));
+    assert!(err(&server("spec: [1]")).2.contains("spec"));
+    assert!(
+        err(&server("").replace("GameServer", "gameServer"))
+            .2
+            .contains("invalid kind")
+    );
+
+    // One definition for a kind; its kind and scope stay, and it stays, while it is used.
+    let again = GAME.replace("name: gameserver", "name: again");
+    let lower = again.replace("kind: GameServer", "kind: Gameserver");
+    assert!(refused(&mut store, &lower).contains("already defines `GameServer`"));
+    let second = refused(&mut store, &again);
+    assert!(
+        second.contains("KindDefinition/gameserver already defines `GameServer`"),
+        "{second}"
+    );
+    let cluster = GAME.replace("version: v1\n", "version: v1\n  namespaced: false\n");
+    assert!(refused(&mut store, &cluster).contains("1 `GameServer` resources exist"));
+    assert!(
+        store
+            .delete("KindDefinition/gameserver")
+            .unwrap_err()
+            .to_string()
+            .contains("delete them first")
+    );
+    store.delete("GameServer/default/one").unwrap();
+    store.apply(one(&cluster)).unwrap();
+    assert_eq!(
+        store.apply(one(&server("spec: { map: dust }"))).unwrap().after.key(),
+        "GameServer/one"
+    );
+    let placed = server("spec: { map: dust }").replace("name: one", "name: one, namespace: shop");
+    assert!(refused(&mut store, &placed).contains("cluster-scoped"));
+    store.delete("GameServer/one").unwrap();
+    store.delete("KindDefinition/gameserver").unwrap();
+}
+
+#[test]
+fn custom_kind_definitions_are_checked() {
+    let wrong = |from: &str, to: &str| err(&GAME.replace(from, to)).2;
+    assert!(wrong("kind: GameServer", "kind: Workload").contains("one of kith's own kinds"));
+    assert!(wrong("kind: GameServer", "kind: game_server").contains("invalid kind"));
+    assert!(wrong("games.example.com", "kith.dev").contains("not kith.dev"));
+    assert!(wrong("games.example.com", "games").contains("domain name"));
+    assert!(wrong("version: v1", "version: one").contains("like v1 or v1beta1"));
+    assert!(wrong("type: object", "oneOf: []").contains("`oneOf` is not a keyword kith checks"));
+    assert!(wrong("path: spec.map", "path: 'spec..map'").contains("dotted path"));
+}

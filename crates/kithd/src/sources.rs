@@ -158,13 +158,15 @@ async fn git(dir: &Path, local: bool, args: &[&str]) -> Fallible<Vec<u8>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = match command.spawn() {
+    // (kithd collects the children nobody waits for: this one is waited for.)
+    let child = match kith_runtime::spawn_awaited(|| command.spawn(), tokio::process::Child::id) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err("this node has no git: a Source from a git repository needs it".into());
         }
         Err(e) => return Err(format!("running git: {e}")),
         Ok(child) => child,
     };
+    let (mut child, _awaited) = child;
     // (No more of what it says is kept than a source may hold; the rest ends it.)
     let (stdout, stderr) = (child.stdout.take().expect("piped"), child.stderr.take().expect("piped"));
     let (mut out, mut said) = (Vec::new(), Vec::new());
@@ -319,12 +321,14 @@ fn desired(key: &str, fetched: &Fetched) -> Fallible<Vec<Resource>> {
                 .get("metadata")
                 .is_some_and(|metadata| metadata.get("namespace").is_some());
             let mut resource = Resource::from_node(&document).map_err(shown)?;
-            let scoped = kith_api::kind(&resource.kind).is_some_and(|kind| kind.namespaced);
+            // (A kind some KindDefinition makes is placed when the store is at hand: `settled`.)
+            let own = kith_api::kind(&resource.kind);
+            let scoped = own.is_some_and(|kind| kind.namespaced);
             if !placed && scoped {
                 resource.metadata.namespace = Some(home.to_string());
             }
             let at = resource.key();
-            if home != "kith-system" {
+            if home != "kith-system" && own.is_some() {
                 if !scoped || resource.kind == "Source" {
                     return Err(format!(
                         "{path}: {at}: only a Source in kith-system gets to make a {}",
@@ -357,6 +361,54 @@ fn plain(message: &str) -> String {
     message.chars().filter(|c| !c.is_control() || *c == '\n').collect()
 }
 
+/// `resources` (see `desired`) with those of kinds a `KindDefinition` makes put where
+/// such a kind lives, and kept where a Source may put things. The definition is the
+/// store's, or one the source brings along.
+fn settled<'a>(store: &Store, key: &str, resources: &'a [Resource]) -> Fallible<std::borrow::Cow<'a, [Resource]>> {
+    let custom = |resource: &Resource| kith_api::kind(&resource.kind).is_none();
+    if !resources.iter().any(custom) {
+        return Ok(resources.into());
+    }
+    let home = key.split('/').nth(1).unwrap_or_default();
+    let mut kinds = crate::releases::custom_kinds(store);
+    let brought = resources.iter().filter(|resource| resource.kind == "KindDefinition");
+    kinds.extend(brought.map(|definition| {
+        let kind = definition.spec["kind"].as_str().unwrap_or_default();
+        (kind.to_string(), definition.spec["namespaced"] != false)
+    }));
+    let mut resources = resources.to_vec();
+    let mut seen = BTreeSet::new();
+    for resource in &mut resources {
+        // (A kind nothing makes is for the store to refuse, in its words.)
+        let scoped = match kinds.get(&resource.kind) {
+            Some(scoped) if custom(resource) => *scoped,
+            _ => {
+                seen.insert(resource.key());
+                continue;
+            }
+        };
+        if scoped && resource.metadata.namespace.is_none() {
+            resource.metadata.namespace = Some(home.to_string());
+        }
+        let at = resource.key();
+        if home != "kith-system" && !scoped {
+            return Err(format!(
+                "{at}: only a Source in kith-system gets to make a {}",
+                resource.kind
+            ));
+        }
+        if home != "kith-system" && resource.metadata.namespace.as_deref() != Some(home) {
+            return Err(format!(
+                "{at}: a Source stays in its own namespace ({home}) unless it is in kith-system"
+            ));
+        }
+        if !seen.insert(at.clone()) {
+            return Err(format!("{at} is in the source twice"));
+        }
+    }
+    Ok(resources.into())
+}
+
 /// What was fetched for each Source, or why it could not be.
 type Fetches = BTreeMap<String, Result<Fetched, String>>;
 
@@ -381,8 +433,8 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
         // (Worked out once for each fetch, not each time the store changes.)
         let done = fetched.as_ref().map_err(String::clone).and_then(|fetched| {
             let resources = fetched.resources.get_or_init(|| desired(&key, fetched));
-            let resources = resources.as_ref().map_err(String::clone)?;
-            let done = reconcile(store, &key, &recorded(source), resources, spec.prune == Some(true))?;
+            let resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
+            let done = reconcile(store, &key, &recorded(source), &resources, spec.prune == Some(true))?;
             Ok((fetched, done))
         });
         let status = match done {
@@ -801,5 +853,53 @@ mod tests {
         )]);
         settle(&mut store, &system);
         assert!(message(&store, "Source/kith-system/repo").contains("a Source does not apply itself"));
+    }
+
+    /// Kinds a KindDefinition makes go where such a kind lives, and no further than a
+    /// Source may reach; a source may bring the definition along.
+    #[test]
+    fn a_source_applies_kinds_that_are_defined() {
+        let mut store = Store::default();
+        let message = |store: &Store, key: &str| store.get(key).unwrap().status.clone().unwrap()["message"].to_string();
+        let definition = |kind: &str, scoped: bool| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{ name: {} }}\n\
+                 spec: {{ group: games.example.com, version: v1, kind: {kind}, namespaced: {scoped}, schema: {{ type: object }} }}\n",
+                kind.to_lowercase()
+            )
+        };
+        let of = |kind: &str, name: &str| {
+            format!("apiVersion: games.example.com/v1\nkind: {kind}\nmetadata: {{ name: {name} }}\n")
+        };
+        apply(&mut store, &SOURCE.replace("namespace: shop", "namespace: kith-system"));
+        let brought = [
+            definition("GameServer", true),
+            definition("Realm", false),
+            of("GameServer", "one"),
+            of("Realm", "north"),
+        ];
+        let system = Fetches::from([(
+            "Source/kith-system/repo".to_string(),
+            at("r1", &[("all.yaml", brought.join("---\n"))])
+                .remove("Source/shop/repo")
+                .unwrap(),
+        )]);
+        settle(&mut store, &system);
+        assert!(store.get("GameServer/kith-system/one").is_some() && store.get("Realm/north").is_some());
+
+        apply(&mut store, SOURCE);
+        let mut both = system.clone();
+        both.extend(at("r1", &[("two.yaml", of("GameServer", "two"))]));
+        settle(&mut store, &both);
+        assert!(store.get("GameServer/shop/two").is_some());
+        both.extend(at("r2", &[("two.yaml", of("Realm", "south"))]));
+        settle(&mut store, &both);
+        assert!(message(&store, "Source/shop/repo").contains("only a Source in kith-system gets to make a Realm"));
+        both.extend(at("r3", &[("two.yaml", of("Nothing", "x"))]));
+        assert!(
+            plan(&store, &both)
+                .iter()
+                .any(|step| step.apply.iter().any(|resource| resource.kind == "Nothing"))
+        );
     }
 }

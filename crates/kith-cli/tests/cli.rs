@@ -328,7 +328,7 @@ fn package_render_and_lint() {
     // Values the package does not have, and a package that is not there.
     let (code, _, err) = sandbox.kith(&["package", "render", web, "--set", "colour=red"]);
     assert_eq!(code, 2);
-    assert!(err.contains("values.colour: is not a value this package has"), "{err}");
+    assert!(err.contains("values.colour: is not a field the schema has"), "{err}");
     let (code, _, err) = sandbox.kith(&["package", "lint", "nowhere"]);
     assert!(code == 2 && err.contains("nowhere: no package.yaml"), "{err}");
 }

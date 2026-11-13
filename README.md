@@ -472,6 +472,53 @@ in the report (the output is still printed), 2 the input could not be read.
 `nodeSelector` becomes a placement requirement, and a pod template's labels
 are added to the workload's, since kith Services select on those.
 
+## Kinds of your own
+
+A `KindDefinition` makes a new kind. Resources of it are applied, listed,
+watched, kept with their history and deleted like any other; what a kind
+*does* is up to a controller that watches it.
+
+```yaml
+apiVersion: kith.dev/v1
+kind: KindDefinition
+metadata: { name: gameserver }
+spec:
+  group: games.example.com   # a domain of yours; with version, the apiVersion
+  version: v1
+  kind: GameServer
+  namespaced: true           # [true]
+  schema:                    # of the spec; the same subset as a package's values
+    type: object
+    required: [map]
+    additionalProperties: false
+    properties:
+      map: { type: string }
+      players: { type: integer, minimum: 1, maximum: 64 }
+  columns:                   # what `kith get gameserver` shows
+    - { name: Map, path: spec.map }
+---
+apiVersion: games.example.com/v1
+kind: GameServer
+metadata: { name: one }
+spec: { map: dust, players: 8 }
+```
+
+- The store checks every write of such a resource against the schema, and
+  says what is wrong by path (`spec.players: it must be at most 64`). In one
+  `kith apply`, put the definition before what is of its kind.
+- `kith get`, `delete`, `history`, `rollback` and `schema` take the kind's
+  name in any case, like kith's own; `kith schema` lists the cluster's kinds
+  after kith's.
+- One definition per kind. A definition cannot be deleted, renamed to another
+  kind or moved between namespaced and cluster-wide while resources of its
+  kind exist. A changed schema is checked at the next write of each resource;
+  what is stored stays as it is.
+- A Source or a package may apply resources of a defined kind; a Source in
+  `kith-system` may bring the definition along.
+
+Not yet: several versions of a kind side by side, a schema for `status`,
+rules beyond the schema subset.
+
 ## YAML, strictly
 
 kith reads a strict subset of YAML (and JSON, which is a subset of that):

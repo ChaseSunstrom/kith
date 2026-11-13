@@ -510,7 +510,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 },
                 None => (None, None),
             };
-            let info = kind_name.map(find_kind).transpose()?;
+            let info = kind_name.map(|name| Kind::find(name, &backend)).transpose()?;
             let single = name.is_some();
             if watch {
                 let Backend::Daemon(kithd) = backend()? else {
@@ -520,18 +520,19 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     return fail("-w prints a table: leave out -o");
                 }
                 let one = info
+                    .as_ref()
                     .zip(name.as_deref())
-                    .map(|(info, n)| key(info, n, namespace.as_deref()));
+                    .map(|(info, n)| info.key(n, namespace.as_deref()));
                 let keep = |r: &Resource| match &one {
                     Some(one) => r.key() == *one,
                     None => namespace.is_none() || r.metadata.namespace == namespace,
                 };
-                return watch_get(&kithd, info.map(|i| i.kind), keep);
+                return watch_get(&kithd, info.as_ref().map(|i| i.kind.as_str()), keep);
             }
-            let found: Vec<Resource> = match (info, name) {
-                (Some(info), Some(name)) => vec![backend()?.get(&key(info, &name, namespace.as_deref()))?],
+            let found: Vec<Resource> = match (&info, name) {
+                (Some(info), Some(name)) => vec![backend()?.get(&info.key(&name, namespace.as_deref()))?],
                 (info, _) => {
-                    let mut all = backend()?.list(info.map(|i| i.kind))?;
+                    let mut all = backend()?.list(info.as_ref().map(|i| i.kind.as_str()))?;
                     all.retain(|r| namespace.is_none() || r.metadata.namespace == namespace);
                     all
                 }
@@ -546,6 +547,34 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 // One named resource is an object; a listing is an array.
                 Output::Json if single => println!("{}", serde_json::to_string_pretty(&found[0]).or_else(fail)?),
                 Output::Json => println!("{}", serde_json::to_string_pretty(&found).or_else(fail)?),
+                // A kind with columns of its own (a KindDefinition's) shows those.
+                Output::Table if info.as_ref().is_some_and(|info| !info.columns.is_empty()) => {
+                    let columns = &info.as_ref().expect("checked").columns;
+                    let titles: Vec<String> = columns.iter().map(|(name, _)| name.to_uppercase()).collect();
+                    let header = ["NAMESPACE", "NAME", "REVISION"]
+                        .into_iter()
+                        .chain(titles.iter().map(String::as_str));
+                    let row = |r: &Resource| {
+                        let whole = serde_json::to_value(r).unwrap_or_default();
+                        let cell =
+                            |(_, path): &(String, String)| match path.split('.').fold(&whole, |at, part| &at[part]) {
+                                serde_json::Value::Null => String::new(),
+                                serde_json::Value::String(text) => text.replace(char::is_control, ""),
+                                other => other.to_string(),
+                            };
+                        let m = &r.metadata;
+                        let own = [
+                            m.namespace.clone().unwrap_or_default(),
+                            m.name.clone(),
+                            m.revision.unwrap_or(0).to_string(),
+                        ];
+                        own.into_iter().chain(columns.iter().map(cell)).collect()
+                    };
+                    print_rows(
+                        &header.collect::<Vec<_>>(),
+                        &found.iter().map(row).collect::<Vec<Vec<String>>>(),
+                    );
+                }
                 Output::Table => {
                     let rows = found.iter().map(table_row);
                     print_table(["KIND", "NAMESPACE", "NAME", "REVISION", "STATUS"], rows.collect());
@@ -553,7 +582,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Command::Delete { target } => {
-            let key = target.key()?;
+            let key = target.key(&backend)?;
             backend()?.delete(&key)?;
             println!("{key} deleted");
         }
@@ -569,7 +598,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("logs are kept by kithd: leave out --store");
             };
-            let mut path = format!("/v1/logs/{}?replica={replica}", escape(&target.key()?));
+            let mut path = format!("/v1/logs/{}?replica={replica}", escape(&target.key(&backend)?));
             for (flag, option) in [(stderr, "&stderr=true"), (previous, "&previous=true")] {
                 path += if flag { option } else { "" };
             }
@@ -598,7 +627,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Command::History { target } => {
-            let history = backend()?.history(&target.key()?)?;
+            let history = backend()?.history(&target.key(&backend)?)?;
             let rows = history.iter().map(|r| {
                 let m = &r.resource.metadata;
                 [m.revision.unwrap_or(0).to_string(), rfc3339(r.at)]
@@ -606,7 +635,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             print_table(["REVISION", "APPLIED"], rows.collect());
         }
         Command::Rollback { target, to } => {
-            let key = target.key()?;
+            let key = target.key(&backend)?;
             let change = backend()?.rollback(&key, to)?;
             match change.action {
                 Action::Unchanged => println!("{key} already matches revision {to}"),
@@ -793,7 +822,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             command: SourceCommand::Approve { name, namespace },
         } => {
             let backend = backend()?;
-            let mut source = backend.get(&key(find_kind("Source")?, &name, namespace.as_deref()))?;
+            let mut source = backend.get(&format!(
+                "Source/{}/{name}",
+                namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE)
+            ))?;
             let pending = source
                 .status
                 .as_ref()
@@ -842,13 +874,31 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let rows = KINDS
                 .iter()
                 .map(|k| [k.kind, if k.namespaced { "namespaced" } else { "cluster" }, k.about].map(String::from));
-            print_table(["KIND", "SCOPE", "ABOUT"], rows.collect());
+            // (And the kinds the cluster's KindDefinitions make, when there is a cluster to ask.)
+            let defined = backend()
+                .and_then(|backend| backend.list(Some("KindDefinition")))
+                .unwrap_or_default();
+            let made = defined.iter().map(|d| {
+                let text = |field: &str| d.spec[field].as_str().unwrap_or_default().replace(char::is_control, "");
+                let scope = if d.spec["namespaced"] == false {
+                    "cluster"
+                } else {
+                    "namespaced"
+                };
+                [
+                    text("kind"),
+                    scope.into(),
+                    format!("{}/{} ({})", text("group"), text("version"), d.key()),
+                ]
+            });
+            print_table(["KIND", "SCOPE", "ABOUT"], rows.chain(made).collect());
         }
         Command::Schema { kind: Some(name) } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&find_kind(&name)?.schema()).or_else(fail)?
-            );
+            let schema = match kith_api::kind(&name) {
+                Some(own) => own.schema(),
+                None => Kind::find(&name, &backend)?.schema,
+            };
+            println!("{}", serde_json::to_string_pretty(&schema).or_else(fail)?);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -954,25 +1004,73 @@ fn status_summary(resource: &Resource) -> String {
     }
 }
 
-fn find_kind(name: &str) -> Result<&'static kith_api::KindInfo, String> {
-    kith_api::kind(name).ok_or(format!("error: unknown kind `{name}` (`kith schema` lists the kinds)"))
+/// A kind as a command needs it: one of kith's own, or one a KindDefinition in the
+/// cluster makes.
+struct Kind {
+    kind: String,
+    namespaced: bool,
+    /// The columns `kith get` shows for it (name, dotted path), when it says.
+    columns: Vec<(String, String)>,
+    /// The schema of its spec (a made kind's only: kith's own have a whole one).
+    schema: serde_json::Value,
 }
 
-fn key(info: &kith_api::KindInfo, name: &str, namespace: Option<&str>) -> String {
-    match info.namespaced {
-        true => format!("{}/{}/{name}", info.kind, namespace.unwrap_or(DEFAULT_NAMESPACE)),
-        false => format!("{}/{name}", info.kind),
+impl Kind {
+    /// The kind called `name`, in any case; the cluster is asked only when it is not kith's own.
+    fn find(name: &str, backend: &dyn Fn() -> Result<Backend, String>) -> Result<Kind, String> {
+        if let Some(own) = kith_api::kind(name) {
+            return Ok(Kind {
+                kind: own.kind.into(),
+                namespaced: own.namespaced,
+                columns: Vec::new(),
+                schema: serde_json::Value::Null,
+            });
+        }
+        let unknown = |why: &str| {
+            fail(format!(
+                "error: unknown kind `{name}` (`kith schema` lists the kinds{why})"
+            ))
+        };
+        let defined = match backend().and_then(|backend| backend.list(Some("KindDefinition"))) {
+            Ok(defined) => defined,
+            Err(e) => return unknown(&format!("; the cluster's own could not be asked for: {e}")),
+        };
+        let made = |d: &&Resource| {
+            d.spec["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case(name))
+        };
+        let Some(definition) = defined.iter().find(made) else {
+            return unknown("");
+        };
+        let columns = definition.spec["columns"].as_array().into_iter().flatten();
+        let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().replace(char::is_control, "");
+        Ok(Kind {
+            kind: text(&definition.spec["kind"]),
+            namespaced: definition.spec["namespaced"] != false,
+            columns: columns
+                .map(|column| (text(&column["name"]), text(&column["path"])))
+                .collect(),
+            schema: definition.spec["schema"].clone(),
+        })
+    }
+
+    fn key(&self, name: &str, namespace: Option<&str>) -> String {
+        match self.namespaced {
+            true => format!("{}/{}/{name}", self.kind, namespace.unwrap_or(DEFAULT_NAMESPACE)),
+            false => format!("{}/{name}", self.kind),
+        }
     }
 }
 
 impl Target {
-    fn key(&self) -> Result<String, String> {
+    fn key(&self, backend: &dyn Fn() -> Result<Backend, String>) -> Result<String, String> {
         let (kind, name) = match (self.target.split_once('/'), &self.name) {
             (Some((kind, name)), None) => (kind, name),
             (None, Some(name)) => (self.target.as_str(), name.as_str()),
             _ => return fail("name the resource as KIND/NAME or KIND NAME"),
         };
-        Ok(key(find_kind(kind)?, name, self.namespace.as_deref()))
+        Ok(Kind::find(kind, backend)?.key(name, self.namespace.as_deref()))
     }
 }
 
@@ -1025,18 +1123,22 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
 }
 
 fn print_table<const N: usize>(header: [&str; N], rows: Vec<[String; N]>) {
-    let mut widths = header.map(str::len);
-    for row in &rows {
+    print_rows(&header, &rows.into_iter().map(Vec::from).collect::<Vec<_>>());
+}
+
+fn print_rows(header: &[&str], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = header.iter().map(|title| title.chars().count()).collect();
+    for row in rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
         }
     }
-    let line = |cells: [&str; N]| {
-        let cols: Vec<String> = cells.iter().zip(widths).map(|(c, w)| format!("{c:<w$}")).collect();
+    let line = |cells: Vec<&str>| {
+        let cols: Vec<String> = cells.iter().zip(&widths).map(|(c, w)| format!("{c:<w$}")).collect();
         println!("{}", cols.join("  ").trim_end());
     };
-    line(header);
-    for row in &rows {
-        line(std::array::from_fn(|i| row[i].as_str()));
+    line(header.to_vec());
+    for row in rows {
+        line(row.iter().map(String::as_str).collect());
     }
 }

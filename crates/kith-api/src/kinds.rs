@@ -728,11 +728,67 @@ no_checks!(
     RepositorySpec,
     OsReleaseSpec,
     UpdatePlanSpec,
-    KindDefinitionSpec,
     RoleSpec,
     RoleBindingSpec,
     IdentitySpec,
 );
+
+/// A kind's name: letters and digits, a capital first (`GameServer`).
+pub(crate) fn kind_name(name: &str) -> Result<(), String> {
+    let fine = name.len() <= 63
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric());
+    match fine {
+        true => Ok(()),
+        false => Err(format!(
+            "invalid kind `{name}`: letters and digits, a capital first, at most 63"
+        )),
+    }
+}
+
+impl Spec for KindDefinitionSpec {
+    fn check(&self) -> Result<(), String> {
+        kind_name(&self.kind).map_err(|e| format!("kind: {e}"))?;
+        if let Some(own) = crate::kind(&self.kind) {
+            return Err(format!("kind: `{}` is one of kith's own kinds", own.kind));
+        }
+        let own = self.group == "kith.dev" || self.group.ends_with(".kith.dev");
+        if own || !self.group.contains('.') || !dns_name(&self.group) || self.group != self.group.to_ascii_lowercase() {
+            return Err(format!(
+                "group: `{}` must be a domain name of yours, in lowercase (not kith.dev)",
+                self.group
+            ));
+        }
+        let digits = self.version.strip_prefix('v').unwrap_or_default();
+        let (number, stage) = digits.split_at(digits.bytes().take_while(u8::is_ascii_digit).count());
+        if number.is_empty() || !stage.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+            return Err(format!("version: `{}` must be like v1 or v1beta1", self.version));
+        }
+        let mut wrong = Vec::new();
+        if !self.schema.is_object() {
+            wrong.push("schema: must be a mapping".to_string());
+        }
+        crate::schema::unknown_keywords(&self.schema, "schema", &mut wrong);
+        for column in &self.columns {
+            let part = |part: &str| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            };
+            if column.name.is_empty() || !column.path.split('.').all(part) {
+                wrong.push(format!(
+                    "columns: `{}` needs a name and a dotted path like spec.size",
+                    column.name
+                ));
+            }
+        }
+        match wrong.is_empty() {
+            true => Ok(()),
+            false => Err(wrong.join("; ")),
+        }
+    }
+}
 
 fn exactly_one(at: &str, options: &[(&str, bool)]) -> Result<(), String> {
     if options.iter().filter(|(_, set)| *set).count() == 1 {

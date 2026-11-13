@@ -787,6 +787,76 @@ fn watch_reports_changes() {
     assert_eq!((code, err.contains("-w needs kithd")), (2, true), "{err}");
 }
 
+/// A KindDefinition makes a kind that the store and the CLI take like one of kith's own.
+#[test]
+fn custom_kind_works_like_a_builtin() {
+    let daemon = Daemon::start("custom_kind");
+    let definition = "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: { name: gameserver }\nspec:\n  group: games.example.com\n  version: v1\n  kind: GameServer\n  schema:\n    type: object\n    required: [map]\n    additionalProperties: false\n    properties:\n      map: { type: string }\n      players: { type: integer, maximum: 64 }\n  columns:\n    - { name: Map, path: spec.map }\n    - { name: Players, path: spec.players }\n";
+    let server = |name: &str, spec: &str| {
+        format!("apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: {name} }}\nspec: {spec}\n")
+    };
+    let refused = |yaml: &str| {
+        std::fs::write(daemon.dir.join("bad.yaml"), yaml).unwrap();
+        let (code, _, err) = daemon.kith(&["apply", "-f", "bad.yaml"]);
+        assert_eq!(code, 2, "{err}");
+        err
+    };
+
+    // Not a kind until it is defined.
+    assert!(
+        daemon
+            .kith(&["get", "gameserver"])
+            .2
+            .contains("unknown kind `gameserver`")
+    );
+    assert!(refused(&server("one", "{ map: dust }")).contains("no KindDefinition makes it"));
+
+    // Defined and used in one apply (the definition first); then like any kind.
+    let both = format!("{definition}---\n{}", server("one", "{ map: dust, players: 8 }"));
+    assert!(daemon.apply(&both).contains("GameServer/default/one created"));
+    let wrong = refused(&server("two", "{ players: 99, cheats: true }"));
+    for said in [
+        "spec.map: is required",
+        "spec.players: it must be at most 64",
+        "spec.cheats",
+    ] {
+        assert!(wrong.contains(said), "{wrong}");
+    }
+    daemon.apply(&server("two", "{ map: nuke }").replace("name: two", "name: two, namespace: shop"));
+    let table = daemon.ok(&["get", "gameserver"]);
+    let lines: Vec<Vec<&str>> = table.lines().map(|line| line.split_whitespace().collect()).collect();
+    assert_eq!(lines[0], ["NAMESPACE", "NAME", "REVISION", "MAP", "PLAYERS"], "{table}");
+    assert_eq!(
+        (&lines[1], &lines[2]),
+        (
+            &vec!["default", "one", "1", "dust", "8"],
+            &vec!["shop", "two", "1", "nuke"]
+        )
+    );
+    assert!(
+        daemon
+            .ok(&["get", "GameServer/two", "-n", "shop", "-o", "yaml"])
+            .contains("apiVersion: games.example.com/v1")
+    );
+    assert!(
+        daemon
+            .ok(&["schema"])
+            .contains("games.example.com/v1 (KindDefinition/gameserver)")
+    );
+    assert!(daemon.ok(&["schema", "gameserver"]).contains("\"maximum\": 64"));
+    let watched = watch_request(&daemon, "?kind=GameServer");
+    assert_eq!(watched["resources"].as_array().unwrap().len(), 2);
+    assert!(daemon.ok(&["history", "gameserver/one"]).contains('1'));
+
+    // The definition stays while its kind is used; then both go.
+    let (code, _, err) = daemon.kith(&["delete", "kinddefinition/gameserver"]);
+    assert!(code == 2 && err.contains("2 `GameServer` resources exist"), "{err}");
+    daemon.ok(&["delete", "gameserver/one"]);
+    daemon.ok(&["delete", "gameserver", "two", "-n", "shop"]);
+    daemon.ok(&["delete", "kinddefinition/gameserver"]);
+    assert!(daemon.kith(&["get", "gameserver"]).2.contains("unknown kind"));
+}
+
 /// A Workload of busybox containers running `script`, with `extra` lines in the container.
 fn boxed(name: &str, replicas: u32, strategy: &str, script: &str, extra: &str) -> String {
     let image = std::env::var("KITH_E2E_IMAGE").unwrap_or("mirror.gcr.io/library/busybox:1.36".into());

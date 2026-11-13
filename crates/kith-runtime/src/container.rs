@@ -243,6 +243,33 @@ impl Runtime {
     }
 }
 
+/// The children someone waits for besides the handles' (see [`spawn_awaited`]).
+static AWAITED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// A child whose exit status is its starter's to collect, for as long as this lives.
+pub struct Awaited(i32);
+
+impl Drop for Awaited {
+    fn drop(&mut self) {
+        let mut awaited = AWAITED.lock().expect("nothing panics holding the list");
+        awaited.retain(|pid| *pid != self.0);
+    }
+}
+
+/// Start a child (`spawn`, whose process is `pid`) that [`reap_orphans`] leaves to its
+/// starter: without this the reaper may collect it first, and its starter never learns
+/// how it ended.
+pub fn spawn_awaited<C>(
+    spawn: impl FnOnce() -> std::io::Result<C>,
+    pid: impl Fn(&C) -> Option<u32>,
+) -> std::io::Result<(C, Awaited)> {
+    let mut awaited = AWAITED.lock().expect("nothing panics holding the list");
+    let child = spawn()?;
+    let pid = pid(&child).and_then(|pid| i32::try_from(pid).ok()).unwrap_or(0);
+    awaited.push(pid);
+    Ok((child, Awaited(pid)))
+}
+
 /// Collect the children nobody waits for. As a subreaper this process inherits
 /// whatever an exec unit forked and left behind; unreaped, each stays a zombie.
 ///
@@ -250,10 +277,12 @@ impl Runtime {
 /// exit status belongs to [`Handle::try_wait`], so call this after trying those.
 pub fn reap_orphans(mains: &[i32]) {
     use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    // (Held throughout: nothing is started and taken from its starter in between.)
+    let awaited = AWAITED.lock().expect("nothing panics holding the list");
     // WNOWAIT looks without taking, so a handle's status is never taken from it.
     let peek = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
     while let Ok(Some(pid)) = waitid(Id::All, peek).map(|status| status.pid()) {
-        if mains.contains(&pid.as_raw()) {
+        if mains.contains(&pid.as_raw()) || awaited.contains(&pid.as_raw()) {
             break; // its handle collects it; whatever queues behind it waits for the next call
         }
         let _ = waitpid(pid, None);
