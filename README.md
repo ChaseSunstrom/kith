@@ -835,7 +835,10 @@ shell. When kithd finds it is process 1 it does what an init does:
   `console=ttyS0 kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects the processes nobody waits for;
 - stops what it runs and then restarts the machine on Ctrl-Alt-Del, or powers
-  it off on SIGTERM. If kithd fails or panics it says why and restarts the
+  it off on SIGTERM or the power button (what a VPS panel's shutdown presses;
+  a keyboard's power key counts too, and so does any input device there at
+  start that sends it). A press while kithd is still starting is acted on
+  once it serves. If kithd fails or panics it says why and restarts the
   machine ten seconds later: process 1 never exits.
 
 - mounts the partition labelled `state` at `/var/lib/kith`, and says so when
@@ -1240,7 +1243,7 @@ stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk, drivers for Wi-Fi,
 sound and graphics, a card plugged in later, IPv6 addresses from the network,
-the power button, arm64.
+arm64.
 
 ## YAML, strictly
 

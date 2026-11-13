@@ -34,7 +34,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --time SECONDS   stop the VM after this long (default: 60)
   --test init      instead: wait for kithd, as the machine's first process, to serve its
                    API, print how long that took (it fails past 10 s), press Ctrl-Alt-Del,
-                   and expect kithd to stop and restart the machine; needs socat
+                   and expect kithd to stop and restart the machine; then the same
+                   with the power button, and expect it to power off; needs socat
   --test image     instead: build kith OS's image (os/build.sh), boot a copy of it under
                    UEFI with a network card, and expect: the root mounted through
                    dm-verity, the state partition mounted, an address by DHCP, TLS
@@ -764,23 +765,32 @@ if [ "$test" = init ]; then
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
     began=$(date +%s%N)
     shift 13 # (up to -monitor none: here the console goes to a file, and keys come in)
-    timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
-        -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 &
-    vm=$!
-    until said 'kithd: serving '; do
-        kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served"
-        sleep 0.05
-    done
-    took=$((($(date +%s%N) - began) / 1000000))
-    echo sendkey ctrl-alt-delete | socat - "unix-connect:$work/keys" >/dev/null
-    wait "$vm" || fail "the VM did not end within ${time} s of starting"
-    cat "$work/log"
-    said 'kithd: init: .* is up' || fail "kithd did not say it was the first process"
-    said 'reboot: Restarting system' || fail "kithd did not restart the machine when told"
-    ! said 'Kernel panic' || fail "the kernel panicked: its first process ended"
+    # Started, told to stop with what $1 says to QEMU, and the console then to say $2.
+    started() {
+        told=$1 last=$2
+        shift 2
+        rm -f "$work/log" "$work/keys"
+        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
+            -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" "$@" </dev/null >/dev/null 2>&1 &
+        vm=$!
+        until said 'kithd: serving '; do
+            kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served"
+            sleep 0.05
+        done
+        [ -n "${took:-}" ] || took=$((($(date +%s%N) - began) / 1000000))
+        echo "$told" | socat - "unix-connect:$work/keys" >/dev/null
+        wait "$vm" || fail "the VM did not end within ${time} s of starting (told: $told)"
+        cat "$work/log"
+        said 'kithd: init: .* is up' || fail "kithd did not say it was the first process"
+        said "$last" || fail "after $told the console never said: $last"
+        ! said 'Kernel panic' || fail "the kernel panicked: its first process ended"
+    }
+    started 'sendkey ctrl-alt-delete' 'reboot: Restarting system' "$@"
+    # The power button (a VPS panel's shutdown): kithd stops what it runs and powers off.
+    started system_powerdown 'reboot: Power down' "$@"
     echo "vm.sh: kithd served ${took} ms after QEMU started (the firmware and kernel included)"
     [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }
-    echo "vm.sh: ok: kithd is the first process, serves, and restarts the machine when told"
+    echo "vm.sh: ok: kithd is the first process, serves, restarts the machine when told, and powers it off at the power button"
     exit 0
 fi
 
