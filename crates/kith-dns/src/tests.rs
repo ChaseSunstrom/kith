@@ -821,6 +821,127 @@ async fn a_cname_that_leaves_the_zones_gets_its_targets_records_from_the_upstrea
     assert_eq!(udp_ask(u, &query(1, "alias.kith", A, None)).await.an.len(), 2);
 }
 
+/// The upstream's message for the chase of `out.kith`: flags, the question, `an` records.
+fn chase_reply(c: &Chase, flags: u16, an: u16, records: &[u8]) -> Vec<u8> {
+    let ask = c.ask();
+    let mut r = [0x77, flags, 1, an, 0, 0]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect::<Vec<_>>();
+    r.extend(&ask[12..]);
+    r.extend(records);
+    r
+}
+
+fn out_chase() -> Chase {
+    let Answer::Chase(c) = answer(&query(7, "out.kith", A, None), LOCAL, &zones(), true) else {
+        panic!("not a chase")
+    };
+    c
+}
+
+#[test]
+fn chase_finish_stops_at_a_chain_that_loops() {
+    let c = out_chase();
+    // example.com -> a.example.net -> example.com: the names repeat, the loop is not walked.
+    let mut records = rr("example.com", CNAME, 120, b"\x01a\x07example\x03net\x00");
+    records.extend(rr("a.example.net", CNAME, 120, b"\x07example\x03com\x00"));
+    let just_the_loop = records.clone();
+    records.extend(rr("a.example.net", A, 300, &[9, 9, 9, 9]));
+    let r = decode(c.finish(&chase_reply(&c, 0x8180, 3, &records)));
+    assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, CNAME, CNAME, A]);
+    assert_eq!(r.data(&r.an[3]), [9, 9, 9, 9]);
+    // A reply of nothing but a loop adds the loop's CNAMEs and ends.
+    let r = decode(c.finish(&chase_reply(&c, 0x8180, 2, &just_the_loop)));
+    assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, CNAME, CNAME]);
+}
+
+#[test]
+fn chase_finish_leaves_a_truncated_empty_reply_as_plain_and_takes_what_a_cut_one_holds() {
+    let c = out_chase();
+    let records = rr("example.com", A, 300, &[9, 9, 9, 9]);
+    // TC with no answers (what an upstream sends over UDP when the rest does not fit).
+    assert_eq!(c.finish(&chase_reply(&c, 0x8380, 0, &[])), c.plain());
+    // TC with the records that did fit: those belong.
+    let r = decode(c.finish(&chase_reply(&c, 0x8380, 1, &records)));
+    assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, A]);
+    // An error reply, or a reply too short to read, is plain.
+    assert_eq!(c.finish(&chase_reply(&c, 0x8182, 0, &[])), c.plain());
+    assert_eq!(c.finish(&[0; 5]), c.plain());
+}
+
+#[tokio::test]
+async fn a_truncated_udp_chase_is_asked_again_over_tcp() {
+    let mut full = rr("example.com", A, 300, &[9, 9, 9, 9]);
+    full.extend(rr("example.com", A, 300, &[9, 9, 9, 8]));
+    let up = truncating_upstream(Some((2, full))).await;
+    let (u, t, _tx) = start(zones(), vec![up]).await;
+    let q = query(0x56, "out.kith", A, None);
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(r.an.iter().map(|x| x.ty).collect::<Vec<_>>(), [CNAME, A, A]);
+        assert_eq!(r.data(&r.an[2]), [9, 9, 9, 8]);
+    }
+    // No TCP listener there: the CNAME goes out alone.
+    let up = truncating_upstream(None).await;
+    let (u, _, _tx) = start(zones(), vec![up]).await;
+    let r = udp_ask(u, &q).await;
+    assert_eq!((r.rcode(), r.an.len(), r.an[0].ty), (0, 1, CNAME));
+}
+
+/// An upstream whose UDP answer is always truncated (TC, no records); over TCP, when `tcp`, it
+/// gives `(count, records)` for every question.
+async fn truncating_upstream(tcp: Option<(u16, Vec<u8>)>) -> SocketAddr {
+    let (tl, udp) = loop {
+        let tl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if let Ok(udp) = UdpSocket::bind(tl.local_addr().unwrap()).await {
+            break (tl, udp);
+        }
+    };
+    let addr = udp.local_addr().unwrap();
+    let msg = |q: &[u8], flags: u16, an: u16, records: &[u8]| {
+        let mut r = [u16_at(q, 0), flags, 1, an, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<_>>();
+        r.extend(&q[12..]);
+        r.extend(records);
+        r
+    };
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(&msg(&buf[..n], 0x8380, 0, &[]), from).await.unwrap();
+        }
+    });
+    if let Some((an, records)) = tcp {
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = tl.accept().await.unwrap();
+                let mut len = [0; 2];
+                s.read_exact(&mut len).await.unwrap();
+                let mut q = vec![0; usize::from(u16::from_be_bytes(len))];
+                s.read_exact(&mut q).await.unwrap();
+                let r = msg(&q, 0x8180, an, &records);
+                s.write_all(&[&(r.len() as u16).to_be_bytes()[..], &r].concat())
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+    addr
+}
+
+#[test]
+fn the_chase_slot_log_speaks_once_a_minute() {
+    let t = crate::server::Throttle::default();
+    let t0 = std::time::Instant::now();
+    assert!(t.ready(t0));
+    assert!(!t.ready(t0 + Duration::from_secs(59)));
+    assert!(t.ready(t0 + Duration::from_secs(60)));
+    assert!(!t.ready(t0 + Duration::from_secs(61)));
+}
+
 #[test]
 fn upstream_replies_cut_or_corrupted_anywhere_never_panic() {
     let mut records = rr("example.com", CNAME, 120, b"\x04edge\x07example\x03net\x00");

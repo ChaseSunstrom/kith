@@ -7,7 +7,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Semaphore, watch};
@@ -84,6 +84,7 @@ struct Shared {
     upstreams: Arc<[SocketAddr]>,
     forwarders: Arc<[Cidr]>,
     forwards: PerIp,
+    slot_log: Arc<Throttle>,
 }
 
 /// Serves DNS on `udp` and `tcp` until the task is dropped. Names outside `zones` go to each of
@@ -101,6 +102,7 @@ pub async fn serve(
         upstreams: upstreams.into(),
         forwarders: forwarders.into(),
         forwards: PerIp::default(),
+        slot_log: Arc::default(),
     };
     tokio::join!(serve_udp(udp, shared.clone()), serve_tcp(tcp, shared));
 }
@@ -126,7 +128,8 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
             Answer::Chase(c) => {
                 // Asking upstream costs a forward slot; with none to spare (or for a client that
                 // may not forward) the CNAME goes out alone.
-                let held = may_forward(from.ip(), &sh.forwarders)
+                let allowed = may_forward(from.ip(), &sh.forwarders);
+                let held = allowed
                     .then(|| {
                         slots
                             .clone()
@@ -136,6 +139,9 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
                     })
                     .flatten();
                 let Some(held) = held else {
+                    if allowed {
+                        sh.slot_log.no_slot(from.ip());
+                    }
                     let _ = sock.send_to(&c.plain(), from).await;
                     continue;
                 };
@@ -198,13 +204,18 @@ async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::R
         let reply = match answer(&query, from.ip(), &zs, false) {
             Answer::Drop => return Ok(()),
             Answer::Reply(r) => r,
-            Answer::Chase(c) => match may_forward(from.ip(), &sh.forwarders)
-                .then(|| sh.forwards.take(from.ip(), FORWARDS_PER_IP))
-                .flatten()
-            {
-                Some(_held) => chase(&c, &sh.upstreams, true).await,
-                None => c.plain(),
-            },
+            Answer::Chase(c) => {
+                let allowed = may_forward(from.ip(), &sh.forwarders);
+                match allowed.then(|| sh.forwards.take(from.ip(), FORWARDS_PER_IP)).flatten() {
+                    Some(_held) => chase(&c, &sh.upstreams, true).await,
+                    None => {
+                        if allowed {
+                            sh.slot_log.no_slot(from.ip());
+                        }
+                        c.plain()
+                    }
+                }
+            }
             Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => wire::failure(&query, REFUSED),
             Answer::Forward => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
                 Some(_held) => forward(&query, &sh.upstreams, true).await,
@@ -263,12 +274,47 @@ async fn forward(query: &[u8], upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
 }
 
 /// The zone's answer with what the upstreams say for its CNAME's target (one question, over TCP
-/// when the client used it); the CNAME alone when they say nothing useful.
+/// when the client used it, or when the UDP answer came back truncated); the CNAME alone when
+/// they say nothing useful.
 async fn chase(c: &Chase, upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
+    let ask = c.ask();
+    let both = async {
+        let reply = forward(&ask, upstreams, tcp).await;
+        // TC: the rest did not fit in a datagram. If TCP fails too, what UDP gave stays.
+        if !tcp && reply[2] & 0x02 != 0 {
+            let whole = forward(&ask, upstreams, true).await;
+            if u16::from(whole[3] & 0xF) != wire::SERVFAIL {
+                return whole;
+            }
+        }
+        reply
+    };
     // (The CNAME is ours to give: it does not wait on every upstream's full patience.)
-    match timeout(CHASE_TIMEOUT, forward(&c.ask(), upstreams, tcp)).await {
+    match timeout(CHASE_TIMEOUT, both).await {
         Ok(reply) => c.finish(&reply),
         Err(_) => c.plain(),
+    }
+}
+
+/// Lets a message through at most once a minute.
+#[derive(Default)]
+pub(crate) struct Throttle(Mutex<Option<Instant>>);
+
+impl Throttle {
+    pub(crate) fn ready(&self, now: Instant) -> bool {
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let due = last.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60));
+        if due {
+            *last = Some(now);
+        }
+        due
+    }
+
+    /// Says (on stderr) that a chase from `ip` went out as the CNAME alone for want of a slot.
+    fn no_slot(&self, ip: IpAddr) {
+        if self.ready(Instant::now()) {
+            eprintln!("kith-dns: no forward slot for {ip}: answering a CNAME chase without its target's records");
+        }
     }
 }
 
