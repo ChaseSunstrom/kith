@@ -210,19 +210,18 @@ fn installer(boot: init::Boot, source: String) -> ! {
     let made = tokio::runtime::Builder::new_current_thread().enable_all().build();
     match made {
         Ok(runtime) => runtime.block_on(async {
-            // As a node does: Ctrl-Alt-Del starts the machine again, SIGTERM powers it off.
-            tokio::spawn(async {
-                use tokio::signal::unix::{SignalKind, signal};
-                let (Ok(mut off), Ok(mut again)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
-                else {
-                    return;
-                };
-                tokio::select! {
-                    _ = off.recv() => init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
-                    _ = again.recv() => {}
-                }
-                init::end(false)
-            });
+            // As a node does: Ctrl-Alt-Del starts the machine again, SIGTERM and the power button power it off.
+            // (Registered here, not in the task: heard from now on, whenever the task runs.)
+            if let Ok((mut off, mut again)) = stops() {
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = off.recv() => init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
+                        _ = again.recv() => {}
+                        () = init::BUTTON.notified() => {}
+                    }
+                    init::end(false)
+                });
+            }
             boot.network();
             install::run(source).await
         }),
@@ -231,6 +230,13 @@ fn installer(boot: init::Boot, source: String) -> ! {
             init::end(true)
         }
     }
+}
+
+/// SIGTERM and SIGINT, heard from here on (one that comes before it is read is kept).
+/// Call inside the runtime.
+fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
+    use tokio::signal::unix::{SignalKind, signal};
+    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
 }
 
 fn default_state() -> Option<PathBuf> {
@@ -421,15 +427,36 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         .map_err(|e| format!("starting: {e}"))?;
     let first_process = boot.is_some();
     let sealed = boot.as_mut().and_then(|boot| boot.sealed.take());
+    // As the first process, SIGTERM and Ctrl-Alt-Del are heard from the start: the kernel
+    // drops what process 1 does not handle. (Anywhere else the default, which ends kithd, stays until serving.)
+    let mut early = None;
     if let Some(boot) = boot {
         let _in = rt.enter();
+        early = stops().ok();
         boot.network();
     }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
-    // done before that, and it takes as long as it takes.
+    // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
+    //
+    // ponytail: past this, a stop waits for the serving below (the membership and the replica
+    // open in moments, not as long as a key); it is kept until then.
     let mut opened = None;
     if let Some((record, _)) = &sealed {
-        opened = Some(rt.block_on(crypt::open(record, args.join.as_ref()))?);
+        let key = crypt::open(record, args.join.as_ref());
+        opened = Some(match &mut early {
+            Some((term, int)) => rt.block_on(async {
+                tokio::select! {
+                    key = key => key,
+                    _ = term.recv() => {
+                        init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+                        init::end(false)
+                    }
+                    _ = int.recv() => init::end(false),
+                    () = init::BUTTON.notified() => init::end(false),
+                }
+            })?,
+            None => rt.block_on(key)?,
+        });
     }
     let state = args
         .state
@@ -497,11 +524,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| fail("securing the socket", &e))?;
         // (Heard before it says it serves: a first process is not sent what it does not handle.)
-        use tokio::signal::unix::{SignalKind, signal};
-        let (mut term, mut int) = (
-            signal(SignalKind::terminate()).unwrap(),
-            signal(SignalKind::interrupt()).unwrap(),
-        );
+        let (mut term, mut int) = early.take().map_or_else(stops, Ok).unwrap();
         eprintln!("kithd: serving {} (state in {})", socket.display(), state.display());
 
         let stopping = shared.stop.subscribe();
@@ -510,6 +533,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             tokio::select! {
                 _ = term.recv() => init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed),
                 _ = int.recv() => {}
+                () = init::BUTTON.notified() => {}
             }
             watched.stop.send_replace(true);
         });
