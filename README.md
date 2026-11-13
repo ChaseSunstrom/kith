@@ -820,7 +820,7 @@ without touching a disk:
   image: systemd's stub, the kernel, the command line), so a root that was
   changed is refused block by block: the test changes one and the kernel
   stops before kithd runs;
-- a GPT disk: `esp` (systemd-boot and the kernel image), `root-a` and
+- a GPT disk: `esp` (systemd-boot and the kernel image, `kith-1-a.efi`), `root-a` and
   `verity-a`, `root-b` and `verity-b` (empty: an update goes there), and `state`
   (ext4), the only partition a running node writes.
 
@@ -836,8 +836,47 @@ starts. The test passes kithd its arguments through the VM's SMBIOS, which the
 stub adds to the command line; where a real machine's come from is the
 installer's to say, which is not written yet.
 
-Not yet: an installer and anything written to a real disk, updates into the
-other slot and going back when one fails, Secure Boot (the image is not
+### Updating a node: two slots
+
+```sh
+KITH_OS_VERSION=0.0.2 sh os/build.sh   # also writes target/os/kith-os.update (32 MB)
+sh ci/vm.sh --test update              # a node updates itself in QEMU, and goes back when it must
+```
+
+A node runs from one slot (`root-a` or `root-b`) and an update is written into
+the other, so the system that runs is never the one being changed:
+
+1. kithd checks each piece of the update against the SHA-256 in its header as
+   it writes it: the root, its verity tree, and last, on the ESP, the kernel
+   image for that slot as `kith-N-b+3.efi`. N is one more than any other
+   there, so the boot loader starts it first, and `+3` is three tries.
+2. The node restarts. The boot loader counts a try down in the file's name
+   each time it starts the slot (`+2-1`, `+1-2`, `+0-3`).
+3. A slot that comes up, and whose kithd is still running ten seconds later,
+   is marked good: the counter is dropped and the console says
+   `slot b is good`.
+4. A slot that does not (a root its verity tree refuses, a kithd that cannot
+   start) is restarted until its tries are gone. The boot loader then starts
+   the slot that worked, and kithd says so on each start:
+   `slot a did not come up in 3 tries: this is slot b, which ran before it`.
+
+A damaged update, one cut short, or one too big for the slot is refused, and
+then no kernel image offers the half-written slot: the node starts as before.
+The state partition is not part of a slot, so the node is the same node after
+an update, and after going back.
+
+For now an update reaches a node from a disk: put `kith-os.update` on a stick
+(`dd if=kith-os.update of=/dev/sdX`) and start the node once with
+`kith.update=sdX` on its kernel command line (its name on the node, which may
+differ). It writes the other slot and restarts into it, whether the release
+is newer or older than what runs. An update that is what the node runs
+already is skipped, and one given to a node whose own slot is not yet marked
+good is refused: the slot it would replace is the only one known to start. Nothing checks who made the file yet:
+signed releases handed out by the cluster are the next step.
+
+Not yet: an installer and anything written to a real disk, updates signed and
+rolled out by the cluster, a watchdog for a slot that hangs without
+stopping, Secure Boot (the image is not
 signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk and being encrypted, drivers for Wi-Fi,
 sound and graphics, a card plugged in later, IPv6 addresses from the network,
@@ -892,6 +931,7 @@ KITH_E2E=1 cargo test -q -p kithd --test cluster rig_   # 3 nodes: one behind a 
 sh ci/vm.sh                                             # the host's kernel, booted with kithd as init
 sh ci/vm.sh --test init                                 # and: it serves, then restarts when told
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
+sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```

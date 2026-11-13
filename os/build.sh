@@ -34,6 +34,9 @@ usage() {
 usage: sh os/build.sh [--out DIR] [--check] [--twice]
 
 Builds DIR/kith-os.raw and DIR/kith-os.qcow2 (default DIR: target/os).
+Beside them, DIR/kith-os.update: what a running node is given to become this version
+(it writes it into its other slot). KITH_OS_VERSION names the version built (default:
+the workspace's).
 
   --out DIR   where the image and the pieces it is made of go: a directory this
               made before, or an empty one (it is emptied first)
@@ -134,8 +137,9 @@ fi
 fetch "$ca_url" "$ca_sha256" "$cache/cacert-$ca_date.pem"
 exec 9>&-
 bin=$(sh "$root/ci/musl.sh")
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)
-[ -n "$version" ] || die "no version in Cargo.toml"
+# (KITH_OS_VERSION: the name of what is built, where it is not the workspace's version.)
+version=${KITH_OS_VERSION:-$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/Cargo.toml" | head -n 1)}
+case $version in '' | *[!0-9A-Za-z.+-]*) die "a version is letters, digits, dots, + and -: not '$version'" ;; esac
 
 # One slot's worth of system, and the disk around it, into DIR.
 assemble() { # DIR
@@ -161,31 +165,43 @@ assemble() { # DIR
     blocks=$(($(stat -c %s "$w/root.squashfs") / 4096))
 
     # The kernel is told its root's hash on its command line, which is inside the one
-    # file the firmware starts: change the root and it is refused, block by block.
-    table="root,,,ro,0 $((blocks * 8)) verity 1 PARTLABEL=root-a PARTLABEL=verity-a 4096 4096 $blocks 1 sha256 $hash $salt"
-    printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-a,PARTLABEL=verity-a root=/dev/dm-0 ro rootwait" >"$w/cmdline"
-    # (Sections go after the stub's own: its image starts at 0x14df90000.)
+    # file the firmware starts: change the root and it is refused, block by block. One
+    # such file per slot, since the command line names the slot's partitions.
+    #
     # The sections go above the stub's own, at the addresses systemd's ukify uses for
     # this stub: a stub laid out otherwise is refused here, not at boot.
     objdump -h "$efi/linuxx64.efi.stub" | awk '$1 ~ /^[0-9]+$/ { print $3, $4 }' | while read -r size at; do
         [ $((0x$at + 0x$size)) -le $((0x14dfc0000)) ] || die "systemd's EFI stub here is laid out otherwise than this script knows"
     done
-    objcopy \
-        --add-section .osrel="$r/etc/os-release" --change-section-vma .osrel=0x14dfc0000 \
-        --add-section .cmdline="$w/cmdline" --change-section-vma .cmdline=0x14dfd0000 \
-        --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
-        "$efi/linuxx64.efi.stub" "$w/kith.efi"
+    # (No version in the kernel image's own os-release: the boot loader would order the
+    # slots by it, and a node told to go to an older release would never start it. The
+    # order is the N in the file's name, which the node gives it: crates/kithd/src/os.rs.)
+    printf 'NAME="kith OS"\nID=kith\nPRETTY_NAME="kith OS"\n' >"$w/osrel"
+    for slot in a b; do
+        table="root,,,ro,0 $((blocks * 8)) verity 1 PARTLABEL=root-$slot PARTLABEL=verity-$slot 4096 4096 $blocks 1 sha256 $hash $salt"
+        printf '%s' "console=ttyS0 console=tty0 dm-mod.create=\"$table\" dm-mod.waitfor=PARTLABEL=root-$slot,PARTLABEL=verity-$slot root=/dev/dm-0 ro rootwait kith.slot=$slot" >"$w/cmdline-$slot"
+        objcopy \
+            --add-section .osrel="$w/osrel" --change-section-vma .osrel=0x14dfc0000 \
+            --add-section .cmdline="$w/cmdline-$slot" --change-section-vma .cmdline=0x14dfd0000 \
+            --add-section .linux="$kernel" --change-section-vma .linux=0x14e000000 \
+            "$efi/linuxx64.efi.stub" "$w/kith-$slot.efi"
+        touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-$slot.efi"
+    done
+    # What a node of an older version is given to become this one (os/update.sh).
+    sh "$root/os/update.sh" "$version" "$hash" "$w/root.squashfs" "$w/root.verity" "$w/kith-a.efi" "$w/kith-b.efi" >"$w/kith-os.update"
 
     # The ESP, made here and not by repart: FAT16 at 64 MB, where repart insists on 260.
     truncate -s 64M "$w/esp.img"
     mkfs.vfat --invariant -i 6B697468 -n KITH-ESP "$w/esp.img" >/dev/null
     printf 'timeout 0\n' >"$w/loader.conf"
-    touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf" "$w/kith.efi"
+    touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf"
     cp -p "$efi/systemd-bootx64.efi" "$w/boot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/boot.efi"
     mmd -i "$w/esp.img" ::EFI ::EFI/BOOT ::EFI/Linux ::loader
     mcopy -m -i "$w/esp.img" "$w/boot.efi" ::EFI/BOOT/BOOTX64.EFI
-    mcopy -m -i "$w/esp.img" "$w/kith.efi" ::EFI/Linux/kith-a.efi
+    # (kith-N-SLOT: the boot loader starts the highest N that has tries left; an update
+    # is added as N+1 with three tries, see crates/kithd/src/os.rs.)
+    mcopy -m -i "$w/esp.img" "$w/kith-a.efi" ::EFI/Linux/kith-1-a.efi
     mcopy -m -i "$w/esp.img" "$w/loader.conf" ::loader/loader.conf
 
     # The disk. root-b and verity-b are empty: an update fills them (and has room to
@@ -218,7 +234,7 @@ if [ -n "$check" ]; then
 fi
 if [ -n "$twice" ]; then
     assemble "$out/again"
-    for piece in root.squashfs root.verity kith.efi esp.img kith-os.raw; do
+    for piece in root.squashfs root.verity kith-a.efi kith-b.efi kith-os.update esp.img kith-os.raw; do
         cmp "$out/$piece" "$out/again/$piece" || die "$piece differs between two builds"
     done
     find "$out/again" -delete

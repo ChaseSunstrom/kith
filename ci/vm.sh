@@ -6,6 +6,7 @@
 #   sh ci/vm.sh [--kernel FILE] [--initrd FILE] [--disk IMAGE] [--append ARGS] [--time SECONDS]
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
 #   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI
+#   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -34,6 +35,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    dm-verity, the state partition mounted, an address by DHCP, TLS
                    answered on the node's port, the same node after a restart, and a
                    root with one block changed refused; needs OVMF, socat, openssl
+  --test update    instead: on a copy of the image, give the node a damaged update
+                   (refused), a good one (it restarts into its other slot, marks it
+                   good, and is the same node), then one whose root is broken (three
+                   tries, and it is back on the slot that worked); same needs
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -56,7 +61,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image) ;; *) echo "vm.sh: --test knows: init, image" >&2; exit 2 ;; esac
+case $test in '' | init | image | update) ;; *) echo "vm.sh: --test knows: init, image, update" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -75,7 +80,7 @@ trap 'rm -rf "$work"' EXIT INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
-if [ "$test" = image ]; then
+if [ "$test" = image ] || [ "$test" = update ]; then
     command -v socat >/dev/null 2>&1 || skip "no socat to press keys with"
     command -v openssl >/dev/null 2>&1 || skip "no openssl to call the node with"
     firmware=''
@@ -88,23 +93,25 @@ if [ "$test" = image ]; then
     # A copy: the node writes its state to the disk, and this test damages its root.
     cp "$root/target/os/kith-os.raw" "$work/disk.raw"
     port=$((20000 + $$ % 20000))
-    # (The stub adds this to the command line of the image: kithd's own arguments.)
-    more='io.systemd.stub.kernel-cmdline-extra=-- --listen 0.0.0.0:7443 --advertise 10.0.2.15:7443'
-    boot() {
+    # (The stub adds $more to the command line of the image: here, kithd's own arguments.)
+    serve='-- --listen 0.0.0.0:7443 --advertise 10.0.2.15:7443'
+    more=$serve once=1
+    boot() { # [more of QEMU's arguments]: $once empty lets the guest restart itself
         : >"$work/log"
-        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
+        timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none ${once:+-no-reboot} \
             -machine q35 -bios "$firmware" -drive "file=$work/disk.raw,format=raw,if=virtio" \
             -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$port-:7443" -device virtio-net-pci,netdev=n0 \
-            -smbios "type=11,value=$more" \
+            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=$more" "$@" \
             -serial "file:$work/log" -monitor "unix:$work/keys,server,nowait" </dev/null >/dev/null 2>&1 &
         vm=$!
     }
-    up() {
-        until said 'serving other nodes on '; do
-            kill -0 "$vm" 2>/dev/null || fail "the VM ended before kithd served other nodes"
+    heard() { # TEXT: wait for the guest to say it
+        until said "$1"; do
+            kill -0 "$vm" 2>/dev/null || fail "the VM ended before it said: $1"
             sleep 0.05
         done
     }
+    up() { heard 'serving other nodes on '; }
     # Who answers on the node's port, through the VM's network card: its certificate,
     # into $who.
     who() {
@@ -119,9 +126,70 @@ if [ "$test" = image ]; then
     restart() {
         echo sendkey ctrl-alt-delete | socat - "unix-connect:$work/keys" >/dev/null
         wait "$vm" || fail "the VM did not end within ${time} s of starting"
-        said 'kithd: init: restarting' || fail "kithd did not restart the machine when told"
+        said 'reboot: Restarting system' || fail "kithd did not restart the machine when told"
         ! said 'Kernel panic' || fail "the kernel panicked"
     }
+
+    if [ "$test" = update ]; then
+        [ "$time" -gt 60 ] || time=180
+        # Three updates: a release, the same with its end damaged on the way, and a
+        # release whose root is not the one its verity tree was made for.
+        # (The release is an older version than the image's: the node must start it all
+        # the same, since the newest written is what was asked for.)
+        KITH_OS_VERSION=0.0.0-test sh "$root/os/build.sh" --out "$work/next" >&2
+        cp "$work/next/kith-os.update" "$work/good.update"
+        cp "$work/good.update" "$work/damaged.update"
+        printf 'kith-test-damage' | dd of="$work/damaged.update" bs=1 seek=$(($(stat -c %s "$work/good.update") - 16)) conv=notrunc status=none
+        cp "$work/next/root.squashfs" "$work/broken.root"
+        dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
+        sh "$root/os/update.sh" 0.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
+            "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/broken.update"
+        # (A disk is whole sectors; kithd reads as much as the header says.)
+        truncate -s %1M "$work/good.update" "$work/damaged.update" "$work/broken.update"
+        given() { boot -drive "file=$work/$1.update,format=raw,if=virtio,readonly=on"; }
+        slot() { [ "$(grep -ac "Kernel command line:.*kith.slot=$1" "$work/log")" = "$2" ] || fail "expected $2 start(s) of slot $1"; }
+
+        more="kith.update=vdb $serve"
+        given damaged
+        up
+        said 'kithd: init: no update from vdb: the update is damaged' || fail "a damaged update was not refused"
+        slot a 1
+        who
+        first=$who
+        restart
+
+        given good
+        wait "$vm" || fail "the VM did not end within ${time} s of starting"
+        said 'kithd: init: kith OS 0.0.0-test from vdb is in the other slot' || fail "the update was not written"
+        cat "$work/log"
+
+        more=$serve
+        boot
+        up
+        slot b 1
+        who
+        [ "$first" = "$who" ] || fail "the updated node is another node: its state did not survive ($first, then $who)"
+        heard 'kithd: init: slot b is good'
+        restart
+        cat "$work/log"
+
+        # A release that cannot start: slot a is tried three times, then b again.
+        more="kith.update=vdb $serve"
+        given broken
+        wait "$vm" || fail "the VM did not end within ${time} s of starting"
+        said 'kithd: init: kith OS 0.0.0-broken from vdb is in the other slot' || fail "the broken release was not written"
+        more=$serve once=''
+        boot
+        heard 'kithd: init: slot a did not come up in 3 tries: this is slot b'
+        cat "$work/log"
+        slot a 3
+        slot b 1
+        who
+        [ "$first" = "$who" ] || fail "after going back the node is another node ($first, then $who)"
+        kill "$vm"
+        echo "vm.sh: ok: a damaged update refused; an update written into slot b, started, marked good, the same node ($first); a release that cannot start tried three times, then slot b again"
+        exit 0
+    fi
 
     began=$(date +%s%N)
     boot
@@ -195,7 +263,7 @@ if [ "$test" = init ]; then
     wait "$vm" || fail "the VM did not end within ${time} s of starting"
     cat "$work/log"
     said 'kithd: init: .* is up' || fail "kithd did not say it was the first process"
-    said 'kithd: init: restarting' || fail "kithd did not restart the machine when told"
+    said 'reboot: Restarting system' || fail "kithd did not restart the machine when told"
     ! said 'Kernel panic' || fail "the kernel panicked: its first process ended"
     echo "vm.sh: kithd served ${took} ms after QEMU started (the firmware and kernel included)"
     [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }

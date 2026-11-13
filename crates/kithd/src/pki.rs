@@ -183,7 +183,7 @@ fn certs(pem: &str) -> Fallible<Vec<CertificateDer<'static>>> {
         .ok_or("no certificate in the PEM text".into())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

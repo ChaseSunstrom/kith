@@ -19,6 +19,7 @@ mod ingress;
 mod init;
 mod members;
 mod mesh;
+mod os;
 mod pki;
 mod probe;
 mod raft;

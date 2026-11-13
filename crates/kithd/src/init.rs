@@ -5,7 +5,8 @@
 //!
 //! Told on the kernel command line: `kith.hostname=NAME`; `kith.ip=ADDRESS/BITS[,GATEWAY]`
 //! and `kith.dns=ADDRESS` for a machine whose network gives no addresses (without them
-//! every network card asks by DHCP); and whatever follows ` -- `, which the kernel hands
+//! every network card asks by DHCP); `kith.update=DISK` for an update to install from a
+//! disk (see `os`); and whatever follows ` -- `, which the kernel hands
 //! to its first process as arguments: kithd's own, as in
 //! `console=ttyS0 kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`.
 //!
@@ -25,6 +26,9 @@ pub static POWER_OFF: AtomicBool = AtomicBool::new(false);
 /// in memory.
 pub const STATE: &str = "/var/lib/kith";
 
+/// How long kithd has run when the slot it started from is marked good.
+const GOOD: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub fn is_init() -> bool {
     std::process::id() == 1
 }
@@ -36,6 +40,10 @@ pub struct Options {
     /// The first network card's address, how many bits of it are the network's, the way out.
     pub ip: Option<(Ipv4Addr, u8, Option<Ipv4Addr>)>,
     pub dns: Option<IpAddr>,
+    /// Which of kith OS's two slots this kernel's root is (the image says, not a person).
+    pub slot: Option<char>,
+    /// A disk under /dev with an update on it, for the other slot (see `os`).
+    pub update: Option<String>,
 }
 
 fn static_ip(value: &str) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
@@ -74,6 +82,13 @@ pub fn options(line: &str) -> (Options, Vec<String>) {
             }
             Some(("kith.ip", value)) if static_ip(value).is_some() => options.ip = static_ip(value),
             Some(("kith.dns", value)) if value.parse::<IpAddr>().is_ok() => options.dns = value.parse().ok(),
+            // (The first one: the image's own, which what is typed at a boot menu follows.)
+            Some(("kith.slot", "a")) => drop(options.slot.get_or_insert('a')),
+            Some(("kith.slot", "b")) => drop(options.slot.get_or_insert('b')),
+            // (A name in /dev, not a path out of it.)
+            Some(("kith.update", value)) if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                options.update = Some(value.into());
+            }
             _ => unknown.push(word.into()),
         }
     }
@@ -131,12 +146,10 @@ fn disk(partition: &std::path::Path) -> Option<std::ffi::OsString> {
     Some(std::fs::canonicalize(partition).ok()?.parent()?.file_name()?.to_owned())
 }
 
-/// Mount the state partition, or say that there is none and keep the state in memory.
-/// Where the root is a verity device, only a partition of the disk the root is on will
-/// do: a stick with a partition named `state` must not become the node's store.
-fn state() {
-    let _ = std::fs::create_dir_all(STATE);
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+/// The device of the partition named `label`. Where the root is a verity device, only
+/// a partition of the disk the root is on will do: a stick with a partition named `state`
+/// must not become the node's store, nor one named `root-b` its next system.
+pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
     let entries = |dir: &str| -> Vec<std::path::PathBuf> {
         let mut all: Vec<_> = std::fs::read_dir(dir)
             .into_iter()
@@ -148,11 +161,18 @@ fn state() {
         all
     };
     let ours = entries("/sys/block/dm-0/slaves").first().and_then(|under| disk(under));
-    let found = entries("/sys/class/block").into_iter().find_map(|device| {
+    entries("/sys/class/block").into_iter().find_map(|device| {
         let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
-        let name = partition(&uevent, "state")?;
+        let name = partition(&uevent, label)?;
         (ours.is_none() || disk(&device) == ours).then(|| std::path::Path::new("/dev").join(name))
-    });
+    })
+}
+
+/// Mount the state partition, or say that there is none and keep the state in memory.
+fn state() {
+    let _ = std::fs::create_dir_all(STATE);
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    let found = labelled("state");
     let Some(device) = found else {
         eprintln!(
             "kithd: init: no partition is labelled state: this node's state is in memory, and gone when it restarts"
@@ -188,6 +208,7 @@ pub struct Boot {
     name: String,
     asking: Vec<kith_mesh::Card>,
     dns: Option<IpAddr>,
+    slot: Option<char>,
 }
 
 impl Boot {
@@ -202,6 +223,19 @@ impl Boot {
             };
             tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
         }
+        let Some(slot) = self.slot else { return };
+        // ponytail: good means kithd started and is still running a little later (one that
+        // cannot start ends, and the machine restarts, well within that). Whether the node
+        // is healthy in its cluster is the update plan's to judge (T-0073).
+        tokio::spawn(async move {
+            tokio::time::sleep(GOOD).await;
+            let said = tokio::task::spawn_blocking(move || crate::os::esp(|esp| crate::os::settle(slot, esp)));
+            match said.await {
+                Ok(Ok(said)) => said.iter().for_each(|line| eprintln!("kithd: init: {line}")),
+                Ok(Err(e)) => eprintln!("kithd: init: slot {slot} is not marked good: {e}"),
+                Err(e) => eprintln!("kithd: init: slot {slot} is not marked good: {e}"),
+            }
+        });
     }
 }
 
@@ -327,10 +361,21 @@ pub fn early() -> Boot {
         eprintln!("kithd: {info}");
         end(true);
     }));
+    if let (Some(slot), Some(device)) = (options.slot, &options.update) {
+        match crate::os::update(device, slot, &line) {
+            Ok(Some(version)) => {
+                eprintln!("kithd: init: kith OS {version} from {device} is in the other slot: starting it");
+                end(false)
+            }
+            Ok(None) => eprintln!("kithd: init: the update on {device} is what runs here already"),
+            Err(e) => eprintln!("kithd: init: no update from {device}: {e}"),
+        }
+    }
     eprintln!("kithd: init: {name} is up");
     Boot {
         asking: links(&options),
         dns: options.dns,
+        slot: options.slot,
         name,
     }
 }
@@ -381,15 +426,20 @@ mod tests {
             hostname: Some("alpha".into()),
             ip: Some(([10, 0, 0, 5].into(), 24, Some([10, 0, 0, 1].into()))),
             dns: Some([9, 9, 9, 9].into()),
+            slot: Some('b'),
+            update: Some("sdb".into()),
         };
-        let line = "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9";
+        let line =
+            "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.slot=b kith.update=sdb";
         assert_eq!(read(line), (named, vec![]));
         assert_eq!(read("kith.ip=10.0.0.5/8").0.ip, Some(([10, 0, 0, 5].into(), 8, None)));
+        assert_eq!(read("kith.slot=a kith.slot=b").0.slot, Some('a'));
         // Not a name, or not an option: said, and the machine starts all the same.
         let bad = ["kith.hostname=", "kith.hostname=Al_pha", "kith.nope=1", "kith.hostname"];
         for bad in bad
             .into_iter()
             .chain(["kith.ip=10.0.0.5", "kith.ip=10.0.0.5/33", "kith.ip=x/8", "kith.dns=x"])
+            .chain(["kith.slot=c", "kith.update=../sda", "kith.update="])
         {
             assert_eq!(read(bad), (Options::default(), vec![bad.to_string()]), "{bad}");
         }
