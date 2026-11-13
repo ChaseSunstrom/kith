@@ -1,0 +1,5 @@
+# An example package: a GNOME session on a seat of one node.
+name: gnome
+version: 0.1.0
+description: A GNOME session on a node's seat
+kithVersion: ">=0.0.1"

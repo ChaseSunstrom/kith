@@ -1,0 +1,5 @@
+# An example package: a tray and launcher for whichever session runs on a seat.
+name: kith-panel
+version: 0.1.0
+description: A panel for a desktop session - the cluster's nodes, workloads and a launcher
+kithVersion: ">=0.0.1"

@@ -1,0 +1,22 @@
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: 1
+  {%- if values.require %}
+  placement:
+    require: {{ values.require | tojson }}
+  {%- endif %}
+  template:
+    containers:
+      - name: panel
+        image: {{ values.image | tojson }}
+        {%- if values.env %}
+        env:
+          {%- for name, value in values.env | items %}
+          - { name: {{ name | tojson }}, value: {{ value | tojson }} }
+          {%- endfor %}
+        {%- endif %}

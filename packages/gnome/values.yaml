@@ -1,0 +1,17 @@
+# The seat the session takes, as `kith get seat` names it (NODE-seat0). Set it: until a
+# seat of this name exists, the session waits.
+seat: seat0
+# The image that holds the session. kith ships none: name one you built or trust.
+image: registry.example/desktop/gnome:1
+# Who the session runs as inside the image.
+user: user
+# What the session is promised on its node while it runs (CPUs, memory).
+reserve:
+  cpu: "2"
+  memory: 4Gi
+# Programs the session starts with.
+apps: []
+# A git repository of dotfiles the image may fetch at start ("" for none).
+dotfiles: ""
+# More environment variables for the session: NAME: value.
+env: {}

@@ -278,3 +278,49 @@ fn deep_values_do_not_end_the_process() {
     );
     assert!(with("{% macro m(a) %}{{ m([a]) }}{% endmacro %}a: {{ m([]) }}".into()).is_err());
 }
+
+#[test]
+fn desktop_packages_lint_and_render() {
+    let load = |name: &str| {
+        let dir = format!("{}/../../packages/{name}", env!("CARGO_MANIFEST_DIR"));
+        Package::load(Path::new(&dir)).unwrap()
+    };
+    let office = Release {
+        name: "office",
+        namespace: "desktop",
+    };
+    for name in ["hyprland", "gnome", "kiosk"] {
+        let package = load(name);
+        assert_eq!(package.lint(), Vec::<String>::new(), "{name}");
+        // No seat named: it asks for `seat0`, and waits until there is one; an empty name is refused.
+        assert_eq!(package.render(office, &[]).unwrap().resources[0].spec["seat"], "seat0");
+        assert!(package.render(office, &[json!({ "seat": "" })]).is_err(), "{name}");
+        let values = json!({ "seat": "office-pc-seat0", "env": { "LANG": "en_GB.UTF-8" } });
+        let rendered = package.render(office, &[values]).unwrap();
+        let keys: Vec<String> = rendered.resources.iter().map(Resource::key).collect();
+        let full = format!("office-{name}");
+        assert_eq!(
+            keys,
+            [
+                format!("DeviceClaim/desktop/{full}"),
+                format!("Workload/desktop/{full}")
+            ]
+        );
+        assert_eq!(rendered.resources[0].spec["seat"], "office-pc-seat0");
+        let template = &rendered.resources[1].spec["template"];
+        assert_eq!(template["deviceClaims"][0], full.as_str());
+        assert_eq!(template["containers"][0]["resources"]["memory"], "4Gi");
+        assert!(rendered.notes.unwrap().contains("office-pc-seat0"));
+    }
+    let kiosk = load("kiosk").render(office, &[json!({ "seat": "s", "command": ["foot"] })]);
+    assert_eq!(
+        kiosk.unwrap().resources[1].spec["template"]["containers"][0]["command"][0],
+        "foot"
+    );
+    let panel = load("kith-panel");
+    assert_eq!(panel.lint(), Vec::<String>::new());
+    let rendered = panel
+        .render(office, &[json!({ "require": { "desk": "office" } })])
+        .unwrap();
+    assert_eq!(rendered.resources[0].spec["placement"]["require"]["desk"], "office");
+}

@@ -1,0 +1,24 @@
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: {{ name }}
+  labels:
+    app: {{ name }}
+spec:
+  replicas: 1
+  template:
+    deviceClaims: [{{ name }}]
+    containers:
+      - name: session
+        image: {{ values.image | tojson }}
+        resources: {{ values.reserve | tojson }}
+        env:
+          - { name: KITH_SEAT, value: {{ values.seat | tojson }} }
+          - { name: KITH_USER, value: {{ values.user | tojson }} }
+          - { name: KITH_APPS, value: {{ values.apps | join(" ") | tojson }} }
+          {%- if values.dotfiles %}
+          - { name: KITH_DOTFILES, value: {{ values.dotfiles | tojson }} }
+          {%- endif %}
+          {%- for name, value in values.env | items %}
+          - { name: {{ name | tojson }}, value: {{ value | tojson }} }
+          {%- endfor %}

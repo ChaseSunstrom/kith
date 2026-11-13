@@ -1,0 +1,5 @@
+# An example package: one program, full screen, on a seat of one node.
+name: kiosk
+version: 0.1.0
+description: One program, full screen, on a node's seat
+kithVersion: ">=0.0.1"

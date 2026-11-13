@@ -1,0 +1,8 @@
+# The seat, for this session alone: its screens, keyboards, sound and GPU.
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata:
+  name: {{ name }}
+spec:
+  seat: {{ values.seat | tojson }}
+  access: exclusive

@@ -1,0 +1,5 @@
+# An example package: a Hyprland session on a seat of one node.
+name: hyprland
+version: 0.1.0
+description: A Hyprland session on a node's seat
+kithVersion: ">=0.0.1"

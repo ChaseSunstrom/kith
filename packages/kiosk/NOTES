@@ -1,0 +1,3 @@
+{{ name }} runs one program, full screen, on the seat {{ values.seat }} from {{ values.image }}.
+It shows: {{ values.command | join(" ") }}
+Nothing is streamed: the session has the seat's devices itself. Delete the release and the node is headless again.

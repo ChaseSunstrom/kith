@@ -1,0 +1,6 @@
+# The image that holds the panel. kith ships none: name one you built or trust.
+image: registry.example/desktop/kith-panel:1
+# Labels the node it runs on must have (the one with the session): { desk: office }.
+require: {}
+# More environment variables for the panel: NAME: value.
+env: {}

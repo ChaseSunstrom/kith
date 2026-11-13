@@ -1,0 +1,15 @@
+# The seat the session takes, as `kith get seat` names it (NODE-seat0). Set it: until a
+# seat of this name exists, the session waits.
+seat: seat0
+# The image that holds the session. kith ships none: name one you built or trust.
+image: registry.example/desktop/kiosk:1
+# Who the session runs as inside the image.
+user: user
+# What the session is promised on its node while it runs (CPUs, memory).
+reserve:
+  cpu: "2"
+  memory: 4Gi
+# The one program the screen shows, and its arguments.
+command: [cage, --, chromium, --kiosk, "https://example.org"]
+# More environment variables for the session: NAME: value.
+env: {}

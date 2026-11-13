@@ -450,6 +450,29 @@ spec:
 Not yet: `dependencies` are read and nothing more; no hooks, no looking up
 what is in the cluster from a template, no registry credentials.
 
+### A desktop is a package
+
+kith has no desktop of its own, and a node nobody gives one stays headless.
+Four example packages show the shape ([`packages/hyprland`](packages/hyprland),
+[`packages/gnome`](packages/gnome), [`packages/kiosk`](packages/kiosk),
+[`packages/kith-panel`](packages/kith-panel)):
+
+```sh
+kith get seat                       # office-pc-seat0
+kith package render packages/hyprland --name office -n desktop \
+  --set seat=office-pc-seat0 --set image=registry.example/me/hyprland:1 | kith apply -f -
+```
+
+- Each session package renders a `DeviceClaim` for the seat (exclusive) and a
+  `Workload` of one replica that holds it; see [Hardware](#hardware) for what
+  a seat is. `reserve` is the container's CPUs and memory.
+- kith ships no desktop images: `image` names one you built or trust. The
+  session's container is told `KITH_SEAT`, `KITH_USER`, and (Hyprland, GNOME)
+  `KITH_APPS` and `KITH_DOTFILES`; the kiosk runs `command`.
+- `kith-panel` is a plain `Workload` for a panel image, placed by node labels
+  (`require`).
+- Delete the release and the node is headless again.
+
 ## Sources (GitOps)
 
 A `Source` keeps what is in a git repository (or an OCI artifact) applied:
