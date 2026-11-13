@@ -8,7 +8,8 @@ use libcontainer::syscall::syscall::SyscallType;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
-    LinuxCpuBuilder, LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, Mount, MountBuilder, RootBuilder, Spec,
+    LinuxCpuBuilder, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType,
+    LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, Mount, MountBuilder, RootBuilder, Spec,
 };
 use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
@@ -65,6 +66,9 @@ pub struct Unit {
     pub memory_bytes: Option<u64>,
     /// Thousandths of a CPU: 500 is half a core.
     pub cpu_millis: Option<u64>,
+    /// Host device nodes the container is given (and allowed in its cgroup), e.g. `/dev/dri/card0`.
+    /// An exec unit ignores them: it sees all of `/dev` already.
+    pub devices: Vec<PathBuf>,
 }
 
 /// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
@@ -480,9 +484,53 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
 
     let mut linux = spec.linux().clone().unwrap_or_default();
     linux.set_cgroups_path(Some(cgroup.into()));
-    linux.set_resources(Some(resources(unit)?));
+    let mut limits = resources(unit)?;
+    let (nodes, allowed) = device_nodes(&unit.devices)?;
+    if !nodes.is_empty() {
+        linux.set_devices(Some(nodes));
+        limits.set_devices(Some(allowed));
+    }
+    linux.set_resources(Some(limits));
     spec.set_linux(Some(linux));
     Ok(spec)
+}
+
+/// The device nodes at `paths` as the container sees them (made in its `/dev`, or bound there
+/// when rootless) and the cgroup rules that let it read and write them. A path that is not
+/// there, or is not a character or block device, is an error: the unit is not made without it.
+///
+/// An exec unit is not given these: it runs on the host and sees all of `/dev` already.
+fn device_nodes(
+    paths: &[PathBuf],
+) -> std::result::Result<(Vec<LinuxDevice>, Vec<LinuxDeviceCgroup>), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let (mut nodes, mut allowed) = (Vec::new(), Vec::new());
+    for path in paths {
+        // Device nodes live in `/dev`: a path from a resource is not trusted to point elsewhere.
+        let plain = path.starts_with("/dev") && !path.components().any(|c| c == std::path::Component::ParentDir);
+        if !plain {
+            return Err(format!("{} is not a device node under /dev", path.display()).into());
+        }
+        let meta = fs::metadata(path).map_err(|e| format!("device {}: {e}", path.display()))?;
+        let kind = match meta.file_type() {
+            t if t.is_char_device() => LinuxDeviceType::C,
+            t if t.is_block_device() => LinuxDeviceType::B,
+            _ => return Err(format!("{} is not a device node", path.display()).into()),
+        };
+        let (major, minor) = (
+            i64::try_from(nix::sys::stat::major(meta.rdev()))?,
+            i64::try_from(nix::sys::stat::minor(meta.rdev()))?,
+        );
+        let node = LinuxDeviceBuilder::default()
+            .path(path)
+            .typ(kind)
+            .major(major)
+            .minor(minor);
+        nodes.push(node.file_mode(meta.mode() & 0o777).build()?);
+        let rule = LinuxDeviceCgroupBuilder::default().allow(true).typ(kind);
+        allowed.push(rule.major(major).minor(minor).access("rw").build()?);
+    }
+    Ok((nodes, allowed))
 }
 
 /// The cgroup limits of a unit.
@@ -546,5 +594,44 @@ mod tests {
         assert_eq!(resources.cpu().as_ref().unwrap().quota(), Some(50_000));
         assert_eq!(resources.pids().as_ref().unwrap().limit(), MAX_PIDS);
         assert_eq!(resources.memory().as_ref().unwrap().limit(), Some(1 << 20));
+        assert!(
+            linux.devices().as_ref().is_none_or(Vec::is_empty),
+            "no claim, no device"
+        );
+    }
+
+    #[test]
+    fn a_device_is_in_the_spec_and_in_the_cgroups_allow_list() {
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let with = |path: &str| Unit {
+            devices: vec![path.into()],
+            ..Unit::default()
+        };
+        // /dev/null is the character device 1:3.
+        let made = spec("a", &image, &with("/dev/null"), "/kith/a").unwrap();
+        let linux = made.linux().as_ref().unwrap();
+        let [node] = &linux.devices().as_ref().unwrap()[..] else {
+            panic!("one device node")
+        };
+        assert_eq!(node.path(), Path::new("/dev/null"));
+        assert_eq!(node.typ(), oci_spec::runtime::LinuxDeviceType::C);
+        assert_eq!((node.major(), node.minor()), (1, 3));
+        let allowed = linux.resources().as_ref().unwrap().devices().clone().unwrap();
+        let rule = allowed.last().expect("an allow rule");
+        assert_eq!(
+            (rule.allow(), rule.access().as_deref(), rule.major(), rule.minor()),
+            (true, Some("rw"), Some(1), Some(3))
+        );
+        assert_eq!(rule.typ(), Some(oci_spec::runtime::LinuxDeviceType::C));
+        // Missing, or not a device node: the unit is not created, and the reason says which.
+        let missing = spec("a", &image, &with("/dev/kith-no-such-device"), "/kith/a").unwrap_err();
+        assert!(missing.to_string().contains("/dev/kith-no-such-device"), "{missing}");
+        let file = spec("a", &image, &with("/etc"), "/kith/a");
+        assert!(file.unwrap_err().to_string().contains("not a device node"));
+        let out = spec("a", &image, &with("/dev/../dev/null"), "/kith/a");
+        assert!(out.unwrap_err().to_string().contains("not a device node"));
     }
 }

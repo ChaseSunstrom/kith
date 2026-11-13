@@ -63,6 +63,8 @@ struct Slot {
     /// Replace changed replicas one at a time (a Workload unless its strategy is `recreate`).
     rolling: bool,
     probes: Option<crate::probe::Probes>,
+    /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
+    devices: Vec<PathBuf>,
     handle: Option<Handle>,
     state: &'static str,
     restarts: u32,
@@ -286,15 +288,20 @@ impl Controller {
     /// One pass: returns how long the controller may sleep if nothing happens.
     async fn reconcile(&mut self, shared: &std::sync::Arc<Shared>, stopping: &watch::Receiver<bool>) -> Duration {
         // 1. What should run, from a snapshot of the store.
-        let resources: Vec<Resource> = {
+        // And, per workload this node may run that holds DeviceClaims, the device nodes of its own
+        // Devices they come to (`granted` knows no other node's).
+        let (resources, granted): (Vec<Resource>, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
             let kinds = ["Workload", "NodeWorkload", "Job"];
-            kinds
+            let resources = kinds
                 .into_iter()
                 .flat_map(|kind| store.list(Some(kind)))
                 .cloned()
-                .collect()
+                .collect();
+            let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+            let granted = me.map(|me| crate::claims::granted(store, me, Path::new("/sys")));
+            (resources, granted.unwrap_or_default())
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
@@ -322,9 +329,21 @@ impl Controller {
                     continue;
                 }
             };
+            // The device nodes its claims come to here; a workload with claims that do not come to
+            // this node is not run by it (the scheduler has, or will have, put it where they do).
+            // ponytail: a NodeWorkload cannot claim (a copy on every node, a device on one), and
+            // alone, a node has no name for the Devices to name: both run nothing, and say so.
+            let claimed = !template.device_claims.is_empty();
+            let devices = granted.get(&key).cloned().unwrap_or_default();
+            let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
+            if claimed && resource.kind == "NodeWorkload" {
+                note.push("a NodeWorkload cannot hold DeviceClaims: it runs nothing (use a Workload)".into());
+            } else if claimed && me.is_none() {
+                note.push("DeviceClaims need a node with a name in a cluster: this one runs nothing".into());
+            }
             let here = |replica: u32| {
                 let bound = |status: &Value| status["nodes"][replica.to_string()] == *me.unwrap_or_default();
-                me.is_none() || resource.status.as_ref().is_some_and(bound)
+                allowed && (me.is_none() || resource.status.as_ref().is_some_and(bound))
             };
             if resource.kind == "Job" && !here(0) {
                 // Bound here again later, it starts over, like after a restart.
@@ -422,6 +441,7 @@ impl Controller {
                             env: env.clone(),
                             rolling,
                             probes: None,
+                            devices: devices.clone(),
                             handle: None,
                             state: "pending",
                             restarts: 0,
@@ -445,7 +465,7 @@ impl Controller {
         let differs = |new: &Slot, slot: &Slot| {
             // A Job's run is not started over because a value changed under it.
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
-            new.run != slot.run || new.policy != slot.policy || new_values
+            new.run != slot.run || new.policy != slot.policy || new.devices != slot.devices || new_values
         };
         for (id, slot) in &self.slots {
             let Some(new) = wanted.get(id) else {
@@ -825,6 +845,8 @@ async fn start(runtime: &Runtime, logs: &Path, id: &str, slot: &Slot) -> Result<
     };
     let mut unit = Unit {
         env: slot.env.clone()?,
+        // (An exec unit is given none: it sees all of `/dev`.)
+        devices: slot.devices.clone(),
         ..Unit::default()
     };
     if let Some(Resources { cpu, memory, .. }) = resources {
