@@ -16,7 +16,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 schemars = { version = "1", features = ["preserve_order"] }
 saphyr-parser = "0.3"
-clap = { version = "4", features = ["derive", "env"] }
+# (No colour: it is some 60 kB of the 3 MB kith may be.)
+clap = { version = "4", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions"] }
 similar = "2"
 
 # PLAN.md §5: unsafe only in future `*-sys` crates, which opt out explicitly.
