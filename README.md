@@ -876,6 +876,29 @@ spec:
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
   other kind: give it only to someone you would let hold any hardware of the cluster.
 
+### Remote apps
+
+`kith run --on NODE|SELECTOR [--via PROGRAM] [-n NAMESPACE] -- APP [ARGS…]` runs a
+graphical app on another node and opens its window on this machine, through
+[waypipe](https://gitlab.freedesktop.org/mstoeckl/waypipe) over the mesh.
+`--on` is a node's name, or labels (`role=display,zone=lab`) for the first ready Node,
+by name, that has them. `--via` names the program that carries the window (default
+`waypipe`). The app's command line is passed as it is written, never through a shell.
+
+- **waypipe must be installed on both ends** (here, and on the node that runs the app):
+  kith does not ship it. A missing program is refused with its name and the node's.
+- **Who may:** whoever may apply a Job in the namespace (`-n`, default `default`). That is
+  checked on the node you ask, before anything starts or is forwarded; `admin` has it. The
+  other node accepts the hop only from a cluster node, never from a client token, and
+  writes its own audit entry (`GET /v1/audit`) with the name of the caller who asked. The app runs as kithd's user on the node: this is the right to run
+  programs there, so give it as you would a Job.
+- **How:** the `kith` command asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app
+  there with `waypipe --socket S server -- APP…`, S in a private (0700) directory with a name
+  nobody can guess, and joins it to the tunnel; `kith` runs `waypipe --socket L client` and
+  joins L to the other end. Either end closing ends the app, which is killed and waited for.
+- Not yet: one `kith run` carries one connection of the app; the app's exit status is not
+  returned; an interrupt (Ctrl-C) leaves an empty directory in the temp dir.
+
 ## Web UI
 
 Every node serves a page that shows the cluster and changes it: what is

@@ -1324,6 +1324,8 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "kith-api",
  "kith-dm-sys",
  "kith-dns",
