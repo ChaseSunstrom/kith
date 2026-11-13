@@ -4,7 +4,7 @@
 //
 // What is shown is other people's text (names, messages, logs): it goes into the page as
 // text nodes only, and the page's policy allows no script or style but its own files.
-import { at, blank, diffLines, health, keyOf, lamps, resourceOf, shape, summary, written } from './forms.js';
+import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, resourceOf, shape, summary, written } from './forms.js';
 
 const $ = (id) => document.getElementById(id);
 const PROPERTIES = new Set(['value', 'checked', 'disabled', 'hidden', 'open', 'readOnly', 'selected']);
@@ -338,17 +338,33 @@ function control(node, root, value, change, { required = false, id, label } = {}
       const emit = () => change(Object.fromEntries(entries.filter(([key]) => key !== '')));
       const one = label ?? 'entry';
       const box = h('div', { class: 'items' });
-      const draw = () => box.replaceChildren(
+      // A row with no name, or a name another row has, is not written: say so on the row (Review is held while one stands).
+      const mark = () => {
+        const wrong = entriesCheck(entries);
+        box.querySelectorAll('.item').forEach((row, i) => {
+          const input = row.querySelector('.key');
+          const note = row.querySelector('.row-error');
+          if (wrong[i]) {
+            input.setAttribute('aria-invalid', 'true');
+            if (note) note.textContent = wrong[i];
+            else row.append(h('small', { class: 'row-error', role: 'alert' }, wrong[i]));
+          } else {
+            input.removeAttribute('aria-invalid');
+            note?.remove();
+          }
+        });
+      };
+      const draw = () => { box.replaceChildren(
         ...entries.map((entry, i) => {
           const key = h('input', { type: 'text', class: 'key', 'aria-label': `${one} ${i + 1}: its name`, spellcheck: 'false', autocomplete: 'off',
-            value: entry[0], oninput: () => { entry[0] = key.value; emit(); } });
+            value: entry[0], oninput: () => { entry[0] = key.value; emit(); mark(); } });
           return h('div', { class: 'item' }, key,
             control(schema.additionalProperties, root, entry[1], (next) => { entry[1] = next; emit(); }, { required: true, label: `${one} ${i + 1}: its value` }),
             h('button', { type: 'button', class: 'small', 'aria-label': `Remove ${one} ${i + 1}`, onclick: () => { entries.splice(i, 1); emit(); draw(); } }, '×'),
           );
         }),
         h('button', { type: 'button', class: 'small', onclick: () => { entries.push(['', undefined]); draw(); box.querySelector('.item:last-of-type input')?.focus(); } }, `+ ${one}`),
-      );
+      ); mark(); };
       draw();
       return box;
     }
@@ -473,6 +489,9 @@ async function check() {
 async function review() {
   let resources;
   let plan;
+  if (state.draft?.mode === 'form' && $('pane').querySelector('[aria-invalid="true"]')) {
+    return say($('check'), 'Fix the rows and fields marked invalid first.', 'bad');
+  }
   try {
     resources = await drafted();
     plan = await api('POST', 'diff', resources);
