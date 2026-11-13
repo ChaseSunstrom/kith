@@ -315,4 +315,17 @@ mod tests {
         members(&store, &none, &mut known, later);
         assert_eq!(known.len(), 1);
     }
+
+    #[test]
+    fn whole_torn_or_empty_first_peers_file_is_no_peers() {
+        let dir = std::env::temp_dir().join(format!("kith-whole-mesh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = first_peers(&dir.join("mesh.key"));
+        assert_eq!(path, dir.join("mesh-peers.json"));
+        for torn in ["", "[{\"name\":\"b\",\"ke"] {
+            crate::pki::write_whole(&path, torn.as_bytes()).unwrap();
+            assert!(told(&path).is_empty(), "{torn:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
