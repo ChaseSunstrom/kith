@@ -80,8 +80,16 @@ fn inward(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => v4(ip),
         std::net::IpAddr::V6(ip) => {
-            let local = (ip.segments()[0] & 0xfe00) == 0xfc00 || (ip.segments()[0] & 0xffc0) == 0xfe80;
-            ip.is_loopback() || local || ip.to_ipv4_mapped().or(ip.to_ipv4()).is_some_and(v4)
+            let first = ip.segments()[0];
+            // (Unique-local, link-local, the old site-local; and the forms that carry an
+            // IPv4 address inside: mapped, compatible, 6to4, NAT64.)
+            let local = (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || (first & 0xffc0) == 0xfec0;
+            let [a, b, c, d] = [ip.octets()[2], ip.octets()[3], ip.octets()[4], ip.octets()[5]];
+            let sixtofour = first == 0x2002 && v4(std::net::Ipv4Addr::new(a, b, c, d));
+            let [a, b, c, d] = [ip.octets()[12], ip.octets()[13], ip.octets()[14], ip.octets()[15]];
+            let nat64 = ip.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && v4(std::net::Ipv4Addr::new(a, b, c, d));
+            let ours = ip.is_loopback() || local || sixtofour || nat64;
+            ours || ip.to_ipv4_mapped().or(ip.to_ipv4()).is_some_and(v4)
         }
     }
 }
@@ -90,26 +98,72 @@ fn inward(ip: std::net::IpAddr) -> bool {
 /// `url`? Not with the node's own ssh keys, and not from this node or the networks
 /// around it, whatever name they go by: whoever may write a Source in a namespace does
 /// not get to have kithd ask them.
-//
-// ponytail: the name is looked up here and again by whoever fetches, so a name that
-// changes its answer in between still gets through. Fetching from the address that was
-// checked when namespaces have other owners than the cluster's (RBAC, T-0057).
-pub async fn outward(url: &str) -> Fallible<()> {
+///
+/// Says where it is, as git's `http.curloptResolve` takes it (`HOST:PORT:ADDRESS`): the
+/// fetch connects there and nowhere else, so a name that changes its answer after this
+/// look gets nothing by it.
+pub async fn outward(url: &str) -> Fallible<Vec<String>> {
+    let (host, port, found) = vetted(url).await?;
+    // (One entry for the name: curl keeps only the last it is given for a host and port.)
+    let all: Vec<String> = found.iter().map(|address| at(address.ip())).collect();
+    Ok(vec![format!("{host}:{port}:{}", all.join(","))])
+}
+
+#[cfg(test)]
+thread_local! {
+    /// For a test whose "outside" server is on this machine: its own thread takes loopback for outside.
+    pub static LOOPBACK_IS_OUTSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The host and port `url` names and the addresses it is at, if none of them is this
+/// node or its networks.
+pub async fn vetted(url: &str) -> Fallible<(String, u16, Vec<std::net::SocketAddr>)> {
     let host = host(url);
+    let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = authority.split('/').next().unwrap_or_default();
+    // What is vetted must be what whoever fetches connects to: nothing that one reader
+    // of a URL takes for the host's end and another does not.
+    if url.contains(['?', '#', '\\']) || authority.contains(['@', '%']) || url.chars().any(char::is_whitespace) {
+        return Err(format!(
+            "{url}: a Source's address is scheme://host[:port]/path, and no more"
+        ));
+    }
+    let after = authority.rsplit_once(']').map_or(authority, |(_, after)| after);
+    let port: u16 = match after.rsplit_once(':') {
+        Some((_, port)) => port.parse().map_err(|_| format!("{url}: {port:?} is not a port"))?,
+        None => 443,
+    };
     if url.starts_with("ssh://") {
         return Err(format!(
             "{host}: only a Source in kith-system is fetched over ssh (with this node's keys)"
         ));
     }
-    let found: Vec<_> = match tokio::net::lookup_host((host, 443)).await {
+    let found: Vec<_> = match tokio::net::lookup_host((host, port)).await {
         Ok(found) => found.collect(),
         Err(e) => return Err(format!("{host}: {e}")),
     };
+    #[cfg(test)]
+    let inward = |ip: std::net::IpAddr| inward(ip) && !(ip.is_loopback() && LOOPBACK_IS_OUTSIDE.get());
     match found.is_empty() || found.iter().any(|address| inward(address.ip())) {
         true => Err(format!(
             "{host}: only a Source in kith-system is fetched from this node or its own networks"
         )),
-        false => Ok(()),
+        false => Ok((host.to_string(), port, found)),
+    }
+}
+
+/// Does the git that says this of its version know `http.curloptResolve` (2.37 on)?
+fn pinnable(version: &str) -> bool {
+    let mut numbers = version.split_whitespace().nth(2).unwrap_or_default().split('.');
+    let mut number = || numbers.next().and_then(|number| number.parse::<u32>().ok());
+    matches!((number(), number()), (Some(major), Some(minor)) if (major, minor) >= (2, 37))
+}
+
+/// An address as curl's `--resolve` takes it.
+fn at(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
     }
 }
 
@@ -133,8 +187,9 @@ pub fn path_allowed(path: &str) -> Fallible<()> {
 }
 
 /// Run git in the bare repository `dir`: with no configuration but ours, nothing to
-/// ask anyone, and only the transports a Source may use.
-async fn git(dir: &Path, local: bool, args: &[&str]) -> Fallible<Vec<u8>> {
+/// ask anyone, and only the transports a Source may use. With `pins` (see [`outward`]) it
+/// connects only where they say and follows no redirect to anywhere else.
+async fn git(dir: &Path, local: bool, pins: &[String], args: &[&str]) -> Fallible<Vec<u8>> {
     let mut command = tokio::process::Command::new("git");
     command.arg("-C").arg(dir);
     let file = if local { "always" } else { "never" };
@@ -147,6 +202,23 @@ async fn git(dir: &Path, local: bool, args: &[&str]) -> Fallible<Vec<u8>> {
         "credential.helper=",
     ] {
         command.args(["-c", setting]);
+    }
+    for pin in pins {
+        command.args(["-c", &format!("http.curloptResolve={pin}")]);
+    }
+    if !pins.is_empty() {
+        // (And through no proxy, which would look the name up again itself.)
+        command.args(["-c", "http.followRedirects=false", "-c", "http.proxy="]);
+        for proxy in [
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ] {
+            command.env_remove(proxy);
+        }
     }
     command
         .args(args)
@@ -203,8 +275,22 @@ async fn git(dir: &Path, local: bool, args: &[&str]) -> Fallible<Vec<u8>> {
 
 /// Fetch `rev` of the repository at `url` into the bare repository `dir` (made if it
 /// is not there) and read the files under `path`.
-pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&str>, local: bool) -> Fallible<Fetched> {
+pub async fn fetch_git(
+    dir: &Path,
+    url: &str,
+    rev: Option<&str>,
+    path: Option<&str>,
+    local: bool,
+    pins: &[String],
+) -> Fallible<Fetched> {
     url_allowed(url, local)?;
+    if !pins.is_empty() {
+        // (An older git takes the setting that pins it for nothing, and says nothing.)
+        let version = git(dir.parent().unwrap_or(dir), local, &[], &["version"]).await?;
+        if !pinnable(&String::from_utf8_lossy(&version)) {
+            return Err("this node's git is older than 2.37: it cannot be held to the address that was checked".into());
+        }
+    }
     let rev = rev.unwrap_or("HEAD");
     rev_allowed(rev)?;
     let path = path.map(|path| path.trim_matches('/')).filter(|path| !path.is_empty());
@@ -212,7 +298,7 @@ pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&s
     if !dir.join("HEAD").exists() {
         let failed = |e: std::io::Error| format!("{}: {e}", dir.display());
         tokio::fs::create_dir_all(dir).await.map_err(failed)?;
-        git(dir, local, &["init", "--quiet", "--bare", "."]).await?;
+        git(dir, local, pins, &["init", "--quiet", "--bare", "."]).await?;
     }
     let fetch = [
         "fetch",
@@ -224,9 +310,9 @@ pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&s
         url,
         rev,
     ];
-    git(dir, local, &fetch).await?;
+    git(dir, local, pins, &fetch).await?;
     let text = |bytes: Vec<u8>| String::from_utf8(bytes).map_err(|_| "git said something that is not text".to_string());
-    let revision = text(git(dir, local, &["rev-parse", "FETCH_HEAD"]).await?)?
+    let revision = text(git(dir, local, pins, &["rev-parse", "FETCH_HEAD"]).await?)?
         .trim()
         .to_string();
 
@@ -234,7 +320,7 @@ pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&s
     let mut list = vec!["ls-tree", "-r", "-l", "-z", "FETCH_HEAD"];
     list.extend(path.iter().flat_map(|path| ["--", *path]));
     // (A name that is not text is no reason to refuse the rest.)
-    let listed = git(dir, local, &list).await?;
+    let listed = git(dir, local, pins, &list).await?;
     let listed = String::from_utf8_lossy(&listed);
     let (mut wanted, mut skipped, mut bytes) = (Vec::new(), Vec::new(), 0u64);
     for entry in listed.split('\0').filter(|entry| !entry.is_empty()) {
@@ -263,7 +349,7 @@ pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&s
     }
     let mut files = BTreeMap::new();
     for (name, object) in wanted {
-        match String::from_utf8(git(dir, local, &["cat-file", "blob", &object]).await?) {
+        match String::from_utf8(git(dir, local, pins, &["cat-file", "blob", &object]).await?) {
             Ok(file) => drop(files.insert(name, file)),
             Err(_) => skipped.push(format!("{name}: not text")),
         }
@@ -278,12 +364,16 @@ pub async fn fetch_git(dir: &Path, url: &str, rev: Option<&str>, path: Option<&s
 
 /// The files of the OCI artifact `oci://HOST/PATH/NAME[:TAG]` (as `kith source push`
 /// makes one), under `path`. Its revision is the blob's digest.
-pub async fn fetch_oci(reference: &str, path: Option<&str>) -> Fallible<Fetched> {
+///
+/// `outward`: of a Source that is not the cluster's own, so every connection made for it
+/// (the registry, where its tokens come from, where a redirect leads) goes only to an
+/// address that was just seen to be outside this node and its networks.
+pub async fn fetch_oci(reference: &str, path: Option<&str>, outward: bool) -> Fallible<Fetched> {
     let (url, name) = reference
         .rsplit_once('/')
         .ok_or(format!("{reference}: not oci://HOST/PATH/NAME[:TAG]"))?;
     let (name, tag) = name.split_once(':').unwrap_or((name, "latest"));
-    let (blob, _) = crate::registry::pull(url, name, tag).await?;
+    let (blob, _) = crate::registry::pull(url, name, tag, outward).await?;
     let digest = ring::digest::digest(&ring::digest::SHA256, &blob);
     let revision: String = digest.as_ref()[..16].iter().map(|byte| format!("{byte:02x}")).collect();
     let files = kith_packages::artifact::files(&blob)?;
@@ -530,16 +620,17 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
                     let own = key.starts_with("Source/kith-system/") || (local && source.git.is_some());
                     let allowed = match named.filter(|_| !own) {
                         Some(url) => outward(url).await,
-                        None => Ok(()),
+                        None => Ok(Vec::new()),
                     };
-                    let got = match (&source.git, &source.oci) {
-                        _ if allowed.is_err() => allowed.map(|()| unreachable!("an error")),
-                        (Some(git), _) => {
+                    let outward = named.is_some() && !own;
+                    let got = match (&source.git, &source.oci, allowed) {
+                        (_, _, Err(refused)) => Err(refused),
+                        (Some(git), _, Ok(pins)) => {
                             let dir = clone_of(&state, key);
-                            fetch_git(&dir, &git.url, git.rev.as_deref(), source.path.as_deref(), local).await
+                            fetch_git(&dir, &git.url, git.rev.as_deref(), source.path.as_deref(), local, &pins).await
                         }
-                        (None, Some(oci)) => fetch_oci(oci, source.path.as_deref()).await,
-                        (None, None) => Err("neither git nor oci".into()),
+                        (None, Some(oci), _) => fetch_oci(oci, source.path.as_deref(), outward).await,
+                        (None, None, _) => Err("neither git nor oci".into()),
                     };
                     // (Read here, not while the store is held.)
                     if let Ok(fetched) = &got {
@@ -640,11 +731,53 @@ mod tests {
             "https://user@10.1.2.3/a",
             "https:///a",
             "ssh://git@8.8.8.8/a",
+            // What one reader of a URL ends the host at and another does not.
+            "https://127.0.0.1#@8.8.8.8/a",
+            "https://127.0.0.1:8080#@8.8.8.8/a", // pragma: allowlist secret
+            "https://8.8.8.8/a?b",
+            "https://127.0.0.1\\@8.8.8.8/a",
+            "https://8.8.8.8:x/a",
+            "https://user@8.8.8.8/a",
+            "https://[2002:7f00:1::1]/a",
+            "https://[64:ff9b::a00:1]/a",
+            "https://[fec0::1]/a",
         ] {
             assert!(outward(url).await.is_err(), "{url}");
         }
-        assert!(outward("https://8.8.8.8/x").await.is_ok());
+        assert_eq!(
+            outward("https://8.8.8.8/x").await,
+            Ok(vec!["8.8.8.8:443:8.8.8.8".to_string()])
+        );
+        assert_eq!(
+            outward("https://8.8.8.8:8443/x").await,
+            Ok(vec!["8.8.8.8:8443:8.8.8.8".to_string()])
+        );
+        assert_eq!(super::at("2001:db8::1".parse().unwrap()), "[2001:db8::1]");
+        assert!(
+            pinnable("git version 2.37.0") && pinnable("git version 3.0.1") && pinnable("git version 2.56.0.windows.1")
+        );
+        assert!(!pinnable("git version 2.36.9") && !pinnable("git version 1.99") && !pinnable("nonsense"));
         assert_eq!(plain("a\x1b[2Jb\nc"), "a[2Jb\nc");
+    }
+
+    /// git goes to the address it was told, whatever the name would answer (this one answers nothing).
+    #[tokio::test]
+    async fn pinned_git_connects_where_it_was_vetted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("kith-pinned-{}", std::process::id()));
+        let url = format!("https://kith-pinned.invalid:{port}/x.git");
+        let pins = [format!("kith-pinned.invalid:{port}:127.0.0.1")];
+        let fetch = fetch_git(&dir, &url, None, None, false, &pins);
+        let reached = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                accepted = listener.accept() => accepted.is_ok(),
+                _ = fetch => false,
+            }
+        });
+        let reached = reached.await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reached, Ok(true), "git did not connect to the pinned address");
     }
 
     fn apply(store: &mut Store, source: &str) {

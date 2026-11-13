@@ -7,8 +7,10 @@
 // A registry is one an admin named, but not trusted to drown us or to send us inward:
 // the blob is capped (and pulled by oci-client), the manifest, the list of tags and the
 // token's answer are our own capped requests, a token is asked for only at the registry's
-// own scheme, host and port, and a redirect stays there too (T-0054). A registry whose
-// tokens come from another host (Docker Hub's auth.docker.io) is refused for it.
+// own scheme, host and port, or at an https one that is outside this node and its
+// networks (Docker Hub's auth.docker.io), and a redirect stays on the registry (T-0054).
+// For a Source that is not the cluster's own (`outward`), every connection is made to an
+// address that was just vetted (sources::vetted), the blob's and each redirect's too.
 
 use crate::Shared;
 use crate::releases::REPOSITORY;
@@ -45,7 +47,7 @@ const TOKEN_LIMIT: usize = 64 << 10;
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// Where `name` at `version` is in the repository `url`, and clients for there.
-fn place(url: &str, name: &str, version: &str) -> Fallible<(Client, Reference, Web)> {
+fn place(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Client, Reference, Web)> {
     let path = url
         .strip_prefix("oci://")
         .ok_or(format!("{url}: not oci://HOST/PATH"))?;
@@ -88,13 +90,72 @@ fn place(url: &str, name: &str, version: &str) -> Fallible<(Client, Reference, W
         .build()
         .map_err(|e| format!("setting up the registry client: {e}"))?;
     let scheme = if local { "http" } else { "https" };
-    Ok((Client::new(config), reference, Web { http, scheme }))
+    let web = Web {
+        http,
+        scheme,
+        outward,
+        token: Default::default(),
+    };
+    Ok((Client::new(config), reference, web))
 }
 
 /// The client for what [`capped`] asks, and the scheme the registry is reached by.
 struct Web {
     http: reqwest::Client,
     scheme: &'static str,
+    /// See the module's note.
+    outward: bool,
+    /// The token the registry wanted, once one was fetched.
+    token: std::sync::Mutex<Option<String>>,
+}
+
+/// A client that connects only where `url`'s host was just seen to be: outside this node
+/// and its networks. It follows nothing.
+async fn held(url: &reqwest::Url) -> Fallible<reqwest::Client> {
+    // (Its origin only: what follows, a query too, is not what is connected to.)
+    let (host, _, addresses) = crate::sources::vetted(&url.origin().ascii_serialization()).await?;
+    let client = reqwest::Client::builder()
+        .resolve_to_addrs(&host, &addresses)
+        // (Nor a proxy, which would look the name up again itself.)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PATIENCE);
+    client
+        .build()
+        .map_err(|e| format!("setting up the registry client: {e}"))
+}
+
+/// GET `url` as `web` does: with its client, or, `outward`, hop by hop through [`held`]
+/// ones (five at most, never from https to less, the token only to the first host).
+async fn get(web: &Web, url: &str, accept: &str, token: Option<&str>) -> Fallible<reqwest::Response> {
+    let authorized = |request: reqwest::RequestBuilder, token: Option<&str>| match token {
+        Some(token) => request.header("accept", accept).bearer_auth(token),
+        None => request.header("accept", accept),
+    };
+    if !web.outward {
+        let sent = authorized(web.http.get(url), token).send().await;
+        return sent.map_err(|e| e.to_string());
+    }
+    let mut url = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    let mut token = token;
+    for _ in 0..5 {
+        let client = held(&url).await?;
+        let reply = authorized(client.get(url.clone()), token).send().await;
+        let reply = reply.map_err(|e| e.to_string())?;
+        if !reply.status().is_redirection() {
+            return Ok(reply);
+        }
+        let to = reply.headers().get("location").and_then(|to| to.to_str().ok());
+        let to = to.and_then(|to| url.join(to).ok()).ok_or("a redirect to nowhere")?;
+        if url.scheme() == "https" && to.scheme() != "https" {
+            return Err(format!("a redirect from https to {to}"));
+        }
+        if to.host_str() != url.host_str() {
+            token = None;
+        }
+        url = to;
+    }
+    Err("more than five redirects".into())
 }
 
 /// `path` of the repository `reference` is in (`manifests/TAG`, `tags/list?n=1000`), as
@@ -114,11 +175,7 @@ async fn capped(
     let url = format!("{}://{registry}/v2/{}/{path}", web.scheme, reference.repository());
     let mut token: Option<String> = None;
     loop {
-        let mut request = web.http.get(&url).header("accept", accept);
-        if let Some(token) = &token {
-            request = request.bearer_auth(token);
-        }
-        let reply = request.send().await.map_err(|e| what(&e))?;
+        let reply = get(web, &url, accept, token.as_deref()).await.map_err(|e| what(&e))?;
         if reply.status() == 401 && token.is_none() {
             let challenge = reply.headers().get("www-authenticate").and_then(|h| h.to_str().ok());
             token = Some(
@@ -171,8 +228,12 @@ async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
             url.port_or_known_default(),
         )
     };
-    if key(&realm) != key(&own) {
-        return Err(format!("token realm {realm} is not the registry's own ({own})"));
+    // (Its own, or one that is https and outside this node's networks: asked where it was seen to be.)
+    let elsewhere = key(&realm) != key(&own);
+    if elsewhere && realm.scheme() != "https" {
+        return Err(format!(
+            "token realm {realm} is not the registry's own ({own}), nor https"
+        ));
     }
     {
         let mut query = realm.query_pairs_mut();
@@ -181,7 +242,13 @@ async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
             query.append_pair("service", &service);
         }
     }
-    let reply = web.http.get(realm).send().await.map_err(|e| e.to_string())?;
+    let reply = match elsewhere {
+        true => {
+            let client = held(&realm).await.map_err(|e| format!("token realm {realm}: {e}"))?;
+            client.get(realm).send().await.map_err(|e| e.to_string())?
+        }
+        false => get(web, realm.as_str(), "application/json", None).await?,
+    };
     if !reply.status().is_success() {
         return Err(format!("token: {}", reply.status()));
     }
@@ -199,6 +266,7 @@ async fn bearer(oci: &Client, web: &Web, reference: &Reference, challenge: &str)
     )
     .await
     .map_err(|e| e.to_string())?;
+    *web.token.lock().expect("nothing panics holding it") = Some(token.to_string());
     Ok(token.to_string())
 }
 
@@ -212,7 +280,7 @@ async fn patiently<T>(what: &Reference, asked: impl Future<Output = oci_client::
 /// Put a blob (a package's, a Source's files) in the repository `url` as `name` at
 /// `version`, with its signature if it has one. Says where.
 pub async fn push(url: &str, name: &str, version: &str, blob: Vec<u8>, signature: Option<String>) -> Fallible<String> {
-    let (client, reference, _) = place(url, name, version)?;
+    let (client, reference, _) = place(url, name, version, false)?;
     let layers = [ImageLayer::new(blob, LAYER.to_string(), None)];
     let config = Config::new(b"{}".to_vec(), CONFIG.to_string(), None);
     let annotations = signature.map(|signature| BTreeMap::from([(SIGNATURE.to_string(), signature)]));
@@ -224,8 +292,10 @@ pub async fn push(url: &str, name: &str, version: &str, blob: Vec<u8>, signature
 
 /// The blob and the signature of `name` at `version` in the repository `url`: not yet
 /// checked against any key, only against the digest the registry's manifest gives.
-pub async fn pull(url: &str, name: &str, version: &str) -> Fallible<(Vec<u8>, Option<String>)> {
-    let (client, reference, web) = place(url, name, version)?;
+///
+/// `outward`: see the module's note.
+pub async fn pull(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Vec<u8>, Option<String>)> {
+    let (client, reference, web) = place(url, name, version, outward)?;
     let tag = format!("manifests/{version}");
     let manifest = capped(&client, &web, &reference, &tag, MANIFEST_TYPE, MANIFEST_LIMIT).await?;
     let manifest: OciImageManifest = serde_json::from_slice(&manifest).map_err(|e| format!("{reference}: {e}"))?;
@@ -238,12 +308,30 @@ pub async fn pull(url: &str, name: &str, version: &str) -> Fallible<(Vec<u8>, Op
         ));
     }
     // (Room for what the manifest says and no more: a registry that sends more fails.)
-    let mut blob = vec![0; usize::try_from(layer.size).unwrap_or_default()];
-    patiently(
-        &reference,
-        client.pull_blob(&reference, layer, std::io::Cursor::new(blob.as_mut_slice())),
-    )
-    .await?;
+    let size = usize::try_from(layer.size).unwrap_or_default();
+    let mut blob = vec![0; size];
+    if web.outward {
+        // (Not by oci-client, which goes wherever a name or a redirect leads.)
+        let at = format!(
+            "{}://{}/v2/{}/blobs/{}",
+            web.scheme,
+            reference.resolve_registry(),
+            reference.repository(),
+            layer.digest
+        );
+        let token = web.token.lock().expect("nothing panics holding it").clone();
+        let what = |e: String| format!("{reference}: the blob: {e}");
+        let reply = get(&web, &at, "application/octet-stream", token.as_deref())
+            .await
+            .map_err(what)?;
+        if !reply.status().is_success() {
+            return Err(what(reply.status().to_string()));
+        }
+        blob = read(reply, size).await.map_err(what)?;
+    } else {
+        let pulled = client.pull_blob(&reference, layer, std::io::Cursor::new(blob.as_mut_slice()));
+        patiently(&reference, pulled).await?;
+    }
     let digest = ring::digest::digest(&ring::digest::SHA256, &blob);
     let digest: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
     if layer.digest != format!("sha256:{digest}") {
@@ -257,7 +345,7 @@ pub async fn pull(url: &str, name: &str, version: &str) -> Fallible<(Vec<u8>, Op
 
 /// The versions of `name` in the repository `url`.
 pub async fn versions(url: &str, name: &str) -> Fallible<Vec<String>> {
-    let (client, reference, web) = place(url, name, "latest")?;
+    let (client, reference, web) = place(url, name, "latest", false)?;
     // ponytail: the first 1000 tags; a package with more versions gets pages.
     let listed = capped(
         &client,
@@ -378,7 +466,7 @@ async fn fetch(shared: &Shared, wanted: &Wanted) -> Fallible<(Option<Resource>, 
             Some(_) => return Err(format!("{key} is there already, and not from this repository")),
             None => {}
         }
-        let pulled = pull(&wanted.url, &wanted.name, version).await?;
+        let pulled = pull(&wanted.url, &wanted.name, version, false).await?;
         let (blob, signature) = pulled;
         match checked(
             &blob,
@@ -579,15 +667,45 @@ mod tests {
     async fn registry_serves_a_package_and_its_versions() {
         let tags = br#"{"name":"kith/pkg","tags":["1.0.0","1.1.0"]}"#.to_vec();
         let (port, _) = fake(registry(manifest(0), tags)).await;
-        let (blob, signature) = pull(&url(port), "pkg", "1.0.0").await.unwrap();
+        let (blob, signature) = pull(&url(port), "pkg", "1.0.0", false).await.unwrap();
         assert_eq!((blob.as_slice(), signature.as_deref()), (BLOB, Some("sig")));
         assert_eq!(versions(&url(port), "pkg").await.unwrap(), ["1.0.0", "1.1.0"]);
+    }
+
+    /// For a Source that is not the cluster's own: nothing is asked of an address that is
+    /// not outside, and the blob is followed hop by hop to where it was moved.
+    #[tokio::test]
+    async fn pinned_oci_connects_only_where_it_was_vetted() {
+        let (port, asked) = fake(registry(manifest(0), vec![])).await;
+        let e = pull(&url(port), "pkg", "1.0.0", true).await.unwrap_err();
+        assert!(e.contains("its own networks"), "{e}");
+        assert!(asked.lock().unwrap().is_empty(), "an inward registry was asked");
+
+        // (From here this thread takes loopback for outside.)
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let (blob, _) = pull(&url(port), "pkg", "1.0.0", true).await.unwrap();
+        assert_eq!(blob.as_slice(), BLOB);
+        // The blob moved to another host: asked there, without the token.
+        let (elsewhere, reached) = fake(|_, _, authed| (if authed { 400 } else { 200 }, vec![], BLOB.to_vec())).await;
+        let inner = registry(manifest(0), vec![]);
+        let (port, _) = fake(move |port, path, authed| match path.contains("/blobs/") {
+            true => (
+                307,
+                vec![format!("location: http://localhost:{elsewhere}/moved")],
+                vec![],
+            ),
+            false => inner(port, path, authed),
+        })
+        .await;
+        let (blob, _) = pull(&url(port), "pkg", "1.0.0", true).await.unwrap();
+        assert_eq!(blob.as_slice(), BLOB);
+        assert_eq!(*reached.lock().unwrap(), ["/moved"]);
     }
 
     #[tokio::test]
     async fn registry_refuses_an_oversized_manifest() {
         let (port, _) = fake(registry(manifest(2 << 20), vec![])).await;
-        let e = pull(&url(port), "pkg", "1.0.0").await.unwrap_err();
+        let e = pull(&url(port), "pkg", "1.0.0", false).await.unwrap_err();
         assert!(e.contains("more than"), "{e}");
     }
 
@@ -610,7 +728,7 @@ mod tests {
         ] {
             let challenge = format!("www-authenticate: Bearer realm=\"{realm}\",service=\"fake\"");
             let (port, asked) = fake(move |_, _, _| (401, vec![challenge.clone()], vec![])).await;
-            let e = pull(&url(port), "pkg", "1.0.0").await.unwrap_err();
+            let e = pull(&url(port), "pkg", "1.0.0", false).await.unwrap_err();
             assert!(e.contains("token realm"), "{realm}: {e}");
             assert_eq!(asked.lock().unwrap().len(), 1, "{realm}: one request, the manifest's");
         }
@@ -622,7 +740,7 @@ mod tests {
         let (elsewhere, reached) = fake(|_, _, _| (200, vec![], manifest(0))).await;
         let location = format!("location: http://localhost:{elsewhere}/v2/kith/pkg/manifests/1.0.0");
         let (port, _) = fake(move |_, _, _| (302, vec![location.clone()], vec![])).await;
-        assert!(pull(&url(port), "pkg", "1.0.0").await.is_err());
+        assert!(pull(&url(port), "pkg", "1.0.0", false).await.is_err());
         assert!(versions(&url(port), "pkg").await.is_err());
         assert!(reached.lock().unwrap().is_empty(), "the other host was asked");
     }

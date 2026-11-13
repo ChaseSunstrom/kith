@@ -488,6 +488,10 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
 - Only a Source in `kith-system` is fetched over `ssh://` (it is the node's
   own keys that open the door) or from this node and its own networks
   (loopback, private, link-local and shared addresses, by whatever name).
+  Any other Source is fetched from the very address that was checked: a name
+  that answers differently a moment later, or a redirect, leads nowhere else
+  (git follows none and needs to be 2.37 or newer; a registry's redirects
+  and token host are each checked the same way).
 - An approval is for a revision: a Source whose `path` or `prune` you change
   applies the revision already approved the new way.
 

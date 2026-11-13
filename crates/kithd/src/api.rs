@@ -663,7 +663,9 @@ async fn pull(
     Json(asked): Json<Pull>,
 ) -> Reply<std::collections::BTreeMap<String, String>> {
     permit(&shared, &caller, Verb::Apply, |_| vec![("Package".into(), None)])?;
-    let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version).await;
+    // (An Identity names any registry it likes: only outside ones, as a namespace's Source.)
+    let outward = matches!(caller, Caller::Identity(_));
+    let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version, outward).await;
     let (blob, signature) = fetched.map_err(|e| ApiError::Store(Error::Io(e)))?;
     let package = crate::registry::checked(
         &blob,
