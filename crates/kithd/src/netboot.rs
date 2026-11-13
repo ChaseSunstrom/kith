@@ -515,6 +515,24 @@ mod tests {
     const CARD: Mac = [0x52, 0x54, 0, 0xaa, 0xbb, 0xcc];
     /// A machine asked for in small blocks.
     const SMALL: Mac = [0x52, 0x54, 0, 0xaa, 0xbb, 0xcd];
+    /// The tests that turn netboot on share its one state: one at a time.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn machine(served: bool) -> Machine {
+        // (made up) pragma: allowlist secret
+        Machine {
+            token: "kith1.ab.cd".into(),
+            served,
+            transfer: None,
+        }
+    }
+
+    /// A PXE question from a machine of `mac`, as `discover` makes it.
+    fn asking(mac: Mac, class: &[u8], arch: u16, kind: u8) -> Vec<u8> {
+        let mut packet = discover(class, arch, kind);
+        packet[28..34].copy_from_slice(&mac);
+        packet
+    }
 
     /// What firmware sends: a DISCOVER from a PXE client of architecture `arch`.
     fn discover(class: &[u8], arch: u16, kind: u8) -> Vec<u8> {
@@ -660,6 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn netboot_serves_the_file_over_tftp_to_the_machines_named_once() {
+        let _serial = SERIAL.lock().await;
         // More blocks of 8 bytes than a block number counts to, so the numbers go round.
         let mut image: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
         image[1000..1000 + MARKER.len()].copy_from_slice(MARKER);
@@ -735,5 +754,95 @@ mod tests {
         }
         assert_eq!(status()["on"], false);
         assert_eq!(mac("52:54:+0:aa:bb:cc"), None);
+    }
+
+    /// Proxy DHCP answers the machines named, once each, and nothing else: the questions it
+    /// must not answer come first, so a reply to any of them is heard before the one it must.
+    #[tokio::test]
+    async fn netboot_proxy_dhcp_answers_the_machines_named_until_they_have_the_file() {
+        let _serial = SERIAL.lock().await;
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let serving = tokio::spawn(dhcp(server, None));
+        *active() = Some(Active {
+            image: Arc::new(Vec::new()),
+            at: 0,
+            disk: "only".into(),
+            encrypt: false,
+            machines: BTreeMap::from([(CARD, machine(false)), (SMALL, machine(true))]),
+            until: Instant::now() + Duration::from_secs(60),
+            tasks: vec![serving],
+        });
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let other = [0x52, 0x54, 0, 0, 0, 1];
+        for unwanted in [
+            asking(other, b"PXEClient", 7, 1),
+            asking(SMALL, b"PXEClient", 7, 1),
+            asking(CARD, b"PXEClient", 0, 1),
+            asking(CARD, b"MSFT 5.0", 7, 1),
+        ] {
+            client.send_to(&unwanted, server_addr).await.unwrap();
+        }
+        client
+            .send_to(&asking(CARD, b"PXEClient", 7, 1), server_addr)
+            .await
+            .unwrap();
+        let mut packet = [0; 1500];
+        let heard = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut packet));
+        let (len, from) = heard.await.expect("no answer").unwrap();
+        let offer = &packet[..len];
+        assert_eq!(from, server_addr);
+        assert_eq!(offer[..8], [2, 1, 6, 0, 1, 2, 3, 4]);
+        // No address (the network's server gives one); the file is at this node, and is CARD's.
+        assert_eq!(offer[16..20], [0; 4]);
+        assert_eq!(offer[20..24], [127, 0, 0, 1]);
+        assert_eq!(offer[28..34], CARD);
+        assert!(offer[108..].starts_with(b"kith-netboot-525400aabbcc.efi\0"));
+        assert_eq!(offer[240..243], [53, 1, 2]);
+
+        // Once it has the file, its firmware's questions are not answered again.
+        active().as_mut().unwrap().machines.get_mut(&CARD).unwrap().served = true;
+        client
+            .send_to(&asking(CARD, b"PXEClient", 7, 1), server_addr)
+            .await
+            .unwrap();
+        let again = tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut packet)).await;
+        assert!(again.is_err(), "answered a machine that has the file");
+
+        for task in off() {
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+        assert_eq!(status()["on"], false);
+    }
+
+    /// Netboot is on for an hour at most, and says how much of that is left: what is out of
+    /// bounds is refused before anything is bound or any token is made.
+    #[tokio::test]
+    async fn netboot_is_on_for_an_hour_at_most_and_says_what_is_left() {
+        let _serial = SERIAL.lock().await;
+        let _ = PORT.set(7443);
+        let mut image = vec![0; 64];
+        image.extend(MARKER);
+        let none = || -> Result<String, String> { panic!("a token for a refusal") };
+        for minutes in [0, MINUTES + 1] {
+            let refused = on(image.clone(), vec![CARD], minutes, "only", false, none).await;
+            assert!(refused.is_err(), "{minutes} minutes");
+        }
+        assert_eq!(status()["on"], false);
+
+        *active() = Some(Active {
+            image: Arc::new(image.clone()),
+            at: 64,
+            disk: "only".into(),
+            encrypt: false,
+            machines: BTreeMap::new(),
+            until: Instant::now() + Duration::from_secs(MINUTES * 30),
+            tasks: vec![],
+        });
+        assert!((1790..=1800).contains(&status()["secondsLeft"].as_u64().unwrap()));
+        active().as_mut().unwrap().until = Instant::now();
+        assert_eq!(status()["secondsLeft"], 0);
+        assert!(off().is_empty());
+        assert_eq!(status()["on"], false);
     }
 }
