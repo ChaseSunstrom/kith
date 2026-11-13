@@ -494,6 +494,10 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     }
     for volume in &unit.mounts {
         check_mount(volume)?;
+        // Not over a mount the container already has (/tmp, /run, its resolv.conf, another volume).
+        if mounts.iter().any(|m| m.destination() == Path::new(&volume.container)) {
+            return Err(format!("volume path `{}` in the container is already a mount", volume.container).into());
+        }
         let mut options = ["rbind", "nosuid", "nodev"].map(String::from).to_vec();
         if volume.read_only {
             options.push("ro".into());
@@ -742,5 +746,8 @@ mod tests {
         assert!(mounted(vec![bind("/srv/data", "/processing", false)]).is_ok());
         // A host path that is not absolute would be taken as relative to the runtime's directory.
         assert!(mounted(vec![bind("srv/data", "/data", false)]).is_err());
+        // Nor over a mount the container already has, nor twice on one path.
+        assert!(mounted(vec![bind("/srv/data", "/tmp", false)]).is_err());
+        assert!(mounted(vec![bind("/srv/a", "/data", false), bind("/srv/b", "/data", false)]).is_err());
     }
 }

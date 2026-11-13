@@ -910,7 +910,9 @@ spec:
   claim has, is at least as big, is on a node with the labels in its `selector`, and is
   `shared` if the claim asks for that. `kith get volumeclaim db-data -o yaml` shows
   `status.volume`, the Volume shows `status.claim`, and it stays so while both exist; a claim
-  that finds none says so in `status.message`. Deleting a claim frees its Volume, data
+  that finds none says so in `status.message`. A claim whose Volume is deleted says so and
+  takes no other (the workload would start on empty data): make the Volume again, or delete
+  the claim and apply it again. Every replica of a workload shares the one directory. Deleting a claim frees its Volume, data
   kept.
 - The container sees the directory as a bind mount (`readOnly: true` makes it read-only).
   The directory is made on the node when the unit starts. In a namespace other than

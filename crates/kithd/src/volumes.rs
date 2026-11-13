@@ -133,6 +133,10 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
         if vols.contains_key(&volume_key) && !taken.contains_key(&volume_key) {
             taken.insert(volume_key, name);
             bound.insert(key, Ok(volume.to_string()));
+        } else {
+            // It does not quietly take another: the workload would start on empty data.
+            let why = format!("its Volume {volume} is gone: make it again, or delete this claim to bind another");
+            bound.insert(key, Err(why));
         }
     }
     for claim in claims {
@@ -154,10 +158,9 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
                 .get(&format!("Node/{node}"))
                 .map(|node| node.metadata.labels.clone())
         };
-        let on_node = |node: &str| {
-            let have = labels(node).unwrap_or_default();
-            spec.selector.iter().all(|(k, v)| have.get(k) == Some(v))
-        };
+        // (A Volume on a node that is not there fits nothing: its claim could never run.)
+        let on_node =
+            |node: &str| labels(node).is_some_and(|have| spec.selector.iter().all(|(k, v)| have.get(k) == Some(v)));
         let prefix = format!("Volume/{namespace}/");
         let fits = |(volume_key, vol): &(&String, &Vol)| {
             vol.refused.is_none()
@@ -247,7 +250,16 @@ pub fn resolve(store: &Store) -> Volumes {
     for (key, outcome) in &bound {
         let status = match outcome {
             Ok(volume) => json!({ "volume": volume }),
-            Err(message) => json!({ "message": message }),
+            Err(message) => {
+                // (What it was bound to stays written: that is what keeps it from another.)
+                let recorded = store
+                    .get(key)
+                    .and_then(|claim| claim.status.as_ref()?["volume"].as_str());
+                match recorded {
+                    Some(volume) => json!({ "volume": volume, "message": message }),
+                    None => json!({ "message": message }),
+                }
+            }
         };
         found.status.insert(key.clone(), Some(status));
     }
@@ -288,9 +300,17 @@ pub fn together(
 /// the directory that is. Only a Volume of `me` is ever in it.
 pub fn mounts(store: &Store, me: &str) -> BTreeMap<String, BTreeMap<String, Dir>> {
     let owners = resolve(store).owners;
+    // A claim counts once the scheduler has written what it is bound to: this node's own first
+    // fit, worked out from a store that is a write behind, could be another Volume.
+    let recorded = |namespace: &str, name: &str, dir: &Dir| {
+        let claim = store.get(&format!("VolumeClaim/{namespace}/{name}"));
+        name == dir.name || claim.and_then(|c| c.status.as_ref()?["volume"].as_str()) == Some(&dir.name)
+    };
     let mine = owners.into_iter().filter_map(|(key, outcome)| {
         let held = outcome.ok().filter(|held| held.node == me)?;
-        Some((key, held.volumes))
+        let namespace = parts(&key).0;
+        let settled = held.volumes.iter().all(|(name, dir)| recorded(namespace, name, dir));
+        settled.then_some((key, held.volumes))
     });
     mine.collect()
 }
@@ -529,11 +549,16 @@ spec: { node: a, path: tiny, size: 1Gi }
         // ... and it is `second`'s now, which was waiting.
         assert_eq!(status(&store, "VolumeClaim/default/second"), json!({ "volume": "aaa" }));
         assert_eq!(status(&store, "Volume/default/aaa"), json!({ "claim": "second" }));
-        // The volume goes: its claim is bound again to another one that is free (`tiny` is too small).
+        // The volume goes: its claim says so and takes no other (`aaa` would fit once `second` goes):
+        // the workload would start on empty data.
         store.delete("Volume/default/fast").unwrap();
+        store.delete("VolumeClaim/default/second").unwrap();
         let again = settle(&mut store);
-        assert!(status(&store, "VolumeClaim/default/db")["message"].is_string());
+        let gone = status(&store, "VolumeClaim/default/db");
+        assert_eq!(gone["volume"], "fast");
+        assert!(gone["message"].as_str().unwrap().contains("is gone"), "{gone}");
         assert!(again.owners["Workload/default/app"].is_err());
+        assert!(mounts(&store, "a").is_empty());
     }
 
     #[test]
