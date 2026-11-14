@@ -3,3 +3,5 @@
 /sdk/**/target
 /sdk/**/Cargo.lock
 __pycache__/
+# (ci/site_shots.py cuts a tall page into pieces to look at; the whole ones are kept.)
+docs/shots/site-*.[0-9].png
