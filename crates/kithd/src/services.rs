@@ -11,6 +11,8 @@
 // and replicas of one node share its ports until workloads have addresses of their own.
 // The kernel takes this over (nftables or eBPF) behind the same addresses.
 
+mod connect;
+
 use crate::Shared;
 use crate::ingress::{Idle, Limits};
 use futures_util::FutureExt;
@@ -760,6 +762,12 @@ pub async fn run(
     let mut listening: BTreeMap<(Ipv6Addr, u16), Vec<tokio::task::JoinHandle<()>>> = BTreeMap::new();
     let mut threads = Vec::new();
     let mut generation = shared.generation.subscribe();
+    let mut kernel = kith_dm_sys::netns_cookie()
+        .and_then(|netns| connect::attach(&[], netns).map(|()| netns))
+        .inspect(|_| eprintln!("kithd: services: the kernel passes connections to a replica here"))
+        .inspect_err(|e| eprintln!("kithd: services: kithd passes every connection itself: {e}"))
+        .ok()
+        .map(|netns| (netns, Vec::new()));
     loop {
         let (wanted, reports) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -809,6 +817,15 @@ pub async fn run(
         }
         if !threads.is_empty() {
             keys.insert((me, port));
+        }
+        if let Some((netns, last)) = &mut kernel {
+            let entries = kernel_entries(&wanted, proxy.me()).await;
+            if entries != *last {
+                match connect::attach(&entries, *netns) {
+                    Ok(()) => *last = entries,
+                    Err(e) => eprintln!("kithd: services: the kernel's program: {e}"),
+                }
+            }
         }
         proxy.turns.keep(&wanted);
         proxy.forget();
@@ -862,6 +879,25 @@ pub async fn run(
         .flatten()
         .chain(&stray)
         .for_each(tokio::task::JoinHandle::abort);
+}
+
+/// What the kernel passes itself: (spike) a Service port whose every backend is a
+/// container on this node's network, which answers on its loopback.
+async fn kernel_entries(table: &Table, me: &str) -> Vec<connect::Entry> {
+    let mut entries = Vec::new();
+    for (&service, backends) in table {
+        let Some((_, port, _, _)) = backends.first() else { continue };
+        if !backends.iter().all(|(node, at, _, replica)| node == me && at == port && replica.is_none()) {
+            continue;
+        }
+        let v4 = within(TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port))).await.is_ok();
+        let ip = if v4 { std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped() } else { Ipv6Addr::LOCALHOST };
+        if v4 || within(TcpStream::connect((Ipv6Addr::LOCALHOST, *port))).await.is_ok() {
+            let here = vec![std::net::SocketAddrV6::new(ip, *port, 0, 0)];
+            entries.push(connect::Entry { service, here, all: 1, elsewhere: None });
+        }
+    }
+    entries
 }
 
 /// `threads` handles on one listener on `at`, one for each thread: one accept queue,

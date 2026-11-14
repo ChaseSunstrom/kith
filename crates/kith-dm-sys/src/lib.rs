@@ -179,11 +179,11 @@ pub fn remove(name: &str) -> Result<()> {
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
 /// (the kernel takes what is past the request's end as zeros). What the kernel answers.
 ///
-/// For the two commands of [`device_filter`] only: neither has the kernel write through
+/// For the two commands of [`cgroup_program`] only: neither has the kernel write through
 /// the request, and what the request points at is alive for the call.
 fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
     // SAFETY: `request` is `request.len()` readable bytes, and the pointers in it (see
-    // `device_filter`) are to memory its caller holds until this returns.
+    // `cgroup_program`) are to memory its caller holds until this returns.
     let said = unsafe { libc::syscall(libc::SYS_bpf, command, request.as_ptr(), request.len()) };
     if said < 0 {
         Err(Error::last_os_error())
@@ -197,28 +197,63 @@ fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
 /// the kernel checks the program before it takes it. It takes the place of the one put
 /// there this way before; the cgroup keeps it, and it goes with the cgroup.
 pub fn device_filter(cgroup: &File, program: &[u8]) -> Result<()> {
+    // BPF_PROG_TYPE_CGROUP_DEVICE, as BPF_CGROUP_DEVICE.
+    cgroup_program(cgroup, program, 15, 6)
+}
+
+/// Make `program` what `cgroup` asks at every connect() of an IPv6 socket by a process
+/// in it, before the kernel looks at the address: the program may write another address
+/// and port in its place. As [`device_filter`]: it takes the place of the one before.
+pub fn connect_filter(cgroup: &File, program: &[u8]) -> Result<()> {
+    // BPF_PROG_TYPE_CGROUP_SOCK_ADDR, as BPF_CGROUP_INET6_CONNECT.
+    cgroup_program(cgroup, program, 18, 11)
+}
+
+/// Load `program` as a `kind` of program for `attach`, and put it on `cgroup` as that.
+fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
     if program.is_empty() || !program.len().is_multiple_of(8) {
         return Err(Error::other("not a program of whole instructions"));
     }
     let license = b"Apache-2.0\0";
-    // BPF_PROG_LOAD: the kind of program (BPF_PROG_TYPE_CGROUP_DEVICE), how many
-    // instructions, where they are, where the licence's name is.
-    let mut load = [0u8; 48];
-    load[0..4].copy_from_slice(&15u32.to_ne_bytes());
+    // BPF_PROG_LOAD: the kind of program, how many instructions, where they are, where
+    // the licence's name is; and (at 68) what it is to be attached as.
+    let mut load = [0u8; 72];
+    load[0..4].copy_from_slice(&kind.to_ne_bytes());
     load[4..8].copy_from_slice(&((program.len() / 8) as u32).to_ne_bytes());
     load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
     load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    load[68..72].copy_from_slice(&attach.to_ne_bytes());
     let loaded = bpf(5, &load)?;
     // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
     let loaded = unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) };
-    // BPF_PROG_ATTACH: to which cgroup, which program, as what (BPF_CGROUP_DEVICE), and
-    // with no flags: the one program of this cgroup, replaced by the next.
-    let mut attach = [0u8; 16];
-    attach[0..4].copy_from_slice(&cgroup.as_raw_fd().to_ne_bytes());
-    attach[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
-    attach[8..12].copy_from_slice(&6u32.to_ne_bytes());
-    bpf(8, &attach).map(drop)
+    // BPF_PROG_ATTACH: to which cgroup, which program, as what, and with no flags: the
+    // one program of this cgroup, replaced by the next.
+    let mut request = [0u8; 16];
+    request[0..4].copy_from_slice(&cgroup.as_raw_fd().to_ne_bytes());
+    request[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
+    request[8..12].copy_from_slice(&attach.to_ne_bytes());
+    bpf(8, &request).map(drop)
+}
+
+/// The cookie of the network namespace this process is in: what a program's
+/// bpf_get_netns_cookie() says for a socket made in it.
+pub fn netns_cookie() -> Result<u64> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
+    let mut cookie = 0u64;
+    let mut size = std::mem::size_of::<u64>() as libc::socklen_t;
+    // SAFETY: SO_NETNS_COOKIE writes at most `size` bytes to `cookie`, which is that big.
+    let said = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            71,
+            (&raw mut cookie).cast(),
+            &raw mut size,
+        )
+    };
+    if said < 0 { Err(Error::last_os_error()) } else { Ok(cookie) }
 }
 
 #[cfg(test)]
