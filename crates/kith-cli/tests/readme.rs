@@ -99,6 +99,49 @@ fn readme_says_nothing_that_was_true_once() {
     }
 }
 
+/// Who reads an Image on a node is said one way in both documents: the registry answers
+/// kithd's own pull only, and neither still says what was so before.
+#[test]
+fn readme_and_security_say_who_reads_an_image_on_a_node() {
+    let security = std::fs::read_to_string(root().join("SECURITY.md")).unwrap();
+    let finding = security
+        .lines()
+        .find(|line| line.contains("The node's own registry answers every local process"))
+        .expect("SECURITY.md: the review's finding about the registry is gone");
+    assert!(finding.contains("| Fixed: "), "{finding}");
+    for (name, text, said) in [
+        (
+            "SECURITY.md",
+            security.as_str(),
+            "nothing but 401 to a request without the password",
+        ),
+        (
+            "SECURITY.md",
+            &security,
+            "kithd pulls an Image only for what runs in the Image's",
+        ),
+        (
+            "README.md",
+            README,
+            "answers kithd's own pull and nothing else on the node",
+        ),
+        (
+            "README.md",
+            README,
+            "runs in a namespace runs that namespace's Images only",
+        ),
+    ] {
+        assert!(text.contains(said), "{name} no longer says {said:?}");
+    }
+    for (name, text, stale) in [
+        ("README.md", README, "can read every Image of the cluster"),
+        ("README.md", README, "works on a node too"),
+        ("SECURITY.md", &security, "can pull every Image of the cluster"),
+    ] {
+        assert!(!text.contains(stale), "{name} still says {stale:?}");
+    }
+}
+
 /// The table beside k3s is the one `sh ci/compare.sh` wrote down: not numbers typed in.
 #[test]
 fn readme_carries_the_measured_comparison() {

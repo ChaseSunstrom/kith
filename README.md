@@ -1743,12 +1743,16 @@ spec:
   image's config and its manifest as Blobs (`copies` nodes hold them, 2 unless said).
   `kith get image hello -o yaml` has the `digest` when it is made, or a `message` saying why
   it was not (tried again every minute).
-- **The registry.** Every node's kithd serves the cluster's Images to its own machine, on
+- **The registry.** Every node's kithd serves the cluster's Images to itself, on
   `127.0.0.1:5000` (`--registry-port`; 0 turns it off), as an OCI registry that can only be
-  read: `localhost:5000/NAMESPACE/NAME:TAG` is the Image `NAME` of `NAMESPACE` on whichever
-  node asks, fetched from a node that holds its Blobs. kith pulls from a registry on
-  `localhost` without TLS, as container tools do (`docker pull localhost:5000/default/hello:1`
-  works on a node too).
+  read: `localhost:5000/NAMESPACE/NAME:TAG` (or `127.0.0.1:5000/…`) is the Image `NAME` of
+  `NAMESPACE` on whichever node runs it, fetched from a node that holds its Blobs. It
+  answers kithd's own pull and nothing else on the node: it speaks TLS under a certificate
+  kithd makes for each start and wants that start's password, and both stay in kithd's
+  memory. So `docker pull localhost:5000/default/hello:1` on a node gets nothing (the
+  Image's status names its Blobs, and `kith blob get` reads one, for who may). Another
+  registry on `localhost`, at another port, is still asked without TLS, as container
+  tools do.
 - **The `kith-build` package** renders the three pieces from a few values: a Volume on the
   node you name, a Job that runs your script in a builder image with the volume at `/out`
   (as root, `runAsUser: 0`: an image's files belong to whoever its build gives them to),
@@ -1770,9 +1774,11 @@ spec:
   what should roll out a new tag (the tag it had is then served no more). A Job deleted
   and applied again just as it was is not seen as a new run: change the tag.
 - Who may: writing an Image takes leave to read its Volume (checked on `kith apply` and a
-  rollback; an Image a Release renders is written by the release, as a Backup is). Every process on a node
-  (containers too: they share its network) can read every Image of the cluster from the
-  registry: put no secrets in one.
+  rollback; an Image a Release renders is written by the release, as a Backup is). What
+  runs in a namespace runs that namespace's Images only: a template in `web` that names
+  `localhost:5000/default/hello:1` is not started, and its status says whose Image that
+  is (make the Image in the namespace that runs it). Nothing else on a node is given an
+  Image: not its other processes, nor its containers (see the registry, above).
 - Not yet (ponytail): a base image under the layer (`FROM`): the volume holds the whole
   root, programs with their libraries or static ones; Dockerfiles; pushing into the
   registry with `docker push`; a registry other machines can reach; deleting an Image

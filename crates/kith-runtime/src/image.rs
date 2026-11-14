@@ -16,9 +16,42 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 pub struct ImageStore {
     root: PathBuf,
+    /// This node's own registry, where it serves one.
+    pub local: Option<Local>,
+}
+
+/// This node's own registry of the cluster's Images, as its kithd made it at this start.
+/// It is asked over TLS, trusting the one certificate it was started with and no other,
+/// with a password nothing else on the node is told.
+#[derive(Clone)]
+pub struct Local {
+    pub port: u16,
+    pub password: String,
+    /// The registry's certificate (DER), made when it is first asked for (a node that
+    /// serves no Image makes no key), or why there is none.
+    pub certificate: Arc<dyn Fn() -> std::result::Result<Vec<u8>, String> + Send + Sync>,
+}
+
+impl Local {
+    /// Whether `registry` (the `host:port` of a reference) is that registry: one of its
+    /// two names at its very port, said just so. Nothing else is sent the password.
+    pub fn is(&self, registry: &str) -> bool {
+        ["localhost", "127.0.0.1"]
+            .iter()
+            .any(|host| registry == format!("{host}:{}", self.port))
+    }
+
+    /// The namespace of the cluster Image `reference` names, if it names one of this
+    /// registry's (`localhost:PORT/NAMESPACE/NAME`).
+    pub fn namespace(&self, reference: &str) -> Option<String> {
+        let reference: Reference = reference.parse().ok()?;
+        let (namespace, _) = reference.repository().split_once('/')?;
+        self.is(reference.registry()).then(|| namespace.to_string())
+    }
 }
 
 /// A pulled, unpacked image.
@@ -92,7 +125,7 @@ impl ImageStore {
         }
         // Images keep their setuid bits; nobody else on this machine gets to run them.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ctx(format!("securing {}", root.display()))?;
-        Ok(ImageStore { root })
+        Ok(ImageStore { root, local: None })
     }
 
     /// Where the store remembers what `reference` resolved to.
@@ -173,11 +206,32 @@ impl ImageStore {
                 ),
             });
         }
-        let client = Client::new(ClientConfig {
-            protocol: protocol(reference.registry()),
-            ..ClientConfig::default()
-        });
-        let auth = RegistryAuth::Anonymous;
+        // The node's own registry is shown its password only once it has shown the
+        // certificate it was started with: whatever else listens on that port is not it.
+        let own = self.local.as_ref().filter(|local| local.is(reference.registry()));
+        let (config, auth) = match own {
+            Some(local) => (
+                ClientConfig {
+                    protocol: oci_client::client::ClientProtocol::Https,
+                    tls_certs_only: vec![oci_client::client::Certificate {
+                        encoding: oci_client::client::CertificateEncoding::Der,
+                        data: (local.certificate)().ctx("the node's registry")?,
+                    }],
+                    ..ClientConfig::default()
+                },
+                RegistryAuth::Basic("kithd".into(), local.password.clone()),
+            ),
+            None => (
+                ClientConfig {
+                    protocol: protocol(reference.registry()),
+                    ..ClientConfig::default()
+                },
+                RegistryAuth::Anonymous,
+            ),
+        };
+        // (Not `Client::new`: it falls back to a client with every usual root when it is
+        // given a certificate it cannot read.)
+        let client = Client::try_from(config).ctx("setting up the registry client")?;
         let (manifest, digest, config, list) = client
             .pull_manifest_and_config_and_list_digest(&reference, &auth)
             .await
@@ -732,6 +786,114 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.to_string().contains("unsupported layer type"), "{e}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The node's own registry is two names at one port and nothing that looks like them:
+    /// the password goes nowhere else, and an Image's namespace is read from no other.
+    #[test]
+    fn the_nodes_own_registry_is_its_two_names_at_its_port_and_nothing_else() {
+        let local = Local {
+            port: 5000,
+            password: "p".into(),
+            certificate: Arc::new(|| Ok(Vec::new())),
+        };
+        for own in ["localhost:5000", "127.0.0.1:5000"] {
+            assert!(local.is(own), "{own}");
+            let of = local.namespace(&format!("{own}/team/hello:1"));
+            assert_eq!(of.as_deref(), Some("team"), "{own}");
+        }
+        for other in [
+            "localhost",
+            "localhost:5001",
+            "localhost:50000",
+            "127.0.0.1",
+            "127.0.0.2:5000",
+            "[::1]:5000",
+            "localhost.example.org:5000",
+            "localhost:5000.example.org",
+            "example.org",
+            "LOCALHOST:5000",
+            "0.0.0.0:5000",
+        ] {
+            assert!(!local.is(other), "{other}");
+            assert_eq!(local.namespace(&format!("{other}/team/hello:1")), None, "{other}");
+        }
+        // (Not an Image's name: the registry has nothing there, and the pull says so.)
+        assert_eq!(local.namespace("localhost:5000/hello:1"), None);
+        assert_eq!(local.namespace("docker.io/team/hello:1"), None);
+    }
+
+    /// Whatever listens on the node's registry port without its certificate is shown a
+    /// TLS handshake and no password; and a registry that is not the node's own is asked
+    /// as before, with none.
+    #[tokio::test]
+    async fn the_registry_password_is_shown_to_the_nodes_own_registry_only() {
+        use std::io::Write;
+        let (dir, _) = sandbox("local-password");
+        let heard = |listener: std::net::TcpListener| {
+            let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let into = heard.clone();
+            std::thread::spawn(move || {
+                for mut stream in listener.incoming().flatten() {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(300)));
+                    let mut said = vec![0; 4096];
+                    let n = stream.read(&mut said).unwrap_or(0);
+                    into.lock().unwrap().extend_from_slice(&said[..n]);
+                    let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            });
+            heard
+        };
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (port, far) = (
+            squatter.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        let (squatted, asked) = (heard(squatter), heard(other));
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        // (Somebody's certificate for `localhost`, made for this test and its key thrown
+        // away: what the node's registry would have shown, and the squatter cannot.)
+        let certificate = "MIIBejCCASCgAwIBAgIUeB0Ob+IUKMsyzojHgFVmKdxIbzgwCgYIKoZIzj0EAwIw\
+            FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNDEzMTAwMVoYDzIxMjYxMDIx\
+            MTMxMDAxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\
+            PQMBBwNCAASemNdrUoBlAEh3pDAfln2GeFxSD58qyJsodvGQwHokep/TNITm0gEc\
+            JQ2HJ/9ADMuLuqsXxCNIi28RTHguK4xuo04wTDAdBgNVHQ4EFgQUBVWGeBlQwQFA\
+            EPE2hy5k7nDZ8X4wDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhv\
+            c3SHBH8AAAEwCgYIKoZIzj0EAwIDSAAwRQIgJ7+DxgUL05UX018RauiWDrv57XiZ\
+            kSKcG5ltxXmnZxMCIQDVSGK947WkxHyq5NIweKHgaf2GQNp8BU3fWPQ44u+doA==";
+        let certificate = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, certificate).unwrap();
+        store.local = Some(Local {
+            port,
+            password: "open-sesame".into(), // pragma: allowlist secret
+            certificate: Arc::new(move || Ok(certificate.clone())),
+        });
+        let secret = |heard: &std::sync::Mutex<Vec<u8>>| {
+            let heard = String::from_utf8_lossy(&heard.lock().unwrap()).to_lowercase();
+            // (`kithd:open-sesame`, as Basic sends it.)
+            heard.contains("authorization") || heard.contains("a2l0aGQ6b3Blbi1zZXNhbWU")
+        };
+        for name in ["localhost", "127.0.0.1"] {
+            let pulled = store
+                .pull(&format!("{name}:{port}/team/hello:1"), PullPolicy::Always)
+                .await;
+            assert!(pulled.is_err(), "{name}: nothing there shows the node's certificate");
+        }
+        // (A TLS hello and nothing after it: 0x16 is a handshake record.)
+        assert_eq!(
+            squatted.lock().unwrap().first(),
+            Some(&0x16),
+            "it was asked for its certificate"
+        );
+        assert!(!secret(&squatted), "whoever took the port was told the password");
+        // Another registry on this machine, which asks for a password: it is not given this one.
+        let pulled = store
+            .pull(&format!("127.0.0.1:{far}/team/hello:1"), PullPolicy::Always)
+            .await;
+        assert!(pulled.is_err());
+        assert!(!asked.lock().unwrap().is_empty(), "it was asked");
+        assert!(!secret(&asked), "another registry was told the password");
         fs::remove_dir_all(&dir).unwrap();
     }
 

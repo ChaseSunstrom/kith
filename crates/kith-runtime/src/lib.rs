@@ -16,7 +16,7 @@ mod seccomp;
 pub mod signed;
 
 pub use container::{Awaited, Handle, Mount, Runtime, Unit, exec_shim, reap_orphans, spawn_awaited, tune};
-pub use image::{Image, ImageStore, PullPolicy};
+pub use image::{Image, ImageStore, Local, PullPolicy};
 pub use seccomp::REFUSED;
 
 #[derive(Debug)]

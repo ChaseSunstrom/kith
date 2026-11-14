@@ -2499,8 +2499,9 @@ spec:
 }
 
 /// The cluster makes an image of its own and runs it: a Job fills a Volume, an Image packs
-/// the volume when the Job has succeeded, the node's registry serves it, and a Job whose
-/// container is that image runs what was built. (The container needs a program with no
+/// the volume when the Job has succeeded, the node's registry serves it to kithd's own pull
+/// and to nobody else, and a Job whose container is that image runs what was built; a
+/// Workload of another namespace is not given it. (The container needs a program with no
 /// libraries: kith built for musl, `sh ci/musl.sh`, or `KITH_E2E_STATIC`; without one the
 /// test ends once the registry has served the image.)
 #[test]
@@ -2553,31 +2554,49 @@ spec:
     let digest = status["digest"].as_str().unwrap();
     assert_eq!(status["blobs"].as_object().unwrap().len(), 3, "{status}");
 
-    // The registry: the manifest by its tag, under its digest; nothing under another tag.
-    let get = |path: &str| {
+    // The registry answers kithd's own pull and nothing else on the node: who asks it as
+    // any process could (no TLS, no password) is told nothing, of an Image or at all.
+    for path in ["/v2/", "/v2/default/hello/manifests/1"] {
         let mut registry = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        write!(
-            registry,
-            "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut reply = String::new();
-        registry.read_to_string(&mut reply).unwrap();
-        reply
+        registry
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        // (In one write, and it may fail: the registry hangs up at the first bytes that
+        // are not TLS.)
+        let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let _ = registry.write_all(request.as_bytes());
+        let mut reply = Vec::new();
+        let _ = registry.read_to_end(&mut reply);
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(
+            !reply.contains("HTTP/1.1") && !reply.contains(digest),
+            "{path}: {reply}"
+        );
+    }
+
+    // Another namespace is not given the Image, by kithd's own pull either.
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1
+kind: Namespace
+metadata: {{ name: other }}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {{ name: theirs, namespace: other }}
+spec:
+  template:
+    containers:
+      - name: main
+        image: localhost:{port}/default/hello:1
+"
+    ));
+    let theirs = || -> serde_json::Value {
+        let got = daemon.ok(&["get", "workload/theirs", "-n", "other", "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&got).unwrap()["status"]["containers"][0].clone()
     };
-    assert!(get("/v2/").starts_with("HTTP/1.1 200"));
-    let manifest = get("/v2/default/hello/manifests/1");
-    assert!(manifest.starts_with("HTTP/1.1 200"), "{manifest}");
-    assert!(
-        manifest.contains(&format!("docker-content-digest: {digest}")),
-        "{manifest}"
-    );
-    assert!(
-        manifest.contains("application/vnd.oci.image.layer.v1.tar"),
-        "{manifest}"
-    );
-    assert!(get("/v2/default/hello/manifests/2").starts_with("HTTP/1.1 404"));
-    assert!(get("/v2/other/hello/manifests/1").starts_with("HTTP/1.1 404"));
+    wait_for("the other namespace to be refused", || theirs()["state"] == "failed");
+    let why = theirs()["message"].to_string();
+    assert!(why.contains("is the Image of namespace `default`"), "{why}");
 
     if fixed.is_none() {
         return eprintln!("the image was not run: no static program (sh ci/musl.sh, or KITH_E2E_STATIC)");

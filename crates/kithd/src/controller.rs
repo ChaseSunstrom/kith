@@ -1070,6 +1070,9 @@ async fn start(
                 Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
                 Some(PullPolicy::Never) => kith_runtime::PullPolicy::Never,
             };
+            if let Some(why) = not_its_image(runtime.images.local.as_ref(), &slot.owner, &c.image) {
+                return Err(why);
+            }
             let image = runtime
                 .images
                 .pull_signed(&c.image, policy, &c.signed_by)
@@ -1092,9 +1095,64 @@ async fn start(
     }
 }
 
+/// Why a unit of `owner` (`Kind/namespace/name`) is not given `image`: it names an Image
+/// of the cluster that is another namespace's. An Image is a packed Volume, and the node
+/// keeps what it has pulled by its reference, whoever it was pulled for: so this is asked
+/// before every pull, and before the node looks at what it holds.
+fn not_its_image(local: Option<&kith_runtime::Local>, owner: &str, image: &str) -> Option<String> {
+    let theirs = local?.namespace(image)?;
+    // (`Kind/namespace/name`: what has no namespace has no Images.)
+    let mine = match owner.split('/').collect::<Vec<_>>()[..] {
+        [_, mine, _] => mine,
+        _ => "",
+    };
+    (theirs != mine).then(|| {
+        format!(
+            "image `{image}` is the Image of namespace `{theirs}`: what runs in `{mine}` runs the Images of `{mine}`"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit runs the cluster Images of its own namespace and no other's, by either name
+    /// of the node's registry; what is not that registry's is nothing to this.
+    #[test]
+    fn an_image_of_another_namespace_is_not_run() {
+        let local = kith_runtime::Local {
+            port: 5000,
+            password: String::new(),
+            certificate: std::sync::Arc::new(|| Ok(Vec::new())),
+        };
+        let refused = |owner: &str, image: &str| not_its_image(Some(&local), owner, image);
+        let by_digest = format!("127.0.0.1:5000/team/hello@sha256:{}", "a".repeat(64));
+        for own in ["localhost:5000/team/hello:1", &by_digest] {
+            assert_eq!(refused("Workload/team/web", own), None, "{own}");
+            for other in ["Workload/default/web", "Job/team2/build", "NodeWorkload/tea/agent"] {
+                let why = refused(other, own).unwrap_or_else(|| panic!("{other} was given {own}"));
+                assert!(why.contains("namespace `team`") && why.contains(own), "{why}");
+            }
+        }
+        for elsewhere in [
+            "docker.io/team/hello:1",
+            "localhost:5001/team/hello:1",
+            "registry.example:5000/team/hello:1",
+            "busybox",
+        ] {
+            assert_eq!(refused("Workload/default/web", elsewhere), None, "{elsewhere}");
+        }
+        // What has no namespace is given no namespace's Image, whatever it is called.
+        for none in ["Workload/team", "team", "", "Workload/team/web/more"] {
+            assert!(refused(none, "localhost:5000/team/hello:1").is_some(), "{none:?}");
+        }
+        // A node that serves no registry has no Images to keep apart.
+        assert_eq!(
+            not_its_image(None, "Workload/default/web", "localhost:5000/team/hello:1"),
+            None
+        );
+    }
 
     /// The names a template may allow back are the names the runtime's filter knows.
     #[test]

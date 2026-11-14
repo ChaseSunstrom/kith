@@ -518,7 +518,19 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if std::fs::symlink_metadata(&socket).is_ok_and(|meta| meta.file_type().is_socket()) {
         let _ = std::fs::remove_file(&socket);
     }
-    let runtime = kith_runtime::Runtime::new(state.join("runtime"));
+    let mut runtime = kith_runtime::Runtime::new(state.join("runtime"));
+    // The registry's door, and the one copy of what opens it: the runtime's, for its pulls.
+    // (No door is no kithd: without one a pull of `localhost:PORT/…` would ask whatever
+    // else took the port, in the clear.)
+    let door = match args.registry_port {
+        0 => None,
+        port => Some(Arc::new(
+            images::Door::new(port).map_err(|e| fail("making the registry's door", &e))?,
+        )),
+    };
+    if let (Ok(runtime), Some(door)) = (&mut runtime, &door) {
+        runtime.images.local = Some(door.local.clone());
+    }
 
     let upstream = |address: &String| {
         let with_port = address.parse().ok();
@@ -686,7 +698,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
         let images = images::run(shared.clone(), state.clone(), stopping.clone());
         let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
-        let registry = images::serve(shared.clone(), args.registry_port, stopping.clone());
+        let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry, encrypted) };
         let (served, nodes, (), (), (), (), (), _) =
             tokio::join!(server, nodes, work, names, mesh, proxy, ingress, storage);

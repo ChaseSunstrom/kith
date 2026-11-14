@@ -78,6 +78,19 @@ Only the newest version is fixed. There are no security releases of older ones.
   the package's own `templates/` and nothing else (no file of the node, no time, no
   network).
 - **kith OS updates** are taken only with a signature, and never to an older version.
+- **The node's own registry** (`127.0.0.1:5000`, the cluster's Images) answers that
+  node's kithd and nothing else on the node, though every process and container of the
+  node can connect to it. For each start kithd makes a password and, when the registry
+  is first asked, a certificate, keeps both in its memory (no file, no argument, no
+  container's environment) and gives them to its own pull alone: the registry speaks only TLS under that certificate and says
+  nothing but 401 to a request without the password, whatever it asks for. The pull
+  trusts that one certificate and sends the password only to `localhost` or `127.0.0.1`
+  at the registry's own port, so neither what is pulled nor the password is read off the
+  loopback (by a container that is the node's root, say; that a pull happens, and how
+  large, still shows) and a process that takes the port in kithd's place learns no
+  password. A process of the node that floods the port can hold Image pulls up. And kithd pulls an Image only for what runs in the Image's
+  own namespace: an Image is a packed Volume. Reading kithd's memory is being root on
+  the node outside any container, which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
@@ -113,9 +126,6 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   stop working on the node-to-node routes. Take its disk, or make a new cluster.
 - **A Release is the right to apply whatever its packages render**, with the node's
   rights and not the writer's; the same for a Source. (T-0229, T-0227.)
-- **Every process on a node, containers included, can pull every Image of the cluster**
-  from the node's own registry on `127.0.0.1:5000`, whatever its namespace. An Image is
-  a packed Volume. (T-0228.)
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
   Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
@@ -169,7 +179,7 @@ Severity:
 | 2 | High (not traced all the way: it is a race) | A workload that swaps a directory or a file of its volume for a link while the node archives the volume had the node read what the link names, as kithd, into a Backup or an Image the workload's owner can read. | Fixed: the archive is read through held directory handles and follows no link; it stops at 128 directories deep. |
 | 3 | High | An exposed host went to whichever Service asked first, in any namespace; with `--acme` anyone who may write a Service had certificates ordered for names of their choosing. | Fixed in part: a Namespace keeps hosts (`hosts`), and exposes no others once it names any. Open where none is kept: T-0233. |
 | 4 | Medium | An Identity allowed to push a package could have the node send it to an address only the node reaches (its loopback, its networks), by naming such a registry or one that sends the upload on to there. | Fixed: when an Identity asks, every request of the push goes only to an address that was checked, as a Source's fetch does. |
-| 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Open: T-0228. |
+| 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Open: T-0230. |
 | 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Open: T-0231. |

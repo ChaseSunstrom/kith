@@ -7,6 +7,8 @@
 //!
 //! Every node serves the cluster's Images to itself, as a registry that can only be read:
 //! `localhost:PORT/NAMESPACE/NAME:TAG` is the Image `NAME` of `NAMESPACE`, on any node.
+//! "Itself" is kithd's own pull and nothing else on the node: an Image is a packed Volume,
+//! and every process and container of the node can reach its loopback (see [`Door`]).
 //
 // ponytail: one layer and no base image (the volume holds the whole root); made once for a
 // spec (a new tag is a new image: nodes keep a tag they have pulled); nothing is pushed
@@ -18,7 +20,7 @@ use crate::Shared;
 use crate::blobs::Incoming;
 use crate::volumes::Dir;
 use axum::body::Body;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use kith_api::kinds::ImageSpec;
 use kith_api::store::Store;
@@ -26,7 +28,7 @@ use kith_store::Command;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -288,12 +290,20 @@ async fn answer(shared: Arc<Shared>, uri: Uri) -> Response {
     };
     let Some((key, sha)) = known else { return unknown() };
     let file = match crate::blobs::here(&shared, &key).await {
-        Ok(path) => std::fs::File::open(path).and_then(|file| Ok((file.metadata()?.len(), file))),
+        Ok(path) => std::fs::File::open(path),
         Err(e) => Err(std::io::Error::other(e)),
     };
-    match file {
+    if let Err(e) = &file {
+        eprintln!("kithd: registry: {key}: {e}");
+    }
+    piece(uri.path(), &sha, file)
+}
+
+/// The piece `sha` of an image as the registry sends it, asked for at `path`.
+fn piece(path: &str, sha: &str, file: std::io::Result<std::fs::File>) -> Response {
+    match file.and_then(|file| Ok((file.metadata()?.len(), file))) {
         Ok((size, file)) => {
-            let kind = if uri.path().contains("/manifests/") {
+            let kind = if path.contains("/manifests/") {
                 MANIFEST
             } else {
                 "application/octet-stream"
@@ -308,28 +318,176 @@ async fn answer(shared: Arc<Shared>, uri: Uri) -> Response {
             ];
             (head, Body::from_stream(crate::blobs::chunks(file))).into_response()
         }
-        Err(e) => {
-            eprintln!("kithd: registry: {key}: {e}");
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
     }
 }
 
-/// Serves the cluster's Images on this node's loopback, to read (0: not at all).
-pub async fn serve(shared: Arc<Shared>, port: u16, mut stopping: watch::Receiver<bool>) {
-    if port == 0 {
-        return;
+/// The registry's certificate (DER) and the server that shows it, or why there is neither.
+type Tls = Result<(Vec<u8>, Arc<rustls::ServerConfig>), String>;
+
+/// What stands between this node's registry and everything on the node that is not
+/// kithd's own pull. Made anew for every start and written nowhere: a certificate only
+/// that pull trusts (so nothing of a pull is read off the loopback, and whoever takes the
+/// port in kithd's place is shown no password), and a password only it is given.
+pub struct Door {
+    pub local: kith_runtime::Local,
+    /// Made when the registry is first asked, by the pull or by whoever connects: making
+    /// a key at start cost a node that serves no Image half a megabyte of resident memory.
+    tls: Arc<OnceLock<Tls>>,
+    /// SHA-256 of the `authorization` a request must carry.
+    wanted: [u8; 32],
+}
+
+impl Door {
+    pub fn new(port: u16) -> Result<Door, String> {
+        let mut secret = [0u8; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut secret)
+            .map_err(|_| "no random bytes from the system")?;
+        let password = hex(&secret);
+        let tls = Arc::new(OnceLock::new());
+        let made = tls.clone();
+        let certificate = move || match Door::made(&made) {
+            Ok((certificate, _)) => Ok(certificate.clone()),
+            Err(e) => Err(e.clone()),
+        };
+        let said = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        Ok(Door {
+            wanted: Sha256::digest(format!("Basic {said}")).into(),
+            tls,
+            local: kith_runtime::Local {
+                port,
+                password,
+                certificate: Arc::new(certificate),
+            },
+        })
     }
-    let listener = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
-        Ok(listener) => listener,
+
+    fn made(tls: &OnceLock<Tls>) -> &Tls {
+        tls.get_or_init(crate::pki::local_config)
+    }
+
+    /// What a request that does not carry this start's password is told; `None` lets it in.
+    // Digests are compared, so how long that takes says nothing about the password.
+    fn refusal(&self, headers: &HeaderMap) -> Option<Response> {
+        let said = headers.get(header::AUTHORIZATION).map(|said| said.as_bytes());
+        if <[u8; 32]>::from(Sha256::digest(said.unwrap_or_default())) == self.wanted {
+            return None;
+        }
+        let why =
+            json!({ "errors": [{ "code": "UNAUTHORIZED", "message": "this registry answers its node's kithd only" }] });
+        // (Basic, and no token realm: there is nowhere else to send the password.)
+        let ask = [(header::WWW_AUTHENTICATE, "Basic realm=\"kithd\"")];
+        Some((StatusCode::UNAUTHORIZED, ask, axum::Json(why)).into_response())
+    }
+}
+
+/// TLS handshakes going on at once, and how long one may take: whoever connects and says
+/// nothing holds one of the slots that long and no longer. (On the loopback a handshake
+/// is milliseconds; the slots are many and the time short so that kithd's own pull, in
+/// line behind a thousand connections that say nothing, waits seconds and not minutes.)
+// ponytail: a process of the node that keeps connecting faster than that still holds the
+// pulls of Images up, as it could fill the node's ports; and a connection that has shaken
+// hands is not counted, as none was before there was a door. A limit per peer's user
+// (SO_PEERCRED has none on TCP: by its port's owner) if that is ever seen.
+const HANDSHAKES: usize = 256;
+const HANDSHAKE: Duration = Duration::from_secs(2);
+
+type Secured = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+
+/// The registry's connections, each once its handshake is done.
+struct Listener(
+    tokio::sync::mpsc::Receiver<(Secured, std::net::SocketAddr)>,
+    std::net::SocketAddr,
+);
+
+impl axum::serve::Listener for Listener {
+    type Io = Secured;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Secured, std::net::SocketAddr) {
+        match self.0.recv().await {
+            Some(accepted) => accepted,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        Ok(self.1)
+    }
+}
+
+fn listen(tcp: tokio::net::TcpListener, tls: Arc<OnceLock<Tls>>) -> std::io::Result<Listener> {
+    let at = tcp.local_addr()?;
+    let (tx, ready) = tokio::sync::mpsc::channel(HANDSHAKES);
+    let slots = Arc::new(tokio::sync::Semaphore::new(HANDSHAKES));
+    tokio::spawn(async move {
+        loop {
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                return;
+            };
+            let accepted = tokio::select! {
+                // (Nobody serves any more: the port is given back.)
+                () = tx.closed() => return,
+                accepted = tcp.accept() => accepted,
+            };
+            let Ok((stream, from)) = accepted else {
+                // Out of file descriptors, most likely: let some close.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            let (tls, tx) = (tls.clone(), tx.clone());
+            tokio::spawn(async move {
+                // (No certificate: nobody is let in, and the pull says why.)
+                let Ok((_, tls)) = Door::made(&tls) else { return };
+                let acceptor = tokio_rustls::TlsAcceptor::from(tls.clone());
+                let shaken = tokio::time::timeout(HANDSHAKE, acceptor.accept(stream)).await;
+                drop(slot);
+                if let Ok(Ok(stream)) = shaken {
+                    let _ = tx.send((stream, from)).await;
+                }
+            });
+        }
+    });
+    Ok(Listener(ready, at))
+}
+
+/// `app` on `tcp` behind the door: TLS, and the password before anything of a request
+/// (its path, too) is looked at, whatever it asks for.
+async fn behind(
+    tcp: tokio::net::TcpListener,
+    door: Arc<Door>,
+    app: axum::Router,
+    mut stopping: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let listener = listen(tcp, door.tls.clone())?;
+    let guard = move |request: axum::extract::Request, next: axum::middleware::Next| {
+        let door = door.clone();
+        async move {
+            match door.refusal(request.headers()) {
+                Some(refused) => refused,
+                None => next.run(request).await,
+            }
+        }
+    };
+    let app = app.layer(axum::middleware::from_fn(guard));
+    let served = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = stopping.changed().await;
+    });
+    served.await
+}
+
+/// Serves the cluster's Images on this node's loopback, to kithd's own pulls (no door:
+/// not at all).
+pub async fn serve(shared: Arc<Shared>, door: Option<Arc<Door>>, stopping: watch::Receiver<bool>) {
+    let Some(door) = door else { return };
+    let port = door.local.port;
+    let tcp = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+        Ok(tcp) => tcp,
         Err(e) => return eprintln!("kithd: registry: 127.0.0.1:{port}: {e}: Images are not served on this node"),
     };
     // (`get` answers HEAD too, without the body.)
     let app = axum::Router::new().fallback(axum::routing::get(move |uri: Uri| answer(shared.clone(), uri)));
-    let served = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = stopping.changed().await;
-    });
-    if let Err(e) = served.await {
+    if let Err(e) = behind(tcp, door, app, stopping).await {
         eprintln!("kithd: registry: {e}");
     }
 }
@@ -353,6 +511,176 @@ mod tests {
     /// A directory becomes an image a registry can serve: the manifest names the config and
     /// the layer by what their bytes hash to, the config names the layer, and the layer is
     /// the directory.
+    /// `app` behind a door of its own, on a port of this machine; the sender stops it.
+    async fn opened(app: axum::Router) -> (Arc<Door>, watch::Sender<bool>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let door = Arc::new(Door::new(tcp.local_addr().unwrap().port()).unwrap());
+        let (stop, stopping) = watch::channel(false);
+        tokio::spawn(behind(tcp, door.clone(), app, stopping));
+        (door, stop)
+    }
+
+    /// Nothing is said to who does not carry this start's password, whatever is asked
+    /// for and however: every path there is and those there are not, with no password,
+    /// a wrong one, the right one under another name or as a token. And nothing at all
+    /// to who does not speak TLS, or does not trust the certificate of this start.
+    #[tokio::test]
+    async fn the_registry_needs_the_nodes_password_whatever_is_asked() {
+        let inside = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let (door, _stop) = opened(inside).await;
+        let (port, password) = (door.local.port, door.local.password.clone());
+        assert!(
+            door.tls.get().is_none(),
+            "a key was made before anybody asked the registry"
+        );
+        let trusted = reqwest::Certificate::from_der(&(door.local.certificate)().unwrap()).unwrap();
+        let client = reqwest::Client::builder().tls_certs_only([trusted]).build().unwrap();
+        let sha = "a".repeat(64);
+        for path in [
+            "/v2/".to_string(),
+            "/v2".into(),
+            "/v2/team/hello/manifests/1".into(),
+            format!("/v2/team/hello/manifests/sha256:{sha}"),
+            format!("/v2/team/hello/blobs/sha256:{sha}"),
+            "/v2/team/hello/tags/list".into(),
+            "/v2/_catalog".into(),
+            "/v2/team/hello/blobs/uploads/".into(),
+            "/".into(),
+            "/v1/apply".into(),
+        ] {
+            let url = format!("https://localhost:{port}{path}");
+            for method in [reqwest::Method::GET, reqwest::Method::HEAD, reqwest::Method::POST] {
+                let ask = || client.request(method.clone(), &url);
+                let outside = [
+                    ask(),
+                    ask().basic_auth("kithd", Some("not-it")),
+                    ask().basic_auth("kithd", None::<&str>),
+                    ask().basic_auth("root", Some(&password)),
+                    ask().bearer_auth(&password),
+                    ask().header("authorization", &password),
+                ];
+                for (n, request) in outside.into_iter().enumerate() {
+                    let said = request.send().await.unwrap();
+                    assert_eq!(said.status(), 401, "{method} {path} (try {n})");
+                    let how = said.headers()["www-authenticate"].to_str().unwrap().to_string();
+                    assert!(how.starts_with("Basic "), "{how}");
+                    assert!(!said.text().await.unwrap().contains("inside"), "{method} {path}");
+                }
+            }
+            let said = client
+                .get(&url)
+                .basic_auth("kithd", Some(&password))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                (said.status().as_u16(), said.text().await.unwrap().as_str()),
+                (200, "inside"),
+                "{path}"
+            );
+        }
+        // The password of another start (another door) opens nothing here.
+        let other = Door::new(port).unwrap();
+        let url = format!("https://127.0.0.1:{port}/v2/");
+        let said = client.get(&url).basic_auth("kithd", Some(&other.local.password));
+        assert_eq!(said.send().await.unwrap().status(), 401);
+        // Without TLS there is no answer at all, with the password or without.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        let request = format!("GET /v2/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {basic}\r\n\r\n");
+        plain.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(10), plain.read_to_end(&mut reply)).await;
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(!reply.contains("HTTP/1.1") && !reply.contains("inside"), "{reply}");
+        // And who trusts the usual authorities, or another start's certificate, hangs up.
+        for roots in [
+            None,
+            Some(reqwest::Certificate::from_der(&(other.local.certificate)().unwrap()).unwrap()),
+        ] {
+            let builder = reqwest::Client::builder();
+            let stranger = match roots {
+                Some(root) => builder.tls_certs_only([root]),
+                None => builder,
+            };
+            let asked = stranger.build().unwrap().get(&url).basic_auth("kithd", Some(&password));
+            assert!(asked.send().await.is_err());
+        }
+    }
+
+    /// kithd's own pull, given what the door was made with, gets the image by either name
+    /// of the registry; a pull without it, with another password or trusting another
+    /// certificate gets nothing.
+    #[tokio::test]
+    async fn the_registry_serves_kithds_own_pull_and_no_other() {
+        let root = std::env::temp_dir().join(format!("kith-registry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, blobs) = (root.join("volume"), root.join("blobs"));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/hello"), "#!/bin/sh\necho hello\n").unwrap();
+        let spec: ImageSpec = serde_json::from_value(json!({ "volume": "out", "entrypoint": ["/bin/hello"] })).unwrap();
+        let [layer, config, manifest] = pack(&dir, &blobs, &spec).unwrap();
+        let at = |what: &str, which: &str| format!("/v2/team/hello/{what}/{which}");
+        let files: std::collections::HashMap<String, (String, PathBuf)> = [
+            (at("manifests", "1"), &manifest),
+            (at("manifests", &format!("sha256:{}", manifest.0)), &manifest),
+            (at("blobs", &format!("sha256:{}", config.0)), &config),
+            (at("blobs", &format!("sha256:{}", layer.0)), &layer),
+        ]
+        .into_iter()
+        .map(|(path, (sha, blob, _))| (path, (sha.clone(), blobs.join(blob))))
+        .collect();
+        let files = Arc::new(files);
+        let serve = move |uri: Uri| {
+            let files = files.clone();
+            async move {
+                match files.get(uri.path()) {
+                    Some((sha, file)) => piece(uri.path(), sha, std::fs::File::open(file)),
+                    None if uri.path() == "/v2/" => "{}".into_response(),
+                    None => StatusCode::NOT_FOUND.into_response(),
+                }
+            }
+        };
+        let (door, _stop) = opened(axum::Router::new().fallback(axum::routing::get(serve))).await;
+        let port = door.local.port;
+        let store = |name: &str, local: Option<kith_runtime::Local>| {
+            let mut store = kith_runtime::ImageStore::new(root.join(name)).unwrap();
+            store.local = local;
+            store
+        };
+        let always = kith_runtime::PullPolicy::Always;
+        let own = store("own", Some(door.local.clone()));
+        for name in ["localhost", "127.0.0.1"] {
+            let image = own.pull(&format!("{name}:{port}/team/hello:1"), always).await.unwrap();
+            assert_eq!(image.digest, format!("sha256:{}", manifest.0));
+            assert_eq!(image.entrypoint, ["/bin/hello"]);
+            let run = std::fs::read_to_string(image.rootfs.join("bin/hello")).unwrap();
+            assert!(run.contains("echo hello"), "{run}");
+        }
+        let other = Door::new(port).unwrap().local;
+        let wrong_password = kith_runtime::Local {
+            password: other.password.clone(),
+            ..door.local.clone()
+        };
+        let wrong_certificate = kith_runtime::Local {
+            certificate: other.certificate.clone(),
+            ..door.local.clone()
+        };
+        for (name, local) in [
+            ("none", None),
+            ("password", Some(wrong_password)),
+            ("certificate", Some(wrong_certificate)),
+            ("neither", Some(other)),
+        ] {
+            let stranger = store(name, local);
+            let pulled = stranger.pull(&format!("localhost:{port}/team/hello:1"), always).await;
+            assert!(pulled.is_err(), "a pull with {name} of the door's was served");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn an_image_packed_from_a_directory_is_a_whole_oci_image() {
         let root = std::env::temp_dir().join(format!("kith-image-{}", std::process::id()));

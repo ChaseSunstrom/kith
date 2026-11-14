@@ -259,6 +259,24 @@ pub fn server_config(identity: &Identity) -> Fallible<Arc<ServerConfig>> {
     Ok(Arc::new(tls("setting up TLS", config)?))
 }
 
+/// TLS for the node's own registry, for this start only: a certificate for `localhost`
+/// that nobody signed and no file holds (DER, for the one client that is to trust it),
+/// and the server that shows it.
+pub fn local_config() -> Fallible<(Vec<u8>, Arc<ServerConfig>)> {
+    let key = tls("making the registry's key", KeyPair::generate())?;
+    let names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    let params = tls("making the registry's certificate", CertificateParams::new(names))?;
+    let cert = tls("making the registry's certificate", params.self_signed(&key))?;
+    let der = cert.der().clone();
+    let config = tls(
+        "setting up TLS",
+        ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
+    )?
+    .with_no_client_auth()
+    .with_single_cert(vec![der.clone()], PrivateKeyDer::Pkcs8(key.serialize_der().into()));
+    Ok((der.to_vec(), Arc::new(tls("setting up TLS", config)?)))
+}
+
 /// A certificate chain and its key (both PEM) as a server shows them for `host`. Not if the
 /// key is another certificate's, or the leaf does not name `host`.
 pub fn certified(chain: &str, key: &str, host: &str) -> Fallible<rustls::sign::CertifiedKey> {
