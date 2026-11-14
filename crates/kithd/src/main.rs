@@ -51,6 +51,7 @@ mod tpm;
 mod ui;
 mod update;
 mod vm;
+mod volume_files;
 mod volumes;
 mod wasm;
 

@@ -105,6 +105,7 @@ is still there when it starts again.
 | Let other people and programs in, each with their own rights | [Who may do what](#who-may-do-what) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](#hardware) |
 | Keep data: volumes, shares, replicas, backups | [Storage](#storage) |
+| Copy files into a volume or out of it, or move a guest's data in | [Files in and out of a volume](#files-in-and-out-of-a-volume) |
 | See it and change it in a browser | [Web UI](#web-ui) |
 | Make a machine nothing but a node, and keep it updated | [kith OS](#kith-os-kithd-as-the-machines-first-process) |
 | Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s) |
@@ -1184,11 +1185,20 @@ guest becomes, and what is still missing:
 | an app that must go out through a VPN | a Workload with an exit | not yet |
 | a VM with no image (an appliance) | a [`vms` unit](#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
 
-Moving a guest's data: stop the guest, apply the Volume, and put the directory into it
-(`kith volume put`, not yet: until then, copy it into the Volume's directory on the node
-that holds it, as [Storage](#storage) says where that is, owned by the user its
-container runs as). Move one guest at a time and
-keep the old one stopped, not deleted, until the new one has run a week.
+Moving a guest's data, one guest at a time:
+
+1. Stop the app in the guest, so its files are whole.
+2. Apply the Volume its Workload will mount (`kith apply -f app.yaml`; the Workload may
+   wait with `replicas: 0`).
+3. From a machine that reaches both, send the directory:
+   `ssh GUEST tar -cf - -C /var/lib/app . | kith volume put app-data -`
+   (or `kith volume put app-data ./a-copy` for a copy you already have). It says how many
+   files went in and names any link it left out; see
+   [Files in and out of a volume](#files-in-and-out-of-a-volume) for what it refuses.
+4. Start the Workload and look at the app. The files are its user's whatever they were
+   in the guest.
+
+Keep the old guest stopped, not deleted, until the new one has run a week.
 
 kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI,
 virtio disk and network), and that is the way to try it beside what runs today. It is
@@ -1985,6 +1995,47 @@ kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
   and revisions are kept as before); a
   blob passes through the CLI's memory whole; no size limit or quota but the disk; a holder
   does not read its copies again to find one the disk has spoiled.
+
+### Files in and out of a volume
+
+```sh
+kith volume put data ./nextcloud-data    # what is in the directory, into the Volume `data`
+kith volume put data ./config.php        # or one file, under its name
+kith volume get data ./copy              # what is in the Volume, into a directory
+tar -cf - -C /srv/app . | kith volume put data -   # a tar you make yourself (`get … -` writes one)
+```
+
+- Any node is asked; the node that has the Volume does it, and the files cross as one tar
+  stream, never held whole in memory or on a second disk. `-n NAMESPACE` as elsewhere.
+  `kith` runs the machine's own `tar` to pack and unpack (with `-` as the path it needs
+  none).
+- A put adds to what is there: a file takes the place of one with its name, a directory
+  is gone into, nothing else is touched. It all arrives first in a directory `.kith-put`
+  inside the Volume and is moved in when the whole stream was good, so a put that is
+  refused or cut short leaves the Volume as it was. A running container that mounts the
+  Volume sees the files appear, and one that changes the Volume's directories at that
+  moment can leave a put half moved in (the put says so): stop it first.
+- Files, directories, links and hard links go in, with their modes (less setuid and
+  setgid) and times. Their owner is not carried: they are made the user's that the
+  Volume's directory is, which is the user of the container that mounts it (see
+  [What a container is kept from](#what-a-container-is-kept-from)), so the app reads what
+  you put.
+- Refused, with the name of the entry: a path that leaves the Volume (`..`, or one that
+  starts at the root), a path through a link, a device, a pipe, a sparse file (pack
+  without `--sparse`), a file where the Volume has a directory of that name or the other
+  way round, more bytes than the Volume's `size` when it says one, and whatever would
+  leave the node's disk with less than 64 MiB free. A link that points out of the Volume
+  (`/etc/localtime`, `../../elsewhere`), or that goes up after it has gone down
+  (`a/../b`), is left out, and the reply names each.
+- Both need `apply` on `Volume` and on `Workload` in the namespace: whoever may run a
+  workload that mounts the Volume reads and writes the same files. Each put, and each get
+  as it starts, is in the audit log with who asked. A Volume in `kith-system` is a
+  directory of the host's and is neither read nor written this way.
+- A get gives the files as the Volume has them, written by whatever ran there: unpack it
+  as an ordinary user, not as root, which would keep their owners and setuid bits.
+- Not yet: no path inside the Volume to put into or get from (it is the whole Volume);
+  one put at a time on a node; a get is of the directory as it is while it is read, like a
+  backup.
 
 ### Backups
 

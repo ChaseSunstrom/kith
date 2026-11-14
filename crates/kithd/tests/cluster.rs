@@ -426,6 +426,109 @@ fn a_backup_of_a_volume_is_held_by_two_nodes_and_restored_through_another() {
 }
 
 #[test]
+fn volume_files_go_in_and_come_out_through_another_node() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "volume-files";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two nodes with addresses", || {
+        alpha.nodes().iter().filter(|(_, at)| !at.is_empty()).count() == 2
+    });
+    let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: beta, path: d }\n---\n\
+                apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: copy }\nspec: { node: alpha, path: c }\n";
+    std::fs::write(alpha.dir.join("volume.yaml"), yaml).unwrap();
+    alpha.ok(&["apply", "-f", "volume.yaml"]);
+
+    // A directory on alpha's machine, one file of it longer than anything is held in at once.
+    let src = alpha.dir.join("src");
+    let long: Vec<u8> = (0..3_000_000u32).map(|n| (n % 251) as u8).collect();
+    std::fs::create_dir_all(src.join("deep")).unwrap();
+    std::fs::write(src.join("deep/file"), b"what a guest kept").unwrap();
+    std::fs::write(src.join("long"), &long).unwrap();
+    std::os::unix::fs::symlink("/etc", src.join("out")).unwrap();
+    let data = beta.dir.join("state/volumes/default/data/d");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("there"), b"before").unwrap();
+
+    // In through alpha: on beta, beside what was there, less the link that points out.
+    let (code, said, err) = alpha.kith(&["volume", "put", "data", "src"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(said.trim(), "2 files (3000017 bytes) are in volume data on node beta");
+    assert!(
+        err.contains("left out, a link that points out of the volume: out -> /etc"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(data.join("deep/file")).unwrap(), b"what a guest kept");
+    assert!(std::fs::read(data.join("long")).unwrap() == long);
+    assert_eq!(std::fs::read(data.join("there")).unwrap(), b"before");
+    assert!(std::fs::symlink_metadata(data.join("out")).is_err() && !data.join(".kith-put").exists());
+    // One file goes in under its name.
+    alpha.ok(&["volume", "put", "data", "src/deep/file"]);
+    assert_eq!(std::fs::read(data.join("file")).unwrap(), b"what a guest kept");
+
+    // Out through alpha, into a directory there.
+    alpha.ok(&["volume", "get", "data", "back"]);
+    let back = alpha.dir.join("back");
+    assert_eq!(std::fs::read(back.join("deep/file")).unwrap(), b"what a guest kept");
+    assert!(std::fs::read(back.join("long")).unwrap() == long);
+    assert_eq!(std::fs::read(back.join("there")).unwrap(), b"before");
+
+    // As a tar, out of one Volume and into another, with no tar program between.
+    let kith = Path::new(env!("CARGO_BIN_EXE_kithd")).with_file_name("kith");
+    let piped = format!("{0} volume get data - | {0} volume put copy -", kith.display());
+    let piped = Command::new("sh")
+        .args(["-c", &piped])
+        .env("KITH_SOCKET", beta.dir.join("kithd.sock"))
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&piped.stdout);
+    assert!(said.contains("are in volume copy on node alpha"), "{said} {piped:?}");
+    assert!(std::fs::read(alpha.dir.join("state/volumes/default/copy/c/long")).unwrap() == long);
+
+    // A stream that is refused at its first entry says why, though far more was to come.
+    let evil = "import io, sys, tarfile\n\
+                tar = tarfile.open(fileobj=sys.stdout.buffer, mode='w|')\n\
+                for name, size in (('../evil', 1), ('long', 50_000_000)):\n\
+                \x20   entry = tarfile.TarInfo(name)\n\
+                \x20   entry.size = size\n\
+                \x20   tar.addfile(entry, io.BytesIO(bytes(size)))\n\
+                tar.close()\n";
+    std::fs::write(alpha.dir.join("evil.py"), evil).unwrap();
+    let piped = format!("python3 evil.py | {} volume put data -", kith.display());
+    let piped = Command::new("sh")
+        .args(["-c", &piped])
+        .current_dir(&alpha.dir)
+        .env("KITH_SOCKET", alpha.dir.join("kithd.sock"))
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&piped.stderr);
+    assert!(
+        !piped.status.success() && err.contains("../evil: a path that leaves the volume"),
+        "{err}"
+    );
+    assert!(!data.join(".kith-put").exists() && !beta.dir.join("state/volumes/default/data/evil").exists());
+
+    // What cannot be: said, and nothing done.
+    let (code, _, err) = alpha.kith(&["volume", "put", "nope", "src"]);
+    assert!(code != 0 && err.contains("Volume/default/nope"), "{err}");
+    let (code, _, err) = alpha.kith(&["volume", "put", "data", "missing"]);
+    assert!(code != 0 && err.contains("missing"), "{err}");
+    std::fs::remove_file(data.join("there")).unwrap();
+    std::fs::create_dir(data.join("long.d")).unwrap();
+    std::fs::rename(src.join("long"), src.join("long.d")).unwrap();
+    let (code, _, err) = alpha.kith(&["volume", "put", "data", "src"]);
+    assert!(code != 0 && err.contains("long.d: a directory in the volume"), "{err}");
+    assert!(!data.join(".kith-put").exists());
+}
+
+#[test]
 fn a_volumes_replica_has_its_files_and_takes_over_when_its_node_is_lost() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

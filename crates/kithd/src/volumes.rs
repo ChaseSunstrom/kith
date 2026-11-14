@@ -458,6 +458,12 @@ pub fn dir(store: &Store, namespace: &str, name: &str) -> Option<Dir> {
     vol.refused.is_none().then_some(vol.dir)
 }
 
+/// How many bytes the Volume `name` of `namespace` says it holds, if it says.
+pub fn size(store: &Store, namespace: &str, name: &str) -> Option<u64> {
+    let vol = volumes(store).remove(&format!("Volume/{namespace}/{name}"))?;
+    vol.size.map(|size| size as u64)
+}
+
 /// The encrypted Volumes whose data is on `me`, and how big each is to be (bytes).
 pub fn encrypted(store: &Store, me: &str) -> Vec<(Dir, u64)> {
     let mine = |vol: Vol| {
