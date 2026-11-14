@@ -3,7 +3,6 @@
 //! `kith.dev/v1` is stable (`stable.rs`): a field is added, never taken away or narrowed.
 //! Unknown fields are always an error, so a typo never passes silently.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -13,16 +12,18 @@ type Values = serde_json::Map<String, serde_json::Value>;
 
 macro_rules! spec {
     ($($item:item)*) => {$(
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         $item
     )*};
 }
 
 /// An amount of CPU, memory or storage: `2`, `500m`, `2Gi`, `1.5G`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
-#[schemars(extend("pattern" = r"^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$"))]
+#[cfg_attr(feature = "generate", schemars(extend("pattern" = r"^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$")))]
 pub struct Quantity(String);
 
 impl TryFrom<String> for Quantity {
@@ -70,7 +71,8 @@ impl From<Quantity> for String {
 }
 
 /// `{ weight: 50, node.labels.room: closet }`: a weight plus the labels it rewards.
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 pub struct Preference {
     pub weight: u32,
     #[serde(flatten)]
@@ -473,7 +475,7 @@ spec! {
         /// Of a `configMap` or `secret`: its files' mode, in octal (`0400`). Without it:
         /// `0444`.
         #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(extend("pattern" = "^0?[0-7]{3}$"))]
+        #[cfg_attr(feature = "generate", schemars(extend("pattern" = "^0?[0-7]{3}$")))]
         pub mode: Option<String>,
         /// Of a `configMap` or `secret`: mount this one file of it at `path`, and not the
         /// directory. It stays as it was when the container started.
@@ -1100,7 +1102,8 @@ spec! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "UPPERCASE")]
 pub enum DnsRecordType {
     A,
@@ -1113,7 +1116,8 @@ pub enum DnsRecordType {
 }
 
 /// A port by number or by name.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum PortRef {
     Number(u16),

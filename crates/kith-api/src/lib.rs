@@ -8,7 +8,6 @@ pub mod store;
 
 use kinds::*;
 use kith_yaml::Node;
-use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +16,8 @@ use std::collections::BTreeMap;
 pub const API_VERSION: &str = "kith.dev/v1";
 pub const DEFAULT_NAMESPACE: &str = "default";
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Metadata {
     /// Lowercase letters, digits, `-` and `.`; at most 63 characters.
@@ -48,7 +48,8 @@ pub struct Resource {
 }
 
 /// The envelope with a typed spec: what validation and the schemas are generated from.
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Typed<S> {
     api_version: String,
@@ -59,19 +60,65 @@ struct Typed<S> {
     status: Option<Value>,
 }
 
+/// Every kind's JSON Schema, as `v1.schema.json` has them (build.rs took its indentation off).
+/// A binary reads schemas from here; what makes them from the code is in the tests only, which
+/// fail when the two differ.
+const SCHEMAS: &str = include_str!(concat!(env!("OUT_DIR"), "/schemas.json"));
+
+/// Puts the definitions `schema` points at into `defs`, each before the ones it uses in turn:
+/// the order the generator writes them in.
+fn reach(schema: &Value, all: &Value, defs: &mut serde_json::Map<String, Value>) {
+    match schema {
+        Value::Object(map) => {
+            for (key, value) in map {
+                match value.as_str().and_then(|to| to.strip_prefix("#/$defs/")) {
+                    Some(name) if key == "$ref" => {
+                        if !defs.contains_key(name) {
+                            let def = &all["$defs"][name];
+                            defs.insert(name.into(), def.clone());
+                            reach(def, all, defs);
+                        }
+                    }
+                    _ => reach(value, all, defs),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|one| reach(one, all, defs)),
+        _ => {}
+    }
+}
+
 pub struct KindInfo {
     pub kind: &'static str,
     pub namespaced: bool,
     pub about: &'static str,
     from_node: fn(&Node) -> Result<Resource, kith_yaml::Error>,
     from_json: fn(Value) -> Result<Resource, String>,
-    schema: fn() -> Value,
+    #[cfg(feature = "generate")]
+    generated: fn() -> Value,
 }
 
 impl KindInfo {
-    /// JSON Schema of a whole resource of this kind.
+    /// JSON Schema of a whole resource of this kind, out of `v1.schema.json`.
     pub fn schema(&self) -> Value {
-        let mut schema = (self.schema)();
+        // ponytail: the whole file is read for each call (about 60 KB; the web UI asks for every
+        // kind in one request). Read it once into a `OnceLock` if that ever shows in a profile: it
+        // would then stay in memory, which is why it is not.
+        let all: Value = serde_json::from_str(SCHEMAS).expect("the tests read v1.schema.json");
+        let mut schema = all["kinds"][self.kind].clone();
+        // With the definitions it uses, and the ones those use.
+        let mut defs = serde_json::Map::new();
+        reach(&schema, &all, &mut defs);
+        if !defs.is_empty() {
+            schema["$defs"] = defs.into();
+        }
+        schema
+    }
+
+    /// The same, made from the code: what `v1.schema.json` is written from and held to.
+    #[cfg(feature = "generate")]
+    pub fn generated(&self) -> Value {
+        let mut schema = (self.generated)();
         schema["title"] = self.kind.into();
         schema["description"] = self.about.into();
         schema["properties"]["kind"] = serde_json::json!({ "const": self.kind });
@@ -91,7 +138,8 @@ macro_rules! kinds {
                 let typed = serde_json::from_value(json).map_err(|e| e.to_string())?;
                 finish::<$spec>(None, typed).map_err(|e| e.msg)
             },
-            schema: || schemars::schema_for!(Typed<$spec>).to_value(),
+            #[cfg(feature = "generate")]
+            generated: || schemars::schema_for!(Typed<$spec>).to_value(),
         },)*];
     };
     (@ namespaced) => { true };
