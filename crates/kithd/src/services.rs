@@ -7,9 +7,11 @@
 //! connections between them for a while and pass on one client's after another on each
 //! ([`carry`]): a new connection to a Service is then no new one between the nodes.
 //
-// ponytail: kithd copies every byte (a restart of kithd cuts the connections), TCP only,
-// and replicas of one node share its ports until workloads have addresses of their own.
-// The kernel takes this over (nftables or eBPF) behind the same addresses.
+// ponytail: kithd copies every byte to another node (the kernel passes those to a replica
+// on this one: sockmap.rs), a restart of kithd cuts the connections, TCP only, and
+// replicas of one node share its ports until workloads have addresses of their own.
+
+mod sockmap;
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits};
@@ -419,9 +421,14 @@ impl Proxy {
         for at in 0..backends.len() {
             match self.reach(&backends[(first + at) % backends.len()], &early).await {
                 Ok(Reached::Whole(mut backend)) => {
+                    let here = backends[(first + at) % backends.len()].0 == self.me();
                     if backend.write_all(&early).await.is_ok() {
                         drop(early);
-                        let _ = pass(client, backend, IDLE).await;
+                        let _ = if here {
+                            sockmap::pass(client, backend, IDLE).await
+                        } else {
+                            pass(client, backend, IDLE).await.map(drop)
+                        };
                     }
                     return;
                 }

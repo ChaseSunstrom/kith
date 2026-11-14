@@ -3,10 +3,11 @@
 //! things such a machine has no tool for: a file as a block device (`losetup`), and an ext4
 //! file system grown where it is mounted (`resize2fs`). And one that has no tool anywhere
 //! but a container runtime: the program a cgroup asks which devices its processes may
-//! open (`bpf(2)`).
+//! open (`bpf(2)`). And what lets the kernel pass the bytes of a TCP connection on to
+//! another itself: a socket map with a program, and what the kernel counts of a socket.
 //!
-//! The `unsafe` of the workspace is here: the ioctl call and the bpf call themselves (and
-//! taking the file descriptor bpf answers with). Each request is put together as bytes, so
+//! The `unsafe` of the workspace is here: the ioctl, bpf and socket option calls
+//! themselves (and taking the file descriptor bpf answers with). Each request is put together as bytes, so
 //! there is no struct whose layout has to match the kernel's.
 
 use std::fs::File;
@@ -179,8 +180,8 @@ pub fn remove(name: &str) -> Result<()> {
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
 /// (the kernel takes what is past the request's end as zeros). What the kernel answers.
 ///
-/// For the two commands of [`device_filter`] only: neither has the kernel write through
-/// the request, and what the request points at is alive for the call.
+/// For the commands of [`device_filter`] and [`SocketMap`] only: none has the kernel write
+/// through the request, and what the request points at is alive for the call.
 fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
     // SAFETY: `request` is `request.len()` readable bytes, and the pointers in it (see
     // `device_filter`) are to memory its caller holds until this returns.
@@ -197,21 +198,11 @@ fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
 /// the kernel checks the program before it takes it. It takes the place of the one put
 /// there this way before; the cgroup keeps it, and it goes with the cgroup.
 pub fn device_filter(cgroup: &File, program: &[u8]) -> Result<()> {
-    use std::os::fd::{FromRawFd, OwnedFd};
     if program.is_empty() || !program.len().is_multiple_of(8) {
         return Err(Error::other("not a program of whole instructions"));
     }
-    let license = b"Apache-2.0\0";
-    // BPF_PROG_LOAD: the kind of program (BPF_PROG_TYPE_CGROUP_DEVICE), how many
-    // instructions, where they are, where the licence's name is.
-    let mut load = [0u8; 48];
-    load[0..4].copy_from_slice(&15u32.to_ne_bytes());
-    load[4..8].copy_from_slice(&((program.len() / 8) as u32).to_ne_bytes());
-    load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
-    load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
-    let loaded = bpf(5, &load)?;
-    // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
-    let loaded = unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) };
+    // BPF_PROG_TYPE_CGROUP_DEVICE.
+    let loaded = load(15, program)?;
     // BPF_PROG_ATTACH: to which cgroup, which program, as what (BPF_CGROUP_DEVICE), and
     // with no flags: the one program of this cgroup, replaced by the next.
     let mut attach = [0u8; 16];
@@ -219,6 +210,190 @@ pub fn device_filter(cgroup: &File, program: &[u8]) -> Result<()> {
     attach[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
     attach[8..12].copy_from_slice(&6u32.to_ne_bytes());
     bpf(8, &attach).map(drop)
+}
+
+/// BPF_PROG_LOAD of `program` (whole instructions) as a program of the kind `kind`: its
+/// descriptor. The kernel checks the program before it takes it.
+fn load(kind: u32, program: &[u8]) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let license = b"Apache-2.0\0";
+    // The kind, how many instructions, where they are, where the licence's name is.
+    let mut load = [0u8; 48];
+    load[0..4].copy_from_slice(&kind.to_ne_bytes());
+    load[4..8].copy_from_slice(&((program.len() / 8) as u32).to_ne_bytes());
+    load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
+    load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    let loaded = bpf(5, &load)?;
+    // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+    Ok(unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) })
+}
+
+/// A socket map of the kernel's (BPF_MAP_TYPE_SOCKHASH): TCP sockets, each under a
+/// number. A program attached to the map is run on what each socket in it is sent, before
+/// anyone reads it ([`SocketMap::redirect_to`]).
+pub struct SocketMap(std::os::fd::OwnedFd);
+
+impl SocketMap {
+    /// An empty map for up to `capacity` sockets (room is taken as sockets are put in).
+    pub fn new(capacity: u32) -> Result<SocketMap> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // BPF_MAP_CREATE: the kind, the key's size (a u64), the value's (a descriptor),
+        // how many.
+        let mut create = [0u8; 20];
+        create[0..4].copy_from_slice(&18u32.to_ne_bytes());
+        create[4..8].copy_from_slice(&8u32.to_ne_bytes());
+        create[8..12].copy_from_slice(&4u32.to_ne_bytes());
+        create[12..16].copy_from_slice(&capacity.to_ne_bytes());
+        let made = bpf(0, &create)?;
+        // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+        Ok(SocketMap(unsafe { OwnedFd::from_raw_fd(made as libc::c_int) }))
+    }
+
+    /// Put `socket` (an established TCP connection's) in the map under `key`, in place of
+    /// what was there. The kernel refuses a socket in any other state: one that has had
+    /// its end of the connection, say.
+    pub fn insert(&self, key: u64, socket: std::os::fd::BorrowedFd) -> Result<()> {
+        let value = socket.as_raw_fd() as u32;
+        // BPF_MAP_UPDATE_ELEM: the map, where the key is, where the value is, BPF_ANY.
+        let mut update = [0u8; 32];
+        update[0..4].copy_from_slice(&self.0.as_raw_fd().to_ne_bytes());
+        update[8..16].copy_from_slice(&(&key as *const u64 as u64).to_ne_bytes());
+        update[16..24].copy_from_slice(&(&value as *const u32 as u64).to_ne_bytes());
+        bpf(2, &update).map(drop)
+    }
+
+    /// Take what is under `key` out of the map (the socket itself stays open).
+    pub fn remove(&self, key: u64) -> Result<()> {
+        // BPF_MAP_DELETE_ELEM: the map, where the key is.
+        let mut delete = [0u8; 16];
+        delete[0..4].copy_from_slice(&self.0.as_raw_fd().to_ne_bytes());
+        delete[8..16].copy_from_slice(&(&key as *const u64 as u64).to_ne_bytes());
+        bpf(3, &delete).map(drop)
+    }
+
+    /// What a socket in this map is sent is sent on, by the kernel, on the socket `peers`
+    /// has under this one's cookie ([`socket_cookie`]); none is read by anyone here. With
+    /// no socket under that cookie, the bytes are dropped: so a socket's peer is put in
+    /// `peers` before the socket is put here, and taken out after it.
+    pub fn redirect_to(&self, peers: &SocketMap) -> Result<()> {
+        // if the packet has no bytes (an end alone), return SK_DROP;
+        // r6 = the packet; *(u64 *)(r10 - 8) = bpf_get_socket_cookie(r6);
+        // return bpf_sk_redirect_hash(r6, peers, r10 - 8, 0) (SK_PASS, with where it
+        // goes, or SK_DROP: nothing under the key).
+        // (An end alone sent on is an error to the kernel (6.18): it marks the socket it
+        // was sent to as broken and sends it nothing more. The end is the connection's
+        // state, which the socket keeps; dropping its packet loses nothing.)
+        let mut program: Vec<u8> = [
+            [0x61, 0x12, 0, 0, 0, 0, 0, 0],
+            [0x55, 0x02, 2, 0, 0, 0, 0, 0],
+            [0xb7, 0, 0, 0, 0, 0, 0, 0],
+            [0x95, 0, 0, 0, 0, 0, 0, 0],
+            [0xbf, 0x16, 0, 0, 0, 0, 0, 0],
+            [0x85, 0, 0, 0, 46, 0, 0, 0],
+            [0x7b, 0x0a, 0xf8, 0xff, 0, 0, 0, 0],
+            [0xbf, 0x61, 0, 0, 0, 0, 0, 0],
+            [0x18, 0x12, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0xbf, 0xa3, 0, 0, 0, 0, 0, 0],
+            [0x07, 0x03, 0, 0, 0xf8, 0xff, 0xff, 0xff],
+            [0xb7, 0x04, 0, 0, 0, 0, 0, 0],
+            [0x85, 0, 0, 0, 72, 0, 0, 0],
+            [0x95, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat();
+        // (The map is named by its descriptor in the load of a 64-bit number: the kernel
+        // puts the map itself there.)
+        program[68..72].copy_from_slice(&peers.0.as_raw_fd().to_ne_bytes());
+        // BPF_PROG_TYPE_SK_SKB.
+        let loaded = load(14, &program)?;
+        // BPF_PROG_ATTACH to this map, as BPF_SK_SKB_VERDICT: the map keeps it.
+        let mut attach = [0u8; 16];
+        attach[0..4].copy_from_slice(&self.0.as_raw_fd().to_ne_bytes());
+        attach[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
+        attach[8..12].copy_from_slice(&38u32.to_ne_bytes());
+        bpf(8, &attach).map(drop)
+    }
+}
+
+/// `getsockopt(2)` of `socket`'s option `name` at `level` into `value`: how much of it the
+/// kernel filled in.
+fn option(socket: std::os::fd::BorrowedFd, level: libc::c_int, name: libc::c_int, value: &mut [u8]) -> Result<usize> {
+    let mut length = value.len() as libc::socklen_t;
+    // SAFETY: `value` is `length` writable bytes, and `length` is a socklen_t for the call.
+    let said = unsafe { libc::getsockopt(socket.as_raw_fd(), level, name, value.as_mut_ptr().cast(), &mut length) };
+    if said < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(length as usize)
+}
+
+/// The number the kernel gave `socket` when it was made, the same for its whole life and
+/// never another's (SO_COOKIE).
+pub fn socket_cookie(socket: std::os::fd::BorrowedFd) -> Result<u64> {
+    let mut cookie = [0u8; 8];
+    match option(socket, libc::SOL_SOCKET, libc::SO_COOKIE, &mut cookie)? {
+        8 => Ok(u64::from_ne_bytes(cookie)),
+        _ => Err(Error::other("no cookie")),
+    }
+}
+
+/// What the kernel counts of a TCP connection (TCP_INFO).
+#[derive(Clone, Copy, Debug)]
+pub struct TcpCounts {
+    /// Its state (`TCP_ESTABLISHED`, 1; `TCP_CLOSE_WAIT`, 8, once the other end is done
+    /// sending; `TCP_CLOSE`, 7, once it is over or was reset).
+    pub state: u8,
+    /// How long since it was last sent a byte.
+    pub since_received: std::time::Duration,
+    /// How many of the bytes it sent the other end has said it has (and its end).
+    pub acked: u64,
+    /// How many bytes it was sent (and the other end's end of them).
+    pub received: u64,
+    /// How many of those wait in it to be read (FIONREAD).
+    pub unread: u64,
+}
+
+/// What the kernel counts of the TCP connection `socket`.
+pub fn tcp_counts(socket: std::os::fd::BorrowedFd) -> Result<TcpCounts> {
+    let mut info = [0u8; 136];
+    if option(socket, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info)? < 136 {
+        return Err(Error::other("a kernel that counts less of a connection"));
+    }
+    let word = |at: usize| u32::from_ne_bytes(info[at..at + 4].try_into().unwrap());
+    let long = |at: usize| u64::from_ne_bytes(info[at..at + 8].try_into().unwrap());
+    let mut unread: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one c_int, and `unread` is one, writable for the call.
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::FIONREAD, &mut unread) } < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(TcpCounts {
+        state: info[0],
+        since_received: std::time::Duration::from_millis(word(52).into()),
+        acked: long(120),
+        received: long(128),
+        unread: unread.max(0) as u64,
+    })
+}
+
+/// Ask the kernel to look at what `socket` was sent and nobody has read, as when a byte
+/// comes (SO_RCVLOWAT of one byte, which it is already): bytes that came before a program
+/// was attached to it are then passed to that program.
+pub fn look_again(socket: std::os::fd::BorrowedFd) -> Result<()> {
+    let one: libc::c_int = 1;
+    // SAFETY: `one` is a c_int, readable for the call.
+    let said = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVLOWAT,
+            (&one as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if said < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,6 +451,80 @@ mod tests {
         assert!(device_filter(&here, &[]).is_err() && device_filter(&here, &[0; 7]).is_err());
         // r0 = 1, and no exit.
         assert!(device_filter(&here, &[0xb7, 0, 0, 0, 1, 0, 0, 0]).is_err());
+    }
+
+    /// What the kernel counts of a connection over the loopback: the bytes either way,
+    /// and the end of them; and a cookie for each socket, its own.
+    #[test]
+    fn connections_are_counted() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::os::fd::AsFd;
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut receiver, _) = listener.accept().unwrap();
+        // (Acked and received, as the sender and the receiver count them; the state of each.)
+        let (sending, receiving) = (sender.try_clone().unwrap(), receiver.try_clone().unwrap());
+        let counts = || {
+            let (sent, heard) = (
+                tcp_counts(sending.as_fd()).unwrap(),
+                tcp_counts(receiving.as_fd()).unwrap(),
+            );
+            (sent.acked, heard.received, sent.state, heard.state)
+        };
+        // The end that connected counts its start as acked; the one that accepted does not.
+        assert_eq!(counts(), (1, 0, 1, 1));
+        assert_eq!(tcp_counts(receiver.as_fd()).unwrap().acked, 0);
+        sender.write_all(&[7; 1000]).unwrap();
+        let mut waited = 0;
+        while tcp_counts(receiver.as_fd()).unwrap().unread < 1000 && waited < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(tcp_counts(receiver.as_fd()).unwrap().unread, 1000);
+        let mut got = [0; 1000];
+        receiver.read_exact(&mut got).unwrap();
+        assert_eq!(tcp_counts(receiver.as_fd()).unwrap().unread, 0);
+        let mut waited = 0;
+        while counts().0 < 1001 && waited < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(counts(), (1001, 1000, 1, 1));
+        // An end is counted as one more byte, both ways; the receiver is in CLOSE_WAIT.
+        sender.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(receiver.read(&mut got).unwrap(), 0);
+        while counts().0 < 1002 && waited < 200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        assert_eq!(counts(), (1002, 1001, 5, 8));
+        let cookie = |s: &TcpStream| socket_cookie(s.as_fd()).unwrap();
+        assert_ne!(cookie(&sender), cookie(&receiver));
+        assert_eq!(cookie(&sender), cookie(&sender));
+    }
+
+    /// Where the kernel lets this process make a socket map (as root): sockets in it, and
+    /// the redirect program attached. Otherwise the refusal is an error.
+    #[test]
+    fn socket_maps_take_connections() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsFd;
+        let Ok(map) = SocketMap::new(4) else {
+            return;
+        };
+        let peers = SocketMap::new(4).unwrap();
+        map.redirect_to(&peers).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let near = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (far, _) = listener.accept().unwrap();
+        peers.insert(1, far.as_fd()).unwrap();
+        map.insert(2, near.as_fd()).unwrap();
+        look_again(near.as_fd()).unwrap();
+        // (A listening socket is not a connection's.)
+        assert!(map.remove(2).is_ok() && map.remove(2).is_err() && peers.remove(1).is_ok());
     }
 
     /// What is no ext4 file system is not grown, and says so (a loop device and a real
