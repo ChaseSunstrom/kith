@@ -6,7 +6,7 @@
 use clap::Subcommand;
 use kith_kube::{documents, translate};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 #[derive(Subcommand)]
@@ -17,6 +17,16 @@ pub enum Import {
         /// YAML or JSON file, or `-` for stdin
         #[arg(short, long = "file", value_name = "PATH", required = true)]
         files: Vec<PathBuf>,
+    },
+    /// The same for a docker-compose file (`docker compose config` prints one with its variables filled in)
+    Compose {
+        /// A docker-compose.yml, or `-` for stdin
+        file: PathBuf,
+        #[arg(short, long)]
+        namespace: Option<String>,
+        /// The node that holds the volumes' directories
+        #[arg(long)]
+        node: Option<String>,
     },
     /// The same for a Helm chart, rendered by the installed `helm template`
     Helm {
@@ -33,34 +43,52 @@ pub enum Import {
     },
 }
 
+/// A file's name and text; `-` is stdin.
+/// ponytail: files and stdin only; a directory is an error, not a walk.
+fn read(file: &Path) -> Result<(String, String), String> {
+    if file.as_os_str() == "-" {
+        let mut src = String::new();
+        std::io::stdin()
+            .read_to_string(&mut src)
+            .map_err(|e| format!("error: stdin: {e}"))?;
+        return Ok(("<stdin>".to_string(), src));
+    }
+    let src = std::fs::read_to_string(file).map_err(|e| format!("error: {}: {e}", file.display()))?;
+    Ok((file.display().to_string(), src))
+}
+
 pub fn run(what: Import) -> Result<ExitCode, String> {
-    let objects = match what {
+    let (resources, report) = match what {
         Import::K8s { files } => {
             let mut objects = Vec::new();
             for file in files {
-                // ponytail: files and stdin only; a directory is an error, not a walk.
-                let (name, src) = if file.as_os_str() == "-" {
-                    let mut src = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut src)
-                        .map_err(|e| format!("error: stdin: {e}"))?;
-                    ("<stdin>".to_string(), src)
-                } else {
-                    let src = std::fs::read_to_string(&file).map_err(|e| format!("error: {}: {e}", file.display()))?;
-                    (file.display().to_string(), src)
-                };
+                let (name, src) = read(&file)?;
                 objects.extend(documents(&name, &src)?);
             }
-            objects
+            translate(objects)
         }
         Import::Helm {
             chart,
             name,
             namespace,
             values,
-        } => documents("helm template", &helm(&chart, name, namespace, &values)?)?,
+        } => translate(documents("helm template", &helm(&chart, name, namespace, &values)?)?),
+        Import::Compose { file, namespace, node } => {
+            let (name, src) = read(&file)?;
+            // kith's YAML has no anchors, aliases or merge keys, which compose files lean on.
+            let docs = documents(&name, &src).map_err(|e| {
+                if e.contains("not supported in kith YAML") {
+                    format!("{e}\nerror: a compose file must be written out: `docker compose config` does")
+                } else {
+                    e
+                }
+            })?;
+            let Some(doc) = docs.into_iter().next() else {
+                return Err(format!("error: {name}: no compose file in it"));
+            };
+            kith_kube::compose::translate(doc, namespace.as_deref(), node.as_deref())
+        }
     };
-    let (resources, report) = translate(objects);
     let mut out = std::io::stdout();
     for (i, resource) in resources.iter().enumerate() {
         let separator = if i == 0 { "" } else { "---\n" };
