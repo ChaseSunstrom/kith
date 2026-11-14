@@ -4,6 +4,8 @@
 //! at the end is exactly what was not. Each of those is one of two ([`FIELDS`]): a hint,
 //! which is said and changes nothing, or refused. A field nobody wrote down is refused.
 
+pub mod compose;
+
 use kith_api::kinds::Quantity;
 use kith_api::{Metadata, Resource};
 use serde_json::{Value, json};
