@@ -9,7 +9,10 @@
 //
 // ponytail: kithd copies every byte (a restart of kithd cuts the connections), TCP only,
 // and replicas of one node share its ports until workloads have addresses of their own.
-// The kernel takes this over (nftables or eBPF) behind the same addresses.
+// The kernel takes this over (nftables or eBPF) behind the same addresses. Tried
+// (T-0318): a socket map whose verdict program redirects each side's bytes to the
+// other lost no byte, and was slower on small turns (kernel 6.18 passes each
+// redirected segment through a worker): 74k kept requests a second where this has 81k.
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits};

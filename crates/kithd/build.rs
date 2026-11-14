@@ -8,7 +8,9 @@ fn main() {
     let musl = std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "musl");
     // (The profile's name: the build script is not told that the profile aborts.)
     if musl && std::env::var("PROFILE").is_ok_and(|profile| profile == "release") {
-        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../kith-cli/no-unwind.ld");
+        // Written where cargo builds (see kith-cli's build.rs).
+        let script = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("no-unwind.ld");
+        std::fs::write(&script, include_str!("../kith-cli/no-unwind.ld")).unwrap();
         println!("cargo::rustc-link-arg-bins=-Wl,-T,{}", script.display());
         println!("cargo::rustc-link-arg-bins=-Wl,--no-eh-frame-hdr");
         println!("cargo::rustc-link-arg-bins=-Wl,-z,pack-relative-relocs");

@@ -17,6 +17,8 @@
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
+#   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
+#                               back in order, however its connection ends
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
@@ -106,6 +108,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
                    KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
+  --test services  instead: one node on the mesh with ci/pod.rs as a container image
+                   already there: a pod that sends back every byte it is sent, its
+                   Service, and a Job on the same node sending through that Service
+                   over 680 connections (one after another and side by side, from
+                   nothing to more than a megabyte, half closed at once when all is
+                   sent, reset by either end on the way) and one of 5000 small turns:
+                   every byte comes back in order. Needs rustc for x86_64-unknown-linux-musl
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
                    the one on PATH) asking the first as the cluster's admin: the
@@ -147,7 +156,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, kube, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | services | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, services, kube, chaos" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -181,7 +190,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = kube ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = chaos ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -198,11 +207,12 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout and chaos: three nodes and nothing more said to kithd; share, pods and kube: two,
-        # on the mesh.)
+        # on the mesh; services: one, on the mesh.)
         others='2 3' more=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = kube ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ]; then
         others=2 more=--mesh
+        [ "$test" != services ] || others=''
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -354,11 +364,10 @@ EOF
             join=$(api 1 POST /v1/tokens | field token) || fail "no join token over TLS"
             node "$n" "--join 10.9.0.1:7443 --token $join"
         done
-        if [ "$test" = pods ]; then
-            # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
-            # what it says" (`none` for a unit with no address of its own).
-            units() { # KIND NAME
-                any GET /v1/resources 2>/dev/null | python3 -c '
+        # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
+        # what it says" (`none` for a unit with no address of its own).
+        units() { # KIND NAME
+            any GET /v1/resources 2>/dev/null | python3 -c '
 import json, sys
 try:
     found = json.load(sys.stdin)
@@ -373,7 +382,46 @@ for r in found:
         said = [status.get("message", "")] + [u.get("message", "") for u in units]
         print(ready, status.get("state", "-"), *sorted(u.get("address", "none") for u in units), *said)
 ' "$1" "$2"
-            }
+        }
+        if [ "$test" = services ]; then
+            # A pod that sends back what it is sent, and its Service.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"echo","labels":{"app":"echo"}},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"echo","image":"kith.test/pod:1","command":["/bin/pod","echo"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"echo"},"spec":{"selector":{"app":"echo"},"ports":[{"port":80}]}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the echo pod was not applied"
+            waited=0
+            until line=$(units Workload echo) && [ "${line%% *}" = 1 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "waited for the echo pod to be ready; the Workload says: $line"
+                sleep 1
+            done
+            # A Job on the same node sending to it through the Service: what it says is in
+            # $work/check.out.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"check"},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"check","image":"kith.test/pod:1","command":["/bin/pod","check","echo","80"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job check was not applied"
+            waited=0
+            until line=$(units Job check) && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 600 ] || fail "waited for the Job check; it says: $line"
+                sleep 1
+            done
+            any GET /v1/logs/Job/default/check >"$work/check.out" 2>/dev/null || true
+            any GET '/v1/logs/Job/default/check?stderr=true' >"$work/check.err" 2>/dev/null || true
+            any GET '/v1/logs/Workload/default/echo?replica=0' >"$work/echo.out" 2>/dev/null || true
+            printf '%s\n' "$line" | grep -q succeeded || fail "bytes through the Service did not all come back in order: $line: $(cat "$work/check.out" "$work/check.err")"
+            ! grep -q 'echo: bad' "$work/echo.out" || fail "the echo pod heard bytes out of order: $(cat "$work/echo.out")"
+            # (The log comes as JSON: its line is inside a string.)
+            checked=$(grep -o 'check: [^"\\]*' "$work/check.out") || fail "the Job check said nothing of how it went: $(cat "$work/check.out" "$work/check.err")"
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; a Job on the same node sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
+            exit 0
+        fi
+        if [ "$test" = pods ]; then
             # This machine, as something outside the cluster a pod asks: the nodes reach it
             # at 10.0.2.2, and only from an address their card out has (a pod's own is not
             # one the network out there knows).

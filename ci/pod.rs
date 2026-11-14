@@ -22,10 +22,152 @@
 //!                              told (its environment); then of each PATH what is mounted
 //!                              there, whether it can be written, and every file under it;
 //!                              and, given a PATH, each file again when it changes
+//!   pod echo                   on port 80, send back every byte each connection sends, and
+//!                              when it ends say whether all of them came, in order (what
+//!                              `pod check` sends: a length, a way to end, then the bytes)
+//!   pod check HOST PORT        send `pod echo` there, over many connections, small and large,
+//!                              one after another and side by side, closed at once, half
+//!                              closed, reset by either end and kept for many small turns; say
+//!                              each byte that did not come back in order, and how it went
 
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::time::Duration;
+use std::io::{ErrorKind, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
+
+/// The byte at `i` of what `pod check` sends: one no lost, doubled or swapped byte keeps in
+/// place (251 is prime, and no buffer's size is a multiple of it).
+fn byte(i: u64) -> u8 {
+    (i % 251) as u8
+}
+
+/// One connection of `pod echo`: a length, how it is to end (1: by a reset, the rest of what
+/// is sent left unread half way), then every byte sent back as it comes; at the end, what
+/// it heard ("ok", or the first byte out of place, or how many came).
+fn echo(mut stream: TcpStream) {
+    let mut head = [0; 9];
+    // (What only connects and sends nothing, as a readiness probe does, is not asked.)
+    if stream.read_exact(&mut head).is_err() {
+        return;
+    }
+    let length = u64::from_be_bytes(head[..8].try_into().expect("8 bytes"));
+    let (mut at, mut buffer, mut bad) = (0u64, vec![0; 65536], None);
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if let Some(i) = (0..read).find(|&i| buffer[i] != byte(at + i as u64)) {
+            bad.get_or_insert(at + i as u64);
+        }
+        at += read as u64;
+        if stream.write_all(&buffer[..read]).is_err() {
+            break;
+        }
+        if head[8] == 1 && at >= length / 2 {
+            // (Closed with bytes still coming unread: the kernel answers them with a reset.)
+            return;
+        }
+    }
+    let said = match bad {
+        Some(i) => format!("bad at {i} of {length}\n"),
+        None if at != length => format!("short {at} of {length}\n"),
+        None => "ok\n".to_string(),
+    };
+    if bad.is_some() {
+        println!("echo: {}", said.trim());
+    }
+    let _ = stream.write_all(said.as_bytes());
+}
+
+/// One connection to `pod echo` at `to`: `length` bytes sent in pieces of several sizes while
+/// what comes back is read, and how it ends: 0, half closed at once when all is sent and
+/// then everything back with "ok" after it; 1, reset by the far end half way, after which
+/// what came back is in order up to where it stopped; 2, reset by this end half way.
+fn exchange(to: (&str, u16), length: u64, mode: u8) -> Result<(), String> {
+    let mut stream = TcpStream::connect(to).map_err(|e| format!("connect: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    let mut sending = stream.try_clone().map_err(|e| e.to_string())?;
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        sending.write_all(&[&length.to_be_bytes()[..], &[mode]].concat())?;
+        let (until, mut at, mut piece) = (if mode == 2 { length / 2 } else { length }, 0u64, 0);
+        while at < until {
+            let size = [1, 1448, 8192, 65536][piece % 4].min(until - at);
+            let bytes: Vec<u8> = (at..at + size).map(byte).collect();
+            sending.write_all(&bytes)?;
+            (at, piece) = (at + size, piece + 1);
+        }
+        if mode != 2 {
+            sending.shutdown(Shutdown::Write)?;
+        }
+        Ok(())
+    });
+    let (mut at, mut after, mut buffer) = (0u64, Vec::new(), vec![0; 65536]);
+    let ended = loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break None,
+            Ok(read) => {
+                for &got in &buffer[..read] {
+                    if at < length && got != byte(at) {
+                        return Err(format!("byte {at} of {length} (mode {mode}) came back as {got}"));
+                    } else if at >= length && after.len() < 64 {
+                        after.push(got);
+                    }
+                    at += 1;
+                }
+                if mode == 2 && at > 0 {
+                    // (Dropped with what is still coming unread: the kernel resets the connection.)
+                    let _ = writer.join();
+                    return Ok(());
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(format!("nothing for 30 s after {at} of {length} bytes back (mode {mode})"));
+            }
+            Err(e) => break Some(e),
+        }
+    };
+    let wrote = writer.join().map_err(|_| "the writer panicked".to_string())?;
+    let after = String::from_utf8_lossy(&after);
+    match mode {
+        1 if at <= length => Ok(()),
+        1 => Err(format!("{at} bytes came back of {length} sent before a reset")),
+        _ => match (ended, wrote) {
+            (None, Ok(())) if at == length + 3 && after == "ok\n" => Ok(()),
+            (ended, wrote) => Err(format!(
+                "{at} bytes back of {length} (mode {mode}), then {:?}; it ended with {ended:?}, sending {wrote:?}",
+                after.trim()
+            )),
+        },
+    }
+}
+
+/// Many small turns on one connection, each waiting for the last: what a kept connection of
+/// requests and answers asks of whatever passes its bytes. How many turns a second.
+fn turns(to: (&str, u16), count: u64) -> Result<f64, String> {
+    let mut stream = TcpStream::connect(to).map_err(|e| format!("connect: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    let _ = stream.set_nodelay(true);
+    let failed = |e: std::io::Error| format!("turns: {e}");
+    stream.write_all(&[&(count * 100).to_be_bytes()[..], &[0]].concat()).map_err(failed)?;
+    let started = Instant::now();
+    for turn in 0..count {
+        let sent: Vec<u8> = (turn * 100..turn * 100 + 100).map(byte).collect();
+        stream.write_all(&sent).map_err(failed)?;
+        let mut back = [0; 100];
+        stream.read_exact(&mut back).map_err(failed)?;
+        if back[..] != sent[..] {
+            return Err(format!("turn {turn} came back as {back:?}"));
+        }
+    }
+    let took = started.elapsed().as_secs_f64();
+    stream.shutdown(Shutdown::Write).map_err(failed)?;
+    let mut said = String::new();
+    stream.read_to_string(&mut said).map_err(failed)?;
+    if said != "ok\n" {
+        return Err(format!("turns: the end said {said:?}"));
+    }
+    Ok(count as f64 / took)
+}
 
 fn asked(host: &str, port: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect((host, port.parse::<u16>().expect("a port")))?;
@@ -214,6 +356,57 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...]"),
+        ["echo"] => {
+            let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || echo(stream));
+            }
+        }
+        ["check", host, port] => {
+            let to = (&*String::leak(host.to_string()), port.parse::<u16>().expect("a port"));
+            // (Its pod may still be starting, and its name not yet known.)
+            let mut tries = 0;
+            while let Err(e) = exchange(to, 1000, 0) {
+                tries += 1;
+                assert!(tries < 120, "check: {host} {port} never answered: {e}");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            let mut failed = Vec::new();
+            let mut connections = 0;
+            // One after another, each closed as soon as all is sent: nothing, a byte, less
+            // than a segment, a window's worth, more than any buffer holds.
+            for i in 0..300 {
+                failed.extend(exchange(to, [0, 1, 1000, 65536, 1 << 20][i % 5], 0).err());
+                connections += 1;
+            }
+            // Side by side.
+            let side: Vec<_> = (0..8u64)
+                .map(|thread| {
+                    std::thread::spawn(move || {
+                        let sizes = [1, 4096, 65536, 300_000];
+                        (0..40).filter_map(|i| exchange(to, sizes[(thread as usize + i) % 4] + thread, 0).err()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for thread in side {
+                failed.extend(thread.join().unwrap_or_else(|_| vec!["a thread panicked".to_string()]));
+                connections += 40;
+            }
+            // Reset by either end with bytes on their way, then plain ones again.
+            for mode in [1, 2, 0] {
+                for i in 0..20 {
+                    failed.extend(exchange(to, (1 << 20) + i, mode).err());
+                    connections += 1;
+                }
+            }
+            let rate = turns(to, 5000);
+            failed.extend(rate.as_ref().err().cloned());
+            for failure in &failed {
+                println!("failed: {failure}");
+            }
+            println!("check: {connections} connections and one of 5000 turns ({:.0} a second), {} failed", rate.unwrap_or(0.0), failed.len());
+            std::process::exit(if failed.is_empty() { 0 } else { 1 });
+        }
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT"),
     }
 }
