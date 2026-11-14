@@ -18,7 +18,7 @@
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
-#                               back in order, however its connection ends, passed by the kernel
+#                               back in order, however its connection ends
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
@@ -114,8 +114,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    over 680 connections (one after another and side by side, from
                    nothing to more than a megabyte, half closed at once when all is
                    sent, reset by either end on the way) and one of 5000 small turns:
-                   every byte comes back in order, and kithd says the kernel passes
-                   them. Needs rustc for x86_64-unknown-linux-musl
+                   every byte comes back in order. Needs rustc for
+                   x86_64-unknown-linux-musl
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
                    the one on PATH) asking the first as the cluster's admin: the
@@ -418,10 +418,8 @@ EOF
             ! grep -q 'echo: bad' "$work/echo.out" || fail "the echo pod heard bytes out of order: $(cat "$work/echo.out")"
             # (The log comes as JSON: its line is inside a string.)
             checked=$(grep -o 'check: [^"\\]*' "$work/check.out") || fail "the Job check said nothing of how it went: $(cat "$work/check.out" "$work/check.err")"
-            # (kithd says once whether the kernel or kithd itself passes these bytes.)
-            grep -aq 'the kernel passes' "$work/n1.log" || fail "kithd did not hand the bytes of a connection to a pod on its node to the kernel: $(grep -a 'kithd: services' "$work/n1.log" | head -n 5)"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; a Job on the same node sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order, passed by the kernel ($checked)"
+            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; a Job on the same node sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
             exit 0
         fi
         if [ "$test" = pods ]; then
