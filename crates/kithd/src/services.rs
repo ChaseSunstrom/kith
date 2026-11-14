@@ -75,6 +75,10 @@ const SERVING: usize = 4096;
 const RELAYING: usize = 4096;
 /// How many of the relayed ones one other node may hold.
 const RELAYING_PER_NODE: usize = 1024;
+/// The most threads the connections to Services are on, one to a core. Each connection
+/// still takes the store's lock and the table's for a moment as it starts: past a few
+/// threads those moments queue, and the rest of kithd keeps a core of its own.
+const THREADS: usize = 4;
 
 fn namespace(resource: &Resource) -> String {
     resource.key().split('/').nth(1).unwrap_or_default().to_string()
@@ -282,7 +286,8 @@ struct Proxy {
     serving: Limits,
     relaying: Limits,
     /// The connections to each other node's kithd that no client's is on now, and since when.
-    kept: Mutex<BTreeMap<String, Vec<(Relay, Instant)>>>,
+    /// (As the kernel's, on no thread's runtime: the next client's may be on another.)
+    kept: Mutex<BTreeMap<String, Vec<(std::net::TcpStream, Instant)>>>,
 }
 
 /// What [`Proxy::reach`] reached.
@@ -370,7 +375,8 @@ impl Proxy {
         let mut kept = self.kept.lock().expect("nothing panics holding the kept");
         let (relay, since) = kept.get_mut(node)?.pop()?;
         if since.elapsed() < KEPT {
-            return Some(relay);
+            // (A runtime that cannot take it: a new one is made, as for a node that hung up.)
+            return TcpStream::from_std(relay).ok().map(Relay::new);
         }
         // (The others were kept before it: for too long as well.)
         kept.remove(node);
@@ -379,6 +385,19 @@ impl Proxy {
 
     /// Keep `relay`, on which a client's connection ended well, for the next one to `node`.
     fn keep(&self, node: &str, relay: Relay) {
+        // (Bytes read and not yet used would be lost with the buffer: not kept, then.)
+        if !relay.from.buffer().is_empty() {
+            return;
+        }
+        let Some(relay) = relay
+            .from
+            .into_inner()
+            .reunite(relay.to)
+            .ok()
+            .and_then(|relay| relay.into_std().ok())
+        else {
+            return;
+        };
         let mut kept = self.kept.lock().expect("nothing panics holding the kept");
         let kept = kept.entry(node.to_string()).or_default();
         if kept.len() < KEEP {
@@ -737,7 +756,9 @@ pub async fn run(
             elsewhere.store(false, Ordering::Relaxed);
         })
     });
-    let mut listening: BTreeMap<(Ipv6Addr, u16), tokio::task::JoinHandle<()>> = BTreeMap::new();
+    // On each thread a listener of each port, the kernel spreading the connections between them.
+    let mut listening: BTreeMap<(Ipv6Addr, u16), Vec<tokio::task::JoinHandle<()>>> = BTreeMap::new();
+    let mut threads = Vec::new();
     let mut generation = shared.generation.subscribe();
     loop {
         let (wanted, reports) = {
@@ -781,14 +802,21 @@ pub async fn run(
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
         let elsewhere = elsewhere.load(Ordering::Relaxed);
         keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
-        keys.insert((me, port));
+        // (No thread, and no listener, before there is a Service: a node that has none
+        // has nothing to pass on, and nothing on it waits.)
+        if threads.is_empty() && !wanted.is_empty() {
+            threads = start();
+        }
+        if !threads.is_empty() {
+            keys.insert((me, port));
+        }
         proxy.turns.keep(&wanted);
         proxy.forget();
         *proxy.table.lock().expect("nothing panics holding the table") = wanted;
-        listening.retain(|key, task| {
-            let keep = keys.contains(key) && !task.is_finished();
+        listening.retain(|key, tasks| {
+            let keep = keys.contains(key) && !tasks.iter().any(tokio::task::JoinHandle::is_finished);
             if !keep {
-                task.abort();
+                tasks.iter().for_each(tokio::task::JoinHandle::abort);
             }
             keep
         });
@@ -797,20 +825,31 @@ pub async fn run(
             if listening.contains_key(&key) {
                 continue;
             }
-            let Ok(listener) = TcpListener::bind(SocketAddr::new(key.0.into(), key.1)).await else {
+            // (One that fails is dropped with the ones bound before it, and all tried again.)
+            let at = SocketAddr::new(key.0.into(), key.1);
+            let Ok(listeners) = threads.iter().map(|_| listen(at)).collect::<std::io::Result<Vec<_>>>() else {
                 waiting = true;
                 continue;
             };
-            let task = if key == (me, port) {
-                let take = |proxy: Arc<Proxy>, stream| async move {
-                    let _ = proxy.take(stream).await;
-                };
-                tokio::spawn(proxy.clone().accept(listener, take))
-            } else {
-                let serve = move |proxy: Arc<Proxy>, stream| async move { proxy.serve(key, stream).await };
-                tokio::spawn(proxy.clone().accept(listener, serve))
-            };
-            listening.insert(key, task);
+            let tasks = threads.iter().zip(listeners).map(|(thread, listener)| {
+                let proxy = proxy.clone();
+                thread.spawn(async move {
+                    // (Taken by this thread's runtime, which then wakes it.)
+                    let Ok(listener) = TcpListener::from_std(listener) else {
+                        return;
+                    };
+                    if key == (me, port) {
+                        let take = |proxy: Arc<Proxy>, stream| async move {
+                            let _ = proxy.take(stream).await;
+                        };
+                        proxy.accept(listener, take).await;
+                    } else {
+                        let serve = move |proxy: Arc<Proxy>, stream| async move { proxy.serve(key, stream).await };
+                        proxy.accept(listener, serve).await;
+                    }
+                })
+            });
+            listening.insert(key, tasks.collect());
         }
         let again = Duration::from_millis(if waiting { 500 } else { 5000 });
         tokio::select! {
@@ -821,8 +860,54 @@ pub async fn run(
     }
     listening
         .values()
+        .flatten()
         .chain(&stray)
         .for_each(tokio::task::JoinHandle::abort);
+}
+
+/// A listener on `at` that the other threads' listeners of it share the port with.
+fn listen(at: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = if at.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    // (Only a process of kithd's own user may share it: the kernel says so.)
+    socket.set_reuseport(true)?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(at)?;
+    socket.listen(1024)?.into_std()
+}
+
+/// The threads the connections to Services are on, each with a runtime of its own: the
+/// requests a second rise with the cores, and kithd's API never waits behind a busy
+/// Service. Where none can be started, they are on kithd's own, as they were.
+fn start() -> Vec<tokio::runtime::Handle> {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut threads = Vec::new();
+    for at in 0..cores.min(THREADS) {
+        match thread(format!("kith-proxy-{at}")) {
+            Ok(handle) => threads.push(handle),
+            Err(e) => {
+                eprintln!("kithd: services: starting a thread: {e}");
+                break;
+            }
+        }
+    }
+    if threads.is_empty() {
+        threads.push(tokio::runtime::Handle::current());
+    }
+    threads
+}
+
+/// A thread called `name` with a runtime of its own, for as long as kithd runs (what is
+/// on it is stopped, not the thread).
+pub fn thread(name: String) -> std::io::Result<tokio::runtime::Handle> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let handle = runtime.handle().clone();
+    let run = move || runtime.block_on(std::future::pending::<()>());
+    std::thread::Builder::new().name(name).spawn(run)?;
+    Ok(handle)
 }
 
 #[cfg(test)]
@@ -998,6 +1083,50 @@ spec:
         assert!(within_cidr("0.0.0.0/0", "11.0.0.1".parse().unwrap()));
         assert!(!within_cidr("0.0.0.0/0", from) && !within_cidr("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
         assert!(!within_cidr("nonsense", from));
+    }
+
+    #[tokio::test]
+    async fn services_are_on_a_thread_a_core_each_listening_on_the_same_port() {
+        let named = || {
+            let tasks = std::fs::read_dir("/proc/self/task").unwrap().flatten();
+            let comm = |task: std::fs::DirEntry| std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+            tasks.map(comm).filter(|comm| comm.starts_with("kith-proxy")).count()
+        };
+        let before = named();
+        let threads = start();
+        let cores = std::thread::available_parallelism().unwrap().get();
+        assert_eq!(threads.len(), cores.min(THREADS));
+        // (Each thread names itself as it starts.)
+        for _ in 0..100 {
+            if named() - before == cores.min(THREADS) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(named() - before, cores.min(THREADS));
+        // Each thread's listener of a port shares it with the others'.
+        let first = listen("127.0.0.1:0".parse().unwrap()).unwrap();
+        let at = first.local_addr().unwrap();
+        let second = listen(at).unwrap();
+        let on = |listener: std::net::TcpListener, thread: &tokio::runtime::Handle| {
+            thread.spawn(async move { TcpListener::from_std(listener).unwrap().accept().await.is_ok() })
+        };
+        let (first, second) = (on(first, &threads[0]), on(second, &threads[threads.len() - 1]));
+        // (Refused once both have taken one and closed, before the loop sees it.)
+        let mut clients = Vec::new();
+        for _ in 0..1000 {
+            if first.is_finished() && second.is_finished() {
+                break;
+            }
+            clients.push(TcpStream::connect(at).await);
+        }
+        let both = tokio::time::timeout(Duration::from_secs(5), async {
+            first.await.unwrap() && second.await.unwrap()
+        });
+        assert!(
+            both.await.unwrap_or(false),
+            "the kernel gave every connection to one listener"
+        );
     }
 
     /// Two connected loopback sockets: (the one a client holds, the one the proxy holds).

@@ -67,7 +67,60 @@ impl Node {
         let got: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
         got["status"].clone()
     }
+
+    /// How many threads this kithd passes connections to Services on.
+    fn proxies(&self) -> usize {
+        self.threads("kith-proxy")
+    }
+
+    /// How many of this kithd's threads have names starting with `name`.
+    fn threads(&self, name: &str) -> usize {
+        let tasks = std::fs::read_dir(format!("/proc/{}/task", self.child.id())).unwrap();
+        let comm = |task: std::fs::DirEntry| std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+        tasks.flatten().map(comm).filter(|comm| comm.starts_with(name)).count()
+    }
+
+    /// How long its API takes to answer, half the time or less (the median of many).
+    fn answers_in(&self) -> Duration {
+        use std::io::{Read, Write};
+        let mut took: Vec<Duration> = (0..200)
+            .map(|_| {
+                let asked = Instant::now();
+                let mut api = std::os::unix::net::UnixStream::connect(self.dir.join("kithd.sock")).unwrap();
+                api.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut reply = Vec::new();
+                api.read_to_end(&mut reply).unwrap();
+                assert!(reply.starts_with(b"HTTP/1.1 200"));
+                asked.elapsed()
+            })
+            .collect();
+        took.sort();
+        took[took.len() / 2]
+    }
+
+    /// How long its DNS, on port 5353, takes to answer for `name` (the median of many).
+    fn names_in(&self, name: &str) -> Duration {
+        let netns = format!("--net=/run/netns/{}", self.dir.file_name().unwrap().to_str().unwrap());
+        let out = Command::new("nsenter")
+            .args([&netns, "python3", "-c", ASK, name])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        Duration::from_micros(String::from_utf8(out.stdout).unwrap().trim().parse().unwrap())
+    }
 }
+
+/// Asks 127.0.0.1:5353 for `argv[1]` 200 times; prints the median time to an answer, in µs.
+const ASK: &str = "import socket, struct, sys, time\n\
+labels = b''.join(bytes([len(p)]) + p.encode() for p in sys.argv[1].split('.'))\n\
+query = struct.pack('>6H', 7, 0x0100, 1, 0, 0, 0) + labels + b'\\0' + struct.pack('>2H', 1, 1)\n\
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5); s.connect(('127.0.0.1', 5353))\n\
+took = []\n\
+for _ in range(200):\n\
+\x20   asked = time.perf_counter(); s.send(query); answer = s.recv(4096)\n\
+\x20   took.append(time.perf_counter() - asked); assert answer[:2] == query[:2]\n\
+print(int(sorted(took)[100] * 1e6))\n";
 
 /// A helper process, killed when the test is over.
 struct Stop(std::process::Child);
@@ -96,35 +149,122 @@ class H(http.server.BaseHTTPRequestHandler):\n\
 \x20   def log_message(self, *a): pass\n\
 http.server.HTTPServer(('127.0.0.1', 8080), H).serve_forever()\n";
 
-/// The namespaces a and b, a wire between them, then this test again.
+/// The namespaces a and b, a wire between them, then the test `$1` again.
 const SETUP: &str = "set -e; mount -t tmpfs none /run; \
     ip netns add a; ip netns add b; ip -n a link set lo up; ip -n b link set lo up; \
     ip link add tob netns a type veth peer name toa netns b; \
     ip -n a addr add 10.1.0.1/24 dev tob; ip -n a link set tob up; \
     ip -n b addr add 10.1.0.2/24 dev toa; ip -n b link set toa up; \
-    KITH_IN_NAMESPACE=1 exec \"$0\" --exact a_service_spreads_connections --nocapture";
+    KITH_IN_NAMESPACE=1 exec \"$0\" --exact \"$1\" --nocapture";
+
+/// Whether the test `name` goes on here: it is run again inside the namespaces (and goes
+/// on there), or skipped where they cannot be made.
+fn in_namespaces(name: &str) -> bool {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return false;
+    }
+    if std::env::var_os("KITH_IN_NAMESPACE").is_some() {
+        return true;
+    }
+    // (As the user it is, not as root: kithd puts units where a user's cgroups are.)
+    let flags = ["-Unm", "--map-current-user", "--keep-caps"];
+    let unshare = |args: &[&str]| Command::new("unshare").args(flags).args(args).status();
+    if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+        eprintln!("skipped: no unprivileged user namespaces here (unshare -Unm --map-current-user --keep-caps)");
+        return false;
+    }
+    let built = Command::new(env!("CARGO"))
+        .args(["build", "--quiet", "-p", "kith-cli"])
+        .status();
+    assert!(built.unwrap().success());
+    let me = std::env::current_exe().unwrap();
+    // (One test at a time: their nodes have the same names, and so the same directories,
+    // whose sockets' paths have no room for a test's name too.)
+    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let status = unshare(&["sh", "-c", SETUP, me.to_str().unwrap(), name]).unwrap();
+    assert!(status.success(), "the test failed inside its namespaces");
+    false
+}
+
+/// A replica that sends as fast as it can to each connection, for as long as it lasts.
+const FLOOD: &str = "import socket, threading\n\
+listener = socket.create_server(('127.0.0.1', 8080))\n\
+zeros = bytes(1 << 20)\n\
+def send(c):\n\
+\x20   try:\n\
+\x20       while True: c.sendall(zeros)\n\
+\x20   except OSError: pass\n\
+while True:\n\
+\x20   c, _ = listener.accept(); threading.Thread(target=send, args=(c,), daemon=True).start()\n";
+
+/// Sixteen clients of the Service at `argv[1]`, port 80, taking all it sends; says so on
+/// its output once each has had some (and says nothing if one has not in a minute).
+const LOAD: &str = "import socket, sys, threading\n\
+going = threading.Barrier(17, timeout=60)\n\
+def take():\n\
+\x20   c = socket.create_connection((sys.argv[1], 80)); c.sendall(b'go'); got, buffer = 0, bytearray(1 << 20)\n\
+\x20   while got < 64 << 20:\n\
+\x20       n = c.recv_into(buffer)\n\
+\x20       if not n: return\n\
+\x20       got += n\n\
+\x20   going.wait()\n\
+\x20   while c.recv_into(buffer): pass\n\
+for _ in range(16): threading.Thread(target=take, daemon=True).start()\n\
+going.wait(); print('flowing', flush=True); threading.Event().wait()\n";
+
+#[test]
+fn the_api_answers_as_fast_with_the_proxy_busy() {
+    if !in_namespaces("the_api_answers_as_fast_with_the_proxy_busy") {
+        return;
+    }
+    let a = Node::start("a", "10.1.0.1", &["--dns", "127.0.0.1:5353"]);
+    wait_for("a to lead", || a.kith(&["get", "node"]).0);
+    std::fs::write(a.dir.join("flood.py"), FLOOD).unwrap();
+    let web = format!(
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: web, labels: {{ app: web }} }}\nspec:\n  \
+         template:\n    exec: [{{ name: run, command: [python3, {}] }}]\n---\n\
+         apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  selector: {{ app: web }}\n  \
+         ports: [{{ port: 80, targetPort: 8080 }}]\n",
+        a.dir.join("flood.py").display()
+    );
+    std::fs::write(a.dir.join("web.yaml"), web).unwrap();
+    a.ok(&["apply", "-f", "web.yaml"]);
+    wait_for("the replica behind the Service", || {
+        a.status("workload/web")["ready"] == 1 && a.status("service/web")["backends"] == 1
+    });
+    let address = a.status("service/web")["address"].as_str().unwrap().to_string();
+    wait_for("DNS on a thread of its own", || a.threads("kith-dns") == 1);
+    let idle = a.answers_in();
+    let named = a.names_in("a.node.kith");
+
+    let load = Command::new("nsenter")
+        .args(["--net=/run/netns/a", "python3", "-c", LOAD, &address])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut load = Stop(load);
+    let mut flowing = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(load.0.stdout.as_mut().unwrap()),
+        &mut flowing,
+    )
+    .unwrap();
+    assert_eq!(flowing, "flowing\n", "the clients could not reach the Service");
+    let busy = a.answers_in();
+    let named_busy = a.names_in("a.node.kith");
+    eprintln!("the API answers in {idle:?} with the proxy idle, {busy:?} with it busy");
+    eprintln!("DNS answers in {named:?} with the proxy idle, {named_busy:?} with it busy");
+    // (Twice as long, and a millisecond, for a machine busy with other things.)
+    let as_fast = |idle: Duration, busy: Duration| busy <= idle * 2 + Duration::from_millis(1);
+    assert!(as_fast(idle, busy), "the API: {idle:?} idle, {busy:?} busy");
+    assert!(as_fast(named, named_busy), "DNS: {named:?} idle, {named_busy:?} busy");
+}
 
 #[test]
 fn a_service_spreads_connections() {
-    if std::env::var_os("KITH_E2E").is_none() {
-        return eprintln!("skipped: set KITH_E2E=1");
-    }
-    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
-        // (As the user it is, not as root: kithd puts units where a user's cgroups are.)
-        let flags = ["-Unm", "--map-current-user", "--keep-caps"];
-        let unshare = |args: &[&str]| Command::new("unshare").args(flags).args(args).status();
-        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
-            return eprintln!(
-                "skipped: no unprivileged user namespaces here (unshare -Unm --map-current-user --keep-caps)"
-            );
-        }
-        let built = Command::new(env!("CARGO"))
-            .args(["build", "--quiet", "-p", "kith-cli"])
-            .status();
-        assert!(built.unwrap().success());
-        let me = std::env::current_exe().unwrap();
-        let status = unshare(&["sh", "-c", SETUP, me.to_str().unwrap()]).unwrap();
-        assert!(status.success(), "the test failed inside its namespaces");
+    if !in_namespaces("a_service_spreads_connections") {
         return;
     }
     // A certificate authority of our own, where node a is told to ask (never a real one).
@@ -161,6 +301,8 @@ fn a_service_spreads_connections() {
         both && b.ok(&["node", "status"]).contains(", handshake ")
     });
 
+    // No thread passes connections to Services before there is a Service.
+    assert_eq!((a.proxies(), b.proxies()), (0, 0));
     std::fs::write(a.dir.join("server.py"), SERVER).unwrap();
     let server = a.dir.join("server.py");
     let web = format!(
@@ -194,6 +336,9 @@ fn a_service_spreads_connections() {
         String::from_utf8(Command::new("nsenter").args(curl).output().unwrap().stdout).unwrap()
     };
     wait_for("the Service to answer", || !ask("a").is_empty());
+    // Then one on each core, up to kithd's bound of four, on each node.
+    let cores = std::thread::available_parallelism().unwrap().get().min(4);
+    wait_for("a thread on each core", || (a.proxies(), b.proxies()) == (cores, cores));
     for from in ["a", "b"] {
         let mut answers: Vec<String> = (0..6).map(|_| ask(from)).collect();
         answers.sort();

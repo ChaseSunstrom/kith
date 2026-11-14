@@ -321,11 +321,30 @@ pub async fn run(
             }
         }
     };
+    // Answered on a thread of its own: a busy API, controller or Service does not hold a
+    // lookup up. (Where none can be started, on kithd's own, as before.)
+    let thread = crate::services::thread("kith-dns".into()).unwrap_or_else(|e| {
+        eprintln!("kithd: DNS: starting a thread: {e}");
+        tokio::runtime::Handle::current()
+    });
+    let sockets = udp.into_std().and_then(|udp| Ok((udp, tcp.into_std()?)));
+    let answering = thread.spawn(async move {
+        let (udp, tcp) = sockets?;
+        let (udp, tcp) = (UdpSocket::from_std(udp)?, TcpListener::from_std(tcp)?);
+        kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect()).await;
+        Ok::<_, std::io::Error>(())
+    });
+    let stop = answering.abort_handle();
     tokio::select! {
-        () = kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect()) => {}
+        done = answering => {
+            if let Ok(Err(e)) = done {
+                eprintln!("kithd: serving DNS on {listen}: {e}");
+            }
+        }
         () = feed => {}
         _ = stopping.changed() => {}
     }
+    stop.abort();
 }
 
 #[cfg(test)]
