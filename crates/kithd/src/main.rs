@@ -105,6 +105,9 @@ struct Args {
     /// Resolvers for names that are not ours, in the order tried [default: those in /etc/resolv.conf]
     #[arg(long, env = "KITH_DNS_UPSTREAM", value_name = "ADDR[:PORT]", value_delimiter = ',')]
     dns_upstream: Vec<String>,
+    /// Take any node certificate of this cluster's CA, even one whose Node was deleted (for a cluster locked out of itself)
+    #[arg(long, env = "KITH_ADMIT_DELETED_NODES")]
+    admit_deleted_nodes: bool,
     /// Seconds a node may be out of contact before what it runs is started on other nodes
     #[arg(long, env = "KITH_LOST_AFTER", value_name = "SECONDS", default_value_t = 300)]
     lost_after: u64,
@@ -611,6 +614,10 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
             eprintln!("kithd: node {} serving other nodes on {address}", cluster.me.name);
             let _ = netboot::PORT.set(address.port());
+            if args.admit_deleted_nodes {
+                eprintln!("kithd: --admit-deleted-nodes: a deleted node's certificate is still taken here");
+                cluster::ADMIT_DELETED.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             let listener = cluster::listen(tcp, pki::server_config(&cluster.me)?).map_err(|e| fail("listening", &e))?;
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
@@ -623,7 +630,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     let reachable = advertise.clone().unwrap_or(address.to_string());
                     let id = shared.raft.metrics().borrow().id;
                     // Not fatal: the address the cluster has for this node is the one from last time.
-                    if let Err(e) = cluster::register(&shared, &cluster.me.name, &reachable, id).await {
+                    let registered = match pki::print_of(&cluster.me.cert) {
+                        Ok(print) => cluster::register(&shared, &cluster.me.name, &reachable, id, &print, None)
+                            .await
+                            .map_err(|e| e.to_string()),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = registered {
                         eprintln!("kithd: telling the cluster this node is at {reachable}: {e}");
                     }
                 }

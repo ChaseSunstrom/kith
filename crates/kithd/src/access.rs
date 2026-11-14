@@ -137,8 +137,8 @@ pub fn for_identities(path: &str) -> bool {
     FOR_IDENTITIES.iter().any(open)
 }
 
-/// The public key (DER) of the certificate a request came with, for an Identity: a watch
-/// asks again whether it still stands for the Identity once its wait is over.
+/// The public key (DER) of the certificate a request came with, for an Identity or a node:
+/// a watch asks again whether it still stands for them once its wait is over.
 #[derive(Clone)]
 pub struct Certificate(pub Vec<u8>);
 
@@ -160,7 +160,20 @@ pub fn who(
     path: &str,
 ) -> Result<Caller, (StatusCode, String)> {
     let (name, key) = match subject {
-        Some(pki::Subject::Node(node)) => return Ok(Caller::Node(node.clone())),
+        Some(pki::Subject::Node(node, key, _)) => {
+            let caller = Caller::Node(node.clone());
+            if crate::cluster::admitted(shared, node, key) {
+                return Ok(caller);
+            }
+            let why = crate::cluster::EVICTED.to_string();
+            // (One a minute, as for someone with no certificate: it can ask as often as it likes.)
+            if shared.audit.stranger() {
+                shared
+                    .audit
+                    .record(&caller, method, vec![path.into()], Err(why.clone()));
+            }
+            return Err((StatusCode::UNAUTHORIZED, why));
+        }
         Some(pki::Subject::User(name, key)) => (name, key),
         None => {
             let why = "a certificate from this cluster's CA is needed".to_string();
@@ -209,7 +222,7 @@ pub async fn caller(
         Ok(caller) => caller,
         Err((status, why)) => return refuse(status, why).into_response(),
     };
-    if let Some(pki::Subject::User(_, key)) = &peer.subject {
+    if let Some(pki::Subject::User(_, key) | pki::Subject::Node(_, key, _)) = &peer.subject {
         request.extensions_mut().insert(Certificate(key.clone()));
     }
     request.extensions_mut().insert(caller);

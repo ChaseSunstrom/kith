@@ -1991,6 +1991,7 @@ impl Watch {
         match (&self.call.caller, &self.call.certificate) {
             (Caller::Identity(name), Some(Certificate(der))) => access::stands(&self.call.shared, name, der),
             (Caller::Identity(_), None) => false,
+            (Caller::Node(name), Some(Certificate(der))) => crate::cluster::admitted(&self.call.shared, name, der),
             _ => true,
         }
     }

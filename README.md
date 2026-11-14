@@ -478,7 +478,11 @@ kith node status                                   # who leads the store, who vo
   two nodes (also after one of three is deleted) only one votes, because two
   voters would stop when either one did; losing it stops changes until it is
   back. A node starts to vote only once it has received the store.
-- `kith delete node/NAME` takes a node out of the store's members.
+- `kith delete node/NAME` takes a node out of the store's members. From the next
+  request on, the other nodes refuse its certificate (`401`, on the API and between
+  nodes) and drop it from the mesh, with nothing restarted. To have the machine back,
+  join it again with a new token: it gets a new certificate, and the old one stays
+  refused. What that node already copied it still has: see SECURITY.md.
 - Every node tells every other one, every two seconds, which nodes it has
   heard from (none of this goes through the store). A node nobody has heard
   from for ten seconds shows as `unreachable` in `kith get node`, and as
@@ -697,7 +701,8 @@ that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and
 `--token` shows in the process list until then: `KITH_TOKEN` does not), a join
 that dies halfway needs `kith delete node/NAME` and a new token,
-certificates last ten years and cannot be renewed or revoked, and `kith` itself
+certificates last ten years and cannot be renewed (a node's stops being taken when its Node is deleted,
+an Identity's when the Identity is), and `kith` itself
 only talks to the kithd on its own machine.
 
 ## DNS

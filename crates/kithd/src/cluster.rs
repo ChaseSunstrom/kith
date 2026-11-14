@@ -222,7 +222,7 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
                     let certs = stream.get_ref().1.peer_certificates();
                     let subject = certs.and_then(|certs| pki::subject_of(certs.first()?));
                     // Whoever the CA vouches for gives the slot back; a guest keeps it, for a short while.
-                    // ponytail: that includes an Identity since deleted, until certificates expire or are revoked by more than the store.
+                    // ponytail: that includes an Identity or a node since deleted (each request of theirs is refused, the slot is not kept), until certificates expire or are revoked by more than the store.
                     let guest = subject
                         .is_none()
                         .then(|| (slot, Box::pin(tokio::time::sleep(GUEST_TIME))));
@@ -275,9 +275,93 @@ fn cluster(shared: &Shared) -> Result<&Cluster, Refusal> {
     shared.cluster.as_ref().ok_or_else(none)
 }
 
-async fn members_only(ConnectInfo(peer): ConnectInfo<Peer>, request: Request, next: Next) -> Response {
-    let (status, why) = match peer.subject {
-        Some(pki::Subject::Node(_)) => return next.run(request).await,
+pub const EVICTED: &str = "this certificate is not a node of this cluster's any more: its Node was deleted, or the \
+     name has joined again with another";
+
+/// Set by `--admit-deleted-nodes`: [`admitted`] says yes to every node certificate.
+pub static ADMIT_DELETED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Does the certificate for the key `key` (DER) still stand for the node `name`? Its Node
+/// has to be in the store this node has, admitted (a Node made by hand never joined), and
+/// to name that key: a name that joined again got another. A Node from before certificates
+/// were written down names none, and stands by its name.
+pub fn admitted(shared: &Shared, name: &str, key: &[u8]) -> bool {
+    if ADMIT_DELETED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    stands(&state.store, name, key)
+}
+
+/// [`admitted`], asked of a store.
+fn stands(store: &kith_api::store::Store, name: &str, key: &[u8]) -> bool {
+    let node = store.get(&node_key(name));
+    let Some(status) = node.and_then(|node| node.status.as_ref()) else {
+        return false;
+    };
+    let joined = status["raftId"].is_string();
+    joined
+        && status["certificate"]
+            .as_str()
+            .is_none_or(|print| print == pki::key_print(key))
+}
+
+/// What the leader sends a node to bring its store up to date, and what asks for its vote:
+/// the only routes a node this one has not heard of is let into ([`unheard`]).
+const CATCHING_UP: [&str; 3] = ["/v1/raft/append", "/v1/raft/vote", "/v1/raft/snapshot"];
+
+/// Is `path` one of those routes, is there no Node `name` in the store of the node `me`,
+/// which has applied its log up to `applied`, and can this node not know that one was deleted? A node that was away while
+/// another joined must take what that one sends it (it may lead by now), or it would never
+/// catch up. A certificate from a join says by which index of the store its Node was there
+/// (`born`): a store that is past it had the Node, and it is gone. One that says none (the
+/// node the cluster started on, whose Node is older than every join; a certificate from
+/// before this) is unheard of only by a node that has not heard of itself: one that has
+/// just joined, or the one that was deleted.
+fn unheard(store: &kith_api::store::Store, me: &str, applied: u64, path: &str, name: &str, born: Option<u64>) -> bool {
+    CATCHING_UP.contains(&path)
+        && store.get(&node_key(name)).is_none()
+        && match born {
+            Some(born) => applied < born,
+            None => store.get(&node_key(me)).is_none(),
+        }
+}
+
+/// [`unheard`], asked of this node.
+fn catching_up(shared: &Shared, path: &str, name: &str, born: Option<u64>) -> bool {
+    let Some(cluster) = &shared.cluster else {
+        return false;
+    };
+    // (Read before the store: an index that is a moment old only says "behind" a moment longer.)
+    let applied = shared.raft.metrics().borrow().last_applied.map_or(0, |log| log.index);
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    unheard(&state.store, &cluster.me.name, applied, path, name, born)
+}
+
+async fn members_only(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let (status, why) = match &peer.subject {
+        Some(pki::Subject::Node(name, key, born))
+            if admitted(&shared, name, key) || catching_up(&shared, path, name, *born) =>
+        {
+            return next.run(request).await;
+        }
+        Some(pki::Subject::Node(name, ..)) => {
+            // (One a minute, as on the API.)
+            if shared.audit.stranger() {
+                let who = crate::access::Caller::Node(name.clone());
+                let refused = Err(EVICTED.to_string());
+                shared
+                    .audit
+                    .record(&who, request.method().as_str(), vec![path.to_string()], refused);
+            }
+            (StatusCode::UNAUTHORIZED, EVICTED)
+        }
         Some(pki::Subject::User(..)) => (
             StatusCode::FORBIDDEN,
             "this is for the cluster's nodes, not for an Identity",
@@ -313,10 +397,11 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
             get(crate::encrypted::get).put(crate::encrypted::put),
         )
         .with_state(shared.clone());
-    let members = crate::raft::router(shared).merge(ping).merge(hop);
+    let members = crate::raft::router(shared.clone()).merge(ping).merge(hop);
+    let members_only = axum::middleware::from_fn_with_state(shared, members_only);
     open.merge(crate::ui::pages())
         .merge(api)
-        .merge(members.layer(axum::middleware::from_fn(members_only)))
+        .merge(members.layer(members_only))
 }
 
 /// What only the local socket serves.
@@ -627,9 +712,18 @@ fn node_key(name: &str) -> String {
     format!("Node/{name}")
 }
 
-/// Put `Node/<name>` in the store: reachable at `address`, and `id` in Raft (as text:
-/// not every JSON reader keeps 64 bits). The leader then starts sending it the store.
-pub async fn register(shared: &Shared, name: &str, address: &str, id: u64) -> Result<(), kith_api::store::Error> {
+/// Put `Node/<name>` in the store: reachable at `address`, `id` in Raft (as text: not
+/// every JSON reader keeps 64 bits), and holding the certificate whose key's print is
+/// `print` ([`admitted`]), with what it says of itself on the mesh if it joined there, all
+/// in one entry: no entry makes it half a node. The leader then starts sending it the store.
+pub async fn register(
+    shared: &Shared,
+    name: &str,
+    address: &str,
+    id: u64,
+    print: &str,
+    mesh: Option<serde_json::Value>,
+) -> Result<(), kith_api::store::Error> {
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": {},
     });
@@ -642,10 +736,11 @@ pub async fn register(shared: &Shared, name: &str, address: &str, id: u64) -> Re
         let (resources, at) = (vec![node], kith_api::store::now());
         shared.submit(Command::Apply { resources, at }).await?;
     }
-    let status = serde_json::json!({ "address": address, "raftId": id.to_string() });
-    let serde_json::Value::Object(status) = status else {
+    let status = serde_json::json!({ "address": address, "raftId": id.to_string(), "certificate": print });
+    let serde_json::Value::Object(mut status) = status else {
         unreachable!("an object")
     };
+    status.extend(mesh.map(|mesh| ("mesh".to_string(), mesh)));
     let statuses = vec![(node_key(name), status)];
     shared.submit(Command::Patch { statuses }).await.map(drop)
 }
@@ -735,33 +830,38 @@ async fn join(
         let why = "no node of this cluster is on the mesh (--mesh), and a node that roams is reached there";
         return Err(refuse(StatusCode::CONFLICT, why));
     }
-    let (cert, key) = ca
-        .issue(&request.name)
-        .map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Its Node first, then its certificate, which says by which index of the store the Node
+    // was there (`unheard`). The Node admits nobody until `register` gives it a status.
     let unavailable = |e| refuse(StatusCode::SERVICE_UNAVAILABLE, e);
-    let address = match &request.mesh {
-        None => SocketAddr::new(peer.addr.ip(), request.port).to_string(),
+    let failed = |e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e);
+    let spec = match request.mesh {
+        Some(_) => serde_json::json!({ "roaming": true }),
+        None => serde_json::json!({}),
+    };
+    let node = serde_json::json!({
+        "apiVersion": kith_api::API_VERSION, "kind": "Node",
+        "metadata": { "name": request.name }, "spec": spec,
+    });
+    let resources = vec![serde_json::from_value(node).expect("a Node with a valid name")];
+    let at = kith_api::store::now();
+    let (_, born) = shared
+        .write_at(Command::Apply { resources, at })
+        .await
+        .map_err(unavailable)?;
+    let (cert, key) = ca.issue_born(&request.name, born).map_err(failed)?;
+    let print = pki::print_of(&cert).map_err(failed)?;
+    // (What a roaming node says of itself on the mesh goes in with the rest: the other
+    // nodes take it as a peer by this key, and it calls them.)
+    let (address, mesh) = match &request.mesh {
+        None => (SocketAddr::new(peer.addr.ip(), request.port), None),
         Some(said) => {
-            // Its Node says so before anything is sent to it: the other nodes take it as a
-            // peer by this key, and it calls them.
-            let node = serde_json::json!({
-                "apiVersion": kith_api::API_VERSION, "kind": "Node",
-                "metadata": { "name": request.name }, "spec": { "roaming": true },
-            });
-            let resources = vec![serde_json::from_value(node).expect("a Node with a valid name")];
-            let at = kith_api::store::now();
-            shared
-                .submit(Command::Apply { resources, at })
-                .await
-                .map_err(unavailable)?;
             let mesh = serde_json::json!({ "key": said.key, "address": mesh_address.to_string(), "port": said.port });
-            let fields = serde_json::Map::from_iter([("mesh".to_string(), mesh)]);
-            let statuses = vec![(node_key(&request.name), fields)];
-            shared.submit(Command::Patch { statuses }).await.map_err(unavailable)?;
-            SocketAddr::new(mesh_address.into(), request.port).to_string()
+            (SocketAddr::new(mesh_address.into(), request.port), Some(mesh))
         }
     };
-    register(&shared, &request.name, &address, kith_store::node_id(&request.name))
+    let address = address.to_string();
+    let id = kith_store::node_id(&request.name);
+    register(&shared, &request.name, &address, id, &print, mesh)
         .await
         .map_err(unavailable)?;
     cluster.tokens.good(&request.token, true);
@@ -847,6 +947,53 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::Poll;
+
+    #[test]
+    fn an_evicted_nodes_key_stands_for_no_node() {
+        let mut store = kith_api::store::Store::default();
+        // A node that has not heard of itself has not heard of the others: it is being sent
+        // the store, and takes it from a node whose certificate says no index.
+        let unheard = |store: &kith_api::store::Store, applied, name: &str, born| {
+            unheard(store, "a", applied, "/v1/raft/append", name, born)
+        };
+        assert!(!stands(&store, "b", b"key") && unheard(&store, 0, "b", None));
+        // On the routes that bring it up to date, and on no other: not to write, not to run.
+        for (path, let_in) in [
+            ("/v1/raft/snapshot", true),
+            ("/v1/raft/vote", true),
+            ("/v1/raft/write", false),
+        ] {
+            assert_eq!(super::unheard(&store, "a", 0, path, "b", None), let_in, "{path}");
+        }
+        assert!(!super::unheard(&store, "a", 0, "/v1/run-hop", "b", Some(5)));
+        for name in ["a", "b", "old", "made"] {
+            let node = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n");
+            let node = kith_api::Resource::from_source(&node).unwrap().remove(0);
+            store.apply(node.unwrap()).unwrap();
+        }
+        let joined = |print: Option<String>| serde_json::json!({ "raftId": "7", "certificate": print });
+        store.set_status("Node/a", Some(joined(None))).unwrap();
+        store
+            .set_status("Node/b", Some(joined(Some(pki::key_print(b"key")))))
+            .unwrap();
+        // (A Node from before certificates were written down: by its name.)
+        store.set_status("Node/old", Some(joined(None))).unwrap();
+        assert!(stands(&store, "b", b"key") && stands(&store, "old", b"any"));
+        // Another key under the name, a Node made by hand, and one that is not there.
+        assert!(!stands(&store, "b", b"another") && !stands(&store, "made", b"key"));
+        assert!(!stands(&store, "gone", b"key"));
+        // A Node that is there is not unheard of, whatever its certificate says.
+        assert!(!unheard(&store, 0, "b", Some(5)) && !unheard(&store, 0, "made", None));
+        store.delete("Node/b").unwrap();
+        assert!(!stands(&store, "b", b"key"));
+        // A certificate from a join says by which index its Node was there: a node that is
+        // past it knows the Node was deleted; one that was away and is not there yet takes
+        // what it sends (it may lead by now, and would be the one to send this node the store).
+        assert!(!unheard(&store, 9, "b", Some(5)) && !unheard(&store, 5, "b", Some(5)));
+        assert!(unheard(&store, 4, "b", Some(5)));
+        // One that says no index, to a node that has heard of itself: deleted.
+        assert!(!unheard(&store, 0, "b", None));
+    }
 
     /// `/v1/netboot` refuses an Identity that may not apply Nodes before it reads the body:
     /// the body here says when it is read, and it is never.

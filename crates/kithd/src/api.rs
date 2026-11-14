@@ -413,6 +413,11 @@ async fn watch(
     // The wait may have been long: an Identity deleted, or given another key, meanwhile is
     // told no more, and that is written down.
     // (An Identity with no certificate on record is not taken on trust.)
+    if let (Caller::Node(name), Some(Extension(Certificate(der)))) = (&caller, &certificate)
+        && !crate::cluster::admitted(&shared, name, der)
+    {
+        return Err(ApiError::Unauthorized(crate::cluster::EVICTED.into()));
+    }
     if let Caller::Identity(name) = &caller
         && !certificate.is_some_and(|Extension(Certificate(der))| access::stands(&shared, name, &der))
     {

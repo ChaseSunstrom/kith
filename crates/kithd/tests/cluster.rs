@@ -223,6 +223,92 @@ fn nodes_join_over_mutual_tls() {
     assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
 }
 
+/// A raw HTTPS request with the node certificate kept in `dir`; returns the status code.
+fn status_as_node(address: &str, dir: &Path, method: &str, path: &str) -> String {
+    let out = Command::new("curl")
+        .args([
+            "-sk",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "5",
+            "-X",
+            method,
+        ])
+        .arg("--cert")
+        .arg(dir.join("node.crt"))
+        .arg("--key")
+        .arg(dir.join("node.key"))
+        .arg(format!("https://{address}{path}"))
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// (Not behind KITH_E2E: it pulls nothing, and a test that is skipped proves nothing.)
+#[test]
+fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
+    let test = "evicted";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    let address = alpha.address();
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    // A join goes through the check: beta is sent the store, and writes through alpha.
+    let token = alpha.ok(&["node", "token"]);
+    let mut beta = Node::start(test, "beta", &["--join", &address, "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: shared }\nspec: { data: { a: b } }\n";
+    std::fs::write(beta.dir.join("cm.yaml"), config).unwrap();
+    beta.ok(&["apply", "-f", "cm.yaml"]);
+
+    // The certificate beta was given, as whoever took the machine would have it.
+    let taken = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join("taken");
+    let _ = std::fs::remove_dir_all(&taken);
+    std::fs::create_dir_all(&taken).unwrap();
+    for file in ["node.crt", "node.key"] {
+        std::fs::copy(beta.dir.join("state/pki").join(file), taken.join(file)).unwrap();
+    }
+    let api = || status_as_node(&address, &taken, "GET", "/v1/resources");
+    // (A node route: what is posted is not a write, and a member is told so.)
+    let route = || status_as_node(&address, &taken, "POST", "/v1/raft/write");
+    assert_eq!(api(), "200");
+    assert!(!["401", "403"].contains(&route().as_str()), "{}", route());
+
+    // Deleted: refused by the next request, with alpha never restarted.
+    alpha.ok(&["delete", "node/beta"]);
+    assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
+    beta.stop();
+    // A Node of that name made by hand admits nobody: it never joined.
+    let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: beta }\nspec: {}\n";
+    std::fs::write(alpha.dir.join("node.yaml"), node).unwrap();
+    alpha.ok(&["apply", "-f", "node.yaml"]);
+    assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
+    alpha.ok(&["delete", "node/beta"]);
+
+    // A node that joins under the name has a certificate of its own; the old one stays out.
+    let token = alpha.ok(&["node", "token"]);
+    let beta = Node::start(test, "beta", &["--join", &address, "--token", token.trim()]);
+    wait_for("the new beta to have the store", || beta.nodes().len() == 2);
+    assert_eq!(
+        status_as_node(&address, &beta.dir.join("state/pki"), "GET", "/v1/resources"),
+        "200"
+    );
+    assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
+    assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
+    // The new node refuses it too, by the store it was sent.
+    assert_eq!(status_as_node(&beta.address(), &taken, "GET", "/v1/resources"), "401");
+    assert_eq!(status_as_node(&beta.address(), &taken, "POST", "/v1/raft/write"), "401");
+
+    // For a cluster locked out of itself: a node started with the switch takes it again.
+    alpha.stop();
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &["--admit-deleted-nodes"]);
+    wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
+    wait_for("the old certificate to be taken", || api() == "200");
+}
+
 #[test]
 fn the_store_survives_its_leader() {
     if std::env::var_os("KITH_E2E").is_none() {

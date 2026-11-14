@@ -225,7 +225,7 @@ pub async fn hop(
     ConnectInfo(peer): ConnectInfo<Peer>,
     request: Request,
 ) -> Response {
-    let Some(Subject::Node(from)) = peer.subject else {
+    let Some(Subject::Node(from, ..)) = peer.subject else {
         return say(StatusCode::FORBIDDEN, "this is for the cluster's nodes");
     };
     let (spec, upgrade) = match take(request).await {
@@ -510,13 +510,20 @@ spec: {role: other-jobber, subjects: [carol]}
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}, labels: {{{labels}}}}}\nspec: {{}}\n"
             );
             let resource = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            // (With a `raftId`, as a node that joined has: one without is let in nowhere.)
             let status = match port {
-                Some(port) => json!({"address": format!("127.0.0.1:{port}"), "state": "ready"}),
-                None => json!({"address": "127.0.0.1:1", "state": "unreachable"}),
+                Some(port) => json!({"address": format!("127.0.0.1:{port}"), "state": "ready", "raftId": "1"}),
+                None => json!({"address": "127.0.0.1:1", "state": "unreachable", "raftId": "1"}),
             };
-            let mut state = self.a.store.lock().unwrap();
-            state.store.apply(resource).unwrap();
-            state.store.set_status(&format!("Node/{name}"), Some(status)).unwrap();
+            // Both nodes have the store: the one asked looks the asking node up in its own.
+            for shared in [&self.a, &self.b] {
+                let mut state = shared.store.lock().unwrap();
+                state.store.apply(resource.clone()).unwrap();
+                state
+                    .store
+                    .set_status(&format!("Node/{name}"), Some(status.clone()))
+                    .unwrap();
+            }
         }
 
         /// A client that shows the certificate of the Identity `name` (made now, on `a`).

@@ -163,6 +163,11 @@ impl Shared {
 
     /// [`Shared::submit`] for the blob store's own Blobs: the bytes were just put.
     pub async fn write(&self, command: Command) -> Result<Done, Error> {
+        self.write_at(command).await.map(|(done, _)| done)
+    }
+
+    /// [`Shared::write`], and the index of the log the change is at: this node has applied it.
+    pub async fn write_at(&self, command: Command) -> Result<(Done, u64), Error> {
         // Whoever applies, here is where a kind's admission module is asked.
         let command = match command {
             Command::Apply { resources, at } => {
@@ -179,7 +184,7 @@ impl Shared {
         loop {
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
             let leader = match written {
-                Ok(Ok(written)) => return written.data,
+                Ok(Ok(written)) => return written.data.map(|done| (done, written.log_id.index)),
                 Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to)))) => to.leader_node,
                 Ok(Err(e)) => return Err(unavailable(e)),
                 Err(_) => return Err(unavailable(NO_MAJORITY)),
@@ -194,7 +199,7 @@ impl Shared {
                             // What a client writes through this node, it can read from this node.
                             let caught_up = self.raft.wait(Some(PATIENCE));
                             let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                            return reply;
+                            return reply.map(|done| (done, index));
                         }
                     }
                     // Never reached it: nothing happened, and asking again is safe.
