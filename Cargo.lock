@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "kith-api"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "kith-yaml",
  "schemars",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "kith-cli"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "clap",
  "kith-api",
@@ -1254,21 +1254,21 @@ dependencies = [
 
 [[package]]
 name = "kith-dm-sys"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "kith-dns"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "kith-mesh"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "netlink-packet-core",
  "netlink-packet-generic",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "kith-packages"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "kith-api",
  "kith-yaml",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "kith-runtime"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "libcgroups",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "kith-sched"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "kith-api",
  "serde_json",
@@ -1316,7 +1316,7 @@ dependencies = [
 
 [[package]]
 name = "kith-store"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "kith-api",
  "openraft",
@@ -1328,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "kith-yaml"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "saphyr-parser",
  "serde",
@@ -1337,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "kithd"
-version = "0.0.1"
+version = "1.0.0"
 dependencies = [
  "axum",
  "base64 0.22.1",

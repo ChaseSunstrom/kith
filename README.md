@@ -1524,7 +1524,7 @@ installer's to say, which is not written yet.
 ### Updating a node: two slots
 
 ```sh
-KITH_OS_VERSION=0.0.2 sh os/build.sh   # also writes target/os/kith-os.update (32 MB)
+KITH_OS_VERSION=1.0.1 sh os/build.sh   # also writes target/os/kith-os.update (32 MB)
 sh ci/vm.sh --test update              # a node updates itself in QEMU, and goes back when it must
 ```
 
@@ -1609,8 +1609,8 @@ kind: OSRelease
 metadata:
   name: v0-0-2
 spec:
-  version: 0.0.2
-  image: http://files.example/kith-os-0.0.2.update
+  version: 1.0.1
+  image: http://files.example/kith-os-1.0.1.update
   publicKey: <what keygen printed>
   signature: <what --sign printed>
 ---
@@ -1905,6 +1905,34 @@ signed, so the firmware does not yet check the file that checks the root), the
 state partition growing to its disk, drivers for Wi-Fi,
 sound and graphics, a card plugged in later, IPv6 addresses from the network,
 arm64.
+
+## kith.dev/v1 is stable
+
+```sh
+cargo test -p kith-api stable          # the kinds take every file v1.schema.json says they took
+```
+
+Every resource says `apiVersion: kith.dev/v1`, and from kith 1.0 that is a
+promise: a file that 1.0 takes is taken by every later build.
+
+- `crates/kith-api/v1.schema.json` is the JSON Schema of every built-in kind
+  (what `kith schema KIND` prints), and the test above compares the code with
+  it. A field or a kind that is gone, a type that changed, a field that is
+  newly required and a new limit on a value are each named, and fail the
+  build.
+- Kinds grow: a new field nobody has to give, a new kind, one more value a
+  field takes. Those pass once the file is written again
+  (`KITH_BLESS=1 cargo test -p kith-api stable`), so every change to what v1
+  takes is in a diff somebody reads.
+- A change that would refuse a v1 file waits for a `kith.dev/v2`.
+
+A schema does not say everything: what a field means when it is left out,
+the checks across fields, and the few values kith reads by hand (a quantity
+such as `512Mi`, a placement preference) are held by review, not by that
+test. Not
+promised: the fields of `status` (controllers write them, and they change),
+kinds you define yourself (their schema is yours), and what the commands
+print for people (`-o yaml` and `-o json` print resources, which are).
 
 ## YAML, strictly
 

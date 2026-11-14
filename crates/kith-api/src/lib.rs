@@ -301,4 +301,6 @@ impl Resource {
 }
 
 #[cfg(test)]
+mod stable;
+#[cfg(test)]
 mod tests;

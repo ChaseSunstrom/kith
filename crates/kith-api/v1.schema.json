@@ -1,0 +1,3521 @@
+{
+  "kinds": {
+    "Cluster": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Cluster"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClusterSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Cluster-wide settings: domain, voter set, update policy, mesh settings",
+      "title": "Cluster",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Node": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Node"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "One machine: roles, taints, OS version, system extensions, resource reservations",
+      "title": "Node",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Namespace"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NamespaceSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Grouping, quotas, default policies",
+      "title": "Namespace",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Workload"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkloadSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Long-running replicas",
+      "title": "Workload",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "NodeWorkload": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "NodeWorkload"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeWorkloadSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Runs on every node matching a selector",
+      "title": "NodeWorkload",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Job": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Job"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A run-to-completion task",
+      "title": "Job",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "CronJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "CronJob"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CronJobSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A scheduled task",
+      "title": "CronJob",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Service"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServiceSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Stable name, load balancing and optional public exposure",
+      "title": "Service",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "DNSZone": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "DNSZone"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsZoneSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A domain kithd's DNS server answers for",
+      "title": "DNSZone",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "DNSRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "DNSRecord"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsRecordSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Names in a DNSZone: A, AAAA, CNAME, TXT, SRV, NS, PTR",
+      "title": "DNSRecord",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "NetworkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "NetworkPolicy"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NetworkPolicySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Allow or deny traffic between workloads, namespaces and nodes",
+      "title": "NetworkPolicy",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Volume"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Storage on a node, optionally shared over the mesh",
+      "title": "Volume",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "VolumeClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "VolumeClaim"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VolumeClaimSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A request for storage",
+      "title": "VolumeClaim",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Blob"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BlobSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Bytes named by their BLAKE3 hash, kept on several nodes",
+      "title": "Blob",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Backup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Backup"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackupSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A Volume archived on a schedule, to blobs or S3",
+      "title": "Backup",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Image"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A container image made from a Volume and served by the cluster's registry",
+      "title": "Image",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Share": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Share"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShareSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A Volume given to machines that are not nodes, over NFS and SMB",
+      "title": "Share",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Secret": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Secret"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SecretSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Secrets, delivered as files or env vars",
+      "title": "Secret",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "ConfigMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "ConfigMap"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConfigMapSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Configuration, delivered as files or env vars",
+      "title": "ConfigMap",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Seat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Seat"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SeatSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A group of local display, input and audio devices on a node",
+      "title": "Seat",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Device": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Device"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A piece of hardware discovered on a node",
+      "title": "Device",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "DeviceClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "DeviceClaim"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceClaimSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A workload's claim on a seat or device",
+      "title": "DeviceClaim",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Package": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Package"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackageSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A versioned bundle of resource templates",
+      "title": "Package",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Release": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Release"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReleaseSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "An installed package with its values",
+      "title": "Release",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Repository"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RepositorySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "An OCI registry holding packages",
+      "title": "Repository",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Source"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "GitOps: sync resources from a git repo or OCI artifact",
+      "title": "Source",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "OSRelease": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "OSRelease"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OsReleaseSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A signed kith OS image version",
+      "title": "OSRelease",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "UpdatePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "UpdatePlan"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdatePlanSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A rollout of an OSRelease across nodes",
+      "title": "UpdatePlan",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "NodeKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "NodeKey"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeKeySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "The wrapped key of a node's encrypted state",
+      "title": "NodeKey",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "KindDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "KindDefinition"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KindDefinitionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Defines a new resource kind",
+      "title": "KindDefinition",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Role": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Role"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A set of permissions",
+      "title": "Role",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "RoleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "RoleBinding"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleBindingSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Grants a role to identities",
+      "title": "RoleBinding",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Identity"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentitySpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A user, node or workload that can call the API",
+      "title": "Identity",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    }
+  },
+  "$defs": {
+    "Access": {
+      "type": "string",
+      "enum": [
+        "exclusive",
+        "shared"
+      ]
+    },
+    "AccessRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Kind names, or `*`."
+        },
+        "verbs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Verb"
+          }
+        },
+        "namespaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Empty means every namespace."
+        }
+      },
+      "required": [
+        "kinds",
+        "verbs"
+      ]
+    },
+    "Activity": {
+      "type": "string",
+      "enum": [
+        "active",
+        "idle",
+        "fullscreen"
+      ],
+      "description": "What a session says its seat is doing; a seat that says nothing is idle."
+    },
+    "Approval": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "manual"
+      ]
+    },
+    "BackupSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "volume": {
+          "type": "string",
+          "description": "The Volume, in this namespace."
+        },
+        "every": {
+          "type": "string",
+          "description": "How often: a number and `s`, `m`, `h` or `d` (`24h`)."
+        },
+        "keep": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many are kept [default: 7]."
+        },
+        "copies": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many nodes keep each backup's blob [default: 2]."
+        },
+        "s3": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/S3"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Send them to an S3-compatible bucket instead of the cluster's blob store."
+        }
+      },
+      "required": [
+        "volume",
+        "every"
+      ],
+      "description": "A Volume's directory as an archive, made every so often by the volume's node and\nkept as a blob (on other nodes too) or in an S3 bucket."
+    },
+    "BlobSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0,
+          "description": "How many bytes."
+        },
+        "copies": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many nodes keep a copy [default: 2]."
+        }
+      },
+      "required": [
+        "size"
+      ],
+      "description": "Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3\nhash, and `kith blob put` makes it."
+    },
+    "ClusterSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "DNS domain for public names."
+        },
+        "voters": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of the nodes that vote in Raft."
+        },
+        "updatePolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpdatePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mesh": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MeshSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Cluster-wide package values."
+        }
+      }
+    },
+    "Column": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "Dotted path into the resource, e.g. `spec.replicas`."
+        }
+      },
+      "required": [
+        "name",
+        "path"
+      ]
+    },
+    "Concurrency": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "forbid",
+        "replace"
+      ]
+    },
+    "ConfigMapSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "Container": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "pullPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PullPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When to ask the registry what `image` points at. Defaults to `ifNotPresent`."
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvVar"
+          }
+        },
+        "workingDir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Port"
+          }
+        },
+        "volumeMounts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VolumeMount"
+          }
+        },
+        "liveness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Probe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "readiness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Probe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "image"
+      ]
+    },
+    "CronJobSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schedule": {
+          "type": "string",
+          "description": "Five-field cron expression."
+        },
+        "timezone": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "concurrency": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Concurrency"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "job": {
+          "$ref": "#/$defs/JobSpec"
+        }
+      },
+      "required": [
+        "schedule",
+        "job"
+      ]
+    },
+    "DeviceClaimSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "seat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "access": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Access"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "description": "Exactly one of `seat` or `device`, or a `selector` over device labels."
+    },
+    "DeviceClass": {
+      "type": "string",
+      "enum": [
+        "gpu",
+        "display",
+        "input",
+        "audio",
+        "usb",
+        "camera",
+        "other"
+      ]
+    },
+    "DeviceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string"
+        },
+        "class": {
+          "$ref": "#/$defs/DeviceClass"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Device node, e.g. `/dev/dri/card0`."
+        }
+      },
+      "required": [
+        "node",
+        "class"
+      ]
+    },
+    "DnsRecordSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "zone": {
+          "type": "string",
+          "description": "Name of the `DNSZone` the record is in."
+        },
+        "name": {
+          "type": "string",
+          "description": "The name inside the zone: `nas`, `*.apps`, or `@` for the zone itself."
+        },
+        "type": {
+          "$ref": "#/$defs/DnsRecordType"
+        },
+        "values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "One record per value. `SRV`: `priority weight port target`."
+        },
+        "ttl": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "zone",
+        "name",
+        "type",
+        "values"
+      ]
+    },
+    "DnsRecordType": {
+      "type": "string",
+      "enum": [
+        "A",
+        "AAAA",
+        "CNAME",
+        "TXT",
+        "SRV",
+        "NS",
+        "PTR"
+      ]
+    },
+    "DnsZoneSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain": {
+          "type": "string",
+          "description": "The domain, like `home.example`."
+        },
+        "ttl": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Seconds a resolver may keep an answer, unless a record says otherwise. Defaults to 300."
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Split horizon: only clients in these networks (`192.168.0.0/16`, `fd00::/8`,\nor one address) get this zone's answers. Empty: everyone does."
+        }
+      },
+      "required": [
+        "domain"
+      ],
+      "description": "A domain kithd answers for itself instead of asking upstream."
+    },
+    "EnvVar": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "configMap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KeyRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "description": "Exactly one of `value`, `secret` or `configMap`."
+    },
+    "ExecUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvVar"
+          }
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "command"
+      ]
+    },
+    "Expose": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "via": {
+          "$ref": "#/$defs/ExposeVia"
+        },
+        "proxyProtocol": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Send the backend a PROXY protocol v1 line with the client's address before the\nclient's bytes. Off unless true: a backend that does not expect the line breaks."
+        }
+      },
+      "required": [
+        "host",
+        "via"
+      ],
+      "description": "Public HTTPS through an edge node."
+    },
+    "ExposeVia": {
+      "type": "string",
+      "enum": [
+        "edge"
+      ]
+    },
+    "GitSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string"
+        },
+        "rev": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Branch, tag or commit."
+        },
+        "verifySignedCommits": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
+    "HttpProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "port": {
+          "$ref": "#/$defs/PortRef"
+        }
+      },
+      "required": [
+        "path",
+        "port"
+      ]
+    },
+    "Hypervisor": {
+      "type": "string",
+      "enum": [
+        "qemu",
+        "cloudHypervisor"
+      ]
+    },
+    "IdentitySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "publicKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "ImageSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "volume": {
+          "type": "string",
+          "description": "The Volume, in this namespace, whose directory is the image's root."
+        },
+        "tag": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "[default: latest] Made once for a spec: a new tag is a new image."
+        },
+        "job": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A Job, in this namespace, that fills the volume: the image is made when it has succeeded."
+        },
+        "entrypoint": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "cmd": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "`NAME=value` entries."
+        },
+        "workingDir": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "copies": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How many nodes keep the image's blobs [default: 2]."
+        }
+      },
+      "required": [
+        "volume"
+      ],
+      "description": "A container image made in the cluster: a Volume's directory, packed by the volume's\nnode as the image's one layer and kept as Blobs. Every node serves it to itself as\n`localhost:PORT/NAMESPACE/NAME:TAG`."
+    },
+    "JobSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "template": {
+          "$ref": "#/$defs/Template"
+        },
+        "completions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "parallelism": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "retries": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "timeoutSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "template"
+      ]
+    },
+    "KeyRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "key"
+      ]
+    },
+    "KindDefinitionSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "group": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "namespaced": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "schema": {
+          "description": "JSON Schema of the new kind's `spec`."
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Column"
+          }
+        },
+        "controller": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WasmModule"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Run by kithd for each resource of the kind: says what should exist because\nof it, and its status."
+        },
+        "admission": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WasmModule"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Run by kithd before a resource of the kind is written: lets it be, changes\nit or refuses it."
+        }
+      },
+      "required": [
+        "group",
+        "version",
+        "kind",
+        "schema"
+      ]
+    },
+    "MeshSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cidr": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "IPv6 ULA prefix for mesh addresses."
+        },
+        "ipv4": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "port": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      }
+    },
+    "Metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Lowercase letters, digits, `-` and `.`; at most 63 characters."
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Defaults to `default` for namespaced kinds."
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0,
+          "description": "Set by the store: 1 on creation, +1 on every change. When present in an\napplied resource it must match the live revision, so a stale edit is refused."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "NamespaceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "quota": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Namespace-wide package values."
+        }
+      }
+    },
+    "NetworkPolicySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Workloads the policy applies to. Empty means the whole namespace."
+        },
+        "ingress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyRule"
+          }
+        },
+        "egress": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PolicyRule"
+          }
+        }
+      }
+    },
+    "NodeKeySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "What the node asks for it by: made from its disk's secret."
+        },
+        "wrapped": {
+          "type": "string",
+          "description": "The key, wrapped (hex). Empty once wiped."
+        },
+        "locked": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Not handed out while set: the node waits at its next start (`kith node lock`)."
+        },
+        "wiped": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Forgotten for good (`kith node wipe`)."
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "description": "The key of a node's encrypted state partition, as the cluster holds it: wrapped\nwith a secret that only the node's disk has. Written by the node itself."
+    },
+    "NodeMesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "relay": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Relay"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`never`: this node's traffic goes straight to the other node or not at all,\nnever through an edge node (which would see it). Defaults to `auto`."
+        }
+      }
+    },
+    "NodeRole": {
+      "type": "string",
+      "enum": [
+        "voter",
+        "worker",
+        "edge"
+      ]
+    },
+    "NodeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "roles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NodeRole"
+          },
+          "description": "Defaults to `[worker]`."
+        },
+        "taints": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Taint"
+          }
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "System extensions layered on at boot."
+        },
+        "reserved": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resources kept back from scheduled workloads."
+        },
+        "unschedulable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Cordoned: no new workloads are placed here."
+        },
+        "roaming": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "It comes and goes (a laptop): it does not start to vote, peers reach it wherever\nit last called from (they keep no address for it: it calls them), and what it runs\nis never started elsewhere, however long it is away. Take this off a node that is\ngone for good, or delete the node."
+        },
+        "mesh": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NodeMesh"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "NodeWorkloadSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Node labels to match. Empty means every node."
+        },
+        "template": {
+          "$ref": "#/$defs/Template"
+        }
+      },
+      "required": [
+        "template"
+      ]
+    },
+    "OsReleaseSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string",
+          "description": "URL of the signed update file."
+        },
+        "publicKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The signing key (hex); required."
+        },
+        "signature": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Its signature of the file's header."
+        }
+      },
+      "required": [
+        "version",
+        "image"
+      ]
+    },
+    "PackageRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Exact version or semver range."
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "PackageSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kithVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Semver range of kith versions the package supports."
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PackageRef"
+          }
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The package itself: its files by path (`package.yaml`, `templates/web.yaml`),\nas `kith package push` puts them here."
+        }
+      },
+      "required": [
+        "version"
+      ]
+    },
+    "Peer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "node": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cidr": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "Placement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "require": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Every entry must match, e.g. `node.labels.disks: hdd`."
+        },
+        "prefer": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Preference"
+          }
+        }
+      }
+    },
+    "PolicyAction": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "PolicyRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/PolicyAction"
+        },
+        "peers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Peer"
+          },
+          "description": "Empty means any peer."
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "description": "Empty means any port."
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "Port": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Protocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "port"
+      ]
+    },
+    "PortRef": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "A port by number or by name."
+    },
+    "Preference": {
+      "type": "object",
+      "properties": {
+        "weight": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "weight"
+      ],
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "`{ weight: 50, node.labels.room: closet }`: a weight plus the labels it rewards."
+    },
+    "Probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "http": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HttpProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tcp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TcpProbe"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "exec": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "intervalSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "timeoutSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "failureThreshold": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "description": "Exactly one of `http`, `tcp` or `exec`."
+    },
+    "Protocol": {
+      "type": "string",
+      "enum": [
+        "tcp",
+        "udp"
+      ]
+    },
+    "PullPolicy": {
+      "type": "string",
+      "enum": [
+        "ifNotPresent",
+        "always",
+        "never"
+      ],
+      "description": "`ifNotPresent` never notices a tag that moved at the registry."
+    },
+    "Quantity": {
+      "type": "string",
+      "description": "An amount of CPU, memory or storage: `2`, `500m`, `2Gi`, `1.5G`.",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$"
+    },
+    "Relay": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "never"
+      ]
+    },
+    "ReleaseSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "package": {
+          "$ref": "#/$defs/PackageRef"
+        },
+        "values": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "autoUpgrade": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Follow the version range and upgrade automatically."
+        }
+      },
+      "required": [
+        "package"
+      ]
+    },
+    "RepositorySpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": "string",
+          "description": "OCI registry path, e.g. `oci://ghcr.io/example/packages`."
+        },
+        "publicKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Key the repository's packages must be signed with."
+        }
+      },
+      "required": [
+        "url"
+      ]
+    },
+    "Resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "RestartPolicy": {
+      "type": "string",
+      "enum": [
+        "always",
+        "onFailure",
+        "never"
+      ]
+    },
+    "RoleBindingSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "subjects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of `Identity` resources."
+        }
+      },
+      "required": [
+        "role",
+        "subjects"
+      ]
+    },
+    "RoleSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AccessRule"
+          }
+        }
+      },
+      "required": [
+        "rules"
+      ]
+    },
+    "S3": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "endpoint": {
+          "type": "string",
+          "description": "`https://host[:port]`; objects are `endpoint/bucket/prefix…` (path style)."
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "region": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "[default: us-east-1]"
+        },
+        "prefix": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Put before each object's name (`backups/`)."
+        },
+        "secret": {
+          "type": "string",
+          "description": "The Secret, in this namespace, with `accessKey` and `secretKey`."
+        }
+      },
+      "required": [
+        "endpoint",
+        "bucket",
+        "secret"
+      ]
+    },
+    "SeatSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string"
+        },
+        "devices": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of the `Device`s grouped into this seat."
+        },
+        "reserve": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Slice guaranteed to whatever holds the seat."
+        }
+      },
+      "required": [
+        "node"
+      ]
+    },
+    "SecretSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Encrypted at rest once the Raft store lands (§4.3); the Phase 0 local store is plain JSON."
+    },
+    "ServicePort": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "targetPort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Defaults to `port`."
+        },
+        "protocol": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Protocol"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "port"
+      ]
+    },
+    "ServiceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Labels of the workloads behind this service."
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ServicePort"
+          }
+        },
+        "expose": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Expose"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "selector",
+        "ports"
+      ]
+    },
+    "ShareNfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Who may mount it: IPv4 addresses (`192.168.1.20`) or ranges (`192.168.1.0/24`)."
+        }
+      },
+      "required": [
+        "clients"
+      ]
+    },
+    "ShareSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "volume": {
+          "type": "string",
+          "description": "The Volume, in this namespace."
+        },
+        "readOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Nobody may write."
+        },
+        "uid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Whoever uses the share is this user on the volume's files [default: 65534, nobody]."
+        },
+        "gid": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "[default: 65534]"
+        },
+        "nfs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShareNfs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Serve it over NFS 4.2 from the volume's node."
+        },
+        "users": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The Identities that may use it over SMB."
+        }
+      },
+      "required": [
+        "volume"
+      ],
+      "description": "A Volume given to machines that are not nodes: over NFS by the volume's node, and\nover SMB by the `nas` package's file server."
+    },
+    "SourceSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "git": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GitSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "oci": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "intervalSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "approval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Approval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prune": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Delete resources that are no longer in the source."
+        },
+        "approve": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "With `approval: manual`: the revision that may be applied (the one in\n`status.pending`, as `kith source approve` puts here)."
+        }
+      },
+      "description": "Exactly one of `git` or `oci`."
+    },
+    "Strategy": {
+      "type": "string",
+      "enum": [
+        "rolling",
+        "recreate",
+        "blueGreen"
+      ]
+    },
+    "Taint": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effect": {
+          "$ref": "#/$defs/TaintEffect"
+        }
+      },
+      "required": [
+        "key",
+        "effect"
+      ]
+    },
+    "TaintEffect": {
+      "type": "string",
+      "enum": [
+        "noSchedule",
+        "preferNoSchedule",
+        "noExecute"
+      ]
+    },
+    "TcpProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "$ref": "#/$defs/PortRef"
+        }
+      },
+      "required": [
+        "port"
+      ]
+    },
+    "Template": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "containers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Container"
+          }
+        },
+        "exec": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecUnit"
+          },
+          "description": "Plain supervised processes in a cgroup."
+        },
+        "vms": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VmUnit"
+          },
+          "description": "Virtual machines, each run by a hypervisor on the node."
+        },
+        "confidential": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Run only where the processor keeps a guest's memory encrypted (AMD SEV-SNP or\nIntel TDX), and only as `vms`: a node that has neither refuses it."
+        },
+        "restartPolicy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RestartPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deviceClaims": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of `DeviceClaim`s this replica holds."
+        },
+        "yieldTo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/YieldTo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Hold this replica back (a sliver of one CPU) while a seat of its node is busy."
+        }
+      },
+      "description": "The units one replica runs. `vm` and `wasm` units join in Phase 7."
+    },
+    "UpdatePlanSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "release": {
+          "type": "string",
+          "description": "Name of the `OSRelease` to roll out."
+        },
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Node labels to match. Empty means every node."
+        },
+        "maxUnavailable": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Nodes updated at a time. Defaults to 1."
+        },
+        "windows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "drain": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "waitForIdleSeats": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Hold back nodes with an active seat until it is idle."
+        },
+        "paused": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allowDowngrade": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Let nodes take a release older than the one they run. Refused otherwise."
+        }
+      },
+      "required": [
+        "release"
+      ]
+    },
+    "UpdatePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "auto": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "windows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Maintenance windows, e.g. `Sat 02:00-05:00`."
+        }
+      }
+    },
+    "Verb": {
+      "type": "string",
+      "enum": [
+        "get",
+        "list",
+        "watch",
+        "apply",
+        "delete",
+        "exec"
+      ]
+    },
+    "VmDisk": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "A raw disk image on the node, by absolute path."
+        },
+        "readOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "VmUnit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "hypervisor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Hypervisor"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What runs it [default: qemu]."
+        },
+        "kernel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A kernel on the node, by absolute path."
+        },
+        "initrd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cmdline": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The kernel's command line."
+        },
+        "firmware": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A firmware image on the node (UEFI), for a machine that starts from a disk."
+        },
+        "disks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/VmDisk"
+          }
+        },
+        "cpus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "[default: 1]"
+        },
+        "memory": {
+          "$ref": "#/$defs/Quantity",
+          "description": "The machine's memory (`2Gi`)."
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Resources"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the hypervisor's process is held to on the node."
+        }
+      },
+      "required": [
+        "name",
+        "memory"
+      ],
+      "description": "A virtual machine. It starts `kernel` if there is one, or else what its firmware\nfinds on `disks`. Each PCI Device a DeviceClaim of the replica holds is passed\nthrough to it (VFIO)."
+    },
+    "VolumeClaimSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "size": {
+          "$ref": "#/$defs/Quantity"
+        },
+        "shared": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "selector": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Node labels the backing volume's node must have."
+        }
+      },
+      "required": [
+        "size"
+      ]
+    },
+    "VolumeMount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "volume": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "readOnly": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "volume",
+        "path"
+      ]
+    },
+    "VolumeSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "The node holding the data."
+        },
+        "path": {
+          "type": "string",
+          "description": "A local path, or a btrfs subvolume when `subvolume` is true."
+        },
+        "subvolume": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "shared": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Export over the mesh so any node can mount it."
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantity"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "replicas": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Keep this many copies in all, the others on other nodes, one of which takes\nover when the volume's node is lost."
+        },
+        "sync": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How often the other copies are brought up to date [default: 5m]."
+        },
+        "encrypted": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Keep it encrypted on its node's disk (dm-crypt), the key held by the cluster's\nother nodes: needs a `size`, which it has from the start. Set when it is made."
+        }
+      },
+      "required": [
+        "node",
+        "path"
+      ]
+    },
+    "WasmModule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wasm": {
+          "type": "string",
+          "description": "The WebAssembly module, base64 (`kith controller set` puts a file here)."
+        }
+      },
+      "required": [
+        "wasm"
+      ]
+    },
+    "WorkloadSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "replicas": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Defaults to 1."
+        },
+        "strategy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Strategy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "template": {
+          "$ref": "#/$defs/Template"
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "priorityClass": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "template"
+      ]
+    },
+    "YieldTo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "seat": {
+          "type": "string",
+          "description": "Name of the `Seat`."
+        },
+        "when": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Activity"
+          },
+          "description": "What the seat is doing while this is held back, e.g. `[fullscreen]`."
+        }
+      },
+      "required": [
+        "seat",
+        "when"
+      ]
+    }
+  }
+}
