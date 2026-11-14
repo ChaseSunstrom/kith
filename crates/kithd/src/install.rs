@@ -18,9 +18,9 @@
 //! Everything on the chosen disk is lost. Without a person there, a disk is only chosen
 //! by name, or as `only` when the machine has exactly one.
 //
-// ponytail: the image is copied as it is, so the state partition is as small as the
-// image's (T-0094 grows it) and the spare partition table sits where the image ended,
-// not at the disk's end (the kernel says so at each start and uses the first).
+// The image is copied as it is: its state partition is as small as the image's, and the
+// spare partition table sits where the image ended, until the node's first start from
+// the disk, which makes both right (`gpt`).
 
 use serde::Deserialize;
 use std::fs::File;

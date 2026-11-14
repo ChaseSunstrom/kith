@@ -1956,9 +1956,18 @@ a new cluster or `--join` with the token). A node that starts a cluster
 [offers a claim on its console](#who-may-do-what); one that asked its network
 for an address tells other nodes the address it was given.
 
-The installed disk is the image as built: the state partition is 32 MB until
-it can grow, and the kernel notes at each start that the spare partition
-table is not at the disk's end.
+The image's state partition is 32 MB, and no disk is that small: at its first
+start on a disk, and at any later one if the disk was made longer since (a
+cloud volume, a VM's file), a node's state partition
+grows to the end of its disk and the file system in it grows with it. The node
+says so on its console
+(`the state partition now ends where its disk does: 228936 MB`). It only ever
+does this where the state is the disk's last partition, as in the image, and
+the partition table reads right; the spare table is written at the disk's new
+end before the first one is touched, so a power cut in the middle leaves one of
+them whole, and the next start finishes from that one. `kith.grow=off` on the
+kernel command line keeps the disk as it is. A node that ran an older kith OS grows its state the first time it starts
+a release with this in it.
 
 ### Installing from the network
 
@@ -2115,9 +2124,8 @@ new recovery key for a running node.
 
 A CD image, starting by BIOS, a watchdog for a slot that hangs without
 stopping, Secure Boot (the image is not
-signed, so the firmware does not yet check the file that checks the root), the
-state partition growing to its disk, drivers for Wi-Fi,
-sound and graphics, a card plugged in later, IPv6 addresses from the network,
+signed, so the firmware does not yet check the file that checks the root),
+drivers for Wi-Fi, sound and graphics, a card plugged in later, IPv6 addresses from the network,
 arm64.
 
 ## kith.dev/v1 is stable
@@ -2209,7 +2217,7 @@ k3s is Kubernetes, with its API and all that is written for it, and kith is not.
 | `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
 | `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan |
 | `crates/kith-packages` | Packages: templates and values rendered into resources |
-| `crates/kith-dm-sys` | The one crate of the workspace with `unsafe`: device-mapper, loop devices and growing a file system, by ioctl, for encrypted volumes |
+| `crates/kith-dm-sys` | The one crate of the workspace with `unsafe`: device-mapper, loop devices, growing a file system and a partition's new length, by ioctl, for encrypted volumes and kith OS's state |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 | `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |

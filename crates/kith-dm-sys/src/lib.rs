@@ -68,7 +68,8 @@ fn call(control: &File, command: u8, mut request: Vec<u8>) -> Result<Vec<u8>> {
 /// The ioctl `number` on `file`, with `bytes` as what it points at. What the kernel answers.
 ///
 /// For the numbers of this file only: each is one whose argument the kernel takes as a
-/// pointer to no more than `bytes` holds (or does not look at).
+/// pointer to no more than `bytes` holds (or does not look at). One of them (BLKPG) holds
+/// a pointer itself, to bytes its caller keeps for as long as the call takes.
 fn ioctl(file: &File, number: u32, bytes: &mut [u8]) -> Result<i32> {
     // SAFETY: the kernel reads and writes within `bytes` (see above), which lives past the call.
     let said = unsafe { libc::ioctl(file.as_raw_fd(), number as _, bytes.as_mut_ptr()) };
@@ -109,6 +110,29 @@ pub fn attach(file: &File) -> Result<(File, PathBuf)> {
 pub fn grow(mounted: &Path, blocks: u64) -> Result<()> {
     // EXT4_IOC_RESIZE_FS: _IOW('f', 16, __u64)
     ioctl(&File::open(mounted)?, 0x4008_6610, &mut blocks.to_ne_bytes()).map(drop)
+}
+
+/// Tell the kernel that partition `number` (from 1) of `disk`, which starts at byte `start`,
+/// is now `length` bytes long: the disk's partition table says so already, and a disk in
+/// use is one whose table the kernel will not read again by itself.
+pub fn resize_partition(disk: &File, number: u32, start: u64, length: u64) -> Result<()> {
+    // `struct blkpg_partition`: start and length in bytes, the number, and two names
+    // nobody reads.
+    let mut partition = [0u8; 152];
+    partition[0..8].copy_from_slice(&start.to_ne_bytes());
+    partition[8..16].copy_from_slice(&length.to_ne_bytes());
+    partition[16..20].copy_from_slice(&number.to_ne_bytes());
+    // `struct blkpg_ioctl_arg`: what to do (BLKPG_RESIZE_PARTITION), flags, how long the
+    // above is, and where it is (after four bytes that line the pointer up).
+    let mut request = [0u8; 24];
+    request[0..4].copy_from_slice(&3u32.to_ne_bytes());
+    request[8..12].copy_from_slice(&(partition.len() as u32).to_ne_bytes());
+    request[16..24].copy_from_slice(&(partition.as_mut_ptr() as usize as u64).to_ne_bytes());
+    // BLKPG: _IO(0x12, 105). (The kernel reads `partition` through the request: it is
+    // kept until the call is over.)
+    let said = ioctl(disk, 0x1269, &mut request).map(drop);
+    std::hint::black_box(&mut partition);
+    said
 }
 
 fn control() -> Result<File> {

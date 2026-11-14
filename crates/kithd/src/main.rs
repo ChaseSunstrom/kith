@@ -21,6 +21,7 @@ mod devices;
 mod dhcp;
 mod dns;
 mod encrypted;
+mod gpt;
 mod images;
 mod ingress;
 mod init;

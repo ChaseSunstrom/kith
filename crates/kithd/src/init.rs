@@ -6,7 +6,8 @@
 //! Told on the kernel command line: `kith.hostname=NAME`; `kith.ip=ADDRESS/BITS[,GATEWAY]`
 //! and `kith.dns=ADDRESS` for a machine whose network gives no addresses (without them
 //! every network card asks by DHCP); `kith.update=DISK` for an update to install from a
-//! disk (see `os`); and whatever follows ` -- `, which the kernel hands
+//! disk (see `os`); `kith.grow=off` for a state partition that stays as long as it is on a
+//! longer disk (see `gpt`); and whatever follows ` -- `, which the kernel hands
 //! to its first process as arguments: kithd's own, as in
 //! `console=ttyS0 kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`.
 //!
@@ -110,6 +111,8 @@ pub struct Options {
     pub update: Option<String>,
     /// This is the installer (see `install`): the URL of its answers, or empty.
     pub install: Option<String>,
+    /// `kith.grow=off`: the state partition stays as long as it is on a longer disk.
+    pub keep: bool,
 }
 
 /// The address this machine was given: by its command line, or else the first its network
@@ -190,6 +193,7 @@ pub fn options(line: &str) -> (Options, Vec<String>) {
             Some(("kith.update", value)) if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric()) => {
                 options.update = Some(value.into());
             }
+            Some(("kith.grow", "off")) => options.keep = true,
             Some(("kith.install", url)) if url.starts_with("http://") || url.starts_with("https://") => {
                 options.install = Some(url.into());
             }
@@ -272,6 +276,94 @@ pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// Where the disk this node runs from goes on past its state partition, make the partition
+/// end where the disk does (see `gpt`): the image's is 32 MB, whatever it was written to.
+/// Before the state is mounted or opened; `mount_state` grows the file system to it.
+fn widen() {
+    let Some(device) = labelled("state") else { return };
+    let Some(disk) = disk(&std::path::Path::new("/sys/class/block").join(device.file_name().unwrap_or_default()))
+    else {
+        return;
+    };
+    let said = |what: &str| {
+        let text = std::fs::read_to_string(std::path::Path::new("/sys/block").join(&disk).join(what));
+        text.ok().and_then(|text| text.trim().parse::<u64>().ok())
+    };
+    // (A partition table counts in sectors of 512 bytes: a disk that counts otherwise is left.)
+    let (Some(512), Some(sectors)) = (said("queue/logical_block_size"), said("size")) else {
+        return;
+    };
+    let opened = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(std::path::Path::new("/dev").join(&disk));
+    let widened = opened.map_err(|e| e.to_string()).and_then(|disk| {
+        let Some(now) = crate::gpt::widen(&disk, sectors, "state")? else {
+            return Ok(None);
+        };
+        // (Refused, the kernel reads the table at the next start, and the state grows then.)
+        kith_dm_sys::resize_partition(&disk, now.number, now.start * 512, now.sectors * 512)
+            .map_err(|e| format!("its table is written, and the kernel will not take it before the next start: {e}"))?;
+        Ok(Some(now.sectors / 2048))
+    });
+    match widened {
+        Ok(Some(size)) => eprintln!("kithd: init: the state partition now ends where its disk does: {size} MB"),
+        Ok(None) => {}
+        Err(e) => eprintln!("kithd: init: the state partition stays as long as it is: {e}"),
+    }
+}
+
+/// How many blocks the ext4 file system with this superblock has, and how long one is.
+fn ext4_blocks(superblock: &[u8]) -> Option<(u64, u64)> {
+    let word = |at: usize| {
+        superblock
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if superblock.get(0x38..0x3A) != Some(&[0x53, 0xEF]) {
+        return None;
+    }
+    // (The upper half counts only where the file system says it has one: 64bit.)
+    let upper = if word(0x60)? & 0x80 != 0 { word(0x150)? } else { 0 };
+    // (A block is 1 to 64 KiB.)
+    let block = 1024u64 << word(0x18).filter(|shift| *shift <= 6)?;
+    Some((u64::from(upper) << 32 | u64::from(word(4)?), block))
+}
+
+/// Grow the state's file system to the device it is on, where it is smaller: what to say
+/// of it. (Not asked of the kernel otherwise: it says a line on the console each time, in
+/// the middle of whatever this is saying.)
+fn grow(device: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::FileExt;
+    // (`kith.grow=off` is for this too: a partition made longer at an earlier start.)
+    if std::fs::read_to_string("/proc/cmdline").is_ok_and(|line| options(&line).0.keep) {
+        return None;
+    }
+    let file = std::fs::File::open(device).ok()?;
+    let read = || {
+        let mut superblock = [0; 1024];
+        file.read_exact_at(&mut superblock, 1024).ok()?;
+        ext4_blocks(&superblock)
+    };
+    let (before, block) = read()?;
+    let fits = std::io::Seek::seek(&mut &file, std::io::SeekFrom::End(0)).ok()? / block;
+    if fits <= before {
+        return None;
+    }
+    match kith_dm_sys::grow(std::path::Path::new(STATE), fits) {
+        // (Blocks too few for another group of them are left: nothing grew, nothing is said.)
+        Ok(()) => read().filter(|(now, _)| *now > before).map(|(now, _)| {
+            format!(
+                "kithd: init: the state's file system grown to {} MB",
+                (now * block) >> 20
+            )
+        }),
+        Err(e) => Some(format!(
+            "kithd: init: the state's file system is not as big as its partition: {e}"
+        )),
+    }
+}
+
 /// Mount the state partition, or say that there is none and keep the state in memory.
 fn state() {
     let found = labelled("state");
@@ -300,7 +392,14 @@ pub fn mount_state(device: &std::path::Path) {
         flags | MsFlags::MS_NOATIME,
         None::<&str>,
     ) {
-        Ok(()) => eprintln!("kithd: init: state on {}", device.display()),
+        Ok(()) => {
+            // (The kernel's own lines about growing first, then this one whole.)
+            let grown = grow(device);
+            eprintln!("kithd: init: state on {}", device.display());
+            if let Some(grown) = grown {
+                eprintln!("{grown}");
+            }
+        }
         // (Not in memory instead: the node would come up as a new one, with nothing.)
         Err(e) => {
             eprintln!(
@@ -489,6 +588,9 @@ pub fn early() -> Boot {
             end(true)
         }
     });
+    if !installing && !options(&line).0.keep {
+        widen();
+    }
     if !installing && sealed.is_none() {
         state();
     }
@@ -601,6 +703,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn init_counts_a_file_systems_blocks() {
+        let mut superblock = vec![0u8; 1024];
+        assert_eq!(ext4_blocks(&superblock), None);
+        superblock[0x38..0x3A].copy_from_slice(&[0x53, 0xEF]);
+        superblock[4..8].copy_from_slice(&8192u32.to_le_bytes());
+        superblock[0x18] = 2;
+        superblock[0x150] = 1;
+        assert_eq!(ext4_blocks(&superblock), Some((8192, 4096)));
+        superblock[0x60] = 0x80;
+        assert_eq!(ext4_blocks(&superblock), Some(((1 << 32) + 8192, 4096)));
+        superblock[0x18] = 60;
+        assert_eq!(
+            (ext4_blocks(&superblock), ext4_blocks(&superblock[..100])),
+            (None, None)
+        );
+    }
+
+    #[test]
     fn init_reads_the_kernel_command_line() {
         let read = |line| options(line);
         assert_eq!(read("console=ttyS0 panic=-1"), (Options::default(), vec![]));
@@ -611,12 +731,17 @@ mod tests {
             slot: Some('b'),
             update: Some("sdb".into()),
             install: None,
+            keep: false,
         };
         let line =
             "quiet kith.hostname=alpha kith.ip=10.0.0.5/24,10.0.0.1 kith.dns=9.9.9.9 kith.slot=b kith.update=sdb";
         assert_eq!(read(line), (named, vec![]));
         assert_eq!(read("kith.ip=10.0.0.5/8").0.ip, Some(([10, 0, 0, 5].into(), 8, None)));
         assert_eq!(read("kith.slot=a kith.slot=b").0.slot, Some('a'));
+        assert_eq!(
+            (read("kith.grow=off").0.keep, read("kith.grow=on").1),
+            (true, vec!["kith.grow=on".to_string()])
+        );
         // Not a name, or not an option: said, and the machine starts all the same.
         let bad = ["kith.hostname=", "kith.hostname=Al_pha", "kith.nope=1", "kith.hostname"];
         for bad in bad

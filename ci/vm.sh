@@ -5,7 +5,7 @@
 #
 #   sh ci/vm.sh [--kernel FILE] [--initrd FILE] [--disk IMAGE] [--append ARGS] [--time SECONDS]
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told
-#   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI
+#   sh ci/vm.sh --test image    kith OS's disk image (os/build.sh), booted under UEFI on a longer disk
 #   sh ci/vm.sh --test update   that image updating itself, and going back when it must
 #   sh ci/vm.sh --test rollout  three nodes of it taking a release, one at a time
 #   sh ci/vm.sh --test install  the installer, onto virtual disks, and what it installed
@@ -1098,20 +1098,34 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
         exit 0
     fi
 
+    # (The disk is longer than the image written to it, as a real one is: 40 GB, of which
+    # the file holds what is written. Past 32 GB an ext4 as small as the image's has used
+    # up the room it kept for growing and the kernel has to lay its groups out anew.)
+    truncate -s 40G "$work/disk.raw"
     began=$(date +%s%N)
     boot
     up
     took=$((($(date +%s%N) - began) / 1000000))
     said 'Mounted root (squashfs filesystem) readonly on device 25[0-9]:0' || fail "the root is not the verity device"
-    said 'kithd: init: state on /dev/vda6' || fail "the state partition was not mounted"
+    said 'kithd: init: state on /dev/vda7' || fail "the state partition was not mounted"
+    # The state partition is the image's 32 MB no longer: it ends where the disk does, the
+    # file system fills it, and a tool that reads partition tables finds nothing to say.
+    said 'kithd: init: the state partition now ends where its disk does: 407[0-9][0-9] MB' || fail "the state partition was not made to end where its disk does"
+    said "kithd: init: the state's file system grown to 407[0-9][0-9] MB" || fail "the state's file system was not grown to its partition"
     who
     first=$who
     said 'by DHCP' || fail "the network card got no address by DHCP"
     restart
     cp "$work/log" "$work/log.first"
+    table=$(sfdisk -l "$work/disk.raw" 2>&1)
+    case $table in *mismatch* | *corrupt* | *'not on the end'* | *rror*) fail "the partition table kith OS wrote is not right: $table" ;; esac
+    [ "$(sfdisk -l -o Name,Sectors "$work/disk.raw" | awk '$1 == "state" { print int($2 / 2048 / 100) }')" = 407 ] || fail "the table does not say the state partition is longer: $table"
 
     boot
     up
+    said 'kithd: init: state on /dev/vda7' || fail "the state partition was not mounted the second time"
+    ! said 'now ends where its disk does' || fail "the state partition was changed again at the second start"
+    ! said 'file system grown' || fail "the state's file system was grown again at the second start"
     who
     second=$who
     restart
@@ -1127,7 +1141,7 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
     said 'device-mapper: verity: .* is corrupted' || fail "the kernel did not say the root was corrupted"
     echo "vm.sh: the image served other nodes ${took} ms after QEMU started (firmware, boot loader and kernel included)"
     [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }
-    echo "vm.sh: ok: UEFI boot from the image, a verity root, DHCP, TLS answered ($first), state kept across a restart, a tampered root refused"
+    echo "vm.sh: ok: UEFI boot from the image, a verity root, DHCP, TLS answered ($first), on a disk longer than the image a state partition that ends where the disk does from the first start and is left alone at the second, state kept across a restart, a tampered root refused"
     exit 0
 fi
 
