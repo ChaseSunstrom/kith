@@ -255,6 +255,8 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Vec<Path
                 }
             }
             paths.insert(PathBuf::from(path));
+            // (What comes with it: the nodes of NVIDIA's driver.)
+            paths.extend(spec.nodes.iter().map(PathBuf::from));
         }
         granted.insert(key, paths.into_iter().collect());
     }
@@ -580,6 +582,19 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
             [PathBuf::from("/dev/dri/card0")]
         );
         assert_eq!(granted(&store, "a", &empty)["Workload/default/kiosk"].len(), 2);
+        // A Device that lists further nodes (an NVIDIA card's) gives them with its own.
+        let nvidia = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-gpu-card1 }\n\
+                      spec: { node: a, class: gpu, path: /dev/dri/card1, nodes: [/dev/nvidiactl, /dev/nvidia0] }\n";
+        let source = [
+            nvidia,
+            &claim("cuda", "{ device: a-gpu-card1 }"),
+            &workload("train", "[cuda]"),
+        ]
+        .concat();
+        assert_eq!(
+            granted(&self::store(&source), "a", &empty)["Workload/default/train"],
+            ["/dev/dri/card1", "/dev/nvidia0", "/dev/nvidiactl"].map(PathBuf::from)
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
     }

@@ -258,6 +258,7 @@ spec:
         runAsUser: 1000            # [the image's User; 65534 if it names none, or root]
         seccomp:
           allow: [ptrace]          # refused calls it may make after all [none]
+        userNamespaces: true       # it may start a sandbox of its own inside [false]
 ```
 
 - **Who it is.** The user its template names (`runAsUser`, a number, the group the same),
@@ -296,6 +297,21 @@ spec:
   `clone3`), and `seccomp: { unconfined: true }` is no filter. A 32-bit program on a
   64-bit node is stopped at its first call, the filter knowing only the node's own
   numbers: it needs `unconfined`.
+- **No sandbox of its own inside, unless it asks.** Steam's runtime, Flatpak and a
+  browser start what they run in a user namespace they make themselves (bubblewrap), and
+  do not start without. `userNamespaces: true` lets the calls for namespaces (`unshare`,
+  `setns`, `clone`, `clone3`) and those that mount (`mount` to `mount_setattr` in the
+  list above; not `open_by_handle_at`) through the filter and covers nothing in the
+  container's `/proc` and `/sys/firmware` (the kernel gives a namespace made inside no
+  `/proc` of its own while the one around it is covered in places), so it reads there
+  what its user could read on the node. On kith OS it also starts without the capability
+  for ports below 1024 (bubblewrap refuses to start as a user who holds one). The rest of
+  the filter holds, for what the
+  sandbox starts too, and so does `no_new_privs`. What it costs: inside a user namespace
+  a program is that namespace's root, and reaches kernel code a plain user never calls
+  (mounting, more of the network); much of what has let a user become the node's root was
+  found there. A container that is the node's root (`runAsUser: 0` on kith OS, or a pod
+  whose image is root's) is not started with it, and says so.
 - **Whose image it is.** With `signedBy`, the image is run only if one of those keys
   signed it, as `cosign sign --key` does: the signature is looked for in the image's own
   repository (the tag `sha256-DIGEST.sig`) and checked against the manifest's digest
@@ -1200,6 +1216,17 @@ within 30 seconds). `kith get device` lists them.
 - GPUs are the DRM cards; a `display` is a connector with a screen on it, an `input`
   an `event` device, `audio` a sound card, `camera` a video4linux device, and `usb`
   a USB device that is not a hub.
+- A card on NVIDIA's own driver also has `nodes`: the device nodes CUDA and the
+  driver's OpenGL and Vulkan open beside the card's (`/dev/nvidiactl`, `/dev/nvidia-uvm`,
+  `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, and its own `/dev/nvidiaN`, by the
+  number the driver gives it in `/proc/driver/nvidia`). Only those that are there are
+  listed: the driver's `nvidia-modprobe` or udev makes them, kith does not. A card the
+  driver holds with no DRM card (a compute card, or the driver without modesetting) is
+  a `gpu` named by its PCI address, with `/dev/nvidiaN` as its path. Every node but
+  `nvidiaN` is one for all the node's cards: a container holding one card can ask the
+  driver about the others. **Not tried on a real card**: this is read from the driver's
+  documentation and tested against a made-up `/sys` and `/proc`, and kith OS ships no
+  NVIDIA module.
 - Labels: `kith.dev/node`, `class` and `kith.dev/discovered: "true"` on all; GPUs and
   USB devices also `vendor` and `model` (the hex ids, so `1002` and `73bf`), a GPU
   `driver` and, where its driver says, `vram` in bytes; inputs and sound cards `model`
@@ -1245,16 +1272,30 @@ spec:
   it holds together.
 - `kith get deviceclaim render -o yaml` shows `status.node`, `status.devices` and
   `status.holders`; a claim that comes to nothing has a `status.message` instead.
-- A container is given the device nodes of its Devices in its own `/dev` and the
-  cgroup's device list allows reading and writing them and nothing else. A GPU brings its
-  render node (`/dev/dri/renderD*`) with its card; a `display` has no device node and gives
-  nothing. A Device or claim that is missing, or a path that is not a device node, stops the
-  unit from starting, and says which. An `exec` unit runs on the host and sees all of
-  `/dev` as it is.
-- Not yet: a NodeWorkload cannot claim (one that names a claim is refused); there is no
-  hot-plug (a changed set of device nodes starts the unit over at the next scan, and a
-  Device gone even for a moment stops what claimed it until it is back: its holder keeps
-  its turn). On kith OS a claimed device node is made the container's user's. Where kithd
+- A container is given the device nodes of its Devices in its own `/dev`, beside the few
+  every container has (`null`, `zero`, `full`, `random`, `urandom`, `tty`). A GPU brings its render
+  node (`/dev/dri/renderD*`) with its card, and a card on NVIDIA's driver its `nodes`; a
+  `display` has no device node and gives nothing. A Device or claim that is missing, or a
+  path that is not a device node, stops the unit from starting, and says which. An `exec`
+  unit runs on the host and sees all of `/dev` as it is.
+- **What holds it to those is that it cannot make a device node**: no container has the
+  capability but a pod that is root on kith OS. Nothing more does yet: the list of
+  devices a container may open is written for its cgroup and no filter is loaded there
+  to enforce it (T-0306). Until it is, a pod that is root on kith OS can make a node for
+  any device of its node and open it, a disk included.
+- An input device plugged in or pulled (a controller, a keyboard) while a container holds
+  its seat is given to that container, or taken from it, as it runs: the node appears in
+  its `/dev/input` at the next scan, within half a minute, and nothing is started over. (An
+  input device that is still on the node and is taken from the container, by a changed
+  claim or seat, starts it over: what it has open would stay open.) That
+  is so on kith OS, for a container that had an input device when it started; where kithd
+  is your own service it cannot make a node in a running container, and the unit is
+  started over as for any other device. kith OS runs no udev: a program that asks udev
+  what an input device is (libinput does) is told nothing about it yet.
+- Not yet: a NodeWorkload cannot claim (one that names a claim is refused); for anything
+  but input there is no hot-plug (a changed set of device nodes starts the unit over at
+  the next scan, and a Device gone even for a moment stops what claimed it until it is
+  back: its holder keeps its turn). On kith OS a claimed device node is made the container's user's. Where kithd
   is your service it is the node's own file: the container opens what you may open.
 - Who may claim is ordinary access control: to claim, you apply a `DeviceClaim` and a
   workload that names it, so the right to apply those is the grant, and there is no other

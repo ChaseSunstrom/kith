@@ -7,6 +7,9 @@
 //!                              adds a line to at each start, how many lines that has
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
+//!   pod seen DIR               for as long as it runs, say the names in DIR each time they
+//!                              change: those it can open with a `+`, the others with a `-`
+//!   pod self                   say which process it is and whose, where it finds itself
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -61,6 +64,30 @@ fn main() {
                 writeln!(out, "{line}").expect("a line out");
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...]"),
+        ["seen", dir] => {
+            let mut said = String::new();
+            loop {
+                let names = std::fs::read_dir(dir).into_iter().flatten().flatten();
+                let mut names: Vec<String> = names
+                    .map(|entry| {
+                        let opens = if std::fs::File::open(entry.path()).is_ok() { '+' } else { '-' };
+                        format!("{}{opens}", entry.file_name().to_string_lossy())
+                    })
+                    .collect();
+                names.sort();
+                let now = format!("seen: {}", names.join(" "));
+                if now != said {
+                    println!("{now}");
+                    said = now;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        ["self"] => {
+            let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
+            let uid = status.lines().find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next());
+            println!("nested: pid {}, uid {}", std::process::id(), uid.unwrap_or("?"));
+        }
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR | pod self"),
     }
 }

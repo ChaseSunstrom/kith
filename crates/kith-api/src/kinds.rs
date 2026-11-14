@@ -310,6 +310,17 @@ spec! {
         /// What the filter on its system calls lets through that it refuses by default.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub seccomp: Option<Seccomp>,
+        /// The container may make user namespaces of its own, as a sandbox inside it does
+        /// (bubblewrap: Steam's, Flatpak's). The filter then lets through the calls that
+        /// takes (`unshare`, `setns`, `clone`, `clone3`, and those that mount: `mount`,
+        /// `umount2`, `pivot_root`, `open_tree`, `move_mount`, the `fs…` four, `mount_setattr`)
+        /// and its `/proc` hides nothing, which a `/proc` mounted inside needs; on kith OS it
+        /// starts without the capability for ports below 1024, which bubblewrap refuses. In a
+        /// namespace of its own a program has every capability over it, and with them far
+        /// more of the kernel to call: off unless said, and refused for a container that
+        /// is the node's root.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub user_namespaces: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub resources: Option<Resources>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -749,6 +760,10 @@ spec! {
         /// Device node, e.g. `/dev/dri/card0`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub path: Option<String>,
+        /// Further device nodes that come with it and are granted with it: a card on
+        /// NVIDIA's driver has `/dev/nvidiactl`, `/dev/nvidia-uvm` and its own `/dev/nvidiaN`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub nodes: Vec<String>,
     }
 
     pub enum DeviceClass { Gpu, Display, Input, Audio, Usb, Camera, Other }

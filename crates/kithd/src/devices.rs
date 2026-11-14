@@ -63,9 +63,35 @@ fn number<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
 /// One piece of hardware found: its class, the kernel's name for it, its device node and its labels.
 type Found = (&'static str, String, Option<String>, Vec<(&'static str, String)>);
 
+/// What NVIDIA's driver has in `dev` for its card at `address` on the PCI bus: the card's
+/// own node (`nvidiaN`, N being the minor the driver gives it in `proc`), and the nodes all
+/// its cards share. Only those that are there: the driver makes none itself (its
+/// `nvidia-modprobe` does, or udev).
+fn nvidia(proc: &Path, dev: &Path, address: &str) -> (Option<String>, Vec<String>) {
+    let said = read(&proc.join("driver/nvidia/gpus").join(address).join("information"));
+    let minor = |line: &str| line.strip_prefix("Device Minor:")?.trim().parse::<u32>().ok();
+    let minor = said.and_then(|said| said.lines().find_map(minor));
+    let there = |name: String| dev.join(&name).exists().then(|| format!("/dev/{name}"));
+    let own = minor.and_then(|minor| there(format!("nvidia{minor}")));
+    let shared = ["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"];
+    (
+        own,
+        shared.into_iter().filter_map(|name| there(name.to_string())).collect(),
+    )
+}
+
 /// What `sys` (a `/sys`) says the machine has, as the `Device`s and `Seat` of `node`, sorted by name.
 pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
+    scan_in(sys, Path::new("/proc"), Path::new("/dev"), node)
+}
+
+/// [`scan`], with the `/proc` and `/dev` in which a driver keeps what `/sys` does not say.
+fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
     let mut found: Vec<Found> = Vec::new();
+    // The further nodes that come with a Device, by its class and the kernel's name for it;
+    // and NVIDIA's cards that are DRM cards, by their place on the PCI bus.
+    let mut also: BTreeMap<(&str, String), Vec<String>> = BTreeMap::new();
+    let mut drawing: Vec<String> = Vec::new();
     let drm = sys.join("class/drm");
     for name in names(&drm) {
         let dir = drm.join(&name);
@@ -77,6 +103,14 @@ pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
             labels.extend(id(&device.join("device")).map(|model| ("model", model)));
             let driver = std::fs::read_link(device.join("driver")).ok();
             let driver = driver.and_then(|link| Some(label(link.file_name()?.to_str()?)));
+            let place = std::fs::canonicalize(&device).ok();
+            let place = place.and_then(|real| Some(real.file_name()?.to_str()?.to_string()));
+            if let Some(place) = place.filter(|_| driver.as_deref() == Some("nvidia")) {
+                let (own, mut nodes) = nvidia(proc, dev, &place);
+                nodes.extend(own);
+                also.insert(("gpu", name.clone()), nodes);
+                drawing.push(place);
+            }
             labels.extend(driver.map(|driver| ("driver", driver)));
             let vram = read(&device.join("mem_info_vram_total")).filter(|bytes| bytes.parse::<u64>().is_ok());
             labels.extend(vram.map(|bytes| ("vram", bytes)));
@@ -128,10 +162,25 @@ pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
     for name in names(&pci) {
         let dir = pci.join(&name);
         let driver = std::fs::read_link(dir.join("driver")).ok();
-        if driver.as_deref().and_then(Path::file_name) != Some("vfio-pci".as_ref()) {
+        let driver = driver
+            .as_deref()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str());
+        let kind = read(&dir.join("class")).unwrap_or_default();
+        // A card on NVIDIA's driver that is no DRM card (the driver loaded to compute, not
+        // to draw): a GPU all the same, its node the driver's own.
+        if driver == Some("nvidia") && kind.starts_with("0x03") && !drawing.contains(&name) {
+            let mut labels = vec![("driver", "nvidia".to_string())];
+            labels.extend(id(&dir.join("vendor")).map(|vendor| ("vendor", vendor)));
+            labels.extend(id(&dir.join("device")).map(|model| ("model", model)));
+            let (own, nodes) = nvidia(proc, dev, &name);
+            also.insert(("gpu", name.clone()), nodes);
+            found.push(("gpu", name, own, labels));
             continue;
         }
-        let kind = read(&dir.join("class")).unwrap_or_default();
+        if driver != Some("vfio-pci") {
+            continue;
+        }
         // (Its class is `pci`, never `gpu`: a selector for a GPU to draw with must not come
         // to a card that only a machine can use. What it is, is in its `function` label.)
         let function = match kind.get(2..6) {
@@ -175,6 +224,9 @@ pub fn scan(sys: &Path, node: &str) -> Vec<Resource> {
         let mut spec = json!({ "node": node, "class": class });
         if let Some(path) = path {
             spec["path"] = path.into();
+        }
+        if let Some(nodes) = also.remove(&(class, name)).filter(|nodes| !nodes.is_empty()) {
+            spec["nodes"] = nodes.into();
         }
         // (Two that come to one name, a node name nearly 63 long: the first keeps it.)
         devices
@@ -393,6 +445,56 @@ mod tests {
         ];
         assert_eq!(seat.spec, json!({ "node": "n1", "devices": devices }));
         assert_eq!(seat.metadata.labels["kith.dev/discovered"], "true");
+        // What it makes, the store takes.
+        let mut store = Store::default();
+        for resource in found {
+            store.apply(resource).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A card on NVIDIA's driver brings the driver's own nodes with it: those every card
+    /// shares and its own, by the minor the driver says, and only those that are there.
+    /// With no DRM card (the driver loaded to compute, not to draw) it is found on the PCI bus.
+    #[test]
+    fn an_nvidia_card_lists_the_drivers_nodes_with_it() {
+        let root = tree("nvidia");
+        let (sys, proc, dev) = (root.join("sys"), root.join("proc"), root.join("dev"));
+        for (address, minor) in [("0000:01:00.0", 1), ("0000:02:00.0", 0), ("0000:03:00.0", 2)] {
+            let dir = format!("bus/pci/devices/{address}");
+            put(&sys, &format!("{dir}/vendor"), "0x10de\n");
+            put(&sys, &format!("{dir}/device"), "0x2684\n");
+            put(&sys, &format!("{dir}/class"), "0x030000\n");
+            std::os::unix::fs::symlink("../../drivers/nvidia", sys.join(&dir).join("driver")).unwrap();
+            let said = format!("Model: \t\t NVIDIA GeForce\nIRQ:   \t\t 130\nDevice Minor: \t {minor}\n");
+            put(&proc, &format!("driver/nvidia/gpus/{address}/information"), &said);
+        }
+        // The first draws (nvidia-drm made it a card); the others do not.
+        std::fs::create_dir_all(sys.join("class/drm/card1")).unwrap();
+        let card = sys.join("class/drm/card1/device");
+        std::os::unix::fs::symlink("../../../bus/pci/devices/0000:01:00.0", card).unwrap();
+        // (No nvidia-uvm-tools, and no node for the third card.)
+        for node in ["nvidiactl", "nvidia-uvm", "nvidia-modeset", "nvidia0", "nvidia1"] {
+            put(&dev, node, "");
+        }
+        let found = scan_in(&sys, &proc, &dev, "n1");
+        let shared = ["/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-modeset"];
+        let card = get(&found, "n1-gpu-card1");
+        assert_eq!(card.spec["path"], "/dev/dri/card1");
+        assert_eq!(
+            card.spec["nodes"],
+            json!([shared[0], shared[1], shared[2], "/dev/nvidia1"])
+        );
+        assert_eq!(card.metadata.labels["driver"], "nvidia");
+        let compute = get(&found, "n1-gpu-0000-02-00.0");
+        assert_eq!(compute.spec["path"], "/dev/nvidia0");
+        assert_eq!(compute.spec["nodes"], json!(shared));
+        assert_eq!(compute.metadata.labels["vendor"], "10de");
+        // A card whose own node is not there is listed, and has nothing of its own to give.
+        let bare = get(&found, "n1-gpu-0000-03-00.0");
+        assert_eq!(bare.spec, json!({ "node": "n1", "class": "gpu", "nodes": shared }));
+        // The card that draws is one Device, not two.
+        assert_eq!(found.iter().filter(|r| r.spec["class"] == "gpu").count(), 3);
         // What it makes, the store takes.
         let mut store = Store::default();
         for resource in found {

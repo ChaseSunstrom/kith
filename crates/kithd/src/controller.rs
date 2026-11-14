@@ -198,6 +198,17 @@ fn stop(id: &str, handle: Option<Handle>) {
     }
 }
 
+/// May a container that was given the device nodes `was` be given `now` as it runs, with
+/// no new start? Where input devices alone came or went, it had one when it started (so
+/// its `/dev/input` is there), and each it loses is in `gone`: no longer on the node.
+fn in_place(was: &BTreeSet<&PathBuf>, now: &BTreeSet<&PathBuf>, gone: &[&PathBuf]) -> bool {
+    let plugged = |path: &&PathBuf| kith_runtime::plugged(path);
+    was != now
+        && was.iter().any(plugged)
+        && was.symmetric_difference(now).all(plugged)
+        && was.difference(now).all(|path| gone.contains(path))
+}
+
 /// `1s, 2s, 4s … 60s`.
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(6)).min(Duration::from_secs(60))
@@ -521,6 +532,32 @@ impl Controller {
         // 2. Stop what is no longer wanted, and replace what changed: its own definition, or
         // a Secret or ConfigMap value it was started with (a value that can no longer be looked
         // up stops nothing). Scaling or relabelling a Workload leaves its running units alone.
+        //
+        // But an input device plugged in or pulled (a controller, a keyboard) is given to,
+        // or taken from, a container as it runs: a session is not started over for that.
+        // (One that is still on the node and no longer the container's is another matter:
+        // what the container has open stays open until it is stopped.)
+        for (id, slot) in &mut self.slots {
+            let (Some(new), Some(handle)) = (wanted.get(id), &slot.handle) else {
+                continue;
+            };
+            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
+                (slot.devices.iter().collect(), new.devices.iter().collect());
+            let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
+            if !in_place(&was, &now, &gone) || !matches!(slot.run, Run::Container(_)) {
+                continue;
+            }
+            let given = now.difference(&was).try_for_each(|path| handle.plug(path));
+            let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
+            match taken {
+                Ok(()) => {
+                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
+                    slot.devices = new.devices.clone();
+                }
+                // (Started over, as before: by the comparison below.)
+                Err(e) => eprintln!("kithd: {id}: {e}"),
+            }
+        }
         let mut stale: Vec<String> = Vec::new();
         // Per owner, the replicas with something to replace.
         let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
@@ -1065,6 +1102,7 @@ async fn start(
             if let Some(seccomp) = &c.seccomp {
                 (unit.unconfined, unit.allow) = (seccomp.unconfined == Some(true), seccomp.allow.clone());
             }
+            unit.nested = c.user_namespaces == Some(true);
             let policy = match c.pull_policy {
                 None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
                 Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
@@ -1159,6 +1197,28 @@ mod tests {
     fn seccomp_names_in_the_api_are_the_filters() {
         let filters: Vec<&str> = kith_runtime::REFUSED.iter().map(|(name, _)| *name).collect();
         assert_eq!(kith_api::kinds::REFUSED_CALLS, filters);
+    }
+
+    #[test]
+    fn input_devices_alone_come_and_go_as_a_container_runs() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let fits = |was: &[&str], now: &[&str], gone: &[&str]| {
+            let (was, now, gone) = (paths(was), paths(now), paths(gone));
+            in_place(
+                &was.iter().collect(),
+                &now.iter().collect(),
+                &gone.iter().collect::<Vec<_>>(),
+            )
+        };
+        let (key, pad, card) = ("/dev/input/event0", "/dev/input/event5", "/dev/dri/card0");
+        assert!(fits(&[key, card], &[key, pad, card], &[]), "one plugged in");
+        assert!(fits(&[key, pad], &[key], &[pad]), "one pulled");
+        // Still on the node, and no longer this container's: only a new start takes it away.
+        assert!(!fits(&[key, pad], &[key], &[]));
+        // Nothing changed; no /dev/input to make one in; another kind of device.
+        assert!(!fits(&[key], &[key], &[]));
+        assert!(!fits(&[card], &[card, pad], &[]));
+        assert!(!fits(&[key], &[key, card], &[]));
     }
 
     #[test]

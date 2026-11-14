@@ -85,6 +85,10 @@ pub struct Unit {
     pub unconfined: bool,
     /// Calls the filter refuses that this container may make: names of [`crate::REFUSED`].
     pub allow: Vec<String>,
+    /// It may make user namespaces of its own (a sandbox inside it: bubblewrap): the calls
+    /// of [`NESTED`] go through, and its `/proc` hides nothing, without which no `/proc`
+    /// can be mounted inside. Refused where it would be the node's root.
+    pub nested: bool,
     /// As any container runtime runs an image with nothing said: it is the user its image
     /// names (root where it names none), and root has what such a runtime gives root
     /// ([`ROOTS`]). Without it, only `user` makes a container root.
@@ -405,7 +409,85 @@ fn manager(cgroup: &str) -> libcgroups::v2::manager::Manager {
     libcgroups::v2::manager::Manager::new("/sys/fs/cgroup".into(), cgroup.into()).expect("joining two absolute paths")
 }
 
+/// Is `path` a node of a kind that comes and goes while a unit runs (an input device: a
+/// controller plugged in)? A unit that has one is made those that come later in its `/dev`
+/// as it runs ([`Handle::plug`]).
+pub fn plugged(path: &Path) -> bool {
+    path.starts_with("/dev/input")
+}
+
 impl Handle {
+    /// The directory of the container's own `/dev` that `path` (a node under `/dev`) lies
+    /// in, and the node's name there. Opened a name at a time and through no link: what
+    /// the container put in its `/dev` leads nowhere else.
+    fn in_dev(&self, path: &Path) -> Result<(fs::File, PathBuf)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let what = format!("{} in the container", path.display());
+        let inside = path
+            .strip_prefix("/")
+            .ok()
+            .filter(|_| plugged(path) && self.container.is_some());
+        let (Some(parent), Some(name)) = (inside.and_then(Path::parent), inside.and_then(Path::file_name)) else {
+            return err(format!("{what}: not a node that is given to a running container"));
+        };
+        let dir = |path: String| {
+            let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_PATH;
+            fs::OpenOptions::new().read(true).custom_flags(flags).open(path)
+        };
+        // (The one link followed is the kernel's own, to the container's root.)
+        let root = fs::File::open(format!("/proc/{}/root/.", self.pid)).ctx(&what)?;
+        let mut at = root;
+        for part in parent.components() {
+            let part = part.as_os_str().to_string_lossy();
+            at = dir(format!("/proc/self/fd/{}/{part}", at.as_raw_fd())).ctx(&what)?;
+        }
+        Ok((at, PathBuf::from(name)))
+    }
+
+    /// Give the running container the device node at `path` (one that is [`plugged`]): made
+    /// in its `/dev` as its user's own, as those it started with were. Where kithd is not
+    /// root nothing can be made there: an error, and the unit is started over for it.
+    pub fn plug(&self, path: &Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let what = format!("giving the container {}", path.display());
+        let meta = fs::metadata(path).ctx(&what)?;
+        if fs::canonicalize(path).ctx(&what)? != path || !meta.file_type().is_char_device() {
+            return err(format!("{what}: not a character device node under /dev"));
+        }
+        let made = oci_spec::runtime::Spec::load(self.bundle.join("config.json")).ctx(&what)?;
+        let owner = made
+            .process()
+            .as_ref()
+            .map(|process| (process.user().uid(), process.user().gid()));
+        let (dir, name) = self.in_dev(path)?;
+        let node = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+        let mode = nix::sys::stat::Mode::from_bits_truncate(meta.mode() & 0o777);
+        match nix::sys::stat::mknod(&node, nix::sys::stat::SFlag::S_IFCHR, mode, meta.rdev()) {
+            // (There already: the one it had when it started.)
+            Err(nix::errno::Errno::EEXIST) => return Ok(()),
+            made => made.ctx(&what)?,
+        }
+        if let Some((user, group)) = owner {
+            std::os::unix::fs::lchown(&node, Some(user), Some(group)).ctx(&what)?;
+        }
+        Ok(())
+    }
+
+    /// Take the node at `path` out of the running container's `/dev`: its device is gone.
+    pub fn unplug(&self, path: &Path) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let (dir, name) = self.in_dev(path)?;
+        let node = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+        match fs::remove_file(node) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).ctx(format!("taking {} from the container", path.display()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// A memory limit that swap could stretch is no limit. The OCI resources cannot say
     /// "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
     fn no_swap(self, unit: &Unit, what: &str) -> Result<Handle> {
@@ -583,6 +665,25 @@ const BECOMES: &str = "dev.kith.becomes";
 /// Where the spec says which refused system calls the container is allowed back (names with
 /// spaces between), or that it has no filter.
 const CALLS: &str = "dev.kith.seccomp";
+/// The refused calls a sandbox makes to build namespaces of its own and a root inside them:
+/// those for namespaces, and all those that mount (bubblewrap sets a mount's flags with
+/// `mount_setattr`, and takes "not permitted" for an answer where "no such call" would do).
+pub const NESTED: &[&str] = &[
+    "unshare",
+    "setns",
+    "clone",
+    "clone3",
+    "mount",
+    "umount2",
+    "pivot_root",
+    "open_tree",
+    "move_mount",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
+    "mount_setattr",
+];
 const UNCONFINED: &str = "unconfined";
 
 /// What happens in a container's first process right before the image's program takes its place.
@@ -723,12 +824,20 @@ fn spec_of(
     } else {
         Spec::rootless(uid.as_raw(), gid.as_raw())
     };
+    // With `/proc` as the kernel has it, the node's root could write the node's settings
+    // (`/proc/sys` asks who you are, not what you may): only another user is given that.
+    if unit.nested && uid.is_root() && user == 0 {
+        let why = "userNamespaces: this container is the node's root (runAsUser 0, or its image's user), who is not given a /proc that hides nothing: name another user";
+        return Err(why.into());
+    }
     let calls = if unit.unconfined {
         UNCONFINED.to_string()
     } else {
+        let nested = NESTED.iter().filter(|_| unit.nested).map(|call| call.to_string());
+        let allow: Vec<String> = unit.allow.iter().cloned().chain(nested).collect();
         // (Made here once to find a wrong name before anything is started.)
-        crate::seccomp::filters(&unit.allow)?;
-        unit.allow.join(" ")
+        crate::seccomp::filters(&allow)?;
+        allow.join(" ")
     };
     let mut notes = std::collections::HashMap::from([(CALLS.to_string(), calls)]);
     if !uid.is_root() && user != 0 {
@@ -808,13 +917,13 @@ fn spec_of(
         // The new namespace's are all dropped there, and this one counts for nothing in it.)
         //
         // Where kithd is root, a user of the node keeps one, through every exec: ports under
-        // 1024 are what a server is for, and nothing else of root's comes with it.
-        let kept = || {
-            HashSet::from([if root {
-                Capability::NetBindService
-            } else {
-                Capability::Setfcap
-            }])
+        // 1024 are what a server is for, and nothing else of root's comes with it. Not one
+        // that may nest: bubblewrap does not start as a user who has a capability and is not
+        // root (it takes itself for a setuid program set up wrongly).
+        let kept = || match root {
+            true if unit.nested => HashSet::new(),
+            true => HashSet::from([Capability::NetBindService]),
+            false => HashSet::from([Capability::Setfcap]),
         };
         let passed = || if root { kept() } else { HashSet::new() };
         let caps = LinuxCapabilitiesBuilder::default().bounding(kept()).effective(kept());
@@ -885,6 +994,12 @@ fn spec_of(
 
     let mut linux = spec.linux().clone().unwrap_or_default();
     linux.set_cgroups_path(Some(cgroup.into()));
+    if unit.nested {
+        // (A `/proc` with anything mounted over a part of it is not one the kernel lets a
+        // namespace made inside mount again.)
+        linux.set_masked_paths(Some(Vec::new()));
+        linux.set_readonly_paths(Some(Vec::new()));
+    }
     let mut limits = resources(unit)?;
     // (Made as the container's user's own where kithd is root; where it is not, a node is the
     // host's own, bound in, and opens for whoever kithd's user could open it.)
@@ -1036,6 +1151,42 @@ mod tests {
         );
     }
 
+    /// A container that may make user namespaces: the calls a sandbox makes go through its
+    /// filter beside those it named, and its `/proc` hides nothing; any other keeps both.
+    #[test]
+    fn a_container_that_may_nest_has_the_calls_and_a_whole_proc() {
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            user: Some("1000".into()),
+            ..Image::default()
+        };
+        let made = |unit: &Unit| spec("a", &image, unit, "/kith/a", Path::new("/b")).unwrap();
+        let calls = |spec: &Spec| spec.annotations().as_ref().unwrap()[CALLS].clone();
+        let plain = made(&Unit::default());
+        let hidden = plain
+            .linux()
+            .as_ref()
+            .unwrap()
+            .masked_paths()
+            .clone()
+            .unwrap_or_default();
+        assert!(hidden.iter().any(|path| path == "/proc/kcore"), "{hidden:?}");
+        assert_eq!(calls(&plain), "");
+        let nested = made(&Unit {
+            nested: true,
+            allow: vec!["ptrace".into()],
+            ..Unit::default()
+        });
+        let linux = nested.linux().as_ref().unwrap();
+        assert_eq!(linux.masked_paths().as_deref(), Some(&[][..]));
+        assert_eq!(linux.readonly_paths().as_deref(), Some(&[][..]));
+        assert_eq!(
+            calls(&nested),
+            "ptrace unshare setns clone clone3 mount umount2 pivot_root open_tree move_mount fsopen fsconfig fsmount fspick mount_setattr"
+        );
+        assert_eq!(nested.process().as_ref().unwrap().no_new_privileges(), Some(true));
+    }
+
     #[test]
     fn a_device_is_in_the_spec_and_in_the_cgroups_allow_list() {
         let image = Image {
@@ -1062,6 +1213,7 @@ mod tests {
             (true, Some("rw"), Some(1), Some(3))
         );
         assert_eq!(rule.typ(), Some(oci_spec::runtime::LinuxDeviceType::C));
+        assert!(plugged(Path::new("/dev/input/event7")) && !plugged(Path::new("/dev/dri/card0")));
         // Missing, or not a device node: the unit is not created, and the reason says which.
         let missing = spec(
             "a",

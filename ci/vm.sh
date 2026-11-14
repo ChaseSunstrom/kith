@@ -96,8 +96,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of their own; a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; needs rustc for
-                   x86_64-unknown-linux-musl. With KITH_E2E=1 also three pods of
+                   writes to /dev/stdout by name; a container that asks for user
+                   namespaces starts a sandbox in it (this machine's bwrap), one that
+                   does not is refused, one that is root is not started; a USB keyboard
+                   plugged in is given to the container holding the seat as it runs;
+                   needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
+                   KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
@@ -181,6 +185,10 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         kubectl=${KITH_KUBECTL:-$(command -v kubectl || true)}
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
+        if [ "$test" = pods ]; then
+            command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
+            bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
+        fi
         [ "$time" -gt 60 ] || time=900
         [ "$test" != kube ] || time=$((time * 2))
         port=$((20000 + $$ % 20000))
@@ -219,6 +227,22 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                         printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
                     done
                 fi
+                if [ "$test" = pods ]; then
+                    # And bubblewrap as this machine has it, with what it is linked to, beside
+                    # pod, for a user who is not root: a sandbox started inside a container.
+                    digest=$(printf sandbox | sha256sum | cut -d ' ' -f 1)
+                    image=$work/seed/runtime/images/$digest
+                    mkdir -p "$image/rootfs/bin"
+                    cp "$work/pod" "$image/rootfs/bin/pod"
+                    cp -L "$bwrap" "$image/rootfs/bin/bwrap"
+                    ldd "$bwrap" | awk '$2 == "=>" && $3 ~ /^\// { print ($1 ~ /^\// ? $1 : $3), $3 } $1 ~ /^\// && $2 != "=>" { print $1, $1 }' >"$work/linked"
+                    while read -r to from; do
+                        mkdir -p "$image/rootfs${to%/*}"
+                        cp -L "$from" "$image/rootfs$to"
+                    done <"$work/linked"
+                    echo '{}' >"$image/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fsandbox:1"
+                fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
                 mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
@@ -254,7 +278,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         node() { # N [kithd's further arguments]
             [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
-                -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" \
+                -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:2049" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}" \
@@ -414,8 +438,73 @@ EOF
                 stock='three pods of nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) started the same way, and each said on /dev/stdout that it was asked through their Service'
             fi
 
+            # A sandbox inside a container (bubblewrap as this machine has it; Steam's runtime
+            # and Flatpak start theirs so): a user namespace of its own, with a /proc and a
+            # /dev made in it. NAME, more of its container, and what its Job comes to say.
+            sandbox() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"box","image":"kith.test/sandbox:1"$2,"command":["/bin/bwrap","--unshare-user","--uid","0","--gid","0","--unshare-pid","--ro-bind","/","/","--proc","/proc","--dev","/dev","/bin/pod","self"]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+                waited=0
+                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq "$3|^[0-9]+ (succeeded|failed)( |\$)"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "waited for the Job $1; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$1" >"$work/$1.out" 2>/dev/null || true
+                any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
+                printf '%s\n' "$line" | grep -Eq "$3" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
+            }
+            # Only a container that asks may, and never one that is the node's root.
+            sandbox boxed ',"userNamespaces":true' '^[0-9]+ succeeded'
+            grep -q 'nested: pid 2, uid 0' "$work/boxed.out" || fail "the sandbox did not say where it found itself: $(cat "$work/boxed.out" "$work/boxed.err")"
+            sandbox unboxed '' '^[0-9]+ failed'
+            # (bubblewrap gives up there before it asks for a namespace, over the capability a
+            # container keeps on kith OS; that the call itself is refused is the runtime's test.)
+            ! grep -q nested "$work/unboxed.out" || fail "a container that did not ask started a sandbox: $(cat "$work/unboxed.out")"
+            sandbox rooted ',"runAsUser":0,"userNamespaces":true' 'userNamespaces: this container is the node.s root'
+            ! grep -q nested "$work/rooted.out" || fail "the node's root was let make a user namespace: $(cat "$work/rooted.out")"
+
+            # A session's input: a keyboard plugged in while a container holds the seat is
+            # one more node in its /dev that it can open, and nothing is started again for it.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"seat"},"spec":{"seat":"n1-seat0"}},
+ {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"session"},"spec":{"template":{"deviceClaims":["seat"],"containers":[
+  {"name":"sees","image":"kith.test/pod:1","command":["/bin/pod","seen","/dev/input"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the session and its claim on the seat were not applied"
+            # How many nodes it can open, by the last it said.
+            opens() { any GET /v1/logs/Workload/default/session 2>/dev/null | field data | grep '^seen:' | tail -n 1 | tr ' ' '\n' | grep -c '+$'; }
+            comes_to() { # WHAT, and a test of how many it opens now against $had
+                waited=0
+                until now=$(opens) && test "$now" "$2" "$had"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "waited for $1; it opens $now, and says: $(any GET /v1/logs/Workload/default/session 2>&1 | tail -n 3); the Workload: $(units Workload session)"
+                    sleep 1
+                done
+            }
+            plug() { echo "$1" | socat - "unix-connect:$work/keys1" >/dev/null; } # what the first node's machine is told
+            had=0
+            comes_to "the session to open the seat's input devices" -gt
+            had=$now
+            plug 'device_add usb-kbd,id=pad,bus=usb.0'
+            comes_to "the session to open the keyboard plugged in" -gt
+            grep -aq 'its input devices changed, and it has them as it runs' "$work/n1.log" || fail "the first node did not say it gave the session the keyboard as it ran"
+            plug 'device_del pad'
+            comes_to "the session to lose the keyboard pulled" -eq
+            any GET /v1/resources >"$work/found.json" || fail "the cluster's resources could not be read"
+            again=$(python3 -c '
+import json, sys
+found = json.load(open(sys.argv[1]))
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+units = [u for r in found if r["kind"] == "Workload" and r["metadata"]["name"] == "session" for u in (r.get("status") or {}).get("containers") or []]
+print(len(units), sum(u.get("restarts", 0) for u in units))' "$work/found.json")
+            [ "$again" = '1 0' ] || fail "the session was started again for its keyboard (units, restarts): $again"
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again"
             exit 0
         fi
         if [ "$test" = kube ]; then

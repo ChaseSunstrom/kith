@@ -1513,6 +1513,13 @@
           ],
           "description": "What the filter on its system calls lets through that it refuses by default."
         },
+        "userNamespaces": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The container may make user namespaces of its own, as a sandbox inside it does\n(bubblewrap: Steam's, Flatpak's). The filter then lets through the calls that\ntakes (`unshare`, `setns`, `clone`, `clone3`, and those that mount: `mount`,\n`umount2`, `pivot_root`, `open_tree`, `move_mount`, the `fs…` four, `mount_setattr`)\nand its `/proc` hides nothing, which a `/proc` mounted inside needs; on kith OS it\nstarts without the capability for ports below 1024, which bubblewrap refuses. In a\nnamespace of its own a program has every capability over it, and with them far\nmore of the kernel to call: off unless said, and refused for a container that\nis the node's root."
+        },
         "resources": {
           "anyOf": [
             {
@@ -1657,6 +1664,13 @@
             "null"
           ],
           "description": "Device node, e.g. `/dev/dri/card0`."
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Further device nodes that come with it and are granted with it: a card on\nNVIDIA's driver has `/dev/nvidiactl`, `/dev/nvidia-uvm` and its own `/dev/nvidiaN`."
         }
       },
       "required": [

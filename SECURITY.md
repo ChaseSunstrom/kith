@@ -49,6 +49,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   `no_new_privs`, on a read-only image, behind a seccomp filter that refuses some forty
   system calls: mounting, new namespaces, loading modules, bpf, perf, io_uring, keyrings,
   another process's memory, the clock. An image that names root as its user gets nobody.
+  A container whose template says `userNamespaces: true` (off unless said: a sandbox
+  inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
+  and nothing in its `/proc` is covered; it is refused to a container that is the node's
+  root.
 - **A pod** (a template that says `pod: true`, and so every Deployment, StatefulSet,
   DaemonSet and Job sent through the Kubernetes API) is a container with three of those
   taken off, as Kubernetes has them: it is the user its image names, root included; root
@@ -106,9 +110,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 - **Whoever may apply a Workload, a NodeWorkload or a Job runs code on the cluster's
   nodes.** A container is kept small by default (see "A container" above), and its
   template is where each of those defaults is taken off: `runAsUser: 0`, `seccomp: {
-  unconfined: true }`, `pod: true`. On kith OS there is no user namespace, so `runAsUser: 0`
+  unconfined: true }`, `pod: true`, `userNamespaces: true`. That last gives a user who is
+  not root the kernel's code for a namespace's root (mounting, a network of its own),
+  where much of what has made a user the node's root was found; the other refused calls
+  stay refused inside. On kith OS there is no user namespace, so `runAsUser: 0`
   there is the node's root with three capabilities, and root in a pod is the node's root
-  with fourteen (T-0280). Containers that are not pods share the node's network, and an
+  with fourteen (T-0280). One of the fourteen makes device nodes, and no filter on the
+  pod's cgroup says which devices it may open (T-0306): root in a pod on kith OS can make
+  and open any device of its node, its disks included. Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
