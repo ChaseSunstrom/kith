@@ -277,6 +277,18 @@ kith node status                                   # who leads the store, who vo
   passes on 4096 connections to Services at a time (1024 for any one other
   node), and one that is silent both ways for an hour is closed.
 
+What a cluster of three does when a node is cut off or loses power is tested
+in VMs (`sh ci/vm.sh --test chaos`): three kith OS nodes, and a writer on the
+host through each of them. Each node in turn has its card on the cluster's
+network unplugged for a while; each node in turn is reset by the hypervisor
+in the middle of writes. Every time the other two go on taking writes, and the
+node that is cut off acknowledges none. Then all three are reset at the same
+moment, so that no node has what another lost. At the end every write that
+was acknowledged is on all three nodes, which hold the same. A reset by the
+hypervisor loses what the guest had not yet handed to its disk and nothing
+else: a disk that says it flushed and did not, a write torn in half, delay
+and loss on the network, and real machines are not what this shows.
+
 Not yet: the nodes still talk to each other at their plain addresses, not
 over the mesh, workloads have no addresses on it, and two nodes that
 are both behind NAT only reach each other through an edge node.
@@ -1997,6 +2009,7 @@ sh ci/vm.sh                                             # the host's kernel, boo
 sh ci/vm.sh --test init                                 # and: it serves, then restarts when told
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
+sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
 KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```
