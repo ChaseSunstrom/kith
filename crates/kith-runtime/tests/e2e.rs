@@ -35,6 +35,139 @@ fn script(s: &str) -> Unit {
     }
 }
 
+/// A runtime of its own with the image pulled, or `None` (and "skipped") where this was not asked for.
+async fn rig(name: &str) -> Option<(Runtime, kith_runtime::Image, std::path::PathBuf)> {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1 to run");
+        return None;
+    }
+    let image_ref = std::env::var("KITH_E2E_IMAGE").unwrap_or(IMAGE.into());
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("e2e-{name}-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let rt = Runtime::new(dir.join("runtime")).unwrap();
+    let image = rt.images.pull(&image_ref, PullPolicy::IfNotPresent).await.unwrap();
+    Some((rt, image, dir))
+}
+
+/// What every container gets with nothing said: no way to more privileges, no user 0, no capabilities.
+#[tokio::test]
+async fn hardened() {
+    let Some((rt, image, dir)) = rig("hardened").await else {
+        return;
+    };
+    let look = "grep -E 'NoNewPrivs|CapEff|CapBnd' /proc/self/status | tr -s '\\t' ' '; id -u; id -g";
+    let (code, out, err) = sh(&rt, &image, &dir, "plain", script(look));
+    let none = "0000000000000000";
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            0,
+            format!("CapEff: {none}\nCapBnd: {none}\nNoNewPrivs: 1\n65534\n65534\n").as_str()
+        ),
+        "{err}"
+    );
+    // (No setuid program is run here. What would stop one is read: NoNewPrivs above, and
+    // that there is no user 0 in the container for one to become.)
+    let (_, out, _) = sh(
+        &rt,
+        &image,
+        &dir,
+        "nobody-else",
+        script("cat /proc/self/uid_map | wc -l"),
+    );
+    assert_eq!(out, "1\n", "one user is mapped into the container, and it is not 0");
+
+    // The template may say which user, 0 included; still no way to more.
+    let unit = Unit {
+        user: Some(1000),
+        ..script("id -u; touch /tmp/mine && stat -c %u /tmp/mine")
+    };
+    assert_eq!(sh(&rt, &image, &dir, "said", unit).1, "1000\n1000\n");
+    let unit = Unit {
+        user: Some(0),
+        ..script("id -u; grep NoNewPrivs /proc/self/status | tr -s '\\t' ' '")
+    };
+    assert_eq!(sh(&rt, &image, &dir, "root", unit).1, "0\nNoNewPrivs: 1\n");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A call the filter refuses fails in a container; allowed back by name, or with no filter,
+/// it does not. (A user namespace is what anyone may make, where nothing is in the way.)
+#[tokio::test]
+async fn seccomp() {
+    let Some((rt, image, dir)) = rig("seccomp").await else {
+        return;
+    };
+    let look = "grep Seccomp: /proc/self/status | tr -s '\\t' ' '; unshare -U true";
+    let (code, out, err) = sh(&rt, &image, &dir, "filtered", script(look));
+    assert_eq!((code != 0, out.as_str()), (true, "Seccomp: 2\n"), "{err}");
+    assert!(err.contains("Operation not permitted"), "{err}");
+
+    let unit = Unit {
+        allow: vec!["unshare".into()],
+        ..script(look)
+    };
+    let (code, out, err) = sh(&rt, &image, &dir, "allowed", unit);
+    assert_eq!((code, out.as_str()), (0, "Seccomp: 2\n"), "{err}");
+    let unit = Unit {
+        unconfined: true,
+        ..script(look)
+    };
+    let (code, out, err) = sh(&rt, &image, &dir, "unconfined", unit);
+    assert_eq!((code, out.as_str()), (0, "Seccomp: 0\n"), "{err}");
+
+    // A name that is no refused call is a mistake found before anything starts.
+    let unit = Unit {
+        allow: vec!["unshar".into()],
+        ..script("true")
+    };
+    let (out, err) = (
+        fs::File::create(dir.join("o")).unwrap(),
+        fs::File::create(dir.join("e")).unwrap(),
+    );
+    let said = rt
+        .create("misnamed", &image, &unit, out, err)
+        .err()
+        .map(|e| e.to_string());
+    assert!(
+        said.as_ref()
+            .is_some_and(|said| said.contains("`unshar` is not a call the filter refuses")),
+        "{said:?}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The image is nobody's to write: only volumes and the two tmpfs are.
+#[tokio::test]
+async fn read_only_root() {
+    let Some((rt, image, dir)) = rig("read-only-root").await else {
+        return;
+    };
+    let kept = dir.join("kept");
+    fs::create_dir_all(&kept).unwrap();
+    let tries = "for at in /x /etc/x /bin/x /tmp/x /run/x /kept/x; do touch $at 2>/dev/null; echo $at $?; done";
+    for (id, user) in [("as-nobody", None), ("as-root", Some(0))] {
+        let mount = kith_runtime::Mount {
+            host: kept.clone(),
+            container: "/kept".into(),
+            read_only: false,
+            give: true,
+        };
+        let unit = Unit {
+            user,
+            mounts: vec![mount],
+            ..script(tries)
+        };
+        let (_, out, err) = sh(&rt, &image, &dir, id, unit);
+        assert_eq!(
+            out, "/x 1\n/etc/x 1\n/bin/x 1\n/tmp/x 0\n/run/x 0\n/kept/x 0\n",
+            "{id}: {err}"
+        );
+    }
+    assert!(!image.rootfs.join("x").exists() && kept.join("x").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn pull_and_run() {
     if std::env::var_os("KITH_E2E").is_none() {
@@ -131,7 +264,7 @@ async fn pull_and_run() {
     let (_, out, _) = sh(&rt, &image, &dir, "env", unit);
     assert_eq!(out, "hi /etc\n/bin/sh\n");
 
-    // Isolation: read-only image, writable /tmp, its own PID namespace, root only inside.
+    // Isolation: read-only image, writable /tmp, its own PID namespace, nobody inside.
     let (code, out, _) = sh(
         &rt,
         &image,
@@ -139,7 +272,7 @@ async fn pull_and_run() {
         "iso",
         script("touch /x 2>/dev/null; echo $?; touch /tmp/x; echo $?; echo $$; id -u"),
     );
-    assert_eq!((code, out.as_str()), (0, "1\n0\n1\n0\n"));
+    assert_eq!((code, out.as_str()), (0, "1\n0\n1\n65534\n"));
     assert!(!image.rootfs.join("x").exists());
 
     // A container killed by a signal reports 128 + signal.

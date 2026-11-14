@@ -844,6 +844,79 @@ fn a_vm_unit_names_what_it_starts_by_absolute_paths_and_its_memory() {
     assert!(job(twice).unwrap_err().contains("two units are named `vm`"));
 }
 
+/// A container's user and what its filter lets through: said by the template, and checked
+/// when it is applied.
+#[test]
+fn hardened_containers_say_who_they_are_and_what_they_call() {
+    let job = |container: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: j }}\nspec:\n  template:\n    containers: [{{ name: c, image: i, {container} }}]\n"
+        );
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    // (The shape of a key: what a P-256 and an Ed25519 public key file start with, and how long each is.)
+    let p256 = format!("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE{}==", "A".repeat(86));
+    let ed = format!("MCowBQYDK2VwAyEA{}=", "A".repeat(43));
+    let pem = format!(
+        "\"-----BEGIN PUBLIC KEY-----\\n{}\\n{}\\n-----END PUBLIC KEY-----\\n\"",
+        &p256[..64],
+        &p256[64..]
+    );
+    for good in [
+        format!("signedBy: [{p256}, {ed}]"),
+        format!("signedBy: [{pem}]"),
+        "signedBy: []".to_string(),
+    ] {
+        job(&good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for (bad, why) in [
+        (
+            format!("signedBy: [{}]", &p256[..100]),
+            "is not a public key kith can check",
+        ),
+        (
+            "signedBy: [cosign.pub]".to_string(),
+            "`cosign.pub` is not a public key kith can check",
+        ),
+        (
+            format!("signedBy: [{}]", [ed.as_str(); 17].join(", ")),
+            "at most 16 keys",
+        ),
+        (format!("signedBy: {ed}"), "expected a sequence"),
+    ] {
+        let refused = job(&bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    for good in [
+        "runAsUser: 0",
+        "runAsUser: 1000",
+        "seccomp: { unconfined: true }",
+        "seccomp: { allow: [unshare, clone, clone3] }",
+        "seccomp: {}",
+    ] {
+        job(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for (bad, why) in [
+        ("runAsUser: 4294967295", "is no user"),
+        ("runAsUser: -1", "expected u32"),
+        ("runAsUser: nobody", "expected u32"),
+        (
+            "seccomp: { allow: [read] }",
+            "`read` is not a call the filter refuses (it refuses: mount, umount2,",
+        ),
+        (
+            "seccomp: { allow: [Mount] }",
+            "`Mount` is not a call the filter refuses",
+        ),
+        ("seccomp: unconfined", "expected struct Seccomp"),
+        ("seccomp: { deny: [read] }", "deny"),
+    ] {
+        let refused = job(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+}
+
 /// `encrypted: true` on a Volume and `confidential: true` on a template: what each needs,
 /// and what neither can be yet.
 #[test]

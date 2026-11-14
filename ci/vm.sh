@@ -164,7 +164,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 mkdir -p "$work/seed/runtime/refs" "$image/rootfs/bin"
                 cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
                 echo '{}' >"$image/config.json"
-                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[]}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
                 mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
@@ -328,6 +328,24 @@ EOF
             until_job across failed
             refused across from-n1
 
+            # Those containers were not root: /dev is root's, and a key cannot be made there
+            # but by a container whose template says it is root.
+            user() { # NAME [USER]
+                as=''
+                [ -z "${2:-}" ] || as=",\"runAsUser\":$2"
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/dev/key"]$as}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+            }
+            user nobody
+            until_job nobody failed
+            any GET "/v1/logs/Job/default/nobody?stderr=true" >"$work/nobody.err" 2>/dev/null || true
+            grep -q 'Permission denied' "$work/nobody.err" || fail "a container that names no user was not kept out of /dev as one that is not root is: $(cat "$work/nobody.err")"
+            user root 0
+            until_job root succeeded
+
             # From outside the mesh (this machine, through the node's other card) there is no
             # NFS server to talk to: it listens on the mesh address alone.
             python3 - "$((port + 5))" <<'EOF' || fail "the first node's NFS port answered an address outside the mesh"
@@ -347,7 +365,7 @@ EOF
             # is no node and not on the mesh, and speaks NFS 4.2 to the first node itself.
             probe() { python3 "$root/ci/nfs_probe.py" 127.0.0.1 "$@" | tr '\n' ' '; }
             cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"Share","metadata":{"name":"mine"},"spec":{"volume":"on1","uid":0,"gid":0,"nfs":{"clients":["10.0.2.2"]}}},
+[{"apiVersion":"kith.dev/v1","kind":"Share","metadata":{"name":"mine"},"spec":{"volume":"on1","nfs":{"clients":["10.0.2.2"]}}},
  {"apiVersion":"kith.dev/v1","kind":"Share","metadata":{"name":"look"},"spec":{"volume":"data","readOnly":true,"nfs":{"clients":["10.0.2.0/24"]}}}]
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Shares were not applied"
@@ -360,6 +378,7 @@ EOF
             said=$(probe "$((port + 5))" /default/on1/own mkdir from-lan) || fail "the first node did not speak NFS to a machine its Share names"
             [ "$said" = '0 0 ' ] || fail "a machine the Share names did not make a directory in its volume: NFS said $said"
             # The directory is in the volume, for a container on that node: a key goes in it.
+            # (The Share's user and the container's are the same one: nobody, as neither says.)
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"lan"},"spec":{"retries":0,"template":{"containers":[
   {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/here/from-lan/key"],

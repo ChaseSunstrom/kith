@@ -1,17 +1,24 @@
 //! Running one container from an [`Image`].
 
 use crate::{Context, Image, ImageStore, Result, err};
+use caps::CapSet;
 use libcgroups::common::{CgroupManager, ControllerOpt};
 use libcontainer::container::Container;
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::syscall::syscall::SyscallType;
+use libcontainer::workload::default::DefaultExecutor;
+use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use oci_spec::runtime::{
-    LinuxCpuBuilder, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceCgroup, LinuxDeviceCgroupBuilder, LinuxDeviceType,
-    LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, MountBuilder, RootBuilder, Spec,
+    Capability, LinuxCapabilitiesBuilder, LinuxCpuBuilder, LinuxDevice, LinuxDeviceBuilder, LinuxDeviceCgroup,
+    LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, MountBuilder,
+    RootBuilder, Spec, UserBuilder,
 };
+use std::collections::HashSet;
 use std::fs::{self, File};
+use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,6 +78,13 @@ pub struct Unit {
     pub devices: Vec<PathBuf>,
     /// Host directories bound into the container. An exec unit gets none: it has no mount namespace.
     pub mounts: Vec<Mount>,
+    /// The user (and group) the container's process is: `None` is the image's own, or 65534
+    /// where the image names none. An exec unit ignores it: it is kithd's user.
+    pub user: Option<u32>,
+    /// No filter on its system calls. An exec unit has none either way.
+    pub unconfined: bool,
+    /// Calls the filter refuses that this container may make: names of [`crate::REFUSED`].
+    pub allow: Vec<String>,
 }
 
 /// A host directory bound into a container: where it is, where the container sees it.
@@ -81,6 +95,9 @@ pub struct Mount {
     /// An absolute path in the container, not `/` nor under `/proc`, `/sys` or `/dev`.
     pub container: String,
     pub read_only: bool,
+    /// A directory kith made for this: where kithd is root and the container's user is
+    /// not, it is made that user's, with all that is in it, unless it is theirs already.
+    pub give: bool,
 }
 
 /// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
@@ -155,6 +172,17 @@ impl Runtime {
             .validate_id()
             .ctx(&what)?;
         let spec = spec(id, image, unit, &cgroup).ctx(&what)?;
+        // (The spec names a user only where kithd is root: see `spec`.)
+        let user = spec.process().as_ref().map(|process| process.user());
+        if let Some(user) = user.filter(|user| user.uid() != 0) {
+            for volume in unit.mounts.iter().filter(|volume| volume.give && !volume.read_only) {
+                give(&volume.host, user.uid(), user.gid()).ctx(format!(
+                    "{what}: giving {} to user {}",
+                    volume.host.display(),
+                    user.uid()
+                ))?;
+            }
+        }
         fs::create_dir_all(&bundle).ctx(&what)?;
         let built = (|| {
             spec.save(bundle.join("config.json")).ctx(&what)?;
@@ -165,6 +193,7 @@ impl Runtime {
                 .with_stdin(File::open("/dev/null").ctx(&what)?)
                 .with_stdout(stdout)
                 .with_stderr(stderr)
+                .with_executor(Entry)
                 .as_init(&bundle)
                 .with_systemd(false)
                 .with_detach(true)
@@ -445,17 +474,212 @@ fn cgroup_parent() -> Result<String> {
 /// Processes and threads one container may have.
 const MAX_PIDS: i64 = 4096;
 
-// ponytail: the image's `User` is not applied: rootless, only uid 0 is mapped into
-// the container, so any other user cannot exist there. It needs subuid ranges
-// (newuidmap) or running as root, and comes with whichever arrives first.
+/// Who a container's process is where neither its template nor its image says.
+pub const NOBODY: u32 = 65534;
+
+/// The lines of the image's own `/etc/FILE`, split at the colons. Never through a link:
+/// an image says where its own files are, not where the host's are.
+fn listed(image: &Image, file: &str) -> Vec<Vec<String>> {
+    let etc = image.rootfs.join("etc");
+    let is = |path: &Path, dir: bool| {
+        fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() == dir && !meta.is_symlink())
+    };
+    if !is(&etc, true) || !is(&etc.join(file), false) {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(etc.join(file)).unwrap_or_default();
+    let fields = |line: &str| line.split(':').map(String::from).collect();
+    text.lines().map(fields).collect()
+}
+
+/// The user and group a container's process is: the template's, else the image's own
+/// (a number, or a name of its `/etc/passwd`), else nobody. User 0 only when the
+/// template says so: an image that asks for it gets nobody.
+fn who(image: &Image, unit: &Unit) -> std::result::Result<(u32, u32), String> {
+    let number = |text: &str| text.parse::<u32>().ok().filter(|id| *id != u32::MAX);
+    if let Some(user) = unit.user {
+        let user = number(&user.to_string()).ok_or(format!("{user} is not a user"))?;
+        return Ok((user, user));
+    }
+    let Some(said) = image.user.as_deref().filter(|said| !said.is_empty()) else {
+        return Ok((NOBODY, NOBODY));
+    };
+    let (user, group) = said
+        .split_once(':')
+        .map_or((said, None), |(user, group)| (user, Some(group)));
+    // name:x:uid:gid:…
+    let users = listed(image, "passwd");
+    let entry = users
+        .iter()
+        .find(|line| line.len() > 3 && (line[0] == user || line[2] == user));
+    let uid = number(user).or_else(|| entry.and_then(|line| number(&line[2])));
+    let uid = uid.ok_or(format!(
+        "the image's user `{user}` is not in its /etc/passwd: say runAsUser"
+    ))?;
+    let gid = match group {
+        None => entry.and_then(|line| number(&line[3])).unwrap_or(uid),
+        Some(group) => {
+            let groups = listed(image, "group");
+            let entry = groups.iter().find(|line| line.len() > 2 && line[0] == group);
+            let gid = number(group).or_else(|| entry.and_then(|line| number(&line[2])));
+            gid.ok_or(format!(
+                "the image's group `{group}` is not in its /etc/group: say runAsUser"
+            ))?
+        }
+    };
+    // An image makes its container neither root nor of root's group (which, where there
+    // is no user namespace, is the node's own): `runAsUser: 0` is how a template says so.
+    Ok(match (uid, gid) {
+        (0, _) => (NOBODY, NOBODY),
+        (uid, 0) => (uid, uid),
+        both => both,
+    })
+}
+
+/// Where the spec says who the process becomes in a namespace of its own (`USER:GROUP`).
+const BECOMES: &str = "dev.kith.becomes";
+
+/// Where the spec says which refused system calls the container is allowed back (names with
+/// spaces between), or that it has no filter.
+const CALLS: &str = "dev.kith.seccomp";
+const UNCONFINED: &str = "unconfined";
+
+/// What happens in a container's first process right before the image's program takes its place.
+#[derive(Clone)]
+struct Entry;
+
+impl Executor for Entry {
+    fn exec(&self, spec: &Spec) -> std::result::Result<(), ExecutorError> {
+        let said = spec.annotations().as_ref().and_then(|notes| notes.get(BECOMES));
+        if let Some((user, group)) = said.and_then(|said| said.split_once(':')) {
+            // Without root there is one user to map, and libcontainer needs it to be 0 while
+            // it sets up. So the program gets a user namespace inside that one, where the
+            // same one user is the one it is meant to be, and no 0 exists.
+            // (Said on the unit's own stderr too: that is where its operator looks.)
+            let failed = |what: &str, e: &dyn std::fmt::Display| {
+                let said = format!("kith: the container's user {user}:{group}: {what}: {e}\n");
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), said.as_bytes());
+                ExecutorError::Other(format!("{what}: {e}"))
+            };
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWUSER).map_err(|e| failed("a user namespace", &e))?;
+            // (A process that changed who it is has files in /proc that only root may
+            // write, until it says it may be looked at again.)
+            nix::sys::prctl::set_dumpable(true).map_err(|e| failed("its own /proc files", &e))?;
+            let wrote = |file: &str, text: String| fs::write(file, text).map_err(|e| failed(file, &e));
+            wrote("/proc/self/uid_map", format!("{user} 0 1"))?;
+            wrote("/proc/self/setgroups", "deny".into())?;
+            wrote("/proc/self/gid_map", format!("{group} 0 1"))?;
+            // A new namespace starts with every capability in it: none outlives this.
+            for set in [
+                CapSet::Bounding,
+                CapSet::Inheritable,
+                CapSet::Effective,
+                CapSet::Permitted,
+            ] {
+                caps::clear(None, set).map_err(|e| failed("dropping capabilities", &e))?;
+            }
+        }
+        // Last, once nothing above needs a call it refuses. (Not said, the filter is whole.)
+        let said = spec.annotations().as_ref().and_then(|notes| notes.get(CALLS));
+        if said.map(String::as_str) != Some(UNCONFINED) {
+            let allowed: Vec<String> = said
+                .iter()
+                .flat_map(|said| said.split_whitespace())
+                .map(String::from)
+                .collect();
+            crate::seccomp::filters(&allowed)
+                .and_then(|filters| crate::seccomp::install(&filters))
+                .map_err(|e| {
+                    let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("kith: {e}\n").as_bytes());
+                    ExecutorError::Other(e)
+                })?;
+        }
+        DefaultExecutor {}.exec(spec)
+    }
+
+    fn validate(&self, spec: &Spec) -> std::result::Result<(), ExecutorValidationError> {
+        DefaultExecutor {}.validate(spec)
+    }
+}
+
+/// Gives a volume to a user: all of it, when its directory is not theirs already (a new
+/// volume, one written by root before containers had users, one restored, one whose
+/// workload changed its user).
+///
+/// Each directory is opened as an entry of the one that holds it and never through a link,
+/// so a program writing the volume meanwhile cannot have something outside it given away.
+//
+// ponytail: a walk of the whole volume when its user changes, and two workloads with two
+// users on one volume walk it at every start. Idmapped mounts (the files stay as they
+// are, each container sees them as its own) when a volume is big enough for that to hurt.
+fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    fn held(dir: &Path) -> io::Result<File> {
+        let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
+        fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)
+    }
+    fn walk(dir: File, uid: u32, gid: u32, deeper: u32) -> io::Result<()> {
+        for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                std::os::unix::fs::lchown(entry.path(), Some(uid), Some(gid))?;
+            } else if deeper == 0 {
+                return Err(io::Error::other("directories more than 128 deep"));
+            } else {
+                walk(held(&entry.path())?, uid, gid, deeper - 1)?;
+            }
+        }
+        // (Last, the top of all included: a walk that was cut short is done again.)
+        std::os::unix::fs::fchown(&dir, Some(uid), Some(gid))
+    }
+    let top = held(dir)?;
+    let has = top.metadata()?;
+    if (has.uid(), has.gid()) == (uid, gid) {
+        return Ok(());
+    }
+    walk(top, uid, gid, 128)
+}
+
 fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
-    let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
+    spec_of(id, image, unit, cgroup, nix::unistd::getuid(), nix::unistd::getgid())
+}
+
+/// [`spec`], for a kithd that is the user `uid`.
+fn spec_of(
+    id: &str,
+    image: &Image,
+    unit: &Unit,
+    cgroup: &str,
+    uid: nix::unistd::Uid,
+    gid: nix::unistd::Gid,
+) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
+    // Who the process is. Where kithd is root it is that user of the node, with nothing
+    // root has. Where it is not, the container is a user namespace whose one user is
+    // kithd's own, and the program is given a second one inside (`Entry`).
+    //
+    // ponytail: no user namespace where kithd is root (kith OS): the image's files and the
+    // volumes are root's there, and a namespace needs them shifted to its users (idmapped
+    // mounts, or a chown of every image). So `runAsUser: 0` on kith OS is the node's root
+    // with three capabilities, as before.
+    let (user, group) = who(image, unit)?;
     let mut spec = if uid.is_root() {
         Spec::default()
     } else {
         Spec::rootless(uid.as_raw(), gid.as_raw())
     };
-    // No network namespace, as root too: containers share the host's network.
+    let calls = if unit.unconfined {
+        UNCONFINED.to_string()
+    } else {
+        // (Made here once to find a wrong name before anything is started.)
+        crate::seccomp::filters(&unit.allow)?;
+        unit.allow.join(" ")
+    };
+    let mut notes = std::collections::HashMap::from([(CALLS.to_string(), calls)]);
+    if !uid.is_root() && user != 0 {
+        notes.insert(BECOMES.to_string(), format!("{user}:{group}"));
+    }
+    spec.set_annotations(Some(notes));
+    // No network namespace: containers share the host's network.
     let mut linux = spec.linux().clone().unwrap_or_default();
     let mut namespaces = linux.namespaces().clone().unwrap_or_default();
     namespaces.retain(|ns| ns.typ() != oci_spec::runtime::LinuxNamespaceType::Network);
@@ -499,6 +723,41 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
             .into(),
     );
     process.set_terminal(Some(false));
+    let root = uid.is_root();
+    if root {
+        // (Its group said once more as the whole list of its groups: with no list,
+        // libcontainer leaves the process in kithd's own.)
+        let groups = vec![group];
+        process.set_user(
+            UserBuilder::default()
+                .uid(user)
+                .gid(group)
+                .additional_gids(groups)
+                .build()?,
+        );
+    }
+    // Never a way to more than it starts with; and it starts with no capability at all
+    // unless it is the namespace's root, who keeps the three a container is given.
+    process.set_no_new_privileges(Some(true));
+    if user != 0 {
+        // (Without root one is left until `Entry` has made the second namespace: the kernel
+        // lets a namespace's user 0 be mapped only by who could set file capabilities.
+        // The new namespace's are all dropped there, and this one counts for nothing in it.)
+        //
+        // Where kithd is root, a user of the node keeps one, through every exec: ports under
+        // 1024 are what a server is for, and nothing else of root's comes with it.
+        let kept = || {
+            HashSet::from([if root {
+                Capability::NetBindService
+            } else {
+                Capability::Setfcap
+            }])
+        };
+        let passed = || if root { kept() } else { HashSet::new() };
+        let caps = LinuxCapabilitiesBuilder::default().bounding(kept()).effective(kept());
+        let caps = caps.permitted(kept()).inheritable(passed()).ambient(passed());
+        process.set_capabilities(Some(caps.build()?));
+    }
     spec.set_process(Some(process));
 
     let tmpfs = |at: &str| -> std::result::Result<oci_spec::runtime::Mount, Box<dyn std::error::Error>> {
@@ -537,7 +796,9 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     let mut linux = spec.linux().clone().unwrap_or_default();
     linux.set_cgroups_path(Some(cgroup.into()));
     let mut limits = resources(unit)?;
-    let (nodes, allowed) = device_nodes(&unit.devices)?;
+    // (Made as the container's user's own where kithd is root; where it is not, a node is the
+    // host's own, bound in, and opens for whoever kithd's user could open it.)
+    let (nodes, allowed) = device_nodes(&unit.devices, root.then_some((user, group)))?;
     if !nodes.is_empty() {
         linux.set_devices(Some(nodes));
         limits.set_devices(Some(allowed));
@@ -581,6 +842,7 @@ fn check_mount(volume: &Mount) -> std::result::Result<(), Box<dyn std::error::Er
 /// An exec unit is not given these: it runs on the host and sees all of `/dev` already.
 fn device_nodes(
     paths: &[PathBuf],
+    owner: Option<(u32, u32)>,
 ) -> std::result::Result<(Vec<LinuxDevice>, Vec<LinuxDeviceCgroup>), Box<dyn std::error::Error>> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let (mut nodes, mut allowed) = (Vec::new(), Vec::new());
@@ -606,6 +868,10 @@ fn device_nodes(
             .typ(kind)
             .major(major)
             .minor(minor);
+        let node = match owner {
+            Some((user, group)) => node.uid(user).gid(group),
+            None => node,
+        };
         nodes.push(node.file_mode(meta.mode() & 0o777).build()?);
         let rule = LinuxDeviceCgroupBuilder::default().allow(true).typ(kind);
         allowed.push(rule.major(major).minor(minor).access("rw").build()?);
@@ -766,7 +1032,200 @@ mod tests {
             host: host.into(),
             container: at.into(),
             read_only,
+            give: false,
         }
+    }
+
+    /// What the README says every container gets is what the spec says, with nothing asked
+    /// for: where kithd is root, and where it is a user.
+    #[test]
+    fn hardened_is_what_a_plain_unit_gets() {
+        use nix::unistd::{Gid, Uid};
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let asked = Unit {
+            user: Some(0),
+            ..Unit::default()
+        };
+        let sets = |process: &oci_spec::runtime::Process| {
+            let caps = process.capabilities().clone().unwrap();
+            let sorted = |set: &Option<HashSet<Capability>>| {
+                let mut names: Vec<String> = set.iter().flatten().map(|cap| format!("{cap:?}")).collect();
+                names.sort();
+                names.join(" ")
+            };
+            [
+                caps.bounding(),
+                caps.effective(),
+                caps.permitted(),
+                caps.inheritable(),
+                caps.ambient(),
+            ]
+            .map(sorted)
+        };
+        let becomes = |made: &Spec| {
+            made.annotations()
+                .as_ref()
+                .and_then(|notes| notes.get(BECOMES).cloned())
+        };
+        for (root, kithd) in [(true, 0), (false, 1000)] {
+            let (uid, gid) = (Uid::from_raw(kithd), Gid::from_raw(kithd));
+            let made = spec_of("a", &image, &Unit::default(), "/kith/a", uid, gid).unwrap();
+            let process = made.process().as_ref().unwrap();
+            assert_eq!(process.no_new_privileges(), Some(true));
+            assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
+            assert_eq!(made.annotations().as_ref().unwrap()[CALLS], "", "the whole filter");
+            let user = process.user();
+            if root {
+                // That user of the node, in no group of kithd's, with the one capability
+                // that outlives its start: the one for ports under 1024.
+                assert_eq!((user.uid(), user.gid(), becomes(&made)), (NOBODY, NOBODY, None));
+                assert_eq!(user.additional_gids(), &Some(vec![NOBODY]));
+                assert_eq!(sets(process), ["NetBindService"; 5]);
+            } else {
+                // The namespace's one user until `Entry` makes it nobody; what it holds
+                // meanwhile is for that step, and is not passed on to a program.
+                assert_eq!((user.uid(), becomes(&made)), (0, Some(format!("{NOBODY}:{NOBODY}"))));
+                assert_eq!(sets(process), ["Setfcap", "Setfcap", "Setfcap", "", ""]);
+            }
+            // Root when the template says so, and only then: it keeps what a container is given.
+            let made = spec_of("a", &image, &asked, "/kith/a", uid, gid).unwrap();
+            let process = made.process().as_ref().unwrap();
+            assert_eq!((process.user().uid(), process.no_new_privileges()), (0, Some(true)));
+            assert_eq!(becomes(&made), None, "no second namespace for root");
+            assert_eq!(sets(process)[0], "AuditWrite Kill NetBindService");
+        }
+        // No filter, or some of it, only as the unit says.
+        let (uid, gid) = (Uid::from_raw(0), Gid::from_raw(0));
+        let unit = Unit {
+            unconfined: true,
+            ..Unit::default()
+        };
+        let made = spec_of("a", &image, &unit, "/kith/a", uid, gid).unwrap();
+        assert_eq!(made.annotations().as_ref().unwrap()[CALLS], UNCONFINED);
+        let unit = Unit {
+            allow: vec!["ptrace".into(), "unshare".into()],
+            ..Unit::default()
+        };
+        let made = spec_of("a", &image, &unit, "/kith/a", uid, gid).unwrap();
+        assert_eq!(made.annotations().as_ref().unwrap()[CALLS], "ptrace unshare");
+        let unit = Unit {
+            allow: vec![UNCONFINED.into()],
+            ..Unit::default()
+        };
+        let said = spec_of("a", &image, &unit, "/kith/a", uid, gid)
+            .unwrap_err()
+            .to_string();
+        assert!(said.contains("`unconfined` is not a call the filter refuses"), "{said}");
+    }
+
+    /// A volume is given whole, and nothing a link in it names is: not a file outside, not
+    /// what is under a directory outside. (Run as a user with a second group: only root
+    /// can give files to another user, and a group of one's own is what a test can give.)
+    #[test]
+    fn hardened_volume_is_given_whole_and_no_link_is_followed() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let (uid, gid) = (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw());
+        let groups = nix::unistd::getgroups().unwrap();
+        let Some(other) = groups.iter().map(|group| group.as_raw()).find(|group| *group != gid) else {
+            return eprintln!("skipped: this user has one group, so nothing can be given");
+        };
+        let dir = std::env::temp_dir().join(format!("kith-give-{}", std::process::id()));
+        let (volume, outside) = (dir.join("volume"), dir.join("outside"));
+        fs::create_dir_all(volume.join("a/b")).unwrap();
+        fs::create_dir_all(outside.join("deep")).unwrap();
+        for file in ["volume/top", "volume/a/b/file", "outside/file", "outside/deep/file"] {
+            fs::write(dir.join(file), "x").unwrap();
+        }
+        symlink(outside.join("file"), volume.join("a/to-file")).unwrap();
+        symlink(&outside, volume.join("a/to-dir")).unwrap();
+        let group = |path: &str| fs::symlink_metadata(dir.join(path)).unwrap().gid();
+
+        give(&volume, uid, other).unwrap();
+        for given in [
+            "volume",
+            "volume/top",
+            "volume/a",
+            "volume/a/b",
+            "volume/a/b/file",
+            "volume/a/to-file",
+        ] {
+            assert_eq!(group(given), other, "{given}");
+        }
+        for kept in ["outside", "outside/file", "outside/deep", "outside/deep/file"] {
+            assert_eq!(group(kept), gid, "{kept}");
+        }
+        // Theirs already: nothing is walked (what is under it is as it was left).
+        nix::unistd::chown(&volume.join("a/b/file"), None, Some(gid.into())).unwrap();
+        give(&volume, uid, other).unwrap();
+        assert_eq!(group("volume/a/b/file"), gid);
+        // A volume that is itself a link is not a volume.
+        assert!(give(&volume.join("a/to-dir"), uid, other).is_err());
+        assert_eq!(group("outside"), gid);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The user is the template's, else the image's (by number, or by name from the image's
+    /// own files and never the host's), else nobody; an image cannot ask for 0.
+    #[test]
+    fn hardened_user_is_the_templates_then_the_images_then_nobody() {
+        let dir = std::env::temp_dir().join(format!("kith-who-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("etc")).unwrap();
+        fs::write(
+            dir.join("etc/passwd"),
+            "root:x:0:0::/:/bin/sh\napp:x:1000:1001::/:/bin/sh\nsvc:x:1002:0::/:/bin/sh\n",
+        )
+        .unwrap();
+        fs::write(dir.join("etc/group"), "root:x:0:\nstaff:x:50:\n").unwrap();
+        let image = |user: Option<&str>| Image {
+            rootfs: dir.clone(),
+            user: user.map(String::from),
+            ..Image::default()
+        };
+        let of = |user: Option<&str>| who(&image(user), &Unit::default());
+        assert_eq!(of(None), Ok((NOBODY, NOBODY)));
+        assert_eq!(of(Some("")), Ok((NOBODY, NOBODY)));
+        assert_eq!(of(Some("app")), Ok((1000, 1001)));
+        assert_eq!(
+            of(Some("1000")),
+            Ok((1000, 1001)),
+            "a number the image lists has its group"
+        );
+        assert_eq!(of(Some("2000")), Ok((2000, 2000)));
+        assert_eq!(of(Some("app:staff")), Ok((1000, 50)));
+        assert_eq!(of(Some("2000:3000")), Ok((2000, 3000)));
+        assert_eq!(of(Some("root")), Ok((NOBODY, NOBODY)));
+        assert_eq!(of(Some("0:0")), Ok((NOBODY, NOBODY)));
+        // Nor root's group: on kith OS it would be the node's own group 0.
+        assert_eq!(of(Some("1000:0")), Ok((1000, 1000)));
+        assert_eq!(of(Some("app:root")), Ok((1000, 1000)));
+        assert_eq!(of(Some("svc")), Ok((1002, 1002)));
+        assert!(of(Some("nobody-here")).unwrap_err().contains("not in its /etc/passwd"));
+        assert!(of(Some("app:nogroup")).unwrap_err().contains("not in its /etc/group"));
+        assert!(of(Some("4294967295")).is_err());
+        let said = Unit {
+            user: Some(7),
+            ..Unit::default()
+        };
+        assert_eq!(who(&image(Some("app")), &said), Ok((7, 7)));
+        assert_eq!(
+            who(
+                &image(Some("app")),
+                &Unit {
+                    user: Some(0),
+                    ..Unit::default()
+                }
+            ),
+            Ok((0, 0))
+        );
+        // A passwd that is a link (to the host's, say) is not read.
+        fs::remove_file(dir.join("etc/passwd")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", dir.join("etc/passwd")).unwrap();
+        assert!(of(Some("root")).is_err() && of(Some("daemon")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

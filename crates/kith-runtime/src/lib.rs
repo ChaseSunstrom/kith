@@ -12,9 +12,12 @@
 
 mod container;
 mod image;
+mod seccomp;
+pub mod signed;
 
 pub use container::{Awaited, Handle, Mount, Runtime, Unit, exec_shim, reap_orphans, spawn_awaited, tune};
 pub use image::{Image, ImageStore, PullPolicy};
+pub use seccomp::REFUSED;
 
 #[derive(Debug)]
 pub struct Error(String);

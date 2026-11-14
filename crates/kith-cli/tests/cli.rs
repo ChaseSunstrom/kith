@@ -315,9 +315,8 @@ fn the_kith_build_package_renders_a_volume_a_job_and_an_image() {
         "{out}"
     );
     assert!(out.contains("image: localhost:5000/default/tools:3"), "{out}");
-    // (The script is one argument, whatever is in it.)
-    let script =
-        "          - |\n            cp /bin/hello /out/hello\n            echo 'it''s \"done\"'\n        resources:";
+    // (The script is one argument, whatever is in it; and it is root's, as an image's files are.)
+    let script = "          - |\n            cp /bin/hello /out/hello\n            echo 'it''s \"done\"'\n        runAsUser: 0\n        resources:";
     assert!(out.contains(script), "{out}");
     let image = format!(
         "  volume: {name}-root\n  tag: v2\n  job: {name}-build\n  entrypoint:\n    - /hello\n  env:\n    - A=b\n  copies: 2\n"
@@ -352,6 +351,8 @@ fn the_nas_package_renders_a_share_and_its_smb_server() {
     let (code, out, notes) = sandbox.kith(&["package", "render", nas, "--name", "films", "-f", "mine.yaml"]);
     assert_eq!(code, 0, "{notes}");
     assert!(out.contains("kind: Workload") && out.contains("exec smbd"), "{out}");
+    // (smbd is started as root: nobody takes port 445 or becomes another user.)
+    assert!(out.contains("        runAsUser: 0\n"), "{out}");
     assert!(
         out.contains("volume: media\n            path: /share\n            readOnly: true"),
         "{out}"

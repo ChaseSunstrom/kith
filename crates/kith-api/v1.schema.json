@@ -1408,6 +1408,13 @@
         "image": {
           "type": "string"
         },
+        "signedBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Public keys, one of which the image must be signed by, as `cosign sign --key`\nsigns: each a PEM file's text or the base64 in it (ECDSA P-256 or Ed25519).\nWith none, an image is run whoever made it."
+        },
         "pullPolicy": {
           "anyOf": [
             {
@@ -1442,6 +1449,26 @@
             "string",
             "null"
           ]
+        },
+        "runAsUser": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "The user (and group) its process is, by number. Without it: the image's own\nuser, or 65534 where the image names none or names 0. `0` is root: of the\ncontainer's user namespace where kithd is not root, of the node where it is."
+        },
+        "seccomp": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Seccomp"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the filter on its system calls lets through that it refuses by default."
         },
         "resources": {
           "anyOf": [
@@ -2799,6 +2826,25 @@
       "required": [
         "node"
       ]
+    },
+    "Seccomp": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unconfined": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "A container's system calls go through a filter that refuses the ones in\n[`REFUSED_CALLS`]. `allow` names those it may make after all;\n`unconfined: true` is no filter."
     },
     "SecretSpec": {
       "type": "object",

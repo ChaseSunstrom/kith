@@ -269,6 +269,11 @@ spec! {
     pub struct Container {
         pub name: String,
         pub image: String,
+        /// Public keys, one of which the image must be signed by, as `cosign sign --key`
+        /// signs: each a PEM file's text or the base64 in it (ECDSA P-256 or Ed25519).
+        /// With none, an image is run whoever made it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub signed_by: Vec<String>,
         /// When to ask the registry what `image` points at. Defaults to `ifNotPresent`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pull_policy: Option<PullPolicy>,
@@ -280,6 +285,14 @@ spec! {
         pub env: Vec<EnvVar>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub working_dir: Option<String>,
+        /// The user (and group) its process is, by number. Without it: the image's own
+        /// user, or 65534 where the image names none or names 0. `0` is root: of the
+        /// container's user namespace where kithd is not root, of the node where it is.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub run_as_user: Option<u32>,
+        /// What the filter on its system calls lets through that it refuses by default.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub seccomp: Option<Seccomp>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub resources: Option<Resources>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -375,6 +388,16 @@ spec! {
         pub path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub read_only: Option<bool>,
+    }
+
+    /// A container's system calls go through a filter that refuses the ones in
+    /// [`REFUSED_CALLS`]. `allow` names those it may make after all;
+    /// `unconfined: true` is no filter.
+    pub struct Seccomp {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub unconfined: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub allow: Vec<String>,
     }
 
     /// Exactly one of `http`, `tcp` or `exec`.
@@ -991,6 +1014,51 @@ pub fn every(text: &str) -> Option<u64> {
         .checked_mul(unit)
 }
 
+/// The system calls a container's filter refuses, by the names `seccomp.allow` takes.
+/// (`clone` only when it makes a namespace; `clone3` as a kernel without it answers.)
+pub const REFUSED_CALLS: &[&str] = &[
+    "mount",
+    "umount2",
+    "pivot_root",
+    "open_tree",
+    "move_mount",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "fspick",
+    "mount_setattr",
+    "open_by_handle_at",
+    "unshare",
+    "setns",
+    "clone",
+    "clone3",
+    "init_module",
+    "finit_module",
+    "delete_module",
+    "kexec_load",
+    "kexec_file_load",
+    "reboot",
+    "swapon",
+    "swapoff",
+    "acct",
+    "settimeofday",
+    "clock_settime",
+    "bpf",
+    "perf_event_open",
+    "userfaultfd",
+    "io_uring_setup",
+    "io_uring_enter",
+    "io_uring_register",
+    "add_key",
+    "request_key",
+    "keyctl",
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "kcmp",
+    "pidfd_getfd",
+];
+
 /// The smallest encrypted Volume, in bytes: the file system each starts as.
 pub const ENCRYPTED_LEAST: u64 = 8 << 20;
 
@@ -1277,6 +1345,41 @@ impl Template {
             }
         }
         for c in &self.containers {
+            if c.run_as_user == Some(u32::MAX) {
+                return Err(format!(
+                    "{at}, container `{}`: runAsUser: {} is no user",
+                    c.name,
+                    u32::MAX
+                ));
+            }
+            if c.signed_by.len() > 16 {
+                return Err(format!("{at}, container `{}`: signedBy: at most 16 keys", c.name));
+            }
+            for key in &c.signed_by {
+                // The two kinds of key there are start their files the same way each: told
+                // here by that and their length, and read in full by the node that pulls.
+                let lines = key.lines().filter(|line| !line.trim_start().starts_with("-----"));
+                let text: String = lines.flat_map(str::chars).filter(|c| !c.is_whitespace()).collect();
+                let kinds = [("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE", 124), ("MCowBQYDK2VwAyEA", 60)];
+                if !kinds
+                    .iter()
+                    .any(|(start, len)| text.starts_with(start) && text.len() == *len)
+                {
+                    let shown: String = key.trim().chars().take(40).collect();
+                    return Err(format!(
+                        "{at}, container `{}`: signedBy: `{shown}` is not a public key kith can check: an ECDSA P-256 or Ed25519 key, as its PEM file's text or the base64 in it",
+                        c.name
+                    ));
+                }
+            }
+            let allowed = c.seccomp.iter().flat_map(|seccomp| &seccomp.allow);
+            if let Some(unknown) = allowed.clone().find(|name| !REFUSED_CALLS.contains(&name.as_str())) {
+                return Err(format!(
+                    "{at}, container `{}`: seccomp: `{unknown}` is not a call the filter refuses (it refuses: {})",
+                    c.name,
+                    REFUSED_CALLS.join(", ")
+                ));
+            }
             for (which, probe) in [("liveness", &c.liveness), ("readiness", &c.readiness)] {
                 if let Some(p) = probe {
                     exactly_one(

@@ -20,6 +20,8 @@ spec:
       - name: build
         image: {{ values.builder | tojson }}
         command: ["/bin/sh", "-c", {{ values.script | tojson }}]
+        # Root: an image's files belong to the users its build gave them to, root first.
+        runAsUser: 0
         resources: {{ values.reserve | tojson }}
         volumeMounts:
           - { volume: {{ name }}-root, path: /out }

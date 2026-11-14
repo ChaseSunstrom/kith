@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
@@ -97,38 +97,66 @@ fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<UnixStream, String> {
     fail(said.chars().filter(|c| !c.is_control()).collect::<String>())
 }
 
-pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {
-    let program = via.unwrap_or("waypipe");
-    let dir = Dir::make()?;
-    let socket = dir.0.join("c");
-    let spawned = Command::new(program)
-        .arg("--socket")
-        .arg(&socket)
-        .arg("client")
-        .stdin(Stdio::null())
-        .spawn();
-    let mut client = Client(spawned.or_else(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => fail(format!("{program} is not installed here (kith does not ship it)")),
-        _ => fail(format!("cannot start {program}: {e}")),
-    })?);
-    let body = serde_json::json!({ "on": on, "via": via, "argv": argv });
-    let tunnel = open(kithd, &body)?;
-    // The client listens on its socket a moment after it starts.
-    let started = Instant::now();
-    let local = loop {
-        match UnixStream::connect(&socket) {
-            Ok(local) => break local,
-            Err(e) => {
-                if let Ok(Some(status)) = client.0.try_wait() {
-                    return fail(format!("{program} stopped before it listened ({status})"));
+/// What this screen's compositor is told the app's windows are, where it takes the word
+/// (Wayland's security-context-v1, which waypipe speaks when given `--secctx`): those of a
+/// sandboxed program, kept from what the compositor keeps such a one from (reading the
+/// screen, typing as the user). The word is the context's app id.
+const TAG: &str = "dev.kith.run";
+
+/// Starts the local VIA and waits for it to listen: with the tag, and where it does not come
+/// up so (a waypipe before 0.9, a compositor without the protocol, another program),
+/// without it, and why.
+fn carried(program: &str, dir: &Path) -> Result<(Client, UnixStream, Option<String>), String> {
+    let start = |tag: Option<&str>| -> Result<(Client, UnixStream), String> {
+        let socket = dir.join(if tag.is_some() { "t" } else { "c" });
+        let mut command = Command::new(program);
+        if let Some(tag) = tag {
+            command.arg("--secctx").arg(tag);
+        }
+        let spawned = command
+            .arg("--socket")
+            .arg(&socket)
+            .arg("client")
+            .stdin(Stdio::null())
+            .spawn();
+        let mut client = Client(spawned.or_else(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => fail(format!("{program} is not installed here (kith does not ship it)")),
+            _ => fail(format!("cannot start {program}: {e}")),
+        })?);
+        // The client listens on its socket a moment after it starts.
+        let started = Instant::now();
+        loop {
+            match UnixStream::connect(&socket) {
+                Ok(local) => return Ok((client, local)),
+                Err(e) => {
+                    if let Ok(Some(status)) = client.0.try_wait() {
+                        return fail(format!("{program} stopped before it listened ({status})"));
+                    }
+                    if started.elapsed() > Duration::from_secs(5) {
+                        return fail(format!("{program} did not listen on {}: {e}", socket.display()));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                if started.elapsed() > Duration::from_secs(5) {
-                    return fail(format!("{program} did not listen on {}: {e}", socket.display()));
-                }
-                std::thread::sleep(Duration::from_millis(20));
             }
         }
     };
+    match start(Some(TAG)) {
+        Ok((client, local)) => Ok((client, local, None)),
+        Err(why) => start(None).map(|(client, local)| (client, local, Some(why))),
+    }
+}
+
+pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Result<ExitCode, String> {
+    let program = via.unwrap_or("waypipe");
+    let dir = Dir::make()?;
+    let (client, local, untagged) = carried(program, &dir.0)?;
+    if let Some(why) = untagged {
+        eprintln!(
+            "kith: this screen is not told that the app's windows are a sandboxed program's: with --secctx, {why}"
+        );
+    }
+    let body = serde_json::json!({ "on": on, "via": via, "argv": argv });
+    let tunnel = open(kithd, &body)?;
     // Either end done ends both. (The app's own exit status does not come back.)
     let ends = |a: &UnixStream, b: &UnixStream| drop((a.shutdown(Shutdown::Both), b.shutdown(Shutdown::Both)));
     let (mut tunnel_in, mut local_out) = (
@@ -162,26 +190,56 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::OnceLock;
 
-    /// What `waypipe client` would be here: listens on its socket, answers one line, in capitals.
+    /// What `waypipe client` would be here: listens on its socket, answers one line, in
+    /// capitals, after the tag it was started with. Under a name that ends in `-old` it is a
+    /// waypipe from before there was a tag: it stops at the word.
     const STAND_IN: &str = r#"#!/usr/bin/env python3
 import socket, sys
-if sys.argv[1] != "--socket" or sys.argv[3:] != ["client"]:
+args, tag = sys.argv[1:], b""
+if args[0] == "--secctx" and not sys.argv[0].endswith("-old"):
+    tag, args = args[1].encode() + b" ", args[2:]
+if args[0] != "--socket" or args[2:] != ["client"]:
     sys.exit(3)
 s = socket.socket(socket.AF_UNIX)
-s.bind(sys.argv[2])
+s.bind(args[1])
 s.listen(1)
 c, _ = s.accept()
-c.sendall(c.makefile("rb").readline().upper())
+c.sendall(tag + c.makefile("rb").readline().upper())
 "#;
+
+    fn stand_in_named(end: &str) -> String {
+        let path = std::env::temp_dir().join(format!("kith-cli-run-on-stand-in-{}{end}", std::process::id()));
+        std::fs::write(&path, STAND_IN).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.display().to_string()
+    }
 
     fn stand_in() -> &'static str {
         static PATH: OnceLock<String> = OnceLock::new();
-        PATH.get_or_init(|| {
-            let path = std::env::temp_dir().join(format!("kith-cli-run-on-stand-in-{}", std::process::id()));
-            std::fs::write(&path, STAND_IN).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            path.display().to_string()
-        })
+        PATH.get_or_init(|| stand_in_named(""))
+    }
+
+    /// The windows are tagged where the carrier takes the word; where it does not, the app
+    /// still comes up, and `kith run` has the reason to say.
+    #[test]
+    fn sandbox_tag_is_given_to_the_carrier_and_its_absence_is_said() {
+        let dir = Dir::make().unwrap();
+        let (_client, mut local, untagged) = carried(stand_in(), &dir.0).unwrap();
+        assert_eq!(untagged, None);
+        local.write_all(b"hello\n").unwrap();
+        let mut answer = String::new();
+        local.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "dev.kith.run HELLO\n");
+
+        let (dir, old) = (Dir::make().unwrap(), stand_in_named("-old"));
+        let (_client, mut local, untagged) = carried(&old, &dir.0).unwrap();
+        let why = untagged.expect("an old carrier does not take the tag");
+        assert!(why.contains("stopped before it listened (exit status: 3)"), "{why}");
+        local.write_all(b"hello\n").unwrap();
+        let mut answer = String::new();
+        local.read_to_string(&mut answer).unwrap();
+        assert_eq!(answer, "HELLO\n");
+        std::fs::remove_file(old).unwrap();
     }
 
     /// A kithd that answers `reply` to one request, and returns what it was asked (head and body)
@@ -245,7 +303,7 @@ c.sendall(c.makefile("rb").readline().upper())
             serde_json::json!({"on": "role=display", "via": via, "argv": argv})
         );
         // "hello" went to the client, which answered in capitals.
-        assert_eq!(through, "HELLO\n");
+        assert_eq!(through, "dev.kith.run HELLO\n");
     }
 
     #[test]

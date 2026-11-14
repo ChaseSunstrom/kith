@@ -18,7 +18,14 @@ tokio = { version = "1", features = ["fs", "rt"] }
 tar = { version = "0.4", default-features = false }
 flate2 = "1"
 serde_json.workspace = true
-nix = { version = "0.29", features = ["process", "user", "signal"] }
+nix = { version = "0.29", features = ["process", "user", "signal", "sched"] }
+# Already in the tree through libcontainer.
+caps = "0.5"
+# Image signatures. (Both in the tree already: rustls verifies with ring.)
+ring = "0.17"
+base64 = "0.22"
+# The seccomp filter, written out in Rust: no C libseccomp (kithd is one static binary).
+seccompiler = "0.5"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

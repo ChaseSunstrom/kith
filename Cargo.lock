@@ -1294,13 +1294,17 @@ dependencies = [
 name = "kith-runtime"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
+ "caps",
  "flate2",
  "libcgroups",
  "libcontainer",
  "nix 0.29.0",
  "oci-client",
  "oci-spec",
+ "ring",
  "rustls",
+ "seccompiler",
  "serde_json",
  "tar",
  "tokio",
@@ -2416,6 +2420,15 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

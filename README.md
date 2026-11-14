@@ -106,9 +106,8 @@ container's `ports` only name them for probes and Services (nothing is opened or
 mapped: containers share the host's network), a replica is stopped before
 its replacement starts (so `replicas: 1` is down for a moment during an update;
 `blueGreen` is treated as rolling), containers share the host's
-network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, layers
-must be gzip or plain tar, the image's `User` is ignored (containers run as
-root inside their user namespace), and there is no seccomp filter. The log cap
+network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, and layers
+must be gzip or plain tar. The log cap
 is checked every 10 s, so a file can pass it by what its unit writes in that
 time, and output written in the instant a file is moved aside is lost. As a service on a
 distro, running as root is untested (on kith OS kithd is root: it is the first
@@ -116,6 +115,91 @@ process).
 
 [`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has
 not been run under systemd yet.
+
+### What a container is kept from
+
+Every container is started the same way, whatever it is for, with nothing to say:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: web
+spec:
+  template:
+    containers:
+      - name: web
+        image: registry.example/shop/web:1
+        signedBy:                  # run only if signed by one of these keys [whoever made it]
+          - |
+            -----BEGIN PUBLIC KEY-----
+            MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERhDxn4VReZhiLBr2unWdvMY/ZNKC
+            MGaYlOciQKQ+hYdtBvtUrt5fB1yFOSdyVJyZGQsBVEz8puMa+EcnvEXHIg==
+            -----END PUBLIC KEY-----
+        runAsUser: 1000            # [the image's User; 65534 if it names none, or root]
+        seccomp:
+          allow: [ptrace]          # refused calls it may make after all [none]
+```
+
+- **Who it is.** The user its template names (`runAsUser`, a number, the group the same),
+  else the image's `User` (a name is looked up in the image's own `/etc/passwd`), else
+  nobody (65534). An image cannot make its container root by saying so: one that names
+  root, or 0, gets nobody too (and one that names root's group, the user's own number
+  as its group), and `runAsUser: 0` is how a container is root. Where kithd
+  is your own service the container is a user namespace in which that user is the only
+  one there is (on the node, its files are yours), and root, when asked for, is root of
+  that namespace alone. It is still in your groups there (a namespace made without
+  privileges cannot leave them), for what that is worth to it: the files it can reach
+  are its image, its volumes and the devices it claims. On kith OS, where kithd is root, there is no user namespace yet:
+  the container is that user of the node, and `runAsUser: 0` is the node's root with
+  three capabilities (to send signals, to take a port below 1024, to write the audit log).
+- **Nothing more than that user.** No capabilities (on kith OS the one for ports below
+  1024 is kept), and no way to any: `no_new_privs` is set, so a setuid program in the
+  image is an ordinary program.
+- **Its image is read-only**, with a tmpfs on `/tmp` and on `/run`. A volume it mounts to
+  write is given to its user where kithd is root: all of it, the first time and whenever
+  the volume's directory is someone else's (a volume from before containers had users,
+  a restored one, a workload whose user changed), walked without following a link. Two
+  workloads that write one volume should be one user: each start would take it back. A
+  directory of the host's that you named (a `kith-system` Volume) is left as you made it,
+  and so is a volume mounted `readOnly`.
+- **A filter on its system calls** (seccomp) refuses these, as if it were not allowed
+  them: `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`,
+  `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `open_by_handle_at`; `unshare`,
+  `setns`, `clone` when it makes a namespace, `clone3` (answered as a kernel without it
+  answers, so a C library falls back on `clone`); `init_module`, `finit_module`,
+  `delete_module`, `kexec_load`, `kexec_file_load`, `reboot`, `swapon`, `swapoff`,
+  `acct`, `settimeofday`, `clock_settime`; `bpf`, `perf_event_open`, `userfaultfd`,
+  `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `add_key`, `request_key`,
+  `keyctl`; `ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`.
+  Everything else goes through. `seccomp: { allow: [NAMES] }` lets some of them through again (a
+  debugger wants `ptrace`; a browser's own sandbox wants `unshare`, `clone` and
+  `clone3`), and `seccomp: { unconfined: true }` is no filter. A 32-bit program on a
+  64-bit node is stopped at its first call, the filter knowing only the node's own
+  numbers: it needs `unconfined`.
+- **Whose image it is.** With `signedBy`, the image is run only if one of those keys
+  signed it, as `cosign sign --key` does: the signature is looked for in the image's own
+  repository (the tag `sha256-DIGEST.sig`) and checked against the manifest's digest
+  before any layer is fetched; an image for several machines may be signed as the list
+  or as this machine's own. Keys are ECDSA P-256 (what `cosign generate-key-pair` makes)
+  or Ed25519: the text of the `.pub` file, or the base64 in it. An image already on the
+  node counts as signed only by the keys a signature of it was found by; `pullPolicy:
+  never` with a key the node has not checked it against does not start. With no
+  `signedBy`, an image is run whoever made it.
+- **What it still reaches.** The node's network (and so every port on its loopback, and
+  the sockets programs of the node listen on by name alone, without a file), the
+  kernel through every call the filter lets by, and the devices it claims: a GPU's render
+  node is a wide door into a kernel driver, and no filter here narrows it. All of this is
+  for keeping an honest program's mistakes small. Untrusted programs belong in a VM
+  ([Virtual machines](#virtual-machines)), which is what a `vms` unit is for.
+- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS; the filter is a
+  list of what is refused, not of what is allowed, so a call the kernel gains later is let
+  through until it is named here; signatures with a certificate instead of a key
+  (cosign's keyless signing), a transparency log, and signatures kept as referrers of the
+  image (cosign's newer bundle format) are not read; keys are named by each template,
+  not once for a cluster or a registry; an `exec` unit is none of this: it is a process
+  of the host. The user namespace of the first kind (kithd as your service) has been run;
+  the kith OS kind has been run in VMs with the default user and with root.
 
 ## More than one node
 
@@ -494,7 +578,10 @@ kith package render packages/hyprland --name office -n desktop \
   a seat is. `reserve` is the container's CPUs and memory.
 - kith ships no desktop images: `image` names one you built or trust. The
   session's container is told `KITH_SEAT`, `KITH_USER`, and (Hyprland, GNOME)
-  `KITH_APPS` and `KITH_DOTFILES`; the kiosk runs `command`.
+  `KITH_APPS` and `KITH_DOTFILES`; the kiosk runs `command`. It runs as the image's
+  `User`, like any container ([What a container is kept from](#what-a-container-is-kept-from)):
+  give the image the user the session is to be, since it is not started as root to become
+  one. The seat's device nodes are that user's (on kith OS).
 - `kith-panel` is a plain `Workload` for a panel image, placed by node labels
   (`require`).
 - Delete the release and the node is headless again.
@@ -897,8 +984,8 @@ spec:
 - Not yet: a NodeWorkload cannot claim (one that names a claim is refused); there is no
   hot-plug (a changed set of device nodes starts the unit over at the next scan, and a
   Device gone even for a moment stops what claimed it until it is back: its holder keeps
-  its turn). The device nodes are given as root's: a container that runs as another user
-  cannot open one whose mode does not let it.
+  its turn). On kith OS a claimed device node is made the container's user's. Where kithd
+  is your service it is the node's own file: the container opens what you may open.
 - Who may claim is ordinary access control: to claim, you apply a `DeviceClaim` and a
   workload that names it, so the right to apply those is the grant, and there is no other
   permission. A Role rule with `kinds: ["*"]` covers `DeviceClaim` and `Device` like any
@@ -1164,8 +1251,9 @@ spec:
   `users` that does not exist, or nobody named. Whoever applies a Share (or rolls one
   back) must be allowed to apply the Volume it gives; a Release or a Source that renders
   one gives a Volume of its own namespace, as it may run a workload that mounts it.
-- `uid` is who writes: with the default, nobody (65534), make the volume's directory
-  theirs or writable by them first, or name the user whose files they are.
+- `uid` is who writes: nobody (65534) unless you say, which is also who a container is
+  with nothing said, so the two write each other's files. Where a container on the volume
+  is another user (`runAsUser`, or its image's), name that user here.
 - Not yet: NFS trusts an address to be who it says (no Kerberos), so name single addresses
   or a network you trust; a range wider than a /8 is refused; IPv6 clients that are not
   nodes are not served; once a node has served a Share over NFS it keeps listening on port
@@ -1385,7 +1473,8 @@ spec:
   `localhost` without TLS, as container tools do (`docker pull localhost:5000/default/hello:1`
   works on a node too).
 - **The `kith-build` package** renders the three pieces from a few values: a Volume on the
-  node you name, a Job that runs your script in a builder image with the volume at `/out`,
+  node you name, a Job that runs your script in a builder image with the volume at `/out`
+  (as root, `runAsUser: 0`: an image's files belong to whoever its build gives them to),
   and the Image.
 
   ```sh
@@ -1427,6 +1516,12 @@ by name, that has them. `--via` names the program that carries the window (defau
 
 - **waypipe must be installed on both ends** (here, and on the node that runs the app):
   kith does not ship it. A missing program is refused with its name and the node's.
+- **The windows are tagged for your compositor as a sandboxed program's** (`waypipe
+  --secctx dev.kith.run`, Wayland's security-context-v1), so that it keeps them from what
+  it keeps such a program from: reading the screen, typing as you. A waypipe before 0.9,
+  a compositor without that protocol or another `--via` program does not take the tag:
+  the app is then started without it, and `kith run` says so and why. (The tag has been
+  run against a stand-in here, not against waypipe and a compositor.)
 - **Who may:** only who may run the node itself: a Role rule with `verbs: [exec]` on
   `kinds: [Node]` and no `namespaces` (`admin` has it). The app runs as kithd's user on
   the node, outside any container, so a right in one namespace is never enough. It is

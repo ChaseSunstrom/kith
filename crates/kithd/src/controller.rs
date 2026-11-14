@@ -974,6 +974,8 @@ async fn start(
             host,
             container: at.clone(),
             read_only: *read_only,
+            // (Not a directory of the host's that an admin named: that one is theirs.)
+            give: dir.namespace != crate::volumes::SYSTEM,
         });
     }
     if let Some(Resources { cpu, memory, .. }) = resources {
@@ -991,12 +993,20 @@ async fn start(
     let created = match &slot.run {
         Run::Container(c) => {
             (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
+            unit.user = c.run_as_user;
+            if let Some(seccomp) = &c.seccomp {
+                (unit.unconfined, unit.allow) = (seccomp.unconfined == Some(true), seccomp.allow.clone());
+            }
             let policy = match c.pull_policy {
                 None | Some(PullPolicy::IfNotPresent) => kith_runtime::PullPolicy::IfNotPresent,
                 Some(PullPolicy::Always) => kith_runtime::PullPolicy::Always,
                 Some(PullPolicy::Never) => kith_runtime::PullPolicy::Never,
             };
-            let image = runtime.images.pull(&c.image, policy).await.map_err(|e| e.to_string())?;
+            let image = runtime
+                .images
+                .pull_signed(&c.image, policy, &c.signed_by)
+                .await
+                .map_err(|e| e.to_string())?;
             runtime.create(id, &image, &unit, log("out")?, log("err")?)
         }
         Run::Exec(e) => {
@@ -1017,6 +1027,13 @@ async fn start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The names a template may allow back are the names the runtime's filter knows.
+    #[test]
+    fn seccomp_names_in_the_api_are_the_filters() {
+        let filters: Vec<&str> = kith_runtime::REFUSED.iter().map(|(name, _)| *name).collect();
+        assert_eq!(kith_api::kinds::REFUSED_CALLS, filters);
+    }
 
     #[test]
     fn ids_and_backoff() {

@@ -32,6 +32,11 @@ pub struct Image {
     /// `NAME=value` entries.
     pub env: Vec<String>,
     pub working_dir: Option<String>,
+    /// The user its programs are meant to run as, as the image says it: a number or a
+    /// name of its `/etc/passwd`, with `:group` or without.
+    pub user: Option<String>,
+    /// The keys this node has found a signature of this image by (see [`ImageStore::pull_signed`]).
+    pub signed_by: Vec<String>,
     /// Layers this pull had to download; 0 when everything was already stored.
     pub downloaded: usize,
     /// Answered from the store alone: the registry was not asked anything.
@@ -52,7 +57,7 @@ pub enum PullPolicy {
 
 /// The hex part of a `sha256:<64 hex>` digest. Digests come from the registry
 /// and become file names, so anything else is refused.
-fn sha256_hex(digest: &str) -> Result<&str> {
+pub(crate) fn sha256_hex(digest: &str) -> Result<&str> {
     match digest.strip_prefix("sha256:") {
         Some(hex) if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) => Ok(hex),
         _ => err(format!(
@@ -123,6 +128,10 @@ impl ImageStore {
             cmd: strings("cmd")?,
             env: strings("env")?,
             working_dir: saved["workingDir"].as_str().map(String::from),
+            // (A note with no `user` at all is from before this was kept: not an image
+            // that names none. It is asked for again, and its layers are here already.)
+            user: saved.get("user")?.as_str().map(String::from),
+            signed_by: strings("signedBy").unwrap_or_default(),
             downloaded: 0,
             from_cache: true,
         })
@@ -134,26 +143,57 @@ impl ImageStore {
     /// it points at, and layers and unpacked images already stored are reused.
     // ponytail: anonymous pulls only; registry credentials arrive with Secrets in the controller.
     pub async fn pull(&self, reference: &str, policy: PullPolicy) -> Result<Image> {
+        self.pull_signed(reference, policy, &[]).await
+    }
+
+    /// [`pull`](Self::pull), for an image that must be signed by one of the keys `signed_by`
+    /// where any is named (see [`crate::signed`]). The signature is of the manifest's
+    /// digest, found before a layer is fetched, and every layer is fetched by the digest
+    /// that manifest gives it: what is unpacked is what was signed, whatever the tag is
+    /// made to name meanwhile. An image that is here counts as signed only by the keys a
+    /// signature of it was found by, here, before.
+    pub async fn pull_signed(&self, reference: &str, policy: PullPolicy, signed_by: &[String]) -> Result<Image> {
         let reference: Reference = reference.parse().ctx(format!("image reference `{reference}`"))?;
+        let keys: Vec<crate::signed::Key> = signed_by
+            .iter()
+            .map(|key| crate::signed::key(key))
+            .collect::<Result<_>>()?;
+        let here = self.cached(&reference);
+        let signed = |image: &Image| keys.is_empty() || keys.iter().any(|key| image.signed_by.contains(&key.id));
         if policy != PullPolicy::Always
-            && let Some(image) = self.cached(&reference)
+            && let Some(image) = here.clone().filter(signed)
         {
             return Ok(image);
         }
         if policy == PullPolicy::Never {
-            return err(format!(
-                "image `{reference}` is not here and its pull policy is `never`"
-            ));
+            return err(match here {
+                None => format!("image `{reference}` is not here and its pull policy is `never`"),
+                Some(_) => format!(
+                    "image `{reference}` is here, but has not been checked for a signature by a key its template names, and its pull policy is `never`"
+                ),
+            });
         }
         let client = Client::new(ClientConfig {
             protocol: protocol(reference.registry()),
             ..ClientConfig::default()
         });
         let auth = RegistryAuth::Anonymous;
-        let (manifest, digest, config) = client
-            .pull_manifest_and_config(&reference, &auth)
+        let (manifest, digest, config, list) = client
+            .pull_manifest_and_config_and_list_digest(&reference, &auth)
             .await
             .ctx(format!("pulling {reference}"))?;
+        // Whose it is, before anything of it but its manifest and its config is here. (A
+        // signature of an image for several machines is of the list this one was in.)
+        let mut signed_by = here
+            .filter(|image| image.digest == digest)
+            .map(|image| image.signed_by)
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            let digests: Vec<&str> = list.iter().map(String::as_str).chain([digest.as_str()]).collect();
+            let by = crate::signed::signer(&client, &reference, &digests, &keys).await?;
+            signed_by.retain(|key| *key != by);
+            signed_by.push(by);
+        }
         let config: ConfigFile =
             serde_json::from_str(&config).ctx(format!("reading the image config of {reference}"))?;
 
@@ -199,13 +239,15 @@ impl ImageStore {
             cmd: cfg.cmd.unwrap_or_default(),
             env: cfg.env.unwrap_or_default(),
             working_dir: cfg.working_dir.filter(|d| !d.is_empty()),
+            user: cfg.user.filter(|user| !user.is_empty()),
+            signed_by,
             downloaded,
             from_cache: false,
         };
         // Remember the answer. Written whole, then renamed: a reader sees the old one or the new one.
         let saved = serde_json::json!({
             "digest": image.digest, "entrypoint": image.entrypoint, "cmd": image.cmd,
-            "env": image.env, "workingDir": image.working_dir,
+            "env": image.env, "workingDir": image.working_dir, "user": image.user, "signedBy": image.signed_by,
         });
         // Best effort: the image is here either way, and without the note the next pull just asks again.
         if let Ok(file) = self.ref_file(&reference) {
@@ -517,6 +559,26 @@ mod tests {
     const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 
     #[test]
+    fn a_note_that_does_not_say_the_images_user_is_asked_again() {
+        let (dir, _) = sandbox("old-note");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let reference: Reference = "busybox".parse().unwrap();
+        let hex = "a".repeat(64);
+        fs::create_dir_all(dir.join("store/images").join(&hex)).unwrap();
+        fs::write(dir.join("store/images").join(&hex).join("config.json"), "{}").unwrap();
+        let noted = |user: &str| {
+            let text = format!(r#"{{"digest":"sha256:{hex}","entrypoint":[],"cmd":[],"env":[]{user}}}"#);
+            fs::write(store.ref_file(&reference).unwrap(), text).unwrap();
+            store.cached(&reference).map(|image| image.user)
+        };
+        assert_eq!(noted(r#","user":"app""#), Some(Some("app".to_string())));
+        assert_eq!(noted(r#","user":null"#), Some(None));
+        // Written by a kithd from before a container ran as its image's user: taking it
+        // for an image that names none would run it as nobody.
+        assert_eq!(noted(""), None);
+    }
+
+    #[test]
     fn remembered_references() {
         let (dir, _) = sandbox("refs");
         let store = ImageStore::new(dir.join("store")).unwrap();
@@ -538,7 +600,7 @@ mod tests {
         fs::write(&file, "{ not json").unwrap();
         assert!(store.cached(&reference).is_none());
         let digest = format!("sha256:{}", "a".repeat(64));
-        let note = serde_json::json!({ "digest": digest, "entrypoint": ["sh"], "cmd": [], "env": ["A=1"], "workingDir": null });
+        let note = serde_json::json!({ "digest": digest, "entrypoint": ["sh"], "cmd": [], "env": ["A=1"], "workingDir": null, "user": null });
         fs::write(&file, note.to_string()).unwrap();
         assert!(store.cached(&reference).is_none());
         fs::write(&file, note.to_string().replace("sha256:", "sha256:../")).unwrap();

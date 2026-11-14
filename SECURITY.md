@@ -44,6 +44,15 @@ Only the newest version is fixed. There are no security releases of older ones.
   node's own or on its networks, each redirect and each place a registry sends an upload
   included, and to the address that was checked, not to the name looked up again. So the
   API is not a way to reach what only the node can reach.
+- **A container** runs as a user that is not root (its template's, its image's, or
+  nobody), with no capabilities (on kith OS, the one to take a port below 1024) and
+  `no_new_privs`, on a read-only image, behind a seccomp filter that refuses some forty
+  system calls: mounting, new namespaces, loading modules, bpf, perf, io_uring, keyrings,
+  another process's memory, the clock. An image that names root as its user gets nobody.
+- **An image whose template names keys** (`signedBy`) is run only if one of them signed
+  its manifest's digest, which is found out before a layer is fetched; every layer is
+  then fetched by the digest that manifest names. An image already on the node counts as
+  signed only by keys it was checked against there.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size.
@@ -61,10 +70,22 @@ Only the newest version is fixed. There are no security releases of older ones.
 These are how kith is today. Each is a decision or a gap that is known; plan around it.
 
 - **Whoever may apply a Workload, a NodeWorkload or a Job runs code on the cluster's
-  nodes.** Containers share the node's network, run as root inside a user namespace, and
-  have no seccomp filter; an `exec` unit is a process of kithd's user. The Roles decide
-  who may do that, and nothing more is in the way. Do not give them to someone you would
-  not give a shell on the node.
+  nodes.** A container is kept small by default (see "A container" above), and its
+  template is where each of those defaults is taken off: `runAsUser: 0`, `seccomp: {
+  unconfined: true }`. On kith OS there is no user namespace, so `runAsUser: 0` there is
+  the node's root with three capabilities. Containers share the node's network, and an
+  `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
+  nothing more is in the way. Do not give them to someone you would not give a shell on
+  the node.
+- **A container is not a sandbox for a program you do not trust.** The filter is a list
+  of what is refused: every other system call reaches the kernel, and so does a claimed
+  device (a GPU's render node is a kernel driver's whole interface). There is no AppArmor
+  or SELinux profile. Run such a program in a VM (`vms`).
+- **An image is whoever's its registry says**, unless its template names keys
+  (`signedBy`). Nothing makes a template name them: there is no rule for a cluster or a
+  registry yet. A signature is checked against keys only: no certificate, no
+  transparency log, so a signing key that leaks signs until it is taken out of every
+  template.
 - **A node that is taken is the cluster taken.** It has the whole store. Certificates
   last ten years and cannot be revoked: deleting a node does not make its certificate
   stop working on the node-to-node routes. Take its disk, or make a new cluster.
@@ -138,6 +159,11 @@ is built, package signatures, template limits, how git is called, the CA being p
 the join token, the DNS forwarder's limits, update signatures and the refusal of older
 versions, the web UI's escaping and its content security policy, and the unpacking of
 archives.
+
+The hardening of containers (their user, capabilities, the seccomp filter, signed
+images) was written after this review, in answer to its first "not defended" entry. It
+had one reading of its own, by a reviewer who did not write it; nothing was run against
+it either, beyond its tests.
 
 ### Not reviewed
 
