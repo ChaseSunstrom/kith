@@ -14,6 +14,8 @@
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
+#   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
+#                               found by their Service's name and reaching out from behind their node
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
 #
@@ -80,6 +82,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    volume is made on one node with its key kept by the other, shows
                    no file system on the node's disk, and is opened again with what
                    was written in it after the node restarts
+  --test pods      instead: two nodes on the mesh with ci/pod.rs as a container image
+                   already there: three pods of one Workload (so two on one node) each
+                   listen on port 80 as root, write to their root and have an address
+                   of their own; a pod of a user who is not root finds their Service
+                   by its short name and its Kubernetes one, hears all three through
+                   it, reaches this machine from behind its node's address, and
+                   writes to /dev/stdout by name; needs rustc for
+                   x86_64-unknown-linux-musl. With KITH_E2E=1 also three pods of
+                   nginx as it is shipped, pulled from mirror.gcr.io
   --test chaos     instead: three nodes as for rollout, and three writers on this
                    machine, one through each node. Each node in turn has its card on
                    the cluster's network unplugged, then plugged back; each node in
@@ -110,7 +121,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share | pods | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share, pods, chaos" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -141,7 +152,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = chaos ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -149,10 +160,11 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
-        # (rollout and chaos: three nodes and nothing more said to kithd; share: two, on the mesh.)
+        # (rollout and chaos: three nodes and nothing more said to kithd; share and pods: two,
+        # on the mesh.)
         others='2 3' more=''
         seed() { :; }
-      if [ "$test" = share ]; then
+      if [ "$test" = share ] || [ "$test" = pods ]; then
         others=2 more=--mesh
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
@@ -165,12 +177,26 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
                 echo '{}' >"$image/config.json"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
+                if [ "$test" = pods ]; then
+                    # And what that test's pods run (ci/pod.rs), as an image that names no
+                    # user and as one that names a user who is not root.
+                    rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
+                    digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
+                    image=$work/seed/runtime/images/$digest
+                    mkdir -p "$image/rootfs/bin"
+                    cp "$work/pod" "$image/rootfs/bin/pod"
+                    echo '{}' >"$image/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
+                fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
                 mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
             fi
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
+            # (Room for an image that is pulled: the state grows to the disk's end at the first start.)
+            [ "$test${KITH_E2E:-}" != pods1 ] || truncate -s 2G "$1"
         }
       elif [ "$test" = rollout ]; then
         # Two releases, both signed: one that runs, and one whose root is not the one its
@@ -271,6 +297,97 @@ EOF
             join=$(api 1 POST /v1/tokens | field token) || fail "no join token over TLS"
             node "$n" "--join 10.9.0.1:7443 --token $join"
         done
+        if [ "$test" = pods ]; then
+            # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
+            # what it says" (`none` for a unit with no address of its own).
+            units() { # KIND NAME
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    if r["kind"] == sys.argv[1] and r["metadata"]["name"] == sys.argv[2]:
+        status = r.get("status") or {}
+        units = status.get("containers") or []
+        ready = sum(1 for u in units if u.get("ready"))
+        said = [status.get("message", "")] + [u.get("message", "") for u in units]
+        print(ready, status.get("state", "-"), *sorted(u.get("address", "none") for u in units), *said)
+' "$1" "$2"
+            }
+            # This machine, as something outside the cluster a pod asks: the nodes reach it
+            # at 10.0.2.2, and only from an address their card out has (a pod's own is not
+            # one the network out there knows).
+            mkdir "$work/www"
+            (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
+            web=$!
+            # NAME and the rest of its one container: three pods of it on the two nodes, so
+            # two of them on one, each listening on port 80, and a Service of that name.
+            three() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"$1","labels":{"app":"$1"}},"spec":{"replicas":3,"template":{"pod":true,"containers":[
+  {"name":"web",$2,"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"$1"},"spec":{"selector":{"app":"$1"},"ports":[{"port":80}]}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pods of $1 were not applied"
+                waited=0
+                until line=$(units Workload "$1") && [ "${line%% *}" = 3 ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for three pods of $1 to be ready; the Workload says: $line"
+                    sleep 1
+                done
+                echo "vm.sh: three pods of $1 ready: $line" >&2
+                [ "$(printf '%s\n' $line | grep : | sort -u | grep -c :)" = 3 ] || fail "the three pods of $1 do not have an address each on the mesh: $line"
+            }
+            # NAME and whom to ask (HOST PORT ...): a pod of a user who is not root asks
+            # each, and writes what it heard to /dev/stdout by name; that is in $work/NAME.out.
+            asks() {
+                name=$1
+                shift
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$name"},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $name was not applied"
+                waited=0
+                until line=$(units Job "$name") && case $line in *' succeeded '* | *' succeeded') true ;; *) false ;; esac; do
+                    waited=$((waited + 1))
+                    any GET "/v1/logs/Job/default/$name?stderr=true" >"$work/$name.err" 2>/dev/null || true
+                    case $line in *' failed '* | *' failed') fail "the Job $name failed: $line: $(cat "$work/$name.err")" ;; esac
+                    [ "$waited" -lt 240 ] || fail "waited for the Job $name; it says: $line: $(cat "$work/$name.err")"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$name" >"$work/$name.out" || fail "what the Job $name wrote could not be read"
+                ! grep -q 'failed: ' "$work/$name.out" || fail "the pod that asked was not always answered: $(cat "$work/$name.out")"
+            }
+            # Each makes a file in its root, as root, before it listens.
+            three web '"image":"kith.test/pod:1","command":["/bin/pod","serve"]'
+            # Their Service by its short name and by its whole one, and this machine.
+            asks ask web 80 web.default.svc.cluster.local 80 10.0.2.2 $((port + 9))
+            for heard in web-0 web-1 web-2 'HTTP/1.0 200 OK'; do
+                grep -q "$heard" "$work/ask.out" || fail "the pod that asked did not hear $heard: $(cat "$work/ask.out")"
+            done
+            stock='no stock image was tried (KITH_E2E=1 pulls one)'
+            if [ "${KITH_E2E:-}" = 1 ]; then
+                # An image as its makers ship it, with nothing said but its name: nginx starts
+                # as root, writes its configuration and its pid in its root, opens /dev/stdout
+                # by name for what it is asked, and listens on port 80.
+                three stock '"image":"mirror.gcr.io/library/nginx:1.27-alpine"'
+                asks ask-stock stock 80
+                grep -q 'HTTP/1.1 200 OK' "$work/ask-stock.out" || fail "nginx did not answer through its Service: $(cat "$work/ask-stock.out")"
+                for replica in 0 1 2; do
+                    any GET "/v1/logs/Workload/default/stock?replica=$replica" >"$work/stock.out" || fail "what nginx $replica wrote could not be read"
+                    grep -q 'GET / HTTP/1.0' "$work/stock.out" || fail "the Service did not pass a request to nginx $replica, or it could not say so on /dev/stdout: $(cat "$work/stock.out")"
+                done
+                stock='three pods of nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) started the same way, and each said on /dev/stdout that it was asked through their Service'
+            fi
+
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock"
+            exit 0
+        fi
         if [ "$test" = share ]; then
             # What a Job says of itself and of its unit: "STATE and what it says"; nothing
             # while there is no such Job.

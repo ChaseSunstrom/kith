@@ -14,6 +14,7 @@ kith-yaml.workspace = true
 kith-api.workspace = true
 kith-packages = { path = "../kith-packages" }
 kith-lang = { path = "../kith-lang" }
+kith-kube = { path = "../kith-kube" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

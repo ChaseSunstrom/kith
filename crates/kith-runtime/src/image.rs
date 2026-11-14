@@ -432,6 +432,9 @@ fn unpack_layer_capped(blob: &Path, media_type: &str, rootfs: &Path, budget: &mu
     };
     let mut archive = tar::Archive::new(metered);
     archive.set_preserve_permissions(true);
+    // Where kithd is root every file is its image's user's, as the image says: a container
+    // that may write its root, as that user, writes where the image means it to.
+    archive.set_preserve_ownerships(nix::unistd::getuid().is_root());
     for entry in archive.entries().ctx("reading a layer")? {
         let mut entry = entry.map_err(|e| because("reading a layer", e))?;
         if budget.entries == 0 {

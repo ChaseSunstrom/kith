@@ -55,14 +55,14 @@ fn limit(socket: &Socket, wait: Duration) -> Result<()> {
 
 /// A read that gave up, said as what it is (the kernel's own word for it is "Resource
 /// temporarily unavailable").
-fn silent(e: Error) -> Error {
+pub(crate) fn silent(e: Error) -> Error {
     match e.kind() {
         ErrorKind::WouldBlock => Error::new(ErrorKind::TimedOut, "the kernel did not answer (netlink)"),
         _ => e,
     }
 }
 
-fn socket(protocol: isize) -> Result<Socket> {
+pub(crate) fn socket(protocol: isize) -> Result<Socket> {
     let mut socket = Socket::new(protocol)?;
     socket.bind_auto()?;
     socket.connect(&SocketAddr::new(0, 0))?;
@@ -108,7 +108,7 @@ where
     }
 }
 
-fn link(index: u32, name: Option<&str>) -> LinkMessage {
+pub(crate) fn link(index: u32, name: Option<&str>) -> LinkMessage {
     let mut link = LinkMessage::default();
     link.header.index = index;
     link.attributes
@@ -361,7 +361,7 @@ impl Device {
     }
 }
 
-fn ask_route(message: RouteNetlinkMessage, flags: u16) -> Result<Vec<RouteNetlinkMessage>> {
+pub(crate) fn ask_route(message: RouteNetlinkMessage, flags: u16) -> Result<Vec<RouteNetlinkMessage>> {
     ask(protocols::NETLINK_ROUTE, message, flags)
 }
 

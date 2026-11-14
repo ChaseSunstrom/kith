@@ -85,7 +85,38 @@ pub struct Unit {
     pub unconfined: bool,
     /// Calls the filter refuses that this container may make: names of [`crate::REFUSED`].
     pub allow: Vec<String>,
+    /// As any container runtime runs an image with nothing said: it is the user its image
+    /// names (root where it names none), and root has what such a runtime gives root
+    /// ([`ROOTS`]). Without it, only `user` makes a container root.
+    pub as_image: bool,
+    /// The root file system is the container's own to write: what it writes is kept
+    /// beside it, never in the image, and goes when it is deleted. Without it the root is
+    /// the image, read-only.
+    pub writable: bool,
+    /// The network namespace it is put in (a pod's), by path. Without one: the host's.
+    pub netns: Option<PathBuf>,
+    /// What it is called (a pod's containers are all called as the pod is). Without it: its id.
+    pub hostname: Option<String>,
 }
+
+/// What root keeps in a container that is `as_image`, where kithd is root: what Docker and
+/// containerd give by default. Nothing in it reaches out of the container's namespaces.
+const ROOTS: [Capability; 14] = [
+    Capability::Chown,
+    Capability::DacOverride,
+    Capability::Fsetid,
+    Capability::Fowner,
+    Capability::Mknod,
+    Capability::NetRaw,
+    Capability::Setgid,
+    Capability::Setuid,
+    Capability::Setfcap,
+    Capability::Setpcap,
+    Capability::NetBindService,
+    Capability::SysChroot,
+    Capability::Kill,
+    Capability::AuditWrite,
+];
 
 /// A host directory bound into a container: where it is, where the container sees it.
 #[derive(Debug, Clone, PartialEq)]
@@ -159,9 +190,9 @@ impl Runtime {
     /// Create the container `id`: namespaces and cgroup are set up and the
     /// process is ready, but it does not run until [`Handle::start`].
     ///
-    // ponytail: the image's rootfs is shared read-only, with tmpfs on /tmp and /run,
-    // and the host's network. A writable overlay per container and a network
-    // namespace of its own are not there: volumes are where a container writes.
+    // ponytail: the image's rootfs is shared read-only, with tmpfs on /tmp and /run, and
+    // the host's network, unless the unit says otherwise (`writable`, `netns`). What a
+    // writable root holds is on the state's disk with no limit of its own.
     pub fn create(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
         let what = format!("creating container `{id}`");
         let bundle = self.root.join("containers").join(id);
@@ -171,10 +202,15 @@ impl Runtime {
         let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
             .validate_id()
             .ctx(&what)?;
-        let spec = spec(id, image, unit, &cgroup).ctx(&what)?;
+        let spec = spec(id, image, unit, &cgroup, &bundle).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec`.)
         let user = spec.process().as_ref().map(|process| process.user());
         if let Some(user) = user.filter(|user| user.uid() != 0) {
+            // Its output is its own: an image that writes its log to /dev/stdout by name
+            // opens the file again, and may only if it is its user's.
+            for output in [&stdout, &stderr] {
+                std::os::unix::fs::fchown(output, Some(user.uid()), Some(user.gid())).ctx(&what)?;
+            }
             for volume in unit.mounts.iter().filter(|volume| volume.give && !volume.read_only) {
                 give(&volume.host, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
@@ -185,6 +221,10 @@ impl Runtime {
         }
         fs::create_dir_all(&bundle).ctx(&what)?;
         let built = (|| {
+            if unit.writable {
+                fs::create_dir(bundle.join("upper")).ctx(&what)?;
+                fs::create_dir(bundle.join("work")).ctx(&what)?;
+            }
             spec.save(bundle.join("config.json")).ctx(&what)?;
             let container = builder
                 .with_root_path(self.root.join("state"))
@@ -502,7 +542,7 @@ fn who(image: &Image, unit: &Unit) -> std::result::Result<(u32, u32), String> {
         return Ok((user, user));
     }
     let Some(said) = image.user.as_deref().filter(|said| !said.is_empty()) else {
-        return Ok((NOBODY, NOBODY));
+        return Ok(if unit.as_image { (0, 0) } else { (NOBODY, NOBODY) });
     };
     let (user, group) = said
         .split_once(':')
@@ -530,6 +570,7 @@ fn who(image: &Image, unit: &Unit) -> std::result::Result<(u32, u32), String> {
     // An image makes its container neither root nor of root's group (which, where there
     // is no user namespace, is the node's own): `runAsUser: 0` is how a template says so.
     Ok(match (uid, gid) {
+        both if unit.as_image => both,
         (0, _) => (NOBODY, NOBODY),
         (uid, 0) => (uid, uid),
         both => both,
@@ -640,8 +681,22 @@ fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
     walk(top, uid, gid, 128)
 }
 
-fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
-    spec_of(id, image, unit, cgroup, nix::unistd::getuid(), nix::unistd::getgid())
+fn spec(
+    id: &str,
+    image: &Image,
+    unit: &Unit,
+    cgroup: &str,
+    bundle: &Path,
+) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
+    spec_of(
+        id,
+        image,
+        unit,
+        cgroup,
+        bundle,
+        nix::unistd::getuid(),
+        nix::unistd::getgid(),
+    )
 }
 
 /// [`spec`], for a kithd that is the user `uid`.
@@ -650,6 +705,7 @@ fn spec_of(
     image: &Image,
     unit: &Unit,
     cgroup: &str,
+    bundle: &Path,
     uid: nix::unistd::Uid,
     gid: nix::unistd::Gid,
 ) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
@@ -679,15 +735,22 @@ fn spec_of(
         notes.insert(BECOMES.to_string(), format!("{user}:{group}"));
     }
     spec.set_annotations(Some(notes));
-    // No network namespace: containers share the host's network.
+    // No network namespace of its own: the host's network, or the one it is given.
+    let network = oci_spec::runtime::LinuxNamespaceType::Network;
     let mut linux = spec.linux().clone().unwrap_or_default();
     let mut namespaces = linux.namespaces().clone().unwrap_or_default();
-    namespaces.retain(|ns| ns.typ() != oci_spec::runtime::LinuxNamespaceType::Network);
+    namespaces.retain(|ns| ns.typ() != network);
+    if let Some(netns) = &unit.netns {
+        let given = oci_spec::runtime::LinuxNamespaceBuilder::default().typ(network);
+        namespaces.push(given.path(netns).build()?);
+    }
     linux.set_namespaces(Some(namespaces));
     spec.set_linux(Some(linux));
-    spec.set_root(Some(RootBuilder::default().path(&image.rootfs).readonly(true).build()?));
+    let rootfs = RootBuilder::default().path(&image.rootfs).readonly(!unit.writable);
+    spec.set_root(Some(rootfs.build()?));
     // Linux refuses hostnames over 64 bytes; ids are ASCII (validated by the caller).
-    spec.set_hostname(Some(id.chars().take(63).collect()));
+    let hostname = unit.hostname.as_deref().unwrap_or(id);
+    spec.set_hostname(Some(hostname.chars().take(63).collect()));
 
     // Like Kubernetes: `command` replaces the entrypoint and drops the image's
     // default arguments; `args` alone keeps the entrypoint.
@@ -757,6 +820,14 @@ fn spec_of(
         let caps = LinuxCapabilitiesBuilder::default().bounding(kept()).effective(kept());
         let caps = caps.permitted(kept()).inheritable(passed()).ambient(passed());
         process.set_capabilities(Some(caps.build()?));
+    } else if root && unit.as_image {
+        let kept = || HashSet::from(ROOTS);
+        let caps = LinuxCapabilitiesBuilder::default().bounding(kept()).effective(kept());
+        let caps = caps
+            .permitted(kept())
+            .inheritable(HashSet::new())
+            .ambient(HashSet::new());
+        process.set_capabilities(Some(caps.build()?));
     }
     spec.set_process(Some(process));
 
@@ -770,10 +841,29 @@ fn spec_of(
             .build()?)
     };
     let mut mounts = spec.mounts().clone().unwrap_or_default();
+    if unit.writable {
+        // The first mount, on the root itself: the image below, the container's own layer
+        // over it, and everything after is mounted on the two together. (It is made in the
+        // container's mount namespace, and goes with it.)
+        let layer = |name: &str| bundle.join(name).display().to_string();
+        let mut options = vec![
+            format!("lowerdir={}", image.rootfs.display()),
+            format!("upperdir={}", layer("upper")),
+            format!("workdir={}", layer("work")),
+        ];
+        if !root {
+            // (What a user namespace may write its bookkeeping in.)
+            options.push("userxattr".into());
+        }
+        let over = MountBuilder::default().destination("/").typ("overlay");
+        mounts.insert(0, over.source("overlay").options(options).build()?);
+    }
     mounts.push(tmpfs("/tmp")?);
     mounts.push(tmpfs("/run")?);
-    // The container shares the host's network, so it needs the host's resolver.
-    if Path::new("/etc/resolv.conf").exists() {
+    // The container shares the host's network, so it needs the host's resolver (unless it
+    // is given a file of its own there).
+    let own = |volume: &Mount| volume.container == "/etc/resolv.conf";
+    if Path::new("/etc/resolv.conf").exists() && !unit.mounts.iter().any(own) {
         let options = ["rbind", "ro"].map(String::from).to_vec();
         let resolv = MountBuilder::default().destination("/etc/resolv.conf").typ("bind");
         mounts.push(resolv.source("/etc/resolv.conf").options(options).build()?);
@@ -917,17 +1007,17 @@ mod tests {
             ..Unit::default()
         };
         assert!(
-            spec("a", &image, &unit(Some(0)), "/kith/a").is_err(),
+            spec("a", &image, &unit(Some(0)), "/kith/a", Path::new("/b")).is_err(),
             "0 would mean unlimited"
         );
-        assert!(spec("a", &image, &unit(Some(9)), "/kith/a").is_err());
+        assert!(spec("a", &image, &unit(Some(9)), "/kith/a", Path::new("/b")).is_err());
         let no_memory = Unit {
             memory_bytes: Some(0),
             ..Unit::default()
         };
-        assert!(spec("a", &image, &no_memory, "/kith/a").is_err());
+        assert!(spec("a", &image, &no_memory, "/kith/a", Path::new("/b")).is_err());
 
-        let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a").unwrap();
+        let made = spec(&"x".repeat(100), &image, &unit(Some(500)), "/kith/a", Path::new("/b")).unwrap();
         assert_eq!(made.hostname().as_ref().unwrap().len(), 63);
         let linux = made.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
@@ -957,7 +1047,7 @@ mod tests {
             ..Unit::default()
         };
         // /dev/null is the character device 1:3.
-        let made = spec("a", &image, &with("/dev/null"), "/kith/a").unwrap();
+        let made = spec("a", &image, &with("/dev/null"), "/kith/a", Path::new("/b")).unwrap();
         let linux = made.linux().as_ref().unwrap();
         let [node] = &linux.devices().as_ref().unwrap()[..] else {
             panic!("one device node")
@@ -973,12 +1063,21 @@ mod tests {
         );
         assert_eq!(rule.typ(), Some(oci_spec::runtime::LinuxDeviceType::C));
         // Missing, or not a device node: the unit is not created, and the reason says which.
-        let missing = spec("a", &image, &with("/dev/kith-no-such-device"), "/kith/a").unwrap_err();
+        let missing = spec(
+            "a",
+            &image,
+            &with("/dev/kith-no-such-device"),
+            "/kith/a",
+            Path::new("/b"),
+        )
+        .unwrap_err();
         assert!(missing.to_string().contains("/dev/kith-no-such-device"), "{missing}");
-        let file = spec("a", &image, &with("/etc"), "/kith/a");
+        let file = spec("a", &image, &with("/etc"), "/kith/a", Path::new("/b"));
         assert!(file.unwrap_err().to_string().contains("not a device node"));
         for out in ["/dev/../dev/null", "/dev/fd", "/dev/shm"] {
-            let refused = spec("a", &image, &with(out), "/kith/a").unwrap_err().to_string();
+            let refused = spec("a", &image, &with(out), "/kith/a", Path::new("/b"))
+                .unwrap_err()
+                .to_string();
             assert!(refused.contains("device node"), "{out}: {refused}");
         }
     }
@@ -1024,6 +1123,7 @@ mod tests {
                 ..Unit::default()
             },
             "/kith/a",
+            Path::new("/b"),
         )
     }
 
@@ -1072,7 +1172,7 @@ mod tests {
         };
         for (root, kithd) in [(true, 0), (false, 1000)] {
             let (uid, gid) = (Uid::from_raw(kithd), Gid::from_raw(kithd));
-            let made = spec_of("a", &image, &Unit::default(), "/kith/a", uid, gid).unwrap();
+            let made = spec_of("a", &image, &Unit::default(), "/kith/a", Path::new("/b"), uid, gid).unwrap();
             let process = made.process().as_ref().unwrap();
             assert_eq!(process.no_new_privileges(), Some(true));
             assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
@@ -1091,7 +1191,7 @@ mod tests {
                 assert_eq!(sets(process), ["Setfcap", "Setfcap", "Setfcap", "", ""]);
             }
             // Root when the template says so, and only then: it keeps what a container is given.
-            let made = spec_of("a", &image, &asked, "/kith/a", uid, gid).unwrap();
+            let made = spec_of("a", &image, &asked, "/kith/a", Path::new("/b"), uid, gid).unwrap();
             let process = made.process().as_ref().unwrap();
             assert_eq!((process.user().uid(), process.no_new_privileges()), (0, Some(true)));
             assert_eq!(becomes(&made), None, "no second namespace for root");
@@ -1103,19 +1203,19 @@ mod tests {
             unconfined: true,
             ..Unit::default()
         };
-        let made = spec_of("a", &image, &unit, "/kith/a", uid, gid).unwrap();
+        let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
         assert_eq!(made.annotations().as_ref().unwrap()[CALLS], UNCONFINED);
         let unit = Unit {
             allow: vec!["ptrace".into(), "unshare".into()],
             ..Unit::default()
         };
-        let made = spec_of("a", &image, &unit, "/kith/a", uid, gid).unwrap();
+        let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
         assert_eq!(made.annotations().as_ref().unwrap()[CALLS], "ptrace unshare");
         let unit = Unit {
             allow: vec![UNCONFINED.into()],
             ..Unit::default()
         };
-        let said = spec_of("a", &image, &unit, "/kith/a", uid, gid)
+        let said = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid)
             .unwrap_err()
             .to_string();
         assert!(said.contains("`unconfined` is not a call the filter refuses"), "{said}");
@@ -1226,6 +1326,75 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", dir.join("etc/passwd")).unwrap();
         assert!(of(Some("root")).is_err() && of(Some("daemon")).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A pod's container: its root an overlay of its own over the image, the first thing
+    /// mounted; the network namespace it is given; the user its image says, root included,
+    /// and root with what a container runtime gives root, where kithd is root.
+    #[test]
+    fn a_pods_container_writes_its_root_joins_its_network_and_is_its_images_user() {
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            rootfs: "/images/x/rootfs".into(),
+            ..Image::default()
+        };
+        let unit = Unit {
+            as_image: true,
+            writable: true,
+            netns: Some("/proc/1/fd/9".into()),
+            ..Unit::default()
+        };
+        let (uid, gid) = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+        assert_eq!(made.root().as_ref().unwrap().readonly(), Some(false));
+        let first = &made.mounts().as_ref().unwrap()[0];
+        assert_eq!(
+            (first.destination().to_str(), first.typ().as_deref()),
+            (Some("/"), Some("overlay"))
+        );
+        assert_eq!(
+            first.options().as_ref().unwrap(),
+            &["lowerdir=/images/x/rootfs", "upperdir=/b/upper", "workdir=/b/work"]
+        );
+        let namespaces = made.linux().as_ref().unwrap().namespaces().clone().unwrap();
+        let network = oci_spec::runtime::LinuxNamespaceType::Network;
+        let joined: Vec<_> = namespaces.iter().filter(|ns| ns.typ() == network).collect();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].path().as_deref(), Some(Path::new("/proc/1/fd/9")));
+        let process = made.process().as_ref().unwrap();
+        assert_eq!(process.user().uid(), 0);
+        assert_eq!(process.no_new_privileges(), Some(true));
+        let caps = process.capabilities().as_ref().unwrap();
+        assert_eq!(caps.bounding(), &Some(HashSet::from(ROOTS)));
+        assert_eq!(caps.ambient(), &Some(HashSet::new()));
+        // An image that names a user: that one, with its group, and nothing of root's but ports.
+        let named = Image {
+            user: Some("101:0".into()),
+            ..image.clone()
+        };
+        let made = spec_of("a", &named, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+        let process = made.process().as_ref().unwrap();
+        assert_eq!((process.user().uid(), process.user().gid()), (101, 0));
+        let kept = Some(HashSet::from([Capability::NetBindService]));
+        assert_eq!(process.capabilities().as_ref().unwrap().bounding(), &kept);
+        // Where kithd is not root, the overlay is a user namespace's own.
+        let (uid, gid) = (nix::unistd::Uid::from_raw(1000), nix::unistd::Gid::from_raw(1000));
+        let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+        let first = &made.mounts().as_ref().unwrap()[0];
+        assert_eq!(
+            first.options().as_ref().unwrap().last().map(String::as_str),
+            Some("userxattr")
+        );
+        // Without any of it: as before.
+        let made = spec_of("a", &image, &Unit::default(), "/kith/a", Path::new("/b"), uid, gid).unwrap();
+        assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
+        assert!(
+            made.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|m| m.typ().as_deref() != Some("overlay"))
+        );
     }
 
     #[test]

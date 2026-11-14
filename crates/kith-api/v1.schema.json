@@ -1459,6 +1459,13 @@
           "minimum": 0,
           "description": "The user (and group) its process is, by number. Without it: the image's own\nuser, or 65534 where the image names none or names 0. `0` is root: of the\ncontainer's user namespace where kithd is not root, of the node where it is."
         },
+        "readOnlyRoot": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "`false`: its root file system is its own to write (what it writes is not the\nimage's, and goes when the container does). `true`: only volumes, /tmp and\n/run are. Without it: `true`, or in a `pod` `false`."
+        },
         "seccomp": {
           "anyOf": [
             {
@@ -3214,6 +3221,13 @@
             }
           ],
           "description": "Hold this replica back (a sliver of one CPU) while a seat of its node is busy."
+        },
+        "pod": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Run each replica as Kubernetes runs a pod: its containers share a network of\ntheir own (any port is theirs, `localhost` is each other, and the replica has\nan address on the mesh), each may write its root file system unless it says\n`readOnlyRoot`, and each is the user its image names, root included (with what\na container runtime gives root, and nothing of the node's). Where kithd is not\nroot the replica shares the node's network."
         }
       },
       "description": "The units one replica runs: containers, exec units and virtual machines."

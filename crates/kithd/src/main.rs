@@ -26,11 +26,13 @@ mod images;
 mod ingress;
 mod init;
 mod install;
+mod kube;
 mod members;
 mod mesh;
 mod netboot;
 mod os;
 mod pki;
+mod pods;
 mod probe;
 mod raft;
 mod registry;
@@ -173,6 +175,8 @@ pub struct Shared {
     pub mesh: Mutex<serde_json::Value>,
     /// Set once kithd is told to stop: long-polls answer at once instead of holding it up.
     pub stop: watch::Sender<bool>,
+    /// The pods of this node, and their networks.
+    pub pods: Mutex<pods::Pods>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
@@ -396,6 +400,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         mesh: Mutex::default(),
         cluster,
         stop: watch::channel(false).0,
+        pods: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
     });
     // A node that joined waits to be sent the store; any other is where a cluster starts.
@@ -644,9 +649,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
         };
         let names = async {
-            if let Some(sockets) = names {
-                dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
-            }
+            let pods = pods::names(shared.clone(), upstreams.clone(), stopping.clone());
+            let asked = async {
+                if let Some(sockets) = names {
+                    dns::run(shared.clone(), sockets, upstreams, stopping.clone()).await;
+                }
+            };
+            tokio::join!(pods, asked);
         };
         let mesh = async {
             if let Some(port) = args.mesh {

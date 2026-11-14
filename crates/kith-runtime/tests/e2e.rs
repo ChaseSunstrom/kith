@@ -168,6 +168,56 @@ async fn read_only_root() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A container that asks has a root of its own to write: what it writes is there for it,
+/// never in the image, not in another container of the image, and gone with it.
+#[tokio::test]
+async fn writable_root() {
+    let Some((rt, image, dir)) = rig("writable-root").await else {
+        return;
+    };
+    let writes = "echo mine > /etc/x && mkdir -p /srv/a/b && rm /bin/true && cat /etc/x; ls /bin/true 2>&1 | wc -l";
+    let unit = Unit {
+        writable: true,
+        as_image: true,
+        ..script(writes)
+    };
+    // (Not every kernel lets a user namespace mount an overlay: where kithd is root it can.)
+    let (out, err) = (dir.join("o"), dir.join("e"));
+    let files = || (File::create(&out).unwrap(), File::create(&err).unwrap());
+    let (o, e) = files();
+    match rt.create("can", &image, &unit, o, e) {
+        Ok(made) => made.delete().unwrap(),
+        Err(e) => {
+            eprintln!("skipped: no overlay for this user here: {e}");
+            return fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    let (code, out, err) = sh(&rt, &image, &dir, "writes", unit.clone());
+    assert_eq!((code, out.as_str()), (0, "mine\n1\n"), "{err}");
+    assert!(!image.rootfs.join("etc/x").exists() && image.rootfs.join("bin/true").exists());
+    // The next one starts from the image again.
+    let again = Unit {
+        writable: true,
+        ..script("ls /etc/x /srv/a 2>/dev/null | wc -l; ls /bin/true")
+    };
+    let (_, out, err) = sh(&rt, &image, &dir, "again", again);
+    assert_eq!(out, "0\n/bin/true\n", "{err}");
+    assert!(!dir.join("runtime/containers/writes").exists());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A container's output is its own by name too: an image that opens /dev/stdout writes there.
+#[tokio::test]
+async fn output_by_name() {
+    let Some((rt, image, dir)) = rig("output-by-name").await else {
+        return;
+    };
+    let named = script("echo by name > /dev/stdout; echo too > /proc/self/fd/2");
+    let (code, out, err) = sh(&rt, &image, &dir, "named", named);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "by name\n", "too\n"));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn pull_and_run() {
     if std::env::var_os("KITH_E2E").is_none() {

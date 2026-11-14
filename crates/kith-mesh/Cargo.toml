@@ -13,6 +13,7 @@ netlink-packet-route = "0.31"
 netlink-packet-generic = "0.4"
 netlink-packet-wireguard = "0.4"
 sha2 = "0.11"
+nix = { version = "0.29", features = ["sched", "user"] }
 
 [lints]
 workspace = true

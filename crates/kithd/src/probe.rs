@@ -13,9 +13,7 @@ use kith_api::kinds::{Container, PortRef, Probe};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::Notify;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Health {
@@ -94,7 +92,8 @@ pub fn problems(container: &Container) -> Vec<String> {
 
 /// Start probing a container that was just started. `None` when it has no probe that can run:
 /// it then counts as live and ready for as long as it runs.
-pub fn start(shared: Arc<Shared>, container: &Container) -> Option<Probes> {
+/// `pod`: the pod the container is of, if it is of one: its ports are that pod's.
+pub fn start(shared: Arc<Shared>, container: &Container, pod: Option<String>) -> Option<Probes> {
     let resolve = |probe: &Option<Probe>| probe.as_ref().and_then(|p| check(container, p).ok());
     let (liveness, readiness) = (resolve(&container.liveness), resolve(&container.readiness));
     if liveness.is_none() && readiness.is_none() {
@@ -108,8 +107,11 @@ pub fn start(shared: Arc<Shared>, container: &Container) -> Option<Probes> {
         // ponytail: liveness only counts once it has passed, so a container that never
         // listens is never restarted for it (it is never ready either, if it has a readiness
         // probe). The API has no initialDelaySeconds; a start deadline comes with it.
-        let live = watch_one(liveness, &tx, &shared.changed, true, |health, ok| health.live = ok);
-        let ready = watch_one(readiness, &tx, &shared.changed, false, |health, ok| health.ready = ok);
+        let at = pod.as_deref().map(|pod| (&*shared, pod));
+        let live = watch_one(at, liveness, &tx, &shared.changed, true, |health, ok| health.live = ok);
+        let ready = watch_one(at, readiness, &tx, &shared.changed, false, |health, ok| {
+            health.ready = ok
+        });
         tokio::join!(live, ready);
     });
     Some(Probes { health, task })
@@ -117,6 +119,7 @@ pub fn start(shared: Arc<Shared>, container: &Container) -> Option<Probes> {
 
 /// `after_first`: failures count only once the probe has passed.
 async fn watch_one(
+    at: Option<(&Shared, &str)>,
     check: Option<Check>,
     tx: &watch::Sender<Health>,
     poke: &Notify,
@@ -128,7 +131,7 @@ async fn watch_one(
     };
     let (mut failures, mut passed_once) = (0, false);
     loop {
-        let ok = tokio::time::timeout(check.timeout, probe(&check))
+        let ok = tokio::time::timeout(check.timeout, probe(at, &check))
             .await
             .unwrap_or(false);
         failures = if ok { 0 } else { failures + 1 };
@@ -155,14 +158,10 @@ async fn watch_one(
 }
 
 /// One attempt: can the port be connected to, and for http, is the answer 2xx or 3xx?
-async fn probe(check: &Check) -> bool {
-    // Listeners on either loopback address count.
-    let mut stream = match TcpStream::connect(("127.0.0.1", check.port)).await {
-        Ok(stream) => stream,
-        Err(_) => match TcpStream::connect(("::1", check.port)).await {
-            Ok(stream) => stream,
-            Err(_) => return false,
-        },
+async fn probe(at: Option<(&Shared, &str)>, check: &Check) -> bool {
+    // Listeners on either loopback address count: the machine's, or the container's pod's.
+    let Ok(mut stream) = crate::pods::connect(at, check.port).await else {
+        return false;
     };
     let Some(path) = &check.path else {
         return true;
@@ -240,11 +239,11 @@ mod tests {
             timeout: Duration::from_secs(1),
             threshold: 1,
         };
-        assert!(probe(&check(port, None)).await);
-        assert!(probe(&check(port, Some("/ok"))).await);
-        assert!(!probe(&check(port, Some("/broken"))).await);
+        assert!(probe(None, &check(port, None)).await);
+        assert!(probe(None, &check(port, Some("/ok"))).await);
+        assert!(!probe(None, &check(port, Some("/broken"))).await);
         // Nothing listens on port 1.
-        assert!(!probe(&check(1, None)).await);
+        assert!(!probe(None, &check(1, None)).await);
     }
 
     #[tokio::test]
@@ -265,7 +264,7 @@ mod tests {
             ready: true,
         });
         let changed = Notify::new();
-        let watching = watch_one(Some(check), &tx, &changed, true, |health, ok| health.live = ok);
+        let watching = watch_one(None, Some(check), &tx, &changed, true, |health, ok| health.live = ok);
         let story = async {
             tokio::time::sleep(Duration::from_millis(2500)).await;
             assert!(health.borrow().live, "killed while still starting");

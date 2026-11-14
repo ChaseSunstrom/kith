@@ -64,6 +64,8 @@ struct Slot {
     /// Replace changed replicas one at a time (a Workload unless its strategy is `recreate`).
     rolling: bool,
     probes: Option<crate::probe::Probes>,
+    /// The pod it is of, where its template says `pod`: the pod's id (`pod_of`) and its host name.
+    pod: Option<(String, String)>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
     devices: Vec<PathBuf>,
     /// What its containers mount: the Volume's directory, where in the container, and read-only
@@ -205,6 +207,19 @@ fn id_prefix(kind: &str, namespace: &str, name: &str) -> String {
         _ => "w",
     };
     format!("{kind}_{namespace}_{name}_")
+}
+
+/// The id of the pod that replica `replica` of the resource with the store key `owner` is,
+/// where its template says `pod`: what its units' ids start with.
+pub fn pod_of(owner: &str, replica: u32) -> String {
+    let mut parts = owner.split('/');
+    let (kind, namespace, name) = (parts.next(), parts.next(), parts.next());
+    let prefix = id_prefix(
+        kind.unwrap_or_default(),
+        namespace.unwrap_or_default(),
+        name.unwrap_or_default(),
+    );
+    format!("{prefix}{replica}")
 }
 
 fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
@@ -475,6 +490,10 @@ impl Controller {
                             env: env.clone(),
                             rolling,
                             probes: None,
+                            pod: (template.pod == Some(true)).then(|| {
+                                let name = &resource.metadata.name;
+                                (pod_of(&key, replica), format!("{name}-{replica}"))
+                            }),
                             devices: devices.clone(),
                             volumes: mounts_of(unit, &volumes),
                             tuned: None,
@@ -502,6 +521,7 @@ impl Controller {
             // A Job's run is not started over because a value changed under it.
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
             new.run != slot.run
+                || new.pod != slot.pod
                 || new.policy != slot.policy
                 || new.devices != slot.devices
                 || new.volumes != slot.volumes
@@ -558,6 +578,15 @@ impl Controller {
         for (id, slot) in wanted {
             self.slots.entry(id).or_insert(slot);
         }
+        // A pod none of whose units is wanted any more is let go, its network with it.
+        let pods: BTreeSet<&str> = self
+            .slots
+            .values()
+            .filter_map(|slot| Some(slot.pod.as_ref()?.0.as_str()))
+            .collect();
+        let made = shared.pods.lock();
+        made.expect("nothing panics holding the pods")
+            .keep(|pod| pods.contains(pod));
         self.tend_logs(owners);
         // What this node mounts from the others: a start below mounts it, and what no unit
         // here mounts any more is let go.
@@ -621,7 +650,7 @@ impl Controller {
             if slot.start_at.is_some_and(|at| at <= Instant::now()) {
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
-                    started = start(&self.runtime, &self.logs, mesh, id, slot) => started,
+                    started = start(shared, &self.runtime, &self.logs, mesh, id, slot) => started,
                     // A pull can take minutes; shutting down does not wait for it.
                     _ = stop_now.changed() => return TICK,
                 };
@@ -634,7 +663,8 @@ impl Controller {
                         (slot.state, slot.message, slot.start_at, slot.started) =
                             ("running", None, None, Instant::now());
                         if let Run::Container(c) = &slot.run {
-                            slot.probes = crate::probe::start(shared.clone(), c);
+                            let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
+                            slot.probes = crate::probe::start(shared.clone(), c, pod);
                         }
                         job_moved = true;
                     }
@@ -701,6 +731,10 @@ impl Controller {
                     }
                     if let Some(message) = &slot.message {
                         c["message"] = json!(message);
+                    }
+                    let pods = shared.pods.lock().expect("nothing panics holding the pods");
+                    if let Some(address) = slot.pod.as_ref().and_then(|(pod, _)| pods.address(pod)) {
+                        c["address"] = json!(address);
                     }
                     c
                 })
@@ -937,6 +971,7 @@ fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec
 
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
+    shared: &Shared,
     runtime: &Runtime,
     logs: &Path,
     mesh: Option<(std::net::Ipv6Addr, &str)>,
@@ -978,6 +1013,26 @@ async fn start(
             give: dir.namespace != crate::volumes::SYSTEM,
         });
     }
+    if let Some((pod, hostname)) = &slot.pod {
+        unit.as_image = true;
+        // (Only root can make a network: elsewhere the pod shares the node's.)
+        if nix::unistd::getuid().is_root() {
+            let net = mesh.map(|(prefix, me)| kith_mesh::node_net(prefix, me));
+            let namespace = slot.owner.split('/').nth(1).unwrap_or_default();
+            let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+            let given = pods.given(state, pod, namespace, hostname, net)?;
+            unit.netns = Some(given.netns);
+            unit.hostname = Some(given.hostname);
+            for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
+                unit.mounts.push(kith_runtime::Mount {
+                    host: file,
+                    container: at.into(),
+                    read_only: true,
+                    give: false,
+                });
+            }
+        }
+    }
     if let Some(Resources { cpu, memory, .. }) = resources {
         unit.memory_bytes = memory.as_ref().map(|q| q.value() as u64);
         unit.cpu_millis = cpu.as_ref().map(|q| (q.value() * 1000.0).round() as u64);
@@ -994,6 +1049,7 @@ async fn start(
         Run::Container(c) => {
             (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
             unit.user = c.run_as_user;
+            unit.writable = !c.read_only_root.unwrap_or(slot.pod.is_none());
             if let Some(seccomp) = &c.seccomp {
                 (unit.unconfined, unit.allow) = (seccomp.unconfined == Some(true), seccomp.allow.clone());
             }

@@ -1246,6 +1246,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "kith-api",
+ "kith-kube",
  "kith-lang",
  "kith-packages",
  "kith-yaml",
@@ -1265,6 +1266,15 @@ name = "kith-dns"
 version = "1.0.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "kith-kube"
+version = "1.0.0"
+dependencies = [
+ "kith-api",
+ "kith-yaml",
+ "serde_json",
 ]
 
 [[package]]
@@ -1295,6 +1305,7 @@ dependencies = [
  "netlink-packet-route",
  "netlink-packet-wireguard",
  "netlink-sys",
+ "nix 0.29.0",
  "sha2",
 ]
 
@@ -1374,6 +1385,7 @@ dependencies = [
  "kith-api",
  "kith-dm-sys",
  "kith-dns",
+ "kith-kube",
  "kith-mesh",
  "kith-packages",
  "kith-runtime",

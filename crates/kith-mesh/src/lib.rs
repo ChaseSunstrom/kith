@@ -12,6 +12,7 @@
 // nodes that are both behind NAT talk through an edge node for good.
 
 mod netlink;
+pub mod pod;
 
 pub use netlink::{Card, Device, Seen, address4, cards, up};
 use sha2::{Digest, Sha256};

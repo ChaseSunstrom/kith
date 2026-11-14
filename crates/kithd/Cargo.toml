@@ -11,6 +11,7 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 semver = "1"
 kith-yaml.workspace = true
 kith-packages = { path = "../kith-packages" }
+kith-kube = { path = "../kith-kube" }
 kith-api.workspace = true
 kith-store = { path = "../kith-store" }
 kith-dns = { path = "../kith-dns" }

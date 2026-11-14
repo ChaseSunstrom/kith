@@ -98,7 +98,7 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
 
     // Our own names. Having the zone means a name that is not in it is answered "no
     // such name" here, and never sent to the internet to ask.
-    let mut own = vec![soa("kith")];
+    let mut own = vec![soa("kith"), soa("cluster.local")];
     for node in store.list(Some("Node")) {
         let address = node.status.as_ref().and_then(|status| status["address"].as_str());
         if let Some(address) = address.and_then(|address| address.parse::<SocketAddr>().ok()) {
@@ -128,6 +128,13 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
         if let (Some(namespace), Some(service)) = (parts.next(), parts.next()) {
             let (name, ttl) = (format!("{service}.{namespace}.kith"), NODE_TTL);
             let data = Rdata::Aaaa(address);
+            own.push(Record {
+                name,
+                ttl,
+                data: data.clone(),
+            });
+            // (As what is written for Kubernetes names it: a pod is told to look there.)
+            let name = format!("{service}.{namespace}.svc.cluster.local");
             own.push(Record { name, ttl, data });
         }
     }
@@ -253,6 +260,8 @@ pub async fn run(
     mut upstreams: Vec<SocketAddr>,
     mut stopping: watch::Receiver<bool>,
 ) {
+    // This node's pods are its own to ask for any name, whatever their addresses are.
+    let pods = format!("{}/16", kith_mesh::pod::GATEWAY).parse::<Cidr>().ok();
     let listen = tcp.local_addr().expect("a bound socket has an address");
     upstreams.retain(|upstream| !is_self(*upstream, listen));
     eprintln!("kithd: serving DNS on {listen}; other names go to {upstreams:?}");
@@ -313,7 +322,7 @@ pub async fn run(
         }
     };
     tokio::select! {
-        () = kith_dns::serve(udp, tcp, served, upstreams, Vec::new()) => {}
+        () = kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect()) => {}
         () = feed => {}
         _ = stopping.changed() => {}
     }

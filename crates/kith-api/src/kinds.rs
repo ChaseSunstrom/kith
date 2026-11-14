@@ -252,6 +252,14 @@ spec! {
         /// Hold this replica back (a sliver of one CPU) while a seat of its node is busy.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub yield_to: Option<YieldTo>,
+        /// Run each replica as Kubernetes runs a pod: its containers share a network of
+        /// their own (any port is theirs, `localhost` is each other, and the replica has
+        /// an address on the mesh), each may write its root file system unless it says
+        /// `readOnlyRoot`, and each is the user its image names, root included (with what
+        /// a container runtime gives root, and nothing of the node's). Where kithd is not
+        /// root the replica shares the node's network.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub pod: Option<bool>,
     }
 
     pub struct YieldTo {
@@ -290,6 +298,11 @@ spec! {
         /// container's user namespace where kithd is not root, of the node where it is.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub run_as_user: Option<u32>,
+        /// `false`: its root file system is its own to write (what it writes is not the
+        /// image's, and goes when the container does). `true`: only volumes, /tmp and
+        /// /run are. Without it: `true`, or in a `pod` `false`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub read_only_root: Option<bool>,
         /// What the filter on its system calls lets through that it refuses by default.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub seccomp: Option<Seccomp>,

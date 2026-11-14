@@ -75,6 +75,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(96 << 20)),
         )
         .merge(crate::ui::router())
+        .merge(crate::kube::router())
         // (A package is 4 MB of files at most, and JSON makes them longer.)
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(shared)
@@ -316,24 +317,34 @@ async fn apply(
     if options.dry_run {
         return plan(&shared, &caller, resources).await.map(Json);
     }
+    applied(&shared, &caller, resources).await.map(Json)
+}
+
+/// Apply `resources` as `caller`, if it may: what `/v1/apply` does, for whoever else takes
+/// resources in (the Kubernetes API's paths).
+pub(crate) async fn applied(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    resources: Vec<Resource>,
+) -> Result<Vec<Change>, ApiError> {
     // Each resource of the body is asked about: one that is not allowed refuses them all.
-    permit(&shared, &caller, Verb::Apply, |store| {
+    permit(shared, caller, Verb::Apply, |store| {
         let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(target).collect()
     })?;
-    reach(&shared, &caller, &resources)?;
+    reach(shared, caller, &resources)?;
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         crate::releases::claims(&state.store, &resources)
     };
     if let Err(why) = claimed {
-        shared.audit.record(&caller, "apply", keys, Err(why.clone()));
+        shared.audit.record(caller, "apply", keys, Err(why.clone()));
         return Err(ApiError::Store(Error::Invalid(why)));
     }
     let at = kith_api::store::now();
-    match change(&shared, &caller, "apply", keys, Command::Apply { resources, at }).await? {
-        Done::Changes(changes) => Ok(Json(veiled(&shared, &caller, changes))),
+    match change(shared, caller, "apply", keys, Command::Apply { resources, at }).await? {
+        Done::Changes(changes) => Ok(veiled(shared, caller, changes)),
         _ => Err(odd()),
     }
 }

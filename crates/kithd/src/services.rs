@@ -24,8 +24,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
-/// Where a connection may go: a node's name, a port on it, and the Workload it is of.
-type Backend = (String, u16, String);
+/// Where a connection may go: a node's name, a port on it, the Workload it is of, and
+/// which replica where each is a pod with ports of its own.
+type Backend = (String, u16, String, Option<u32>);
 /// For every address and port a Service listens on: its backends.
 type Table = BTreeMap<(Ipv6Addr, u16), Vec<Backend>>;
 
@@ -52,8 +53,8 @@ pub fn addresses(store: &Store, prefix: Ipv6Addr) -> BTreeMap<String, Ipv6Addr> 
     services.map(|service| (service.key(), address(service))).collect()
 }
 
-/// The nodes that run a replica of `workload` with every unit ready.
-fn ready_on(workload: &Resource) -> Vec<String> {
+/// The replicas of `workload` with every unit ready, and the node each runs on.
+fn ready_on(workload: &Resource) -> Vec<(String, u32)> {
     let mut replicas: BTreeMap<(u64, &str), bool> = BTreeMap::new();
     let units = workload
         .status
@@ -66,7 +67,9 @@ fn ready_on(workload: &Resource) -> Vec<String> {
         *replicas.entry((replica, node)).or_insert(true) &= unit["ready"] == true;
     }
     let ready = replicas.into_iter().filter(|(_, ready)| *ready);
-    ready.map(|((_, node), _)| node.to_string()).collect()
+    ready
+        .map(|((replica, node), _)| (node.to_string(), replica as u32))
+        .collect()
 }
 
 /// What every Service listens on, and where its connections go.
@@ -102,12 +105,12 @@ fn table(store: &Store, prefix: Ipv6Addr) -> Table {
                             .map(|port| port.port)
                     }
                 };
+                let pod = workload.spec["template"]["pod"] == true;
                 let nodes = ready_on(workload).into_iter();
-                backends.extend(
-                    target
-                        .into_iter()
-                        .flat_map(|target| nodes.clone().map(move |node| (node, target, workload.key()))),
-                );
+                backends.extend(target.into_iter().flat_map(|target| {
+                    let backend = move |(node, replica)| (node, target, workload.key(), pod.then_some(replica));
+                    nodes.clone().map(backend)
+                }));
             }
         }
     }
@@ -253,13 +256,13 @@ impl Proxy {
 
     /// A connection to the replica behind `backend`: on this machine, or through the
     /// kithd of the node it is on.
-    async fn reach(&self, (node, port, workload): &Backend) -> std::io::Result<TcpStream> {
+    async fn reach(&self, (node, port, workload, replica): &Backend) -> std::io::Result<TcpStream> {
         if node == self.me() {
             // (Whoever connects to a Service's address is on this node: only it has it.)
             if !self.admits(workload, kith_mesh::node_address(self.prefix, node), *port) {
                 return Err(std::io::Error::other("a NetworkPolicy says no"));
             }
-            return local(*port).await;
+            return self.local(workload, *replica, *port).await;
         }
         let relay = {
             let state = self.shared.store.lock().expect("nothing panics holding the store");
@@ -272,7 +275,10 @@ impl Proxy {
         let relay = relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
         let mut stream = within(TcpStream::connect(there)).await?;
-        stream.write_all(format!("{port} {workload}\n").as_bytes()).await?;
+        let replica = replica.map(|replica| format!(" {replica}")).unwrap_or_default();
+        stream
+            .write_all(format!("{port} {workload}{replica}\n").as_bytes())
+            .await?;
         // It says so (one byte) when it has the replica; if it hangs up instead (a
         // policy, a replica just gone), the next backend is tried.
         within(stream.read_u8()).await?;
@@ -331,19 +337,34 @@ impl Proxy {
         };
         let line = within(reading).await.ok()?;
         let line = std::str::from_utf8(&line).ok()?.trim();
-        let (port, workload) = line.split_once(' ')?;
-        let port: u16 = port.parse().ok()?;
+        let mut words = line.split(' ');
+        let (port, workload) = (words.next()?.parse::<u16>().ok()?, words.next()?);
+        let replica = words.next().map(|replica| replica.parse::<u32>().ok());
+        let replica = if let Some(replica) = replica {
+            Some(replica?)
+        } else {
+            None
+        };
         let asked_for = {
             let table = self.table.lock().expect("nothing panics holding the table");
             let mut backends = table.values().flatten();
-            backends.any(|(node, backend, of)| node == self.me() && *backend == port && of == workload)
+            let asked = (self.me(), port, workload, replica);
+            backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
         };
         if !asked_for || !self.admits(workload, caller, port) {
             return None;
         }
-        let replica = local(port).await.ok()?;
+        let replica = self.local(workload, replica, port).await.ok()?;
         from.write_all(b"+").await.ok()?;
         pass(from, replica, IDLE).await.ok().map(drop)
+    }
+
+    /// A replica on this machine, wherever it listens: on the machine's own loopback, or
+    /// in its pod.
+    async fn local(&self, workload: &str, replica: Option<u32>, port: u16) -> std::io::Result<TcpStream> {
+        let pod = replica.map(|replica| crate::controller::pod_of(workload, replica));
+        let pod = pod.as_deref().map(|pod| (&*self.shared, pod));
+        within(crate::pods::connect(pod, port)).await
     }
 
     /// Accept on `listener` for good, each connection from the mesh handled by `with`.
@@ -377,14 +398,6 @@ async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::
     tokio::time::timeout(CONNECT, doing)
         .await
         .map_err(std::io::Error::other)?
-}
-
-/// A replica on this machine, wherever it listens.
-async fn local(port: u16) -> std::io::Result<TcpStream> {
-    match within(TcpStream::connect(("127.0.0.1", port))).await {
-        Ok(stream) => Ok(stream),
-        Err(_) => within(TcpStream::connect(("::1", port))).await,
-    }
 }
 
 /// Listen for every Service on this node's mesh interface, until stopped. `port` is the
@@ -563,7 +576,12 @@ spec:
         let table = table(&store, prefix);
         // The named port is the container's; a port with no target is itself; UDP is left out.
         let of = "Workload/default/web".to_string();
-        let to = |port: u16| vec![("a".to_string(), port, of.clone()), ("b".to_string(), port, of.clone())];
+        let to = |port: u16| {
+            vec![
+                ("a".to_string(), port, of.clone(), None),
+                ("b".to_string(), port, of.clone(), None),
+            ]
+        };
         let wanted = Table::from([((address, 80), to(8080)), ((address, 9000), to(9000))]);
         assert_eq!(table, wanted);
 

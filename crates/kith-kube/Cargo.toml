@@ -1,0 +1,14 @@
+[package]
+name = "kith-kube"
+description = "Kubernetes manifests read as kith resources, with a report of what was not carried"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-yaml.workspace = true
+kith-api.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

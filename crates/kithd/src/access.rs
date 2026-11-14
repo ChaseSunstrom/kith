@@ -101,7 +101,7 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 18] = [
+const FOR_IDENTITIES: [&str; 22] = [
     "/v1/backups",
     "/v1/blobs",
     "/v1/seats",
@@ -120,6 +120,11 @@ const FOR_IDENTITIES: [&str; 18] = [
     "/v1/schemas",
     "/v1/convert",
     "/v1/diff",
+    // The Kubernetes API's paths (kube.rs): the same callers, by the same rules.
+    "/version",
+    "/api",
+    "/apis",
+    "/openapi",
 ];
 
 /// Is `path` one an Identity can reach (one of [`FOR_IDENTITIES`], or under one)?
