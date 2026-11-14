@@ -893,8 +893,10 @@ Not answered, each refused in words:
 
 What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
 budget of 13 MB is not raised; kithd is 10.7 MB). With pods and CronJobs, kithd
-with nothing to do holds 8.1 MB of memory where it held 7.8 MB. A node that no
-Kubernetes client asks runs none of it.
+with nothing to do holds 7.8 MB of memory, as it did before them (`python3
+ci/budgets.py`: 7.80 MB four times running, 7.75 MB before; between 7.4 and 8.2 on
+a machine busy with other work). A node that no Kubernetes client asks runs none
+of it.
 
 Who may do what is kith's own: a request on `/api` is checked as the same
 request on `/v1` would be, for the kith kind it means, by the Roles bound to the
@@ -2627,40 +2629,40 @@ the same way, runs the same workloads on both, and writes the tables down
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/beside-k3s-dark.svg">
-  <img src="docs/assets/diagrams/beside-k3s-light.svg" alt="kith beside k3s as bars, each pair on its own scale: Memory in use, idle: the first node, or the server: kith 66 MB, k3s 1028 MB; Memory in use, idle: another node, or an agent: kith 66 MB, k3s 471 MB; CPU in use, idle: the first node, or the server: kith 1 % of a CPU, k3s 11.7 % of a CPU; From switching a machine on to a ready node: kith 2.8 s, k3s 30.6 s; From apply to a ready container: kith 0.04 s, k3s 0.48 s; One workload of 30 replicas: until all are ready: kith 0.19 s, k3s 3.5 s; A node lost: its replica ready on another, as each is set to wait: kith 300 s, k3s 346 s; Requests through a Service, connections kept (the one row where more is better): kith 21198 a second, k3s 24001 a second." width="100%">
+  <img src="docs/assets/diagrams/beside-k3s-light.svg" alt="kith beside k3s as bars, each pair on its own scale: Memory in use, idle: the first node, or the server: kith 67 MB, k3s 963 MB; Memory in use, idle: another node, or an agent: kith 65 MB, k3s 478 MB; CPU in use, idle: the first node, or the server: kith 0.7 % of a CPU, k3s 9.5 % of a CPU; From switching a machine on to a ready node: kith 2.6 s, k3s 29.4 s; From apply to a ready container: kith 0.03 s, k3s 0.49 s; One workload of 30 replicas: until all are ready: kith 0.12 s, k3s 2.66 s; A node lost: its replica ready on another, as each is set to wait: kith 300 s, k3s 354 s; Requests through a Service, connections kept (the one row where more is better): kith 29363 a second, k3s 51955 a second." width="100%">
 </picture>
 
 | | kith | k3s |
 | --- | --- | --- |
-| Memory in use on an idle node: the first node / the server | 66 MB (66 to 66, 3 runs) | 1028 MB (1008 to 1046, 3 runs) |
-| Memory in use on an idle node: another node / an agent | 66 MB (65 to 66, 3 runs) | 471 MB (470 to 485, 3 runs) |
-| From apply to a ready container, its image on the node | 0.04 s (0.03 to 0.06, 3 runs) | 0.48 s (0.47 to 0.50, 3 runs) |
-| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 346 s (345 to 351, 3 runs) |
-| The same, each told to wait about 60 s | 60 s | 70 s |
-| From switching a machine on to a node that is ready | 2.8 s (2.6 to 2.8, 3 runs) | 30.6 s (29.9 to 35.5, 3 runs) |
-| CPU in use on an idle node: the first node / the server | 1.0 % of one CPU (0.9 to 1.5, 3 runs) | 11.7 % of one CPU (11.2 to 14.4, 3 runs) |
-| CPU in use on an idle node: another node / an agent | 1.1 % of one CPU (0.8 to 1.2, 3 runs) | 5.7 % of one CPU (5.0 to 7.6, 3 runs) |
-| On the first node's disk at the end | 249 MB (248 to 249, 3 runs) | 1261 MB (1261 to 1261, 3 runs) |
+| Memory in use on an idle node: the first node / the server | 67 MB (65 to 67, 3 runs) | 963 MB (948 to 1026, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 65 MB (65 to 66, 3 runs) | 478 MB (478 to 479, 3 runs) |
+| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.04, 3 runs) | 0.49 s (0.47 to 0.49, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 305, 3 runs) | 354 s (348 to 361, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 58 s |
+| From switching a machine on to a node that is ready | 2.6 s (2.6 to 2.8, 3 runs) | 29.4 s (29.2 to 29.5, 3 runs) |
+| CPU in use on an idle node: the first node / the server | 0.7 % of one CPU (0.7 to 0.8, 3 runs) | 9.5 % of one CPU (8.4 to 9.8, 3 runs) |
+| CPU in use on an idle node: another node / an agent | 0.6 % of one CPU (0.6 to 0.7, 3 runs) | 4.6 % of one CPU (4.3 to 4.7, 3 runs) |
+| On the first node's disk at the end | 248 MB (248 to 248, 3 runs) | 1260 MB (1260 to 1261, 3 runs) |
 
 The same workloads, sent to each system's API in the same way (ci/compare_workloads.py):
 
 | | kith | k3s |
 | --- | --- | --- |
-| One workload of 30 replicas: until all are ready | 0.19 s (0.19 to 0.21, 3 runs) | 3.50 s (3.21 to 5.16, 3 runs) |
-| Memory in use that each of those replicas adds | 0.4 MB (0.3 to 0.5, 3 runs) | 12.3 MB (10.7 to 12.4, 3 runs) |
-| 20 workloads at once: until all are ready | 0.25 s (0.17 to 0.75, 3 runs) | 4.31 s (4.25 to 4.34, 3 runs) |
-| A change to a workload of 6 replicas: until all 6 run it | 0.12 s (0.11 to 0.15, 3 runs) | 1.42 s (1.33 to 1.55, 3 runs) |
-| A container that exits: until it runs again | 1.01 s (1.01 to 1.02, 3 runs) | 0.89 s (0.66 to 1.00, 3 runs) |
-| A Job that does nothing: until it has succeeded | 0.09 s (0.06 to 0.09, 3 runs) | 3.00 s (2.95 to 3.12, 3 runs) |
-| Requests a second through a Service to 3 web servers, a connection each | 3957 (1282 to 4235, 3 runs) | 6212 (6044 to 6562, 3 runs) |
-| Of those requests, half took under | 5 ms (5 to 13, 3 runs) | 3 ms (3 to 3, 3 runs) |
-| and 99 in 100 under | 15 ms (14 to 67, 3 runs) | 12 ms (10 to 13, 3 runs) |
-| Requests a second over connections that are kept | 21198 (14570 to 24172, 3 runs) | 24001 (19299 to 27389, 3 runs) |
+| One workload of 30 replicas: until all are ready | 0.12 s (0.12 to 0.12, 3 runs) | 2.66 s (2.50 to 2.73, 3 runs) |
+| Memory in use that each of those replicas adds | 0.4 MB (0.4 to 0.5, 3 runs) | 11.8 MB (10.2 to 12.2, 3 runs) |
+| 20 workloads at once: until all are ready | 0.10 s (0.08 to 0.13, 3 runs) | 4.18 s (4.13 to 4.21, 3 runs) |
+| A change to a workload of 6 replicas: until all 6 run it | 0.15 s (0.15 to 0.17, 3 runs) | 1.38 s (1.34 to 1.42, 3 runs) |
+| A container that exits: until it runs again | 1.01 s (1.01 to 1.01, 3 runs) | 0.81 s (0.72 to 0.82, 3 runs) |
+| A Job that does nothing: until it has succeeded | 0.07 s (0.07 to 0.07, 3 runs) | 2.91 s (2.86 to 2.98, 3 runs) |
+| Requests a second through a Service to 3 web servers, a connection each | 5077 (5062 to 5265, 3 runs) | 6595 (4363 to 7297, 3 runs) |
+| Of those requests, half took under | 4 ms (3 to 4, 3 runs) | 2 ms (2 to 4, 3 runs) |
+| and 99 in 100 under | 12 ms (11 to 12, 3 runs) | 10 ms (8 to 15, 3 runs) |
+| Requests a second over connections that are kept | 29363 (25560 to 30119, 3 runs) | 51955 (26937 to 67689, 3 runs) |
 
-Alpine alone, before k3s is started on it, has 211 MB (185 to 240, 3 runs) in use; kith OS has no such moment (kithd is its first process).
-A kith OS machine answers on its API 2.7 s (2.5 to 2.7, 3 runs) after it is switched on (firmware included).
+Alpine alone, before k3s is started on it, has 210 MB (208 to 222, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.5 s (2.5 to 2.7, 3 runs) after it is switched on (firmware included).
 
-Of k3s's time to a ready node, 23.9 s (23.6 to 29.0, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
+Of k3s's time to a ready node, 23.5 s (23.0 to 23.5, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
 
 - **Memory in use** is `MemTotal - MemAvailable` in a node's `/proc/meminfo`, read by
   one small container on every node three minutes after all of them run: the kernel,
@@ -2723,8 +2725,11 @@ the two differ in what they do, the numbers are not of the same thing:
 - nginx runs with a configuration of its own on both (it listens on 8080 and
   writes only under `/tmp`): as its image comes it wants to start as root and
   write into its image, which a kith container may not.
-- And the two are not the same thing: k3s is Kubernetes, with its API and all
-  that is written for it, and kith is not.
+- And the two are not the same thing: k3s is Kubernetes, with its whole API and all
+  that is written for it. kith answers the part of that API `kubectl` and `helm` use
+  for the core kinds ([kubectl and Helm, as they are](#kubectl-and-helm-as-they-are))
+  and refuses the rest by name; the kith side of these tables is measured through
+  kith's own API.
 
 ## Layout
 

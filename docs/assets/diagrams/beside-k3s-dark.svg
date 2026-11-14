@@ -1,48 +1,48 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 596" role="img" font-family="ui-sans-serif, system-ui, sans-serif">
-<title>kith beside k3s, measured</title><desc>Memory in use, idle: the first node, or the server: kith 66 MB, k3s 1028 MB; Memory in use, idle: another node, or an agent: kith 66 MB, k3s 471 MB; CPU in use, idle: the first node, or the server: kith 1 % of a CPU, k3s 11.7 % of a CPU; From switching a machine on to a ready node: kith 2.8 s, k3s 30.6 s; From apply to a ready container: kith 0.04 s, k3s 0.48 s; One workload of 30 replicas: until all are ready: kith 0.19 s, k3s 3.5 s; A node lost: its replica ready on another, as each is set to wait: kith 300 s, k3s 346 s; Requests through a Service, connections kept (the one row where more is better): kith 21198 a second, k3s 24001 a second.</desc>
+<title>kith beside k3s, measured</title><desc>Memory in use, idle: the first node, or the server: kith 67 MB, k3s 963 MB; Memory in use, idle: another node, or an agent: kith 65 MB, k3s 478 MB; CPU in use, idle: the first node, or the server: kith 0.7 % of a CPU, k3s 9.5 % of a CPU; From switching a machine on to a ready node: kith 2.6 s, k3s 29.4 s; From apply to a ready container: kith 0.03 s, k3s 0.49 s; One workload of 30 replicas: until all are ready: kith 0.12 s, k3s 2.66 s; A node lost: its replica ready on another, as each is set to wait: kith 300 s, k3s 354 s; Requests through a Service, connections kept (the one row where more is better): kith 29363 a second, k3s 51955 a second.</desc>
 <rect width="100%" height="100%" rx="10" fill="#16181d"/>
 <text x="24" y="36" font-size="17" font-weight="700" fill="#f6f5f1">kith beside k3s v1.37.2, measured</text>
 <text x="24" y="58" font-size="12.5" fill="#a9aebb">Three QEMU machines each, the middle of 3 runs (ci/compare.sh). Each pair has its own scale.</text>
 <rect x="720" y="26" width="12" height="12" rx="2" fill="#5b8cff"/><text x="738" y="36.5" font-size="13" fill="#f6f5f1">kith</text>
 <rect x="790" y="26" width="12" height="12" rx="2" fill="#b98426"/><text x="808" y="36.5" font-size="13" fill="#f6f5f1">k3s</text>
 <text x="24" y="92" font-size="13.5" fill="#f6f5f1">Memory in use, idle: the first node, or the server</text>
-<path d="M24 102h32a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-32z" fill="#5b8cff"/>
-<text x="68" y="113" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">66 MB</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 102h35a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-35z" fill="#5b8cff"/>
+<text x="71" y="113" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">67 MB</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 118h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="129" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">1028 MB</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="129" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">963 MB</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="154" font-size="13.5" fill="#f6f5f1">Memory in use, idle: another node, or an agent</text>
-<path d="M24 164h74a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-74z" fill="#5b8cff"/>
-<text x="110" y="175" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">66 MB</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 164h72a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-72z" fill="#5b8cff"/>
+<text x="108" y="175" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">65 MB</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 180h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="191" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">471 MB</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="191" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">478 MB</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="216" font-size="13.5" fill="#f6f5f1">CPU in use, idle: the first node, or the server</text>
-<path d="M24 226h44a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-44z" fill="#5b8cff"/>
-<text x="80" y="237" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">1 % of a CPU</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 226h37a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-37z" fill="#5b8cff"/>
+<text x="73" y="237" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.7 % of a CPU</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 242h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="253" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">11.7 % of a CPU</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="253" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">9.5 % of a CPU</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="278" font-size="13.5" fill="#f6f5f1">From switching a machine on to a ready node</text>
-<path d="M24 288h47a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-47z" fill="#5b8cff"/>
-<text x="83" y="299" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">2.8 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 288h46a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-46z" fill="#5b8cff"/>
+<text x="82" y="299" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">2.6 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 304h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="315" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">30.6 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="315" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">29.4 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="340" font-size="13.5" fill="#f6f5f1">From apply to a ready container</text>
-<path d="M24 350h43a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-43z" fill="#5b8cff"/>
-<text x="79" y="361" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.04 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 350h30a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-30z" fill="#5b8cff"/>
+<text x="66" y="361" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.03 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 366h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="377" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.48 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="377" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.49 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="402" font-size="13.5" fill="#f6f5f1">One workload of 30 replicas: until all are ready</text>
-<path d="M24 412h26a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-26z" fill="#5b8cff"/>
-<text x="62" y="423" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.19 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 412h21a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-21z" fill="#5b8cff"/>
+<text x="57" y="423" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">0.12 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 428h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="439" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">3.5 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="439" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">2.66 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="464" font-size="13.5" fill="#f6f5f1">A node lost: its replica ready on another, as each is set to wait</text>
-<path d="M24 474h482a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-482z" fill="#5b8cff"/>
-<text x="518" y="485" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">300 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 474h471a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-471z" fill="#5b8cff"/>
+<text x="507" y="485" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">300 s</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 490h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="501" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">346 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="501" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">354 s</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 <text x="24" y="526" font-size="13.5" fill="#f6f5f1">Requests through a Service, connections kept (the one row where more is better)</text>
-<path d="M24 536h491a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-491z" fill="#5b8cff"/>
-<text x="527" y="547" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">21198 a second</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
+<path d="M24 536h312a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-312z" fill="#5b8cff"/>
+<text x="348" y="547" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">29363 a second</tspan><tspan dx="6" fill="#a9aebb">kith</tspan></text>
 <path d="M24 552h556a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-556z" fill="#b98426"/>
-<text x="592" y="563" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">24001 a second</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
+<text x="592" y="563" font-size="12.5" fill="#f6f5f1"><tspan font-weight="700">51955 a second</tspan><tspan dx="6" fill="#a9aebb">k3s</tspan></text>
 </svg>
