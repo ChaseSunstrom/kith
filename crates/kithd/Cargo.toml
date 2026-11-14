@@ -36,8 +36,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 ring = "0.17"
 # The passphrase of an encrypted state (crypt.rs): ring has no memory-hard KDF.
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
-# `kith run` takes the connection over after the 101 (axum's own dependencies, already built).
-hyper = { version = "1", default-features = false }
+# `kith run` takes the connection over after the 101, and the ingress reads the requests of
+# a host with paths or headers (axum's own dependencies, already built).
+hyper = { version = "1", default-features = false, features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 # (In the tree already.) ACME speaks base64url.
 base64 = "0.22"

@@ -1517,12 +1517,19 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
     if !meta.labels.is_empty() && cx.import {
         cx.hint("metadata.labels", "are not kept: kith has no resource for an Ingress");
     }
-    let import = cx.import;
-    for key in meta.annotations.keys().filter(|key| import || key.contains("ingress")) {
-        cx.hint(
-            &format!("metadata.annotations[{key}]"),
-            "is not used: kith's edge has no such setting",
-        );
+    for key in meta.annotations.keys() {
+        let at = format!("metadata.annotations[{key}]");
+        // `nginx.ingress.kubernetes.io/rewrite-target`, `…/use-regex`: requests would reach
+        // another path than the one asked for, or not reach the one they should.
+        let name = key.rsplit('/').next().unwrap_or(key);
+        if name.contains("rewrite") || name.contains("regex") {
+            cx.note(
+                &at,
+                "is refused: kith matches a request's path as it is sent and passes it on unchanged",
+            );
+        } else if cx.import || key.contains("ingress") {
+            cx.hint(&at, "is not used: kith's edge has no such setting");
+        }
     }
     let namespace = meta.namespace.as_deref().unwrap_or("default");
     let mut spec = cx.map(root, "spec", "");
@@ -1536,11 +1543,11 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
         let host = cx.text(&mut rule, "host", &rp);
         let mut http = cx.map(&mut rule, "http", &rp);
         let hp = join(&rp, "http");
+        let mut routes = Vec::new();
         for (j, mut path) in cx.maps(&mut http, "paths", &hp).into_iter().enumerate() {
             let pp = format!("{hp}.paths[{j}]");
-            let route = cx.text(&mut path, "path", &pp);
-            // ponytail: pathType is not read; kith sends the whole host to one Service.
-            path.remove("pathType");
+            let route = cx.text(&mut path, "path", &pp).unwrap_or_else(|| "/".into());
+            let kind = cx.text(&mut path, "pathType", &pp);
             let mut backend = cx.map(&mut path, "backend", &pp);
             let bp = join(&pp, "backend");
             let mut svc = cx.map(&mut backend, "service", &bp);
@@ -1552,64 +1559,125 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
             cx.rest(svc, &sp);
             cx.rest(backend, &bp);
             cx.rest(path, &pp);
-            if route.is_some_and(|r| r != "/") {
-                // (Exposing this backend too would have two Services claim one host.)
-                cx.note(
-                    &pp,
-                    "not translated: kith sends a whole host to one Service, the one behind `/`",
-                );
-                continue;
-            }
-            let (Some(host), Some(name)) = (&host, name) else {
-                cx.note(&pp, "needs a host and a Service backend: not translated");
+            // ImplementationSpecific (or none) is the controller's to say. nginx's reads a
+            // prefix unless `use-regex` is set, which is refused above, so a path with no
+            // pattern in it is read as one. One with a pattern is refused: kith would match
+            // it as plain text, and no request would reach it.
+            let pattern = route.contains(|c| "^$*+?()[]{}|\\".contains(c));
+            let exact = match kind.as_deref() {
+                Some("Exact") => true,
+                Some("Prefix") => false,
+                None | Some("ImplementationSpecific") if !pattern => false,
+                None | Some("ImplementationSpecific") => {
+                    let why = format!("`{route}` is a regular expression, which kith does not match: not translated");
+                    cx.note(&join(&pp, "path"), &why);
+                    continue;
+                }
+                Some(other) => {
+                    let why = format!("`{other}` is not a path type kith knows: not translated");
+                    cx.note(&join(&pp, "pathType"), &why);
+                    continue;
+                }
+            };
+            let Some(name) = name else {
+                cx.note(&pp, "needs a Service backend: not translated");
                 continue;
             };
-            let taken = out.iter().find(|r| {
-                let other =
-                    r.metadata.name != name || r.metadata.namespace.as_deref().unwrap_or("default") != namespace;
-                r.kind == "Service" && other && r.spec["expose"]["host"] == host.as_str()
-            });
-            if let Some(taken) = taken {
-                let why = format!(
-                    "not translated: {host} already goes to Service `{}`",
-                    taken.metadata.name
-                );
-                cx.note(&pp, &why);
-                continue;
-            }
-            let found = out.iter_mut().find(|r| {
-                r.kind == "Service"
-                    && r.metadata.name == name
-                    && r.metadata.namespace.as_deref().unwrap_or("default") == namespace
-            });
-            let Some(service) = found else {
-                let why = format!("Service `{name}` is not there: it is exposed once it is");
-                match cx.import {
-                    true => cx.note(&bp, &why),
-                    false => cx.hint(&bp, &why),
-                }
-                continue;
-            };
-            let ports = service.spec["ports"].as_array().cloned().unwrap_or_default();
-            if let Some(first) = ports.iter().find(|p| p["protocol"] != "udp") {
-                let wrong = number.is_some_and(|n| first["port"] != n)
-                    || port_name.as_ref().is_some_and(|n| first["name"] != *n);
-                if wrong {
-                    cx.note(
-                        &join(&sp, "port"),
-                        "is not the Service's first TCP port, which is what kith sends the host to",
-                    );
-                }
-            }
-            let expose = json!({ "host": host, "via": "edge" });
-            match service.spec.get("expose") {
-                None => service.spec["expose"] = expose,
-                Some(have) if *have == expose => {}
-                Some(_) => cx.note(&pp, "is a second host for its Service: not translated"),
-            }
+            routes.push((pp, route, exact, name, number, port_name));
         }
         cx.rest(http, &hp);
         cx.rest(rule, &rp);
+        let Some(host) = host else {
+            if !routes.is_empty() {
+                cx.note(&rp, "needs a host: not translated");
+            }
+            continue;
+        };
+        // The Service that keeps the host: the one behind `/`, else the first named.
+        let Some((owner_at, owner)) = routes
+            .iter()
+            .find(|r| r.1 == "/" && !r.2)
+            .or(routes.first())
+            .map(|r| (join(&r.0, "backend"), r.3.clone()))
+        else {
+            continue;
+        };
+        let service_of = |r: &Resource, name: &str| {
+            r.kind == "Service"
+                && r.metadata.name == name
+                && r.metadata.namespace.as_deref().unwrap_or("default") == namespace
+        };
+        let taken = out
+            .iter()
+            .find(|r| r.kind == "Service" && !service_of(r, &owner) && r.spec["expose"]["host"] == host.as_str());
+        if let Some(taken) = taken {
+            let why = format!(
+                "not translated: {host} already goes to Service `{}`",
+                taken.metadata.name
+            );
+            cx.note(&rp, &why);
+            continue;
+        }
+        if !out.iter().any(|r| service_of(r, &owner)) {
+            let why = format!("Service `{owner}` is not there: it is exposed once it is");
+            match cx.import {
+                true => cx.note(&owner_at, &why),
+                false => cx.hint(&owner_at, &why),
+            }
+            continue;
+        }
+        // A port by name is the number the Service gives it; a Service not here yet has none.
+        let port_of = |name: &str, want: &str| {
+            let service = out.iter().find(|r| service_of(r, name))?;
+            let ports = service.spec["ports"].as_array()?;
+            let port = ports.iter().find(|p| p["name"] == want)?["port"].as_u64()?;
+            u16::try_from(port).ok()
+        };
+        let mut paths = Vec::new();
+        for (pp, route, exact, name, number, port_name) in &routes {
+            let port = match (number, port_name) {
+                (Some(n), _) => u16::try_from(*n).ok().filter(|n| *n != 0),
+                (None, Some(want)) => port_of(name, want),
+                (None, None) => None,
+            };
+            let Some(port) = port else {
+                let why = format!("is no port of Service `{name}` kith can find: not translated");
+                cx.note(&join(pp, "backend.service.port"), &why);
+                continue;
+            };
+            let mut to = json!({ "path": route, "service": name, "port": port });
+            if *exact {
+                to["exact"] = json!(true);
+            }
+            paths.push(to);
+        }
+        let Some(service) = out.iter_mut().find(|r| service_of(r, &owner)) else {
+            continue;
+        };
+        // One `/` to the port kith sends a whole host to anyway: the host as it always was,
+        // its bytes passed on unread.
+        let first = service.spec["ports"]
+            .as_array()
+            .and_then(|ports| ports.iter().find(|p| p["protocol"] != "udp"));
+        let whole = json!([{ "path": "/", "service": owner, "port": first.map(|p| p["port"].clone()) }]);
+        let mut expose = json!({ "host": host, "via": "edge" });
+        match paths.is_empty() {
+            true => continue,
+            false if json!(paths) == whole => {}
+            false => expose["paths"] = json!(paths),
+        }
+        match service.spec.get("expose") {
+            None => {
+                let mut tried = service.clone();
+                tried.spec["expose"] = expose.clone();
+                match tried.validated() {
+                    Ok(_) => service.spec["expose"] = expose,
+                    Err(e) => cx.note(&rp, &format!("not translated: {e}")),
+                }
+            }
+            Some(have) if *have == expose => {}
+            Some(_) => cx.note(&rp, "is a second host for its Service: not translated"),
+        }
     }
     cx.rest(spec, "spec");
 }
@@ -2458,22 +2526,107 @@ items:
         ]
         .concat();
         let (resources, report) = run(&all);
-        let host =
-            |name: &str| resources.iter().find(|r| r.metadata.name == name).unwrap().spec["expose"]["host"].clone();
+        let expose = |name: &str| resources.iter().find(|r| r.metadata.name == name).unwrap().spec["expose"].clone();
         assert_eq!(
-            (host("web"), host("api"), host("other")),
-            (json!("shop.example.com"), Value::Null, Value::Null)
+            (expose("web"), expose("api"), expose("other")),
+            (
+                json!({ "host": "shop.example.com", "via": "edge", "paths": [
+                    { "path": "/", "service": "web", "port": 80 },
+                    { "path": "/api", "service": "api", "port": 80 },
+                ] }),
+                Value::Null,
+                Value::Null
+            )
         );
         let said = |what: &str| report.iter().filter(|line| line.contains(what)).count();
         assert_eq!(
-            (
-                said("the one behind `/`"),
-                said("already goes to Service `web`"),
-                said("helm.sh/hook")
-            ),
-            (1, 1, 1),
+            (said("already goes to Service `web`"), said("helm.sh/hook")),
+            (1, 1),
             "{report:?}"
         );
         assert_eq!(said("helm.sh/chart"), 0);
+    }
+
+    #[test]
+    fn an_ingress_carries_its_paths_and_refuses_by_name_what_kith_would_match_otherwise() {
+        let src = r#"
+apiVersion: v1
+kind: Service
+metadata: { name: web }
+spec: { selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api }
+spec: { selector: { app: api }, ports: [{ name: metrics, port: 9100 }, { name: http, port: 8080 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: solo }
+spec: { selector: { app: solo }, ports: [{ port: 80 }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /api, pathType: Prefix, backend: { service: { name: api, port: { name: http } } } }
+          - { path: /healthz, pathType: Exact, backend: { service: { name: api, port: { number: 9100 } } } }
+          - { path: /static, pathType: ImplementationSpecific, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: "/img(/|$)(.*)", pathType: ImplementationSpecific, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /odd, pathType: Glob, backend: { service: { name: web, port: { number: 80 } } } }
+          - { path: /gone, pathType: Prefix, backend: { service: { name: api, port: { name: grpc } } } }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: solo }
+spec:
+  rules:
+    - host: solo.example.com
+      http: { paths: [{ path: /, pathType: Prefix, backend: { service: { name: solo, port: { number: 80 } } } }] }
+"#;
+        let taken = take(documents("test", src).unwrap(), true);
+        let expose = |name: &str| find(&taken.resources, "Service", name).spec["expose"].clone();
+        assert_eq!(
+            expose("web"),
+            json!({ "host": "shop.example.com", "via": "edge", "paths": [
+                { "path": "/", "service": "web", "port": 80 },
+                { "path": "/api", "service": "api", "port": 8080 },
+                { "path": "/healthz", "exact": true, "service": "api", "port": 9100 },
+                { "path": "/static", "service": "web", "port": 80 },
+            ] })
+        );
+        // A host to one Service at the port it is sent to anyway is as it was: its bytes unread.
+        assert_eq!(expose("solo"), json!({ "host": "solo.example.com", "via": "edge" }));
+        assert_eq!(expose("api"), Value::Null);
+        let refused = |what: &str| taken.refused.iter().filter(|line| line.contains(what)).count();
+        assert_eq!(
+            (
+                refused("annotations[nginx.ingress.kubernetes.io/rewrite-target]"),
+                refused("annotations[nginx.ingress.kubernetes.io/use-regex]"),
+                refused("paths[4].path"),
+                refused("`Glob` is not a path type"),
+                refused("paths[6].backend.service.port"),
+                refused("proxy-body-size"),
+            ),
+            (1, 1, 1, 1, 1, 0),
+            "{:?}",
+            taken.refused
+        );
+        assert_eq!(taken.refused.len(), 5, "{:?}", taken.refused);
+        assert!(
+            taken.hints.iter().any(|line| line.contains("proxy-body-size")),
+            "{:?}",
+            taken.hints
+        );
     }
 }
