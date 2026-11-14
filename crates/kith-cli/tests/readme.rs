@@ -27,7 +27,9 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
             }
             (Some(_), Some(_)) => out.extend(open.take()),
             (Some((_, text)), None) => {
-                let line = line.get(indent..).filter(|_| line[..indent.min(line.len())].trim().is_empty());
+                let line = line
+                    .get(indent..)
+                    .filter(|_| line[..indent.min(line.len())].trim().is_empty());
                 *text += &format!("{}\n", line.unwrap_or_default());
             }
             (None, _) => {}
