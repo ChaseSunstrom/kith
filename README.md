@@ -1126,6 +1126,36 @@ the output as plain text, and a Secret with `envFrom` keeps it out of the
 Workload. (The other way, a tool that writes Kubernetes YAML of the file and
 then `kith import k8s`, is two steps and was not tried here.)
 
+## Coming from Proxmox or docker compose
+
+A guest on a hypervisor is a whole system with one job. On kith the job is a Workload
+from the same image the guest would have run, its data a Volume, its name a Service;
+the system around it is not carried, because kith OS is that part. What each kind of
+guest becomes, and what is still missing:
+
+| A guest that is | Becomes | Today |
+|---|---|---|
+| a web app with one port and a data directory (a password manager, a search engine, an automation tool, a package repository) | a Workload, a Volume, a Service with `expose` | works |
+| an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS on the node's own address (the forge's SSH) does not yet |
+| a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
+| a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
+| a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name; by path, and with headers set, not yet |
+| a DNS filter | kith's own [DNS](#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
+| a mail relay, or anything on a port of the LAN that is not HTTPS | a Workload that shares its node's network (root, not a pod) | works only so; a port said in the Workload, not yet |
+| a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |
+| an app that must go out through a VPN | a Workload with an exit | not yet |
+| a VM with no image (an appliance) | a [`vms` unit](#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
+
+Moving a guest's data: stop the guest, apply the Volume, and put the directory into it
+(`kith volume put`, not yet: until then, copy it into the Volume's directory on the node
+that holds it, as [Storage](#storage) says where that is, owned by the user its
+container runs as). Move one guest at a time and
+keep the old one stopped, not deleted, until the new one has run a week.
+
+kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI,
+virtio disk and network), and that is the way to try it beside what runs today. It is
+tested in QEMU, not on Proxmox itself.
+
 ## Kinds of your own
 
 A `KindDefinition` makes a new kind. Resources of it are applied, listed,
