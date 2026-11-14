@@ -1278,11 +1278,18 @@ spec:
   `display` has no device node and gives nothing. A Device or claim that is missing, or a
   path that is not a device node, stops the unit from starting, and says which. An `exec`
   unit runs on the host and sees all of `/dev` as it is.
-- **What holds it to those is that it cannot make a device node**: no container has the
-  capability but a pod that is root on kith OS. Nothing more does yet: the list of
-  devices a container may open is written for its cgroup and no filter is loaded there
-  to enforce it (T-0306). Until it is, a pod that is root on kith OS can make a node for
-  any device of its node and open it, a disk included.
+- **What holds it to those on kith OS is a device filter on its cgroup**: a program kithd
+  loads into the kernel for each container, asked at every open and every `mknod` of a
+  device node by a process in it. It lets through the few every container has, the
+  terminals of the container's own `/dev/pts`, and each device it was given (to read and
+  write, not to make a second node of); all else is refused. So a pod that is root there,
+  which has the capability to make device nodes, makes none for its node's disk and opens
+  none. (A pod that made a node for itself before, `/dev/net/tun` or `/dev/fuse`, is
+  refused now: write a `Device` for the node, `class: other` with its `path`, and claim
+  it.) A container whose device filter cannot be loaded is not started. Where kithd is
+  your own service there is no filter and none is needed: a container there is in a user
+  namespace, where the kernel lets no one make a device node, and it has the nodes in its
+  `/dev` and no other.
 - An input device plugged in or pulled (a controller, a keyboard) while a container holds
   its seat is given to that container, or taken from it, as it runs: the node appears in
   its `/dev/input` at the next scan, within half a minute, and nothing is started over. (An

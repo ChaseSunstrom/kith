@@ -11,6 +11,7 @@
 //! tests run it, and is meant to work as root; the root path is not tested yet.
 
 mod container;
+mod devfilter;
 mod image;
 mod seccomp;
 pub mod signed;

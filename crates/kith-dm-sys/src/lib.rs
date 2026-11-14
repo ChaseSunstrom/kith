@@ -1,10 +1,13 @@
 //! Device-mapper by ioctl (linux/dm-ioctl.h): what `dmsetup create` and `dmsetup remove`
 //! do, for a machine with no dmsetup. One mapping of one dm-crypt target. And two more
 //! things such a machine has no tool for: a file as a block device (`losetup`), and an ext4
-//! file system grown where it is mounted (`resize2fs`).
+//! file system grown where it is mounted (`resize2fs`). And one that has no tool anywhere
+//! but a container runtime: the program a cgroup asks which devices its processes may
+//! open (`bpf(2)`).
 //!
-//! The one `unsafe` block of the workspace is the ioctl call itself: the request is put
-//! together as bytes, so there is no struct whose layout has to match the kernel's.
+//! The `unsafe` of the workspace is here: the ioctl call and the bpf call themselves (and
+//! taking the file descriptor bpf answers with). Each request is put together as bytes, so
+//! there is no struct whose layout has to match the kernel's.
 
 use std::fs::File;
 use std::io::{Error, Result};
@@ -173,6 +176,51 @@ pub fn remove(name: &str) -> Result<()> {
     call(&control()?, REMOVE, request(name, 0, None)?).map(drop)
 }
 
+/// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
+/// (the kernel takes what is past the request's end as zeros). What the kernel answers.
+///
+/// For the two commands of [`device_filter`] only: neither has the kernel write through
+/// the request, and what the request points at is alive for the call.
+fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
+    // SAFETY: `request` is `request.len()` readable bytes, and the pointers in it (see
+    // `device_filter`) are to memory its caller holds until this returns.
+    let said = unsafe { libc::syscall(libc::SYS_bpf, command, request.as_ptr(), request.len()) };
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(said)
+    }
+}
+
+/// Make `program` (BPF instructions, eight bytes each) what `cgroup` (a cgroup's
+/// directory, opened) asks at every open and mknod of a device node by a process in it:
+/// the kernel checks the program before it takes it. It takes the place of the one put
+/// there this way before; the cgroup keeps it, and it goes with the cgroup.
+pub fn device_filter(cgroup: &File, program: &[u8]) -> Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    if program.is_empty() || !program.len().is_multiple_of(8) {
+        return Err(Error::other("not a program of whole instructions"));
+    }
+    let license = b"Apache-2.0\0";
+    // BPF_PROG_LOAD: the kind of program (BPF_PROG_TYPE_CGROUP_DEVICE), how many
+    // instructions, where they are, where the licence's name is.
+    let mut load = [0u8; 48];
+    load[0..4].copy_from_slice(&15u32.to_ne_bytes());
+    load[4..8].copy_from_slice(&((program.len() / 8) as u32).to_ne_bytes());
+    load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
+    load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
+    let loaded = bpf(5, &load)?;
+    // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+    let loaded = unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) };
+    // BPF_PROG_ATTACH: to which cgroup, which program, as what (BPF_CGROUP_DEVICE), and
+    // with no flags: the one program of this cgroup, replaced by the next.
+    let mut attach = [0u8; 16];
+    attach[0..4].copy_from_slice(&cgroup.as_raw_fd().to_ne_bytes());
+    attach[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
+    attach[8..12].copy_from_slice(&6u32.to_ne_bytes());
+    bpf(8, &attach).map(drop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +263,19 @@ mod tests {
         }
         assert!(crypt("kith-dm-sys-test", Path::new("/dev/null/none"), 0, 8, &[0; 64]).is_err());
         assert!(remove("kith-dm-sys-test").is_err());
+    }
+
+    /// A program the kernel's checker refuses (it ends nowhere), and what is no program:
+    /// errors, and nothing attached (a filter that holds is the VM test's to show:
+    /// ci/vm.sh --test pods).
+    #[test]
+    fn filter_refusals_are_errors() {
+        let Ok(here) = File::open("/sys/fs/cgroup") else {
+            return;
+        };
+        assert!(device_filter(&here, &[]).is_err() && device_filter(&here, &[0; 7]).is_err());
+        // r0 = 1, and no exit.
+        assert!(device_filter(&here, &[0xb7, 0, 0, 0, 1, 0, 0, 0]).is_err());
     }
 
     /// What is no ext4 file system is not grown, and says so (a loop device and a real

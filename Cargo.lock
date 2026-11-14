@@ -1373,6 +1373,7 @@ dependencies = [
  "base64 0.22.1",
  "caps",
  "flate2",
+ "kith-dm-sys",
  "libcgroups",
  "libcontainer",
  "nix 0.29.0",

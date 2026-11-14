@@ -1,6 +1,6 @@
 //! Running one container from an [`Image`].
 
-use crate::{Context, Image, ImageStore, Result, err};
+use crate::{Context, Image, ImageStore, Result, devfilter, err};
 use caps::CapSet;
 use libcgroups::common::{CgroupManager, ControllerOpt};
 use libcontainer::container::Container;
@@ -262,6 +262,14 @@ impl Runtime {
             bundle,
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
         };
+        // Before its program runs: the devices it may open, and no other. (Where kithd is
+        // root; elsewhere the container is a user namespace, which makes no device node.)
+        if nix::unistd::getuid().is_root()
+            && let Err(e) = devfilter::attach(&handle.cgroup, &allowed(&spec))
+        {
+            let _ = handle.delete();
+            return Err(e).ctx(&what);
+        }
         handle.no_swap(unit, &what)
     }
 
@@ -409,6 +417,49 @@ fn manager(cgroup: &str) -> libcgroups::v2::manager::Manager {
     libcgroups::v2::manager::Manager::new("/sys/fs/cgroup".into(), cgroup.into()).expect("joining two absolute paths")
 }
 
+/// The device rules of a container's spec: each one device it was given (`device_nodes`).
+fn allowed(spec: &Spec) -> Vec<LinuxDeviceCgroup> {
+    let limits = spec.linux().as_ref().and_then(|linux| linux.resources().as_ref());
+    limits.and_then(|limits| limits.devices().clone()).unwrap_or_default()
+}
+
+/// Change `made` so that the node's `path` is the character device numbered `device`, or
+/// (with none) no device of the container's: its nodes and its rules, which are returned.
+/// What a path was is read from `made`, which is kithd's own: the node in the container's
+/// `/dev` is the container's to rename, and to put another in the place of.
+fn regrant(made: &mut Spec, path: &Path, device: Option<u64>) -> Result<Vec<LinuxDeviceCgroup>> {
+    let mut linux = made.linux().clone().unwrap_or_default();
+    let mut nodes = linux.devices().clone().unwrap_or_default();
+    let mut allowed = allowed(made);
+    let was = |node: &LinuxDevice| node.path() == path;
+    for node in nodes.iter().filter(|node| was(node)) {
+        allowed.retain(|rule| (rule.major(), rule.minor()) != (Some(node.major()), Some(node.minor())));
+    }
+    nodes.retain(|node| !was(node));
+    if let Some(device) = device {
+        let (major, minor) = (
+            nix::sys::stat::major(device) as i64,
+            nix::sys::stat::minor(device) as i64,
+        );
+        let node = LinuxDeviceBuilder::default().path(path).typ(LinuxDeviceType::C);
+        nodes.push(node.major(major).minor(minor).build().ctx("a device node")?);
+        let rule = LinuxDeviceCgroupBuilder::default().allow(true).typ(LinuxDeviceType::C);
+        allowed.push(
+            rule.major(major)
+                .minor(minor)
+                .access("rw")
+                .build()
+                .ctx("a device rule")?,
+        );
+    }
+    let mut limits = linux.resources().clone().unwrap_or_default();
+    limits.set_devices(Some(allowed.clone()));
+    linux.set_resources(Some(limits));
+    linux.set_devices(Some(nodes));
+    made.set_linux(Some(linux));
+    Ok(allowed)
+}
+
 /// Is `path` a node of a kind that comes and goes while a unit runs (an input device: a
 /// controller plugged in)? A unit that has one is made those that come later in its `/dev`
 /// as it runs ([`Handle::plug`]).
@@ -464,6 +515,7 @@ impl Handle {
         let (dir, name) = self.in_dev(path)?;
         let node = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
         let mode = nix::sys::stat::Mode::from_bits_truncate(meta.mode() & 0o777);
+        self.allow(made, path, Some(meta.rdev())).ctx(&what)?;
         match nix::sys::stat::mknod(&node, nix::sys::stat::SFlag::S_IFCHR, mode, meta.rdev()) {
             // (There already: the one it had when it started.)
             Err(nix::errno::Errno::EEXIST) => return Ok(()),
@@ -478,14 +530,27 @@ impl Handle {
     /// Take the node at `path` out of the running container's `/dev`: its device is gone.
     pub fn unplug(&self, path: &Path) -> Result<()> {
         use std::os::fd::AsRawFd;
+        let what = format!("taking {} from the container", path.display());
         let (dir, name) = self.in_dev(path)?;
         let node = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd())).join(name);
+        // (Its number is some other device's the next time one is plugged in.)
+        let made = oci_spec::runtime::Spec::load(self.bundle.join("config.json")).ctx(&what)?;
+        self.allow(made, path, None).ctx(&what)?;
         match fs::remove_file(node) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(e).ctx(format!("taking {} from the container", path.display()))
-            }
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).ctx(what),
             _ => Ok(()),
         }
+    }
+
+    /// Let the container read and write the character device numbered `device` that is
+    /// `path` on the node, or, with none, no longer the one that was: in its cgroup's
+    /// filter, and in the spec it was made from (`made`), which is what the next change
+    /// starts from.
+    fn allow(&self, mut made: Spec, path: &Path, device: Option<u64>) -> Result<()> {
+        let allowed = regrant(&mut made, path, device)?;
+        devfilter::attach(&self.cgroup, &allowed)?;
+        made.save(self.bundle.join("config.json"))
+            .ctx("keeping the container's device rules")
     }
 
     /// A memory limit that swap could stretch is no limit. The OCI resources cannot say
@@ -1214,6 +1279,27 @@ mod tests {
         );
         assert_eq!(rule.typ(), Some(oci_spec::runtime::LinuxDeviceType::C));
         assert!(plugged(Path::new("/dev/input/event7")) && !plugged(Path::new("/dev/dri/card0")));
+        // One plugged in later is a node and a rule more. Taken away, it goes by the node's
+        // own name for it: what the container has made of its `/dev` since is not asked.
+        let mut later = made.clone();
+        let has = |rules: &[LinuxDeviceCgroup], major, minor| {
+            let is = |rule: &LinuxDeviceCgroup| (rule.major(), rule.minor()) == (Some(major), Some(minor));
+            rules.iter().any(is)
+        };
+        let pad = Path::new("/dev/input/event5");
+        let with_pad = regrant(&mut later, pad, Some(nix::sys::stat::makedev(13, 69))).unwrap();
+        assert_eq!(with_pad.len(), allowed.len() + 1);
+        assert!(has(&with_pad, 13, 69) && has(&with_pad, 1, 3));
+        assert_eq!(super::allowed(&later), with_pad);
+        assert_eq!(later.linux().as_ref().unwrap().devices().as_ref().unwrap().len(), 2);
+        let without = regrant(&mut later, pad, None).unwrap();
+        assert!(!has(&without, 13, 69) && has(&without, 1, 3));
+        assert_eq!((&without, super::allowed(&later)), (&allowed, allowed.clone()));
+        // One it never had: nothing is taken.
+        assert_eq!(
+            regrant(&mut later, Path::new("/dev/input/event9"), None).unwrap(),
+            allowed
+        );
         // Missing, or not a device node: the unit is not created, and the reason says which.
         let missing = spec(
             "a",

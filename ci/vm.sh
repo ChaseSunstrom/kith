@@ -96,7 +96,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    of their own; a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
-                   writes to /dev/stdout by name; a container that asks for user
+                   writes to /dev/stdout by name; a pod that is root is kept from a
+                   device it was not given (its node's disk); a container that asks for user
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
                    plugged in is given to the container holding the seat as it runs;
@@ -438,25 +439,37 @@ EOF
                 stock='three pods of nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) started the same way, and each said on /dev/stdout that it was asked through their Service'
             fi
 
-            # A sandbox inside a container (bubblewrap as this machine has it; Steam's runtime
-            # and Flatpak start theirs so): a user namespace of its own, with a /proc and a
-            # /dev made in it. NAME, more of its container, and what its Job comes to say.
-            sandbox() {
+            # A Job of one container: NAME, more of its template, its container, and what the
+            # Job comes to say. What it wrote is in $work/NAME.out and .err.
+            job() {
                 cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
-  {"name":"box","image":"kith.test/sandbox:1"$2,"command":["/bin/bwrap","--unshare-user","--uid","0","--gid","0","--unshare-pid","--ro-bind","/","/","--proc","/proc","--dev","/dev","/bin/pod","self"]}]}}}]
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{$2"containers":[
+  {"name":"box",$3}]}}}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
                 waited=0
-                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq "$3|^[0-9]+ (succeeded|failed)( |\$)"; do
+                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq "$4|^[0-9]+ (succeeded|failed)( |\$)"; do
                     waited=$((waited + 1))
                     [ "$waited" -lt 120 ] || fail "waited for the Job $1; it says: $line"
                     sleep 1
                 done
                 any GET "/v1/logs/Job/default/$1" >"$work/$1.out" 2>/dev/null || true
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
-                printf '%s\n' "$line" | grep -Eq "$3" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
+                printf '%s\n' "$line" | grep -Eq "$4" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
             }
+            # What holds a container to its devices: a pod that is root may make device nodes,
+            # and makes /dev/null again and reads it; its node's own disk it may neither make
+            # nor read. (NAME, block or character, and where /sys has the device's numbers.)
+            makes() { job "$1" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"node\",\"$2\",\"$3\",\"/dev/made\"]" '^[0-9]+ succeeded'; }
+            makes null c /sys/class/mem/null/dev
+            grep -q 'node: made 0, read Ok(0)' "$work/null.out" || fail "a pod that is root could not make /dev/null again and read it: $(cat "$work/null.out" "$work/null.err")"
+            makes disk b /sys/class/block/vda/dev
+            grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
+
+            # A sandbox inside a container (bubblewrap as this machine has it; Steam's runtime
+            # and Flatpak start theirs so): a user namespace of its own, with a /proc and a
+            # /dev made in it. NAME, more of its container, and what its Job comes to say.
+            sandbox() { job "$1" '' "\"image\":\"kith.test/sandbox:1\"$2,\"command\":[\"/bin/bwrap\",\"--unshare-user\",\"--uid\",\"0\",\"--gid\",\"0\",\"--unshare-pid\",\"--ro-bind\",\"/\",\"/\",\"--proc\",\"/proc\",\"--dev\",\"/dev\",\"/bin/pod\",\"self\"]" "$3"; }
             # Only a container that asks may, and never one that is the node's root.
             sandbox boxed ',"userNamespaces":true' '^[0-9]+ succeeded'
             grep -q 'nested: pid 2, uid 0' "$work/boxed.out" || fail "the sandbox did not say where it found itself: $(cat "$work/boxed.out" "$work/boxed.err")"
@@ -504,7 +517,7 @@ print(len(units), sum(u.get("restarts", 0) for u in units))' "$work/found.json")
             [ "$again" = '1 0' ] || fail "the session was started again for its keyboard (units, restarts): $again"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again"
             exit 0
         fi
         if [ "$test" = kube ]; then

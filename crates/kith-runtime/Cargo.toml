@@ -11,6 +11,8 @@ libcontainer = { version = "0.7", default-features = false, features = ["v2"] }
 # Already in the tree through libcontainer: exec units get their cgroup from it directly.
 libcgroups = { version = "0.7", default-features = false, features = ["v2"] }
 oci-spec = "0.10"
+# bpf(2) for a cgroup's device filter: the workspace's unsafe code is in this one crate.
+kith-dm-sys = { path = "../kith-dm-sys" }
 # TLS through rustls with ring: smaller than the default aws-lc and no cmake.
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

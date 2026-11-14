@@ -10,6 +10,9 @@
 //!   pod seen DIR               for as long as it runs, say the names in DIR each time they
 //!                              change: those it can open with a `+`, the others with a `-`
 //!   pod self                   say which process it is and whose, where it finds itself
+//!   pod node b|c NUMBERS PATH  make at PATH a node of the block or character device whose
+//!                              MAJOR:MINOR the file NUMBERS holds (one of /sys), read from
+//!                              it, and say how both went
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -88,6 +91,30 @@ fn main() {
             let uid = status.lines().find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next());
             println!("nested: pid {}, uid {}", std::process::id(), uid.unwrap_or("?"));
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR | pod self"),
+        ["node", kind, numbers, path] => {
+            let said = std::fs::read_to_string(numbers).expect("the device's numbers");
+            let (major, minor) = said.trim().split_once(':').expect("MAJOR:MINOR");
+            let (major, minor): (u64, u64) = (major.parse().expect("a major"), minor.parse().expect("a minor"));
+            let device = (major & 0xfff) << 8 | minor & 0xff | (minor & !0xff) << 12 | (major & !0xfff) << 32;
+            let mode: u64 = if *kind == "b" { 0o060600 } else { 0o020600 };
+            let name = std::ffi::CString::new(*path).expect("a path");
+            // mknod(2), by x86-64's number for it, asked of the kernel itself: this file has
+            // only std, which makes no device nodes. What it answers: 0, or minus an errno.
+            let mut made: i64 = 133;
+            unsafe {
+                std::arch::asm!(
+                    "syscall",
+                    inlateout("rax") made,
+                    in("rdi") name.as_ptr(),
+                    in("rsi") mode,
+                    in("rdx") device,
+                    lateout("rcx") _,
+                    lateout("r11") _,
+                );
+            }
+            let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
+            println!("node: made {made}, read {read:?}");
+        }
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR | pod self | pod node b|c NUMBERS PATH"),
     }
 }
