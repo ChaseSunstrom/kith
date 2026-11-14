@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1042.3 978" width="1042.3" height="978" role="img" aria-labelledby="t d" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace">
+<title id="t">kith OS: from power-on, and through an update</title><desc id="d">Firmware → systemd-boot; systemd-boot → Kernel image, slot a or b (one try fewer); Kernel image, slot a or b → Root, 6 MB (a changed block is refused); Root, 6 MB → kithd, the first process; kithd, the first process → config (reads); kithd, the first process → state (mounts); kithd, the first process → OSRelease (one node at a time); OSRelease → The other slot (written); The other slot → Marked good (restart)</desc>
+<style>.f{animation:f 1.7s linear infinite}@keyframes f{to{stroke-dashoffset:-17}}@media (prefers-reduced-motion:reduce){.f{animation:none}}</style>
+<rect width="1042.3" height="978" rx="10" fill="#F6F5F1"/>
+<text x="28" y="42" font-size="16" font-weight="700" fill="#16181D">kith OS: from power-on, and through an update</text>
+<rect x="344.9" y="66.5" width="352.5" height="494" rx="6" fill="#EDECE9" stroke="#CECDCB"/>
+<rect x="358.4" y="75" width="23.6" height="16" rx="2" fill="#2F5FE0"/>
+<text x="363.4" y="87" font-size="11" font-weight="700" fill="#F6F5F1">01</text>
+<text x="392" y="87" font-size="11" font-weight="700" letter-spacing=".9" fill="#16181D">EVERY START<tspan font-weight="400" letter-spacing="0" fill="#666769"> · a read-only root, checked</tspan></text>
+<path d="M344.4 96L697.9 96" fill="none" stroke="#CECDCB" stroke-width="1"/>
+<path d="M341.4 73V63H351.4M690.9 63H700.9V73M700.9 554V564H690.9M351.4 564H341.4V554" fill="none" stroke="#2F5FE0" stroke-width="1.5"/>
+<rect x="28.5" y="752.5" width="566.7" height="98" rx="6" fill="#EDECE9" stroke="#CECDCB"/>
+<rect x="42" y="761" width="23.6" height="16" rx="2" fill="#8F5F00"/>
+<text x="47" y="773" font-size="11" font-weight="700" fill="#F6F5F1">02</text>
+<text x="75.6" y="773" font-size="11" font-weight="700" letter-spacing=".9" fill="#16181D">WHAT A NODE KEEPS<tspan font-weight="400" letter-spacing="0" fill="#666769"> · partitions no update replaces</tspan></text>
+<path d="M28 782L595.7 782" fill="none" stroke="#CECDCB" stroke-width="1"/>
+<path d="M25 759V749H35M588.7 749H598.7V759M598.7 844V854H588.7M35 854H25V844" fill="none" stroke="#8F5F00" stroke-width="1.5"/>
+<rect x="622.2" y="653.5" width="391.6" height="296" rx="6" fill="#EDECE9" stroke="#CECDCB"/>
+<rect x="635.7" y="662" width="23.6" height="16" rx="2" fill="#2F5FE0"/>
+<text x="640.7" y="674" font-size="11" font-weight="700" fill="#F6F5F1">03</text>
+<text x="669.3" y="674" font-size="11" font-weight="700" letter-spacing=".9" fill="#16181D">AN UPDATE<tspan font-weight="400" letter-spacing="0" fill="#666769"> · into the slot that is not running</tspan></text>
+<path d="M621.7 683L1014.3 683" fill="none" stroke="#CECDCB" stroke-width="1"/>
+<path d="M618.7 660V650H628.7M1007.3 650H1017.3V660M1017.3 943V953H1007.3M628.7 953H618.7V943" fill="none" stroke="#2F5FE0" stroke-width="1.5"/>
+<path d="M521.1 149C521.1 175 521.1 175 521.1 201" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 149C521.1 175 521.1 175 521.1 201" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M521.1 201 L517.1 193 L525.1 193Z" fill="#2F5FE0"/>
+<path d="M521.1 248C521.1 274 521.1 274 521.1 300" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 248C521.1 274 521.1 274 521.1 300" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M521.1 300 L517.1 292 L525.1 292Z" fill="#2F5FE0"/>
+<rect x="475.8" y="265" width="90.6" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="521.1" y="277" font-size="10" text-anchor="middle" fill="#16181D">one try fewer</text>
+<path d="M521.1 347C521.1 373 521.1 373 521.1 399" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 347C521.1 373 521.1 373 521.1 399" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M521.1 399 L517.1 391 L525.1 391Z" fill="#2F5FE0"/>
+<rect x="435.5" y="364" width="171.2" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="521.1" y="376" font-size="10" text-anchor="middle" fill="#16181D">a changed block is refused</text>
+<path d="M521.1 446C521.1 472 521.1 472 521.1 498" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 446C521.1 472 521.1 472 521.1 498" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M521.1 498 L517.1 490 L525.1 490Z" fill="#2F5FE0"/>
+<path d="M521.1 545C521.1 666.5 159.1 666.5 159.1 788" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 545C521.1 666.5 159.1 666.5 159.1 788" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M159.1 788 L155.1 780 L163.1 780Z" fill="#2F5FE0"/>
+<rect x="319.6" y="657.5" width="41" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="340.1" y="669.5" font-size="10" text-anchor="middle" fill="#16181D">reads</text>
+<path d="M521.1 545C521.1 666.5 433.9 666.5 433.9 788" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 545C521.1 666.5 433.9 666.5 433.9 788" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M433.9 788 L429.9 780 L437.9 780Z" fill="#2F5FE0"/>
+<rect x="453.9" y="657.5" width="47.2" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="477.5" y="669.5" font-size="10" text-anchor="middle" fill="#16181D">mounts</text>
+<path d="M521.1 545C521.1 617 818 617 818 689" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M521.1 545C521.1 617 818 617 818 689" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M818 689 L814 681 L822 681Z" fill="#2F5FE0"/>
+<rect x="608.8" y="608" width="121.6" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="669.6" y="620" font-size="10" text-anchor="middle" fill="#16181D">one node at a time</text>
+<path d="M818 736C818 762 818 762 818 788" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M818 736C818 762 818 762 818 788" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M818 788 L814 780 L822 780Z" fill="#2F5FE0"/>
+<rect x="791.3" y="753" width="53.4" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="818" y="765" font-size="10" text-anchor="middle" fill="#16181D">written</text>
+<path d="M818 835C818 861 818 861 818 887" fill="none" stroke="#2F5FE0" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M818 835C818 861 818 861 818 887" fill="none" stroke="#2F5FE0" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M818 887 L814 879 L822 879Z" fill="#2F5FE0"/>
+<rect x="791.3" y="852" width="53.4" height="16" rx="3" fill="#F6F5F1" stroke="#CECDCB"/>
+<text x="818" y="864" font-size="10" text-anchor="middle" fill="#16181D">restart</text>
+<rect x="465.9" y="102" width="110.5" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="481.9" cy="118.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="481.9" cy="118.5" r="3.5" fill="#2F5FE0"/>
+<text x="499.9" y="122" font-size="13" font-weight="600" fill="#16181D">Firmware</text>
+<text x="499.9" y="137" font-size="11" fill="#666769">UEFI</text>
+<rect x="378.8" y="201" width="284.7" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="394.8" cy="217.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="394.8" cy="217.5" r="3.5" fill="#2F5FE0"/>
+<text x="412.8" y="221" font-size="13" font-weight="600" fill="#16181D">systemd-boot</text>
+<text x="412.8" y="236" font-size="11" fill="#666769">newest kernel image with tries left</text>
+<rect x="397.4" y="300" width="247.5" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="413.4" cy="316.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="413.4" cy="316.5" r="3.5" fill="#2F5FE0"/>
+<text x="431.4" y="320" font-size="13" font-weight="600" fill="#16181D">Kernel image, slot a or b</text>
+<text x="431.4" y="335" font-size="11" fill="#666769">names its root&#x27;s hash</text>
+<rect x="416.3" y="399" width="209.7" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="432.3" cy="415.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="432.3" cy="415.5" r="3.5" fill="#2F5FE0"/>
+<text x="450.3" y="419" font-size="13" font-weight="600" fill="#16181D">Root, 6 MB</text>
+<text x="450.3" y="434" font-size="11" fill="#666769">squashfs under dm-verity</text>
+<rect x="401.4" y="498" width="239.4" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="417.4" cy="514.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="417.4" cy="514.5" r="3.5" fill="#2F5FE0"/>
+<text x="435.4" y="518" font-size="13" font-weight="600" fill="#16181D">kithd, the first process</text>
+<text x="435.4" y="533" font-size="11" fill="#666769">crates/kithd/src/init.rs</text>
+<rect x="44" y="788" width="230.1" height="47" rx="4" fill="#F6F5F1" stroke="#8F5F00" stroke-width="1.25"/>
+<circle cx="60" cy="804.5" r="7" fill="#8F5F00" opacity=".18"/>
+<circle cx="60" cy="804.5" r="3.5" fill="#8F5F00"/>
+<text x="78" y="808" font-size="13" font-weight="600" fill="#16181D">config</text>
+<text x="78" y="823" font-size="11" fill="#666769">what the installer was told</text>
+<rect x="288.1" y="788" width="291.5" height="47" rx="4" fill="#F6F5F1" stroke="#8F5F00" stroke-width="1.25"/>
+<circle cx="304.1" cy="804.5" r="7" fill="#8F5F00" opacity=".18"/>
+<circle cx="304.1" cy="804.5" r="3.5" fill="#8F5F00"/>
+<text x="322.1" y="808" font-size="13" font-weight="600" fill="#16181D">state</text>
+<text x="322.1" y="823" font-size="11" fill="#666769">grows to its disk · may be encrypted</text>
+<rect x="702.9" y="689" width="230.1" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="718.9" cy="705.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="718.9" cy="705.5" r="3.5" fill="#2F5FE0"/>
+<text x="736.9" y="709" font-size="13" font-weight="600" fill="#16181D">OSRelease</text>
+<text x="736.9" y="724" font-size="11" fill="#666769">signed by the release&#x27;s key</text>
+<rect x="679" y="788" width="277.9" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="695" cy="804.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="695" cy="804.5" r="3.5" fill="#2F5FE0"/>
+<text x="713" y="808" font-size="13" font-weight="600" fill="#16181D">The other slot</text>
+<text x="713" y="823" font-size="11" fill="#666769">root, verity tree, kernel image +3</text>
+<rect x="668.8" y="887" width="298.3" height="47" rx="4" fill="#F6F5F1" stroke="#2F5FE0" stroke-width="1.25"/>
+<circle cx="684.8" cy="903.5" r="7" fill="#2F5FE0" opacity=".18"/>
+<circle cx="684.8" cy="903.5" r="3.5" fill="#2F5FE0"/>
+<text x="702.8" y="907" font-size="13" font-weight="600" fill="#16181D">Marked good</text>
+<text x="702.8" y="922" font-size="11" fill="#666769">or back to the old slot after 3 tries</text>
+</svg>

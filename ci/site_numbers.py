@@ -10,6 +10,8 @@ Where each comes from:
     kinds                                           README.md's count, which a test holds to the code
     tests, vm_tests, crates, rust_lines, refused,   counted in the sources\n    refused.names, by_crate
     cmp.*                                           ci/compare.txt (sh ci/compare.sh): the middle run
+The comparison is drawn too, for README.md: docs/assets/diagrams/beside-k3s-light.svg and
+-dark.svg, from the same cmp.* numbers (--check fails on a drawing of other numbers).
 What cannot be measured now (no image built, no comparison run) keeps the value it had.
 
 In the page, `<b data-n="KEY">` is given the number as its text, and the block
@@ -73,6 +75,48 @@ def compared():
     return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in n.items()}
 
 
+# The drawing's colours: surface, text, quiet text, then kith and k3s. (The two series were
+# checked as a pair on each surface, for every kind of colour sight: they differ by 29 or
+# more where 8 is the floor. Each bar is named and numbered beside it all the same.)
+SCHEMES = {"light": ("#f6f5f1", "#16181d", "#575c69", "#2f5fe0", "#8f5f00"), "dark": ("#16181d", "#f6f5f1", "#a9aebb", "#5b8cff", "#b98426")}
+ROWS = [  # each its own scale: they are not one measure
+    ("control", "MB", "Memory in use, idle: the first node, or the server"),
+    ("worker", "MB", "Memory in use, idle: another node, or an agent"),
+    ("apply", "s", "From apply to a ready container"),
+    ("lost", "s", "A node lost: its replica ready on another"),
+]
+
+
+def chart(n, scheme):
+    """ci/compare.txt's middle runs as bars, a pair for each thing measured."""
+    surface, text, quiet, *colours = SCHEMES[scheme]
+    rows = [(label, unit, [n[f"cmp.{system}.{key}"] for system in ("kith", "k3s")]) for key, unit, label in ROWS if all(f"cmp.{system}.{key}" in n for system in ("kith", "k3s"))]
+    left, full, top, tall = 24, 560, 92, 62
+    said = "; ".join(f"{label}: kith {a} {unit}, k3s {b} {unit}" for label, unit, (a, b) in rows)
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 {top + tall * len(rows) + 8}" role="img" font-family="ui-sans-serif, system-ui, sans-serif">',
+        f"<title>kith beside k3s, measured</title><desc>{said}.</desc>",
+        f'<rect width="100%" height="100%" rx="10" fill="{surface}"/>',
+        f'<text x="{left}" y="36" font-size="17" font-weight="700" fill="{text}">kith beside k3s {n["cmp.k3s.version"]}, measured</text>',
+        f'<text x="{left}" y="58" font-size="12.5" fill="{quiet}">Three QEMU machines each, the middle of {n["cmp.runs"]} runs (ci/compare.sh). Shorter is less; each pair has its own scale.</text>',
+    ]
+    for at, (name, colour) in enumerate(zip(("kith", "k3s"), colours)):
+        out.append(f'<rect x="{720 + at * 70}" y="26" width="12" height="12" rx="2" fill="{colour}"/><text x="{738 + at * 70}" y="36.5" font-size="13" fill="{text}">{name}</text>')
+    for row, (label, unit, values) in enumerate(rows):
+        y = top + row * tall
+        out.append(f'<text x="{left}" y="{y}" font-size="13.5" fill="{text}">{label}</text>')
+        for at, (value, colour, name) in enumerate(zip(values, colours, ("kith", "k3s"))):
+            wide, by = max(6, round(full * value / (max(values) or 1))), y + 10 + at * 16
+            # (Flat where it starts, round where it ends.)
+            out.append(f'<path d="M{left} {by}h{wide - 4}a4 4 0 0 1 4 4v6a4 4 0 0 1 -4 4h-{wide - 4}z" fill="{colour}"/>')
+            out.append(f'<text x="{left + wide + 8}" y="{by + 11}" font-size="12.5" fill="{text}"><tspan font-weight="700">{value} {unit}</tspan><tspan dx="6" fill="{quiet}">{name}</tspan></text>')
+    return "\n".join(out) + "\n</svg>\n"
+
+
+def charts(n):
+    return {ROOT / f"docs/assets/diagrams/beside-k3s-{scheme}.svg": chart(n, scheme) for scheme in SCHEMES}
+
+
 def filled(page, n):
     """The page with every number in its place; and the keys it asks for that there are none of."""
     missing = []
@@ -110,10 +154,15 @@ def main():
             sys.exit("docs/numbers.json has other numbers beside k3s than ci/compare.txt: python3 ci/site_numbers.py takes them")
         if page != PAGE.read_text():
             sys.exit("docs/index.html shows other numbers than docs/numbers.json: python3 ci/site_numbers.py puts them in")
+        for file, drawn in charts(n).items():
+            if not file.exists() or file.read_text() != drawn:
+                sys.exit(f"{file.relative_to(ROOT)} draws other numbers than docs/numbers.json: python3 ci/site_numbers.py draws it again")
         print(f"ok: {len(re.findall('data-n=', page))} numbers in the page, all from docs/numbers.json")
         return
     FILE.write_text(json.dumps(n, indent=1) + "\n")
     PAGE.write_text(page)
+    for file, drawn in charts(n).items():
+        file.write_text(drawn)
     print(json.dumps(n, indent=1))
 
 

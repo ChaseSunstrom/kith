@@ -1,0 +1,129 @@
+{
+  "title": "kith OS: from power-on, and through an update",
+  "direction": "TB",
+  "motion": true,
+  "groups": [
+    {
+      "id": "start",
+      "label": "Every start",
+      "sub": "a read-only root, checked"
+    },
+    {
+      "id": "keeps",
+      "label": "What a node keeps",
+      "sub": "partitions no update replaces"
+    },
+    {
+      "id": "update",
+      "label": "An update",
+      "sub": "into the slot that is not running"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "firmware",
+      "label": "Firmware",
+      "sub": "UEFI",
+      "group": "start"
+    },
+    {
+      "id": "loader",
+      "label": "systemd-boot",
+      "sub": "newest kernel image with tries left",
+      "group": "start"
+    },
+    {
+      "id": "kernel",
+      "label": "Kernel image, slot a or b",
+      "sub": "names its root's hash",
+      "group": "start"
+    },
+    {
+      "id": "root",
+      "label": "Root, 6 MB",
+      "sub": "squashfs under dm-verity",
+      "group": "start"
+    },
+    {
+      "id": "kithd",
+      "label": "kithd, the first process",
+      "sub": "crates/kithd/src/init.rs",
+      "group": "start"
+    },
+    {
+      "id": "config",
+      "label": "config",
+      "sub": "what the installer was told",
+      "group": "keeps"
+    },
+    {
+      "id": "state",
+      "label": "state",
+      "sub": "grows to its disk · may be encrypted",
+      "group": "keeps"
+    },
+    {
+      "id": "release",
+      "label": "OSRelease",
+      "sub": "signed by the release's key",
+      "group": "update"
+    },
+    {
+      "id": "other",
+      "label": "The other slot",
+      "sub": "root, verity tree, kernel image +3",
+      "group": "update"
+    },
+    {
+      "id": "good",
+      "label": "Marked good",
+      "sub": "or back to the old slot after 3 tries",
+      "group": "update"
+    }
+  ],
+  "edges": [
+    {
+      "from": "firmware",
+      "to": "loader"
+    },
+    {
+      "from": "loader",
+      "to": "kernel",
+      "label": "one try fewer"
+    },
+    {
+      "from": "kernel",
+      "to": "root",
+      "label": "a changed block is refused"
+    },
+    {
+      "from": "root",
+      "to": "kithd"
+    },
+    {
+      "from": "kithd",
+      "to": "config",
+      "label": "reads"
+    },
+    {
+      "from": "kithd",
+      "to": "state",
+      "label": "mounts"
+    },
+    {
+      "from": "kithd",
+      "to": "release",
+      "label": "one node at a time"
+    },
+    {
+      "from": "release",
+      "to": "other",
+      "label": "written"
+    },
+    {
+      "from": "other",
+      "to": "good",
+      "label": "restart"
+    }
+  ]
+}

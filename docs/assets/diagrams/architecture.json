@@ -1,0 +1,145 @@
+{
+  "title": "One process on every node",
+  "motion": true,
+  "groups": [
+    {
+      "id": "you",
+      "label": "You",
+      "sub": "a terminal or a browser"
+    },
+    {
+      "id": "kithd",
+      "label": "kithd",
+      "sub": "one process on each node"
+    },
+    {
+      "id": "node",
+      "label": "This node"
+    },
+    {
+      "id": "others",
+      "label": "Every other node"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "cli",
+      "label": "kith",
+      "sub": "crates/kith-cli",
+      "group": "you"
+    },
+    {
+      "id": "ui",
+      "label": "Web UI",
+      "sub": "crates/kithd/ui",
+      "group": "you"
+    },
+    {
+      "id": "api",
+      "label": "Resource API",
+      "sub": "api.rs · /v1",
+      "group": "kithd"
+    },
+    {
+      "id": "store",
+      "label": "Store",
+      "sub": "kith-store · Raft over redb",
+      "group": "kithd"
+    },
+    {
+      "id": "sched",
+      "label": "Scheduler",
+      "sub": "kith-sched · on the leader",
+      "group": "kithd"
+    },
+    {
+      "id": "controller",
+      "label": "Controller",
+      "sub": "controller.rs",
+      "group": "kithd"
+    },
+    {
+      "id": "net",
+      "label": "Mesh, Services, DNS",
+      "sub": "kith-mesh · services.rs · kith-dns",
+      "group": "kithd"
+    },
+    {
+      "id": "cluster",
+      "label": "Cluster",
+      "sub": "cluster.rs · TLS, both ends known",
+      "group": "kithd"
+    },
+    {
+      "id": "runtime",
+      "label": "Containers, processes, VMs",
+      "sub": "kith-runtime · no containerd",
+      "group": "node"
+    },
+    {
+      "id": "wg",
+      "label": "WireGuard",
+      "sub": "with --mesh · a tunnel to each node",
+      "group": "node"
+    },
+    {
+      "id": "peers",
+      "label": "kithd",
+      "sub": "the same process, the same store",
+      "group": "others"
+    }
+  ],
+  "edges": [
+    {
+      "from": "cli",
+      "to": "api",
+      "label": "apply, get, logs"
+    },
+    {
+      "from": "ui",
+      "to": "api",
+      "label": "watch"
+    },
+    {
+      "from": "api",
+      "to": "store",
+      "label": "all or nothing"
+    },
+    {
+      "from": "store",
+      "to": "sched",
+      "label": "placement"
+    },
+    {
+      "from": "store",
+      "to": "controller",
+      "label": "replicas"
+    },
+    {
+      "from": "controller",
+      "to": "runtime",
+      "label": "start, stop"
+    },
+    {
+      "from": "store",
+      "to": "net",
+      "label": "names, peers"
+    },
+    {
+      "from": "net",
+      "to": "wg",
+      "label": "peers"
+    },
+    {
+      "from": "store",
+      "to": "cluster",
+      "label": "the log"
+    },
+    {
+      "from": "cluster",
+      "to": "peers",
+      "label": "Raft"
+    }
+  ],
+  "direction": "TB"
+}

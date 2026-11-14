@@ -65,8 +65,8 @@
 </section>
 
 <section class="strip" data-see aria-label="kith in four numbers">
-  <div class="stat"><b><span data-n="kithd.size" data-count>12.55</span><small>MB</small></b><p><code>kithd</code>: the store, the scheduler and the runtime in one static binary</p></div>
-  <div class="stat"><b><span data-n="kithd.idle" data-count>8.38</span><small>MB</small></b><p>of memory held by <code>kithd</code> with nothing to do</p></div>
+  <div class="stat"><b><span data-n="kithd.size" data-count>12.56</span><small>MB</small></b><p><code>kithd</code>: the store, the scheduler and the runtime in one static binary</p></div>
+  <div class="stat"><b><span data-n="kithd.idle" data-count>8.37</span><small>MB</small></b><p>of memory held by <code>kithd</code> with nothing to do</p></div>
   <div class="stat"><b><span data-n="os.update" data-count>32.2</span><small>MB</small></b><p>a whole kith OS update: kernel, root and its hash tree</p></div>
   <div class="stat"><b><span data-n="kinds" data-count>33</span></b><p>built-in kinds of resource, all in one strict schema</p></div>
 </section>
@@ -182,9 +182,9 @@
   </div>
   <div class="panel bars">
     <div class="row" data-v="kith.size" data-of="kith.size.budget"><p><code>kith</code>, the command</p><div class="track"><i></i></div><b><span data-n="kith.size">2.84</span> MB <small>of <span data-n="kith.size.budget">3</span></small></b></div>
-    <div class="row" data-v="kithd.size" data-of="kithd.size.budget"><p><code>kithd</code>, everything else</p><div class="track"><i></i></div><b><span data-n="kithd.size">12.55</span> MB <small>of <span data-n="kithd.size.budget">13</span></small></b></div>
-    <div class="row" data-v="kithd.idle" data-of="kithd.idle.budget"><p><code>kithd</code> idle, memory</p><div class="track"><i></i></div><b><span data-n="kithd.idle">8.38</span> MB <small>of <span data-n="kithd.idle.budget">9</span></small></b></div>
-    <div class="row" data-v="apply.peak" data-of="apply.peak.budget"><p><code>kith apply</code>, peak memory</p><div class="track"><i></i></div><b><span data-n="apply.peak">2.77</span> MB <small>of <span data-n="apply.peak.budget">4</span></small></b></div>
+    <div class="row" data-v="kithd.size" data-of="kithd.size.budget"><p><code>kithd</code>, everything else</p><div class="track"><i></i></div><b><span data-n="kithd.size">12.56</span> MB <small>of <span data-n="kithd.size.budget">13</span></small></b></div>
+    <div class="row" data-v="kithd.idle" data-of="kithd.idle.budget"><p><code>kithd</code> idle, memory</p><div class="track"><i></i></div><b><span data-n="kithd.idle">8.37</span> MB <small>of <span data-n="kithd.idle.budget">9</span></small></b></div>
+    <div class="row" data-v="apply.peak" data-of="apply.peak.budget"><p><code>kith apply</code>, peak memory</p><div class="track"><i></i></div><b><span data-n="apply.peak">2.51</span> MB <small>of <span data-n="apply.peak.budget">4</span></small></b></div>
     <p class="fine">Static binaries for x86-64. The line at the right of each bar is its budget.</p>
   </div>
 
@@ -201,9 +201,9 @@
   </div>
 
   <div class="counts">
-    <div><b data-n="tests" data-count>399</b><p>tests in the tree</p></div>
+    <div><b data-n="tests" data-count>405</b><p>tests in the tree</p></div>
     <div><b data-n="vm_tests" data-count>10</b><p>more that boot whole machines in QEMU</p></div>
-    <div><b data-n="rust_lines" data-count>49208</b><p>lines of Rust, with <code>unsafe</code> forbidden outside one small crate</p></div>
+    <div><b data-n="rust_lines" data-count>49860</b><p>lines of Rust, with <code>unsafe</code> forbidden outside one small crate</p></div>
     <div><b data-n="crates" data-count>11</b><p>crates in one workspace</p></div>
   </div>
 </section>
@@ -229,7 +229,7 @@
     <figcaption>The page every node serves <span class="dim">kith ui</span></figcaption>
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="ui-dark.png">
-      <img src="ui.png" width="1440" height="900" loading="lazy" alt="The web UI: the kinds as stops on a line, three nodes and their replicas as a line map, a list of Workloads, and one Workload's form">
+      <img src="ui-light.png" width="1440" height="900" loading="lazy" alt="The web UI: the kinds as stops on a line, three nodes and their replicas as a line map, a list of Workloads, and one Workload's form">
     </picture>
     <p class="fine">Three nodes on one machine, photographed by <code>ci/ui_shots.py</code>. A form for every kind, drawn from its schema; an apply shows its diff first.</p>
   </figure>
@@ -290,7 +290,7 @@
   <p class="dim">Numbers measured on <span data-n="measured">2026-11-14</span> by <code>ci/site_numbers.py</code>. This page loads nothing from anywhere else.</p>
 </footer>
 
-<script id="measured" type="application/json">{"apply.peak": 2.77, "apply.peak.budget": 4, "by_crate": {"kith-cli": [4497, 30], "kith-yaml": [942, 9], "kith-api": [3869, 30], "kith-packages": [852, 8], "kith-sched": [913, 21], "kith-runtime": [3146, 21], "kith-dns": [2351, 41], "kith-mesh": [789, 2], "kith-store": [1085, 7], "kith-dm-sys": [203, 3], "kithd": [30561, 227]}, "cmp.k3s.apply": 0.53, "cmp.k3s.before": 233, "cmp.k3s.control": 994, "cmp.k3s.lost": 351, "cmp.k3s.lost60": 60, "cmp.k3s.version": "v1.37.2", "cmp.k3s.worker": 454, "cmp.kith.apply": 0.03, "cmp.kith.boot": 2.5, "cmp.kith.control": 64, "cmp.kith.lost": 300, "cmp.kith.lost60": 60, "cmp.kith.worker": 64, "cmp.runs": 3, "crates": 11, "kinds": 33, "kith.size": 2.84, "kith.size.budget": 3, "kithd.idle": 8.38, "kithd.idle.budget": 9, "kithd.size": 12.55, "kithd.size.budget": 13, "measured": "2026-11-14", "os.image": 282, "os.root": 6.3, "os.update": 32.2, "refused": 40, "refused.names": ["mount", "umount2", "pivot_root", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "open_by_handle_at", "unshare", "setns", "clone", "clone3", "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "reboot", "swapon", "swapoff", "acct", "settimeofday", "clock_settime", "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "add_key", "request_key", "keyctl", "ptrace", "process_vm_readv", "process_vm_writev", "kcmp", "pidfd_getfd"], "rust_lines": 49208, "tests": 399, "version": "1.0.0", "vm_tests": 10}</script>
+<script id="measured" type="application/json">{"apply.peak": 2.51, "apply.peak.budget": 4, "by_crate": {"kith-cli": [4497, 30], "kith-yaml": [942, 9], "kith-api": [3869, 30], "kith-packages": [852, 8], "kith-sched": [913, 21], "kith-runtime": [3146, 21], "kith-dns": [2351, 41], "kith-mesh": [789, 2], "kith-store": [1085, 7], "kith-dm-sys": [227, 3], "kithd": [31189, 233]}, "cmp.k3s.apply": 0.53, "cmp.k3s.before": 233, "cmp.k3s.control": 994, "cmp.k3s.lost": 351, "cmp.k3s.lost60": 60, "cmp.k3s.version": "v1.37.2", "cmp.k3s.worker": 454, "cmp.kith.apply": 0.03, "cmp.kith.boot": 2.5, "cmp.kith.control": 64, "cmp.kith.lost": 300, "cmp.kith.lost60": 60, "cmp.kith.worker": 64, "cmp.runs": 3, "crates": 11, "kinds": 33, "kith.size": 2.84, "kith.size.budget": 3, "kithd.idle": 8.37, "kithd.idle.budget": 9, "kithd.size": 12.56, "kithd.size.budget": 13, "measured": "2026-11-14", "os.image": 282, "os.root": 6.3, "os.update": 32.2, "refused": 40, "refused.names": ["mount", "umount2", "pivot_root", "open_tree", "move_mount", "fsopen", "fsconfig", "fsmount", "fspick", "mount_setattr", "open_by_handle_at", "unshare", "setns", "clone", "clone3", "init_module", "finit_module", "delete_module", "kexec_load", "kexec_file_load", "reboot", "swapon", "swapoff", "acct", "settimeofday", "clock_settime", "bpf", "perf_event_open", "userfaultfd", "io_uring_setup", "io_uring_enter", "io_uring_register", "add_key", "request_key", "keyctl", "ptrace", "process_vm_readv", "process_vm_writev", "kcmp", "pidfd_getfd"], "rust_lines": 49860, "tests": 405, "version": "1.0.0", "vm_tests": 10}</script>
 <script src="site.js"></script>
 </body>
 </html>

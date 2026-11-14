@@ -3,10 +3,126 @@
 > **kith** *(n.)* one's close circle; the people you trust.
 
 A tiny, immutable operating system that turns all of your machines into one
-cluster, configured entirely through declarative resources. The design is in
-[PLAN.md](PLAN.md).
+cluster, configured entirely through declarative resources. On every node one
+process, `kithd`, is the API, the store, the scheduler and the container
+runtime (under 13 MB, a budget the build is held to); `kith` is the command you
+drive it with.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/ui-dark.png">
+  <img src="docs/ui-light.png" alt="kith's web UI over a cluster of three nodes: the kinds down the left as stops on a line, the nodes and each workload's replicas drawn as a line map, the list of Workloads, and the form of the one that is open" width="100%">
+</picture>
 
 A page that shows it, with every number measured: <https://chasesunstrom.github.io/kith/>.
+The design is in [PLAN.md](PLAN.md); what was read for security, and what kith
+does not defend against, in [SECURITY.md](SECURITY.md).
+
+## First run
+
+On one Linux machine, as you: no root, an existing distribution (it needs
+cgroup v2 and a systemd user session, which a current desktop or server has)
+and a Rust toolchain. Most of the time it takes is the build.
+
+1. Build the two programs and put them on your path.
+
+   ```sh
+   cargo build --release
+   export PATH=$PWD/target/release:$PATH
+   kith --version
+   ```
+
+   You should see `kith 1.0.0`.
+
+2. Start the daemon.
+
+   ```sh
+   kithd &
+   ```
+
+   You should see `kithd: serving …/kithd.sock` (a socket under `/run/user/`
+   that only you can open), and after it where the state is kept.
+
+3. Apply the smallest example: one container that says hello every five
+   seconds ([examples/hello.yaml](examples/hello.yaml), 14 lines).
+
+   ```sh
+   kith apply -f examples/hello.yaml
+   ```
+
+   You should see `Workload/default/hello created (revision 1)`.
+
+4. Look at what there is. The first time its image is pulled, which takes a
+   few seconds; ask again until it is ready.
+
+   ```sh
+   kith get
+   ```
+
+   You should see `hello  1         1/1 ready`.
+
+5. Read what it says.
+
+   ```sh
+   kith logs workload/hello
+   ```
+
+   You should see `hello from w_default_hello_0_main`, a line for every five
+   seconds it has run.
+
+6. Open the web UI: the picture above, with your one Workload in it.
+
+   ```sh
+   kith ui
+   ```
+
+   You should see `http://127.0.0.1:…/ui/`. Open that address in a browser on
+   the same machine; ctrl-c ends it.
+
+7. Take the Workload away again.
+
+   ```sh
+   kith delete workload/hello
+   ```
+
+   You should see `Workload/default/hello deleted`.
+
+That is all of it on one machine. `kill %1` stops the daemon; what you applied
+is still there when it starts again.
+
+## What do you want to do?
+
+| To | Read |
+|---|---|
+| Run containers, plain processes and jobs, and change them safely | [What kithd does today](#what-kithd-does-today) |
+| Make several machines one cluster | [More than one node](#more-than-one-node) |
+| Give what runs a name, inside and outside | [DNS](#dns); a host of its own with a certificate: [More than one node](#more-than-one-node) |
+| Install an app with its settings, and upgrade it | [Packages](#packages) |
+| Keep a cluster in step with a git repository | [Sources (GitOps)](#sources-gitops) |
+| Bring manifests or a chart over from Kubernetes | [Importing from Kubernetes and Helm](#importing-from-kubernetes-and-helm) |
+| Add a kind of your own, with its controller | [Kinds of your own](#kinds-of-your-own) |
+| Let other people and programs in, each with their own rights | [Who may do what](#who-may-do-what) |
+| Hand out GPUs and seats, run virtual machines | [Hardware](#hardware) |
+| Keep data: volumes, shares, replicas, backups | [Storage](#storage) |
+| See it and change it in a browser | [Web UI](#web-ui) |
+| Make a machine nothing but a node, and keep it updated | [kith OS](#kith-os-kithd-as-the-machines-first-process) |
+| Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s) |
+| Find your way in the code and test it | [Layout](#layout), [Development](#development) |
+
+## How it works
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/architecture-dark.svg">
+  <img src="docs/assets/diagrams/architecture-light.svg" alt="How kith works: the kith command and the web UI talk to kithd's resource API; what is applied goes into the store whole or not at all; from the store the scheduler places replicas, the controller starts and stops them on its node through kith's own runtime, and the mesh, Services and DNS follow; the store is replicated to the other nodes by Raft, and where the mesh is on (--mesh) each node has a WireGuard tunnel to every other" width="100%">
+</picture>
+
+You say what should exist, in files; `kith apply` sends them to a node, which
+takes all of them or none. Everything else is `kithd` making its node match:
+on the node that leads the store the scheduler says which node runs each
+replica, and every node's controller starts and stops what is its own, with no
+container daemon in between. With more than one node the store is copied to
+the others by Raft; started with `--mesh`, the nodes also set up WireGuard
+tunnels between themselves, over which what runs on one node reaches what
+runs on another.
 
 ## Status
 
@@ -20,24 +136,13 @@ and what kith does not defend against, is in [SECURITY.md](SECURITY.md).
 first process of [kith OS](#kith-os-kithd-as-the-machines-first-process); on
 one machine, or on several [joined into a cluster](#more-than-one-node). It owns
 the store and keeps the containers, processes and machines on its node matching
-the resources you apply. On one node, in agent mode:
+the resources you apply. The [first run](#first-run) is one node in agent mode;
+beyond it, everything goes through the same few commands:
 
 ```sh
-cargo build --release
-export PATH=$PWD/target/release:$PATH
-
-kithd &                          # as you, no root: needs cgroup v2 and a systemd user session
-kith apply -f examples/hello.yaml
-kith get                         # Workload  default  hello  1  1/1 ready
 kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
 kith get -w workload             # the table, then each row as it changes (a long-poll on GET /v1/watch)
 kith logs workload/hello -f      # its output, as it arrives
-kith delete workload/hello       # stops its containers
-```
-
-Everything goes through the same few commands:
-
-```sh
 kith lint -f examples/           # validate files; needs no daemon
 kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
@@ -1558,9 +1663,16 @@ kinds included), the YAML beside it, each resource's status, history with
 rollback, and output. An apply or a rollback shows its diff first; a delete asks.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/ui-dark.png">
-  <img src="docs/ui.png" alt="The web UI: the kinds as stops on a line, the nodes and replicas as a line map, a list of Workloads, and one Workload's form" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/ui-review-dark.png">
+  <img src="docs/assets/screens/ui-review-light.png" alt="The web UI asking before it applies: 'Apply 1 change?' over the diff of Workload/default/web, replicas 3 struck out in red and replicas 5 added in blue, with Cancel and Apply" width="70%">
 </picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/ui-phone-dark.png">
+  <img src="docs/assets/screens/ui-phone-light.png" alt="The web UI at a phone's width: three nodes as stops on lines, mail with 0 of 2 replicas ready and web with 3 of 3, the list of Workloads under them, and the form of the one that is open" width="24%">
+</picture>
+
+It asks before it changes anything (left), and it is the same page on a phone
+(right); the whole of it on a wide screen is the picture this file opens with.
 
 On a node, as its admin:
 
@@ -1599,7 +1711,14 @@ until asked for, metrics.
 ## kith OS: kithd as the machine's first process
 
 On a kith OS machine there is the kernel and kithd, nothing else: no systemd, no
-shell. When kithd finds it is process 1 it does what an init does:
+shell.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/os-dark.svg">
+  <img src="docs/assets/diagrams/os-light.svg" alt="kith OS from power-on: the firmware starts systemd-boot, which starts the newest kernel image that has tries left; the image names the hash of its 6 MB read-only root, of which a changed block is refused; kithd is the first process, reads the config partition and mounts the state partition, the two that no update replaces. An update, one node at a time: an OSRelease signed by the release's key (an update from a stick is not signed) is written into the other slot, the node restarts into it, and it is marked good or the node is back on the old slot after three tries" width="100%">
+</picture>
+
+When kithd finds it is process 1 it does what an init does:
 
 - mounts `/proc`, `/sys`, `/dev`, `/run`, `/tmp` and the cgroup tree;
 - names the machine: `kith.hostname=NAME` on the kernel command line, or else
@@ -2173,6 +2292,11 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 with k3s v1.37.2 as it comes (a server and two agents, with the DNS, ingress, load
 balancer, metrics and storage k3s starts by itself). It measures both from outside,
 the same way, and writes the table down ([ci/compare.txt](ci/compare.txt)):
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/beside-k3s-dark.svg">
+  <img src="docs/assets/diagrams/beside-k3s-light.svg" alt="kith beside k3s as bars, each pair on its own scale: memory in use on an idle first node 64 MB against 994 MB on the k3s server, on another node 64 MB against 454 MB, from apply to a ready container 0.03 s against 0.53 s, a lost node's replica ready on another after 300 s against 351 s" width="100%">
+</picture>
 
 | | kith | k3s |
 | --- | --- | --- |

@@ -1,0 +1,135 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1036.9 773" width="1036.9" height="773" role="img" aria-labelledby="t d" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace">
+<title id="t">One process on every node</title><desc id="d">kith → Resource API (apply, get, logs); Web UI → Resource API (watch); Resource API → Store (all or nothing); Store → Scheduler (placement); Store → Controller (replicas); Controller → Containers, processes, VMs (start, stop); Store → Mesh, Services, DNS (names, peers); Mesh, Services, DNS → WireGuard (peers); Store → Cluster (the log); Cluster → kithd (Raft)</desc>
+<style>.f{animation:f 1.7s linear infinite}@keyframes f{to{stroke-dashoffset:-17}}@media (prefers-reduced-motion:reduce){.f{animation:none}}</style>
+<rect width="1036.9" height="773" rx="10" fill="#16181D"/>
+<text x="28" y="42" font-size="16" font-weight="700" fill="#F6F5F1">One process on every node</text>
+<rect x="347.7" y="66.5" width="341.6" height="98" rx="6" fill="#1F2125" stroke="#3E4043"/>
+<rect x="361.2" y="75" width="23.6" height="16" rx="2" fill="#5B8CFF"/>
+<text x="366.2" y="87" font-size="11" font-weight="700" fill="#16181D">01</text>
+<text x="394.8" y="87" font-size="11" font-weight="700" letter-spacing=".9" fill="#F6F5F1">YOU<tspan font-weight="400" letter-spacing="0" fill="#989898"> · a terminal or a browser</tspan></text>
+<path d="M347.2 96L689.8 96" fill="none" stroke="#3E4043" stroke-width="1"/>
+<path d="M344.2 73V63H354.2M682.8 63H692.8V73M692.8 158V168H682.8M354.2 168H344.2V158" fill="none" stroke="#5B8CFF" stroke-width="1.5"/>
+<rect x="28.5" y="257.5" width="979.9" height="296" rx="6" fill="#1F2125" stroke="#3E4043"/>
+<rect x="42" y="266" width="23.6" height="16" rx="2" fill="#F2B84B"/>
+<text x="47" y="278" font-size="11" font-weight="700" fill="#16181D">02</text>
+<text x="75.6" y="278" font-size="11" font-weight="700" letter-spacing=".9" fill="#F6F5F1">KITHD<tspan font-weight="400" letter-spacing="0" fill="#989898"> · one process on each node</tspan></text>
+<path d="M28 287L1008.9 287" fill="none" stroke="#3E4043" stroke-width="1"/>
+<path d="M25 264V254H35M1001.9 254H1011.9V264M1011.9 547V557H1001.9M35 557H25V547" fill="none" stroke="#F2B84B" stroke-width="1.5"/>
+<rect x="64.7" y="646.5" width="585.3" height="98" rx="6" fill="#1F2125" stroke="#3E4043"/>
+<rect x="78.2" y="655" width="23.6" height="16" rx="2" fill="#5B8CFF"/>
+<text x="83.2" y="667" font-size="11" font-weight="700" fill="#16181D">03</text>
+<text x="111.8" y="667" font-size="11" font-weight="700" letter-spacing=".9" fill="#F6F5F1">THIS NODE</text>
+<path d="M64.2 676L650.5 676" fill="none" stroke="#3E4043" stroke-width="1"/>
+<path d="M61.2 653V643H71.2M643.5 643H653.5V653M653.5 738V748H643.5M71.2 748H61.2V738" fill="none" stroke="#5B8CFF" stroke-width="1.5"/>
+<rect x="677" y="646.5" width="295.2" height="98" rx="6" fill="#1F2125" stroke="#3E4043"/>
+<rect x="690.5" y="655" width="23.6" height="16" rx="2" fill="#F2B84B"/>
+<text x="695.5" y="667" font-size="11" font-weight="700" fill="#16181D">04</text>
+<text x="724.1" y="667" font-size="11" font-weight="700" letter-spacing=".9" fill="#F6F5F1">EVERY OTHER NODE</text>
+<path d="M676.5 676L972.7 676" fill="none" stroke="#3E4043" stroke-width="1"/>
+<path d="M673.5 653V643H683.5M965.7 643H975.7V653M975.7 738V748H965.7M683.5 748H673.5V738" fill="none" stroke="#F2B84B" stroke-width="1.5"/>
+<path d="M437.3 149C437.3 221 518.5 221 518.5 293" fill="none" stroke="#5B8CFF" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M437.3 149C437.3 221 518.5 221 518.5 293" fill="none" stroke="#5B8CFF" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M518.5 293 L514.5 285 L522.5 285Z" fill="#5B8CFF"/>
+<rect x="423.3" y="212" width="109.2" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="477.9" y="224" font-size="10" text-anchor="middle" fill="#F6F5F1">apply, get, logs</text>
+<path d="M599.6 149C599.6 221 518.5 221 518.5 293" fill="none" stroke="#5B8CFF" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M599.6 149C599.6 221 518.5 221 518.5 293" fill="none" stroke="#5B8CFF" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M518.5 293 L514.5 285 L522.5 285Z" fill="#5B8CFF"/>
+<rect x="538.5" y="212" width="41" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="559" y="224" font-size="10" text-anchor="middle" fill="#F6F5F1">watch</text>
+<path d="M518.5 340C518.5 366 518.5 366 518.5 392" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M518.5 340C518.5 366 518.5 366 518.5 392" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M518.5 392 L514.5 384 L522.5 384Z" fill="#F2B84B"/>
+<rect x="470.1" y="357" width="96.8" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="518.5" y="369" font-size="10" text-anchor="middle" fill="#F6F5F1">all or nothing</text>
+<path d="M518.5 439C518.5 465 155.7 465 155.7 491" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M518.5 439C518.5 465 155.7 465 155.7 491" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M155.7 491 L151.7 483 L159.7 483Z" fill="#F2B84B"/>
+<rect x="304.2" y="456" width="65.8" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="337.1" y="468" font-size="10" text-anchor="middle" fill="#F6F5F1">placement</text>
+<path d="M518.5 439C518.5 465 348.6 465 348.6 491" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M518.5 439C518.5 465 348.6 465 348.6 491" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M348.6 491 L344.6 483 L352.6 483Z" fill="#F2B84B"/>
+<rect x="403.8" y="456" width="59.6" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="433.6" y="468" font-size="10" text-anchor="middle" fill="#F6F5F1">replicas</text>
+<path d="M348.6 538C348.6 610 208 610 208 682" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M348.6 538C348.6 610 208 610 208 682" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M208 682 L204 674 L212 674Z" fill="#F2B84B"/>
+<rect x="239.2" y="601" width="78.2" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="278.3" y="613" font-size="10" text-anchor="middle" fill="#F6F5F1">start, stop</text>
+<path d="M518.5 439C518.5 465 568.9 465 568.9 491" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M518.5 439C518.5 465 568.9 465 568.9 491" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M568.9 491 L564.9 483 L572.9 483Z" fill="#F2B84B"/>
+<rect x="501.5" y="456" width="84.4" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="543.7" y="468" font-size="10" text-anchor="middle" fill="#F6F5F1">names, peers</text>
+<path d="M568.9 538C568.9 610 492.1 610 492.1 682" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M568.9 538C568.9 610 492.1 610 492.1 682" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M492.1 682 L488.1 674 L496.1 674Z" fill="#F2B84B"/>
+<rect x="510" y="601" width="41" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="530.5" y="613" font-size="10" text-anchor="middle" fill="#F6F5F1">peers</text>
+<path d="M518.5 439C518.5 465 857.4 465 857.4 491" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M518.5 439C518.5 465 857.4 465 857.4 491" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M857.4 491 L853.4 483 L861.4 483Z" fill="#F2B84B"/>
+<rect x="661.2" y="456" width="53.4" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="687.9" y="468" font-size="10" text-anchor="middle" fill="#F6F5F1">the log</text>
+<path d="M857.4 538C857.4 610 824.6 610 824.6 682" fill="none" stroke="#F2B84B" stroke-opacity=".5" stroke-width="1.5"/>
+<path class="f" d="M857.4 538C857.4 610 824.6 610 824.6 682" fill="none" stroke="#F2B84B" stroke-width="1.5" stroke-dasharray="3 14"/>
+<path d="M824.6 682 L820.6 674 L828.6 674Z" fill="#F2B84B"/>
+<rect x="823.6" y="601" width="34.8" height="16" rx="3" fill="#16181D" stroke="#3E4043"/>
+<text x="841" y="613" font-size="10" text-anchor="middle" fill="#F6F5F1">Raft</text>
+<rect x="363.2" y="102" width="148.3" height="47" rx="4" fill="#16181D" stroke="#5B8CFF" stroke-width="1.25"/>
+<circle cx="379.2" cy="118.5" r="7" fill="#5B8CFF" opacity=".18"/>
+<circle cx="379.2" cy="118.5" r="3.5" fill="#5B8CFF"/>
+<text x="397.2" y="122" font-size="13" font-weight="600" fill="#F6F5F1">kith</text>
+<text x="397.2" y="137" font-size="11" fill="#989898">crates/kith-cli</text>
+<rect x="525.5" y="102" width="148.3" height="47" rx="4" fill="#16181D" stroke="#5B8CFF" stroke-width="1.25"/>
+<circle cx="541.5" cy="118.5" r="7" fill="#5B8CFF" opacity=".18"/>
+<circle cx="541.5" cy="118.5" r="3.5" fill="#5B8CFF"/>
+<text x="559.5" y="122" font-size="13" font-weight="600" fill="#F6F5F1">Web UI</text>
+<text x="559.5" y="137" font-size="11" fill="#989898">crates/kithd/ui</text>
+<rect x="447.1" y="293" width="142.7" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="463.1" cy="309.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="463.1" cy="309.5" r="3.5" fill="#F2B84B"/>
+<text x="481.1" y="313" font-size="13" font-weight="600" fill="#F6F5F1">Resource API</text>
+<text x="481.1" y="328" font-size="11" fill="#989898">api.rs · /v1</text>
+<rect x="403.4" y="392" width="230.1" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="419.4" cy="408.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="419.4" cy="408.5" r="3.5" fill="#F2B84B"/>
+<text x="437.4" y="412" font-size="13" font-weight="600" fill="#F6F5F1">Store</text>
+<text x="437.4" y="427" font-size="11" fill="#989898">kith-store · Raft over redb</text>
+<rect x="44" y="491" width="223.3" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="60" cy="507.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="60" cy="507.5" r="3.5" fill="#F2B84B"/>
+<text x="78" y="511" font-size="13" font-weight="600" fill="#F6F5F1">Scheduler</text>
+<text x="78" y="526" font-size="11" fill="#989898">kith-sched · on the leader</text>
+<rect x="281.3" y="491" width="134.7" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="297.3" cy="507.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="297.3" cy="507.5" r="3.5" fill="#F2B84B"/>
+<text x="315.3" y="511" font-size="13" font-weight="600" fill="#F6F5F1">Controller</text>
+<text x="315.3" y="526" font-size="11" fill="#989898">controller.rs</text>
+<rect x="430" y="491" width="277.9" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="446" cy="507.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="446" cy="507.5" r="3.5" fill="#F2B84B"/>
+<text x="464" y="511" font-size="13" font-weight="600" fill="#F6F5F1">Mesh, Services, DNS</text>
+<text x="464" y="526" font-size="11" fill="#989898">kith-mesh · services.rs · kith-dns</text>
+<rect x="721.9" y="491" width="271.1" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="737.9" cy="507.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="737.9" cy="507.5" r="3.5" fill="#F2B84B"/>
+<text x="755.9" y="511" font-size="13" font-weight="600" fill="#F6F5F1">Cluster</text>
+<text x="755.9" y="526" font-size="11" fill="#989898">cluster.rs · TLS, both ends known</text>
+<rect x="80.2" y="682" width="255.6" height="47" rx="4" fill="#16181D" stroke="#5B8CFF" stroke-width="1.25"/>
+<circle cx="96.2" cy="698.5" r="7" fill="#5B8CFF" opacity=".18"/>
+<circle cx="96.2" cy="698.5" r="3.5" fill="#5B8CFF"/>
+<text x="114.2" y="702" font-size="13" font-weight="600" fill="#F6F5F1">Containers, processes, VMs</text>
+<text x="114.2" y="717" font-size="11" fill="#989898">kith-runtime · no containerd</text>
+<rect x="349.8" y="682" width="284.7" height="47" rx="4" fill="#16181D" stroke="#5B8CFF" stroke-width="1.25"/>
+<circle cx="365.8" cy="698.5" r="7" fill="#5B8CFF" opacity=".18"/>
+<circle cx="365.8" cy="698.5" r="3.5" fill="#5B8CFF"/>
+<text x="383.8" y="702" font-size="13" font-weight="600" fill="#F6F5F1">WireGuard</text>
+<text x="383.8" y="717" font-size="11" fill="#989898">with --mesh · a tunnel to each node</text>
+<rect x="692.5" y="682" width="264.2" height="47" rx="4" fill="#16181D" stroke="#F2B84B" stroke-width="1.25"/>
+<circle cx="708.5" cy="698.5" r="7" fill="#F2B84B" opacity=".18"/>
+<circle cx="708.5" cy="698.5" r="3.5" fill="#F2B84B"/>
+<text x="726.5" y="702" font-size="13" font-weight="600" fill="#F6F5F1">kithd</text>
+<text x="726.5" y="717" font-size="11" fill="#989898">the same process, the same store</text>
+</svg>

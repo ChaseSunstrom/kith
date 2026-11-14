@@ -356,6 +356,124 @@ spec:
     assert_eq!(count(""), 0, "no container outlives kithd");
 }
 
+/// README.md's first run, as it is written: every `kithd` and `kith` line of its steps
+/// is run, in a directory with nothing in it and as whoever runs the tests, and what a
+/// step says you should see is looked for in what came out (`…` stands for anything).
+#[test]
+fn readme_first_run_is_what_happens() {
+    if !e2e() {
+        return;
+    }
+    let readme = include_str!("../../../README.md");
+    let part = readme
+        .split("\n## First run\n")
+        .nth(1)
+        .expect("README.md has a First run");
+    let mut pieces = part.split("\n## ").next().unwrap().split("You should see `");
+    let (mut before, mut steps) = (pieces.next().unwrap(), Vec::new());
+    for piece in pieces {
+        let (seen, rest) = piece.split_once('`').expect("what is seen ends");
+        let block = before.rsplit("```sh\n").next().unwrap().split("```").next().unwrap();
+        steps.push((block.lines().map(str::trim).collect::<Vec<_>>(), seen));
+        before = rest;
+    }
+    assert_eq!(
+        steps.len(),
+        7,
+        "the first run has other steps than this test knows: {steps:?}"
+    );
+    for (_, seen) in &steps {
+        let said = seen.split('…').any(|part| part.len() >= 4);
+        assert!(said, "`{seen}` says nothing that can be looked for");
+    }
+    let built = Command::new(env!("CARGO"))
+        .args(["build", "--quiet", "-p", "kith-cli"])
+        .status()
+        .unwrap();
+    assert!(built.success());
+    let (kithd, root) = (
+        Path::new(env!("CARGO_BIN_EXE_kithd")),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+    );
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("first-run");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let kith = |args: &[&str]| {
+        let mut command = Command::new(kithd.with_file_name("kith"));
+        command
+            .args(args)
+            .current_dir(&root)
+            .env("KITH_SOCKET", dir.join("kithd.sock"))
+            .env_remove("KITH_STORE");
+        command
+    };
+    let is = |said: &str, seen: &str| {
+        let mut rest = said;
+        seen.split('…')
+            .all(|part| rest.find(part).map(|at| rest = &rest[at + part.len()..]).is_some())
+    };
+    let mut daemon = None;
+    for (lines, seen) in steps {
+        for line in lines {
+            let words: Vec<&str> = line.split('#').next().unwrap().split_whitespace().collect();
+            let mut said = String::new();
+            match words.as_slice() {
+                // (Where the page's kithd keeps its socket and state is this user's own: here, the directory.)
+                ["kithd", "&"] => {
+                    let log = std::fs::File::create(dir.join("kithd.log")).unwrap();
+                    let mut command = Command::new(kithd);
+                    command
+                        .current_dir(&dir)
+                        .args(["--state", "state", "--registry-port", "0", "--socket"]);
+                    let child = command
+                        .arg(dir.join("kithd.sock"))
+                        .stdin(Stdio::null())
+                        .stderr(log)
+                        .spawn()
+                        .unwrap();
+                    daemon = Some(Daemon {
+                        child,
+                        dir: dir.clone(),
+                        args: &[],
+                        kith: kithd.with_file_name("kith"),
+                    });
+                    wait_for("kithd to say what the page says", || {
+                        said = std::fs::read_to_string(dir.join("kithd.log")).unwrap();
+                        is(&said, seen)
+                    });
+                }
+                // (It serves until it is stopped: its address is all that is waited for.)
+                ["kith", "ui"] => {
+                    use std::io::BufRead;
+                    let mut ui = kith(&["ui"]).stdout(Stdio::piped()).spawn().unwrap();
+                    let lines = std::io::BufReader::new(ui.stdout.take().unwrap()).lines();
+                    // (Read aside, so that a `kith ui` that never says it is given up on and ended.)
+                    let (tell, told) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || lines.map_while(Result::ok).all(|line| tell.send(line).is_ok()));
+                    while !is(&said, seen) {
+                        match told.recv_timeout(Duration::from_secs(30)) {
+                            Ok(line) => said += &line,
+                            Err(_) => break,
+                        }
+                    }
+                    ui.kill().unwrap();
+                    let _ = ui.wait();
+                }
+                ["kith", args @ ..] => wait_for(&format!("`{line}` to say `{seen}`"), || {
+                    let out = kith(args).output().unwrap();
+                    said = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+                    is(&said, seen)
+                }),
+                // (Building and the path: what `cargo test` did, and where the two are.)
+                ["cargo", "build", "--release"] | ["export", _] | [] => continue,
+                _ => panic!("the first run has a line this test does not run: {line}"),
+            }
+            assert!(is(&said, seen), "`{line}` said:\n{said}\nnot: {seen}");
+        }
+    }
+    assert!(daemon.is_some(), "the first run never started kithd");
+}
+
 fn e2e() -> bool {
     let asked = std::env::var_os("KITH_E2E").is_some();
     if !asked {

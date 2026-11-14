@@ -1,5 +1,5 @@
 {
- "apply.peak": 2.77,
+ "apply.peak": 2.51,
  "apply.peak.budget": 4,
  "by_crate": {
   "kith-cli": [
@@ -39,12 +39,12 @@
    7
   ],
   "kith-dm-sys": [
-   203,
+   227,
    3
   ],
   "kithd": [
-   30561,
-   227
+   31189,
+   233
   ]
  },
  "cmp.k3s.apply": 0.53,
@@ -65,9 +65,9 @@
  "kinds": 33,
  "kith.size": 2.84,
  "kith.size.budget": 3,
- "kithd.idle": 8.38,
+ "kithd.idle": 8.37,
  "kithd.idle.budget": 9,
- "kithd.size": 12.55,
+ "kithd.size": 12.56,
  "kithd.size.budget": 13,
  "measured": "2026-11-14",
  "os.image": 282,
@@ -116,8 +116,8 @@
   "kcmp",
   "pidfd_getfd"
  ],
- "rust_lines": 49208,
- "tests": 399,
+ "rust_lines": 49860,
+ "tests": 405,
  "version": "1.0.0",
  "vm_tests": 10
 }
