@@ -259,12 +259,21 @@ pub fn server_config(identity: &Identity) -> Fallible<Arc<ServerConfig>> {
     Ok(Arc::new(tls("setting up TLS", config)?))
 }
 
-/// A certificate chain and its key (both PEM) as a server shows them. Not if the key is
-/// another certificate's.
-pub fn certified(chain: &str, key: &str) -> Fallible<rustls::sign::CertifiedKey> {
+/// A certificate chain and its key (both PEM) as a server shows them for `host`. Not if the
+/// key is another certificate's, or the leaf does not name `host`.
+pub fn certified(chain: &str, key: &str, host: &str) -> Fallible<rustls::sign::CertifiedKey> {
     let key = tls("reading a key", PrivateKeyDer::from_pem_slice(key.as_bytes()))?;
     let key = tls("reading a key", provider().key_provider.load_private_key(key))?;
-    let certified = rustls::sign::CertifiedKey::new(certs(chain)?, key);
+    let chain = certs(chain)?;
+    {
+        let leaf = tls("reading a certificate", webpki::EndEntityCert::try_from(&chain[0]))?;
+        let name = tls(&format!("a certificate for {host}"), ServerName::try_from(host))?;
+        tls(
+            &format!("a certificate for {host}"),
+            leaf.verify_is_valid_for_subject_name(&name),
+        )?;
+    }
+    let certified = rustls::sign::CertifiedKey::new(chain, key);
     tls("a certificate and its key", certified.keys_match())?;
     Ok(certified)
 }

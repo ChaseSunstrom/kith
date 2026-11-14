@@ -118,9 +118,6 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   handover must be signed by a key the node has and by one it is handed to. A node
   with no state partition keeps neither floor nor keys, and whoever holds a release
   key the nodes take still decides everything they run.
-- **Answers from an ACME authority** are read without a cap on size, and the
-  certificate that comes back is not checked to be for the host that was asked for.
-  (T-0232.)
 - **A Volume's directory on its node** is checked and then mounted: a path changed in
   between is not seen.
 - **A stolen machine that is not locked**, started on the cluster's own network, is
@@ -158,7 +155,7 @@ Severity:
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Open: T-0230. |
 | 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Open: T-0231. |
-| 9 | Low | ACME answers have no size cap, redirects are followed, and the certificate's names are not compared with the host. | Open: T-0232. |
+| 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host is refused and the stored certificate stays in use. (T-0232.) |
 
 The T- numbers are the maintainer's task numbers, the same ones commits carry.
 

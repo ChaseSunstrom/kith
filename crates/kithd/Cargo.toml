@@ -53,6 +53,8 @@ sha2 = "0.11"
 
 [dev-dependencies]
 serde_json.workspace = true
+# (The ACME tests' authority reads the CSR it is sent: rcgen's parser, already in the tree.)
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
 # Test modules are written as text.
 wat = "1"
 
