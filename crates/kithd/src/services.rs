@@ -7,9 +7,12 @@
 //! connections between them for a while and pass on one client's after another on each
 //! ([`carry`]): a new connection to a Service is then no new one between the nodes.
 //
-// ponytail: kithd copies every byte (a restart of kithd cuts the connections), TCP only,
-// and replicas of one node share its ports until workloads have addresses of their own.
-// The kernel takes this over (nftables or eBPF) behind the same addresses.
+// The kernel passes a connection made on the node's own network to a replica here with
+// no NetworkPolicy straight to it ([`connect`]); kithd then never sees it.
+//
+// ponytail: kithd copies every other byte (a restart of kithd cuts those connections),
+// TCP only, and replicas of one node share its ports until workloads have addresses of
+// their own. A pod's client, or one with a NetworkPolicy, is the kernel's next.
 
 mod connect;
 
@@ -192,14 +195,7 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
         return false;
     };
     let mut chosen = false;
-    for policy in store.list(Some("NetworkPolicy")) {
-        let Ok(spec) = serde_json::from_value::<NetworkPolicySpec>(policy.spec.clone()) else {
-            continue;
-        };
-        let has = |(label, value): (&String, &String)| target.metadata.labels.get(label) == Some(value);
-        if namespace(policy) != namespace(target) || !spec.selector.iter().all(has) {
-            continue;
-        }
+    for spec in policies(store, target) {
         chosen = true;
         for rule in &spec.ingress {
             let allow = rule.action == PolicyAction::Allow;
@@ -215,6 +211,15 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
         }
     }
     !chosen
+}
+
+/// The NetworkPolicies for `target`: of its namespace, with a selector its labels fit.
+fn policies<'a>(store: &'a Store, target: &'a Resource) -> impl Iterator<Item = NetworkPolicySpec> + 'a {
+    store.list(Some("NetworkPolicy")).filter_map(move |policy| {
+        let spec = serde_json::from_value::<NetworkPolicySpec>(policy.spec.clone()).ok()?;
+        let has = |(label, value): (&String, &String)| target.metadata.labels.get(label) == Some(value);
+        (namespace(policy) == namespace(target) && spec.selector.iter().all(has)).then_some(spec)
+    })
 }
 
 /// What a NetworkPolicy's status is to be told, if it is not already.
@@ -768,8 +773,9 @@ pub async fn run(
         .inspect_err(|e| eprintln!("kithd: services: kithd passes every connection itself: {e}"))
         .ok()
         .map(|netns| (netns, Vec::new()));
+    let mut probed = BTreeMap::new();
     loop {
-        let (wanted, reports) = {
+        let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix);
             // (A Service that was refused its host says so, in `expose`; the others say nothing.)
@@ -796,7 +802,11 @@ pub async fn run(
             for policy in state.store.list(Some("NetworkPolicy")) {
                 reports.extend(policy_unsaid(policy).map(|fields| (policy.key(), fields)));
             }
-            (table, reports)
+            let plans = match kernel {
+                Some(_) => kernel_plan(&state.store, &table, proxy.me()),
+                None => Vec::new(),
+            };
+            (table, reports, plans)
         };
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) && !reports.is_empty() {
@@ -805,6 +815,10 @@ pub async fn run(
                 eprintln!("kithd: services: writing their status: {e}");
             }
         }
+        let mut entries = match kernel {
+            Some(_) => kernel_entries(&shared, &plans, &mut probed, &mut wanted).await,
+            None => Vec::new(),
+        };
         // The relay, and one listener for each Service port; one whose address is not on
         // the interface yet (the mesh puts it there) is tried again shortly.
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
@@ -817,15 +831,6 @@ pub async fn run(
         }
         if !threads.is_empty() {
             keys.insert((me, port));
-        }
-        if let Some((netns, last)) = &mut kernel {
-            let entries = kernel_entries(&wanted, proxy.me()).await;
-            if entries != *last {
-                match connect::attach(&entries, *netns) {
-                    Ok(()) => *last = entries,
-                    Err(e) => eprintln!("kithd: services: the kernel's program: {e}"),
-                }
-            }
         }
         proxy.turns.keep(&wanted);
         proxy.forget();
@@ -867,12 +872,36 @@ pub async fn run(
             });
             listening.insert(key, tasks.collect());
         }
+        // The kernel's program, made again when what it passes changes: never sending a
+        // share to a port of kithd's that is not listened on yet. (Between a replica going
+        // and this rebuild, which the store's change wakes, its share still goes to it.)
+        if let Some((netns, last)) = &mut kernel {
+            entries.retain(|entry| {
+                entry
+                    .elsewhere
+                    .is_none_or(|port| listening.contains_key(&(entry.service.0, port)))
+            });
+            if entries != *last {
+                if let Err(e) = connect::attach(&entries, *netns) {
+                    // (Left with nothing in it, if the kernel takes that much.)
+                    let _ = connect::attach(&[], *netns);
+                    eprintln!("kithd: services: kithd passes every connection itself: the kernel's program: {e}");
+                    kernel = None;
+                } else {
+                    *last = entries;
+                }
+            }
+        }
         let again = Duration::from_millis(if waiting { 500 } else { 5000 });
         tokio::select! {
             _ = generation.changed() => {}
             () = tokio::time::sleep(again) => {}
             _ = stopping.changed() => break,
         }
+    }
+    // (A kithd that is gone sends nothing the kernel's way: started again, it begins empty.)
+    if let Some((netns, _)) = kernel {
+        let _ = connect::attach(&[], netns);
     }
     listening
         .values()
@@ -881,21 +910,122 @@ pub async fn run(
         .for_each(tokio::task::JoinHandle::abort);
 }
 
-/// What the kernel passes itself: (spike) a Service port whose every backend is a
-/// container on this node's network, which answers on its loopback.
-async fn kernel_entries(table: &Table, me: &str) -> Vec<connect::Entry> {
-    let mut entries = Vec::new();
+/// A Service port the kernel may pass on ([`connect`]): its backends here, which it
+/// connects to itself, and the others, whose share goes to kithd's listener on port
+/// `elsewhere` of the same address (with only them behind it).
+#[derive(Debug, PartialEq)]
+struct Plan {
+    service: (Ipv6Addr, u16),
+    here: Vec<Backend>,
+    others: Vec<Backend>,
+    elsewhere: Option<u16>,
+}
+
+/// The most replicas here of one Service port the kernel's program picks between (each
+/// is a few instructions, and a jump over them has to fit).
+const MOST_HERE: usize = 256;
+
+/// What the kernel may pass on, for `me`: each Service port with a replica here, and no
+/// NetworkPolicy for any of their Workloads (kithd asks those at each connection). The
+/// port to kithd for the others is the highest free one of the address, never 80 or 443
+/// (the ingress may have those).
+fn kernel_plan(store: &Store, table: &Table, me: &str) -> Vec<Plan> {
+    let guarded = |(_, _, workload, _): &Backend| {
+        store
+            .get(workload)
+            .is_none_or(|workload| policies(store, workload).next().is_some())
+    };
+    let mut taken: BTreeSet<(Ipv6Addr, u16)> = table.keys().copied().collect();
+    let mut plans = Vec::new();
     for (&service, backends) in table {
-        let Some((_, port, _, _)) = backends.first() else { continue };
-        if !backends.iter().all(|(node, at, _, replica)| node == me && at == port && replica.is_none()) {
+        let (here, others): (Vec<Backend>, Vec<Backend>) =
+            backends.iter().cloned().partition(|backend| backend.0 == me);
+        if here.is_empty() || here.len() > MOST_HERE || here.iter().any(guarded) {
             continue;
         }
-        let v4 = within(TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, *port))).await.is_ok();
-        let ip = if v4 { std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped() } else { Ipv6Addr::LOCALHOST };
-        if v4 || within(TcpStream::connect((Ipv6Addr::LOCALHOST, *port))).await.is_ok() {
-            let here = vec![std::net::SocketAddrV6::new(ip, *port, 0, 0)];
-            entries.push(connect::Entry { service, here, all: 1, elsewhere: None });
+        let mut elsewhere = None;
+        if !others.is_empty() {
+            let free = (1..=u16::MAX)
+                .rev()
+                .find(|port| ![80, 443].contains(port) && !taken.contains(&(service.0, *port)));
+            let Some(port) = free else { continue };
+            taken.insert((service.0, port));
+            elsewhere = Some(port);
         }
+        plans.push(Plan {
+            service,
+            here,
+            others,
+            elsewhere,
+        });
+    }
+    plans
+}
+
+/// Where a replica here answers on `port`: at one of its pod's addresses (`pod`, the first
+/// that does: a replica may listen on IPv4 only), or with no pod on the machine's loopback,
+/// v4 first.
+async fn probe(pod: Vec<IpAddr>, port: u16) -> Option<std::net::SocketAddrV6> {
+    let loopback = vec![std::net::Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()];
+    for ip in if pod.is_empty() { loopback } else { pod } {
+        if within(TcpStream::connect((ip, port))).await.is_ok() {
+            let ip = match ip {
+                IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+                IpAddr::V6(ip) => ip,
+            };
+            return Some(std::net::SocketAddrV6::new(ip, port, 0, 0));
+        }
+    }
+    None
+}
+
+/// The program's entries for `plans`, each replica here where it answered (asked once
+/// while it stays in the table, `probed`); a port with one that does not is left to kithd.
+/// The ports to kithd for the others go into `wanted`.
+async fn kernel_entries(
+    shared: &Shared,
+    plans: &[Plan],
+    probed: &mut BTreeMap<Backend, std::net::SocketAddrV6>,
+    wanted: &mut Table,
+) -> Vec<connect::Entry> {
+    probed.retain(|backend, _| plans.iter().any(|plan| plan.here.contains(backend)));
+    let asked: BTreeSet<&Backend> = plans
+        .iter()
+        .flat_map(|plan| &plan.here)
+        .filter(|backend| !probed.contains_key(*backend))
+        .collect();
+    let pods: Vec<Vec<IpAddr>> = {
+        let pods = shared.pods.lock().expect("nothing panics holding the pods");
+        let pod = |(_, _, workload, replica): &Backend| {
+            replica.map_or_else(Vec::new, |replica| {
+                pods.addresses(&crate::controller::pod_of(workload, replica))
+            })
+        };
+        asked.iter().map(|backend| pod(backend)).collect()
+    };
+    let found =
+        futures_util::future::join_all(asked.iter().zip(pods).map(|(backend, pod)| probe(pod, backend.1))).await;
+    probed.extend(
+        asked
+            .into_iter()
+            .zip(found)
+            .filter_map(|(backend, at)| Some((backend.clone(), at?))),
+    );
+    let mut entries = Vec::new();
+    for plan in plans {
+        let Some(here) = plan.here.iter().map(|backend| probed.get(backend).copied()).collect() else {
+            continue;
+        };
+        if let Some(port) = plan.elsewhere {
+            wanted.insert((plan.service.0, port), plan.others.clone());
+        }
+        let all = (plan.here.len() + plan.others.len()) as u32;
+        entries.push(connect::Entry {
+            service: plan.service,
+            here,
+            all,
+            elsewhere: plan.elsewhere,
+        });
     }
     entries
 }
@@ -1623,5 +1753,79 @@ spec:
         );
         assert!(client.read_u8().await.is_err());
         assert!(replica.read_u8().await.is_err());
+    }
+
+    #[test]
+    fn the_kernel_passes_what_no_policy_guards_and_sends_the_rest_on() {
+        let mut store = Store::default();
+        let apply = |store: &mut Store, source: &str| {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        };
+        apply(&mut store, HOME);
+        let unit =
+            |replica: u32, node: &str| json!({ "name": "main", "replica": replica, "node": node, "ready": true });
+        let web = json!({ "containers": [unit(0, "a"), unit(1, "b")] });
+        store.set_status("Workload/default/web", Some(web)).unwrap();
+        let prefix = kith_mesh::prefix(b"test");
+        let address = kith_mesh::service_address(prefix, "default", "web");
+        let mut table = table(&store, prefix);
+        // (A Service port as high as they go: the one to kithd is another.)
+        table.insert((address, 65535), vec![]);
+        let at = |node: &str, port| (node.to_string(), port, "Workload/default/web".to_string(), None);
+        // Of two replicas, the one here is the kernel's to pass on; the other's share goes to
+        // a port of kithd's own on the same address, with only the other node's behind it.
+        let plan = |port, target, elsewhere| Plan {
+            service: (address, port),
+            here: vec![at("a", target)],
+            others: vec![at("b", target)],
+            elsewhere,
+        };
+        let planned = kernel_plan(&store, &table, "a");
+        assert_eq!(planned, [plan(80, 8080, Some(65534)), plan(9000, 9000, Some(65533))]);
+        // On a node with no replica of it there is nothing to pass on; with all of them
+        // here, nothing goes to kithd.
+        assert_eq!(kernel_plan(&store, &table, "c"), []);
+        let here = json!({ "containers": [unit(0, "a"), unit(1, "a")] });
+        store.set_status("Workload/default/web", Some(here)).unwrap();
+        let all_here = kernel_plan(&store, &super::table(&store, prefix), "a");
+        assert!(
+            all_here
+                .iter()
+                .all(|plan| plan.others.is_empty() && plan.elsewhere.is_none() && plan.here.len() == 2)
+        );
+        assert_eq!(all_here.len(), 2);
+        // A NetworkPolicy for the Workload is asked by kithd at each connection: the kernel
+        // passes none of them, from the rebuild that sees it.
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: p }\n\
+             spec:\n  selector: { app: web }\n  ingress: [{ action: allow }]\n",
+        );
+        assert_eq!(kernel_plan(&store, &super::table(&store, prefix), "a"), []);
+    }
+
+    #[tokio::test]
+    async fn the_kernel_sends_a_connection_only_where_a_replica_answers() {
+        // On the machine's loopback, as kithd reaches one: by its v4 address, mapped.
+        let v4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert_eq!(
+            probe(Vec::new(), port).await,
+            Some(std::net::SocketAddrV6::new(mapped, port, 0, 0))
+        );
+        // A pod's by one of its own addresses: the IPv4 one, where it listens on no other
+        // (as ci/pod.rs's echo, on 0.0.0.0, with a mesh address first).
+        let pod = vec![Ipv6Addr::LOCALHOST.into(), std::net::Ipv4Addr::LOCALHOST.into()];
+        assert_eq!(
+            probe(pod.clone(), port).await,
+            Some(std::net::SocketAddrV6::new(mapped, port, 0, 0))
+        );
+        // Nothing listening: none, and kithd passes that Service port's connections itself.
+        drop(v4);
+        assert_eq!(probe(Vec::new(), port).await, None);
+        assert_eq!(probe(pod, port).await, None);
     }
 }

@@ -253,7 +253,11 @@ pub fn netns_cookie() -> Result<u64> {
             &raw mut size,
         )
     };
-    if said < 0 { Err(Error::last_os_error()) } else { Ok(cookie) }
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(cookie)
+    }
 }
 
 #[cfg(test)]

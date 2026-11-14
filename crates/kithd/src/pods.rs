@@ -115,6 +115,19 @@ impl Pods {
     pub fn address(&self, id: &str) -> Option<IpAddr> {
         self.made.get(id).map(|pod| pod.address)
     }
+
+    /// The pod's addresses: on the mesh where there is one, and its IPv4 one.
+    pub fn addresses(&self, id: &str) -> Vec<IpAddr> {
+        let Some(pod) = self.made.get(id) else {
+            return Vec::new();
+        };
+        let v4 = IpAddr::V4(kith_mesh::pod::addresses(None, pod.number).0);
+        if pod.address == v4 {
+            vec![v4]
+        } else {
+            vec![pod.address, v4]
+        }
+    }
 }
 
 /// A connection to `port` of a pod, or (`None`, or a pod with no network of its own) of

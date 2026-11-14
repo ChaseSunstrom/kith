@@ -68,22 +68,25 @@ fn write(made: &mut Vec<[u8; 8]>, address: Option<Ipv6Addr>, port: u16) {
 /// namespace whose cookie is `netns` (a pod's loopback is not the node's).
 pub fn program(entries: &[Entry], netns: u64) -> Vec<u8> {
     let mut made = vec![
-        instruction(0xbf, 6, 1, 0, 0),           // r6 = what the program is handed
-        instruction(0x61, 2, 6, PROTOCOL, 0),    // w2 = the protocol
-        instruction(0x16, 2, 0, 2, 6),           // TCP, or:
+        instruction(0xbf, 6, 1, 0, 0),        // r6 = what the program is handed
+        instruction(0x61, 2, 6, PROTOCOL, 0), // w2 = the protocol
+        instruction(0x16, 2, 0, 2, 6),        // TCP, or:
     ];
     made.extend(done());
     made.extend([
         instruction(0x85, 0, 0, 0, NETNS_COOKIE), // r0 = the socket's namespace's cookie
         instruction(0x18, 2, 0, 0, netns as u32 as i32),
         instruction(0x00, 0, 0, 0, (netns >> 32) as u32 as i32), // r2 = this node's
-        instruction(0x1d, 0, 2, 2, 0),            // the same, or:
+        instruction(0x1d, 0, 2, 2, 0),                           // the same, or:
     ]);
     made.extend(done());
     for entry in entries {
         // Each test jumps to the entry's end (`NEXT`, made right below) where it fails.
         const NEXT: i16 = i16::MAX;
-        let mut block = vec![instruction(0x61, 2, 6, PORT, 0), instruction(0x56, 2, 0, NEXT, port_word(entry.service.1))];
+        let mut block = vec![
+            instruction(0x61, 2, 6, PORT, 0),
+            instruction(0x56, 2, 0, NEXT, port_word(entry.service.1)),
+        ];
         for (at, word) in address_words(entry.service.0).into_iter().enumerate() {
             block.push(instruction(0x61, 2, 6, IP6 + at as i16 * 4, 0));
             block.push(instruction(0x56, 2, 0, NEXT, word));
@@ -173,7 +176,10 @@ mod tests {
                     registers[to] = u64::from(context[offset as usize / 4]);
                 }
                 0x63 => {
-                    assert!(to == 6 && (offset == PORT || (IP6..IP6 + 16).contains(&offset)), "a field it may write");
+                    assert!(
+                        to == 6 && (offset == PORT || (IP6..IP6 + 16).contains(&offset)),
+                        "a field it may write"
+                    );
                     context[offset as usize / 4] = low(registers[from]) as u32;
                 }
                 0x18 => {
@@ -214,26 +220,46 @@ mod tests {
         let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
         let at = |ip, port| SocketAddrV6::new(ip, port, 0, 0);
         let entries = [
-            Entry { service: (service, 80), here: vec![at(mapped, 8080)], all: 1, elsewhere: None },
+            Entry {
+                service: (service, 80),
+                here: vec![at(mapped, 8080)],
+                all: 1,
+                elsewhere: None,
+            },
             // Three backends, one of them here: two picks in three go to kithd's other listener.
-            Entry { service: (service, 443), here: vec![at(Ipv6Addr::LOCALHOST, 8443)], all: 3, elsewhere: Some(40001) },
+            Entry {
+                service: (service, 443),
+                here: vec![at(Ipv6Addr::LOCALHOST, 8443)],
+                all: 3,
+                elsewhere: Some(40001),
+            },
         ];
         let made = program(&entries, 0x1234_5678_9abc_def0);
         let node = 0x1234_5678_9abc_def0;
         let run = |netns, protocol, to, random| run(&made, netns, protocol, to, random);
         assert_eq!(run(node, 6, at(service, 80), 0), (true, at(mapped, 8080)));
         // Another port, another address, UDP, a pod's own namespace: left as they are.
-        for (netns, protocol, to) in [(node, 6, at(service, 81)), (node, 6, at(other, 80)), (node, 17, at(service, 80)), (7, 6, at(service, 80))] {
+        for (netns, protocol, to) in [
+            (node, 6, at(service, 81)),
+            (node, 6, at(other, 80)),
+            (node, 17, at(service, 80)),
+            (7, 6, at(service, 80)),
+        ] {
             assert_eq!(run(netns, protocol, to, 0), (true, to));
         }
         // The shares: each backend's pick as likely, over every number the kernel may say.
         assert_eq!(run(node, 6, at(service, 443), 3), (true, at(Ipv6Addr::LOCALHOST, 8443)));
         assert_eq!(run(node, 6, at(service, 443), 4), (true, at(service, 40001)));
         assert_eq!(run(node, 6, at(service, 443), 5), (true, at(service, 40001)));
-        let here = (0..3000).filter(|random| run(node, 6, at(service, 443), *random).1.port() == 8443).count();
+        let here = (0..3000)
+            .filter(|random| run(node, 6, at(service, 443), *random).1.port() == 8443)
+            .count();
         assert_eq!(here, 1000);
         // With nothing in it, it changes nothing.
         let empty = program(&[], node);
-        assert_eq!(super::tests::run(&empty, node, 6, at(service, 80), 0), (true, at(service, 80)));
+        assert_eq!(
+            super::tests::run(&empty, node, 6, at(service, 80), 0),
+            (true, at(service, 80))
+        );
     }
 }

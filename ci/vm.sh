@@ -18,7 +18,8 @@
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
-#                               back in order, however its connection ends
+#                               back in order, however its connection ends, passed by kithd from a pod
+#                               and by the kernel from the node's own network
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
@@ -114,7 +115,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    over 680 connections (one after another and side by side, from
                    nothing to more than a megabyte, half closed at once when all is
                    sent, reset by either end on the way) and one of 5000 small turns:
-                   every byte comes back in order. Needs rustc for
+                   every byte comes back in order. The Job runs twice: in a pod,
+                   kithd passes its bytes; on the node's own network, the kernel
+                   sends its connections straight to the pod. Needs rustc for
                    x86_64-unknown-linux-musl
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
@@ -398,28 +401,61 @@ EOF
                 [ "$waited" -lt 300 ] || fail "waited for the echo pod to be ready; the Workload says: $line"
                 sleep 1
             done
-            # A Job on the same node sending to it through the Service: what it says is in
-            # $work/check.out.
-            cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"check"},"spec":{"retries":0,"template":{"pod":true,"containers":[
-  {"name":"check","image":"kith.test/pod:1","command":["/bin/pod","check","echo","80"]}]}}}]
-EOF
-            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job check was not applied"
+            # The Service's address, once it has its replica.
             waited=0
-            until line=$(units Job check) && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+            until address=$(any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    status = r.get("status") or {}
+    if r["kind"] == "Service" and r["metadata"]["name"] == "echo" and status.get("address") and status.get("backends"):
+        print(status["address"])
+        sys.exit(0)
+sys.exit(1)
+'); do
                 waited=$((waited + 1))
-                [ "$waited" -lt 600 ] || fail "waited for the Job check; it says: $line"
+                [ "$waited" -lt 120 ] || fail "the Service echo was given no address with its replica"
                 sleep 1
             done
-            any GET /v1/logs/Job/default/check >"$work/check.out" 2>/dev/null || true
-            any GET '/v1/logs/Job/default/check?stderr=true' >"$work/check.err" 2>/dev/null || true
-            any GET '/v1/logs/Workload/default/echo?replica=0' >"$work/echo.out" 2>/dev/null || true
-            printf '%s\n' "$line" | grep -q succeeded || fail "bytes through the Service did not all come back in order: $line: $(cat "$work/check.out" "$work/check.err")"
-            ! grep -q 'echo: bad' "$work/echo.out" || fail "the echo pod heard bytes out of order: $(cat "$work/echo.out")"
-            # (The log comes as JSON: its line is inside a string.)
-            checked=$(grep -o 'check: [^"\\]*' "$work/check.out") || fail "the Job check said nothing of how it went: $(cat "$work/check.out" "$work/check.err")"
+            # A Job on the same node sending to it through the Service, twice: in a pod of its
+            # own (kithd passes its bytes), and on the node's own network (the kernel sends
+            # its connections straight to the replica). What each says is in $work/JOB.out.
+            checked=''
+            for job in check near; do
+                if [ "$job" = check ]; then pod='"pod":true,' to=echo; else pod='' to=$address; fi
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$job"},"spec":{"retries":0,"template":{$pod"containers":[
+  {"name":"check","image":"kith.test/pod:1","command":["/bin/pod","check","$to","80"]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $job was not applied"
+                waited=0
+                until line=$(units Job "$job") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 600 ] || fail "waited for the Job $job; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$job" >"$work/$job.out" 2>/dev/null || true
+                any GET "/v1/logs/Job/default/$job?stderr=true" >"$work/$job.err" 2>/dev/null || true
+                any GET '/v1/logs/Workload/default/echo?replica=0' >"$work/echo.out" 2>/dev/null || true
+                printf '%s\n' "$line" | grep -q succeeded || fail "bytes through the Service from the Job $job did not all come back in order: $line: $(cat "$work/$job.out" "$work/$job.err")"
+                ! grep -q 'echo: bad' "$work/echo.out" || fail "the echo pod heard bytes out of order: $(cat "$work/echo.out")"
+                # (The log comes as JSON: its lines are inside a string.)
+                said=$(grep -o 'check: [0-9][^"\\]*' "$work/$job.out") || fail "the Job $job said nothing of how it went: $(cat "$work/$job.out" "$work/$job.err")"
+                reached=$(grep -o 'check: reached [^"\\]*' "$work/$job.out") || fail "the Job $job did not say what it reached: $(cat "$work/$job.out" "$work/$job.err")"
+                reached=${reached#check: reached }
+                if [ "$job" = check ]; then
+                    [ "$reached" = "[$address]:80" ] || fail "a pod's connection to the Service reached $reached, not kithd at [$address]:80"
+                else
+                    case $reached in "[$address]:80" | [!0-9[]*) fail "a connection on the node's own network to the Service reached $reached, not the replica: the kernel did not send it there" ;; esac
+                fi
+                checked="$checked${checked:+; }$job: ${said#check: }, reached $reached"
+            done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; a Job on the same node sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
+            echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
             exit 0
         fi
         if [ "$test" = pods ]; then
