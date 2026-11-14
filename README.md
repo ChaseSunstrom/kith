@@ -881,6 +881,11 @@ Not answered, each refused in words:
 - `exec`, `attach`, `port-forward`, `cp` and `kubectl run` (a pod alone); `kubectl top`.
 - CustomResourceDefinitions, and so other people's operators; admission
   webhooks; NetworkPolicy, HorizontalPodAutoscaler.
+- What it is not, and is not meant to become: kith is not a conformant Kubernetes
+  (the conformance tests are not run and would not pass). It takes no CNI, CSI
+  or device plugin (a pod's network, a volume and a device are kith's own), and
+  serves no aggregated API. It never starts, fetches or packages Kubernetes
+  itself: what needs the real thing needs a real cluster.
 - Of a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`,
   added capabilities (kith gives no Workload these, by any API); and, not yet,
   volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
