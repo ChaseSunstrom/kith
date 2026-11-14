@@ -181,7 +181,9 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   (about 25 ms from `kith apply` to first output here), so `pullPolicy: always` is
   how you follow a tag that moves. Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
-  restarted according to `restartPolicy`, with a backoff of up to a minute.
+  restarted according to `restartPolicy`: at once the first time (and whenever it
+  had run for a minute), then after a wait that doubles from a second up to a
+  minute for one that keeps exiting.
 - Runs `exec` units next to containers: a plain process of the host (its files,
   its network, your user) in its own cgroup with the same limits and restart
   policy, for host-level tools. Whatever it forks is stopped with it.
@@ -620,7 +622,16 @@ kith node status                                   # who leads the store, who vo
   are hung up on. One with no byte either way for 5 minutes on 443 is closed,
   and one on 80 after 30 seconds whatever it does. Inside the mesh, a node
   passes on 4096 connections to Services at a time (1024 for any one other
-  node), and one that is silent both ways for an hour is closed.
+  node), and one that is silent both ways for an hour is closed. Two nodes keep
+  the connections between them for a while (up to 16, for 30 seconds with no
+  client on them) and pass the next client's connection on one of those, so a
+  new connection to a Service is seldom a new one between the nodes. Each
+  client's connection is still asked for by itself, and a NetworkPolicy is
+  asked about each. What a client has already said goes to the other node with
+  the asking (and to no replica if the answer is no): if that node gives no
+  answer in three seconds, or hangs up with none, the client's connection is
+  closed, so that what it said reaches no second replica; one that had said
+  nothing yet is tried at the next replica.
 
 What a cluster of three does when a node is cut off or loses power is tested
 in VMs (`sh ci/vm.sh --test chaos`): three kith OS nodes, and a writer on the
@@ -2885,35 +2896,35 @@ the same way, runs the same workloads on both, and writes the tables down
 
 | | kith | k3s |
 | --- | --- | --- |
-| Memory in use on an idle node: the first node / the server | 67 MB (65 to 67, 3 runs) | 963 MB (948 to 1026, 3 runs) |
-| Memory in use on an idle node: another node / an agent | 65 MB (65 to 66, 3 runs) | 478 MB (478 to 479, 3 runs) |
-| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.04, 3 runs) | 0.49 s (0.47 to 0.49, 3 runs) |
-| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 305, 3 runs) | 354 s (348 to 361, 3 runs) |
-| The same, each told to wait about 60 s | 60 s | 58 s |
-| From switching a machine on to a node that is ready | 2.6 s (2.6 to 2.8, 3 runs) | 29.4 s (29.2 to 29.5, 3 runs) |
-| CPU in use on an idle node: the first node / the server | 0.7 % of one CPU (0.7 to 0.8, 3 runs) | 9.5 % of one CPU (8.4 to 9.8, 3 runs) |
-| CPU in use on an idle node: another node / an agent | 0.6 % of one CPU (0.6 to 0.7, 3 runs) | 4.6 % of one CPU (4.3 to 4.7, 3 runs) |
-| On the first node's disk at the end | 248 MB (248 to 248, 3 runs) | 1260 MB (1260 to 1261, 3 runs) |
+| Memory in use on an idle node: the first node / the server | 66 MB (66 to 67, 3 runs) | 1030 MB (967 to 1035, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 65 MB (65 to 66, 3 runs) | 474 MB (472 to 479, 3 runs) |
+| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.04, 3 runs) | 0.50 s (0.49 to 0.61, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 305, 3 runs) | 350 s (344 to 364, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 57 s |
+| From switching a machine on to a node that is ready | 2.6 s (2.6 to 3.8, 3 runs) | 30.8 s (29.7 to 34.2, 3 runs) |
+| CPU in use on an idle node: the first node / the server | 0.8 % of one CPU (0.7 to 0.9, 3 runs) | 11.2 % of one CPU (10.4 to 12.2, 3 runs) |
+| CPU in use on an idle node: another node / an agent | 0.8 % of one CPU (0.7 to 0.9, 3 runs) | 5.1 % of one CPU (4.8 to 5.8, 3 runs) |
+| On the first node's disk at the end | 248 MB (248 to 248, 3 runs) | 1261 MB (1261 to 1261, 3 runs) |
 
 The same workloads, sent to each system's API in the same way (ci/compare_workloads.py):
 
 | | kith | k3s |
 | --- | --- | --- |
-| One workload of 30 replicas: until all are ready | 0.12 s (0.12 to 0.12, 3 runs) | 2.66 s (2.50 to 2.73, 3 runs) |
-| Memory in use that each of those replicas adds | 0.4 MB (0.4 to 0.5, 3 runs) | 11.8 MB (10.2 to 12.2, 3 runs) |
-| 20 workloads at once: until all are ready | 0.10 s (0.08 to 0.13, 3 runs) | 4.18 s (4.13 to 4.21, 3 runs) |
-| A change to a workload of 6 replicas: until all 6 run it | 0.15 s (0.15 to 0.17, 3 runs) | 1.38 s (1.34 to 1.42, 3 runs) |
-| A container that exits: until it runs again | 1.01 s (1.01 to 1.01, 3 runs) | 0.81 s (0.72 to 0.82, 3 runs) |
-| A Job that does nothing: until it has succeeded | 0.07 s (0.07 to 0.07, 3 runs) | 2.91 s (2.86 to 2.98, 3 runs) |
-| Requests a second through a Service to 3 web servers, a connection each | 5077 (5062 to 5265, 3 runs) | 6595 (4363 to 7297, 3 runs) |
-| Of those requests, half took under | 4 ms (3 to 4, 3 runs) | 2 ms (2 to 4, 3 runs) |
-| and 99 in 100 under | 12 ms (11 to 12, 3 runs) | 10 ms (8 to 15, 3 runs) |
-| Requests a second over connections that are kept | 29363 (25560 to 30119, 3 runs) | 51955 (26937 to 67689, 3 runs) |
+| One workload of 30 replicas: until all are ready | 0.17 s (0.16 to 0.22, 3 runs) | 2.72 s (2.63 to 3.57, 3 runs) |
+| Memory in use that each of those replicas adds | 0.4 MB (0.4 to 0.5, 3 runs) | 11.9 MB (11.5 to 13.4, 3 runs) |
+| 20 workloads at once: until all are ready | 0.16 s (0.14 to 0.17, 3 runs) | 4.29 s (4.25 to 4.32, 3 runs) |
+| A change to a workload of 6 replicas: until all 6 run it | 0.14 s (0.11 to 0.17, 3 runs) | 1.33 s (1.28 to 1.47, 3 runs) |
+| A container that exits: until it runs again | 0.01 s (0.01 to 0.02, 3 runs) | 0.69 s (0.41 to 0.87, 3 runs) |
+| A Job that does nothing: until it has succeeded | 0.07 s (0.07 to 0.07, 3 runs) | 2.92 s (2.88 to 2.97, 3 runs) |
+| Requests a second through a Service to 3 web servers, a connection each | 7367 (7236 to 7420, 3 runs) | 6988 (6698 to 7377, 3 runs) |
+| Of those requests, half took under | 2 ms (2 to 2, 3 runs) | 3 ms (2 to 3, 3 runs) |
+| and 99 in 100 under | 8 ms (7 to 8, 3 runs) | 9 ms (9 to 10, 3 runs) |
+| Requests a second over connections that are kept | 26004 (25889 to 26682, 3 runs) | 24081 (23688 to 25074, 3 runs) |
 
-Alpine alone, before k3s is started on it, has 210 MB (208 to 222, 3 runs) in use; kith OS has no such moment (kithd is its first process).
-A kith OS machine answers on its API 2.5 s (2.5 to 2.7, 3 runs) after it is switched on (firmware included).
+Alpine alone, before k3s is started on it, has 233 MB (222 to 233, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.5 s (2.5 to 3.7, 3 runs) after it is switched on (firmware included).
 
-Of k3s's time to a ready node, 23.5 s (23.0 to 23.5, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
+Of k3s's time to a ready node, 24.7 s (23.6 to 28.2, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
 
 - **Memory in use** is `MemTotal - MemAvailable` in a node's `/proc/meminfo`, read by
   one small container on every node three minutes after all of them run: the kernel,
@@ -2970,9 +2981,21 @@ the two differ in what they do, the numbers are not of the same thing:
 - kith replaces all replicas of a changed workload that are on different nodes
   at once; Kubernetes goes a quarter at a time unless told otherwise.
 - A kith Service is on the mesh, TCP only, and kithd itself passes every byte on
-  between the two connections; k3s's is rules in the kernel. That is why k3s
-  serves more requests. What goes from one kith node to another over the mesh is
-  encrypted (WireGuard); between k3s's nodes, as it comes, it is not.
+  between the two connections; k3s's is rules in the kernel. What goes from one
+  kith node to another over the mesh is encrypted (WireGuard); between k3s's
+  nodes, as it comes, it is not. In these runs kith serves somewhat more on
+  both rows; with a new connection for each request the two ranges overlap,
+  with connections that are kept they do not. (An earlier sitting of
+  the same script had k3s's kept connections at 27,000 to 68,000 a second, three
+  runs: a connection to a web server on the node that asks is passed by the
+  kernel's rules faster than kithd passes it.) Where kith's time goes,
+  from one run with one web server and connections that are kept
+  ([ci/compare.where.txt](ci/compare.where.txt)): asked
+  directly on its own node it answered 218,000 requests a second, through its
+  Service on that node 94,000 (kithd's copying), and from another node 20,900,
+  where the mesh alone gave 21,800 and the nodes' network with no mesh 30,400.
+  So between nodes the encryption is the bound, not kithd, and on one node
+  kithd is.
 - nginx runs with a configuration of its own on both (it listens on 8080 and
   writes only under `/tmp`): as its image comes it wants to start as root and
   write into its image, which a kith container may not.

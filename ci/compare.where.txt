@@ -1,0 +1,13 @@
+Where the time of a request through a kith Service goes: one run, three kith OS machines
+(QEMU with KVM, 2 CPUs, 2048 MB), one nginx, `ab -n 20000 -c 20` on the first node.
+
+    KITH_COMPARE_ONLY=web,where KITH_COMPARE_RAW=FILE sh ci/compare.sh --only kith --runs 1
+
+The row it wrote (rps: a new connection for each request; kept: connections that are
+kept; p50 and p99 in ms). No prefix: the Service in front of three nginx, as in
+ci/compare.txt. direct_: the web server asked on its own node, no Service between.
+near_: through its Service on that node (kithd passes the bytes once). lan_: the web
+server on another node, asked on the nodes' own network. mesh_: the same over the mesh
+(WireGuard). far_: through its Service from another node (two kithds and the mesh).
+
+    kith tried rps=7107 p50=2 p99=8 kept=25160 direct_rps=31508 direct_p50=1 direct_p99=1 direct_kept=218067 near_rps=22400 near_p50=1 near_p99=2 near_kept=93988 lan_rps=9192 lan_p50=2 lan_p99=4 lan_kept=30436 mesh_rps=7146 mesh_p50=3 mesh_p99=5 mesh_kept=21763 far_rps=6552 far_p50=3 far_p99=5 far_kept=20897

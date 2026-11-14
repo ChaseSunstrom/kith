@@ -3,7 +3,9 @@
 //! passed to a ready replica of a Workload its selector matches, one after the other in
 //! turn. A replica on this node is reached on the machine itself (so it may listen on
 //! 127.0.0.1 only); one on another node through that node's kithd, which listens on its
-//! mesh address for exactly this and connects to the replica there.
+//! mesh address for exactly this and connects to the replica there. Two nodes keep the
+//! connections between them for a while and pass on one client's after another on each
+//! ([`carry`]): a new connection to a Service is then no new one between the nodes.
 //
 // ponytail: kithd copies every byte (a restart of kithd cuts the connections), TCP only,
 // and replicas of one node share its ports until workloads have addresses of their own.
@@ -11,16 +13,18 @@
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits};
+use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PortRef, Protocol, ServiceSpec, WorkloadSpec};
 use kith_api::store::Store;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 
@@ -34,6 +38,36 @@ const CONNECT: Duration = Duration::from_secs(3);
 /// A connection to a Service with no byte either way for this long is closed (a client
 /// that is gone without a word, a backend that stopped answering).
 const IDLE: Duration = Duration::from_secs(3600);
+/// A connection to another node's kithd, which passes on one client's connection after
+/// another on it.
+struct Relay {
+    from: BufReader<OwnedReadHalf>,
+    to: OwnedWriteHalf,
+}
+
+impl Relay {
+    fn new(stream: TcpStream) -> Relay {
+        // (Each frame is to go when it is written: nothing waits for the one before.)
+        let _ = stream.set_nodelay(true);
+        let (from, to) = stream.into_split();
+        Relay {
+            from: BufReader::new(from),
+            to,
+        }
+    }
+}
+/// How long a connection between two nodes is kept with nothing passed on: by the node
+/// that made it and, longer (so it is not hung up on just as it is used), by the other.
+const KEPT: Duration = Duration::from_secs(30);
+const KEPT_THERE: Duration = Duration::from_secs(60);
+/// How many of them a node keeps to each other node while none of its clients needs them.
+const KEEP: usize = 16;
+/// The most bytes in one frame of [`carry`].
+const CHUNK: usize = 8192;
+/// How long a replica here has to take a connection another node asks for: less than
+/// that node waits for the answer ([`CONNECT`]), so that it hears a no and tries the next
+/// replica, where no answer would cost a client that had spoken its connection.
+const FOUND: Duration = Duration::from_secs(2);
 /// How many connections to Services this node passes on at a time, from its own side and
 /// (for the other nodes together, so no node can take them all) from the mesh; one
 /// over is hung up on.
@@ -247,6 +281,20 @@ struct Proxy {
     /// passes on to a replica here.
     serving: Limits,
     relaying: Limits,
+    /// The connections to each other node's kithd that no client's is on now, and since when.
+    kept: Mutex<BTreeMap<String, Vec<(Relay, Instant)>>>,
+}
+
+/// What [`Proxy::reach`] reached.
+enum Reached {
+    /// A connection that is this client's alone: to a replica here, or through a node of
+    /// before, which keeps none.
+    Whole(TcpStream),
+    /// One to that node's kithd, which has the replica: kept after, if it ends well.
+    Kept(String, Relay),
+    /// That node was sent the client's first bytes with the asking and gave no answer in
+    /// time: it may yet pass them to a replica, so they go to no other.
+    Lost,
 }
 
 impl Proxy {
@@ -256,13 +304,13 @@ impl Proxy {
 
     /// A connection to the replica behind `backend`: on this machine, or through the
     /// kithd of the node it is on.
-    async fn reach(&self, (node, port, workload, replica): &Backend) -> std::io::Result<TcpStream> {
+    async fn reach(&self, (node, port, workload, replica): &Backend, early: &[u8]) -> std::io::Result<Reached> {
         if node == self.me() {
             // (Whoever connects to a Service's address is on this node: only it has it.)
             if !self.admits(workload, kith_mesh::node_address(self.prefix, node), *port) {
                 return Err(std::io::Error::other("a NetworkPolicy says no"));
             }
-            return self.local(workload, *replica, *port).await;
+            return self.local(workload, *replica, *port).await.map(Reached::Whole);
         }
         let relay = {
             let state = self.shared.store.lock().expect("nothing panics holding the store");
@@ -270,24 +318,86 @@ impl Proxy {
                 .store
                 .get(&format!("Node/{node}"))
                 .and_then(|node| node.status.as_ref());
-            status.and_then(|status| u16::try_from(status["mesh"]["port"].as_u64()?).ok())
+            status.and_then(|status| {
+                let port = u16::try_from(status["mesh"]["port"].as_u64()?).ok()?;
+                Some((port, status["mesh"]["kept"] == true))
+            })
         };
-        let relay = relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
+        let (relay, keeps) = relay.ok_or_else(|| std::io::Error::other(format!("node {node} is not on the mesh")))?;
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
-        let mut stream = within(TcpStream::connect(there)).await?;
         let replica = replica.map(|replica| format!(" {replica}")).unwrap_or_default();
-        stream
-            .write_all(format!("{port} {workload}{replica}\n").as_bytes())
-            .await?;
-        // It says so (one byte) when it has the replica; if it hangs up instead (a
-        // policy, a replica just gone), the next backend is tried.
-        within(stream.read_u8()).await?;
-        Ok(stream)
+        if !keeps {
+            // A node of before: a connection for this client alone, as it knows them. It
+            // says so (one byte) when it has the replica; if it hangs up instead (a
+            // policy, a replica just gone), the next backend is tried.
+            let mut stream = within(TcpStream::connect(there)).await?;
+            stream
+                .write_all(format!("{port} {workload}{replica}\n").as_bytes())
+                .await?;
+            within(stream.read_u8()).await?;
+            return Ok(Reached::Whole(stream));
+        }
+        let line = format!("kept {port} {workload}{replica}\n");
+        // One kept from before, if there is one; hung up on since, perhaps: then a new one.
+        let mut before = self.kept_to(node);
+        loop {
+            let (was_kept, mut relay) = match before.take() {
+                Some(relay) => (true, relay),
+                None => (false, Relay::new(within(TcpStream::connect(there)).await?)),
+            };
+            let asked = ask(&mut relay, &line, early).await;
+            if was_kept && asked.is_err() {
+                // (The others kept with it are as old: a node that is gone is waited for once.)
+                self.kept.lock().expect("nothing panics holding the kept").remove(node);
+            }
+            match asked {
+                Ok(true) => return Ok(Reached::Kept(node.clone(), relay)),
+                Ok(false) => {
+                    self.keep(node, relay);
+                    return Err(std::io::Error::other("that node does not pass it on"));
+                }
+                Err(e) => match unanswered(e, was_kept, !early.is_empty()) {
+                    Unanswered::Lost => return Ok(Reached::Lost),
+                    Unanswered::Next(e) => return Err(e),
+                    Unanswered::Again => {}
+                },
+            }
+        }
+    }
+
+    /// A connection to `node`'s kithd from before, if one is kept and not for too long.
+    fn kept_to(&self, node: &str) -> Option<Relay> {
+        let mut kept = self.kept.lock().expect("nothing panics holding the kept");
+        let (relay, since) = kept.get_mut(node)?.pop()?;
+        if since.elapsed() < KEPT {
+            return Some(relay);
+        }
+        // (The others were kept before it: for too long as well.)
+        kept.remove(node);
+        None
+    }
+
+    /// Keep `relay`, on which a client's connection ended well, for the next one to `node`.
+    fn keep(&self, node: &str, relay: Relay) {
+        let mut kept = self.kept.lock().expect("nothing panics holding the kept");
+        let kept = kept.entry(node.to_string()).or_default();
+        if kept.len() < KEEP {
+            kept.push((relay, Instant::now()));
+        }
+    }
+
+    /// Hang up on the connections between nodes that were kept for too long.
+    fn forget(&self) {
+        let mut kept = self.kept.lock().expect("nothing panics holding the kept");
+        kept.retain(|_, kept| {
+            kept.retain(|(_, since)| since.elapsed() < KEPT);
+            !kept.is_empty()
+        });
     }
 
     /// Someone connected to a Service: pass the connection to its next backend that
     /// takes it.
-    async fn serve(&self, key: (Ipv6Addr, u16), client: TcpStream) {
+    async fn serve(&self, key: (Ipv6Addr, u16), mut client: TcpStream) {
         // (The place is held while the connection lasts.)
         let Some(_place) = client.peer_addr().ok().and_then(|from| self.serving.take(from.ip())) else {
             return;
@@ -298,10 +408,32 @@ impl Proxy {
         };
         // (No turn is taken, or kept, for what has nothing behind it.)
         let first = if backends.is_empty() { 0 } else { self.turns.next(key) };
+        // What the client has said by now goes with the asking where another node is
+        // asked: one round trip between the nodes before its answer, not two. (Looked
+        // for after the others here had a turn: a client's first bytes are a moment
+        // behind its connection. One that says nothing first is not waited for.)
+        tokio::task::yield_now().await;
+        let mut early = vec![0; CHUNK];
+        let said = client.read(&mut early).now_or_never().and_then(Result::ok);
+        early.truncate(said.unwrap_or(0));
         for at in 0..backends.len() {
-            if let Ok(backend) = self.reach(&backends[(first + at) % backends.len()]).await {
-                let _ = pass(client, backend, IDLE).await;
-                return;
+            match self.reach(&backends[(first + at) % backends.len()], &early).await {
+                Ok(Reached::Whole(mut backend)) => {
+                    if backend.write_all(&early).await.is_ok() {
+                        drop(early);
+                        let _ = pass(client, backend, IDLE).await;
+                    }
+                    return;
+                }
+                Ok(Reached::Kept(node, mut relay)) => {
+                    drop(early);
+                    if carry(client, &mut relay, IDLE).await.is_ok() {
+                        self.keep(&node, relay);
+                    }
+                    return;
+                }
+                Ok(Reached::Lost) => return,
+                Err(_) => {}
             }
         }
         // (Nothing behind it, or nothing that answers: the client sees the connection close.)
@@ -316,47 +448,28 @@ impl Proxy {
         admits(&state.store, workload, node, from.into(), port)
     }
 
-    /// Another node passes on a connection for a replica here: the port and the Workload
-    /// come first, on a line. Only for what a Service has a backend for on this node,
-    /// and only from where the Workload's NetworkPolicies let it.
-    async fn take(&self, mut from: TcpStream) -> Option<()> {
+    /// Another node's kithd connected, to pass on its clients' connections for replicas
+    /// here ([`taken`]): only for what a Service has a backend for on this node, and only
+    /// from where the Workload's NetworkPolicies let it, asked for each of them.
+    async fn take(&self, from: TcpStream) -> Option<()> {
         let IpAddr::V6(caller) = from.peer_addr().ok()?.ip() else {
             return None;
         };
+        // (The place is held while the connection between the nodes lasts.)
         let _place = self.relaying.take(caller.into())?;
-        // (All of it in the time, not each byte: a line that drips does not hold the place.)
-        let reading = async {
-            let mut line = Vec::new();
-            while line.last() != Some(&b'\n') {
-                line.push(from.read_u8().await?);
-                if line.len() > 300 {
-                    return Err(std::io::Error::other("a line too long"));
-                }
+        let find = |port, workload: String, replica| async move {
+            let asked_for = {
+                let table = self.table.lock().expect("nothing panics holding the table");
+                let mut backends = table.values().flatten();
+                let asked = (self.me(), port, workload.as_str(), replica);
+                backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
+            };
+            if !asked_for || !self.admits(&workload, caller, port) {
+                return None;
             }
-            Ok(line)
+            self.local(&workload, replica, port).await.ok()
         };
-        let line = within(reading).await.ok()?;
-        let line = std::str::from_utf8(&line).ok()?.trim();
-        let mut words = line.split(' ');
-        let (port, workload) = (words.next()?.parse::<u16>().ok()?, words.next()?);
-        let replica = words.next().map(|replica| replica.parse::<u32>().ok());
-        let replica = if let Some(replica) = replica {
-            Some(replica?)
-        } else {
-            None
-        };
-        let asked_for = {
-            let table = self.table.lock().expect("nothing panics holding the table");
-            let mut backends = table.values().flatten();
-            let asked = (self.me(), port, workload, replica);
-            backends.any(|(node, port, of, which)| (node.as_str(), *port, of.as_str(), *which) == asked)
-        };
-        if !asked_for || !self.admits(workload, caller, port) {
-            return None;
-        }
-        let replica = self.local(workload, replica, port).await.ok()?;
-        from.write_all(b"+").await.ok()?;
-        pass(from, replica, IDLE).await.ok().map(drop)
+        taken(from, find).await
     }
 
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
@@ -394,10 +507,193 @@ async fn pass(client: TcpStream, backend: TcpStream, idle: Duration) -> std::io:
     tokio::io::copy_bidirectional(&mut client, &mut backend).await
 }
 
+/// What an asking that got no answer means for its client.
+enum Unanswered {
+    /// Its bytes may be with a replica: it is not asked for anywhere else.
+    Lost,
+    /// The next backend is tried.
+    Next(std::io::Error),
+    /// Asked again of the same node, on a new connection.
+    Again,
+}
+
+/// An asking failed with `e`, on a connection that `was_kept` or was new, with what the
+/// client had said (`spoke`) or with nothing. What the client said went with the asking,
+/// and a node that hangs up or goes quiet may have passed it on to a replica first (it
+/// was stopped between that and its answer): said to no second replica, so that client's
+/// connection is closed. With nothing said: no answer in the time (or the kernel gave the
+/// connection up, which reads the same) is a node that is slow or gone, and a new
+/// connection to it would be waited for as long; a kept connection hung up on is one
+/// that was kept too long there, asked again on a new one.
+fn unanswered(e: std::io::Error, was_kept: bool, spoke: bool) -> Unanswered {
+    match (spoke, was_kept && e.kind() != std::io::ErrorKind::TimedOut) {
+        (true, _) => Unanswered::Lost,
+        (false, true) => Unanswered::Again,
+        (false, false) => Unanswered::Next(e),
+    }
+}
+
+/// Ask the kithd on `relay` for the replica `line` names, and send `early` (what the
+/// client has said so far, a frame of [`carry`] at most) with the asking: whether it has
+/// the replica. What it does not pass on it says too; it is then told where the client's
+/// bytes end, and the connection is as good as before.
+async fn ask(relay: &mut Relay, line: &str, early: &[u8]) -> std::io::Result<bool> {
+    let mut asking = line.as_bytes().to_vec();
+    if !early.is_empty() {
+        asking.extend_from_slice(&(early.len() as u16).to_be_bytes());
+        asking.extend_from_slice(early);
+    }
+    relay.to.write_all(&asking).await?;
+    match within(relay.from.read_u8()).await? {
+        b'+' => Ok(true),
+        b'-' => relay.to.write_all(&[0, 0]).await.map(|()| false),
+        _ => Err(std::io::Error::other("not an answer")),
+    }
+}
+
+/// What another node's kithd asks for on `from`, one line for each client of its own: the
+/// port, the Workload and (where each is a pod) which replica, which `find` connects to if
+/// that node may have it. After `kept ` it asks for a connection that is used again, and
+/// the client's bytes follow in frames ([`carry`]) without waiting: `+` and the replica's
+/// in frames, or `-` (and then the client's are nobody's, to where it says they end), and
+/// then the next line. A node of before asks with no such word, once: `+` and the bytes
+/// as they are, or it is hung up on.
+async fn taken<F, Fut>(from: TcpStream, find: F) -> Option<()>
+where
+    F: Fn(u16, String, Option<u32>) -> Fut,
+    Fut: Future<Output = Option<TcpStream>>,
+{
+    let mut relay = Relay::new(from);
+    let mut wait = CONNECT;
+    loop {
+        // A connection that is kept may say nothing for a while. A line that has begun
+        // has all of it in the time, not each byte: one that drips holds no place.
+        let begun = tokio::time::timeout(wait, relay.from.fill_buf()).await.ok()?.ok()?;
+        if begun.is_empty() {
+            return None;
+        }
+        let mut line = Vec::new();
+        within((&mut relay.from).take(300).read_until(b'\n', &mut line))
+            .await
+            .ok()?;
+        let line = std::str::from_utf8(&line).ok()?.strip_suffix('\n')?;
+        let mut words = line.split(' ').peekable();
+        let kept = words.next_if_eq(&"kept").is_some();
+        let (port, workload) = (words.next()?.parse::<u16>().ok()?, words.next()?);
+        let replica = match words.next() {
+            Some(replica) => Some(replica.parse::<u32>().ok()?),
+            None => None,
+        };
+        let replica = tokio::time::timeout(FOUND, find(port, workload.to_string(), replica)).await;
+        let replica = replica.ok().flatten();
+        if !kept {
+            let (mut from, replica) = (relay.from.into_inner().reunite(relay.to).ok()?, replica?);
+            from.write_all(b"+").await.ok()?;
+            return pass(from, replica, IDLE).await.ok().map(drop);
+        }
+        match replica {
+            Some(replica) => {
+                relay.to.write_all(b"+").await.ok()?;
+                carry(replica, &mut relay, IDLE).await.ok()?;
+            }
+            None => {
+                relay.to.write_all(b"-").await.ok()?;
+                let skipped = async {
+                    loop {
+                        let size = u64::from(relay.from.read_u16().await?);
+                        if size == 0 {
+                            return Ok(());
+                        }
+                        tokio::io::copy(&mut (&mut relay.from).take(size), &mut tokio::io::sink()).await?;
+                    }
+                };
+                within(skipped).await.ok()?;
+            }
+        }
+        wait = KEPT_THERE;
+    }
+}
+
+/// Bytes both ways between `local` (a client here, or a replica) and the other node's
+/// kithd on `relay`, each way in frames: two bytes of length and as many bytes, and a
+/// length of none where that side says no more. So `relay` outlasts the connection: Ok
+/// when both ways ended as a connection's do, and then (only then) another may be passed
+/// on it. As in [`pass`], `idle` with no byte moved ends it.
+async fn carry(mut local: TcpStream, relay: &mut Relay, idle: Duration) -> std::io::Result<()> {
+    let (mut from, mut to) = local.split();
+    let (theirs, ours) = (&mut relay.from, &mut relay.to);
+    // When a byte last moved, in ms since it began: asked once in `idle`, not set a
+    // timer for each time.
+    let (begun, moved) = (Instant::now(), AtomicU64::new(0));
+    let moves = || moved.store(begun.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let out = async {
+        let (mut chunk, mut frames) = (vec![0; CHUNK], Vec::new());
+        loop {
+            if frames.len() >= CHUNK {
+                ours.write_all(&frames).await?;
+                frames.clear();
+            }
+            // What is there now goes in one write (an answer and its end, say), so in as
+            // few packets; only when nothing more is, is it sent and waited for.
+            let read = match from.read(&mut chunk).now_or_never() {
+                Some(read) => read?,
+                None => {
+                    ours.write_all(&frames).await?;
+                    frames.clear();
+                    from.read(&mut chunk).await?
+                }
+            };
+            moves();
+            frames.extend_from_slice(&(read as u16).to_be_bytes());
+            frames.extend_from_slice(&chunk[..read]);
+            if read == 0 {
+                return ours.write_all(&frames).await;
+            }
+        }
+    };
+    let back = async {
+        loop {
+            let mut left = usize::from(theirs.read_u16().await?);
+            if left > CHUNK {
+                return Err(std::io::Error::other("a frame too long"));
+            }
+            if left == 0 {
+                // (Whether or not it is still there to be told.)
+                let _ = to.shutdown().await;
+                return Ok(());
+            }
+            while left > 0 {
+                let has = theirs.fill_buf().await?;
+                let some = has.len().min(left);
+                if some == 0 {
+                    return Err(std::io::ErrorKind::UnexpectedEof.into());
+                }
+                to.write_all(&has[..some]).await?;
+                theirs.consume(some);
+                left -= some;
+                moves();
+            }
+        }
+    };
+    let silent = async {
+        loop {
+            let until = begun + Duration::from_millis(moved.load(Ordering::Relaxed)) + idle;
+            if Instant::now() >= until {
+                return std::io::Error::from(std::io::ErrorKind::TimedOut);
+            }
+            tokio::time::sleep_until(until.into()).await;
+        }
+    };
+    tokio::select! {
+        passed = async { tokio::try_join!(out, back) } => passed.map(drop),
+        timed = silent => Err(timed),
+    }
+}
+
 async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::Result<T> {
     tokio::time::timeout(CONNECT, doing)
         .await
-        .map_err(std::io::Error::other)?
+        .map_err(|_| std::io::ErrorKind::TimedOut)?
 }
 
 /// Listen for every Service on this node's mesh interface, until stopped. `port` is the
@@ -420,6 +716,7 @@ pub async fn run(
         turns: Turns::default(),
         serving: Limits::new(SERVING, SERVING),
         relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
+        kept: Mutex::default(),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
     // (False again if the ingress gives up: then the ports are ours after all.)
@@ -486,6 +783,7 @@ pub async fn run(
         keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
         keys.insert((me, port));
         proxy.turns.keep(&wanted);
+        proxy.forget();
         *proxy.table.lock().expect("nothing panics holding the table") = wanted;
         listening.retain(|key, task| {
             let keep = keys.contains(key) && !task.is_finished();
@@ -707,6 +1005,411 @@ spec:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         (ours, listener.accept().await.unwrap().0)
+    }
+
+    /// A replica: it answers what each connection says (all of it, to its end) with `a:`
+    /// before it, then hangs up. Where it listens, and how many connections it has had.
+    async fn replica() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (at, had) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = had.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let mut said = b"a:".to_vec();
+                    if stream.read_to_end(&mut said).await.is_ok() {
+                        let _ = stream.write_all(&said).await;
+                    }
+                });
+            }
+        });
+        (at, had)
+    }
+
+    /// Another node's kithd for the tests: what it is asked ([`taken`]) it passes to
+    /// `replica`, except for the Workload `shut`. Where it listens, how many connections
+    /// it has had, and every replica it was asked for.
+    async fn other_node(
+        replica: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (at, had) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let (count, lines) = (had.clone(), asked.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                let lines = lines.clone();
+                tokio::spawn(taken(stream, move |port, workload: String, which| {
+                    lines.lock().unwrap().push(format!("{port} {workload} {which:?}"));
+                    async move {
+                        match workload.as_str() {
+                            "shut" => None,
+                            "slow" => std::future::pending().await,
+                            _ => TcpStream::connect(replica).await.ok(),
+                        }
+                    }
+                }));
+            }
+        });
+        (at, had, asked)
+    }
+
+    /// One client's connection through `relay`: it says `says` and no more, and what it hears.
+    async fn through(relay: &mut Relay, says: &str) -> (std::io::Result<()>, String) {
+        use tokio::io::AsyncReadExt;
+        let (mut client, held) = pair().await;
+        let asking = async {
+            client.write_all(says.as_bytes()).await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut heard = String::new();
+            let _ = client.read_to_string(&mut heard).await;
+            heard
+        };
+        tokio::join!(carry(held, relay, Duration::from_secs(60)), asking)
+    }
+
+    /// One connection between two nodes passes on one client's connection after another,
+    /// each to a replica that was asked for (and so admitted) by itself; what is not
+    /// passed on is said, and costs no connection.
+    #[tokio::test]
+    async fn a_connection_between_nodes_is_used_again_and_each_client_is_asked_for() {
+        let (replica, replicas) = replica().await;
+        let (node, connections, asked) = other_node(replica).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        for turn in 0..3 {
+            assert!(ask(&mut relay, "kept 8080 web 1\n", b"").await.unwrap());
+            let (carried, heard) = through(&mut relay, &format!("q{turn}")).await;
+            carried.unwrap();
+            assert_eq!(heard, format!("a:q{turn}"));
+        }
+        // What a client said before the answer goes with the asking: to the replica if
+        // there is one for it, and to nobody (not the next client's replica) if not.
+        assert!(!ask(&mut relay, "kept 8080 shut\n", b"for nobody").await.unwrap());
+        assert!(ask(&mut relay, "kept 8081 web\n", b"first, ").await.unwrap());
+        assert_eq!(through(&mut relay, "more").await.1, "a:first, more");
+        assert_eq!(
+            (connections.load(Ordering::Relaxed), replicas.load(Ordering::Relaxed)),
+            (1, 4)
+        );
+        let asked = asked.lock().unwrap().join(", ");
+        assert_eq!(
+            asked,
+            "8080 web Some(1), 8080 web Some(1), 8080 web Some(1), 8080 shut None, 8081 web None"
+        );
+    }
+
+    /// A node of before asks as it always did, a connection for each client's: it is answered so.
+    #[tokio::test]
+    async fn a_node_of_before_is_still_passed_on_for() {
+        use tokio::io::AsyncReadExt;
+        let (node, _, asked) = other_node(replica().await.0).await;
+        let mut relay = TcpStream::connect(node).await.unwrap();
+        relay.write_all(b"8080 web 2\n").await.unwrap();
+        assert_eq!(relay.read_u8().await.unwrap(), b'+');
+        relay.write_all(b"q").await.unwrap();
+        relay.shutdown().await.unwrap();
+        let mut heard = String::new();
+        relay.read_to_string(&mut heard).await.unwrap();
+        assert_eq!(heard, "a:q");
+        assert_eq!(asked.lock().unwrap().join(", "), "8080 web Some(2)");
+        // And what it may not have is hung up on, with no word.
+        let mut relay = TcpStream::connect(node).await.unwrap();
+        relay.write_all(b"8080 shut\n").await.unwrap();
+        assert_eq!(relay.read_to_string(&mut heard).await.unwrap(), 0);
+    }
+
+    /// A client's connection that ends as none does (here: silent for the idle time) takes
+    /// the connection between the nodes with it: nothing else is passed on that one, and
+    /// the replica sees its end.
+    #[tokio::test]
+    async fn a_connection_between_nodes_that_was_cut_is_not_used_again() {
+        use tokio::io::AsyncReadExt;
+        let (node, _, _) = other_node(replica().await.0).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
+        let (mut client, held) = pair().await;
+        client.write_all(b"half a question").await.unwrap();
+        let cut = carry(held, &mut relay, Duration::from_secs(1)).await;
+        assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(client.read_u8().await.is_err());
+        // (The replica answers what it heard, once its connection ends: to nobody.)
+        drop(relay);
+        // A frame longer than any that is sent is no frame: the other node hangs up.
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
+        relay.to.write_all(&[0xff, 0xff]).await.unwrap();
+        assert!(relay.from.read_u8().await.is_err());
+    }
+
+    /// A node that takes an asking and what the client said with it, and hangs up with no
+    /// answer (it was stopped, perhaps after it passed the bytes on): the client is asked
+    /// for nowhere else, whether the connection was kept or new, so that what it said
+    /// reaches no second replica. One that had said nothing is tried elsewhere, or asked
+    /// again where the connection was only kept too long.
+    #[tokio::test]
+    async fn what_a_client_said_goes_to_no_second_replica_when_a_node_hangs_up() {
+        use tokio::io::AsyncReadExt;
+        let stopped = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = stopped.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut asker, _) = stopped.accept().await.unwrap();
+                let _ = asker.read(&mut [0; 64]).await;
+            }
+        });
+        let said = |spoke: bool, was_kept| async move {
+            let mut relay = Relay::new(TcpStream::connect(at).await.unwrap());
+            let early: &[u8] = if spoke { b"POST /pay" } else { b"" };
+            let hung_up = ask(&mut relay, "kept 8080 web\n", early).await.unwrap_err();
+            assert_ne!(hung_up.kind(), std::io::ErrorKind::TimedOut);
+            unanswered(hung_up, was_kept, spoke)
+        };
+        assert!(matches!(said(true, false).await, Unanswered::Lost));
+        assert!(matches!(said(true, true).await, Unanswered::Lost));
+        assert!(matches!(said(false, false).await, Unanswered::Next(_)));
+        assert!(matches!(said(false, true).await, Unanswered::Again));
+        // No answer in the time: lost with something said, the next backend without.
+        let late = || std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(matches!(unanswered(late(), true, true), Unanswered::Lost));
+        assert!(matches!(unanswered(late(), true, false), Unanswered::Next(_)));
+    }
+
+    /// A replica that does not take its node's connection is said no to before the asking
+    /// node gives up waiting: that one tries the next replica, and the connection between
+    /// the two is as good as before. A node that says nothing at all is waited for
+    /// [`CONNECT`], and that reads as time gone by, which [`Proxy::reach`] tells from a
+    /// connection that was hung up on.
+    #[tokio::test]
+    async fn a_replica_that_does_not_answer_is_said_no_to_in_time() {
+        let (node, connections, _) = other_node(replica().await.0).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        let begun = std::time::Instant::now();
+        assert!(!ask(&mut relay, "kept 8080 slow\n", b"said").await.unwrap());
+        assert!(begun.elapsed() >= FOUND);
+        assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
+        assert_eq!(through(&mut relay, "q").await.1, "a:q");
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+
+        let mute = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut relay = Relay::new(TcpStream::connect(mute.local_addr().unwrap()).await.unwrap());
+        let none = ask(&mut relay, "kept 8080 web\n", b"said").await;
+        assert_eq!(none.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// What ends a passed-on connection is silence, not time: one way alone, bytes now and
+    /// then keep it for longer than the idle time; and with one side's end said, silence
+    /// still ends it.
+    #[tokio::test]
+    async fn bytes_one_way_keep_a_passed_on_connection_and_silence_after_an_end_ends_it() {
+        use tokio::io::AsyncReadExt;
+        let dripping = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = dripping.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = dripping.accept().await {
+                tokio::spawn(async move {
+                    // Five bytes over two seconds, then (its client's end heard) its own.
+                    for _ in 0..5 {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        stream.write_all(b".").await.unwrap();
+                    }
+                    let _ = stream.read_to_end(&mut Vec::new()).await;
+                });
+            }
+        });
+        let (node, _, _) = other_node(at).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
+        let (mut client, held) = pair().await;
+        let hearing = async {
+            let mut heard = [0; 5];
+            client.read_exact(&mut heard).await.unwrap();
+            client.shutdown().await.unwrap();
+            client.read_to_end(&mut Vec::new()).await.unwrap()
+        };
+        let begun = std::time::Instant::now();
+        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(1)), hearing);
+        carried.unwrap();
+        assert!(more == 0 && begun.elapsed() >= Duration::from_secs(2));
+
+        // The client's end said and passed on, and then nothing from the replica.
+        let silent = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (node, _, _) = other_node(silent.local_addr().unwrap()).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
+        let (mut client, held) = pair().await;
+        client.shutdown().await.unwrap();
+        let begun = std::time::Instant::now();
+        let cut = carry(held, &mut relay, Duration::from_secs(1)).await;
+        assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(begun.elapsed() >= Duration::from_secs(1) && begun.elapsed() < Duration::from_secs(3));
+    }
+
+    /// A replica that speaks first and ends first: its bytes and its end reach the client,
+    /// and when the client ends too the connection between the nodes is as good as new.
+    #[tokio::test]
+    async fn a_replica_that_ends_first_leaves_the_connection_between_nodes_whole() {
+        use tokio::io::AsyncReadExt;
+        let greeter = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = greeter.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = greeter.accept().await {
+                let _ = stream.write_all(b"hello").await;
+            }
+        });
+        let (node, connections, _) = other_node(at).await;
+        let mut relay = Relay::new(TcpStream::connect(node).await.unwrap());
+        for _ in 0..2 {
+            assert!(ask(&mut relay, "kept 25 mail\n", b"").await.unwrap());
+            let (mut client, held) = pair().await;
+            let hearing = async {
+                let mut heard = String::new();
+                client.read_to_string(&mut heard).await.unwrap();
+                drop(client);
+                heard
+            };
+            let (carried, heard) = tokio::join!(carry(held, &mut relay, Duration::from_secs(60)), hearing);
+            carried.unwrap();
+            assert_eq!(heard, "hello");
+        }
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+    }
+
+    /// Not a check: how many small questions and answers a second twenty kept connections
+    /// get through two kithds, as a node of before passes them on and in frames.
+    #[tokio::test]
+    #[ignore = "a measurement, for whoever changes carry"]
+    async fn how_fast_bytes_pass_between_nodes() {
+        use tokio::io::AsyncReadExt;
+        const TURNS: usize = 20_000;
+        let answering = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = answering.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut replica, _)) = answering.accept().await {
+                tokio::spawn(async move {
+                    let mut asked = [0; 80];
+                    while replica.read_exact(&mut asked).await.is_ok() && replica.write_all(&[7; 200]).await.is_ok() {}
+                });
+            }
+        });
+        let (node, _, _) = other_node(at).await;
+        for kept in [false, true] {
+            let begun = std::time::Instant::now();
+            let clients = (0..20).map(|_| async move {
+                let (mut client, held) = pair().await;
+                let asking = async {
+                    let mut answer = [0; 200];
+                    for _ in 0..TURNS {
+                        client.write_all(&[1; 80]).await.unwrap();
+                        client.read_exact(&mut answer).await.unwrap();
+                    }
+                    drop(client);
+                };
+                let passing = async {
+                    if kept {
+                        let mut there = Relay::new(TcpStream::connect(node).await.unwrap());
+                        assert!(ask(&mut there, "kept 8080 web\n", b"").await.unwrap());
+                        return carry(held, &mut there, Duration::from_secs(60)).await;
+                    }
+                    let mut there = TcpStream::connect(node).await.unwrap();
+                    there.write_all(b"8080 web\n").await.unwrap();
+                    there.read_u8().await.unwrap();
+                    pass(held, there, Duration::from_secs(60)).await.map(drop)
+                };
+                tokio::join!(passing, asking).0.unwrap();
+            });
+            futures_util::future::join_all(clients).await;
+            let each = (20 * TURNS) as f64 / begun.elapsed().as_secs_f64();
+            eprintln!("in frames {kept}: {each:.0} questions answered a second");
+        }
+    }
+
+    /// Not a check: how many clients a second, each with a connection of its own, one
+    /// question and one answer, get through two kithds: with a connection between the
+    /// two for each as a node of before has it, and with ones that are kept (`cargo test
+    /// --release -p kithd --bin kithd how_fast -- --ignored --nocapture`).
+    #[tokio::test]
+    #[ignore = "a measurement, for whoever changes carry or taken"]
+    async fn how_fast_clients_pass_between_nodes() {
+        use tokio::io::AsyncReadExt;
+        const TURNS: usize = 2_000;
+        let (node, _, _) = other_node(replica().await.0).await;
+        for kept in [false, true] {
+            let begun = std::time::Instant::now();
+            let clients = (0..20).map(|_| async move {
+                let mut relay = None;
+                for _ in 0..TURNS {
+                    let (mut client, held) = pair().await;
+                    let asking = async {
+                        client.write_all(&[1; 80]).await.unwrap();
+                        client.shutdown().await.unwrap();
+                        client.read_to_end(&mut Vec::new()).await.unwrap()
+                    };
+                    let passing = async {
+                        if !kept {
+                            let mut there = TcpStream::connect(node).await.unwrap();
+                            there.write_all(b"8080 web\n").await.unwrap();
+                            there.read_u8().await.unwrap();
+                            return pass(held, there, Duration::from_secs(60)).await.map(drop);
+                        }
+                        let mut there = match relay.take() {
+                            Some(there) => there,
+                            None => Relay::new(TcpStream::connect(node).await.unwrap()),
+                        };
+                        assert!(ask(&mut there, "kept 8080 web\n", b"").await.unwrap());
+                        carry(held, &mut there, Duration::from_secs(60)).await?;
+                        relay = Some(there);
+                        Ok(())
+                    };
+                    let (passed, heard) = tokio::join!(passing, asking);
+                    passed.unwrap();
+                    assert_eq!(heard, 82);
+                }
+            });
+            futures_util::future::join_all(clients).await;
+            let each = (20 * TURNS) as f64 / begun.elapsed().as_secs_f64();
+            eprintln!("kept {kept}: {each:.0} clients a second");
+        }
+    }
+
+    /// Not a check: how many small questions and answers a second twenty connections get
+    /// through [`pass`] here, to try a change to it (`cargo test --release -p kithd --bin
+    /// kithd how_fast -- --ignored --nocapture`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "a measurement, for whoever changes pass"]
+    async fn how_fast_bytes_pass() {
+        use tokio::io::AsyncReadExt;
+        const TURNS: usize = 20_000;
+        let mut clients = Vec::new();
+        for _ in 0..20 {
+            let ((mut client, held), (backend, mut replica)) = (pair().await, pair().await);
+            tokio::spawn(pass(held, backend, Duration::from_secs(60)));
+            tokio::spawn(async move {
+                let mut asked = [0; 80];
+                while replica.read_exact(&mut asked).await.is_ok() && replica.write_all(&[7; 200]).await.is_ok() {}
+            });
+            clients.push(tokio::spawn(async move {
+                let mut answer = [0; 200];
+                for _ in 0..TURNS {
+                    client.write_all(&[1; 80]).await.unwrap();
+                    client.read_exact(&mut answer).await.unwrap();
+                }
+            }));
+        }
+        let begun = std::time::Instant::now();
+        for client in clients {
+            client.await.unwrap();
+        }
+        let each = (20 * TURNS) as f64 / begun.elapsed().as_secs_f64();
+        eprintln!("pass: {each:.0} questions answered a second");
     }
 
     #[tokio::test]

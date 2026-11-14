@@ -19,6 +19,12 @@ one line of `name=number`, which compare.sh puts in the run's row:
                   to three web servers, a new connection for each (ab, 20 at a time)
     kept          requests a second over connections that are kept open
 
+KITH_COMPARE_ONLY names the parts to run (cpu, scale, burst, roll, crash, job, web) when a
+change is tried out; without it, all of them. It may also name `where` (kith only): the
+same requests to one web server with no Service between (direct_), through its Service on
+the node that asks (near_), on another node (far_), and that one over the mesh with no
+Service between (mesh_).
+
 The images are on the nodes before anything is timed.
 """
 
@@ -304,68 +310,112 @@ def main():
     api = {"kith": Kith, "k3s": Kube}[sys.argv[1]]()
     cpus = int(os.environ.get("NODE_CPUS", "2"))
     out = {}
+    # To try a change out, some of it alone (KITH_COMPARE_ONLY=crash,web): rows for no table.
+    only = set(filter(None, os.environ.get("KITH_COMPARE_ONLY", "").split(",")))
 
-    # Idle first: what the nodes did in the minutes before any of this ran.
-    out["cpu"] = f"{idle_cpu(api, api.nodes[0], cpus):.1f}"
-    out["cpu2"] = f"{(idle_cpu(api, api.nodes[1], cpus) + idle_cpu(api, api.nodes[2], cpus)) / 2:.1f}"
+    def want(part):
+        return not only or part in only
 
-    # One workload, many replicas; and what each of them costs in memory.
-    many, before = 30, in_use(api)
-    out["scale"] = f"{timed(api, 'thirty replicas', [api.workload('many', many)], lambda: api.ready('many') == many):.2f}"
-    time.sleep(25)
-    out["each"] = f"{(in_use(api) - before) / many:.1f}"
-    api.delete("Workload", "many")
-    until("the thirty to go", lambda: api.gone("many"))
+    if want("cpu"):
+        # Idle first: what the nodes did in the minutes before any of this ran.
+        out["cpu"] = f"{idle_cpu(api, api.nodes[0], cpus):.1f}"
+        out["cpu2"] = f"{(idle_cpu(api, api.nodes[1], cpus) + idle_cpu(api, api.nodes[2], cpus)) / 2:.1f}"
 
-    # Many workloads at once.
-    names = [f"b{n}" for n in range(1, 21)]
-    out["burst"] = f"{timed(api, 'twenty workloads', [api.workload(name, 1) for name in names], lambda: api.all_ready(names)):.2f}"
-    for name in names:
-        api.delete("Workload", name)
-    until("the twenty to go", lambda: all(api.gone(name) for name in names))
+    if want("scale"):
+        # One workload, many replicas; and what each of them costs in memory.
+        many, before = 30, in_use(api)
+        out["scale"] = f"{timed(api, 'thirty replicas', [api.workload('many', many)], lambda: api.ready('many') == many):.2f}"
+        time.sleep(25)
+        out["each"] = f"{(in_use(api) - before) / many:.1f}"
+        api.delete("Workload", "many")
+        until("the thirty to go", lambda: api.gone("many"))
 
-    # A change, rolled through six replicas: done when every one of them says the new word.
-    api.apply([api.workload("roll", 6, says="one")])
-    until("six replicas", lambda: api.rolled("roll", 6, "one"))
-    out["roll"] = f"{timed(api, 'the change in all six', [api.workload('roll', 6, says='two')], lambda: api.rolled('roll', 6, 'two')):.2f}"
-    api.delete("Workload", "roll")
+    if want("burst"):
+        # Many workloads at once.
+        names = [f"b{n}" for n in range(1, 21)]
+        out["burst"] = f"{timed(api, 'twenty workloads', [api.workload(name, 1) for name in names], lambda: api.all_ready(names)):.2f}"
+        for name in names:
+            api.delete("Workload", name)
+        until("the twenty to go", lambda: all(api.gone(name) for name in names))
 
-    # A container that fails: each start says the node's uptime, so the two are on one clock.
-    api.apply([api.workload("crash", 1, command=["sh", "-c", "cut -d ' ' -f 1 /proc/uptime; sleep 3; exit 1"])])
-    said = []
+    if want("roll"):
+        # A change, rolled through six replicas: done when every one of them says the new word.
+        api.apply([api.workload("roll", 6, says="one")])
+        until("six replicas", lambda: api.rolled("roll", 6, "one"))
+        out["roll"] = f"{timed(api, 'the change in all six', [api.workload('roll', 6, says='two')], lambda: api.rolled('roll', 6, 'two')):.2f}"
+        api.delete("Workload", "roll")
 
-    def again():
-        said[:] = api.starts("crash")
-        return len(set(said)) == 2
+    if want("crash"):
+        # A container that fails: each start says the node's uptime, so the two are on one clock.
+        api.apply([api.workload("crash", 1, command=["sh", "-c", "cut -d ' ' -f 1 /proc/uptime; sleep 3; exit 1"])])
+        said = []
 
-    until("the container to start again", again, every=0.2)
-    first, second = map(float, said)
-    out["crash"] = f"{second - first - 3:.2f}"
-    api.delete("Workload", "crash")
+        def again():
+            said[:] = api.starts("crash")
+            return len(set(said)) == 2
 
-    # A task that runs once.
-    out["job"] = f"{timed(api, 'a Job', [api.job('once', BUSYBOX, ['true'])], lambda: api.done('once')):.2f}"
-    api.delete("Job", "once")
+        until("the container to start again", again, every=0.2)
+        first, second = map(float, said)
+        out["crash"] = f"{second - first - 3:.2f}"
+        api.delete("Workload", "crash")
 
-    # Requests through a Service: three web servers, and ab on the first node.
-    api.apply([api.workload("web", 3, NGINX, SERVE, port=8080), api.service("web")])
-    until("three web servers behind the Service", lambda: api.ready("web") == 3 and api.backends("web") == 3)
-    address = api.address("web")
-    for name, keep in (("rps", ""), ("kept", "-k ")):
-        load = f"ab -q {keep}-n 20000 -c 20 http://{address}/"
-        api.apply([api.job(name, HTTPD, ["sh", "-c", load], on="first")])
-        until(f"ab ({name})", lambda: api.done(name), every=0.5)
-        said = api.output(name)
-        found = re.search(r"Requests per second:\s+([\d.]+)", said)
-        failed = re.search(r"Failed requests:\s+(\d+)", said)
-        if not found or not failed or failed.group(1) != "0" or "Non-2xx" in said:
-            sys.exit(f"ab ({name}) did not answer for every request:\n{said}")
-        out[name] = f"{float(found.group(1)):.0f}"
-        if not keep:
-            out["p50"], out["p99"] = (re.search(rf"^\s*{part}%\s+(\d+)", said, re.M).group(1) for part in (50, 99))
-        api.delete("Job", name)
-    api.delete("Workload", "web")
-    api.delete("Service", "web")
+    if want("job"):
+        # A task that runs once.
+        out["job"] = f"{timed(api, 'a Job', [api.job('once', BUSYBOX, ['true'])], lambda: api.done('once')):.2f}"
+        api.delete("Job", "once")
+
+    def asked(address, before=""):
+        """ab on the first node against `address`, a new connection for each request and
+        then kept ones: what it measured, in rows named `before` and what they are."""
+        for name, keep in (("rps", ""), ("kept", "-k ")):
+            load = f"ab -q {keep}-n 20000 -c 20 http://{address}/"
+            job = (before + name).replace("_", "-")
+            api.apply([api.job(job, HTTPD, ["sh", "-c", load], on="first")])
+            until(f"ab ({job})", lambda: api.done(job), every=0.5)
+            said = api.output(job)
+            found = re.search(r"Requests per second:\s+([\d.]+)", said)
+            failed = re.search(r"Failed requests:\s+(\d+)", said)
+            if not found or not failed or failed.group(1) != "0" or "Non-2xx" in said:
+                sys.exit(f"ab ({job}) did not answer for every request:\n{said}")
+            out[before + name] = f"{float(found.group(1)):.0f}"
+            if not keep:
+                out[before + "p50"], out[before + "p99"] = (re.search(rf"^\s*{part}%\s+(\d+)", said, re.M).group(1) for part in (50, 99))
+            api.delete("Job", job)
+
+    if want("web"):
+        # Requests through a Service: three web servers, and ab on the first node.
+        api.apply([api.workload("web", 3, NGINX, SERVE, port=8080), api.service("web")])
+        until("three web servers behind the Service", lambda: api.ready("web") == 3 and api.backends("web") == 3)
+        asked(api.address("web"))
+        api.delete("Workload", "web")
+        api.delete("Service", "web")
+
+    if "where" in only:
+        if sys.argv[1] != "kith":
+            sys.exit("where is of kith only: it asks kith's API where a node's mesh address is")
+        # Only when asked for, and of kith: where the time of a request through a Service
+        # goes. One web server each time: on the node that asks, with no Service between
+        # (direct); the same through its Service (near: kithd passes the bytes once); and
+        # on another node (far: two kithds, and the mesh between them).
+        until("the web servers before to go", lambda: api.gone("web"))
+        # (On the mesh's addresses too, which are IPv6, for the row that asks there.)
+        both = SERVE[:2] + [SERVE[2].replace("listen 8080;", "listen 8080; listen [::]:8080;")]
+        for before, on in (("near_", "first"), ("far_", "worker")):
+            api.apply([api.workload("web", 1, NGINX, both, port=8080, on=on), api.service("web")])
+            until("a web server behind the Service", lambda: api.ready("web") == 1 and api.backends("web") == 1)
+            if on == "first":
+                asked("127.0.0.1:8080", "direct_")
+            else:
+                # (And with no kithd between, on the nodes' own network and over the mesh:
+                # what the network costs, and what the mesh's encryption adds to it.)
+                node = next(iter(api.status("Workload", "web")["nodes"].values()))
+                there = api.get(f"/v1/resources/Node/{node}")["status"]
+                asked(there["address"].rsplit(":", 1)[0] + ":8080", "lan_")
+                asked(f"[{there['mesh']['address']}]:8080", "mesh_")
+            asked(api.address("web"), before)
+            api.delete("Workload", "web")
+            api.delete("Service", "web")
+            until("the web server to go", lambda: api.gone("web"))
 
     print(" ".join(f"{name}={value}" for name, value in out.items()))
 

@@ -267,4 +267,13 @@ fn a_service_spreads_connections() {
         a.status("networkpolicy/web")["state"] == "enforced" && ask("b").is_empty()
     });
     assert!(ask("a").starts_with("kith0 lo to") && ask("b").is_empty());
+
+    // One that lets neither in: the node without the replica asks the other on a
+    // connection the two kept from before, and is told no on that one too.
+    std::fs::write(a.dir.join("policy.yaml"), policy.replace("node: a", "node: nobody")).unwrap();
+    a.ok(&["apply", "-f", "policy.yaml"]);
+    wait_for("the policy to keep both out", || {
+        ask("a").is_empty() && ask("b").is_empty()
+    });
+    assert!(ask("a").is_empty() && ask("b").is_empty());
 }

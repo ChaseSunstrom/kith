@@ -202,7 +202,8 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         }
     };
     eprintln!("kithd: mesh address {address} on {}", options.interface);
-    let base = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port });
+    // (`kept`: this node's kithd keeps the connections other nodes pass a Service's on by, services.rs.)
+    let base = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port, "kept": true });
     let node = format!("Node/{me}");
     let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();

@@ -37,6 +37,8 @@
 # the hashes below; the nodes pull three images (busybox, nginx, and httpd for its ab)
 # from mirror.gcr.io. Exit 77: this machine cannot run it (no KVM, no QEMU, ...).
 # KITH_COMPARE_RAW names another file for the rows (to try the script out).
+# KITH_COMPARE_ONLY (with it) names the workloads to run alone when a change is tried out
+# (ci/compare_workloads.py says which): one system, no node lost, rows for no table.
 #
 # ponytail: one machine shape, three nodes, three runs: enough to say which is bigger and
 # by about how much, not a benchmark. More nodes and more load when someone needs them.
@@ -69,6 +71,7 @@ case $lost in '') ;; *[!0-9]*) echo "compare.sh: --lost takes seconds" >&2; exit
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 raw=${KITH_COMPARE_RAW:-$root/target/compare.raw}
+[ -z "${KITH_COMPARE_ONLY:-}" ] || [ -n "${KITH_COMPARE_RAW:-}" ] || { echo "compare.sh: KITH_COMPARE_ONLY tries a change out: name a file for its rows with KITH_COMPARE_RAW" >&2; exit 2; }
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/kith-compare
 skip() { echo "compare.sh: skipped: $1" >&2; exit 77; }
 
@@ -340,6 +343,12 @@ EOF
     # (What the image's file holds by now, not the size it was made: the state it wrote too.)
     disk=$(du -m "$work/n1.raw" | cut -f 1)
 
+    # (A change tried out, some workloads alone: no node is lost for it, and the row is for no table.)
+    if [ -n "${KITH_COMPARE_ONLY:-}" ]; then
+        echo "kith tried $more" >>"$raw"
+        note "kith: $(tail -n 1 "$raw")"
+        return 0
+    fi
     apply <<EOF || fail "the workload to move was not applied"
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"move"},"spec":{"placement":{"require":{"node.labels.role":"worker"}},
   "template":{"containers":[{"name":"run","image":"$image","command":["sleep","36000"]}]}}}]

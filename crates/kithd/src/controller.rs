@@ -243,7 +243,6 @@ fn in_place(was: &BTreeSet<&PathBuf>, now: &BTreeSet<&PathBuf>, gone: &[&PathBuf
         && was.difference(now).all(|path| gone.contains(path))
 }
 
-/// `1s, 2s, 4s … 60s`.
 /// Is a unit that ended with `code` started again? One that runs first (`init`) is run
 /// until it ends well, and then no more.
 fn again(policy: &RestartPolicy, init: bool, code: i32) -> bool {
@@ -254,6 +253,15 @@ fn again(policy: &RestartPolicy, init: bool, code: i32) -> bool {
     }
 }
 
+/// How long a unit that ended waits before it is started again, having ended `failures`
+/// times in a row (a unit that ran a minute starts the count over, and is started at once
+/// that time too): not at all the first time, then as [`backoff`] has it for one that
+/// keeps ending.
+fn restart_wait(failures: u32) -> Duration {
+    failures.checked_sub(2).map_or(Duration::ZERO, backoff)
+}
+
+/// `1s, 2s, 4s … 60s`.
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(6)).min(Duration::from_secs(60))
 }
@@ -810,7 +818,7 @@ impl Controller {
                 };
                 let again = again(&slot.policy, slot.init, code);
                 slot.state = if again { "waiting" } else { "exited" };
-                slot.start_at = again.then(|| Instant::now() + backoff(slot.failures.saturating_sub(1)));
+                slot.start_at = again.then(|| Instant::now() + restart_wait(slot.failures));
                 if again {
                     slot.restarts += 1;
                 }
@@ -1509,6 +1517,16 @@ mod tests {
         assert_eq!(backoff(0), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(8));
         assert_eq!(backoff(40), Duration::from_secs(60));
+    }
+
+    /// A container that ends is started again at once the first time, and one that keeps
+    /// ending waits longer each time, up to a minute.
+    #[test]
+    fn the_first_restart_has_no_backoff_and_the_wait_grows() {
+        let waits: Vec<u64> = [0, 1, 2, 3, 4, 40]
+            .map(|failures| restart_wait(failures).as_secs())
+            .into();
+        assert_eq!(waits, [0, 0, 1, 2, 4, 60]);
     }
 
     #[test]

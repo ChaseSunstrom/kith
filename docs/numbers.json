@@ -1,14 +1,14 @@
 {
- "apply.peak": 2.75,
+ "apply.peak": 3,
  "apply.peak.budget": 4,
  "by_crate": {
   "kithd": [
-   36073,
-   254
+   38943,
+   276
   ],
   "kith-cli": [
-   3302,
-   25
+   3429,
+   26
   ],
   "kith-lsp": [
    898,
@@ -19,11 +19,11 @@
    9
   ],
   "kith-api": [
-   4077,
-   31
+   4461,
+   32
   ],
   "kith-packages": [
-   958,
+   969,
    10
   ],
   "kith-sched": [
@@ -31,8 +31,8 @@
    21
   ],
   "kith-runtime": [
-   3368,
-   24
+   4064,
+   28
   ],
   "kith-dns": [
    2351,
@@ -43,8 +43,8 @@
    15
   ],
   "kith-kube": [
-   2146,
-   10
+   2477,
+   11
   ],
   "kith-mesh": [
    1210,
@@ -55,65 +55,65 @@
    7
   ],
   "kith-dm-sys": [
-   227,
-   3
+   288,
+   4
   ]
  },
- "cmp.k3s.apply": 0.49,
- "cmp.k3s.before": 210,
- "cmp.k3s.burst": 4.18,
- "cmp.k3s.control": 963,
- "cmp.k3s.cpu": 9.5,
- "cmp.k3s.cpu2": 4.6,
- "cmp.k3s.crash": 0.81,
- "cmp.k3s.disk": 1260,
- "cmp.k3s.each": 11.8,
- "cmp.k3s.job": 2.91,
- "cmp.k3s.kept": 51955,
- "cmp.k3s.login": 23.5,
- "cmp.k3s.lost": 354,
- "cmp.k3s.lost60": 58,
- "cmp.k3s.p50": 2,
- "cmp.k3s.p99": 10,
- "cmp.k3s.ready": 29.4,
- "cmp.k3s.roll": 1.38,
- "cmp.k3s.rps": 6595,
- "cmp.k3s.scale": 2.66,
+ "cmp.k3s.apply": 0.5,
+ "cmp.k3s.before": 233,
+ "cmp.k3s.burst": 4.29,
+ "cmp.k3s.control": 1030,
+ "cmp.k3s.cpu": 11.2,
+ "cmp.k3s.cpu2": 5.1,
+ "cmp.k3s.crash": 0.69,
+ "cmp.k3s.disk": 1261,
+ "cmp.k3s.each": 11.9,
+ "cmp.k3s.job": 2.92,
+ "cmp.k3s.kept": 24081,
+ "cmp.k3s.login": 24.7,
+ "cmp.k3s.lost": 350,
+ "cmp.k3s.lost60": 57,
+ "cmp.k3s.p50": 3,
+ "cmp.k3s.p99": 9,
+ "cmp.k3s.ready": 30.8,
+ "cmp.k3s.roll": 1.33,
+ "cmp.k3s.rps": 6988,
+ "cmp.k3s.scale": 2.72,
  "cmp.k3s.version": "v1.37.2",
- "cmp.k3s.worker": 478,
+ "cmp.k3s.worker": 474,
  "cmp.kith.apply": 0.03,
  "cmp.kith.boot": 2.5,
- "cmp.kith.burst": 0.1,
- "cmp.kith.control": 67,
- "cmp.kith.cpu": 0.7,
- "cmp.kith.cpu2": 0.6,
- "cmp.kith.crash": 1.01,
+ "cmp.kith.burst": 0.16,
+ "cmp.kith.control": 66,
+ "cmp.kith.cpu": 0.8,
+ "cmp.kith.cpu2": 0.8,
+ "cmp.kith.crash": 0.01,
  "cmp.kith.disk": 248,
  "cmp.kith.each": 0.4,
  "cmp.kith.job": 0.07,
- "cmp.kith.kept": 29363,
+ "cmp.kith.kept": 26004,
  "cmp.kith.lost": 300,
  "cmp.kith.lost60": 60,
- "cmp.kith.p50": 4,
- "cmp.kith.p99": 12,
+ "cmp.kith.p50": 2,
+ "cmp.kith.p99": 8,
  "cmp.kith.ready": 2.6,
- "cmp.kith.roll": 0.15,
- "cmp.kith.rps": 5077,
- "cmp.kith.scale": 0.12,
+ "cmp.kith.roll": 0.14,
+ "cmp.kith.rps": 7367,
+ "cmp.kith.scale": 0.17,
  "cmp.kith.worker": 65,
  "cmp.runs": 3,
  "crates": 14,
  "kinds": 34,
- "kith.size": 2.89,
+ "kith.size": 2.95,
  "kith.size.budget": 3,
- "kithd.idle": 7.8,
+ "kithd.idle": 8.41,
  "kithd.idle.budget": 9,
- "kithd.size": 10.74,
+ "kithd.size": 10.97,
  "kithd.size.budget": 13,
  "measured": "2026-11-14",
  "os.image": 282,
- "os.root": 6,
- "os.update": 31.9,
+ "os.root": 6.1,
+ "os.update": 32,
  "refused": 40,
  "refused.names": [
   "mount",
@@ -157,8 +157,8 @@
   "kcmp",
   "pidfd_getfd"
  ],
- "rust_lines": 60178,
- "tests": 455,
+ "rust_lines": 64658,
+ "tests": 485,
  "version": "1.0.0",
- "vm_tests": 12
+ "vm_tests": 13
 }
