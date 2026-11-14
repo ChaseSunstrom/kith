@@ -21,33 +21,35 @@ The face is Overpass (after the lettering of road signs; SIL OFL, served from th
 own host), 800 for what you are going to and 400 for the rest.
 Runner-ups, both built and both rejected by the user: Instrument (a mono, mint-on-black
 mixing desk: "dated", "dark green"), and Front panel (Inter on navy with rounded
-bordered panels, pills and a glow: "very generic AI"). The website wears Line map; the
-web UI still wears Front panel, which the sections below describe, until it is redrawn.
+bordered panels, pills and a glow: "very generic AI"). The website and the web UI both
+wear Line map.
 
 ## Knobs
-- Type: a sans for the interface (Inter where the machine has it, as the wordmark uses; else the system's), a monospace only for what is code: YAML, diffs, logs, table values. Base 14 px; sizes 11 / 12 / 14 / 20; weights 400 and 600. System stacks because the page may load nothing from outside the cluster (CSP, air-gapped nodes).
-- Colour: dark is ink with paper text; light is paper with ink text (`prefers-color-scheme`). `--accent` is the brand blue: live, ready, selected, the one primary action, added diff lines. `--warn` (amber) is waiting; `--bad` (red) is errors, deletions, removed diff lines. No green anywhere. `--glow` is the accent at low alpha: selection, focus rings, the one light at the top left.
-- Density: unit 4 px; table rows 34 px; panel padding 16 px.
-- Shape: panels radius 10, controls 6, pills for counts and tags; 1 px `--line` borders; shadows only on what floats (dialog, toasts).
-- Motion: hover and focus 140 ms; panels rise in once at load (360 ms, staggered); a tab's underline grows; a pane's content arrives (220 ms); the dialog opens with a short lift; toasts slide in; a changed row flashes once. Continuous motion is kept to what is live: the mark's hub and the link light send out a ring, packets run the mesh in Pulse, ready replicas breathe, waiting ones blink. Under `prefers-reduced-motion` all of it is still and the packets are not drawn: states are told by colour and shape alone.
-- Focus: a 2 px accent outline, or an accent border with a glow ring on text controls.
+- Type: Overpass for the interface, served by kithd itself (31 KB, a Latin subset, in the binary: the page may load nothing from outside the cluster; CSP `font-src 'self'`), then the system's sans. A monospace only for what is code: YAML, diffs, logs, table values, what a description puts in backticks. Sizes 13 / 15 / 21; weights 400, 700 and 800 (the heavy one for what you are in: a part's title, the open kind, the open row).
+- Colour: paper with ink text first; dark is ink with paper text (`prefers-color-scheme`). `--accent` is the brand blue: live, ready, selected, the one primary action, added diff lines. `--warn` (amber) is waiting; `--bad` (red) is errors, deletions, removed diff lines. No green anywhere. `--sunken` is the paper a shade down: fields, code, a row under the pointer. `--hair` is the hairline between rows.
+- Density: unit 4 px; table rows 36 px; parts 28 px apart, columns 36 px.
+- Shape: square. A part hangs from a 3 px ink rule and has no box. A field is a sunken strip on a 1 px ink line; a button is a 3 px ink frame that fills with ink under the pointer, and the one that acts is the blue. A stop is a 14 px ring with a 3 px stroke: ink when something is there, filled blue when live or chosen, amber when waiting, a broken red ring when gone. No radius but a stop's, no shadow, no gradient, no glow, no pill.
+- Motion: hover and focus 140 ms; parts rise in once at load (360 ms, 60 ms apart); a tab's blue line grows from the left; a pane's content arrives (220 ms); the dialog opens with a short lift; toasts slide in; a changed row flashes once. Continuous motion is kept to what is live: the mark's hub sends out a ring, packets run the lines in Pulse, ready replicas and the link's stop beat, waiting ones blink. Under `prefers-reduced-motion` all of it is still and the packets are not drawn: states are told by colour and shape alone.
+- Focus: a 2 px accent outline; a text field's ink line turns blue and thickens.
 
 ## Signature moves
-1. The mark, alive: it draws itself at load and its hub keeps a pulse; the same hub-and-nodes figure is the Pulse panel, with the cluster's real nodes and packets running between them.
-2. Replica lamps: every running thing's replicas as a row of pills that breathe (ready), blink (waiting) or stay red (failed), from the same watch the tables use.
+1. The rail: the mark's stem goes on down the page as the line the kinds are stops on. A ring where the cluster has some of that kind, a tick where it has none, the blue stop where you are.
+2. Pulse as a line map: the hub, one trunk out of it and a 45° branch to every node's stop, with packets on the lines; under each thing that runs, a short line with a stop for every replica. From the same watch the tables use.
+3. Branches: an open group of fields hangs from an ink line at its left, and a group inside it from another; the changed lines of a diff carry a blue or a red line the same way.
 
 ## States
-- Empty: one dim line in the panel saying what would be here and how to make one.
-- Loading: the link light blinks amber; panels keep their last data.
-- Error: a red line where the action was, in the server's own words.
-- Done: a toast bottom right, gone in 4 s; the changed row flashes.
+- Empty: one dim line in the part saying what would be here and how to make one.
+- Loading: the link's stop blinks amber; parts keep their last data.
+- Error: a red line where the action was, in the server's own words; a field in error has a red line under it.
+- Done: a toast in ink at the bottom right, gone in 4 s; the changed row flashes.
 
 ## Banned
-- Green as a state colour; a monospace interface; emoji or icon fonts; modal wizards; blurred gradient blobs.
+- Green as a state colour; a monospace interface; emoji or icon fonts; modal wizards.
+- Rounded bordered panels, pills, glows, gradients, shadows, upper-case letter-spaced labels, Inter: what made Front panel read as a template.
 - Defaults to avoid 1, 3, 5, 7, 12.
 
 ## Allowed exceptions
-- Default 2 (a system typeface): Inter is the brand's, but nothing may be fetched; the stack names it first and falls back to the system's sans.
+- None: the face is the page's own now.
 
 ## The website (`docs/`, GitHub Pages)
 

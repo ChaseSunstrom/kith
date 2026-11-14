@@ -1,0 +1,24 @@
+kith 1.0.0 beside k3s v1.37.2+k3s1 (on Alpine: generic_alpine-3.24.1-x86_64-bios-cloudinit): three QEMU machines each (KVM, 2 CPUs, 2048 MB),
+one workload (mirror.gcr.io/library/busybox:1.36), measured by ci/compare.sh. The middle run, and the lowest and highest.
+
+| | kith | k3s |
+| --- | --- | --- |
+| Memory in use on an idle node: the first node / the server | 66 MB (66 to 66, 3 runs) | 994 MB (993 to 1010, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 65 MB (65 to 66, 3 runs) | 454 MB (452 to 482, 3 runs) |
+| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.04, 3 runs) | 0.53 s (0.48 to 0.64, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 351 s (348 to 351, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 64 s |
+
+Alpine alone, before k3s is started on it, has 233 MB (212 to 234, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.7 s (2.6 to 2.7, 3 runs) after it is switched on (firmware included).
+
+The runs (system, the wait for a lost node, then what was measured: MB, MB, s, s):
+
+    kith default control=66 worker=65 apply=0.036 lost=300.145 boot=2.6
+    kith default control=66 worker=65 apply=0.034 lost=300.151 boot=2.7
+    kith default control=66 worker=66 apply=0.034 lost=300.109 boot=2.7
+    kith 60 control=66 worker=65 apply=0.034 lost=60.121 boot=2.7
+    k3s default control=993 worker=482 apply=0.483 lost=351.462 before=233
+    k3s default control=994 worker=454 apply=0.636 lost=351.138 before=212
+    k3s default control=1010 worker=452 apply=0.525 lost=348.203 before=234
+    k3s 60 control=961 worker=482 apply=0.501 lost=64.409 before=222

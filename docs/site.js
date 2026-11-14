@@ -4,7 +4,22 @@ const N = JSON.parse(document.getElementById("measured").textContent);
 const calm = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const $ = (q, el = document) => el.querySelector(q);
 const $$ = (q, el = document) => [...el.querySelectorAll(q)];
-const sleep = ms => new Promise(done => setTimeout(done, ms));
+
+// Everything that moves can be stopped: the two stories wait, and what is drawn holds still.
+let paused = false;
+const motion = $("#motion");
+motion.hidden = calm;
+motion.onclick = () => {
+  paused = !paused;
+  document.documentElement.classList.toggle("paused", paused);
+  motion.textContent = paused ? "Play" : "Pause";
+  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
+};
+const wait = ms => new Promise(done => setTimeout(done, ms));
+const sleep = async ms => {
+  await wait(ms);
+  while (paused) await wait(200);
+};
 
 // A count runs up to its number once; with less motion it is only written with its commas.
 function count(el) {
@@ -82,6 +97,8 @@ const seen = new IntersectionObserver(entries => {
     reveal(entry.target);
   }
 }, { rootMargin: "0px 0px -12% 0px" });
+// Only now are the parts hidden until seen: had anything above failed, the page would stand as written.
+document.documentElement.classList.add("js");
 // Asked for less motion: every part is shown at once, without waiting to be scrolled to.
 $$("[data-see]").forEach(part => (calm ? reveal(part) : seen.observe(part)));
 
@@ -100,10 +117,13 @@ async function pulse() {
   for (;;) {
     show("up", 3, 3, "gamma", "on alpha, beta and gamma", "ok");
     await sleep(4200);
-    show("lost", 2, 2, "", "on alpha, beta and gamma, which is unreachable", "wait");
+    // (An unreachable node's replica is ready in the count until the node has been gone long enough.)
+    show("lost", 2, 3, "", "on alpha, beta and gamma, which is unreachable", "ok");
     await sleep(1700);
-    show("lost", 2, 2, "alpha", "on alpha, beta and gamma, which is unreachable", "wait");
+    show("lost", 2, 3, "alpha", "on alpha, beta and gamma, which is unreachable", "ok");
     await sleep(2200);
+    show("lost", 2, 2, "alpha", "on alpha and beta; gamma's is starting on beta", "wait");
+    await sleep(1400);
     show("lost", 2, 3, "alpha", "on alpha, and two on beta", "ok");
     await sleep(3200);
     show("up", 3, 3, "alpha", "on alpha, and two on beta", "ok");

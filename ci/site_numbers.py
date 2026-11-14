@@ -37,7 +37,7 @@ def measured(old):
     for key, file in (("os.update", "kith-os.update"), ("os.image", "kith-os.raw"), ("os.root", "root.squashfs")):
         if (ROOT / "target/os" / file).exists():
             n[key] = round((ROOT / "target/os" / file).stat().st_size / MB, 1)
-    sources = [p for p in (ROOT / "crates").rglob("*.rs") if "target" not in p.parts]
+    sources = [p for p in (ROOT / "crates").rglob("*.rs") if "target" not in p.relative_to(ROOT).parts]
     text = {p: p.read_text() for p in sources}
     n["kinds"] = int(re.search(r"the (\d+) built-in kinds", (ROOT / "README.md").read_text()).group(1))
     n["tests"] = sum(len(re.findall(r"#\[(?:tokio::)?test\b", t)) for t in text.values())
@@ -80,6 +80,15 @@ def filled(page, n):
 
     page = re.sub(r'(<(\w+)\b[^>]*\bdata-n="([^"]+)"[^>]*>)[^<]*(</\2>)', number, page)
     block = re.compile(r'(<script id="measured" type="application/json">).*?(</script>)', re.S)
+    # A bar's value and its budget are keys too; the numbers' own block has to be there;
+    # and the kinds the page names are as many as it counts.
+    missing += [key for key in re.findall(r'\bdata-(?:v|of)="([^"]+)"', page) if key not in n]
+    if not block.search(page):
+        missing.append("(the #measured block)")
+    kinds = re.search(r'<section[^>]*id="kinds".*?</section>', page, re.S)
+    named = len(re.findall(r"<span>\w+</span>", kinds.group(0))) if kinds else 0
+    if named != n.get("kinds"):
+        missing.append(f"(kinds: {named} named, {n.get('kinds')} counted)")
     return block.sub(lambda f: f.group(1) + json.dumps(n) + f.group(2), page), missing
 
 

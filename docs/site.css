@@ -1,5 +1,11 @@
 /* kith's page, drawn as a line map: paper, ink, and one blue line (DESIGN.md, "Direction").
    The page's rail is the stem of the k in the bar, carried down; every part is a stop on it. */
+.paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; }
+button.button { font-family: inherit; cursor: pointer; }
+@media (max-width: 720px) { .bar #motion { margin-left: auto; } .bar #motion + .button { margin-left: 0; } }
+
+.shot img { display: block; width: 100%; height: auto; margin-top: 14px; border: 1px solid var(--hair); }
+
 @font-face {
   font-family: Overpass;
   src: url(fonts/overpass.woff2) format("woff2");
@@ -228,6 +234,7 @@ pre { background: var(--sunken); padding: 20px; line-height: 1.7; font-size: var
 .track i { position: absolute; inset: 0; color: var(--accent); background: linear-gradient(currentColor, currentColor) no-repeat center / 100% var(--stroke); transform: translateX(-100%); transition: transform var(--grow) var(--ease); }
 .track i::after { content: ""; position: absolute; right: 0; top: 1px; width: 14px; height: 14px; border: var(--stroke) solid currentColor; border-radius: 50%; background: var(--bg); }
 .track i.other { color: var(--text); }
+html:not(.js) .track { display: none; } /* a bar is drawn by the script: without it the figure beside it stands alone */
 .seen .track i { transform: translateX(max(calc((var(--v, 0) - 1) * 100%), calc(14px - 100%))); }
 .row[data-of] .track::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
 .row:nth-child(2) .track i { transition-delay: var(--step); }

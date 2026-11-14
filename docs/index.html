@@ -8,7 +8,6 @@
 <meta name="description" content="kith is a tiny, immutable operating system and one small daemon that joins your machines into a cluster and keeps them matching the YAML you apply.">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="site.css">
-<script>document.documentElement.classList.add("js")</script>
 </head>
 <body>
 
@@ -29,6 +28,7 @@
     <a href="#kinds">Kinds</a>
     <a href="#security">Security</a>
   </nav>
+  <button class="button quiet" id="motion" type="button" hidden>Pause</button>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
 
@@ -145,7 +145,7 @@
       <li><b>Lose the leader</b> and the other two pick a new one within a few seconds.</li>
       <li><b>The nodes find each other</b> over a WireGuard mesh that <code>kithd</code> sets up itself: directly where they can, through an edge node where they cannot.</li>
       <li><b>Tested by breaking it.</b> The chaos test cuts off and resets every node in turn, then all three at once. Every write that was acknowledged is on all three afterwards.</li>
-      <li class="fine">Shown faster than life: a silent node reads <code>unreachable</code> after ten seconds, and its replicas start elsewhere after <code>--lost-after</code>, which is five minutes unless you say otherwise.</li>
+      <li class="fine">Shown faster than life: a silent node reads <code>unreachable</code> after ten seconds, and its replicas still count as ready until it has been gone for <code>--lost-after</code> (five minutes unless you say otherwise); then they start elsewhere.</li>
     </ul>
   </div>
 </section>
@@ -225,6 +225,14 @@
     <div class="group"><div><h3>Access</h3><small>Who may do what, by kind, verb and namespace</small></div><p><span>Identity</span><span>Role</span><span>RoleBinding</span></p></div>
     <div class="group"><div><h3>Your own</h3><small>New kinds with a schema, served like the built-in ones</small></div><p><span>KindDefinition</span></p></div>
   </div>
+  <figure class="panel shot">
+    <figcaption>The page every node serves <span class="dim">kith ui</span></figcaption>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="ui-dark.png">
+      <img src="ui.png" width="1440" height="900" loading="lazy" alt="The web UI: the kinds as stops on a line, three nodes and their replicas as a line map, a list of Workloads, and one Workload's form">
+    </picture>
+    <p class="fine">Three nodes on one machine, photographed by <code>ci/ui_shots.py</code>. A form for every kind, drawn from its schema; an apply shows its diff first.</p>
+  </figure>
 </section>
 
 <section id="security" class="part" data-see>
@@ -233,8 +241,8 @@
     <h2>Kept small, and said plainly.</h2>
   </div>
   <div class="cards">
-    <div class="panel"><h3>A container is kept from most of the machine</h3><p>It runs as a user that is not root, with no capabilities and no new privileges, on a read-only image, behind a filter that refuses <b data-n="refused">40</b> system calls. A template has to say so to take any of that off.</p></div>
-    <div class="panel"><h3>Only signed things are taken</h3><p>Packages and OS updates are refused without a signature by a key the cluster trusts. An image is held to a signature when its template names keys.</p></div>
+    <div class="panel"><h3>A container is kept from most of the machine</h3><p>It runs as a user that is not root, with no capabilities (on kith OS, only the one to take a port below 1024) and no new privileges, on a read-only image, behind a filter that refuses <b data-n="refused">40</b> system calls. A template has to say so to take any of that off.</p></div>
+    <div class="panel"><h3>Only signed things are taken</h3><p>Packages and OS releases are refused without a signature by a key the cluster trusts. (An update stick is not signed: whoever is at the machine with one is its admin.) An image is held to a signature when its template names keys.</p></div>
     <div class="panel"><h3>What is not defended is written down</h3><p>Who is trusted with what, every gap that is known, and what was never reviewed: it is all in one file, and it does not flatter. <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">Read SECURITY.md</a></p></div>
   </div>
   <div class="panel wall" id="wall" hidden>

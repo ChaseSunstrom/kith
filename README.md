@@ -1557,7 +1557,10 @@ running where, a form for every kind (drawn from the kind's schema, your own
 kinds included), the YAML beside it, each resource's status, history with
 rollback, and output. An apply or a rollback shows its diff first; a delete asks.
 
-![The web UI: kinds, the mesh and replicas, a list, and a Workload's form](docs/ui.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/ui-dark.png">
+  <img src="docs/ui.png" alt="The web UI: the kinds as stops on a line, the nodes and replicas as a line map, a list of Workloads, and one Workload's form" width="100%">
+</picture>
 
 On a node, as its admin:
 
@@ -1639,7 +1642,7 @@ without touching a disk:
   file: NVMe, SATA, USB and SD storage, the common wired network cards, virtio,
   WireGuard, dm-verity, dm-crypt, what containers need, KVM. The first build
   compiles it (ten minutes or so); it is kept in `~/.cache/kith-os` after that;
-- a root file system of 5 MB (squashfs, read-only): kithd as `/sbin/init`,
+- a root file system of about 6 MB (squashfs, read-only): kithd as `/sbin/init`,
   `kith`, a CA bundle (curl's, pinned), empty directories. No shell, no libc,
   no package manager;
 - a dm-verity hash tree for the root. The root's hash is on the kernel command
