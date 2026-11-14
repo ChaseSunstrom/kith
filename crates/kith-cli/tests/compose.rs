@@ -339,3 +339,57 @@ fn compose_anchors_must_be_written_out() {
         "{err}"
     );
 }
+
+#[test]
+fn compose_every_service_is_a_pod_with_a_network_of_its_own() {
+    let (all, _) = translate(fixture(), None);
+    for r in all.iter().filter(|r| r.kind == "Workload") {
+        assert_eq!(r.spec["template"]["pod"], json!(true), "{}", r.key());
+    }
+}
+
+#[test]
+fn compose_two_volumes_that_make_one_name_are_not_one_volume_in_silence() {
+    let src = "volumes:\n  a_b:\n  a.b:\n  data:\nservices:\n  app:\n    image: example/app:1\n    volumes:\n      - a_b:/one\n      - a.b:/two\n      - data:/three\n      - ./data:/four\n";
+    let (all, report) = translate(documents("c.yml", src).unwrap().remove(0), None);
+    said(&report, "volumes.a.b", "`a-b`");
+    said(&report, "services.app.volumes[1]", "`a-b`");
+    // A named volume and a directory of the same name are two things in compose.
+    said(&report, "services.app.volumes[3]", "`data`");
+    let mounts = spec(&all, "Workload/app")["template"]["containers"][0]["volumeMounts"].to_string();
+    assert!(mounts.contains("/one") && mounts.contains("/three"), "{mounts}");
+    assert!(!mounts.contains("/two") && !mounts.contains("/four"), "{mounts}");
+}
+
+#[test]
+fn compose_the_nodes_own_directories_are_not_carried_even_in_the_system_namespace() {
+    for path in ["/", "/proc", "/sys/fs", "/dev", "/var/run/docker.sock", "/srv/../etc"] {
+        let src = format!("services:\n  app:\n    image: example/app:1\n    volumes:\n      - {path}:/host\n");
+        let (all, report) = translate(documents("c.yml", &src).unwrap().remove(0), Some("kith-system"));
+        said(&report, "services.app.volumes[0]", "node's own");
+        assert!(all.iter().all(|r| r.kind != "Volume"), "{path}");
+    }
+}
+
+#[test]
+fn compose_a_variable_that_reads_as_a_secret_is_said() {
+    let src = "services:\n  app:\n    image: example/app:1\n    environment:\n      DB_PASSWORD: example\n      API_TOKEN: \"\"\n      TZ: Etc/UTC\n";
+    let (all, report) = translate(documents("c.yml", src).unwrap().remove(0), None);
+    said(&report, "services.app.environment.DB_PASSWORD", "Secret");
+    assert_eq!(report.len(), 1, "{report:?}");
+    // It is still carried: the hint says what it is, the owner decides.
+    assert!(spec(&all, "Workload/app").to_string().contains("DB_PASSWORD"));
+}
+
+#[test]
+fn compose_two_documents_are_not_one_stack() {
+    let sb = Sandbox::new("compose-two");
+    std::fs::write(
+        sb.0.join("compose.yml"),
+        "services:\n  a:\n    image: x/a:1\n---\nservices:\n  b:\n    image: x/b:1\n",
+    )
+    .unwrap();
+    let (code, out, err) = sb.kith(&["import", "compose", "compose.yml"]);
+    assert_eq!((code, out.as_str()), (2, ""));
+    assert!(err.contains("2 documents"), "{err}");
+}

@@ -83,9 +83,9 @@ pub fn run(what: Import) -> Result<ExitCode, String> {
                     e
                 }
             })?;
-            let Some(doc) = docs.into_iter().next() else {
-                return Err(format!("error: {name}: no compose file in it"));
-            };
+            // (More than one document is not one stack: nothing of it is dropped in silence.)
+            let [doc] = <[_; 1]>::try_from(docs)
+                .map_err(|docs| format!("error: {name}: {} documents in it: a compose file is one", docs.len()))?;
             kith_kube::compose::translate(doc, namespace.as_deref(), node.as_deref())
         }
     };

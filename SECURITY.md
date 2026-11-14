@@ -137,6 +137,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **`kith import compose` carries a password as the file has it.** A variable in a compose
+  file's `environment` is plain text in the Workload it prints, and in the store once that
+  is applied, readable by whoever may `get` Workloads in the namespace. The import says
+  which variables read as a secret; it does not make a Secret of them. It refuses what
+  would give a container more than kith gives (`privileged`, capabilities, devices, the
+  node's network, `/`, `/proc`, `/sys`, `/dev` and a docker socket as a volume, even in
+  `kith-system`), and reads no variable of the shell it runs in.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

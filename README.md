@@ -150,7 +150,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 34 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 35 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -1059,6 +1059,37 @@ ignored, not reported. Exit status: 0 everything translated, 1 something is
 in the report (the output is still printed), 2 the input could not be read.
 `nodeSelector` becomes a placement requirement, and a pod template's labels
 are added to the workload's, since kith Services select on those.
+
+### From a docker-compose file
+
+`kith import compose docker-compose.yml --node n1 -n media` prints the stack as
+kith resources, the same way: review, then `kith apply -f` it. kith does not
+run compose; this is a translation, once. kith's YAML has no anchors or merge
+keys, and no variables: `docker compose config` prints a file with both
+written out, and a value that still holds a `$` is refused by name.
+
+| compose | kith |
+|---|---|
+| a service | a Workload with `pod: true` (a network of its own, as in compose) and one container |
+| services joined by `network_mode: service:NAME` | containers of NAME's pod: they share `localhost` |
+| `ports`, `expose` | a Service of the compose name, and of `container_name` and each network alias, with the container's ports (TCP) |
+| a directory (`./config:/config`), a named volume | a Volume on the node `--node` names, and its mount (`:ro` carried) |
+| `environment`, `command`, `entrypoint`, `working_dir`, `user` | the same fields of the container |
+| `restart` | `restartPolicy` |
+| `healthcheck` with `curl` or `wget` of an http address on localhost | a `readiness` probe with its interval, timeout and retries |
+
+Refused by path and name, as `kith import k8s` does: `privileged`, `cap_add`,
+`sysctls`, `devices` (a [DeviceClaim](#claiming-hardware) is how kith gives
+hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port
+published on the node's own address, a `depends_on` condition (kith waits for
+nothing: an app retries), two networks in one file (a namespace is one
+network), an absolute host path (kith takes one in `kith-system` only, and
+never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that
+would make one name, and every key it does not know. A variable whose name
+reads as a secret (`PASSWORD`, `TOKEN`, `KEY`) is carried and said: it is in
+the output as plain text, and a Secret with `envFrom` keeps it out of the
+Workload. (The other way, a tool that writes Kubernetes YAML of the file and
+then `kith import k8s`, is two steps and was not tried here.)
 
 ## Kinds of your own
 

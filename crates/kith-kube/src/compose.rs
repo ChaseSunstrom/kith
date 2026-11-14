@@ -42,8 +42,9 @@ struct Env<'a> {
     ns: Option<&'a str>,
     node: Option<&'a str>,
     declared: Vec<String>,
-    /// Volume name to its directory.
-    vols: BTreeMap<String, String>,
+    /// Volume name to its directory, and what in the file it is made for: a directory, or a
+    /// named volume (two things that make one name must not become one Volume in silence).
+    vols: BTreeMap<String, (String, String)>,
 }
 
 /// One service, as a container of a pod and what the pod gets from it.
@@ -89,7 +90,7 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
             m.remove("driver");
         }
         cx.rest(m, &at);
-        claim(&mut cx, &mut env, &at, &slug(&name), true);
+        claim(&mut cx, &mut env, &at, &slug(&name), Some(&name));
         env.declared.push(name);
     }
     let mut list = Vec::new();
@@ -190,7 +191,9 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
         let template = obj([
             ("containers", Some(json!(containers))),
             ("restartPolicy", restart.map(|(_, word)| json!(word))),
-            ("pod", (containers.len() > 1).then(|| json!(true))),
+            // A compose service has a network of its own, so each is a pod: without it a
+            // container shares its node's network.
+            ("pod", Some(json!(true))),
         ]);
         let app = Strings::from([("app".to_string(), head.clone())]);
         made.push(make("Workload", meta(head, app), json!({ "template": template })));
@@ -210,7 +213,7 @@ pub fn translate(root: Value, namespace: Option<&str>, node: Option<&str>) -> (V
     }
     match env.node {
         Some(node) => {
-            for (name, path) in &env.vols {
+            for (name, (path, _)) in &env.vols {
                 let meta = Metadata {
                     name: name.clone(),
                     namespace: namespace.map(String::from),
@@ -361,8 +364,7 @@ fn refuse(cx: &mut Cx, m: &mut Map, key: &str, why: &str, at: &str) {
     match m.remove(key) {
         None | Some(Value::Null | Value::Bool(false)) => {}
         Some(Value::Array(a)) => {
-            for (i, item) in a.iter().enumerate().filter(|(_, item)| !item.is_null()) {
-                let _ = item;
+            for (i, _) in a.iter().enumerate().filter(|(_, item)| !item.is_null()) {
                 cx.note(&format!("{at}[{i}]"), why);
             }
         }
@@ -376,7 +378,20 @@ fn environment(cx: &mut Cx, m: &mut Map, at: &str) -> Vec<Value> {
     let at = join(at, "environment");
     let mut out = Vec::new();
     let mut var = |cx: &mut Cx, at: &str, name: &str, value: Option<String>| match value {
-        Some(value) => out.push(json!({ "name": name, "value": value })),
+        Some(value) => {
+            let upper = name.to_ascii_uppercase();
+            if !value.is_empty()
+                && ["PASS", "SECRET", "TOKEN", "KEY"]
+                    .iter()
+                    .any(|word| upper.contains(word))
+            {
+                cx.hint(
+                    at,
+                    "reads as a secret and is carried as plain `env`: a Secret and `envFrom` keep it out of the Workload",
+                );
+            }
+            out.push(json!({ "name": name, "value": value }));
+        }
         None if said(cx, at) => {}
         None => cx.note(at, &format!("`{name}` has no value: write `{name}=value`")),
     };
@@ -521,9 +536,9 @@ fn mounts(cx: &mut Cx, env: &mut Env, m: &mut Map, at: &str) -> Vec<Value> {
             cx.note(&at, "starts with ~: write the path out");
             None
         } else if bind {
-            claim(cx, env, &at, &src, !src.starts_with('/'))
+            claim(cx, env, &at, &src, None)
         } else if env.declared.contains(&src) {
-            claim(cx, env, &at, &slug(&src), true)
+            claim(cx, env, &at, &slug(&src), Some(&src))
         } else {
             cx.note(&at, "names a volume the file does not declare");
             None
@@ -557,9 +572,25 @@ fn slug(s: &str) -> String {
 /// The Volume of a directory: its name, or none, the reason said at `at`.
 /// A volume of `kith-system` is an absolute host path, of any other namespace a
 /// directory inside its own.
-fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, relative: bool) -> Option<String> {
-    let path = match (relative, env.ns == Some("kith-system")) {
-        (false, true) => path.to_string(),
+/// `named` is the file's own name of a named volume, whose directory is `path`.
+fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, named: Option<&str>) -> Option<String> {
+    let path = match (!path.starts_with('/'), env.ns == Some("kith-system")) {
+        (false, true) => {
+            // The node's own insides are no container's to hold, whoever applies it.
+            let own = |p: &str| path == p || path.strip_prefix(p).is_some_and(|rest| rest.starts_with('/'));
+            if path.trim_end_matches('/').is_empty()
+                || ["/proc", "/sys", "/dev"].into_iter().any(own)
+                || path.ends_with("docker.sock")
+                || path.split('/').any(|part| part == "..")
+            {
+                cx.note(
+                    at,
+                    "is the node's own (/, /proc, /sys, /dev, a docker socket) or climbs with `..`: not carried",
+                );
+                return None;
+            }
+            path.to_string()
+        }
         (true, true) => {
             cx.note(at, "is relative: a volume in kith-system takes an absolute path");
             return None;
@@ -585,11 +616,15 @@ fn claim(cx: &mut Cx, env: &mut Env, at: &str, path: &str, relative: bool) -> Op
         cx.note(at, "has a path that makes no name");
         return None;
     }
-    if env.vols.get(&name).is_some_and(|other| *other != path) {
-        cx.note(at, &format!("makes the name `{name}` of another path too"));
+    let of = named.map_or_else(|| path.clone(), |named| format!("the volume `{named}`"));
+    if env.vols.get(&name).is_some_and(|(_, other)| *other != of) {
+        cx.note(
+            at,
+            &format!("makes the name `{name}`, which another volume or path of the file makes too"),
+        );
         return None;
     }
-    env.vols.insert(name.clone(), path);
+    env.vols.insert(name.clone(), (path, of));
     Some(name)
 }
 
