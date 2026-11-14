@@ -40,8 +40,8 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
   command on another node) take a node's certificate only.
 - **What a node fetches or sends for someone who is not the admin** (a Source's
-  repository, a package pushed to a registry) goes only to addresses that are not this
-  node's own or on its networks, each redirect and each place a registry sends an upload
+  repository, a package pushed to a registry, a `DNSBlockList`'s `url`) goes only to
+  addresses that are not this node's own or on its networks, each redirect and each place a registry sends an upload
   included, and to the address that was checked, not to the name looked up again. So the
   API is not a way to reach what only the node can reach.
 - **A container** runs as a user that is not root (its template's, its image's, or
@@ -107,6 +107,21 @@ Only the newest version is fixed. There are no security releases of older ones.
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them).
+- **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
+  apply a Volume and a Workload in its namespace, checked on the node that is asked; the
+  node that has the Volume takes the request from that node as it takes any other node's.
+  What is sent is not trusted, and neither is what the Volume holds: each entry is made
+  through a handle on its directory and never through a link (one the stream made, or
+  one a running container puts in the way), in a directory inside the Volume that is
+  moved in only when the whole stream was good (a container that changes the Volume's
+  directories while a put moves in can leave it half moved, inside the Volume). A path
+  that leaves the Volume, a device, a pipe and a sparse file are refused; a link that
+  points out, or that goes up after it has gone down, is not made; setuid and
+  setgid are dropped; the files are the Volume's user's, never the sender's choice. A put
+  stops at the Volume's `size`, where it says one, and before the node's disk has less
+  than 64 MiB free. A Volume in `kith-system` (a directory of the host's) is not served.
+  What a get gives was written by whatever ran in the Volume: unpacked as root it keeps
+  their owners and setuid bits.
 - **An encrypted disk or Volume** cannot be read by whoever takes it out of its machine:
   the key is with the other nodes.
 
@@ -137,6 +152,38 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **Whoever may apply a Volume and a Workload in a namespace reads and writes every
+  file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
+  that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound
+  counts the stream, not what the Volume holds already, so several puts fill a Volume
+  (and its disk, down to the 64 MiB a put leaves) past it. One put runs at a time on a
+  node, and one that sends a little every minute keeps the others waiting; a node packs
+  four gets at once.
+- **`kith import compose` carries a password as the file has it.** A variable in a compose
+  file's `environment` is plain text in the Workload it prints, and in the store once that
+  is applied, readable by whoever may `get` Workloads in the namespace. The import says
+  which variables read as a secret; it does not make a Secret of them. It refuses what
+  would give a container more than kith gives (`privileged`, capabilities, devices, the
+  node's network, `/`, `/proc`, `/sys`, `/dev` and a docker socket as a volume, even in
+  `kith-system`), and reads no variable of the shell it runs in.
+- **A host read by path trusts its own namespace, and lets every client in.** Whoever may
+  write a Service with `expose.paths` sends that host's requests to any Service and port
+  of the same namespace, exposed or not. kith's edge asks no client who it is: an Ingress
+  whose annotations did (`auth-*`, an allow list, a snippet) is refused, not translated
+  into an open host. Toward a backend the client's own `Forwarded`, `X-Forwarded-*`,
+  `X-Real-IP` and any header with `_` in its name are dropped and kith's put in their
+  place; a backend reached some other way than the edge (from inside the mesh) gets none
+  of that, and must not trust those headers from there.
+- **A block list is trusted for the names it lists, by every client of the resolver.** A
+  `DNSBlockList` is the cluster's (no namespace), and its ConfigMap is read from
+  `kith-system` only: whoever may write either decides which names every node answers as
+  not there. The host of a `url` list sees each node's address and when it asks, and what
+  it serves is taken as the list unless `sha256` pins it. A name that is only an alias (a
+  CNAME) of a listed name at the other resolvers is still answered. What those resolvers
+  say is kept for up to an hour and given to every client that asks the same question:
+  kith checks no DNSSEC signature, so an answer forged on the way from them lasts that
+  long, and answers given from what is kept do not count toward a client's limit on
+  forwarded questions.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

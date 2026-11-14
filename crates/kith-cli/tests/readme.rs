@@ -15,14 +15,23 @@ fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
 }
 
-/// The fenced blocks tagged `tag`, each with the line it starts on.
+/// The fenced blocks tagged `tag`, each with the line it starts on. (A block inside a list
+/// is read without the list's indentation: an example there is checked like any other.)
 fn blocks(tag: &str) -> Vec<(usize, String)> {
-    let (mut out, mut open) = (Vec::new(), None::<(usize, String)>);
+    let (mut out, mut open, mut indent) = (Vec::new(), None::<(usize, String)>, 0);
     for (number, line) in README.lines().enumerate() {
         match (&mut open, line.trim_start().strip_prefix("```")) {
-            (None, Some(said)) if said.trim() == tag => open = Some((number + 1, String::new())),
+            (None, Some(said)) if said.trim() == tag => {
+                indent = line.len() - line.trim_start().len();
+                open = Some((number + 1, String::new()));
+            }
             (Some(_), Some(_)) => out.extend(open.take()),
-            (Some((_, text)), None) => *text += &format!("{line}\n"),
+            (Some((_, text)), None) => {
+                let line = line
+                    .get(indent..)
+                    .filter(|_| line[..indent.min(line.len())].trim().is_empty());
+                *text += &format!("{}\n", line.unwrap_or_default());
+            }
             (None, _) => {}
         }
     }

@@ -1,5 +1,6 @@
 //! Records, zones and split-horizon views, and the lookup that turns a question into an answer.
 
+use crate::blocklist::Block;
 use crate::wire::{NXDOMAIN, SERVFAIL, valid_name};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -78,7 +79,7 @@ pub(crate) fn key(name: &str) -> String {
 }
 
 /// `name` and then each parent of it, longest first.
-fn suffixes(name: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn suffixes(name: &str) -> impl Iterator<Item = &str> {
     std::iter::successors(Some(name), |n| n.split_once('.').map(|(_, rest)| rest))
 }
 
@@ -264,9 +265,21 @@ pub struct Zones {
     /// The view with the longest prefix holding the client replaces `records` for it; of equal
     /// prefixes, the first listed.
     pub views: Vec<View>,
+    /// Lists of names answered as not there, for names no zone holds. The first of them that
+    /// names the client and the name decides.
+    pub blocks: Vec<Block>,
 }
 
 impl Zones {
+    /// Whether a list blocks `name` for `client`: `Some(true)` to answer 0.0.0.0 and ::,
+    /// `Some(false)` to answer NXDOMAIN, `None` for a name that is not blocked.
+    pub fn blocked(&self, client: IpAddr, name: &str) -> Option<bool> {
+        self.blocks
+            .iter()
+            .find(|b| (b.nets.is_empty() || b.nets.iter().any(|n| n.contains(client))) && b.names.blocks(name))
+            .map(|b| b.null)
+    }
+
     pub fn lookup(&self, client: IpAddr, qname: &str, qtype: u16) -> Option<Found> {
         let prefix = |v: &View| v.nets.iter().filter(|n| n.contains(client)).map(|n| n.bits).max();
         // min_by_key keeps the first of equals; Reverse makes the longest prefix the smallest.

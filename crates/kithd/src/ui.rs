@@ -99,14 +99,21 @@ const VERBS: [Verb; 6] = [
 /// Every kind `grants` lets its holder do anything with: kith's own, then the cluster's,
 /// each with the schema of a whole resource of it and what may be done (somewhere).
 fn kinds(store: &Store, grants: &Grants) -> Vec<Value> {
-    let own = KINDS.iter().map(|kind| {
-        json!({
+    // What may be done with a kind is asked first: a schema is made only for a kind that is shown.
+    let may = |kind: &str| -> Option<Vec<&Verb>> {
+        let may: Vec<&Verb> = VERBS.iter().filter(|verb| grants.anywhere(verb, Some(kind))).collect();
+        (!may.is_empty()).then_some(may)
+    };
+    let own = KINDS.iter().filter_map(|kind| {
+        let may = may(kind.kind)?;
+        Some(json!({
             "kind": kind.kind, "apiVersion": kith_api::API_VERSION, "namespaced": kind.namespaced,
-            "about": kind.about, "schema": kind.schema(), "columns": [],
-        })
+            "about": kind.about, "schema": kind.schema(), "columns": [], "may": may,
+        }))
     });
-    let defined = store.list(Some("KindDefinition")).map(|definition| {
+    let defined = store.list(Some("KindDefinition")).filter_map(|definition| {
         let spec = &definition.spec;
+        let may = may(spec["kind"].as_str().unwrap_or_default())?;
         let version = format!(
             "{}/{}",
             spec["group"].as_str().unwrap_or_default(),
@@ -122,20 +129,13 @@ fn kinds(store: &Store, grants: &Grants) -> Vec<Value> {
             Value::Null => json!({ "type": "object" }),
             schema => schema.clone(),
         };
-        json!({
+        Some(json!({
             "kind": spec["kind"], "apiVersion": version, "namespaced": spec["namespaced"] != false,
             "about": version, "schema": schema, "columns": spec["columns"].as_array().cloned().unwrap_or_default(),
-            "definition": definition.key(),
-        })
+            "definition": definition.key(), "may": may,
+        }))
     });
-    let mut kinds: Vec<Value> = own.chain(defined).collect();
-    kinds.retain_mut(|kind| {
-        let name = kind["kind"].as_str().unwrap_or_default().to_string();
-        let may: Vec<&Verb> = VERBS.iter().filter(|verb| grants.anywhere(verb, Some(&name))).collect();
-        kind["may"] = json!(may);
-        !may.is_empty()
-    });
-    kinds
+    own.chain(defined).collect()
 }
 
 async fn schemas(State(shared): State<Arc<Shared>>, Extension(caller): Extension<Caller>) -> Json<Value> {

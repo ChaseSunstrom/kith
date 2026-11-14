@@ -105,6 +105,7 @@ is still there when it starts again.
 | Let other people and programs in, each with their own rights | [Who may do what](#who-may-do-what) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](#hardware) |
 | Keep data: volumes, shares, replicas, backups | [Storage](#storage) |
+| Copy files into a volume or out of it, or move a guest's data in | [Files in and out of a volume](#files-in-and-out-of-a-volume) |
 | See it and change it in a browser | [Web UI](#web-ui) |
 | Make a machine nothing but a node, and keep it updated | [kith OS](#kith-os-kithd-as-the-machines-first-process) |
 | Know what it costs beside Kubernetes | [Beside k3s](#beside-k3s) |
@@ -150,7 +151,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 34 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 35 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -575,7 +576,10 @@ kith node status                                   # who leads the store, who vo
   in turn, on whichever node it runs: kithd passes the bytes on, over the
   mesh if the replica is elsewhere, to the replica's port on its node's
   `127.0.0.1` (or `::1`). A kithd that restarts drops the connections through
-  it. Only TCP; a `targetPort` by name is a container port of that name.
+  it. A Service's connections are passed on by up to four threads of their
+  own (one for each core, started with the first Service) and DNS answers on
+  one more, so a busy Service holds up neither the API nor a lookup. Only
+  TCP; a `targetPort` by name is a container port of that name.
 - A `NetworkPolicy` says who may connect to the Workloads it selects through
   a Service: the first ingress rule that fits decides, and when a policy
   selects a Workload and no rule fits, the connection is refused. A peer is
@@ -606,7 +610,42 @@ kith node status                                   # who leads the store, who vo
   client's address before the client's bytes; it is off unless asked for,
   because a backend that does not expect the line will break on it. Only the
   ingress sends it: a client inside the mesh that calls the Service gets
-  none, so the backend has to take both. Certificate keys and the ACME account key
+  none, so the backend has to take both.
+
+  A host whose `expose` has `paths` or `headers` is read as HTTP/1.1 instead:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Service
+  metadata: { name: web }
+  spec:
+    selector: { app: web }
+    ports: [{ port: 80 }]
+    expose:
+      host: shop.example.org
+      via: edge
+      paths:
+        - { path: /, service: web, port: 80 }
+        - { path: /api, service: api, port: 8080 }
+        - { path: /healthz, exact: true, service: api, port: 9100 }
+      headers: { X-Env: prod }
+  ```
+
+  Each request goes to the Service of the longest path that fits it (`/api`
+  fits `/api` and `/api/x`, not `/apiary`; `exact` fits the path alone), as
+  the client sent it: nothing is decoded, rewritten or matched as a pattern.
+  One that fits none is answered 404. A path's Service is one of the exposing
+  Service's own namespace, and is not looked for when applied: to one that is
+  not there, or a port nothing listens on, the answer is 502. On its way a
+  request is given `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and
+  `X-Forwarded-Host` by kith and the `headers` the Service names, each in
+  place of what the client sent; what a client says of where it is from
+  (`Forwarded`, any other `X-Forwarded-*`, `X-Real-IP`, a header with `_` in
+  its name) goes no further. A request that can be framed two ways is refused
+  (400) or its connection closed; a head is 100 headers and about 64 KiB at
+  most, within 30 seconds. Only a WebSocket is switched to (`Upgrade`), and
+  it keeps its place among the connections. HTTP/2 is not spoken to such a
+  host, and `proxyProtocol` is refused with it. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
   `expose.host` has to be a domain name a certificate authority issues for:
   an IP address, a label that starts or ends with `-`, or a `_` is refused
@@ -691,9 +730,44 @@ kith get dnsrecord                   # each one says `served`, or why not
   A CNAME in a zone to a name outside it is answered with the target's
   addresses from those resolvers too, so stub resolvers get one reply to use
   (the CNAME alone when they do not answer).
+- A `DNSBlockList` is names answered as not there, for the clients it names
+  (`clients`, as a zone has them; none: everyone). The names come from a key
+  of a ConfigMap in `kith-system` (`configMap: {name, key}`) or from an
+  `https://` address each node fetches itself (`url`, again every `interval`:
+  24h unless it says, 5m at least). A list is a hosts file, one name a line,
+  or a filter list's plain rules (`||ads.example^`); any other line is skipped
+  and counted. A listed name blocks every name under it. `answer: unspecified`
+  gives `0.0.0.0` and `::` in place of NXDOMAIN. The cluster's own names and
+  zones are answered first, so a list cannot hide one.
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: DNSBlockList
+  metadata: { name: ads }
+  spec:
+    url: https://lists.example/hosts.txt
+    clients: [192.168.0.0/16]
+  ```
+
+  `kith get dnsblocklist` says `loaded`, or why not; `-o yaml` has how many
+  names it holds, how many lines were skipped and when it was read. Only https
+  is fetched, from an address that is not this node's own or on its networks
+  (a list of your own goes in the ConfigMap), no redirect is followed, and no
+  more than 32 MiB is read; `sha256` names the one text that is taken. A fetch
+  that fails, or a list that does not match, leaves the last good list in use
+  and the status says why. A node holds 1,000,000 names in all its lists
+  together, 8 bytes each (100,000 names: 0.8 MB); a list that would pass that
+  is refused whole. Nothing of a list is written to disk. The host of a `url`
+  list sees each node's address and when it asks. A name that is only an alias
+  (a CNAME) of a listed name at the other resolvers is not blocked: lists name
+  the alias too, or it gets through.
+- What the other resolvers answer is kept for as long as its records say, an
+  hour at most, in 4096 answers or 1 MiB, the oldest going first; memory only.
+  A question that carries options of the client's own (its subnet, a cookie)
+  is asked each time.
 - In a cluster every node started with `--dns` answers the same names.
 
-Not yet: DNSSEC, zone transfers, and caching of upstream answers.
+Not yet: DNSSEC and zone transfers.
 
 ## Packages
 
@@ -961,7 +1035,7 @@ helm install site ./chart --wait
 | DaemonSet | a NodeWorkload |
 | Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC; the last three that finished are kept) |
 | Service | a Service |
-| Ingress | `expose` on the Service behind each host; the Ingress itself is kept to be read back |
+| Ingress | `expose` on the Service behind each host, its `Prefix` and `Exact` paths as `paths`; the Ingress itself is kept to be read back. Refused by name: a path that is a pattern, an annotation that rewrites or matches by pattern, and one that keeps clients out (`auth-*`, an allow or deny list, a snippet, middlewares), which kith's edge would not honour |
 | ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
 | PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
 | Namespace | a Namespace |
@@ -1014,7 +1088,7 @@ Not answered, each refused in words:
   `--timestamps` (a unit's output is kept as it was written, not when).
 
 What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
-budget of 13 MB is not raised; kithd is 10.95 MB today). With pods and CronJobs, kithd
+budget of 13 MB is not raised; kithd is 10.92 MB today). With pods and CronJobs, kithd
 with nothing to do holds 7.8 MB of memory, as it did before them (`python3
 ci/budgets.py`: 7.80 MB four times running, 7.75 MB before; between 7.4 and 8.2 on
 a machine busy with other work). A node that no Kubernetes client asks runs none
@@ -1042,7 +1116,7 @@ installed `helm template` and translates what it prints (no helm: pipe
 | Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
 | DaemonSet | NodeWorkload |
 | Service | Service |
-| Ingress | `expose: {host, via: edge, proxyProtocol}` on the Service behind each host |
+| Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
 | PersistentVolumeClaim | VolumeClaim, with `provision: true` unless it says `storageClassName: ""` |
 | Job, CronJob | Job, CronJob (a `timeZone` other than UTC is refused) |
@@ -1059,6 +1133,76 @@ ignored, not reported. Exit status: 0 everything translated, 1 something is
 in the report (the output is still printed), 2 the input could not be read.
 `nodeSelector` becomes a placement requirement, and a pod template's labels
 are added to the workload's, since kith Services select on those.
+
+### From a docker-compose file
+
+`kith import compose docker-compose.yml --node n1 -n media` prints the stack as
+kith resources, the same way: review, then `kith apply -f` it. kith does not
+run compose; this is a translation, once. kith's YAML has no anchors or merge
+keys, and no variables: `docker compose config` prints a file with both
+written out, and a value that still holds a `$` is refused by name.
+
+| compose | kith |
+|---|---|
+| a service | a Workload with `pod: true` (a network of its own, as in compose) and one container |
+| services joined by `network_mode: service:NAME` | containers of NAME's pod: they share `localhost` |
+| `ports`, `expose` | a Service of the compose name, and of `container_name` and each network alias, with the container's ports (TCP) |
+| a directory (`./config:/config`), a named volume | a Volume on the node `--node` names, and its mount (`:ro` carried) |
+| `environment`, `command`, `entrypoint`, `working_dir`, `user` | the same fields of the container |
+| `restart` | `restartPolicy` |
+| `healthcheck` with `curl` or `wget` of an http address on localhost | a `readiness` probe with its interval, timeout and retries |
+
+Refused by path and name, as `kith import k8s` does: `privileged`, `cap_add`,
+`sysctls`, `devices` (a [DeviceClaim](#claiming-hardware) is how kith gives
+hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port
+published on the node's own address, a `depends_on` condition (kith waits for
+nothing: an app retries), two networks in one file (a namespace is one
+network), an absolute host path (kith takes one in `kith-system` only, and
+never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that
+would make one name, and every key it does not know. A variable whose name
+reads as a secret (`PASSWORD`, `TOKEN`, `KEY`) is carried and said: it is in
+the output as plain text, and a Secret with `envFrom` keeps it out of the
+Workload. (The other way, a tool that writes Kubernetes YAML of the file and
+then `kith import k8s`, is two steps and was not tried here.)
+
+## Coming from Proxmox or docker compose
+
+A guest on a hypervisor is a whole system with one job. On kith the job is a Workload
+from the same image the guest would have run, its data a Volume, its name a Service;
+the system around it is not carried, because kith OS is that part. What each kind of
+guest becomes, and what is still missing:
+
+| A guest that is | Becomes | Today |
+|---|---|---|
+| a web app with one port and a data directory (a password manager, a search engine, an automation tool, a package repository) | a Workload, a Volume, a Service with `expose` | works |
+| an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS on the node's own address (the forge's SSH) does not yet |
+| a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
+| a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
+| a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name and by path, with headers set; no rewriting of paths, no login in front of an app, no HTTP/2 to a host read by path |
+| a DNS filter | kith's own [DNS](#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
+| a mail relay, or anything on a port of the LAN that is not HTTPS | a Workload that shares its node's network (root, not a pod) | works only so; a port said in the Workload, not yet |
+| a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |
+| an app that must go out through a VPN | a Workload with an exit | not yet |
+| a VM with no image (an appliance) | a [`vms` unit](#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
+
+Moving a guest's data, one guest at a time:
+
+1. Stop the app in the guest, so its files are whole.
+2. Apply the Volume its Workload will mount (`kith apply -f app.yaml`; the Workload may
+   wait with `replicas: 0`).
+3. From a machine that reaches both, send the directory:
+   `ssh GUEST tar -cf - -C /var/lib/app . | kith volume put app-data -`
+   (or `kith volume put app-data ./a-copy` for a copy you already have). It says how many
+   files went in and names any link it left out; see
+   [Files in and out of a volume](#files-in-and-out-of-a-volume) for what it refuses.
+4. Start the Workload and look at the app. The files are its user's whatever they were
+   in the guest.
+
+Keep the old guest stopped, not deleted, until the new one has run a week.
+
+kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI,
+virtio disk and network), and that is the way to try it beside what runs today. It is
+tested in QEMU, not on Proxmox itself.
 
 ## Kinds of your own
 
@@ -1851,6 +1995,47 @@ kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
   and revisions are kept as before); a
   blob passes through the CLI's memory whole; no size limit or quota but the disk; a holder
   does not read its copies again to find one the disk has spoiled.
+
+### Files in and out of a volume
+
+```sh
+kith volume put data ./nextcloud-data    # what is in the directory, into the Volume `data`
+kith volume put data ./config.php        # or one file, under its name
+kith volume get data ./copy              # what is in the Volume, into a directory
+tar -cf - -C /srv/app . | kith volume put data -   # a tar you make yourself (`get … -` writes one)
+```
+
+- Any node is asked; the node that has the Volume does it, and the files cross as one tar
+  stream, never held whole in memory or on a second disk. `-n NAMESPACE` as elsewhere.
+  `kith` runs the machine's own `tar` to pack and unpack (with `-` as the path it needs
+  none).
+- A put adds to what is there: a file takes the place of one with its name, a directory
+  is gone into, nothing else is touched. It all arrives first in a directory `.kith-put`
+  inside the Volume and is moved in when the whole stream was good, so a put that is
+  refused or cut short leaves the Volume as it was. A running container that mounts the
+  Volume sees the files appear, and one that changes the Volume's directories at that
+  moment can leave a put half moved in (the put says so): stop it first.
+- Files, directories, links and hard links go in, with their modes (less setuid and
+  setgid) and times. Their owner is not carried: they are made the user's that the
+  Volume's directory is, which is the user of the container that mounts it (see
+  [What a container is kept from](#what-a-container-is-kept-from)), so the app reads what
+  you put.
+- Refused, with the name of the entry: a path that leaves the Volume (`..`, or one that
+  starts at the root), a path through a link, a device, a pipe, a sparse file (pack
+  without `--sparse`), a file where the Volume has a directory of that name or the other
+  way round, more bytes than the Volume's `size` when it says one, and whatever would
+  leave the node's disk with less than 64 MiB free. A link that points out of the Volume
+  (`/etc/localtime`, `../../elsewhere`), or that goes up after it has gone down
+  (`a/../b`), is left out, and the reply names each.
+- Both need `apply` on `Volume` and on `Workload` in the namespace: whoever may run a
+  workload that mounts the Volume reads and writes the same files. Each put, and each get
+  as it starts, is in the audit log with who asked. A Volume in `kith-system` is a
+  directory of the host's and is neither read nor written this way.
+- A get gives the files as the Volume has them, written by whatever ran there: unpack it
+  as an ordinary user, not as root, which would keep their owners and setuid bits.
+- Not yet: no path inside the Volume to put into or get from (it is the whole Volume);
+  one put at a time on a node; a get is of the directory as it is while it is read, like a
+  backup.
 
 ### Backups
 

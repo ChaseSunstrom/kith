@@ -12,6 +12,7 @@ mod api;
 mod audit;
 mod backups;
 mod blobs;
+mod blocklist;
 mod claims;
 mod cluster;
 mod controller;
@@ -50,6 +51,7 @@ mod tpm;
 mod ui;
 mod update;
 mod vm;
+mod volume_files;
 mod volumes;
 mod wasm;
 

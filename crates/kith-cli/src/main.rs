@@ -166,6 +166,11 @@ enum Command {
         #[command(subcommand)]
         command: BlobCommand,
     },
+    /// A volume's files: copy a directory into it, or what it holds out of it
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
     /// Backups: put one of a Backup's archives back into its volume
     Backup {
         #[command(subcommand)]
@@ -247,6 +252,26 @@ enum BlobCommand {
         namespace: String,
         #[arg(short, long, value_name = "FILE")]
         output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VolumeCommand {
+    /// Copy what is in the directory PATH (or the file PATH) into the Volume NAME, beside
+    /// what is there; with - as PATH, a tar from standard input
+    Put {
+        name: String,
+        path: PathBuf,
+        #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
+    },
+    /// Copy what is in the Volume NAME into the directory PATH; with - as PATH, as a tar
+    /// to standard output
+    Get {
+        name: String,
+        path: PathBuf,
+        #[arg(short, long, default_value = DEFAULT_NAMESPACE)]
+        namespace: String,
     },
 }
 
@@ -607,6 +632,139 @@ fn secret(prompt: &str) -> Result<String, String> {
     Ok(first)
 }
 
+/// kithd's socket, open.
+fn connect(kithd: &Kithd) -> Result<std::os::unix::net::UnixStream, String> {
+    let socket = &kithd.socket;
+    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
+        let socket = socket.display();
+        format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
+    })?;
+    // A kithd that accepts and then says nothing must not hang a script forever.
+    let timeout = Some(kithd.timeout);
+    let _ = stream.set_read_timeout(timeout).and(stream.set_write_timeout(timeout));
+    Ok(stream)
+}
+
+/// What a reply that is not a yes says: API errors are `{"error": "..."}`; anything else
+/// (a malformed request) is plain text.
+fn refusal(body: &[u8]) -> String {
+    let message = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let message = message.as_ref().and_then(|m| m["error"].as_str()).map(String::from);
+    message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+}
+
+/// A chunked body from `from` into `to`: an error if it ends before it says it has.
+fn unchunk(from: &mut impl std::io::BufRead, to: &mut dyn std::io::Write) -> std::io::Result<()> {
+    loop {
+        let mut line = String::new();
+        from.read_line(&mut line)?;
+        let size = line.trim().split(';').next().unwrap_or_default();
+        let size = u64::from_str_radix(size, 16).map_err(|_| std::io::ErrorKind::UnexpectedEof)?;
+        if size == 0 {
+            return Ok(());
+        }
+        if std::io::copy(&mut (&mut *from).take(size), to)? != size {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        from.read_line(&mut line)?;
+    }
+}
+
+/// One request to kithd whose body (`from`, sent in chunks as it is read) or whose reply
+/// (written to `to` as it comes) is too long to hold: a volume's files. The reply's body,
+/// when it did not go to `to`. An error reading `from` ends the request unfinished, which
+/// kithd takes as no request at all.
+fn carry(
+    kithd: &Kithd,
+    method: &str,
+    path: &str,
+    from: Option<&mut dyn Read>,
+    to: Option<&mut dyn std::io::Write>,
+) -> Result<Vec<u8>, String> {
+    use std::io::{BufRead, Write};
+    let mut stream = connect(kithd)?;
+    let framing = if from.is_some() {
+        "Transfer-Encoding: chunked\r\n"
+    } else {
+        ""
+    };
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n{framing}\r\n");
+    let mut sent = stream.write_all(head.as_bytes());
+    if let Some(from) = from {
+        let mut chunk = vec![0; 64 << 10];
+        // (Until the chunk of no bytes, which says that was all. kithd may refuse before
+        // it has read everything: its reply still says why.)
+        while sent.is_ok() {
+            let n = from
+                .read(&mut chunk)
+                .or_else(|e| fail(format!("reading what to send: {e}")))?;
+            sent = write!(stream, "{n:x}\r\n").and_then(|()| stream.write_all(&chunk[..n]));
+            sent = sent.and_then(|()| stream.write_all(b"\r\n"));
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    let mut reply = std::io::BufReader::new(stream);
+    let mut head = String::new();
+    loop {
+        let mut line = String::new();
+        if reply.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        head.push_str(&line.to_ascii_lowercase());
+    }
+    if head.is_empty() {
+        let why = sent
+            .err()
+            .map_or("kithd sent no reply".to_string(), |e| format!("talking to kithd: {e}"));
+        return fail(why);
+    }
+    let ok = head.split(' ').nth(1).is_some_and(|status| status.starts_with('2'));
+    let length = head.lines().find_map(|line| line.strip_prefix("content-length:"));
+    let length = length.and_then(|length| length.trim().parse::<u64>().ok());
+    let mut body = Vec::new();
+    let out: &mut dyn Write = match to {
+        Some(to) if ok => to,
+        _ => &mut body,
+    };
+    let read = match length {
+        _ if head.contains("transfer-encoding: chunked") => unchunk(&mut reply, out),
+        Some(length) => std::io::copy(&mut (&mut reply).take(length), out).and_then(|read| {
+            let all = read == length;
+            all.then_some(()).ok_or(std::io::ErrorKind::UnexpectedEof.into())
+        }),
+        None => std::io::copy(&mut reply, out).map(drop),
+    };
+    match read {
+        _ if !ok => fail(refusal(&body)),
+        Err(e) => fail(format!("kithd's reply was cut short: {e}")),
+        Ok(()) => Ok(body),
+    }
+}
+
+/// The machine's own tar, at work in `dir` on a tar it reads or writes as `mode` says.
+// ponytail: kith has no tar of its own (its size); a machine with none gives - as PATH
+// and pipes one.
+fn tar(mode: &str, dir: &Path) -> std::process::Command {
+    let mut tar = std::process::Command::new("tar");
+    tar.arg(mode).arg("-").arg("-C").arg(dir);
+    tar
+}
+
+/// What a program writes, which ends in an error if the program does.
+struct Piped(std::process::Child, std::process::ChildStdout);
+
+impl Read for Piped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.1.read(buf)?;
+        if n == 0 && !self.0.wait()?.success() {
+            return Err(std::io::Error::other("tar did not read all of it (it says why above)"));
+        }
+        Ok(n)
+    }
+}
+
 /// One HTTP request to kithd over its unix socket.
 // ponytail: HTTP/1.1 by hand keeps an HTTP client and an async runtime out of the CLI
 // (the size and RSS budgets). It relies on `Connection: close` and kithd never
@@ -618,15 +776,8 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
 
 /// The same, the reply's body as it came.
 fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
-    let socket = &kithd.socket;
     use std::io::Write;
-    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
-        let socket = socket.display();
-        format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
-    })?;
-    // A kithd that accepts and then says nothing must not hang a script forever.
-    let timeout = Some(kithd.timeout);
-    let _ = stream.set_read_timeout(timeout).and(stream.set_write_timeout(timeout));
+    let mut stream = connect(kithd)?;
     let head = format!(
         "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -663,10 +814,7 @@ fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, 
     }
     let ok = head.split(' ').nth(1).is_some_and(|status| status.starts_with('2'));
     if !ok {
-        // API errors are `{"error": "..."}`; anything else (a malformed request) is plain text.
-        let message = serde_json::from_slice::<serde_json::Value>(body).ok();
-        let message = message.as_ref().and_then(|m| m["error"].as_str()).map(String::from);
-        return fail(message.unwrap_or_else(|| String::from_utf8_lossy(body).into_owned()));
+        return fail(refusal(body));
     }
     // (A reply cut short is not the reply: a blob that came through another node, say.)
     let said = head.lines().find_map(|line| line.strip_prefix("content-length:"));
@@ -928,6 +1076,74 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                         None => std::io::stdout().write_all(&bytes),
                     };
                     written.or_else(|e| fail(format!("writing the blob: {e}")))?;
+                }
+            }
+        }
+        Command::Volume { command } => {
+            use std::process::Stdio;
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("a volume's files are kept by kithd: leave out --store");
+            };
+            let no_tar = |e: std::io::Error| {
+                fail(format!(
+                    "running tar: {e}\nkith uses this machine's tar: with none, give - as PATH and pipe a tar"
+                ))
+            };
+            let route =
+                |namespace: &str, name: &str| format!("/v1/volumes/{}/{}/files", escape(namespace), escape(name));
+            match command {
+                VolumeCommand::Put { name, path, namespace } => {
+                    let route = route(&namespace, &name);
+                    let done = if path.as_os_str() == "-" {
+                        carry(&kithd, "PUT", &route, Some(&mut std::io::stdin().lock()), None)?
+                    } else {
+                        // A directory's content, or the one file, under the name it has.
+                        let found = std::fs::metadata(&path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
+                        let named = path.file_name().filter(|_| !found.is_dir());
+                        let (dir, what) = match named {
+                            Some(name) => (path.parent().unwrap_or(Path::new("")), Path::new(".").join(name)),
+                            None => (path.as_path(), PathBuf::from(".")),
+                        };
+                        let dir = if dir.as_os_str().is_empty() {
+                            Path::new(".")
+                        } else {
+                            dir
+                        };
+                        let packing = tar("-cf", dir).arg(what).stdout(Stdio::piped()).spawn();
+                        let mut packing = packing.or_else(no_tar)?;
+                        let packed = packing.stdout.take().expect("it was asked for");
+                        carry(&kithd, "PUT", &route, Some(&mut Piped(packing, packed)), None)?
+                    };
+                    let done: serde_json::Value =
+                        serde_json::from_slice(&done).or_else(|e| fail(format!("reading kithd's reply: {e}")))?;
+                    for link in done["leftOut"].as_array().into_iter().flatten() {
+                        let link = link.as_str().unwrap_or_default();
+                        eprintln!("left out, a link that points out of the volume: {link}");
+                    }
+                    println!(
+                        "{} files ({} bytes) are in volume {name} on node {}",
+                        done["files"],
+                        done["bytes"],
+                        done["node"].as_str().unwrap_or_default()
+                    );
+                }
+                VolumeCommand::Get { name, path, namespace } => {
+                    let route = route(&namespace, &name);
+                    if path.as_os_str() == "-" {
+                        carry(&kithd, "GET", &route, None, Some(&mut std::io::stdout().lock()))?;
+                    } else {
+                        std::fs::create_dir_all(&path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
+                        let unpacking = tar("-xf", &path).stdin(Stdio::piped()).spawn();
+                        let mut unpacking = unpacking.or_else(no_tar)?;
+                        let mut into = unpacking.stdin.take().expect("it was asked for");
+                        let got = carry(&kithd, "GET", &route, None, Some(&mut into));
+                        drop(into);
+                        let unpacked = unpacking.wait();
+                        got?;
+                        if !unpacked.is_ok_and(|unpacked| unpacked.success()) {
+                            return fail("tar did not unpack all of it (it says why above)");
+                        }
+                    }
                 }
             }
         }

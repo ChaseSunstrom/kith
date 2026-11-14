@@ -1,5 +1,6 @@
 //! The UDP and TCP servers and the forwarder.
 
+use crate::cache::{Cache, Key};
 use crate::wire::{self, Query, REFUSED};
 use crate::{Answer, Chase, Cidr, Zones, answer, servfail};
 use std::collections::HashMap;
@@ -67,6 +68,18 @@ impl Drop for Held {
 
 /// Whether a client may use the forwarder: one in `allowed`, or, when that is empty, one on a
 /// loopback, private, link-local or unique-local address.
+/// The local networks, for a list that is to hold them and more: a list takes their place.
+pub const LOCAL_NETWORKS: [&str; 8] = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
+
 pub(crate) fn may_forward(ip: IpAddr, allowed: &[Cidr]) -> bool {
     let ip = ip.to_canonical();
     if !allowed.is_empty() {
@@ -85,17 +98,44 @@ struct Shared {
     forwarders: Arc<[Cidr]>,
     forwards: PerIp,
     slot_log: Arc<Throttle>,
+    cache: Arc<Cache>,
+}
+
+/// What the cache has for a query that is to go upstream, and the key to keep the reply under.
+struct Cached {
+    key: Option<Key>,
+    hit: Option<Vec<u8>>,
+}
+
+impl Shared {
+    /// Looks `query` up in the cache.
+    fn cached(&self, query: &[u8]) -> Cached {
+        // A question with options of its own goes to the upstreams with them, and what comes
+        // back may be for that client alone (its subnet) or echo what is its own (a cookie):
+        // it is neither looked up nor kept.
+        let key = Query::parse(query).filter(|q| !q.edns_options).map(|q| Key::new(&q));
+        let hit = key.as_ref().and_then(|k| self.cache.get(k, query, Instant::now()));
+        Cached { key, hit }
+    }
+
+    /// Keeps an upstream's `reply` under `key` (the cache takes only what it should).
+    fn keep(&self, key: Option<Key>, reply: &[u8]) {
+        if let Some(key) = key {
+            self.cache.put(key, reply, Instant::now());
+        }
+    }
 }
 
 /// Serves DNS on `udp` and `tcp` until the task is dropped. Names outside `zones` go to each of
-/// `upstreams` in turn, for clients in `forwarders` (or, when empty, on local networks); the zones
-/// in the watch channel can be replaced while it runs.
+/// `upstreams` in turn, for clients in `forwarders` (or, when empty, on local networks), and what
+/// they answer is kept in `cache`; the zones in the watch channel can be replaced while it runs.
 pub async fn serve(
     udp: UdpSocket,
     tcp: TcpListener,
     zones: ZonesRx,
     upstreams: Vec<SocketAddr>,
     forwarders: Vec<Cidr>,
+    cache: Arc<Cache>,
 ) {
     let shared = Shared {
         zones,
@@ -103,6 +143,7 @@ pub async fn serve(
         forwarders: forwarders.into(),
         forwards: PerIp::default(),
         slot_log: Arc::default(),
+        cache,
     };
     tokio::join!(serve_udp(udp, shared.clone()), serve_tcp(tcp, shared));
 }
@@ -152,17 +193,24 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
                 });
             }
             Answer::Forward => {
+                let limit = Query::parse(&buf[..n]).map_or(512, |q| q.udp_limit());
+                // A name asked lately is answered here, with no slot and nothing sent upstream.
+                let Cached { key, hit } = sh.cached(&buf[..n]);
+                if let Some(hit) = hit {
+                    let _ = sock.send_to(&wire::truncate(hit, limit), from).await;
+                    continue;
+                }
                 let (Ok(permit), Some(held)) = (
                     slots.clone().try_acquire_owned(),
                     sh.forwards.take(from.ip(), FORWARDS_PER_IP),
                 ) else {
                     continue;
                 };
-                let (query, sock, upstreams) = (buf[..n].to_vec(), sock.clone(), sh.upstreams.clone());
+                let (query, sock, upstreams, sh) = (buf[..n].to_vec(), sock.clone(), sh.upstreams.clone(), sh.clone());
                 tokio::spawn(async move {
-                    let limit = Query::parse(&query).map_or(512, |q| q.udp_limit());
-                    let reply = wire::truncate(forward(&query, &upstreams, false).await, limit);
-                    let _ = sock.send_to(&reply, from).await;
+                    let reply = forward(&query, &upstreams, false).await;
+                    sh.keep(key, &reply);
+                    let _ = sock.send_to(&wire::truncate(reply, limit), from).await;
                     drop((permit, held));
                 });
             }
@@ -217,9 +265,16 @@ async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::R
                 }
             }
             Answer::Forward if !may_forward(from.ip(), &sh.forwarders) => wire::failure(&query, REFUSED),
-            Answer::Forward => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
-                Some(_held) => forward(&query, &sh.upstreams, true).await,
-                None => servfail(&query),
+            Answer::Forward => match sh.cached(&query) {
+                Cached { hit: Some(hit), .. } => hit,
+                Cached { key, .. } => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
+                    Some(_held) => {
+                        let reply = forward(&query, &sh.upstreams, true).await;
+                        sh.keep(key, &reply);
+                        reply
+                    }
+                    None => servfail(&query),
+                },
             },
         };
         within(write_frame(&mut s, &reply)).await?;

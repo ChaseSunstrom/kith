@@ -9,23 +9,29 @@
 //! challenge: the answer takes only the account's key, which is the Secret
 //! `kith-system/acme-account`.
 //
-// ponytail: TLS ends here and the bytes go on as they are: no HTTP is read on 443, so
-// there is no X-Forwarded-For; a Service that asks (`expose.proxyProtocol`) gets the
-// client's address in a PROXY v1 line instead, and to a NetworkPolicy the connection
-// still comes from this node. Two nodes can order for one host at the same moment
+// ponytail: TLS ends here and, for a host without `paths` or `headers`, the bytes go on
+// as they are: no HTTP is read, so there is no X-Forwarded-For; a Service that asks
+// (`expose.proxyProtocol`) gets the client's address in a PROXY v1 line instead. A host
+// with either is read request by request with hyper (its parser, its framing, its
+// limits) and each request is sent on by hyper's client, so a backend only ever sees
+// requests framed by kith. Either way, to a NetworkPolicy the connection comes from this
+// node, to a Service's address, as any other: the Service's proxy decides. Two nodes can order for one host at the same moment
 // (both then get one; the later Secret stays). A connection is cut after a time with no
 // byte either way, but one that trickles a byte inside that time keeps its place in the
 // room (port 80 has no limit on how slowly a request may come, only on how many). A source
 // (an IPv4 address, an IPv6 /64) holds at most `PER_SOURCE` of a port's places: many
 // clients behind one NAT share that.
-// Read HTTP here when a backend needs the address in a header.
 
 use crate::{Shared, acme};
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri, Version, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
+use hyper::body::Incoming;
+use hyper::client::conn::http1::SendRequest;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use kith_api::Resource;
 use kith_api::kinds::{NamespaceSpec, Protocol, SecretSpec, ServiceSpec};
 use kith_api::store::{Store, now};
@@ -67,6 +73,52 @@ pub struct Exposed {
     to: SocketAddr,
     /// Does the backend want the PROXY protocol line (`expose.proxyProtocol`)?
     proxy: bool,
+    /// Requests by their path (`expose.paths`), each to a Service of `namespace`.
+    routes: Vec<Route>,
+    /// Set on each request (`expose.headers`).
+    headers: Vec<(HeaderName, HeaderValue)>,
+}
+
+/// Where requests under one path go.
+#[derive(Debug, Clone, PartialEq)]
+struct Route {
+    /// For a prefix, without its last `/` (so `/` is ``).
+    path: String,
+    exact: bool,
+    to: SocketAddr,
+}
+
+impl Exposed {
+    /// Is HTTP read on this host's connections, or are their bytes carried as they are?
+    fn reads_http(&self) -> bool {
+        !self.routes.is_empty() || !self.headers.is_empty()
+    }
+
+    /// Where a request for `path` goes, if anywhere. The path is matched as the client
+    /// sent it, byte for byte: nothing decoded, no `..` or `//` folded, so no way of
+    /// writing one path reaches another's Service. (`/app` fits `/app` and `/app/x`, not
+    /// `/application`; of those that fit the longest wins, and an exact one over a
+    /// prefix as long.)
+    fn route(&self, path: &str) -> Option<SocketAddr> {
+        if !path.starts_with('/') {
+            return None;
+        }
+        if self.routes.is_empty() {
+            return Some(self.to);
+        }
+        let fits = |route: &&Route| match route.exact {
+            true => path == route.path,
+            false => path
+                .strip_prefix(route.path.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')),
+        };
+        let best = self
+            .routes
+            .iter()
+            .filter(fits)
+            .max_by_key(|route| (route.path.len(), route.exact));
+        best.map(|route| route.to)
+    }
 }
 
 /// The exposed hosts, and the Services refused one: Service key to why. (Two Services
@@ -133,6 +185,29 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
         }
         let to = SocketAddr::new(address.into(), port.port);
         let proxy = expose.proxy_protocol == Some(true);
+        // (Only ever a Service of the exposing one's namespace: the name is all a path says.)
+        let routes: Vec<Route> = expose
+            .paths
+            .iter()
+            .map(|route| {
+                let exact = route.exact == Some(true);
+                Route {
+                    path: kith_api::kinds::exposed_prefix(&route.path, exact).to_string(),
+                    exact,
+                    to: SocketAddr::new(
+                        kith_mesh::service_address(prefix, namespace, &route.service).into(),
+                        route.port,
+                    ),
+                }
+            })
+            .collect();
+        // (Checked when applied: one that is not a header is not there.)
+        let headers = expose.headers.iter().filter_map(|(name, value)| {
+            Some((
+                HeaderName::try_from(name.as_str()).ok()?,
+                HeaderValue::try_from(value.as_str()).ok()?,
+            ))
+        });
         let namespace = namespace.to_string();
         hosts.insert(
             host,
@@ -141,6 +216,8 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
                 service: key,
                 to,
                 proxy,
+                routes,
+                headers: headers.collect(),
             },
         );
     }
@@ -492,6 +569,220 @@ where
     let _ = tokio::io::copy_bidirectional(client, service).await;
 }
 
+/// A connection to a Service's address, cut when nothing moves on it for `IDLE`. (The
+/// Service's proxy on this node takes it, and its NetworkPolicy decides, as for any other.)
+async fn reach(to: SocketAddr) -> Option<Idle<TcpStream>> {
+    let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(to)).await;
+    Some(Idle::new(reached.ok()?.ok()?, IDLE, None))
+}
+
+/// The connection on to a Service a client's connection keeps between its requests, and
+/// where it goes.
+type Kept = Mutex<Option<(SocketAddr, SendRequest<Body>)>>;
+
+/// Headers that are a connection's own, not the message's: never passed on.
+const HOP: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Is `name` (lower case, as hyper has it) a header a client does not say for itself: where
+/// a request is from, or what a backend may read as that? One with `_` in it too, as nginx
+/// drops them: CGI, WSGI and Rack read `X_Forwarded_For` and `X-Forwarded-For` as one name.
+fn forged(name: &str) -> bool {
+    const FROM: [&str; 5] = [
+        "forwarded",
+        "x-real-ip",
+        "x-client-ip",
+        "x-original-url",
+        "x-rewrite-url",
+    ];
+    name.contains('_') || name.starts_with("x-forwarded-") || FROM.contains(&name)
+}
+
+/// Takes out of `headers` what is the connection's: those always, and what `Connection`
+/// names. (`Expect` too: hyper has answered it already.)
+fn unhop(headers: &mut HeaderMap) {
+    let named: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|name| HeaderName::try_from(name.trim()).ok())
+        .collect();
+    for name in named {
+        headers.remove(name);
+    }
+    for name in HOP {
+        headers.remove(name);
+    }
+    headers.remove(header::EXPECT);
+}
+
+/// A host read as HTTP, its client's requests one by one. hyper reads them: a request it
+/// cannot frame one way only (`Content-Length` twice and different, a folded or NUL
+/// header, `Transfer-Encoding` that does not end in chunked) is answered 400 and goes
+/// nowhere. One with both `Content-Length` and chunked is read as chunked and the
+/// connection closed after it (RFC 9112 6.3): what follows it is never read as a request.
+async fn serve<C>(client: C, from: SocketAddr, host: String, of: Exposed, turn: Place)
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let of = Arc::new((of, host, Kept::default(), turn));
+    let service = hyper::service::service_fn(move |request| {
+        let of = of.clone();
+        async move { Ok::<_, std::convert::Infallible>(pass(request, from, of).await) }
+    });
+    // ponytail: hyper's limits: 100 headers (431 past that), a request's head within about
+    // 64 KiB (`max_buf_size`, looked at between reads; 431 past it) and within 30 seconds
+    // of its first byte; the connection's own idle time (`IDLE`, under TLS) ends one that
+    // says nothing between.
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .max_buf_size(64 * 1024);
+    let _ = http
+        .serve_connection(TokioIo::new(client), service)
+        .with_upgrades()
+        .await;
+}
+
+/// One request: to the Service its path names, as the client sent its path, with the
+/// headers kith sets in place of any the client sent by those names; the answer back.
+/// A body goes on as it comes, both ways; after a 101, so do the bytes. `connection`: the
+/// host, where its last request went, and the client's place under the `Limits`.
+async fn pass(
+    mut request: Request<Incoming>,
+    from: SocketAddr,
+    connection: Arc<(Exposed, String, Kept, Place)>,
+) -> Response {
+    let (of, host, kept, _) = &*connection;
+    let to = (request.method() != Method::CONNECT)
+        .then(|| of.route(request.uri().path()))
+        .flatten();
+    let Some(to) = to else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // (A WebSocket only: any other protocol a backend switched to, h2c for one, would be
+    // requests kith no longer reads, past the paths and the headers.)
+    let upgrade = request.headers().get(header::UPGRADE);
+    let upgrade = upgrade
+        .filter(|to| to.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        .cloned();
+    let client = upgrade.is_some().then(|| hyper::upgrade::on(&mut request));
+    let (mut parts, body) = request.into_parts();
+    // (Origin form, whatever the client wrote: a host in the target is not ours to follow.)
+    let target = parts.uri.path_and_query().cloned();
+    let Some(target) = target else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    parts.uri = Uri::from(target);
+    parts.version = Version::HTTP_11;
+    let headers = &mut parts.headers;
+    unhop(headers);
+    let theirs: Vec<HeaderName> = headers.keys().filter(|name| forged(name.as_str())).cloned().collect();
+    for name in theirs {
+        headers.remove(name);
+    }
+    let said = |text: &str| HeaderValue::try_from(text).ok();
+    let ours = [
+        (header::HOST, said(host)),
+        (
+            HeaderName::from_static("x-forwarded-for"),
+            said(&from.ip().to_canonical().to_string()),
+        ),
+        (HeaderName::from_static("x-forwarded-proto"), said("https")),
+        (HeaderName::from_static("x-forwarded-host"), said(host)),
+    ];
+    for (name, value) in ours {
+        // (In place of what the client said: `insert`, not `append`.)
+        headers.remove(&name);
+        if let Some(value) = value {
+            headers.insert(name, value);
+        }
+    }
+    for (name, value) in &of.headers {
+        headers.insert(name, value.clone());
+    }
+    if let Some(upgrade) = upgrade {
+        headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        headers.insert(header::UPGRADE, upgrade);
+    }
+    let mut request = Request::from_parts(parts, Body::new(body));
+
+    // The connection kept from the last request if it goes to the same place and is open,
+    // else a new one. One kept may have been closed by the Service between: a request it
+    // did not take goes once more, on a new connection.
+    let reused = kept.lock().ok().and_then(|mut kept| kept.take());
+    let mut sender = reused
+        .filter(|(at, sender)| *at == to && !sender.is_closed())
+        .map(|(_, sender)| sender);
+    let (sender, mut response) = loop {
+        let (fresh, mut sender) = match sender.take() {
+            Some(sender) => (false, sender),
+            None => match open(to).await {
+                Some(sender) => (true, sender),
+                None => return StatusCode::BAD_GATEWAY.into_response(),
+            },
+        };
+        if sender.ready().await.is_err() {
+            match fresh {
+                true => return StatusCode::BAD_GATEWAY.into_response(),
+                false => continue,
+            }
+        }
+        match sender.try_send_request(request).await {
+            Ok(response) => break (sender, response),
+            Err(mut error) => match error.take_message() {
+                Some(again) if !fresh => request = again,
+                _ => return StatusCode::BAD_GATEWAY.into_response(),
+            },
+        }
+    };
+    let upgrade = response.headers().get(header::UPGRADE).cloned();
+    unhop(response.headers_mut());
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        if let Ok(mut kept) = kept.lock() {
+            *kept = Some((to, sender));
+        }
+        return response.map(Body::new);
+    }
+    // (A Service that switches when not asked to is not answering this request.)
+    let (Some(client), Some(upgrade)) = (client, upgrade) else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    let service = hyper::upgrade::on(&mut response);
+    // (hyper is done with the connection once it is upgraded; its place goes with the bytes.)
+    let held = connection.clone();
+    tokio::spawn(async move {
+        let _held = held;
+        if let (Ok(client), Ok(service)) = tokio::join!(client, service) {
+            let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(client), &mut TokioIo::new(service)).await;
+        }
+    });
+    let headers = response.headers_mut();
+    headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(header::UPGRADE, upgrade);
+    response.map(Body::new)
+}
+
+/// A new connection to the Service at `to`, HTTP/1.1 on it.
+async fn open(to: SocketAddr) -> Option<SendRequest<Body>> {
+    let service = reach(to).await?;
+    let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(service))
+        .await
+        .ok()?;
+    tokio::spawn(connection.with_upgrades());
+    Some(sender)
+}
+
 /// Port 443: TLS for the host asked for, then the bytes go to its Service and back.
 async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>, limits: Limits) {
     loop {
@@ -503,7 +794,6 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>, limits: Limits)
         };
         let (tls, web) = (tls.clone(), web.clone());
         tokio::spawn(async move {
-            let _turn = turn;
             // (Where the client reached us: the line's destination.)
             let at = stream.local_addr();
             let stream = Idle::new(stream, IDLE, None);
@@ -511,16 +801,20 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>, limits: Limits)
             let Ok(Ok(mut client)) = hello.await else {
                 return;
             };
-            let host = client.get_ref().1.server_name().map(str::to_ascii_lowercase);
-            let of = host.and_then(|host| Some(web.hosts.lock().ok()?.get(&host)?.clone()));
+            let Some(host) = client.get_ref().1.server_name().map(str::to_ascii_lowercase) else {
+                return;
+            };
+            let of = web.hosts.lock().ok().and_then(|hosts| hosts.get(&host).cloned());
             let Some(of) = of else { return };
+            if of.reads_http() {
+                return serve(client, from, host, of, turn).await;
+            }
+            let _turn = turn;
             let line = of
                 .proxy
                 .then(|| at.map_or_else(|_| "PROXY UNKNOWN\r\n".into(), |at| proxy_line(from, at)));
-            let reached = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(of.to));
-            if let Ok(Ok(service)) = reached.await {
-                // (A Service that stops taking bytes does not hold the place either.)
-                let mut service = Idle::new(service, IDLE, None);
+            // (A Service that stops taking bytes does not hold the place either.)
+            if let Some(mut service) = reach(of.to).await {
                 carry(&mut client, &mut service, line).await;
             }
         });
@@ -1029,6 +1323,12 @@ mod tests {
 
     /// Port 443 on loopback with `limits`; the task that serves it.
     async fn open_443(limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let (at, serving, _) = open_443_with(limits).await;
+        (at, serving)
+    }
+
+    /// The same, and what it serves.
+    async fn open_443_with(limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>, Arc<Web>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
         let (strays, _kept) = mpsc::unbounded_channel();
@@ -1040,7 +1340,7 @@ mod tests {
         };
         let web = Arc::new(Web::default());
         let tls = TlsAcceptor::from(crate::pki::ingress_config(web.certificates.clone()).unwrap());
-        (at, tokio::spawn(secure(door, tls, web, limits)))
+        (at, tokio::spawn(secure(door, tls, web.clone(), limits)), web)
     }
 
     /// Is the connection hung up on (not held open) within a moment?
@@ -1284,5 +1584,472 @@ mod tests {
             assert!(said.contains("expose.host"), "{name}: {said}");
         }
         assert_eq!(refused.len(), 4);
+    }
+
+    fn at(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn prefix(path: &str, to: SocketAddr) -> Route {
+        let (path, exact) = (path.to_string(), false);
+        Route { path, exact, to }
+    }
+
+    /// A host read as HTTP, its Service at `to`.
+    fn routed(to: SocketAddr, routes: Vec<Route>, headers: &[(&'static str, &'static str)]) -> Exposed {
+        let headers = headers
+            .iter()
+            .map(|(name, value)| (HeaderName::from_static(name), HeaderValue::from_static(value)));
+        let (service, namespace) = ("Service/shop/web".to_string(), "shop".to_string());
+        let (proxy, headers) = (false, headers.collect());
+        Exposed {
+            service,
+            namespace,
+            to,
+            proxy,
+            routes,
+            headers,
+        }
+    }
+
+    #[test]
+    fn paths_are_matched_as_they_are_sent() {
+        let exact = |path: &str, to| Route {
+            exact: true,
+            ..prefix(path, to)
+        };
+        let (api, admin, login, same, web) = (at(1), at(2), at(3), at(4), at(5));
+        let routes = vec![
+            prefix("/api", api),
+            prefix("/api/admin", admin),
+            exact("/login", login),
+            exact("/api", same),
+        ];
+        let of = routed(web, routes, &[]);
+        let cases = [
+            ("/api/", Some(api)),
+            ("/api/x", Some(api)),
+            ("/api/admin/x", Some(admin)),
+            ("/api/admin", Some(admin)),
+            ("/api/administrator", Some(api)),
+            // An exact path over a prefix as long.
+            ("/api", Some(same)),
+            ("/login", Some(login)),
+            ("/login/", None),
+            ("/apiary", None),
+            ("/application", None),
+            ("/", None),
+            // Nothing decoded or folded: what is written another way is another path.
+            ("//api", None),
+            ("/%2fapi", None),
+            ("/%2Fapi/x", None),
+            ("/api%2fadmin", None),
+            ("/API", None),
+            ("/x/../api", None),
+            ("/api/../login", Some(api)),
+            ("/api/%2e%2e/login", Some(api)),
+            ("/api/admin/../x", Some(admin)),
+            ("*", None),
+            ("", None),
+        ];
+        for (path, to) in cases {
+            assert_eq!(of.route(path), to, "{path}");
+        }
+        // `/` is every path; with no paths at all, so is the Service of the host.
+        let of = routed(web, vec![prefix("", web), prefix("/api", api)], &[]);
+        assert_eq!(
+            (of.route("/x"), of.route("/api/x"), of.route("*")),
+            (Some(web), Some(api), None)
+        );
+        let plain = routed(web, Vec::new(), &[]);
+        assert_eq!((plain.route("/anything"), plain.reads_http()), (Some(web), false));
+        assert!(of.reads_http() && routed(web, Vec::new(), &[("x-env", "prod")]).reads_http());
+    }
+
+    #[test]
+    fn a_hosts_paths_reach_services_of_its_namespace() {
+        let mut store = Store::default();
+        let source = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: web, namespace: shop }\nspec:\n  \
+                      selector: { app: web }\n  ports: [{ port: 8080 }]\n  \
+                      expose:\n    host: shop.example.org\n    via: edge\n    \
+                      paths: [{ path: /api/, service: api, port: 9000 }, { path: /, service: web, port: 8080 }, \
+                      { path: /health, exact: true, service: api, port: 9001 }]\n    \
+                      headers: { X-Env: prod }\n";
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let prefix = kith_mesh::prefix(b"ca");
+        let (hosts, refused) = exposed(&store, prefix);
+        assert!(refused.is_empty());
+        let to = |name, port| SocketAddr::new(kith_mesh::service_address(prefix, "shop", name).into(), port);
+        let shop = &hosts["shop.example.org"];
+        let routes = [
+            Route {
+                path: "/api".into(),
+                exact: false,
+                to: to("api", 9000),
+            },
+            Route {
+                path: String::new(),
+                exact: false,
+                to: to("web", 8080),
+            },
+            Route {
+                path: "/health".into(),
+                exact: true,
+                to: to("api", 9001),
+            },
+        ];
+        assert_eq!(shop.routes, routes);
+        let env = (HeaderName::from_static("x-env"), HeaderValue::from_static("prod"));
+        assert_eq!(shop.headers, [env]);
+        assert_eq!(shop.route("/api"), Some(to("api", 9000)));
+    }
+
+    /// What a test's Service was sent, byte for byte, as it reads it.
+    struct Seen<T>(T, Arc<Mutex<Vec<u8>>>);
+
+    impl<T: AsyncRead + Unpin> AsyncRead for Seen<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = Pin::new(&mut self.0).poll_read(cx, buf);
+            self.1.lock().unwrap().extend_from_slice(&buf.filled()[before..]);
+            polled
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for Seen<T> {
+        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// A Service on loopback: what it was sent, and how many connections it took.
+    struct Backend {
+        at: SocketAddr,
+        seen: Arc<Mutex<Vec<u8>>>,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A Service named `name` that answers with what it was asked: the target, the headers
+    /// kith sets (and two a client might), the size of the body. An upgrade to `echo` it
+    /// takes, and sends back the four bytes it is sent after.
+    async fn backend(name: &'static str) -> Backend {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = Backend {
+            at: listener.local_addr().unwrap(),
+            seen: Arc::default(),
+            connections: Arc::default(),
+        };
+        let (seen, connections) = (backend.seen.clone(), backend.connections.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let service = hyper::service::service_fn(move |mut request: Request<Incoming>| async move {
+                    if request.headers().contains_key(header::UPGRADE) {
+                        let upgraded = hyper::upgrade::on(&mut request);
+                        tokio::spawn(async move {
+                            let mut upgraded = TokioIo::new(upgraded.await.unwrap());
+                            let mut four = [0; 4];
+                            upgraded.read_exact(&mut four).await.unwrap();
+                            upgraded.write_all(&four).await.unwrap();
+                        });
+                        let switching = axum::http::Response::builder()
+                            .status(101)
+                            .header(header::CONNECTION, "upgrade");
+                        let switching = switching.header(header::UPGRADE, "websocket").body(Body::empty());
+                        return Ok::<_, std::convert::Infallible>(switching.unwrap());
+                    }
+                    let said = |name: &str| {
+                        let all = request.headers().get_all(name).iter();
+                        let all: Vec<_> = all.map(|value| String::from_utf8_lossy(value.as_bytes())).collect();
+                        if all.is_empty() { "-".to_string() } else { all.join("|") }
+                    };
+                    let names = [
+                        "x-forwarded-for",
+                        "x-forwarded-proto",
+                        "x-forwarded-host",
+                        "host",
+                        "x-env",
+                        "x-secret",
+                        "x-real-ip",
+                        "x_forwarded_for",
+                    ];
+                    let said: Vec<String> = names.iter().map(|name| said(name)).collect();
+                    let text = format!("{name} {} {}", request.uri(), said.join(" "));
+                    let body = axum::body::to_bytes(Body::new(request.into_body()), usize::MAX).await;
+                    let size = body.map_or(0, |body| body.len());
+                    Ok(Response::new(Body::from(format!("{text} body={size}"))))
+                });
+                let stream = TokioIo::new(Seen(stream, seen.clone()));
+                let http = hyper::server::conn::http1::Builder::new();
+                tokio::spawn(http.serve_connection(stream, service).with_upgrades());
+            }
+        });
+        backend
+    }
+
+    /// `of` served as shop.example.org on loopback, under a certificate of a CA of the
+    /// test's own; a client of it.
+    async fn shop(
+        of: Exposed,
+    ) -> (
+        impl AsyncFnMut() -> tokio_rustls::client::TlsStream<TcpStream>,
+        Arc<Web>,
+    ) {
+        shop_with(of, Limits::new(100, 100)).await
+    }
+
+    async fn shop_with(
+        of: Exposed,
+        limits: Limits,
+    ) -> (
+        impl AsyncFnMut() -> tokio_rustls::client::TlsStream<TcpStream>,
+        Arc<Web>,
+    ) {
+        let (at, _serving, web) = open_443_with(limits).await;
+        let ca = crate::pki::Ca::create().unwrap();
+        let (cert, key) = ca.issue("n1").unwrap();
+        let certified = Arc::new(crate::pki::certified(&cert, &key, "kith").unwrap());
+        web.certificates
+            .0
+            .lock()
+            .unwrap()
+            .insert("shop.example.org".into(), certified);
+        web.hosts.lock().unwrap().insert("shop.example.org".into(), of);
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(crate::pki::client_config(&ca.cert, None).unwrap()));
+        let connect = move || {
+            let tls = tls.clone();
+            async move {
+                let name = rustls::pki_types::ServerName::try_from("shop.example.org").unwrap();
+                tls.connect(name, TcpStream::connect(at).await.unwrap()).await.unwrap()
+            }
+        };
+        (connect, web)
+    }
+
+    /// `request` sent on `stream`, and the answer's status and body (of its
+    /// Content-Length), or None when the connection is closed first.
+    async fn ask<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, request: &[u8]) -> Option<(u16, String)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let answer = async {
+            stream.write_all(request).await.ok()?;
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.ok()?);
+            }
+            let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+            let status = head[9..12].parse().unwrap();
+            let length = head.lines().find_map(|line| line.strip_prefix("content-length:"));
+            let mut body = vec![0; length.map_or(0, |length| length.trim().parse().unwrap())];
+            stream.read_exact(&mut body).await.ok()?;
+            Some((status, String::from_utf8(body).unwrap()))
+        };
+        tokio::time::timeout(Duration::from_secs(10), answer).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_go_by_their_path_with_the_headers_kith_sets() {
+        let (api, web) = (backend("api").await, backend("web").await);
+        let routes = vec![prefix("/api", api.at), prefix("/web", web.at)];
+        let (mut connect, _web) = shop(routed(web.at, routes, &[("x-env", "prod")])).await;
+        let mut client = connect().await;
+        // What a client says of where it is from, and the headers kith sets, are replaced;
+        // one its Connection header names goes no further.
+        let request = b"GET /api/items?to=/web HTTP/1.1\r\nHost: shop.example.org\r\nX-Forwarded-For: 192.0.2.66\r\n\
+                        X-Forwarded-Host: other.example\r\nX-Forwarded-Proto: http\r\nX-Env: mine\r\n\
+                        X-Real-IP: 192.0.2.66\r\nX_Forwarded_For: 192.0.2.66\r\n\
+                        Connection: keep-alive, X-Secret\r\nX-Secret: s\r\n\r\n";
+        let said = "api /api/items?to=/web 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
+        assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
+        // The next request on the connection goes by its own path, and so on.
+        let said = "web /web/ 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
+        let request = b"GET /web/ HTTP/1.1\r\nHost: other.example\r\n\r\n";
+        assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
+        for _ in 0..2 {
+            let answer = ask(
+                &mut client,
+                b"GET /api/%2e%2e/web HTTP/1.1\r\nHost: shop.example.org\r\n\r\n",
+            )
+            .await;
+            assert!(answer.unwrap().1.starts_with("api /api/%2e%2e/web "));
+        }
+        // (A connection on to a Service is kept while requests go to it.)
+        assert_eq!(api.connections.load(std::sync::atomic::Ordering::SeqCst), 2);
+        for path in ["/application", "//api", "/%2fapi", "/", "*"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: shop.example.org\r\n\r\n");
+            assert_eq!(
+                ask(&mut client, request.as_bytes()).await,
+                Some((404, String::new())),
+                "{path}"
+            );
+        }
+        // A body goes on as it comes, one larger than any buffer of kith's included.
+        let body = vec![b'x'; 3 << 20];
+        let request = [
+            format!(
+                "POST /web/up HTTP/1.1\r\nHost: s\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+            &body,
+        ]
+        .concat();
+        let (status, said) = ask(&mut client, &request).await.unwrap();
+        assert!(status == 200 && said.ends_with(&format!(" body={}", 3 << 20)), "{said}");
+        let request =
+            b"POST /web/up HTTP/1.1\r\nHost: s\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert!(ask(&mut client, request).await.unwrap().1.ends_with(" body=5"));
+        // A target in absolute form goes by its path, to the host kith serves.
+        let request = b"GET http://other.example/api/x HTTP/1.1\r\nHost: other.example\r\n\r\n";
+        let said = "api /api/x 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
+        assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
+    }
+
+    #[tokio::test]
+    async fn a_request_hyper_cannot_frame_one_way_reaches_no_service() {
+        let api = backend("api").await;
+        let (mut connect, _web) = shop(routed(api.at, vec![prefix("/api", api.at)], &[])).await;
+        let many: String = (0..120).map(|n| format!("X-{n}: 1\r\n")).collect();
+        // (hyper looks at the size between reads: a head a little over 64 KiB may pass.)
+        let long = format!("X-Long: {}\r\n", "a".repeat(200_000));
+        let refused = [
+            (
+                "folded",
+                "GET /api/smuggled HTTP/1.1\r\nHost: s\r\nX-A: 1\r\n  folded\r\n\r\n".to_string(),
+            ),
+            (
+                "two lengths",
+                "POST /api/smuggled HTTP/1.1\r\nHost: s\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab".into(),
+            ),
+            (
+                "NUL",
+                "GET /api/smuggled HTTP/1.1\r\nHost: s\r\nX-A: a\0b\r\n\r\n".into(),
+            ),
+            (
+                "not chunked",
+                "POST /api/smuggled HTTP/1.1\r\nHost: s\r\nTransfer-Encoding: gzip\r\n\r\nab".into(),
+            ),
+            (
+                "1.0 chunked",
+                "POST /api/smuggled HTTP/1.0\r\nHost: s\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n".into(),
+            ),
+            (
+                "space before colon",
+                "GET /api/smuggled HTTP/1.1\r\nHost: s\r\nContent-Length : 3\r\n\r\nabc".into(),
+            ),
+            (
+                "too many",
+                format!("GET /api/smuggled HTTP/1.1\r\nHost: s\r\n{many}\r\n"),
+            ),
+            (
+                "too long",
+                format!("GET /api/smuggled HTTP/1.1\r\nHost: s\r\n{long}\r\n"),
+            ),
+        ];
+        for (what, request) in refused {
+            let mut client = connect().await;
+            let answer = ask(&mut client, request.as_bytes()).await;
+            assert!(matches!(answer, None | Some((400 | 431, _))), "{what}: {answer:?}");
+        }
+        // Both a length and chunked: read as chunked (RFC 9112 6.3), and the connection
+        // closed after, so what follows is never read as a request of its own.
+        let mut client = connect().await;
+        let request = b"POST /api/a HTTP/1.1\r\nHost: s\r\nContent-Length: 40\r\nTransfer-Encoding: chunked\r\n\r\n\
+                        0\r\n\r\nGET /api/smuggled HTTP/1.1\r\nHost: s\r\n\r\n";
+        let answer = ask(&mut client, request).await.unwrap();
+        assert!(answer.0 == 200 && answer.1.starts_with("api /api/a ") && answer.1.ends_with(" body=0"));
+        assert_eq!(ask(&mut client, b"GET /api/b HTTP/1.1\r\nHost: s\r\n\r\n").await, None);
+        // A bare line feed: refused, or the request goes on as kith writes it.
+        let mut client = connect().await;
+        let answer = ask(&mut client, b"GET /api/lf HTTP/1.1\nHost: s\n\n").await;
+        assert!(matches!(answer, None | Some((200 | 400, _))), "{answer:?}");
+
+        let seen = String::from_utf8(api.seen.lock().unwrap().clone()).unwrap();
+        assert!(!seen.contains("smuggled") && !seen.contains("folded"), "{seen}");
+        assert!(!seen.replace("\r\n", "").contains('\n'), "{seen}");
+    }
+
+    #[test]
+    fn a_client_does_not_say_where_it_is_from() {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-prefix",
+            "forwarded",
+            "x-real-ip",
+            "x-client-ip",
+            "x-original-url",
+            "x-rewrite-url",
+            "x_forwarded_for",
+            "x_real_ip",
+            "any_header",
+        ] {
+            assert!(forged(name), "{name}");
+        }
+        for name in ["x-env", "forwarded-for-fun", "cookie", "x-request-id", "authorization"] {
+            assert!(!forged(name), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_carries_bytes_after_the_101() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let api = backend("api").await;
+        let limits = Limits::new(100, 100);
+        let (mut connect, _web) = shop_with(routed(api.at, vec![prefix("/ws", api.at)], &[]), limits.clone()).await;
+        let mut client = connect().await;
+        // Only a WebSocket is switched to: a backend asked for h2c would then be sent requests
+        // kith does not read. The request goes on as one with no upgrade in it.
+        let request = b"GET /ws HTTP/1.1\r\nHost: s\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n\
+                        HTTP2-Settings: AAMAAABkAAQCAAAAAAIAAAAA\r\n\r\n";
+        let (status, said) = ask(&mut client, request).await.unwrap();
+        assert!(status == 200 && said.starts_with("api /ws "), "{status} {said}");
+        let request = b"GET /ws HTTP/1.1\r\nHost: s\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n";
+        assert_eq!(ask(&mut client, request).await, Some((101, String::new())));
+        client.write_all(b"ping").await.unwrap();
+        let mut four = [0; 4];
+        tokio::time::timeout(Duration::from_secs(10), client.read_exact(&mut four))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&four, b"ping");
+        // The connection holds its place under the limits while it carries bytes, and gives
+        // it back once it ends: one upgraded is no way past them.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(limits.room.available_permits(), 99);
+        drop(client);
+        let mut waited = 0;
+        while limits.room.available_permits() != 100 && waited < 100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        assert_eq!(limits.room.available_permits(), 100);
+    }
+
+    #[tokio::test]
+    async fn a_host_without_paths_or_headers_carries_bytes_as_they_are() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (mut connect, _web) = shop(routed(listener.local_addr().unwrap(), Vec::new(), &[])).await;
+        let mut client = connect().await;
+        client.write_all(b"GET /x HTTP/1.1\nX: a\0b\n\n").await.unwrap();
+        client.shutdown().await.unwrap();
+        let (mut service, _) = listener.accept().await.unwrap();
+        let mut got = Vec::new();
+        service.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"GET /x HTTP/1.1\nX: a\0b\n\n");
     }
 }

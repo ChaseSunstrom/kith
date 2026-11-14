@@ -21,7 +21,7 @@ const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/v1.schema.json");
 fn schemas() -> Value {
     let (mut kinds, mut defs) = (Map::new(), Map::new());
     for kind in KINDS {
-        let mut schema = kind.schema();
+        let mut schema = kind.generated();
         if let Some(Value::Object(own)) = schema.as_object_mut().and_then(|schema| schema.remove("$defs")) {
             for (name, def) in own {
                 // One name is one type, whichever kind uses it: that is what lets them be shared.
@@ -160,6 +160,20 @@ fn stable_v1_takes_every_file_it_took() {
         "the kinds take more than crates/kith-api/v1.schema.json says, and nothing it took is refused: run this test \
          once with KITH_BLESS=1 to write it down"
     );
+}
+
+#[test]
+fn stable_a_binary_reads_the_schemas_the_code_makes() {
+    // A binary has `v1.schema.json` in it and not what makes schemas: they must say the same.
+    // (A run that writes the file was built with the file as it was: the next run compares.)
+    if std::env::var_os("KITH_BLESS").is_some() {
+        return;
+    }
+    for kind in KINDS {
+        // (As text: the order of what `kith schema` prints is the same too.)
+        let (read, made) = (kind.schema().to_string(), kind.generated().to_string());
+        assert_eq!(read, made, "{}: KITH_BLESS=1 writes the file again", kind.kind);
+    }
 }
 
 #[test]

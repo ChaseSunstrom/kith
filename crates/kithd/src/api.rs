@@ -59,6 +59,10 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/blobs", axum::routing::put(crate::blobs::put))
         .route("/v1/backups/{namespace}/{name}/restore", post(crate::backups::restore))
         .route("/v1/blobs/{namespace}/{name}", get(crate::blobs::get))
+        .route(
+            "/v1/volumes/{namespace}/{name}/files",
+            get(crate::volume_files::get).put(crate::volume_files::put),
+        )
         .route("/v1/packages/push", post(push))
         .route("/v1/packages/pull", post(pull))
         .route("/v1/audit", get(audit))

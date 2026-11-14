@@ -92,23 +92,30 @@ fn kept(mut backups: Vec<Value>, new: Value, keep: usize) -> (Vec<Value>, Vec<Va
 /// was looked at is left out. Entries go in by name, so the same files make the same blob.
 pub(crate) fn archive(dir: &Path, blobs: &Path) -> Result<(String, u64), String> {
     let failed = |e: std::io::Error| format!("archiving {}: {e}", dir.display());
-    let mut tar = tar::Builder::new(Incoming::new(blobs).map_err(failed)?);
-    let root = std::fs::File::open(dir).map_err(failed)?;
+    let packed = Incoming::new(blobs).and_then(|blob| stream(dir, blob));
+    packed.map_err(failed)?.keep(None)
+}
+
+/// `dir` as a tar written to `out`, as [`archive`] says: what it was written to, once all
+/// of it is.
+pub(crate) fn stream<W: std::io::Write>(dir: &Path, out: W) -> std::io::Result<W> {
+    let mut tar = tar::Builder::new(out);
+    let root = std::fs::File::open(dir)?;
     let mut header = tar::Header::new_gnu();
-    header.set_metadata(&root.metadata().map_err(failed)?);
-    tar.append_data(&mut header, ".", std::io::empty()).map_err(failed)?;
-    pack(&mut tar, &root, Path::new(".")).map_err(failed)?;
-    tar.into_inner().map_err(failed)?.keep(None)
+    header.set_metadata(&root.metadata()?);
+    tar.append_data(&mut header, ".", std::io::empty())?;
+    pack(&mut tar, &root, Path::new("."))?;
+    tar.into_inner()
 }
 
 /// `name` in the directory `dir` is open at, as a path through that handle.
-fn within(dir: &std::fs::File, name: &std::ffi::OsStr) -> PathBuf {
+pub(crate) fn within(dir: &std::fs::File, name: &std::ffi::OsStr) -> PathBuf {
     use std::os::fd::AsRawFd;
     Path::new("/proc/self/fd").join(dir.as_raw_fd().to_string()).join(name)
 }
 
 /// Open `name` in `dir`: not if it is a link, and without waiting on a pipe put there.
-fn open_in(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_in(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
     use nix::fcntl::OFlag;
     use std::os::unix::fs::OpenOptionsExt;
     let flags = OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY;
@@ -121,10 +128,10 @@ fn open_in(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::
 // and a volume's own program can nest them without end (a held directory has no longest
 // path), so the walk stops here and the archive fails with these words. Walk with a list
 // of its own instead if a real volume is ever deeper.
-const DEEPEST: usize = 128;
+pub(crate) const DEEPEST: usize = 128;
 
 /// Every entry of the directory `dir` is open at into `tar`, under `at`.
-fn pack(tar: &mut tar::Builder<Incoming>, dir: &std::fs::File, at: &Path) -> std::io::Result<()> {
+fn pack<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &std::fs::File, at: &Path) -> std::io::Result<()> {
     if at.components().count() > DEEPEST {
         let said = format!("{} is more than {DEEPEST} directories deep", at.display());
         return Err(std::io::Error::other(said));
@@ -153,8 +160,8 @@ const SWAPPED: [nix::errno::Errno; 3] = [
 
 /// `name` in `dir` into `tar` as `path`. `seen` is what it looked like a moment ago, and
 /// decides only how it is opened: what is written is what was opened.
-fn put(
-    tar: &mut tar::Builder<Incoming>,
+fn put<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
     dir: &std::fs::File,
     name: &std::ffi::OsStr,
     path: &Path,

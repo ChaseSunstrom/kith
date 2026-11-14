@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 34);
+    assert_eq!(KINDS.len(), 35);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -460,6 +460,134 @@ fn expose_asks_for_the_proxy_protocol() {
     let off = service("{ host: a.example.org, via: edge }").unwrap();
     assert_eq!(off.expose.unwrap().proxy_protocol, None);
     assert!(service("{ host: a.example.org, via: edge, proxyProtocol: yes please }").is_err());
+}
+
+#[test]
+fn expose_paths_and_headers_are_checked_naming_the_field() {
+    let service = |expose: &str| {
+        let yaml = format!(
+            "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  \
+             selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {expose}\n"
+        );
+        let resource = Resource::from_source(&yaml).unwrap().remove(0).map_err(|e| e.msg)?;
+        serde_json::from_value::<kinds::ServiceSpec>(resource.spec).map_err(|e| e.to_string())
+    };
+    let host = "host: a.example.org, via: edge";
+    let fine = service(&format!(
+        "{{ {host}, paths: [{{ path: /, service: web, port: 80 }}, {{ path: /api/, exact: true, service: api, port: \
+         8080 }}], headers: {{ X-Env: 'prod; a=b' }} }}"
+    ))
+    .unwrap()
+    .expose
+    .unwrap();
+    assert_eq!(fine.paths.len(), 2);
+    assert_eq!(fine.paths[1].exact, Some(true));
+    assert_eq!(fine.headers["X-Env"], "prod; a=b");
+    // A host without either reads as before, and writes as before.
+    let plain = service(&format!("{{ {host} }}")).unwrap().expose.unwrap();
+    assert!(plain.paths.is_empty() && plain.headers.is_empty());
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::json!({"host": "a.example.org", "via": "edge"})
+    );
+
+    let refused = |expose: &str, field: &str| {
+        let said = service(&format!("{{ {host}, {expose} }}")).unwrap_err();
+        assert!(said.contains(field), "{expose}: {said}");
+    };
+    let path = |p: &str| format!("paths: [{{ path: '{p}', service: web, port: 80 }}]");
+    for bad in ["app", "/a b", "/a?x=1", "/a#top", "/caf\u{e9}", "/a\tb", ""] {
+        refused(&path(bad), "expose.paths[0].path");
+    }
+    refused(&path(&format!("/{}", "a".repeat(1100))), "expose.paths[0].path");
+    refused(
+        "paths: [{ path: /a, service: web, port: 80 }, { path: /a/, service: api, port: 80 }]",
+        "expose.paths[1].path: `/a/` is there twice",
+    );
+    refused(
+        "paths: [{ path: /a, service: Web_1, port: 80 }]",
+        "expose.paths[0].service",
+    );
+    refused(
+        "paths: [{ path: /a, service: ../x, port: 80 }]",
+        "expose.paths[0].service",
+    );
+    refused("paths: [{ path: /a, service: web, port: 0 }]", "expose.paths[0].port");
+    refused(
+        "paths: [{ path: /a, service: web, port: 80, namespace: other }]",
+        "namespace",
+    );
+    refused("proxyProtocol: true, headers: { X-A: b }", "expose.proxyProtocol");
+    for name in [
+        "Connection",
+        "transfer-encoding",
+        "Upgrade",
+        "Host",
+        "Content-Length",
+        "TE",
+        "Trailer",
+        "Keep-Alive",
+        "Proxy-Authorization",
+        "X-Forwarded-For",
+        "x-forwarded-proto",
+        "X-Forwarded-Host",
+        "Forwarded",
+        "X A",
+        "X:A",
+        "",
+    ] {
+        refused(
+            &format!("headers: {{ '{name}': v }}"),
+            &format!("expose.headers[{name}]"),
+        );
+    }
+    for value in ["a\\r\\nX-Evil: 1", "a\\nb", "a\\rb", "a\\u0000b", "\\u00e9t\\u00e9"] {
+        refused(&format!("headers: {{ X-A: \"{value}\" }}"), "expose.headers[X-A]");
+    }
+    refused("headers: { X-A: a, x-a: b }", "named twice");
+}
+
+#[test]
+fn dns_block_list_is_checked() {
+    let list = |spec: &str| {
+        let yaml = format!("apiVersion: kith.dev/v1\nkind: DNSBlockList\nmetadata: {{ name: ads }}\nspec: {spec}\n");
+        let docs = Resource::from_source(&yaml).map_err(|e| e.msg)?;
+        docs.into_iter().try_for_each(|doc| doc.map(drop).map_err(|e| e.msg))
+    };
+    let sha = "a".repeat(64);
+    for ok in [
+        "{ url: 'https://lists.example/hosts.txt' }".to_string(),
+        format!("{{ url: 'https://lists.example:8443/h?x=1', sha256: {sha}, interval: 6h, answer: unspecified }}"),
+        "{ configMap: { name: ads, key: hosts }, clients: [192.168.0.0/16, 'fd00::/8'] }".to_string(),
+        "{ configMap: { name: ads, key: hosts }, answer: nxdomain }".to_string(),
+    ] {
+        assert_eq!(list(&ok), Ok(()), "{ok}");
+    }
+    for (bad, why) in [
+        ("{}", "exactly one"),
+        (
+            "{ url: 'https://a.example/x', configMap: { name: a, key: b } }",
+            "exactly one",
+        ),
+        ("{ url: 'http://a.example/x' }", "not an https://"),
+        ("{ url: 'ftp://a.example/x' }", "not an https://"),
+        ("{ url: 'https://' }", "needs a host"),
+        ("{ url: 'https://user:pw@a.example/x' }", "no user or password"),
+        ("{ url: 'https://a.example/a b' }", "space or control"),
+        ("{ url: 'https://a.example/x', sha256: abc }", "64 hexadecimal"),
+        ("{ url: 'https://a.example/x', interval: 1m }", "at least 5m"),
+        ("{ url: 'https://a.example/x', interval: soon }", "not like"),
+        ("{ configMap: { name: a, key: b }, interval: 1h }", "for a `url` list"),
+        ("{ configMap: { name: '', key: b } }", "name and a key"),
+        // (Read from kith-system only: there is no namespace to say.)
+        ("{ configMap: { namespace: dns, name: a, key: b } }", "namespace"),
+        ("{ url: 'https://a.example/x', clients: [lan] }", "not a network"),
+        ("{ url: 'https://a.example/x', answer: redirect }", "unknown variant"),
+        ("{ url: 'https://a.example/x', extra: 1 }", "extra"),
+    ] {
+        let said = list(bad).unwrap_err();
+        assert!(said.contains(why), "{bad}: {said}");
+    }
 }
 
 #[test]

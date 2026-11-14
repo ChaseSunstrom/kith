@@ -1,0 +1,153 @@
+# A made-up media stack: every key here is carried, said or refused, and a test
+# takes each one out in turn to see that the answer changes.
+name: media-stack
+
+services:
+  vpn:
+    image: example/vpn:1.4
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - TZ=Etc/UTC
+      - VPN_PROVIDER=example
+    ports:
+      - "8080:8080"
+      - "9696"
+      - "51820:51820/udp"
+    volumes:
+      - ./config/vpn:/config
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9696/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      media:
+        aliases:
+          - gateway
+
+  downloader:
+    image: example/downloader:2.1
+    network_mode: "service:vpn"
+    depends_on:
+      vpn:
+        condition: service_healthy
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC
+    volumes:
+      - ./config/downloader:/config
+      - /data/media:/data
+      - downloads:/downloads
+
+  indexer:
+    image: example/indexer:3.0
+    hostname: indexer-box
+    user: "1000:1000"
+    expose:
+      - "9697"
+    environment:
+      TZ: Etc/UTC
+    volumes:
+      - ./config/indexer:/config
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "indexer-check || exit 1"]
+    networks:
+      - media
+
+  shows:
+    image: example/shows:4.2
+    ports:
+      - "8989"
+    depends_on:
+      - indexer
+      - downloader
+    volumes:
+      - ./config/shows:/config
+      - library:/library
+      - downloads:/downloads:ro
+    read_only: true
+    cap_drop:
+      - ALL
+    pull_policy: always
+    networks:
+      - media
+
+  films:
+    image: example/films:5.1
+    expose:
+      - 7878
+    entrypoint: ["/init"]
+    command: ["--data", "/config"]
+    working_dir: /config
+    restart: on-failure
+    volumes:
+      - type: bind
+        source: ./config/films
+        target: /config
+      - type: volume
+        source: library
+        target: /library
+        read_only: true
+    user: "1000"
+
+  requests:
+    image: example/requests:1.9
+    ports:
+      - target: 5055
+        published: 5055
+    env_file: .env
+    privileged: true
+    stdin_open: true
+    healthcheck:
+      test: wget -q --spider http://127.0.0.1:5055/api/status || exit 1
+      interval: 1m
+    volumes:
+      - ./config/requests:/app/config
+
+  media:
+    image: example/media:10.9
+    container_name: mediaserver
+    ports:
+      - "8096:8096"
+      - "1900/udp"
+    environment:
+      - TZ=Etc/UTC
+      - PUID
+    volumes:
+      - ./config/media:/config
+      - library:/data/library
+      - /dev/shm:/transcode
+    restart: "no"
+
+  subtitles:
+    image: example/subtitles:2.7
+    expose:
+      - "6767"
+    environment:
+      TZ: ${TZ}
+    volumes:
+      - ./config/subtitles:/config
+      - library:/library
+    labels:
+      stack: media
+    logging:
+      driver: json-file
+    platform: linux/amd64
+    tmpfs:
+      - /tmp
+
+volumes:
+  library:
+  downloads:
+
+networks:
+  media:

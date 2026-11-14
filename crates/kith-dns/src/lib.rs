@@ -4,15 +4,19 @@
 //! TXT, SRV, NS, SOA and PTR. A zone is any name that has an SOA record; names under one are
 //! answered here (NXDOMAIN or NODATA with the SOA when missing), names under none go upstream.
 
+mod blocklist;
+mod cache;
 mod server;
 mod wire;
 mod zones;
 
-use std::net::IpAddr;
-use wire::{FORMERR, Query, REFUSED, build, failure};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use wire::{FORMERR, NXDOMAIN, Query, REFUSED, build, failure};
 use zones::{Found, key};
 
-pub use server::serve;
+pub use blocklist::{Block, Names, Parsed, parse_list};
+pub use cache::{Cache, CacheStats};
+pub use server::{LOCAL_NETWORKS, serve};
 pub use wire::SERVFAIL;
 pub use zones::{Cidr, Rdata, Record, Records, View, Zones};
 
@@ -119,9 +123,37 @@ pub fn answer(query: &[u8], client: IpAddr, zones: &Zones, udp: bool) -> Answer 
             Answer::Chase(Chase { q, found: f, limit })
         }
         Some(f) => Answer::Reply(build(&q, f.rcode, &f.answers, &f.authority, limit)),
-        None => Answer::Forward,
+        // Our zones come first, so a list cannot hide a name the cluster serves. (A CNAME from a
+        // zone to a listed name is followed upstream as before: the target is not checked.)
+        None => match zones.blocked(client, &q.qname) {
+            Some(null) => Answer::Reply(blocked(&q, null, limit)),
+            None => Answer::Forward,
+        },
     }
 }
+
+/// The reply for a listed name: NXDOMAIN, or the unspecified address for an A or AAAA question and
+/// a NOERROR with nothing for any other type.
+fn blocked(q: &Query, null: bool, limit: usize) -> Vec<u8> {
+    let data = match (null, q.qtype) {
+        (false, _) => return build(q, NXDOMAIN, &[], &[], limit),
+        (true, 1) => Some(Rdata::A(Ipv4Addr::UNSPECIFIED)),
+        (true, 28) => Some(Rdata::Aaaa(Ipv6Addr::UNSPECIFIED)),
+        (true, _) => None,
+    };
+    let answers: Vec<_> = data
+        .map(|data| Record {
+            name: q.qname.clone(),
+            ttl: BLOCKED_TTL,
+            data,
+        })
+        .into_iter()
+        .collect();
+    build(q, 0, &answers, &[], limit)
+}
+
+/// How long a client may keep the unspecified address it is given for a listed name.
+const BLOCKED_TTL: u32 = 60;
 
 /// A SERVFAIL reply to `query`, for when no upstream answered.
 pub fn servfail(query: &[u8]) -> Vec<u8> {

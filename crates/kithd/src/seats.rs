@@ -326,6 +326,7 @@ spec:
         // An Identity with no Role bound to it may not, and the seat says what it said.
         assert!(crate::access::for_identities("/v1/seats/a-seat0/activity"));
         assert!(crate::access::for_identities("/v1/blobs/default/abc") && crate::access::for_identities("/v1/blobs"));
+        assert!(crate::access::for_identities("/v1/volumes/default/data/files"));
         assert!(!crate::access::for_identities("/v1/blob-copy/abc"));
         let stranger = Caller::Identity("mallory".into());
         assert_eq!(ask(stranger, "a-seat0", "idle").await.status(), StatusCode::FORBIDDEN);
