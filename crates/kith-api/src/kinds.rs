@@ -591,6 +591,29 @@ spec! {
         /// client's bytes. Off unless true: a backend that does not expect the line breaks.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub proxy_protocol: Option<bool>,
+        /// Requests by their path, each to a Service of this one's namespace: the longest
+        /// path that fits a request wins, and a request none fits is answered 404. With
+        /// none (and no `headers`), the whole host goes to this Service and its HTTP is not
+        /// read.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub paths: Vec<ExposePath>,
+        /// Headers set on each request on its way to the backend, in place of any of the
+        /// same name the client sent.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub headers: BTreeMap<String, String>,
+    }
+
+    /// Where requests under one path go.
+    pub struct ExposePath {
+        /// `/app` fits `/app` and `/app/x`, not `/application`; `/` fits every request.
+        pub path: String,
+        /// Fits only the path itself, not what is under it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub exact: Option<bool>,
+        /// A Service of the exposing Service's namespace.
+        pub service: String,
+        /// The port of that Service.
+        pub port: u16,
     }
 
     pub enum ExposeVia { Edge }
@@ -1745,15 +1768,106 @@ impl Spec for ServiceSpec {
             return Err("ports: needs at least one port".into());
         }
         // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
-        match &self.expose {
-            Some(expose) if !dns_name(&expose.host) => Err(format!(
+        let Some(expose) = &self.expose else { return Ok(()) };
+        if !dns_name(&expose.host) {
+            return Err(format!(
                 "expose.host: `{}` is not a domain name like `shop.example.org`",
                 expose.host
-            )),
-            Some(expose) => expose_host_refused(&expose.host).map_or(Ok(()), Err),
-            None => Ok(()),
+            ));
         }
+        if let Some(refused) = expose_host_refused(&expose.host) {
+            return Err(refused);
+        }
+        if expose.proxy_protocol == Some(true) && !(expose.paths.is_empty() && expose.headers.is_empty()) {
+            return Err(
+                "expose.proxyProtocol: not with paths or headers, whose requests say the client's address in \
+                 X-Forwarded-For"
+                    .into(),
+            );
+        }
+        if expose.paths.len() > 100 || expose.headers.len() > 32 {
+            return Err("expose: at most 100 paths and 32 headers".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, route) in expose.paths.iter().enumerate() {
+            // (Matched as the client sends it, byte for byte: no space, no query, nothing
+            // that is not printable ASCII.)
+            let printable = route
+                .path
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b'?' && b != b'#');
+            if !route.path.starts_with('/') || !printable || route.path.len() > 1024 {
+                return Err(format!(
+                    "expose.paths[{i}].path: `{}` is not a path like `/app` (printable ASCII, no space, `?` or `#`)",
+                    route.path.escape_debug()
+                ));
+            }
+            crate::check_name(&route.service).map_err(|e| format!("expose.paths[{i}].service: {e}"))?;
+            if route.port == 0 {
+                return Err(format!("expose.paths[{i}].port: 0 is no port"));
+            }
+            let exact = route.exact == Some(true);
+            if !seen.insert((exposed_prefix(&route.path, exact), exact)) {
+                return Err(format!("expose.paths[{i}].path: `{}` is there twice", route.path));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in &expose.headers {
+            let lower = name.to_ascii_lowercase();
+            if let Some(why) = header_refused(&lower, value) {
+                return Err(format!("expose.headers[{}]: {why}", name.escape_debug()));
+            }
+            if !names.insert(lower) {
+                return Err(format!(
+                    "expose.headers[{name}]: named twice (names are the same in any case)"
+                ));
+            }
+        }
+        Ok(())
     }
+}
+
+/// The part of an `expose.paths[].path` a request's path is matched against: a prefix
+/// loses its last `/` (`/app/` fits `/app` too, as in a Kubernetes Ingress), an exact
+/// path is kept as it is.
+pub fn exposed_prefix(path: &str, exact: bool) -> &str {
+    match exact {
+        true => path,
+        false => path.trim_end_matches('/'),
+    }
+}
+
+/// Why a header may not be set on a request by `expose.headers`, if it may not: `name`
+/// is in lower case.
+fn header_refused(name: &str, value: &str) -> Option<String> {
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || name.len() > 100 || !name.bytes().all(token) {
+        return Some("is not a header name (letters, digits and !#$%&'*+-.^_`|~)".into());
+    }
+    // Hop-by-hop headers, and what frames or addresses the request, are the connection's,
+    // not the application's: one set here would say something else than the bytes do.
+    const HOP: [&str; 9] = [
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "forwarded",
+    ];
+    if HOP.contains(&name) || name.starts_with("proxy-") {
+        return Some("is the connection's, not one to set".into());
+    }
+    if ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"].contains(&name) {
+        return Some("is set by kith itself".into());
+    }
+    // (A line break would start another header, or the body.)
+    if value.len() > 4096 || !value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b)) {
+        return Some("its value has a line break, a control character or what is not ASCII in it".into());
+    }
+    None
 }
 
 impl Spec for NamespaceSpec {

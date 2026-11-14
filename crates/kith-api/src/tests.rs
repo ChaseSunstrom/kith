@@ -463,6 +463,91 @@ fn expose_asks_for_the_proxy_protocol() {
 }
 
 #[test]
+fn expose_paths_and_headers_are_checked_naming_the_field() {
+    let service = |expose: &str| {
+        let yaml = format!(
+            "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\nspec:\n  \
+             selector: {{ app: web }}\n  ports: [{{ port: 80 }}]\n  expose: {expose}\n"
+        );
+        let resource = Resource::from_source(&yaml).unwrap().remove(0).map_err(|e| e.msg)?;
+        serde_json::from_value::<kinds::ServiceSpec>(resource.spec).map_err(|e| e.to_string())
+    };
+    let host = "host: a.example.org, via: edge";
+    let fine = service(&format!(
+        "{{ {host}, paths: [{{ path: /, service: web, port: 80 }}, {{ path: /api/, exact: true, service: api, port: \
+         8080 }}], headers: {{ X-Env: 'prod; a=b' }} }}"
+    ))
+    .unwrap()
+    .expose
+    .unwrap();
+    assert_eq!(fine.paths.len(), 2);
+    assert_eq!(fine.paths[1].exact, Some(true));
+    assert_eq!(fine.headers["X-Env"], "prod; a=b");
+    // A host without either reads as before, and writes as before.
+    let plain = service(&format!("{{ {host} }}")).unwrap().expose.unwrap();
+    assert!(plain.paths.is_empty() && plain.headers.is_empty());
+    assert_eq!(
+        serde_json::to_value(&plain).unwrap(),
+        serde_json::json!({"host": "a.example.org", "via": "edge"})
+    );
+
+    let refused = |expose: &str, field: &str| {
+        let said = service(&format!("{{ {host}, {expose} }}")).unwrap_err();
+        assert!(said.contains(field), "{expose}: {said}");
+    };
+    let path = |p: &str| format!("paths: [{{ path: '{p}', service: web, port: 80 }}]");
+    for bad in ["app", "/a b", "/a?x=1", "/a#top", "/caf\u{e9}", "/a\tb", ""] {
+        refused(&path(bad), "expose.paths[0].path");
+    }
+    refused(&path(&format!("/{}", "a".repeat(1100))), "expose.paths[0].path");
+    refused(
+        "paths: [{ path: /a, service: web, port: 80 }, { path: /a/, service: api, port: 80 }]",
+        "expose.paths[1].path: `/a/` is there twice",
+    );
+    refused(
+        "paths: [{ path: /a, service: Web_1, port: 80 }]",
+        "expose.paths[0].service",
+    );
+    refused(
+        "paths: [{ path: /a, service: ../x, port: 80 }]",
+        "expose.paths[0].service",
+    );
+    refused("paths: [{ path: /a, service: web, port: 0 }]", "expose.paths[0].port");
+    refused(
+        "paths: [{ path: /a, service: web, port: 80, namespace: other }]",
+        "namespace",
+    );
+    refused("proxyProtocol: true, headers: { X-A: b }", "expose.proxyProtocol");
+    for name in [
+        "Connection",
+        "transfer-encoding",
+        "Upgrade",
+        "Host",
+        "Content-Length",
+        "TE",
+        "Trailer",
+        "Keep-Alive",
+        "Proxy-Authorization",
+        "X-Forwarded-For",
+        "x-forwarded-proto",
+        "X-Forwarded-Host",
+        "Forwarded",
+        "X A",
+        "X:A",
+        "",
+    ] {
+        refused(
+            &format!("headers: {{ '{name}': v }}"),
+            &format!("expose.headers[{name}]"),
+        );
+    }
+    for value in ["a\\r\\nX-Evil: 1", "a\\nb", "a\\rb", "a\\u0000b", "\\u00e9t\\u00e9"] {
+        refused(&format!("headers: {{ X-A: \"{value}\" }}"), "expose.headers[X-A]");
+    }
+    refused("headers: { X-A: a, x-a: b }", "named twice");
+}
+
+#[test]
 fn dns_block_list_is_checked() {
     let list = |spec: &str| {
         let yaml = format!("apiVersion: kith.dev/v1\nkind: DNSBlockList\nmetadata: {{ name: ads }}\nspec: {spec}\n");
