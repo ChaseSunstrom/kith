@@ -559,7 +559,7 @@ fn dns_block_list_is_checked() {
         "{ url: 'https://lists.example/hosts.txt' }".to_string(),
         format!("{{ url: 'https://lists.example:8443/h?x=1', sha256: {sha}, interval: 6h, answer: unspecified }}"),
         "{ configMap: { name: ads, key: hosts }, clients: [192.168.0.0/16, 'fd00::/8'] }".to_string(),
-        "{ configMap: { namespace: dns, name: ads, key: hosts }, answer: nxdomain }".to_string(),
+        "{ configMap: { name: ads, key: hosts }, answer: nxdomain }".to_string(),
     ] {
         assert_eq!(list(&ok), Ok(()), "{ok}");
     }
@@ -579,6 +579,8 @@ fn dns_block_list_is_checked() {
         ("{ url: 'https://a.example/x', interval: soon }", "not like"),
         ("{ configMap: { name: a, key: b }, interval: 1h }", "for a `url` list"),
         ("{ configMap: { name: '', key: b } }", "name and a key"),
+        // (Read from kith-system only: there is no namespace to say.)
+        ("{ configMap: { namespace: dns, name: a, key: b } }", "namespace"),
         ("{ url: 'https://a.example/x', clients: [lan] }", "not a network"),
         ("{ url: 'https://a.example/x', answer: redirect }", "unknown variant"),
         ("{ url: 'https://a.example/x', extra: 1 }", "extra"),

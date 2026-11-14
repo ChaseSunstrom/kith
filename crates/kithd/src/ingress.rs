@@ -593,6 +593,20 @@ const HOP: [&str; 9] = [
     "upgrade",
 ];
 
+/// Is `name` (lower case, as hyper has it) a header a client does not say for itself: where
+/// a request is from, or what a backend may read as that? One with `_` in it too, as nginx
+/// drops them: CGI, WSGI and Rack read `X_Forwarded_For` and `X-Forwarded-For` as one name.
+fn forged(name: &str) -> bool {
+    const FROM: [&str; 5] = [
+        "forwarded",
+        "x-real-ip",
+        "x-client-ip",
+        "x-original-url",
+        "x-rewrite-url",
+    ];
+    name.contains('_') || name.starts_with("x-forwarded-") || FROM.contains(&name)
+}
+
 /// Takes out of `headers` what is the connection's: those always, and what `Connection`
 /// names. (`Expect` too: hyper has answered it already.)
 fn unhop(headers: &mut HeaderMap) {
@@ -656,7 +670,12 @@ async fn pass(
     let Some(to) = to else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let upgrade = request.headers().get(header::UPGRADE).cloned();
+    // (A WebSocket only: any other protocol a backend switched to, h2c for one, would be
+    // requests kith no longer reads, past the paths and the headers.)
+    let upgrade = request.headers().get(header::UPGRADE);
+    let upgrade = upgrade
+        .filter(|to| to.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        .cloned();
     let client = upgrade.is_some().then(|| hyper::upgrade::on(&mut request));
     let (mut parts, body) = request.into_parts();
     // (Origin form, whatever the client wrote: a host in the target is not ours to follow.)
@@ -668,7 +687,8 @@ async fn pass(
     parts.version = Version::HTTP_11;
     let headers = &mut parts.headers;
     unhop(headers);
-    for name in ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"] {
+    let theirs: Vec<HeaderName> = headers.keys().filter(|name| forged(name.as_str())).cloned().collect();
+    for name in theirs {
         headers.remove(name);
     }
     let said = |text: &str| HeaderValue::try_from(text).ok();
@@ -1748,7 +1768,7 @@ mod tests {
                         let switching = axum::http::Response::builder()
                             .status(101)
                             .header(header::CONNECTION, "upgrade");
-                        let switching = switching.header(header::UPGRADE, "echo").body(Body::empty());
+                        let switching = switching.header(header::UPGRADE, "websocket").body(Body::empty());
                         return Ok::<_, std::convert::Infallible>(switching.unwrap());
                     }
                     let said = |name: &str| {
@@ -1763,6 +1783,8 @@ mod tests {
                         "host",
                         "x-env",
                         "x-secret",
+                        "x-real-ip",
+                        "x_forwarded_for",
                     ];
                     let said: Vec<String> = names.iter().map(|name| said(name)).collect();
                     let text = format!("{name} {} {}", request.uri(), said.join(" "));
@@ -1847,11 +1869,12 @@ mod tests {
         // one its Connection header names goes no further.
         let request = b"GET /api/items?to=/web HTTP/1.1\r\nHost: shop.example.org\r\nX-Forwarded-For: 192.0.2.66\r\n\
                         X-Forwarded-Host: other.example\r\nX-Forwarded-Proto: http\r\nX-Env: mine\r\n\
+                        X-Real-IP: 192.0.2.66\r\nX_Forwarded_For: 192.0.2.66\r\n\
                         Connection: keep-alive, X-Secret\r\nX-Secret: s\r\n\r\n";
-        let said = "api /api/items?to=/web 127.0.0.1 https shop.example.org shop.example.org prod - body=0";
+        let said = "api /api/items?to=/web 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
         assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
         // The next request on the connection goes by its own path, and so on.
-        let said = "web /web/ 127.0.0.1 https shop.example.org shop.example.org prod - body=0";
+        let said = "web /web/ 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
         let request = b"GET /web/ HTTP/1.1\r\nHost: other.example\r\n\r\n";
         assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
         for _ in 0..2 {
@@ -1890,7 +1913,7 @@ mod tests {
         assert!(ask(&mut client, request).await.unwrap().1.ends_with(" body=5"));
         // A target in absolute form goes by its path, to the host kith serves.
         let request = b"GET http://other.example/api/x HTTP/1.1\r\nHost: other.example\r\n\r\n";
-        let said = "api /api/x 127.0.0.1 https shop.example.org shop.example.org prod - body=0";
+        let said = "api /api/x 127.0.0.1 https shop.example.org shop.example.org prod - - - body=0";
         assert_eq!(ask(&mut client, request).await, Some((200, said.into())));
     }
 
@@ -1958,6 +1981,29 @@ mod tests {
         assert!(!seen.replace("\r\n", "").contains('\n'), "{seen}");
     }
 
+    #[test]
+    fn a_client_does_not_say_where_it_is_from() {
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-port",
+            "x-forwarded-server",
+            "x-forwarded-prefix",
+            "forwarded",
+            "x-real-ip",
+            "x-client-ip",
+            "x-original-url",
+            "x-rewrite-url",
+            "x_forwarded_for",
+            "x_real_ip",
+            "any_header",
+        ] {
+            assert!(forged(name), "{name}");
+        }
+        for name in ["x-env", "forwarded-for-fun", "cookie", "x-request-id", "authorization"] {
+            assert!(!forged(name), "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn an_upgrade_carries_bytes_after_the_101() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1965,7 +2011,13 @@ mod tests {
         let limits = Limits::new(100, 100);
         let (mut connect, _web) = shop_with(routed(api.at, vec![prefix("/ws", api.at)], &[]), limits.clone()).await;
         let mut client = connect().await;
-        let request = b"GET /ws HTTP/1.1\r\nHost: s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+        // Only a WebSocket is switched to: a backend asked for h2c would then be sent requests
+        // kith does not read. The request goes on as one with no upgrade in it.
+        let request = b"GET /ws HTTP/1.1\r\nHost: s\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n\
+                        HTTP2-Settings: AAMAAABkAAQCAAAAAAIAAAAA\r\n\r\n";
+        let (status, said) = ask(&mut client, request).await.unwrap();
+        assert!(status == 200 && said.starts_with("api /ws "), "{status} {said}");
+        let request = b"GET /ws HTTP/1.1\r\nHost: s\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n";
         assert_eq!(ask(&mut client, request).await, Some((101, String::new())));
         client.write_all(b"ping").await.unwrap();
         let mut four = [0; 4];

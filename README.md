@@ -606,7 +606,42 @@ kith node status                                   # who leads the store, who vo
   client's address before the client's bytes; it is off unless asked for,
   because a backend that does not expect the line will break on it. Only the
   ingress sends it: a client inside the mesh that calls the Service gets
-  none, so the backend has to take both. Certificate keys and the ACME account key
+  none, so the backend has to take both.
+
+  A host whose `expose` has `paths` or `headers` is read as HTTP/1.1 instead:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Service
+  metadata: { name: web }
+  spec:
+    selector: { app: web }
+    ports: [{ port: 80 }]
+    expose:
+      host: shop.example.org
+      via: edge
+      paths:
+        - { path: /, service: web, port: 80 }
+        - { path: /api, service: api, port: 8080 }
+        - { path: /healthz, exact: true, service: api, port: 9100 }
+      headers: { X-Env: prod }
+  ```
+
+  Each request goes to the Service of the longest path that fits it (`/api`
+  fits `/api` and `/api/x`, not `/apiary`; `exact` fits the path alone), as
+  the client sent it: nothing is decoded, rewritten or matched as a pattern.
+  One that fits none is answered 404. A path's Service is one of the exposing
+  Service's own namespace, and is not looked for when applied: to one that is
+  not there, or a port nothing listens on, the answer is 502. On its way a
+  request is given `Host`, `X-Forwarded-For`, `X-Forwarded-Proto` and
+  `X-Forwarded-Host` by kith and the `headers` the Service names, each in
+  place of what the client sent; what a client says of where it is from
+  (`Forwarded`, any other `X-Forwarded-*`, `X-Real-IP`, a header with `_` in
+  its name) goes no further. A request that can be framed two ways is refused
+  (400) or its connection closed; a head is 100 headers and about 64 KiB at
+  most, within 30 seconds. Only a WebSocket is switched to (`Upgrade`), and
+  it keeps its place among the connections. HTTP/2 is not spoken to such a
+  host, and `proxyProtocol` is refused with it. Certificate keys and the ACME account key
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
   `expose.host` has to be a domain name a certificate authority issues for:
   an IP address, a label that starts or ends with `-`, or a `_` is refused
@@ -996,7 +1031,7 @@ helm install site ./chart --wait
 | DaemonSet | a NodeWorkload |
 | Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC; the last three that finished are kept) |
 | Service | a Service |
-| Ingress | `expose` on the Service behind each host; the Ingress itself is kept to be read back |
+| Ingress | `expose` on the Service behind each host, its `Prefix` and `Exact` paths as `paths`; the Ingress itself is kept to be read back. Refused by name: a path that is a pattern, an annotation that rewrites or matches by pattern, and one that keeps clients out (`auth-*`, an allow or deny list, a snippet, middlewares), which kith's edge would not honour |
 | ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
 | PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
 | Namespace | a Namespace |
@@ -1077,7 +1112,7 @@ installed `helm template` and translates what it prints (no helm: pipe
 | Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
 | DaemonSet | NodeWorkload |
 | Service | Service |
-| Ingress | `expose: {host, via: edge, proxyProtocol}` on the Service behind each host |
+| Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
 | PersistentVolumeClaim | VolumeClaim, with `provision: true` unless it says `storageClassName: ""` |
 | Job, CronJob | Job, CronJob (a `timeZone` other than UTC is refused) |
@@ -1139,7 +1174,7 @@ guest becomes, and what is still missing:
 | an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS on the node's own address (the forge's SSH) does not yet |
 | a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
 | a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
-| a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name; by path, and with headers set, not yet |
+| a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name and by path, with headers set; no rewriting of paths, no login in front of an app, no HTTP/2 to a host read by path |
 | a DNS filter | kith's own [DNS](#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
 | a mail relay, or anything on a port of the LAN that is not HTTPS | a Workload that shares its node's network (root, not a pod) | works only so; a port said in the Workload, not yet |
 | a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |

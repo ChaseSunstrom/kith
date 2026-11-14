@@ -144,6 +144,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   would give a container more than kith gives (`privileged`, capabilities, devices, the
   node's network, `/`, `/proc`, `/sys`, `/dev` and a docker socket as a volume, even in
   `kith-system`), and reads no variable of the shell it runs in.
+- **A host read by path trusts its own namespace, and lets every client in.** Whoever may
+  write a Service with `expose.paths` sends that host's requests to any Service and port
+  of the same namespace, exposed or not. kith's edge asks no client who it is: an Ingress
+  whose annotations did (`auth-*`, an allow list, a snippet) is refused, not translated
+  into an open host. Toward a backend the client's own `Forwarded`, `X-Forwarded-*`,
+  `X-Real-IP` and any header with `_` in its name are dropped and kith's put in their
+  place; a backend reached some other way than the edge (from inside the mesh) gets none
+  of that, and must not trust those headers from there.
 - **A block list is trusted for the names it lists, by every client of the resolver.** A
   `DNSBlockList` is the cluster's (no namespace), and its ConfigMap is read from
   `kith-system` only: whoever may write either decides which names every node answers as

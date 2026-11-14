@@ -1511,6 +1511,19 @@ fn volume_claim(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
     }
 }
 
+/// A word (between `-` and `.`) in the name of an annotation that limits who reaches a host:
+/// an Ingress with one is not translated into a host open to all.
+const KEEPS_OUT: [&str; 8] = [
+    "auth",
+    "whitelist",
+    "allowlist",
+    "denylist",
+    "snippet",
+    "middlewares",
+    "cidrs",
+    "satisfy",
+];
+
 /// An Ingress is not a resource of its own: its hosts become `expose` on the Services behind them.
 fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
     // (An Ingress is kept by who took it, as it was sent; a kith file has no place for these.)
@@ -1526,6 +1539,13 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
             cx.note(
                 &at,
                 "is refused: kith matches a request's path as it is sent and passes it on unchanged",
+            );
+        } else if name.split(['-', '.']).any(|word| KEEPS_OUT.contains(&word)) {
+            // `…/auth-url`, `…/whitelist-source-range`, `…/server-snippet`, `…/router.middlewares`:
+            // taken with a hint, the host would be open to everyone its Ingress kept out.
+            cx.note(
+                &at,
+                "is refused: it keeps some clients out or asks who they are, and kith's edge lets every client in",
             );
         } else if cx.import || key.contains("ingress") {
             cx.hint(&at, "is not used: kith's edge has no such setting");
@@ -1600,6 +1620,8 @@ fn ingress(cx: &mut Cx, meta: Metadata, root: &mut Map, out: Out) {
             .or(routes.first())
             .map(|r| (join(&r.0, "backend"), r.3.clone()))
         else {
+            // (No path, or none that was carried: said, so a host that goes nowhere is no surprise.)
+            cx.hint(&rp, "has no path kith carries: nothing is exposed for its host");
             continue;
         };
         let service_of = |r: &Resource, name: &str| {
@@ -2628,5 +2650,48 @@ spec:
             "{:?}",
             taken.hints
         );
+    }
+
+    #[test]
+    fn an_ingress_that_keeps_clients_out_is_not_made_open_to_all() {
+        // Each of these limits who reaches the host where it came from: a hint would leave
+        // the host open. On import and on apply alike.
+        let nginx = |name: &str| format!("nginx.ingress.kubernetes.io/{name}");
+        for key in [
+            nginx("auth-url"),
+            nginx("auth-type"),
+            nginx("auth-tls-verify-client"),
+            nginx("whitelist-source-range"),
+            nginx("allowlist-source-range"),
+            nginx("denylist-source-range"),
+            nginx("server-snippet"),
+            nginx("configuration-snippet"),
+            nginx("satisfy"),
+            "traefik.ingress.kubernetes.io/router.middlewares".to_string(),
+            "haproxy.org/auth-type".to_string(),
+            "haproxy.org/whitelist".to_string(),
+            "alb.ingress.kubernetes.io/inbound-cidrs".to_string(),
+        ] {
+            let src = format!(
+                "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: shop\n  annotations:\n    \
+                 {key}: \"x\"\nspec:\n  rules:\n    - host: shop.example.com\n      http:\n        paths:\n          \
+                 - path: /\n            pathType: Prefix\n            \
+                 backend: {{ service: {{ name: web, port: {{ number: 80 }} }} }}\n"
+            );
+            for import in [true, false] {
+                let taken = take(documents("test", &src).unwrap(), import);
+                let said = |line: &String| line.contains(&key) && line.contains("keeps some clients out");
+                assert!(
+                    taken.refused.iter().any(said),
+                    "{key} (import {import}): {:?}",
+                    taken.refused
+                );
+            }
+        }
+        // A name that only has such a word inside another is not one of them.
+        let src = "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: shop\n  annotations:\n    \
+                   example.com/author: me\n    example.com/authority-notes: x\nspec: { rules: [] }\n";
+        let taken = take(documents("test", src).unwrap(), true);
+        assert!(taken.refused.is_empty(), "{:?}", taken.refused);
     }
 }
