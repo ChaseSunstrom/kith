@@ -575,7 +575,10 @@ kith node status                                   # who leads the store, who vo
   in turn, on whichever node it runs: kithd passes the bytes on, over the
   mesh if the replica is elsewhere, to the replica's port on its node's
   `127.0.0.1` (or `::1`). A kithd that restarts drops the connections through
-  it. Only TCP; a `targetPort` by name is a container port of that name.
+  it. A Service's connections are passed on by up to four threads of their
+  own (one for each core, started with the first Service) and DNS answers on
+  one more, so a busy Service holds up neither the API nor a lookup. Only
+  TCP; a `targetPort` by name is a container port of that name.
 - A `NetworkPolicy` says who may connect to the Workloads it selects through
   a Service: the first ingress rule that fits decides, and when a policy
   selects a Workload and no rule fits, the connection is refused. A peer is
@@ -1084,7 +1087,7 @@ Not answered, each refused in words:
   `--timestamps` (a unit's output is kept as it was written, not when).
 
 What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
-budget of 13 MB is not raised; kithd is 10.95 MB today). With pods and CronJobs, kithd
+budget of 13 MB is not raised; kithd is 10.92 MB today). With pods and CronJobs, kithd
 with nothing to do holds 7.8 MB of memory, as it did before them (`python3
 ci/budgets.py`: 7.80 MB four times running, 7.75 MB before; between 7.4 and 8.2 on
 a machine busy with other work). A node that no Kubernetes client asks runs none
