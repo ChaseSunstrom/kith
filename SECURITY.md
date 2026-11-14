@@ -128,6 +128,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
+- **Whoever may apply a Workload or a Job in a namespace reads that namespace's Secrets
+  and ConfigMaps**, without the right to `get` them: a template names one in `env`, in
+  `envFrom` or as files, and its container is given what it holds. (Another
+  namespace's cannot be named.) A Secret given as files is written to memory only (kithd
+  asks the kernel that the directory is on no disk, and refuses otherwise). Given in
+  `env` or `envFrom` it is in the container's environment, which the node's root and the
+  container's own user can read, and in the container's description that the runtime
+  keeps in the node's state while it runs: on that disk, encrypted only where the
+  state is. A ConfigMap's files are on the state disk too.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

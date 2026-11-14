@@ -121,7 +121,7 @@ fn errors_point_at_the_mistake() {
     assert_eq!(l, 6, "points into the spec: {m}");
     assert_eq!(
         m,
-        "template, unit `web`, env `A`: set exactly one of `value`, `secret`, `configMap`"
+        "template, unit `web`, env `A`: set exactly one of `value`, `secret`, `configMap`, `field`"
     );
     assert!(
         err(&workload("      - name: web\n        image: other\n"))
@@ -975,6 +975,171 @@ fn hardened_containers_say_who_they_are_and_what_they_call() {
         let refused = job(bad).unwrap_err();
         assert!(refused.contains(why), "{bad}: {refused}");
     }
+}
+
+/// What a pod of Kubernetes has that a 1.0 template had not: containers that run first,
+/// ConfigMaps and Secrets as files, a directory of the replica's own, every key of a map
+/// as a variable, something of the replica itself as one, capabilities dropped, and not
+/// root. Each is checked when applied, and a path never climbs out of what is mounted.
+#[test]
+fn a_template_says_what_a_pod_says() {
+    let job = |template: &str, container: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: j }}\nspec:\n  template:\n    {template}\n    containers: [{{ name: c, image: i, {container} }}]\n"
+        );
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map_err(|e| e.msg)
+    };
+    let mount = |mount: &str| job("restartPolicy: never", &format!("volumeMounts: [{{ {mount} }}]"));
+    for good in [
+        "volume: data, path: /data",
+        "volume: data, path: /data, readOnly: true",
+        "configMap: site, path: /etc/site",
+        "configMap: site, path: /etc/site, items: { index: conf.d/index.html }, mode: 0440",
+        "secret: tls, path: /etc/tls/key.pem, subPath: tls.key, mode: 400",
+        "scratch: cache, path: /cache",
+        "scratch: cache, path: /cache, memory: true",
+    ] {
+        mount(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for (bad, why) in [
+        (
+            "path: /data",
+            "set exactly one of `volume`, `configMap`, `secret`, `scratch`",
+        ),
+        ("volume: a, secret: b, path: /data", "set exactly one of"),
+        (
+            "volume: data, path: /d, items: { a: b }",
+            "`items` and `mode` are a `configMap`'s or a `secret`'s",
+        ),
+        ("scratch: s, path: /d, mode: 0400", "`items` and `mode` are"),
+        ("volume: data, path: /d, memory: true", "`memory` is a `scratch`'s"),
+        (
+            "configMap: c, path: /d, items: { a: ../b }",
+            "items: `../b` is not a path inside it",
+        ),
+        (
+            "configMap: c, path: /d, items: { a: /etc/passwd }",
+            "items: `/etc/passwd` is not a path inside it",
+        ),
+        ("configMap: c, path: /d, items: { a: 'b/' }", "is not a path inside it"),
+        (
+            "secret: s, path: /d, subPath: a/../../b",
+            "subPath: `a/../../b` is not a path inside it",
+        ),
+        (
+            "secret: v, path: /d, subPath: ''",
+            "subPath: `` is not a path inside it",
+        ),
+        (
+            "configMap: c, path: /d, items: { a: ..data }",
+            "items: `..data` is not a path inside it",
+        ),
+        (
+            "volume: v, path: /d, subPath: pg/15",
+            "`subPath` is one file of a `configMap` or a `secret`",
+        ),
+        (
+            "scratch: s, path: /d, subPath: a",
+            "a volume or a scratch is mounted whole",
+        ),
+        (
+            "secret: s, path: /d, items: { a: f, b: f }",
+            "items: `f` is named twice",
+        ),
+        (
+            "secret: s, path: /d, items: { a: f, b: f/g }",
+            "items: `f` is named twice, or is a file with files under it",
+        ),
+        ("scratch: a/b, path: /d", "scratch: `a/b` is not a name"),
+        ("scratch: .., path: /d", "scratch: `..` is not a name"),
+        (
+            "secret: s, path: /d, mode: 0888",
+            "mode: `0888` is not a file's mode in octal",
+        ),
+        ("secret: s, path: /d, mode: 04000", "is not a file's mode in octal"),
+        ("secret: s, path: /d, mode: rw", "is not a file's mode in octal"),
+    ] {
+        let refused = mount(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+        assert!(refused.contains("container `c`, mount at `/d"), "{bad}: {refused}");
+    }
+
+    for good in [
+        "envFrom: [{ configMap: site }, { secret: keys, prefix: KEY_ }]",
+        "env: [{ name: ME, field: name }, { name: AT, field: address }, { name: ON, field: node }, { name: NS, field: namespace }]",
+        "dropCapabilities: [all]",
+        "dropCapabilities: [NET_RAW, MKNOD]",
+        "runAsNonRoot: true",
+        "runAsNonRoot: true, runAsUser: 1000",
+    ] {
+        job("restartPolicy: never", good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for (bad, why) in [
+        (
+            "envFrom: [{ prefix: A_ }]",
+            "envFrom: set exactly one of `configMap`, `secret`",
+        ),
+        ("envFrom: [{ configMap: a, secret: b }]", "envFrom: set exactly one of"),
+        ("env: [{ name: ME, field: uid }]", "unknown variant `uid`"),
+        (
+            "env: [{ name: ME, field: name, value: x }]",
+            "set exactly one of `value`, `secret`, `configMap`, `field`",
+        ),
+        (
+            "dropCapabilities: [NET_RWA]",
+            "`NET_RWA` is not a capability: `all`, or one of CHOWN,",
+        ),
+        ("dropCapabilities: [ALL]", "`ALL` is not a capability"),
+        ("dropCapabilities: [CAP_NET_RAW]", "`CAP_NET_RAW` is not a capability"),
+        (
+            "runAsNonRoot: true, runAsUser: 0",
+            "runAsNonRoot, and runAsUser: 0 is root",
+        ),
+    ] {
+        let refused = job("restartPolicy: never", bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+
+    // Containers that run first: each a container as any other, checked as one.
+    let first = "initContainers: [{ name: first, image: i, volumeMounts: [{ scratch: s, path: /s }] }]";
+    let read = job(first, "volumeMounts: [{ scratch: s, path: /s }]").unwrap();
+    assert_eq!(read[0].spec["template"]["initContainers"][0]["name"], "first");
+    for (bad, why) in [
+        ("initContainers: [{ name: c, image: i }]", "two units are named `c`"),
+        (
+            "initContainers: [{ name: first, image: i, readiness: { tcp: { port: 1 } } }]",
+            "container `first`: an init container runs to its end, and has no probes",
+        ),
+        (
+            "initContainers: [{ name: first, image: i, volumeMounts: [{ secret: s, path: /d, subPath: .. }] }]",
+            "container `first`, mount at `/d`: subPath: `..` is not a path inside it",
+        ),
+        (
+            "initContainers: [{ name: first, image: i, dropCapabilities: [x] }]",
+            "container `first`: dropCapabilities",
+        ),
+    ] {
+        let refused = job(bad, "command: [a]").unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    let alone = "apiVersion: kith.dev/v1\nkind: Job\nmetadata: { name: j }\nspec:\n  template:\n    initContainers: [{ name: first, image: i }]\n    exec: [{ name: e, command: [a] }]\n";
+    let refused = Resource::from_source(alone).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+    assert!(
+        refused
+            .unwrap_err()
+            .msg
+            .contains("initContainers run before `containers`, and there are none")
+    );
+
+    // A 1.0 file reads as it did, and is written back as it was: nothing new in it.
+    let old = job("restartPolicy: never", "volumeMounts: [{ volume: data, path: /data }]").unwrap();
+    let container = &old[0].spec["template"]["containers"][0];
+    assert_eq!(
+        container["volumeMounts"],
+        serde_json::json!([{ "volume": "data", "path": "/data" }])
+    );
+    assert_eq!(container.as_object().unwrap().len(), 3);
 }
 
 /// `encrypted: true` on a Volume and `confidential: true` on a template: what each needs,

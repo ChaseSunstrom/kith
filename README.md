@@ -373,6 +373,89 @@ spec:
   capabilities and the filter (no user namespace); what a pod writes to its root has
   no quota; the range pods' addresses are taken from is fixed.
 
+### What a container is given
+
+Files from a ConfigMap or a Secret, directories of its replica's own, what it is told
+from maps and of itself, and containers that run before it. They are what a Deployment
+sent through [the Kubernetes API](#kubectl-and-helm-as-they-are) says with `volumes`,
+`envFrom`, `fieldRef` and `initContainers`; in a kith file:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web }
+spec:
+  template:
+    initContainers:                # run first, in this order, each to its end [none]
+      - name: migrate
+        image: registry.example/shop/migrate:1
+        volumeMounts: [{ scratch: work, path: /work }]
+    containers:
+      - name: web
+        image: registry.example/shop/web:1
+        envFrom:
+          - configMap: web-env     # every key of it is a variable
+          - secret: web-keys
+            prefix: KEY_           # put before each name [nothing]
+        env:
+          - name: POD_NAME
+            field: name            # this replica's name | namespace | node | address
+        runAsNonRoot: true         # do not start it as root [false]
+        dropCapabilities: [all]    # start without these, or without `all` [none]
+        volumeMounts:
+          - configMap: web-conf    # each key a file, changed when the ConfigMap is
+            path: /etc/web
+          - configMap: web-conf
+            path: /etc/nginx/nginx.conf
+            subPath: nginx.conf    # one of them alone, at a file's path
+          - secret: web-tls
+            path: /etc/tls
+            items: { tls.key: private/key.pem }   # only these keys, at these paths [every key, by its name]
+            mode: "0400"           # [0444]
+          - scratch: work          # an empty directory of this replica's
+            path: /work
+          - scratch: cache
+            path: /var/cache
+            memory: true           # kept in memory [on the node's state disk]
+```
+
+- **Files.** A mounted ConfigMap or Secret is read-only. When it changes, its files
+  change in the running container, all at once, and nothing is restarted (they are
+  read through one link that is moved, as Kubernetes does it). A file mounted alone
+  (`subPath`) stays as it was until its container starts again. A ConfigMap or a key
+  that is not there keeps the replica from starting, and its status says which.
+- **A Secret's files are in memory**, never on a disk: under `/run/kith` on kith OS, in
+  your runtime directory where kithd is a service of your user. kithd asks the kernel
+  what that directory is on, and does not write them where the answer is a disk. A
+  ConfigMap's are in the node's state. Both are in directories only kithd opens, belong
+  to the container's user, and go when the replica does.
+- **A scratch** is an empty directory that the containers of one replica which name
+  it share. It outlives a container that is restarted and goes with its replica. On
+  the state disk it has no quota; in memory, what is written counts as the memory of
+  the container that wrote it. (`emptyDir.sizeLimit` is taken and limits nothing.)
+- **`envFrom`** gives every key of a ConfigMap or a Secret as a variable (one that
+  cannot name a variable, with a `=` in it, is passed over); a variable in `env` of the
+  same name wins. As with `env`, a changed value replaces the container.
+  **`field`** is the replica's own: its `name` (`web-0`), its `namespace`, its `node`,
+  its `address` (a pod's own; otherwise its node's on the mesh, or `127.0.0.1` where
+  there is no mesh).
+- **`initContainers`** run one after the other before the template's containers, each
+  until it ends well (where `restartPolicy` is `never` one that fails is not run again,
+  and what waits for it does not start). They take no probes. They run again when
+  their replica is replaced (a new revision, another node), not when one of its
+  containers is restarted.
+- **`runAsNonRoot`** does not start a container that would be root: `runAsUser: 0` is
+  refused when applied, and an image that names root, or (in a pod) no user, when it
+  starts, with the reason in its status. **`dropCapabilities`** takes capabilities
+  (`NET_RAW`, without `CAP_`) from whatever the container would have had: a pod's root
+  has fourteen, root on kith OS three, anyone else none or one.
+- Not yet: `subPath` of a volume or of a scratch; a size limit for a scratch; a mode
+  for one file among the others. Where kithd is not root, the files of a map are your
+  user's, which is the one user its containers have.
+
+What it costs: 0.09 MB of kithd (10.86 to 10.95 MB) and 0.05 MB of `kith`, which knows
+the fields to check a file before it is sent (2.90 to 2.95 MB of its 3 MB).
+
 ## More than one node
 
 ```sh
@@ -907,9 +990,12 @@ Not answered, each refused in words:
   serves no aggregated API. It never starts, fetches or packages Kubernetes
   itself: what needs the real thing needs a real cluster.
 - Of a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`,
-  added capabilities (kith gives no Workload these, by any API); and, not yet,
+  added capabilities (kith gives no Workload these, by any API); a `projected` or
+  `downwardAPI` volume, a mode for one item of a volume, `subPath` of a claim or of an
+  `emptyDir`, and an initContainer with a `restartPolicy` (a sidecar). What a chart
+  commonly says is carried, as [kith's own fields](#what-a-container-is-given):
   volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
-  `initContainers`, `runAsNonRoot`.
+  `initContainers`, `runAsNonRoot` and dropped capabilities.
 - A StatefulSet with a claim template and more than one replica; a CronJob in a
   time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
 - `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
@@ -917,7 +1003,7 @@ Not answered, each refused in words:
   `--timestamps` (a unit's output is kept as it was written, not when).
 
 What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
-budget of 13 MB is not raised; kithd is 10.7 MB). With pods and CronJobs, kithd
+budget of 13 MB is not raised; kithd is 10.95 MB today). With pods and CronJobs, kithd
 with nothing to do holds 7.8 MB of memory, as it did before them (`python3
 ci/budgets.py`: 7.80 MB four times running, 7.75 MB before; between 7.4 and 8.2 on
 a machine busy with other work). A node that no Kubernetes client asks runs none

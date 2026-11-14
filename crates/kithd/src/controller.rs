@@ -13,7 +13,7 @@
 use crate::Shared;
 use kith_api::Resource;
 use kith_api::kinds::{
-    ConfigMapSpec, Container, EnvVar, ExecUnit, JobSpec, NodeWorkloadSpec, PullPolicy, Resources, RestartPolicy,
+    ConfigMapSpec, Container, EnvVar, ExecUnit, Field, JobSpec, NodeWorkloadSpec, PullPolicy, Resources, RestartPolicy,
     SecretSpec, Strategy, Template, WorkloadSpec,
 };
 use kith_api::store::Error;
@@ -51,6 +51,17 @@ impl Run {
     }
 }
 
+/// A ConfigMap or a Secret one of a container's mounts is the files of.
+#[derive(Clone, PartialEq)]
+struct Files {
+    /// Which of its container's `volumeMounts`.
+    mount: usize,
+    secret: bool,
+    /// A path inside the mount, to what is in the file.
+    data: BTreeMap<String, String>,
+    mode: u32,
+}
+
 /// One unit of one replica of one Workload, of one copy of a NodeWorkload, or of one run of a Job.
 struct Slot {
     /// Store key of the Workload, NodeWorkload or Job.
@@ -78,6 +89,18 @@ struct Slot {
     /// What its containers mount: the Volume's directory, where in the container, and read-only
     /// (a changed one replaces the unit, as a changed value does). An exec unit mounts nothing.
     volumes: Vec<(crate::volumes::Dir, String, bool)>,
+    /// The ConfigMaps and Secrets it mounts as files, as they are, or why one cannot be
+    /// read. One that changes is written again where it is mounted: nothing is started over.
+    //
+    // ponytail: each unit keeps what its maps hold, to tell when one changed; a hash of
+    // it when maps mounted by many units are big enough to show in kithd's memory.
+    files: Result<Vec<Files>, String>,
+    /// One of its template's `initContainers`: run to its end, once.
+    init: bool,
+    /// How many init containers of its replica end well before it is started.
+    after: u32,
+    /// Not started yet for that: waiting, with no time to be woken at.
+    held: bool,
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
@@ -95,7 +118,16 @@ struct Slot {
 
 impl Slot {
     fn ready(&self) -> bool {
-        self.state == "running" && self.probes.as_ref().is_none_or(|p| p.health.borrow().ready)
+        match self.init {
+            // (What ran first and ended well holds nothing back.)
+            true => self.done(),
+            false => self.state == "running" && self.probes.as_ref().is_none_or(|p| p.health.borrow().ready),
+        }
+    }
+
+    /// An init container that ran to its end, well.
+    fn done(&self) -> bool {
+        self.init && self.state == "exited" && self.exit_code == Some(0)
     }
 }
 
@@ -212,6 +244,16 @@ fn in_place(was: &BTreeSet<&PathBuf>, now: &BTreeSet<&PathBuf>, gone: &[&PathBuf
 }
 
 /// `1s, 2s, 4s … 60s`.
+/// Is a unit that ended with `code` started again? One that runs first (`init`) is run
+/// until it ends well, and then no more.
+fn again(policy: &RestartPolicy, init: bool, code: i32) -> bool {
+    match (policy, init) {
+        (RestartPolicy::Never, _) => false,
+        (RestartPolicy::OnFailure, _) | (_, true) => code != 0,
+        (RestartPolicy::Always, false) => true,
+    }
+}
+
 fn backoff(failures: u32) -> Duration {
     Duration::from_secs(1 << failures.min(6)).min(Duration::from_secs(60))
 }
@@ -241,7 +283,9 @@ pub fn pod_of(owner: &str, replica: u32) -> String {
 }
 
 fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
+    // (Not `.` or `..`: a unit's name is a directory's too, under its replica's.)
     let ok = !unit.is_empty()
+        && unit.bytes().any(|b| b != b'.')
         && unit
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
@@ -282,7 +326,8 @@ fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
 /// stored resource, never from what the caller sent.
 pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(String, bool), Error> {
     let (template, replicas) = template_of(resource).map_err(Error::Invalid)?;
-    let mut names = template.units();
+    // (One that runs first is asked for by its name; without a name it is not the one meant.)
+    let mut names = template.units().chain(template.init_containers.iter().map(|c| &c.name));
     let name = match unit {
         Some(unit) => names.find(|name| *name == unit),
         None => names.next(),
@@ -392,7 +437,9 @@ impl Controller {
             // The same for its volumes: it runs where they are (the scheduler has put it there), and
             // not as a NodeWorkload, nor alone (a Volume names a node).
             let volumes = mounted.get(&key).cloned().unwrap_or_default();
-            let mounts = template.containers.iter().any(|c| !c.volume_mounts.is_empty());
+            // (A ConfigMap, a Secret and a scratch are on whichever node the replica is.)
+            let mut mounts = template.containers().flat_map(|c| &c.volume_mounts);
+            let mounts = mounts.any(|mount| mount.volume.is_some());
             let allowed = allowed && (!mounts || (resource.kind != "NodeWorkload" && mounted.contains_key(&key)));
             if mounts && resource.kind == "NodeWorkload" {
                 note.push("a NodeWorkload cannot mount volumes: it runs nothing (use a Workload)".into());
@@ -438,7 +485,8 @@ impl Controller {
                         note.push("restartPolicy is ignored: a Job retries whole runs (`retries`)".into());
                     }
                     // The units a run really has: a name counts once, and only if it can be an id.
-                    let names: BTreeSet<_> = template.units().collect();
+                    let first = template.init_containers.iter().map(|c| &c.name);
+                    let names: BTreeSet<_> = template.units().chain(first).collect();
                     let units = names.iter().filter(|name| unit_id(&prefix, 0, name).is_ok()).count();
                     let (runs, not_before) = self.job_runs(&key, resource, replicas, units);
                     // A Job retries whole runs, so a unit that exits stays exited.
@@ -454,7 +502,9 @@ impl Controller {
             if resource.kind == "Job" || !replicas.is_empty() || me.is_none() {
                 ours.insert(key.clone());
             }
-            let containers = template.containers.iter().cloned().map(Run::Container);
+            // (Those that run first are first: `after` below counts them.)
+            let inits = template.init_containers.len();
+            let containers = template.containers().cloned().map(Run::Container);
             // (A VM is the process of its hypervisor: an exec unit, with the command line made here.)
             // A confidential template on a node whose processor encrypts no guest: none of it.
             let guard = crate::vm::confidential(template.confidential, crate::vm::guard(Path::new("/sys")));
@@ -491,11 +541,36 @@ impl Controller {
                         Run::Exec(e) => &e.env,
                     };
                     let value = |var: &EnvVar| Ok((var.name.clone(), env_value(shared, &namespace, var)?));
-                    env.iter().map(value).collect::<Result<Vec<_>, String>>()
+                    let from = match unit {
+                        Run::Container(c) => env_from(shared, &namespace, c)?,
+                        Run::Exec(_) => Vec::new(),
+                    };
+                    let said = env.iter().map(value).collect::<Result<Vec<_>, String>>()?;
+                    Ok(from.into_iter().chain(said).collect::<Vec<_>>())
                 })
                 .collect();
+            let files: Vec<_> = units.iter().map(|unit| files_of(shared, &namespace, unit)).collect();
             for replica in replicas {
-                for (unit, env) in units.iter().zip(&envs) {
+                for (at, ((unit, env), files)) in units.iter().zip(&envs).zip(&files).enumerate() {
+                    // What a variable says of the replica itself (its address is known when
+                    // it starts: `start`).
+                    let mut env = env.clone();
+                    let fields = match unit {
+                        Run::Container(c) => &c.env,
+                        Run::Exec(e) => &e.env,
+                    };
+                    for var in fields {
+                        let value = match var.field {
+                            Some(Field::Name) => format!("{}-{replica}", resource.metadata.name),
+                            Some(Field::Namespace) => namespace.clone(),
+                            Some(Field::Node) => shared.members.me().to_string(),
+                            Some(Field::Address) | None => continue,
+                        };
+                        let named = env.iter_mut().flatten().find(|(name, _)| *name == var.name);
+                        if let Some((_, was)) = named {
+                            *was = value;
+                        }
+                    }
                     match unit_id(&prefix, replica, unit.name()) {
                         // Every node that runs a replica says so, in the same words (one status).
                         Err(e) if !note.contains(&e) => note.push(e),
@@ -506,7 +581,7 @@ impl Controller {
                             replica,
                             run: unit.clone(),
                             policy: policy.clone(),
-                            env: env.clone(),
+                            env,
                             rolling,
                             probes: None,
                             pod: (template.pod == Some(true)).then(|| {
@@ -517,6 +592,10 @@ impl Controller {
                             devices: devices.clone(),
                             seat: seat.clone(),
                             volumes: mounts_of(unit, &volumes),
+                            files: files.clone(),
+                            init: at < inits,
+                            after: at.min(inits) as u32,
+                            held: false,
                             tuned: None,
                             handle: None,
                             state: "pending",
@@ -562,6 +641,9 @@ impl Controller {
             }
         }
         let mut stale: Vec<String> = Vec::new();
+        fn of(slot: &Slot) -> (&str, u32) {
+            (slot.owner.as_str(), slot.replica)
+        }
         // Per owner, the replicas with something to replace.
         let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
         let differs = |new: &Slot, slot: &Slot| {
@@ -621,16 +703,49 @@ impl Controller {
             });
             stale.extend(ids.map(|(id, _)| id.clone()));
         }
+        // A replica with something replaced is one made anew: what runs first runs again.
+        let anew: BTreeSet<(&str, u32)> = stale.iter().filter_map(|id| self.slots.get(id)).map(of).collect();
+        let first = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.init && anew.contains(&of(slot)));
+        let first: Vec<String> = first
+            .map(|(id, _)| id.clone())
+            .filter(|id| !stale.contains(id))
+            .collect();
+        stale.extend(first);
         for id in stale {
             stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
         }
+        let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
             match self.slots.get_mut(&id) {
-                Some(slot) if !differs(&new, slot) => slot.revision = new.revision,
+                Some(slot) if !differs(&new, slot) => {
+                    (slot.revision, slot.init, slot.after) = (new.revision, new.init, new.after);
+                    // A ConfigMap or a Secret that changed: written again where it is mounted,
+                    // all its files at once, and nothing is started over. (One that can no
+                    // longer be read changes nothing, as with a value.)
+                    if new.files.is_ok() && new.files != slot.files {
+                        let files = new.files.as_deref().unwrap_or_default();
+                        match slot.handle.as_ref().map(|_| write_files(&state, &id, slot, files)) {
+                            // (Not written: tried again at the next pass.)
+                            Some(Err(e)) => eprintln!("kithd: {id}: {e}"),
+                            _ => slot.files = new.files,
+                        }
+                    }
+                }
                 Some(_) => {}
                 None => drop(self.slots.insert(id, new)),
             }
         }
+        // What a replica mounted of its own goes with it.
+        let replicas = self.slots.values().map(|slot| pod_of(&slot.owner, slot.replica));
+        let memory = crate::files::memory_dir();
+        let bases: Vec<&Path> = [Some(state.as_path()), memory.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        crate::files::sweep(&bases, &replicas.collect());
         // A pod none of whose units is wanted any more is let go, its network with it.
         let pods: BTreeSet<&str> = self
             .slots
@@ -658,6 +773,11 @@ impl Controller {
         // A Job's unit that ended is accounted for in step 1, and a unit that started may be
         // what a rolling update waits for in step 2: go round again at once.
         let mut job_moved = false;
+        // Per replica: how many of its init containers have run to their end, well.
+        let mut first: BTreeMap<(String, u32), u32> = BTreeMap::new();
+        for slot in self.slots.values().filter(|slot| slot.done()) {
+            *first.entry((slot.owner.clone(), slot.replica)).or_default() += 1;
+        }
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
                 return TICK; // the caller stops everything
@@ -688,19 +808,23 @@ impl Controller {
                 } else {
                     slot.failures + 1
                 };
-                let again = match slot.policy {
-                    RestartPolicy::Always => true,
-                    RestartPolicy::OnFailure => code != 0,
-                    RestartPolicy::Never => false,
-                };
+                let again = again(&slot.policy, slot.init, code);
                 slot.state = if again { "waiting" } else { "exited" };
                 slot.start_at = again.then(|| Instant::now() + backoff(slot.failures.saturating_sub(1)));
                 if again {
                     slot.restarts += 1;
                 }
-                job_moved |= self.jobs.contains_key(&slot.owner);
+                // (What waited for an init container starts in the pass after this one.)
+                job_moved |= self.jobs.contains_key(&slot.owner) || slot.init;
             }
-            if slot.start_at.is_some_and(|at| at <= Instant::now()) {
+            let ended = first.get(&(slot.owner.clone(), slot.replica)).copied().unwrap_or(0);
+            slot.held = slot.start_at.is_some() && ended < slot.after;
+            if slot.held {
+                slot.message = Some(match slot.init {
+                    true => "waiting for the init containers before it".into(),
+                    false => "waiting for its init containers".into(),
+                });
+            } else if slot.start_at.is_some_and(|at| at <= Instant::now()) {
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
                     started = start(shared, &self.runtime, &self.logs, mesh, id, slot) => started,
@@ -841,7 +965,8 @@ impl Controller {
         if job_moved {
             return Duration::ZERO;
         }
-        let next = self.slots.values().filter_map(|slot| slot.start_at).min();
+        let waiting = self.slots.values().filter(|slot| !slot.held);
+        let next = waiting.filter_map(|slot| slot.start_at).min();
         next.map_or(TICK, |at| at.saturating_duration_since(Instant::now()).min(TICK))
     }
 
@@ -981,31 +1106,113 @@ impl Controller {
     }
 }
 
+/// What the ConfigMap (or, `secret`, the Secret) `name` of `namespace` holds.
+fn map_of(shared: &Shared, namespace: &str, secret: bool, name: &str) -> Result<BTreeMap<String, String>, String> {
+    let kind = if secret { "Secret" } else { "ConfigMap" };
+    let key = format!("{kind}/{namespace}/{name}");
+    let file_store = shared.store.lock().expect("a handler panicked holding the store");
+    let found = file_store.store.get(&key).map(|r| r.spec.clone());
+    let spec = found.ok_or(format!("{key} does not exist"))?;
+    // Both kinds are `data: {key: value}`.
+    let data = match secret {
+        true => serde_json::from_value::<SecretSpec>(spec).map(|s| s.data),
+        false => serde_json::from_value::<ConfigMapSpec>(spec).map(|s| s.data),
+    };
+    data.map_err(|e| format!("{key}: {e}"))
+}
+
 /// The value of one environment variable, looked up in the store if it is a reference.
 fn env_value(shared: &Shared, namespace: &str, var: &EnvVar) -> Result<String, String> {
     if let Some(value) = &var.value {
         return Ok(value.clone());
     }
-    let (kind, key_ref) = match (&var.secret, &var.config_map) {
-        (Some(key_ref), _) => ("Secret", key_ref),
-        (_, Some(key_ref)) => ("ConfigMap", key_ref),
+    let (secret, key_ref) = match (&var.secret, &var.config_map) {
+        (Some(key_ref), _) => (true, key_ref),
+        (_, Some(key_ref)) => (false, key_ref),
+        // (Something of the replica: said per replica, by who plans it.)
+        _ if var.field.is_some() => return Ok(String::new()),
         _ => return Err(format!("env `{}` has no value", var.name)),
     };
-    let key = format!("{kind}/{namespace}/{}", key_ref.name);
-    let file_store = shared.store.lock().expect("a handler panicked holding the store");
-    let spec = file_store
-        .store
-        .get(&key)
-        .map(|r| r.spec.clone())
-        .ok_or(format!("env `{}`: {key} does not exist", var.name))?;
-    // Both kinds are `data: {key: value}`.
-    let data = match kind {
-        "Secret" => serde_json::from_value::<SecretSpec>(spec).map(|s| s.data),
-        _ => serde_json::from_value::<ConfigMapSpec>(spec).map(|s| s.data),
+    let mut data = map_of(shared, namespace, secret, &key_ref.name).map_err(|e| format!("env `{}`: {e}", var.name))?;
+    data.remove(&key_ref.key).ok_or(format!(
+        "env `{}`: {} has no key `{}`",
+        var.name, key_ref.name, key_ref.key
+    ))
+}
+
+/// The variables a container's `envFrom` comes to: every key of each map, in their order.
+fn env_from(shared: &Shared, namespace: &str, c: &Container) -> Result<Vec<(String, String)>, String> {
+    let mut env = Vec::new();
+    for from in &c.env_from {
+        let (secret, name) = match (&from.secret, &from.config_map) {
+            (Some(name), _) => (true, name),
+            (_, Some(name)) => (false, name),
+            _ => continue,
+        };
+        let data = map_of(shared, namespace, secret, name).map_err(|e| format!("envFrom: {e}"))?;
+        let prefix = from.prefix.as_deref().unwrap_or_default();
+        // (As Kubernetes: a key that cannot name a variable is passed over.)
+        let names = |(key, _): &(String, String)| !key.is_empty() && !key.contains(['=', '\0']);
+        env.extend(
+            data.into_iter()
+                .filter(names)
+                .map(|(key, value)| (format!("{prefix}{key}"), value)),
+        );
+    }
+    Ok(env)
+}
+
+/// The ConfigMaps and Secrets a unit mounts as files, as they are now: only a container mounts.
+fn files_of(shared: &Shared, namespace: &str, unit: &Run) -> Result<Vec<Files>, String> {
+    let Run::Container(c) = unit else { return Ok(Vec::new()) };
+    let mut files = Vec::new();
+    for (mount, m) in c.volume_mounts.iter().enumerate() {
+        let (secret, name) = match (&m.secret, &m.config_map) {
+            (Some(name), _) => (true, name),
+            (_, Some(name)) => (false, name),
+            _ => continue,
+        };
+        let at = |e: String| format!("mount at `{}`: {e}", m.path);
+        let mut data = map_of(shared, namespace, secret, name).map_err(at)?;
+        if !m.items.is_empty() {
+            let item = |(key, file): (&String, &String)| {
+                let content = data.get(key).ok_or(at(format!("{name} has no key `{key}`")))?;
+                Ok((file.clone(), content.clone()))
+            };
+            data = m.items.iter().map(item).collect::<Result<_, String>>()?;
+        }
+        // (Checked when applied: three octal digits, or four that start with 0.)
+        let mode = m.mode.as_deref().map_or(Ok(0o444), |mode| u32::from_str_radix(mode, 8));
+        let mode = mode.map_err(|e| at(format!("mode: {e}")))?;
+        files.push(Files {
+            mount,
+            secret,
+            data,
+            mode,
+        });
+    }
+    Ok(files)
+}
+
+/// Where the files of the mount `mount` of the unit `id` are written: in memory for a
+/// Secret, on the state disk for a ConfigMap, under its replica's directory either way.
+fn files_dir(state: &Path, id: &str, slot: &Slot, files: &Files) -> Result<PathBuf, String> {
+    let base = match files.secret {
+        true => crate::files::memory()?,
+        false => state.to_path_buf(),
     };
-    let mut data = data.map_err(|e| format!("env `{}`: {key}: {e}", var.name))?;
-    data.remove(&key_ref.key)
-        .ok_or(format!("env `{}`: {key} has no key `{}`", var.name, key_ref.key))
+    let replica = crate::files::of(&base, &pod_of(&slot.owner, slot.replica)).map_err(|e| e.to_string())?;
+    let unit = id.rsplit('_').next().unwrap_or(id);
+    Ok(replica.join("files").join(unit).join(files.mount.to_string()))
+}
+
+/// Write each of `files` where the unit `id` mounts it.
+fn write_files(state: &Path, id: &str, slot: &Slot, files: &[Files]) -> Result<(), String> {
+    for files in files {
+        let dir = files_dir(state, id, slot, files)?;
+        crate::files::write(&dir, &files.data, files.mode).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// What a unit mounts, from the Volumes its workload's mounts come to: only a container mounts.
@@ -1014,7 +1221,7 @@ fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec
     let mounts = c.volume_mounts.iter();
     let found = mounts.filter_map(|m| {
         Some((
-            volumes.get(&m.volume)?.clone(),
+            volumes.get(m.volume.as_ref()?)?.clone(),
             m.path.clone(),
             m.read_only == Some(true),
         ))
@@ -1062,9 +1269,43 @@ async fn start(
             host,
             container: at.clone(),
             read_only: *read_only,
-            // (Not a directory of the host's that an admin named: that one is theirs.)
-            give: dir.namespace != crate::volumes::SYSTEM,
+            // (Not a directory of the host's that an admin named: that one is theirs. Nor
+            // what it only reads: another workload's user may be who writes it.)
+            give: dir.namespace != crate::volumes::SYSTEM && !*read_only,
         });
+    }
+    // What it mounts that is no Volume: its maps' files, and directories of the replica's own.
+    if let Run::Container(c) = &slot.run {
+        let files = slot.files.clone()?;
+        write_files(state, id, slot, &files)?;
+        for (at, mount) in c.volume_mounts.iter().enumerate() {
+            let why = |e: std::io::Error| format!("mount at `{}`: {e}", mount.path);
+            let host = if let Some(files) = files.iter().find(|files| files.mount == at) {
+                let dir = files_dir(state, id, slot, files)?;
+                match &mount.sub_path {
+                    Some(one) => crate::files::one(&dir, one)
+                        .map_err(|e| why(std::io::Error::other(format!("subPath `{one}`: {e}"))))?,
+                    None => dir,
+                }
+            } else if let Some(name) = &mount.scratch {
+                let base = match mount.memory {
+                    Some(true) => crate::files::memory()?,
+                    _ => state.to_path_buf(),
+                };
+                crate::files::scratch(&base, &pod_of(&slot.owner, slot.replica), name).map_err(why)?
+            } else {
+                continue;
+            };
+            unit.mounts.push(kith_runtime::Mount {
+                host,
+                container: mount.path.clone(),
+                // (A map's files are kithd's to write, never the container's.)
+                read_only: mount.read_only == Some(true) || mount.scratch.is_none(),
+                // A scratch is anyone's as it is made; a map's files are made the container's
+                // user's, who may be the only one its mode lets read them.
+                give: mount.scratch.is_none(),
+            });
+        }
     }
     if let Some((seat, client)) = &slot.seat {
         // The seat's own directory: its session puts its sockets there, and its apps find
@@ -1080,6 +1321,8 @@ async fn start(
             give: !*client,
         });
     }
+    // Its address, for a variable that asks: its pod's on the mesh, or else its node's.
+    let mut address = mesh.map(|(prefix, me)| std::net::IpAddr::from(kith_mesh::node_address(prefix, me)));
     if let Some((pod, hostname)) = &slot.pod {
         unit.as_image = true;
         // (Only root can make a network: elsewhere the pod shares the node's.)
@@ -1090,6 +1333,7 @@ async fn start(
             let given = pods.given(state, pod, namespace, hostname, net)?;
             unit.netns = Some(given.netns);
             unit.hostname = Some(given.hostname);
+            address = pods.address(pod).or(address);
             for (file, at) in given.files.into_iter().zip(["/etc/resolv.conf", "/etc/hosts"]) {
                 unit.mounts.push(kith_runtime::Mount {
                     host: file,
@@ -1116,6 +1360,12 @@ async fn start(
         Run::Container(c) => {
             (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
             unit.user = c.run_as_user;
+            (unit.non_root, unit.drop) = (c.run_as_non_root == Some(true), c.drop_capabilities.clone());
+            let address = address.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()).to_string();
+            for var in c.env.iter().filter(|var| var.field == Some(Field::Address)) {
+                unit.env.retain(|(name, _)| *name != var.name);
+                unit.env.push((var.name.clone(), address.clone()));
+            }
             unit.writable = !c.read_only_root.unwrap_or(slot.pod.is_none());
             if let Some(seccomp) = &c.seccomp {
                 (unit.unconfined, unit.allow) = (seccomp.unconfined == Some(true), seccomp.allow.clone());
@@ -1247,6 +1497,15 @@ mod tests {
         for bad in ["", "a/b", "..\\x", "a_b", "a b"] {
             assert!(unit_id(&prefix, 0, bad).is_err(), "{bad:?}");
         }
+        // What runs first is run until it ends well, whatever the others are; a Job's never again.
+        use RestartPolicy::{Always, Never, OnFailure};
+        let started_again = [(Always, false), (Always, true), (OnFailure, true), (Never, true)]
+            .map(|(policy, init)| (again(&policy, init, 0), again(&policy, init, 1)));
+        assert_eq!(
+            started_again,
+            [(true, true), (false, true), (false, true), (false, false)]
+        );
+        assert!(unit_id("w_a_b_", 0, "..").is_err() && unit_id("w_a_b_", 0, "a.b").is_ok());
         assert_eq!(backoff(0), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(8));
         assert_eq!(backoff(40), Duration::from_secs(60));
@@ -1262,6 +1521,11 @@ mod tests {
         .unwrap();
         // No scheduler (a node alone): no `nodes`, and copy 0 is the one.
         assert!(log_of(&resource, None, 0).is_ok());
+        // What ran first is asked for by its name, and is not the unit meant without one.
+        let mut first = resource.clone();
+        first.spec["template"]["initContainers"] = serde_json::json!([{ "name": "first", "image": "img" }]);
+        assert_eq!(log_of(&first, Some("first"), 0).unwrap().0, "n_default_x_0_first");
+        assert_eq!(log_of(&first, None, 0).unwrap().0, "n_default_x_0_run");
         assert!(log_of(&resource, None, 1).is_err());
         // Sparse numbers: the error says which exist.
         resource.status = Some(serde_json::json!({ "nodes": { "2": "b", "1": "a" } }));

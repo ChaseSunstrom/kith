@@ -234,6 +234,11 @@ spec! {
     pub struct Template {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub containers: Vec<Container>,
+        /// Containers run before `containers`, one at a time in this order, each to its
+        /// end: the next starts when one exits 0, and one that fails is run again (unless
+        /// the replica's `restartPolicy` is `never`). They mount what the others do.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub init_containers: Vec<Container>,
         /// Plain supervised processes in a cgroup.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub exec: Vec<ExecUnit>,
@@ -295,6 +300,10 @@ spec! {
         pub args: Vec<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub env: Vec<EnvVar>,
+        /// Every key of a ConfigMap or a Secret as a variable. One in `env` of the same
+        /// name wins, and of two here the later.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub env_from: Vec<EnvFrom>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub working_dir: Option<String>,
         /// The user (and group) its process is, by number. Without it: the image's own
@@ -302,6 +311,14 @@ spec! {
         /// container's user namespace where kithd is not root, of the node where it is.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub run_as_user: Option<u32>,
+        /// Not started if the user it would be is root (0), whoever says so: `runAsUser`
+        /// or its image.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub run_as_non_root: Option<bool>,
+        /// Capabilities it starts without: `[all]`, or names as Linux has them without
+        /// their `CAP_` (`NET_RAW`). Only a container that is root has any to drop.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub drop_capabilities: Vec<String>,
         /// `false`: its root file system is its own to write (what it writes is not the
         /// image's, and goes when the container does). `true`: only volumes, /tmp and
         /// /run are. Without it: `true`, or in a `pod` `false`.
@@ -385,7 +402,7 @@ spec! {
         pub read_only: Option<bool>,
     }
 
-    /// Exactly one of `value`, `secret` or `configMap`.
+    /// Exactly one of `value`, `secret`, `configMap` or `field`.
     pub struct EnvVar {
         pub name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -394,6 +411,24 @@ spec! {
         pub secret: Option<KeyRef>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub config_map: Option<KeyRef>,
+        /// Something of the replica itself.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub field: Option<Field>,
+    }
+
+    /// `name`: the replica's own (`web-0`). `namespace`: its Workload's. `node`: the
+    /// node it runs on. `address`: its own on the mesh if it is a `pod`, or its node's.
+    pub enum Field { Name, Namespace, Node, Address }
+
+    /// Exactly one of `configMap` or `secret`, by name.
+    pub struct EnvFrom {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub config_map: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub secret: Option<String>,
+        /// Put before each key to make its variable's name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub prefix: Option<String>,
     }
 
     pub struct KeyRef {
@@ -411,11 +446,42 @@ spec! {
 
     pub enum Protocol { Tcp, Udp }
 
+    /// Exactly one of `volume`, `configMap`, `secret` or `scratch`, at `path`.
     pub struct VolumeMount {
-        pub volume: String,
+        /// A Volume, or a VolumeClaim's.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub volume: Option<String>,
+        /// A ConfigMap of the namespace: each key a file, read-only, and changed when the
+        /// ConfigMap is (all its files at once).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub config_map: Option<String>,
+        /// A Secret of the namespace, as `configMap`; its files are kept in memory, never
+        /// on a disk.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub secret: Option<String>,
+        /// An empty directory of the replica's own, which goes when the replica does:
+        /// containers of one replica that name the same one share it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub scratch: Option<String>,
         pub path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub read_only: Option<bool>,
+        /// Of a `configMap` or `secret`: only these keys, each as the file named (which
+        /// may be in directories: `conf.d/site`). Without it: every key, as its own name.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub items: BTreeMap<String, String>,
+        /// Of a `configMap` or `secret`: its files' mode, in octal (`0400`). Without it:
+        /// `0444`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(extend("pattern" = "^0?[0-7]{3}$"))]
+        pub mode: Option<String>,
+        /// Of a `configMap` or `secret`: mount this one file of it at `path`, and not the
+        /// directory. It stays as it was when the container started.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sub_path: Option<String>,
+        /// Of a `scratch`: keep it in memory (it counts against the container's).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub memory: Option<bool>,
     }
 
     /// A container's system calls go through a filter that refuses the ones in
@@ -1078,6 +1144,18 @@ pub fn every(text: &str) -> Option<u64> {
         .checked_mul(unit)
 }
 
+/// Linux's capabilities, by the names `dropCapabilities` takes, in the kernel's order
+/// (a name's place here is its number).
+#[rustfmt::skip]
+pub const CAPABILITIES: &[&str] = &[
+    "CHOWN", "DAC_OVERRIDE", "DAC_READ_SEARCH", "FOWNER", "FSETID", "KILL", "SETGID", "SETUID",
+    "SETPCAP", "LINUX_IMMUTABLE", "NET_BIND_SERVICE", "NET_BROADCAST", "NET_ADMIN", "NET_RAW",
+    "IPC_LOCK", "IPC_OWNER", "SYS_MODULE", "SYS_RAWIO", "SYS_CHROOT", "SYS_PTRACE", "SYS_PACCT",
+    "SYS_ADMIN", "SYS_BOOT", "SYS_NICE", "SYS_RESOURCE", "SYS_TIME", "SYS_TTY_CONFIG", "MKNOD",
+    "LEASE", "AUDIT_WRITE", "AUDIT_CONTROL", "SETFCAP", "MAC_OVERRIDE", "MAC_ADMIN", "SYSLOG",
+    "WAKE_ALARM", "BLOCK_SUSPEND", "AUDIT_READ", "PERFMON", "BPF", "CHECKPOINT_RESTORE",
+];
+
 /// The system calls a container's filter refuses, by the names `seccomp.allow` takes.
 /// (`clone` only when it makes a namespace; `clone3` as a kernel without it answers.)
 pub const REFUSED_CALLS: &[&str] = &[
@@ -1352,7 +1430,79 @@ impl VmUnit {
     }
 }
 
+/// A path inside something mounted: it names what is in it, and nothing above it.
+pub fn inside(what: &str, path: &str) -> Result<(), String> {
+    // (`..data` and its like are the names a mounted map's own bookkeeping has.)
+    let part = |part: &str| !part.is_empty() && part != "." && !part.starts_with("..") && !part.contains('\0');
+    match !path.is_empty() && path.split('/').all(part) {
+        true => Ok(()),
+        false => Err(format!(
+            "{what}: `{path}` is not a path inside it (nothing that starts with `..`, no `/` at its start or end)"
+        )),
+    }
+}
+
+impl VolumeMount {
+    fn check(&self) -> Result<(), String> {
+        exactly_one(
+            "it",
+            &[
+                ("volume", self.volume.is_some()),
+                ("configMap", self.config_map.is_some()),
+                ("secret", self.secret.is_some()),
+                ("scratch", self.scratch.is_some()),
+            ],
+        )?;
+        let data = self.config_map.is_some() || self.secret.is_some();
+        if !data && (!self.items.is_empty() || self.mode.is_some()) {
+            return Err("`items` and `mode` are a `configMap`'s or a `secret`'s".into());
+        }
+        // ponytail: no part of a volume or a scratch alone. What is in one is the container's
+        // to write, links included: a part of it has to be opened with no link followed and
+        // mounted by what was opened, which the runtime's mounts by path cannot.
+        if !data && self.sub_path.is_some() {
+            return Err(
+                "`subPath` is one file of a `configMap` or a `secret`: a volume or a scratch is mounted whole".into(),
+            );
+        }
+        if self.memory.is_some() && self.scratch.is_none() {
+            return Err("`memory` is a `scratch`'s".into());
+        }
+        // (A scratch's name is a directory's, under the replica's own.)
+        if let Some(scratch) = &self.scratch
+            && (scratch.contains('/') || inside("scratch", scratch).is_err())
+        {
+            return Err(format!("scratch: `{scratch}` is not a name"));
+        }
+        for file in self.items.values() {
+            inside("items", file)?;
+            // (Two keys are not one file, and a file is not also a directory.)
+            let under = |other: &&String| *other == file || other.starts_with(&format!("{file}/"));
+            if self.items.values().filter(under).count() > 1 {
+                return Err(format!(
+                    "items: `{file}` is named twice, or is a file with files under it"
+                ));
+            }
+        }
+        if let Some(sub_path) = &self.sub_path {
+            inside("subPath", sub_path)?;
+        }
+        if let Some(mode) = &self.mode {
+            let digits = mode.strip_prefix('0').filter(|rest| rest.len() == 3).unwrap_or(mode);
+            if digits.len() != 3 || !digits.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+                return Err(format!("mode: `{mode}` is not a file's mode in octal, as `0400` is"));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Template {
+    /// Its containers, those that run first among them.
+    pub fn containers(&self) -> impl Iterator<Item = &Container> {
+        self.init_containers.iter().chain(&self.containers)
+    }
+
     /// The names of its units, in the order they are numbered: containers, exec units, VMs.
     pub fn units(&self) -> impl Iterator<Item = &String> {
         let containers = self.containers.iter().map(|c| &c.name);
@@ -1370,7 +1520,7 @@ impl Template {
             vm.check().map_err(|e| format!("{at}, vm `{}`: {e}", vm.name))?;
         }
         if self.confidential == Some(true) {
-            if !self.containers.is_empty() || !self.exec.is_empty() {
+            if self.containers().next().is_some() || !self.exec.is_empty() {
                 return Err(format!(
                     "{at}: confidential: only `vms` (a container or an exec unit runs with its memory in the clear)"
                 ));
@@ -1386,14 +1536,28 @@ impl Template {
             }
         }
         let mut names = std::collections::BTreeSet::new();
-        for name in self.units() {
+        for name in self.units().chain(self.init_containers.iter().map(|c| &c.name)) {
             if !names.insert(name) {
                 return Err(format!("{at}: two units are named `{name}`"));
             }
         }
-        let envs = self
-            .containers
+        if !self.init_containers.is_empty() && self.containers.is_empty() {
+            return Err(format!(
+                "{at}: initContainers run before `containers`, and there are none"
+            ));
+        }
+        if let Some(c) = self
+            .init_containers
             .iter()
+            .find(|c| c.liveness.is_some() || c.readiness.is_some())
+        {
+            return Err(format!(
+                "{at}, container `{}`: an init container runs to its end, and has no probes",
+                c.name
+            ));
+        }
+        let envs = self
+            .containers()
             .map(|c| (&c.name, &c.env))
             .chain(self.exec.iter().map(|e| (&e.name, &e.env)));
         for (unit, env) in envs {
@@ -1404,11 +1568,40 @@ impl Template {
                         ("value", var.value.is_some()),
                         ("secret", var.secret.is_some()),
                         ("configMap", var.config_map.is_some()),
+                        ("field", var.field.is_some()),
                     ],
                 )?;
             }
         }
-        for c in &self.containers {
+        for c in self.containers() {
+            let at = &format!("{at}, container `{}`", c.name);
+            for from in &c.env_from {
+                exactly_one(
+                    &format!("{at}, envFrom"),
+                    &[
+                        ("configMap", from.config_map.is_some()),
+                        ("secret", from.secret.is_some()),
+                    ],
+                )?;
+            }
+            for name in &c.drop_capabilities {
+                if name != "all" && !CAPABILITIES.contains(&name.as_str()) {
+                    return Err(format!(
+                        "{at}: dropCapabilities: `{name}` is not a capability: `all`, or one of {}",
+                        CAPABILITIES.join(", ")
+                    ));
+                }
+            }
+            if c.run_as_non_root == Some(true) && c.run_as_user == Some(0) {
+                return Err(format!("{at}: runAsNonRoot, and runAsUser: 0 is root"));
+            }
+            for mount in &c.volume_mounts {
+                mount
+                    .check()
+                    .map_err(|e| format!("{at}, mount at `{}`: {e}", mount.path))?;
+            }
+        }
+        for c in self.containers() {
             if c.run_as_user == Some(u32::MAX) {
                 return Err(format!(
                     "{at}, container `{}`: runAsUser: {} is no user",

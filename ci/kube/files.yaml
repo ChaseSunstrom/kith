@@ -1,0 +1,149 @@
+# What a stock chart says of a pod beyond its image, as `sh ci/vm.sh --test kube` gives it
+# to kubectl: a ConfigMap and a Secret as files, directories of the pod's own, what it is
+# told from maps and from itself, who it runs as and without what, and what runs first.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: files-config
+data:
+  motd: one
+  site.conf: listen 80
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: files-env
+data:
+  COLOUR: green
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: files-secret
+type: Opaque
+data:
+  token: c2VzYW1l # pragma: allowlist secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: files
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: files
+  template:
+    metadata:
+      labels:
+        app: files
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      initContainers:
+        - name: first
+          image: kith.test/pod:1
+          command: ["/bin/pod", "put", "/work/first", "ran first"]
+          volumeMounts:
+            - name: work
+              mountPath: /work
+      containers:
+        - name: tell
+          image: kith.test/pod:1
+          command: ["/bin/pod", "tell", "/etc/conf", "/etc/one.conf", "/etc/secret", "/work", "/fast"]
+          securityContext:
+            capabilities:
+              drop: ["ALL"]
+          envFrom:
+            - configMapRef:
+                name: files-env
+            - prefix: S_
+              secretRef:
+                name: files-secret
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/conf
+              readOnly: true
+            - name: conf
+              mountPath: /etc/one.conf
+              subPath: site.conf
+            - name: secret
+              mountPath: /etc/secret
+              readOnly: true
+            - name: work
+              mountPath: /work
+            - name: fast
+              mountPath: /fast
+      volumes:
+        - name: conf
+          configMap:
+            name: files-config
+        - name: secret
+          secret:
+            secretName: files-secret
+            defaultMode: 0400
+            items:
+              - key: token
+                path: creds/token
+        - name: work
+          emptyDir: {}
+        - name: fast
+          emptyDir:
+            medium: Memory
+---
+# Root, without two of what a container's root is given: the others are still its.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: caps
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: caps
+          image: kith.test/pod:1
+          command: ["/bin/pod", "tell"]
+          securityContext:
+            capabilities:
+              drop: ["NET_RAW", "MKNOD"]
+---
+# An image that names no user, told not to run as root: it does not start.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rooted
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rooted
+  template:
+    metadata:
+      labels:
+        app: rooted
+    spec:
+      containers:
+        - name: rooted
+          image: kith.test/pod:serve
+          securityContext:
+            runAsNonRoot: true

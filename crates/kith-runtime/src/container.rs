@@ -81,6 +81,11 @@ pub struct Unit {
     /// The user (and group) the container's process is: `None` is the image's own, or 65534
     /// where the image names none. An exec unit ignores it: it is kithd's user.
     pub user: Option<u32>,
+    /// Not started if the user it would be is root, whoever says so (`user`, or its image).
+    pub non_root: bool,
+    /// Capabilities it starts without, of those it would have: `all`, or names as Linux
+    /// has them without `CAP_` (`NET_RAW`).
+    pub drop: Vec<String>,
     /// No filter on its system calls. An exec unit has none either way.
     pub unconfined: bool,
     /// Calls the filter refuses that this container may make: names of [`crate::REFUSED`].
@@ -130,8 +135,9 @@ pub struct Mount {
     /// An absolute path in the container, not `/` nor under `/proc`, `/sys` or `/dev`.
     pub container: String,
     pub read_only: bool,
-    /// A directory kith made for this: where kithd is root and the container's user is
-    /// not, it is made that user's, with all that is in it, unless it is theirs already.
+    /// A directory (or a file) kith made for this: where kithd is root and the
+    /// container's user is not, it is made that user's, with all that is in it, unless it
+    /// is theirs already.
     pub give: bool,
 }
 
@@ -215,7 +221,7 @@ impl Runtime {
             for output in [&stdout, &stderr] {
                 std::os::unix::fs::fchown(output, Some(user.uid()), Some(user.gid())).ctx(&what)?;
             }
-            for volume in unit.mounts.iter().filter(|volume| volume.give && !volume.read_only) {
+            for volume in unit.mounts.iter().filter(|volume| volume.give) {
                 give(&volume.host, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
@@ -825,6 +831,12 @@ fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
         let flags = nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW;
         fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)
     }
+    // (One file of a map, mounted alone.)
+    if fs::symlink_metadata(dir)?.is_file() {
+        let flags = nix::libc::O_NOFOLLOW | nix::libc::O_PATH;
+        let file = fs::OpenOptions::new().read(true).custom_flags(flags).open(dir)?;
+        return std::os::unix::fs::chown(format!("/proc/self/fd/{}", file.as_raw_fd()), Some(uid), Some(gid));
+    }
     fn walk(dir: File, uid: u32, gid: u32, deeper: u32) -> io::Result<()> {
         for entry in fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
             let entry = entry?;
@@ -884,6 +896,9 @@ fn spec_of(
     // mounts, or a chown of every image). So `runAsUser: 0` on kith OS is the node's root
     // with three capabilities, as before.
     let (user, group) = who(image, unit)?;
+    if unit.non_root && user == 0 {
+        return Err("runAsNonRoot: this container would be root (its image names no other user, or names root): say who with runAsUser".into());
+    }
     let mut spec = if uid.is_root() {
         Spec::default()
     } else {
@@ -1002,6 +1017,28 @@ fn spec_of(
             .inheritable(HashSet::new())
             .ambient(HashSet::new());
         process.set_capabilities(Some(caps.build()?));
+    }
+    // What it was told to start without, of whatever it would have had. (Not the one a
+    // user who is not root is left with where kithd is not root: that one is how its own
+    // namespace is made, and is gone before its program starts.)
+    if !unit.drop.is_empty() && (root || user == 0) {
+        let named = |cap: &Capability| {
+            let name = cap.to_string();
+            let name = name.strip_prefix("CAP_").unwrap_or(&name);
+            unit.drop.iter().any(|dropped| dropped == "all" || dropped == name)
+        };
+        let left = |caps: &Option<HashSet<Capability>>| -> HashSet<Capability> {
+            caps.iter().flatten().filter(|cap| !named(cap)).copied().collect()
+        };
+        if let Some(has) = process.capabilities().clone() {
+            let caps = LinuxCapabilitiesBuilder::default()
+                .bounding(left(has.bounding()))
+                .effective(left(has.effective()))
+                .permitted(left(has.permitted()))
+                .inheritable(left(has.inheritable()))
+                .ambient(left(has.ambient()));
+            process.set_capabilities(Some(caps.build()?));
+        }
     }
     spec.set_process(Some(process));
 
@@ -1434,6 +1471,50 @@ mod tests {
             assert_eq!((process.user().uid(), process.no_new_privileges()), (0, Some(true)));
             assert_eq!(becomes(&made), None, "no second namespace for root");
             assert_eq!(sets(process)[0], "AuditWrite Kill NetBindService");
+        }
+        // What it is told to start without is in none of its sets; what makes the
+        // namespace of a user who is not root is not its to drop, and is not passed on.
+        let (root, user) = (Uid::from_raw(0), Uid::from_raw(1000));
+        let dropping = |unit: &Unit, drop: &[&str], uid: Uid| {
+            let drop = drop.iter().map(|name| name.to_string()).collect();
+            let unit = Unit { drop, ..unit.clone() };
+            let made = spec_of(
+                "a",
+                &image,
+                &unit,
+                "/kith/a",
+                Path::new("/b"),
+                uid,
+                Gid::from_raw(uid.as_raw()),
+            );
+            sets(made.unwrap().process().as_ref().unwrap())
+        };
+        assert_eq!(
+            dropping(&asked, &["KILL", "SYS_ADMIN"], root)[..3],
+            ["AuditWrite NetBindService"; 3]
+        );
+        assert_eq!(dropping(&asked, &["all"], root), [""; 5]);
+        assert_eq!(dropping(&asked, &["all"], user), [""; 5]);
+        assert_eq!(dropping(&Unit::default(), &["NET_BIND_SERVICE"], root), [""; 5]);
+        assert_eq!(dropping(&Unit::default(), &["all"], user)[0], "Setfcap");
+        let pod = Unit {
+            as_image: true,
+            ..Unit::default()
+        };
+        let left = dropping(&pod, &["NET_RAW", "MKNOD"], root);
+        assert!(
+            left[0].contains("Chown") && !left[0].contains("NetRaw") && !left[0].contains("Mknod"),
+            "{left:?}"
+        );
+        // And a container that would be root is not made where it is told not to be one.
+        for (unit, is_root) in [(&asked, true), (&pod, true), (&Unit::default(), false)] {
+            let unit = Unit {
+                non_root: true,
+                ..unit.clone()
+            };
+            let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), root, Gid::from_raw(0));
+            assert_eq!(made.is_err(), is_root);
+            assert!(made.err().is_none_or(|e| e.to_string().starts_with("runAsNonRoot")));
         }
         // No filter, or some of it, only as the unit says.
         let (uid, gid) = (Uid::from_raw(0), Gid::from_raw(0));

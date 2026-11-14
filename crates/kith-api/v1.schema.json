@@ -1481,6 +1481,13 @@
             "$ref": "#/$defs/EnvVar"
           }
         },
+        "envFrom": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvFrom"
+          },
+          "description": "Every key of a ConfigMap or a Secret as a variable. One in `env` of the same\nname wins, and of two here the later."
+        },
         "workingDir": {
           "type": [
             "string",
@@ -1495,6 +1502,20 @@
           "format": "uint32",
           "minimum": 0,
           "description": "The user (and group) its process is, by number. Without it: the image's own\nuser, or 65534 where the image names none or names 0. `0` is root: of the\ncontainer's user namespace where kithd is not root, of the node where it is."
+        },
+        "runAsNonRoot": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Not started if the user it would be is root (0), whoever says so: `runAsUser`\nor its image."
+        },
+        "dropCapabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Capabilities it starts without: `[all]`, or names as Linux has them without\ntheir `CAP_` (`NET_RAW`). Only a container that is root has any to drop."
         },
         "readOnlyRoot": {
           "type": [
@@ -1760,6 +1781,32 @@
       ],
       "description": "A domain kithd answers for itself instead of asking upstream."
     },
+    "EnvFrom": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "configMap": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secret": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefix": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Put before each key to make its variable's name."
+        }
+      },
+      "description": "Exactly one of `configMap` or `secret`, by name."
+    },
     "EnvVar": {
       "type": "object",
       "additionalProperties": false,
@@ -1792,12 +1839,23 @@
               "type": "null"
             }
           ]
+        },
+        "field": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Field"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Something of the replica itself."
         }
       },
       "required": [
         "name"
       ],
-      "description": "Exactly one of `value`, `secret` or `configMap`."
+      "description": "Exactly one of `value`, `secret`, `configMap` or `field`."
     },
     "ExecUnit": {
       "type": "object",
@@ -1863,6 +1921,16 @@
       "enum": [
         "edge"
       ]
+    },
+    "Field": {
+      "type": "string",
+      "enum": [
+        "name",
+        "namespace",
+        "node",
+        "address"
+      ],
+      "description": "`name`: the replica's own (`web-0`). `namespace`: its Workload's. `node`: the\nnode it runs on. `address`: its own on the mesh if it is a `pod`, or its node's."
     },
     "GitSource": {
       "type": "object",
@@ -3246,6 +3314,13 @@
             "$ref": "#/$defs/Container"
           }
         },
+        "initContainers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Container"
+          },
+          "description": "Containers run before `containers`, one at a time in this order, each to its\nend: the next starts when one exits 0, and one that fails is run again (unless\nthe replica's `restartPolicy` is `never`). They mount what the others do."
+        },
         "exec": {
           "type": "array",
           "items": {
@@ -3547,7 +3622,32 @@
       "additionalProperties": false,
       "properties": {
         "volume": {
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A Volume, or a VolumeClaim's."
+        },
+        "configMap": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A ConfigMap of the namespace: each key a file, read-only, and changed when the\nConfigMap is (all its files at once)."
+        },
+        "secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "A Secret of the namespace, as `configMap`; its files are kept in memory, never\non a disk."
+        },
+        "scratch": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "An empty directory of the replica's own, which goes when the replica does:\ncontainers of one replica that name the same one share it."
         },
         "path": {
           "type": "string"
@@ -3557,12 +3657,41 @@
             "boolean",
             "null"
           ]
+        },
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Of a `configMap` or `secret`: only these keys, each as the file named (which\nmay be in directories: `conf.d/site`). Without it: every key, as its own name."
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Of a `configMap` or `secret`: its files' mode, in octal (`0400`). Without it:\n`0444`.",
+          "pattern": "^0?[0-7]{3}$"
+        },
+        "subPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Of a `configMap` or `secret`: mount this one file of it at `path`, and not the\ndirectory. It stays as it was when the container started."
+        },
+        "memory": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Of a `scratch`: keep it in memory (it counts against the container's)."
         }
       },
       "required": [
-        "volume",
         "path"
-      ]
+      ],
+      "description": "Exactly one of `volume`, `configMap`, `secret` or `scratch`, at `path`."
     },
     "VolumeSpec": {
       "type": "object",

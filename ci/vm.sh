@@ -613,6 +613,67 @@ EOF
             must 'kubectl create job --from' k create job again --from=cronjob/tick
             heard again 'db-0 started 2'
 
+            # What a stock chart says of a pod beyond its image (ci/kube/files.yaml): a
+            # ConfigMap and a Secret as files, directories of its own, what it is told from
+            # maps and from itself, a user who is not root with no capability, and a
+            # container that runs first. The pod says what it finds (ci/pod.rs, tell).
+            must 'kubectl apply of the pod with files' k apply -f "$root/ci/kube/files.yaml"
+            must 'the Deployment with files did not roll out' k rollout status deployment/files --timeout=240s
+            waited=0
+            until k logs files-0 -c tell >"$work/files.out" 2>"$work/said" && grep -q '^tell: watching' "$work/files.out"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the pod with files has not said what it found: $(cat "$work/said" "$work/files.out")"
+                sleep 1
+            done
+            # (What it found when it started: before it watched for what changes.)
+            sed '/^tell: watching/q' "$work/files.out" >"$work/files.first"
+            for line in \
+                '^tell: started uid 1000 caps eff 0000000000000000 bnd 0000000000000000$' \
+                '^tell: env COLOUR=green$' '^tell: env S_token=sesame$' \
+                '^tell: env POD_NAME=files-0$' '^tell: env POD_NAMESPACE=default$' '^tell: env NODE_NAME=n[12]$' \
+                "^tell: env POD_IP=$(k get pod files-0 -o 'jsonpath={.status.podIP}' | sed 's/\./\\./g')\$" \
+                '^tell: mount /etc/conf [^ ]+ /[^ ]+ ro write Err' \
+                '^tell: mount /etc/one.conf [^ ]+ /[^ ]+ ro write Err' \
+                '^tell: mount /etc/secret tmpfs /kith/replicas/[^ ]+ ro write Err' \
+                '^tell: mount /work [^ ]+ /[^ ]+ rw write Ok' \
+                '^tell: mount /fast tmpfs /kith/replicas/[^ ]+ rw write Ok' \
+                '^tell: file /etc/conf/motd [0-7]+ one$' '^tell: file /etc/conf/site.conf [0-7]+ listen 80$' \
+                '^tell: file /etc/one.conf [0-7]+ listen 80$' \
+                '^tell: file /etc/secret/creds/token 400 sesame$' \
+                '^tell: file /work/first [0-7]+ ran first$'; do
+                grep -Eq "$line" "$work/files.first" || fail "the pod with files did not say \"$line\" when it started: $(cat "$work/files.out")"
+            done
+            [ "$(grep -c '^tell: file /etc/secret/' "$work/files.first")" = 1 ] || fail "the Secret's files are not the one its items name: $(cat "$work/files.out")"
+            must 'kubectl logs of the container that ran first' k logs files-0 -c first
+            grep -q '^put: /work/first' "$work/said" || fail "the container that ran first did not say so: $(cat "$work/said")"
+            said=$(k get pod files-0 -o 'jsonpath={.status.initContainerStatuses[0].state.terminated.reason} {.status.containerStatuses[*].name}' 2>&1)
+            [ "$said" = 'Completed tell' ] || fail "the pod with files says of its containers: $said"
+            # The ConfigMap changed, its files are the new ones in the pod that was running.
+            sed -n '/^kind: ConfigMap/,/^---/p' "$root/ci/kube/files.yaml" | sed -e '/^---/,$d' -e 's/motd: one/motd: two/' >"$work/files-config.yaml"
+            { echo 'apiVersion: v1'; cat "$work/files-config.yaml"; } >"$work/files-changed.yaml"
+            grep -q 'motd: two' "$work/files-changed.yaml" || fail "the test's changed ConfigMap is not one: $(cat "$work/files-changed.yaml")"
+            must 'kubectl apply of the changed ConfigMap' k apply -f "$work/files-changed.yaml"
+            waited=0
+            until k logs files-0 -c tell 2>&1 | grep -Eq '^tell: file /etc/conf/motd [0-7]+ two$'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the changed ConfigMap's file did not change in the pod: $(k logs files-0 -c tell 2>&1)"
+                sleep 1
+            done
+            said=$(k logs files-0 -c tell 2>&1 | grep -c '^tell: started') restarts=$(k get pod files-0 -o 'jsonpath={.status.containerStatuses[0].restartCount}')
+            [ "$said $restarts" = '1 0' ] || fail "the pod was started again for a changed file (started $said times, $restarts restarts)"
+            # Root without two capabilities has the others, and not those two (13 and 27; CHOWN is 0).
+            heard caps '^tell: started uid 0 '
+            bnd=$(sed -n 's/^tell: started uid 0 caps eff \([0-9a-f]*\) bnd \1$/\1/p' "$work/caps.out")
+            [ -n "$bnd" ] && [ "$((0x$bnd >> 13 & 1))$((0x$bnd >> 27 & 1))$((0x$bnd & 1))" = 001 ] || fail "root without NET_RAW and MKNOD has: $(cat "$work/caps.out")"
+            # Told not to be root, an image that names no user does not start, and says why.
+            waited=0
+            until k get pod rooted-0 -o 'jsonpath={.status.containerStatuses[0].state.waiting.message}' 2>&1 | grep -q runAsNonRoot; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "a pod that would be root under runAsNonRoot does not say so: $(k get pod rooted-0 -o yaml 2>&1)"
+                sleep 1
+            done
+            [ "$(k get pod rooted-0 -o 'jsonpath={.status.phase}')" = Pending ] || fail "a pod that would be root under runAsNonRoot is not pending: $(k get pods 2>&1)"
+
             # Without a file: made, shown to others, grown and given another image by hand.
             must 'kubectl create deployment' k create deployment made --image=kith.test/pod:serve --replicas=2 --port=80
             must 'kubectl expose' k expose deployment made --port=80
@@ -682,7 +743,7 @@ for r in found:
             done
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
+            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a pod as a chart writes one had a ConfigMap's files (changed in it when the ConfigMap was, with no restart) and one of them alone (subPath), a Secret's file from memory with the mode it asked, two directories of its own (one in memory), what it was told by envFrom and by its own fields, no capability as a user who is not root, and found what its initContainer left; root without two capabilities had the others; told runAsNonRoot an image that names no user did not start and said why; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
             exit 0
         fi
         if [ "$test" = share ]; then

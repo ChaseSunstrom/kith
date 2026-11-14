@@ -762,10 +762,20 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
         }
     };
     let state = |unit: &Value| unit["state"].as_str().unwrap_or("pending").to_string();
-    let pod = |(replica, units): (u64, Vec<&Value>)| {
-        let ready = units.iter().all(|unit| unit["ready"] == true);
-        let phase = if units.iter().all(|unit| state(unit) == "exited") {
-            match units.iter().all(|unit| unit["exitCode"] == 0) {
+    // (Which of a pod's are its initContainers: they are told of apart, and are not what is running.)
+    let named = |list: &str, unit: &Value| {
+        let of = template["spec"][list].as_array();
+        of.into_iter().flatten().find(|c| c["name"] == unit["name"])
+    };
+    let pod = |(replica, all): (u64, Vec<&Value>)| {
+        let ready = all.iter().all(|unit| unit["ready"] == true);
+        let (first, units): (Vec<&Value>, Vec<&Value>) = all
+            .iter()
+            .copied()
+            .partition(|unit| named("initContainers", unit).is_some());
+        let begun = first.iter().all(|unit| unit["ready"] == true);
+        let phase = if all.iter().all(|unit| state(unit) == "exited") {
+            match all.iter().all(|unit| unit["exitCode"] == 0) {
                 true => "Succeeded",
                 false => "Failed",
             }
@@ -775,10 +785,8 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
             "Pending"
         };
         let container = |unit: &&Value| {
-            let containers = template["spec"]["containers"].as_array();
-            let mut containers = containers.into_iter().flatten();
-            let image = containers
-                .find(|c| c["name"] == unit["name"])
+            let image = named("initContainers", unit)
+                .or_else(|| named("containers", unit))
                 .map(|c| c["image"].clone());
             let is = match state(unit).as_str() {
                 "running" => json!({ "running": {} }),
@@ -798,18 +806,21 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
             })
         };
         let mut spec = template["spec"].clone();
-        let (node, address) = (&units[0]["node"], &units[0]["address"]);
+        let (node, address) = (&all[0]["node"], &all[0]["address"]);
         if !node.is_null() {
             set(&mut spec, "/nodeName", node.clone());
         }
         let mut status = json!({
             "phase": phase, "startTime": meta["creationTimestamp"],
             "conditions": [
-                condition("Initialized", true, ""), condition("PodScheduled", true, ""),
+                condition("Initialized", begun, ""), condition("PodScheduled", true, ""),
                 condition("ContainersReady", ready, ""), condition("Ready", ready, ""),
             ],
             "containerStatuses": units.iter().map(container).collect::<Vec<_>>(),
         });
+        if !first.is_empty() {
+            status["initContainerStatuses"] = first.iter().map(container).collect();
+        }
         if !address.is_null() {
             status["podIP"] = address.clone();
             status["podIPs"] = json!([{ "ip": address }]);
@@ -2258,6 +2269,45 @@ spec: {role: writer, subjects: [carol]}
         }
         assert!(picks("", "metadata.name=web,status.phase!=Pending"));
         assert!(!picks("", "metadata.name=other"));
+    }
+
+    /// A pod's initContainers are told of apart from its containers: while one runs the
+    /// pod is pending and not initialized, and done it is not counted among what runs.
+    #[test]
+    fn a_pods_init_containers_are_told_of_apart() {
+        let spec = json!({ "initContainers": [{ "name": "first", "image": "i" }], "containers": [{ "name": "web", "image": "w" }] });
+        let owner = json!({
+            "kind": "StatefulSet", "metadata": { "name": "web", "namespace": "default" },
+            "spec": { "template": { "spec": spec } },
+        });
+        let said = |first: Value, web: Value| -> Value {
+            let meta = json!({ "name": "web", "namespace": "default" });
+            let held: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": meta, "spec": {},
+                "status": { "containers": [first, web] },
+            }))
+            .unwrap();
+            pods(&owner, &held).remove(0)["status"].take()
+        };
+        let unit = |name: &str, state: &str, ready: bool| json!({ "name": name, "replica": 0, "state": state, "ready": ready, "restarts": 0, "exitCode": 0 });
+        let before = said(unit("first", "running", false), unit("web", "pending", false));
+        assert_eq!(
+            (&before["phase"], &before["conditions"][0]["status"]),
+            (&json!("Pending"), &json!("False")),
+            "{before}"
+        );
+        let after = said(unit("first", "exited", true), unit("web", "running", true));
+        assert_eq!(
+            (&after["phase"], &after["conditions"][0]["status"]),
+            (&json!("Running"), &json!("True")),
+            "{after}"
+        );
+        assert_eq!(after["containerStatuses"].as_array().map(Vec::len), Some(1), "{after}");
+        assert_eq!(after["initContainerStatuses"][0]["image"], "i", "{after}");
+        assert_eq!(
+            after["initContainerStatuses"][0]["state"]["terminated"]["reason"], "Completed",
+            "{after}"
+        );
     }
 
     /// `kubectl logs job/NAME` after `kubectl wait --for=condition=complete`: the Job runs

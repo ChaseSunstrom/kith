@@ -115,6 +115,25 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("pod.volumes[].persistentVolumeClaim.claimName", Carried, r#""data""#),
     ("pod.volumes[].persistentVolumeClaim.readOnly", Refused, "true"),
     ("pod.volumes[].hostPath", Refused, r#"{"path":"/"}"#),
+    ("pod.volumes[].configMap.name", Carried, r#""c""#),
+    (
+        "pod.volumes[].configMap.items",
+        Carried,
+        r#"[{"key":"a","path":"conf.d/a"}]"#,
+    ),
+    ("pod.volumes[].configMap.items[].mode", Refused, "256"),
+    ("pod.volumes[].configMap.defaultMode", Carried, "256"),
+    ("pod.volumes[].configMap.optional", Hint, "true"),
+    ("pod.volumes[].secret.secretName", Carried, r#""s""#),
+    ("pod.volumes[].secret.items", Carried, r#"[{"key":"a","path":"a.pem"}]"#),
+    ("pod.volumes[].secret.items[].mode", Refused, "256"),
+    ("pod.volumes[].secret.defaultMode", Carried, "256"),
+    ("pod.volumes[].secret.optional", Hint, "true"),
+    ("pod.volumes[].emptyDir", Carried, "{}"),
+    ("pod.volumes[].emptyDir.medium", Carried, r#""Memory""#),
+    ("pod.volumes[].emptyDir.sizeLimit", Hint, r#""1Gi""#),
+    ("pod.volumes[].projected", Refused, r#"{"sources":[]}"#),
+    ("pod.volumes[].downwardAPI", Refused, r#"{"items":[]}"#),
     ("pod.securityContext.runAsUser", Carried, "1000"),
     ("pod.securityContext.runAsGroup", Hint, "1000"),
     ("pod.securityContext.fsGroup", Hint, "1000"),
@@ -140,7 +159,9 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("pod.hostPID", Refused, "true"),
     ("pod.hostIPC", Refused, "true"),
     ("pod.shareProcessNamespace", Refused, "true"),
-    ("pod.initContainers", Refused, r#"[{"name":"first","image":"busybox"}]"#),
+    ("pod.initContainers", Carried, r#"[{"name":"first","image":"busybox"}]"#),
+    ("pod.initContainers[].restartPolicy", Refused, r#""Always""#),
+    ("pod.securityContext.runAsNonRoot", Carried, "true"),
     (
         "pod.ephemeralContainers",
         Refused,
@@ -191,15 +212,21 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("container.env[].valueFrom.configMapKeyRef.optional", Hint, "true"),
     (
         "container.env[].valueFrom.fieldRef",
-        Refused,
-        r#"{"fieldPath":"metadata.name"}"#,
+        Carried,
+        r#"{"apiVersion":"v1","fieldPath":"status.podIP"}"#,
     ),
     (
         "container.env[].valueFrom.resourceFieldRef",
         Refused,
         r#"{"resource":"limits.cpu"}"#,
     ),
-    ("container.envFrom", Refused, r#"[{"configMapRef":{"name":"c"}}]"#),
+    (
+        "container.envFrom",
+        Carried,
+        r#"[{"configMapRef":{"name":"c"},"prefix":"C_"},{"secretRef":{"name":"s"}}]"#,
+    ),
+    ("container.envFrom[].configMapRef.optional", Hint, "true"),
+    ("container.envFrom[].secretRef.optional", Hint, "true"),
     ("container.ports[].containerPort", Carried, "80"),
     ("container.ports[].name", Carried, r#""http""#),
     ("container.ports[].protocol", Carried, r#""TCP""#),
@@ -214,7 +241,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("container.volumeMounts[].name", Carried, r#""data""#),
     ("container.volumeMounts[].mountPath", Carried, r#""/data""#),
     ("container.volumeMounts[].readOnly", Carried, "true"),
-    ("container.volumeMounts[].subPath", Refused, r#""a""#),
+    ("container.volumeMounts[].subPath", Carried, r#""a""#),
     ("container.volumeMounts[].subPathExpr", Refused, r#""$(A)""#),
     (
         "container.volumeMounts[].mountPropagation",
@@ -274,12 +301,13 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
         r#"{"type":"RuntimeDefault"}"#,
     ),
     ("container.securityContext.privileged", Refused, "true"),
+    ("container.securityContext.capabilities.drop", Carried, r#"["ALL"]"#),
     (
-        "container.securityContext.capabilities",
+        "container.securityContext.capabilities.add",
         Refused,
-        r#"{"add":["SYS_ADMIN"]}"#,
+        r#"["SYS_ADMIN"]"#,
     ),
-    ("container.securityContext.runAsNonRoot", Refused, "true"),
+    ("container.securityContext.runAsNonRoot", Carried, "true"),
     ("container.securityContext.procMount", Refused, r#""Unmasked""#),
     ("container.terminationMessagePath", Hint, r#""/tmp/said""#),
     ("container.terminationMessagePolicy", Hint, r#""FallbackToLogsOnError""#),
@@ -786,8 +814,63 @@ fn probe(cx: &mut Cx, container: &mut Map, key: &str, at: &str) -> Option<Value>
     ]))
 }
 
-/// The mounts of a pod's volumes that are claims: volume name to claim name.
-type Volumes = BTreeMap<String, Option<String>>;
+/// What a volume of a pod is.
+enum Vol {
+    Claim(String),
+    /// A ConfigMap's or (`secret`) a Secret's keys as files.
+    Files {
+        secret: bool,
+        name: String,
+        items: Strings,
+        mode: Option<String>,
+    },
+    /// An `emptyDir`, and whether it is in memory.
+    Scratch(bool),
+    /// Nothing kith has.
+    Other,
+}
+
+/// A pod's volumes, by name.
+type Volumes = BTreeMap<String, Vol>;
+
+/// A pod's volume that is a ConfigMap's or a Secret's files (`key`: which; `named`: the
+/// field its name is in).
+fn files(cx: &mut Cx, volume: &mut Map, key: &str, named: &str, at: &str) -> Option<Vol> {
+    if !volume.contains_key(key) {
+        return None;
+    }
+    let (mut from, p) = (cx.map(volume, key, at), join(at, key));
+    let name = cx.text(&mut from, named, &p);
+    // Kubernetes has a mode as a number, kith as the octal it is written in. And `0400` in
+    // a manifest is octal to Kubernetes, whose YAML is the older one: kith's reads it as
+    // the text it is, which is taken here for what was meant.
+    let written = from.get("defaultMode").and_then(Value::as_str);
+    let written = written.filter(|mode| mode.starts_with('0') && mode.len() > 1);
+    if let Some(mode) = written.and_then(|mode| u32::from_str_radix(mode, 8).ok()) {
+        from.insert("defaultMode".into(), mode.into());
+    }
+    let mode = cx.num(&mut from, "defaultMode", &p).map(|mode| format!("{mode:04o}"));
+    let mut items = Strings::new();
+    for mut item in cx.maps(&mut from, "items", &p) {
+        let ip = join(&p, "items[]");
+        match (cx.text(&mut item, "key", &ip), cx.text(&mut item, "path", &ip)) {
+            (Some(key), Some(path)) => drop(items.insert(key, path)),
+            _ => cx.note(&ip, "has no key or no path: not translated"),
+        }
+        cx.rest(item, &ip);
+    }
+    drop_default(&mut from, "optional", json!(false));
+    cx.rest(from, &p);
+    if name.is_none() {
+        cx.note(&p, "names nothing: not translated");
+    }
+    Some(Vol::Files {
+        secret: key == "secret",
+        name: name?,
+        items,
+        mode,
+    })
+}
 
 /// `seccompProfile`: is the filter off? None where nothing is said.
 fn unconfined(cx: &mut Cx, security: &mut Map, at: &str) -> Option<bool> {
@@ -805,13 +888,13 @@ fn unconfined(cx: &mut Cx, security: &mut Map, at: &str) -> Option<bool> {
     }
 }
 
-/// `of_pod`: the user and the filter the pod says for all its containers.
-fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<u32>, Option<bool>)) -> Option<Value> {
-    let (Some(name), p) = (cx.text(&mut c, "name", at), join(at, "containers")) else {
-        cx.note(
-            &join(at, "containers"),
-            "has a container without a name: not translated",
-        );
+/// What a pod says for all its containers: the user, the filter, and not root.
+type OfPod = (Option<u32>, Option<bool>, Option<bool>);
+
+/// `list`: `containers` or `initContainers`.
+fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_pod: OfPod) -> Option<Value> {
+    let (Some(name), p) = (cx.text(&mut c, "name", at), join(at, list)) else {
+        cx.note(&join(at, list), "has a container without a name: not translated");
         return None;
     };
     let p = format!("{p}[{name}]");
@@ -844,12 +927,24 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
         let fp = join(&ep, "valueFrom");
         let secret = key_ref(cx, &mut from, "secretKeyRef", &fp);
         let config_map = key_ref(cx, &mut from, "configMapKeyRef", &fp);
+        // Something of the pod itself: what kith can say of a replica.
+        let (mut of_pod, rp) = (cx.map(&mut from, "fieldRef", &fp), join(&fp, "fieldRef"));
+        drop_default(&mut of_pod, "apiVersion", json!("v1"));
+        let path = cx.text(&mut of_pod, "fieldPath", &rp);
+        cx.rest(of_pod, &rp);
+        let fields = [
+            ("metadata.name", "name"),
+            ("metadata.namespace", "namespace"),
+            ("spec.nodeName", "node"),
+            ("status.podIP", "address"),
+        ];
+        let field = cx.pick(&join(&rp, "fieldPath"), path, &fields);
         cx.rest(from, &fp);
         cx.rest(e, &ep);
         if !from_there && value.is_none() {
             value = Some(String::new());
         }
-        if value.is_none() && secret.is_none() && config_map.is_none() {
+        if value.is_none() && secret.is_none() && config_map.is_none() && field.is_none() {
             cx.note(&ep, "has no value kith can read: not translated");
             continue;
         }
@@ -858,7 +953,30 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
             ("value", some(value)),
             ("secret", secret),
             ("configMap", config_map),
+            ("field", field),
         ]));
+    }
+    let mut env_from = Vec::new();
+    for (i, mut from) in cx.maps(&mut c, "envFrom", &p).into_iter().enumerate() {
+        let fp = format!("{p}.envFrom[{i}]");
+        let mut named = |cx: &mut Cx, key: &str| {
+            let (mut reference, rp) = (cx.map(&mut from, key, &fp), join(&fp, key));
+            let name = cx.text(&mut reference, "name", &rp);
+            drop_default(&mut reference, "optional", json!(false));
+            cx.rest(reference, &rp);
+            name
+        };
+        let (config_map, secret) = (named(cx, "configMapRef"), named(cx, "secretRef"));
+        let prefix = cx.text(&mut from, "prefix", &fp);
+        cx.rest(from, &fp);
+        match config_map.is_some() != secret.is_some() {
+            true => env_from.push(obj([
+                ("configMap", some(config_map)),
+                ("secret", some(secret)),
+                ("prefix", some(prefix.filter(|prefix| !prefix.is_empty()))),
+            ])),
+            false => cx.note(&fp, "names no ConfigMap or Secret, or both: not translated"),
+        }
     }
     let working_dir = cx.text(&mut c, "workingDir", &p);
     let res = cx.map(&mut c, "resources", &p);
@@ -885,16 +1003,45 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
         let mp = format!("{p}.volumeMounts[{volume}]");
         let path = cx.text(&mut mount, "mountPath", &mp);
         let read_only = cx.flag(&mut mount, "readOnly", &mp);
+        let part = cx.text(&mut mount, "subPath", &mp).filter(|part| !part.is_empty());
         cx.rest(mount, &mp);
+        let whole = "not translated: kith mounts a claim or an emptyDir whole, and one file of a ConfigMap or a Secret";
         match (vols.get(&volume), path) {
-            (Some(Some(claim)), Some(path)) => mounts.push(obj([
+            (_, None) => cx.note(&mp, "has no mountPath: not translated"),
+            (None, _) => cx.note(&mp, "not translated: the pod has no volume of that name"),
+            (Some(Vol::Other), _) => {
+                let why =
+                    "not translated: its volume is not a PersistentVolumeClaim, a ConfigMap, a Secret or an emptyDir";
+                cx.note(&mp, why)
+            }
+            (Some(Vol::Claim(_) | Vol::Scratch(_)), _) if part.is_some() => cx.note(&join(&mp, "subPath"), whole),
+            (Some(Vol::Claim(claim)), Some(path)) => mounts.push(obj([
                 ("volume", Some(json!(claim))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
             ])),
-            (Some(None), _) => cx.note(&mp, "not translated: its volume is not a PersistentVolumeClaim"),
-            (None, _) => cx.note(&mp, "not translated: the pod has no volume of that name"),
-            (_, None) => cx.note(&mp, "has no mountPath: not translated"),
+            (Some(Vol::Scratch(memory)), Some(path)) => mounts.push(obj([
+                ("scratch", Some(json!(volume))),
+                ("path", Some(json!(path))),
+                ("readOnly", some(read_only)),
+                ("memory", memory.then(|| json!(true))),
+            ])),
+            (
+                Some(Vol::Files {
+                    secret,
+                    name,
+                    items,
+                    mode,
+                }),
+                Some(path),
+            ) => mounts.push(obj([
+                (if *secret { "secret" } else { "configMap" }, Some(json!(name))),
+                ("path", Some(json!(path))),
+                ("readOnly", some(read_only)),
+                ("items", nonempty(json!(items))),
+                ("mode", some(mode.clone())),
+                ("subPath", some(part)),
+            ])),
         }
     }
     let liveness = probe(cx, &mut c, "livenessProbe", &p);
@@ -903,6 +1050,15 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
     let read_only_root = cx.flag(&mut security, "readOnlyRootFilesystem", &scp);
     let user = cx.num(&mut security, "runAsUser", &scp).or(of_pod.0);
     let unconfined = unconfined(cx, &mut security, &scp).or(of_pod.1);
+    let non_root = cx.flag(&mut security, "runAsNonRoot", &scp).or(of_pod.2);
+    // What it starts without. (What it would start with more of stays, and is refused.)
+    let (mut capabilities, cp) = (cx.map(&mut security, "capabilities", &scp), join(&scp, "capabilities"));
+    let dropped = cx.strs(&mut capabilities, "drop", &cp);
+    let dropped: Vec<String> = dropped
+        .into_iter()
+        .map(|name| if name == "ALL" { "all".into() } else { name })
+        .collect();
+    cx.rest(capabilities, &cp);
     drop_default(&mut security, "privileged", json!(false));
     if cx.flag(&mut security, "allowPrivilegeEscalation", &scp) == Some(true) {
         let at = join(&scp, "allowPrivilegeEscalation");
@@ -919,6 +1075,7 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
         ("command", nonempty(json!(command))),
         ("args", nonempty(json!(args))),
         ("env", nonempty(json!(env))),
+        ("envFrom", nonempty(json!(env_from))),
         ("workingDir", some(working_dir)),
         ("resources", resources),
         ("ports", nonempty(json!(ports))),
@@ -927,6 +1084,8 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, vols: &Volumes, of_pod: (Option<
         ("readiness", readiness),
         ("readOnlyRoot", some(read_only_root)),
         ("runAsUser", some(user)),
+        ("runAsNonRoot", some(non_root.filter(|non_root| *non_root))),
+        ("dropCapabilities", nonempty(json!(dropped))),
         (
             "seccomp",
             unconfined.filter(|off| *off).map(|_| json!({ "unconfined": true })),
@@ -953,31 +1112,50 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
     let mut s = cx.map(&mut tpl, "spec", at);
     cx.rest(tpl, at);
 
-    let mut vols: Volumes = claims.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+    let mut vols: Volumes = claims.iter().map(|(k, v)| (k.clone(), Vol::Claim(v.clone()))).collect();
     for mut v in cx.maps(&mut s, "volumes", &sp) {
         let Some(name) = cx.text(&mut v, "name", &sp) else {
             cx.note(&join(&sp, "volumes"), "has a volume without a name: not translated");
             continue;
         };
         let vp = format!("{sp}.volumes[{name}]");
+        let sources = ["persistentVolumeClaim", "configMap", "secret", "emptyDir"];
+        if sources.iter().filter(|source| v.contains_key(**source)).count() > 1 {
+            cx.note(&vp, "names more than one source: not translated");
+        }
         let mut claim = cx.map(&mut v, "persistentVolumeClaim", &vp);
         let cp = join(&vp, "persistentVolumeClaim");
         let claim_name = cx.text(&mut claim, "claimName", &cp);
         cx.rest(claim, &cp);
+        let mut vol = claim_name.map_or(Vol::Other, Vol::Claim);
+        for (key, named) in [("configMap", "name"), ("secret", "secretName")] {
+            vol = files(cx, &mut v, key, named, &vp).unwrap_or(vol);
+        }
+        if v.contains_key("emptyDir") {
+            let (mut empty, ep) = (cx.map(&mut v, "emptyDir", &vp), join(&vp, "emptyDir"));
+            let medium = cx.text(&mut empty, "medium", &ep).filter(|medium| !medium.is_empty());
+            let medium = cx.pick(&join(&ep, "medium"), medium, &[("Memory", "memory")]);
+            cx.rest(empty, &ep);
+            vol = Vol::Scratch(medium.is_some());
+        }
         cx.rest(v, &vp);
-        vols.insert(name, claim_name);
+        vols.insert(name, vol);
     }
     let (mut security, scp) = (cx.map(&mut s, "securityContext", &sp), join(&sp, "securityContext"));
     let of_pod = (
         cx.num(&mut security, "runAsUser", &scp),
         unconfined(cx, &mut security, &scp),
+        cx.flag(&mut security, "runAsNonRoot", &scp),
     );
     cx.rest(security, &scp);
-    let containers = cx.maps(&mut s, "containers", &sp);
-    let units: Vec<Value> = containers
-        .into_iter()
-        .filter_map(|c| container(cx, c, &sp, &vols, of_pod))
-        .collect();
+    let mut contained = |cx: &mut Cx, list: &str| -> Vec<Value> {
+        let containers = cx.maps(&mut s, list, &sp);
+        let made = containers
+            .into_iter()
+            .filter_map(|c| container(cx, c, &sp, list, &vols, of_pod));
+        made.collect()
+    };
+    let (first, units) = (contained(cx, "initContainers"), contained(cx, "containers"));
     // What Kubernetes assumes anyway, and tools write out.
     for (key, default) in [
         ("hostNetwork", json!(false)),
@@ -1010,6 +1188,7 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
         // What was written for Kubernetes runs as Kubernetes runs it: a network of the
         // pod's own, a root it can write to, the user its image names.
         template: obj([
+            ("initContainers", nonempty(json!(first))),
             ("containers", nonempty(json!(units))),
             ("restartPolicy", restart),
             ("pod", Some(json!(true))),
@@ -1911,6 +2090,39 @@ spec:
                 }
                 object["spec"]["template"]["spec"]["containers"][0]["env"][0] = variable;
             }
+            // (A volume is one thing: a ConfigMap's files here, not also a claim's; and one
+            // file is mounted alone only of such a volume.)
+            let files = [
+                "pod.volumes[].configMap",
+                "pod.volumes[].secret",
+                "pod.volumes[].emptyDir",
+            ];
+            if let Some(kind) = files.iter().find(|kind| row.starts_with(**kind)) {
+                let kind = kind.rsplit('.').next().unwrap();
+                let named = if kind == "secret" { "secretName" } else { "name" };
+                let mut volume = json!({ "name": "data" });
+                volume[kind] = if kind == "emptyDir" {
+                    json!({})
+                } else {
+                    json!({ named: "c" })
+                };
+                if row.contains("items[]") {
+                    volume[kind]["items"] = json!([{ "key": "a", "path": "a" }]);
+                }
+                object["spec"]["template"]["spec"]["volumes"][0] = volume;
+            }
+            if *row == "container.volumeMounts[].subPath" {
+                let volume = json!({ "name": "data", "configMap": { "name": "c" } });
+                object["spec"]["template"]["spec"]["volumes"][0] = volume;
+            }
+            if let Some(from) = row.strip_prefix("container.envFrom[].") {
+                let reference = from.strip_suffix(".optional").unwrap();
+                let from = json!([{ reference: { "name": "c" } }]);
+                object["spec"]["template"]["spec"]["containers"][0]["envFrom"] = from;
+            }
+            if *row == "pod.initContainers[].restartPolicy" {
+                object["spec"]["template"]["spec"]["initContainers"] = json!([{ "name": "first", "image": "busybox" }]);
+            }
             // What it is without the field: taken whole, and nothing said.
             let plain = take(vec![object.clone(), service.clone()], false);
             assert!(plain.refused.is_empty() && plain.hints.is_empty(), "{row}: {plain:?}");
@@ -1962,6 +2174,125 @@ spec:
         assert_eq!(
             db.spec["template"]["containers"][0]["volumeMounts"][0]["volume"],
             "pgdata-db-0"
+        );
+    }
+
+    /// What nearly every chart's pod has, taken as it is written: files from a ConfigMap
+    /// and a Secret, an emptyDir, every key of a map as a variable, a variable of the pod
+    /// itself, capabilities dropped, not root, and a container that runs first.
+    #[test]
+    fn import_a_pod_with_files_a_scratch_and_a_container_that_runs_first() {
+        let chart = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: site }
+spec:
+  selector: { matchLabels: { app: site } }
+  template:
+    metadata: { labels: { app: site } }
+    spec:
+      securityContext: { runAsNonRoot: true }
+      initContainers:
+        - name: first
+          image: busybox
+          command: [sh, -c, "cp /etc/site/index /work/index"]
+          volumeMounts:
+            - { name: conf, mountPath: /etc/site }
+            - { name: work, mountPath: /work }
+      containers:
+        - name: web
+          image: nginx
+          envFrom:
+            - configMapRef: { name: site }
+              prefix: SITE_
+            - secretRef: { name: keys }
+          env:
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: ME
+              valueFrom: { fieldRef: { apiVersion: v1, fieldPath: metadata.name } }
+          securityContext:
+            runAsUser: 101
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: conf, mountPath: /etc/nginx/nginx.conf, subPath: nginx.conf }
+            - { name: tls, mountPath: /etc/tls, readOnly: true }
+            - { name: work, mountPath: /work }
+            - { name: cache, mountPath: /var/cache/nginx }
+      volumes:
+        - name: conf
+          configMap: { name: site, defaultMode: 0440 }
+        - name: tls
+          secret:
+            secretName: site-tls
+            defaultMode: 256
+            items: [{ key: tls.key, path: key.pem }]
+        - name: work
+          emptyDir: {}
+        - name: cache
+          emptyDir: { medium: Memory }
+"#;
+        let (all, said) = run(chart);
+        assert_eq!(said, Vec::<String>::new());
+        for r in &all {
+            r.clone().validated().unwrap_or_else(|e| panic!("{}: {e}", r.key()));
+        }
+        let template = &find(&all, "Workload", "site").spec["template"];
+        assert_eq!(
+            template["initContainers"][0]["volumeMounts"],
+            json!([{ "configMap": "site", "path": "/etc/site", "mode": "0440" }, { "scratch": "work", "path": "/work" }])
+        );
+        let web = &template["containers"][0];
+        assert_eq!(
+            web["envFrom"],
+            json!([{ "configMap": "site", "prefix": "SITE_" }, { "secret": "keys" }])
+        );
+        assert_eq!(
+            web["env"],
+            json!([{ "name": "POD_IP", "field": "address" }, { "name": "ME", "field": "name" }])
+        );
+        assert_eq!(
+            (&web["dropCapabilities"], &web["runAsUser"]),
+            (&json!(["all"]), &json!(101))
+        );
+        assert_eq!(
+            (&web["runAsNonRoot"], &template["initContainers"][0]["runAsNonRoot"]),
+            (&json!(true), &json!(true))
+        );
+        assert_eq!(
+            web["volumeMounts"],
+            json!([
+                { "configMap": "site", "path": "/etc/nginx/nginx.conf", "subPath": "nginx.conf", "mode": "0440" },
+                { "secret": "site-tls", "path": "/etc/tls", "readOnly": true, "items": { "tls.key": "key.pem" }, "mode": "0400" }, // pragma: allowlist secret
+                { "scratch": "work", "path": "/work" },
+                { "scratch": "cache", "path": "/var/cache/nginx", "memory": true },
+            ])
+        );
+        // And what kith does not do of them is refused by its place, not dropped.
+        let part = chart.replace(
+            "{ name: work, mountPath: /work }",
+            "{ name: work, mountPath: /work, subPath: a }",
+        );
+        let more = part.replace("drop: [ALL]", "drop: [ALL], add: [NET_ADMIN]");
+        let (_, said) = run(&more);
+        let places: Vec<&str> = said.iter().filter_map(|line| line.split(' ').nth(1)).collect();
+        let at = "spec.template.spec";
+        assert_eq!(
+            places,
+            [
+                format!("{at}.initContainers[first].volumeMounts[work].subPath"),
+                format!("{at}.containers[web].volumeMounts[work].subPath"),
+                format!("{at}.containers[web].securityContext.capabilities.add"),
+            ],
+            "{said:?}"
+        );
+        // A volume is from one place, as Kubernetes has it: not the last of those it names.
+        let two = chart.replace("emptyDir: {}", "emptyDir: {}\n          configMap: { name: site }");
+        let (_, said) = run(&two);
+        assert!(
+            said.iter()
+                .any(|line| line.contains("volumes[work] names more than one source")),
+            "{said:?}"
         );
     }
 

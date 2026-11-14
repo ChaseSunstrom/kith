@@ -17,6 +17,11 @@
 //!   pod node b|c NUMBERS PATH  make at PATH a node of the block or character device whose
 //!                              MAJOR:MINOR the file NUMBERS holds (one of /sys), read from
 //!                              it, and say how both went
+//!   pod put FILE TEXT          after three seconds, write TEXT to FILE
+//!   pod tell [PATH ...]        say whose it is, the capabilities it has and what it was
+//!                              told (its environment); then of each PATH what is mounted
+//!                              there, whether it can be written, and every file under it;
+//!                              and, given a PATH, each file again when it changes
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -30,6 +35,23 @@ fn asked(host: &str, port: &str) -> std::io::Result<String> {
     stream.read_to_string(&mut answer)?;
     let (first, last) = (answer.lines().next().unwrap_or_default(), answer.lines().last().unwrap_or_default());
     Ok(format!("{first} {last}"))
+}
+
+/// Every file at or under `path` as "PATH MODE CONTENT", through links (as a mounted
+/// ConfigMap has them) and past what such a mount keeps for itself (`..data` and the like).
+fn files(path: &std::path::Path, found: &mut Vec<String>) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(has) = std::fs::metadata(path) else { return };
+    if has.is_dir() {
+        let mut inside: Vec<_> = std::fs::read_dir(path).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        inside.sort();
+        for path in inside.iter().filter(|path| !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".."))) {
+            files(path, found);
+        }
+    } else {
+        let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("failed: {:?}", e.kind()));
+        found.push(format!("{} {:o} {}", path.display(), has.permissions().mode() & 0o777, content.trim()));
+    }
 }
 
 fn main() {
@@ -148,6 +170,50 @@ fn main() {
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
             println!("node: made {made}, read {read:?}");
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH"),
+        ["put", file, text] => {
+            std::thread::sleep(Duration::from_secs(3));
+            std::fs::write(file, text).expect("the file it was told to write");
+            println!("put: {file}");
+        }
+        ["tell", paths @ ..] => {
+            let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
+            let of = |key: &str| status.lines().find_map(|line| line.strip_prefix(key)?.split_whitespace().next()).unwrap_or("?");
+            println!("tell: started uid {} caps eff {} bnd {}", of("Uid:"), of("CapEff:"), of("CapBnd:"));
+            let mut told: Vec<String> = std::env::vars().map(|(name, value)| format!("{name}={value}")).collect();
+            told.sort();
+            told.iter().for_each(|told| println!("tell: env {told}"));
+            let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            for path in paths {
+                // (mountinfo(5): ID PARENT MAJOR:MINOR ROOT WHERE OPTIONS ... - TYPE SOURCE ...)
+                let mount = mounts.lines().rev().find_map(|line| {
+                    let (before, after) = line.split_once(" - ")?;
+                    let fields: Vec<&str> = before.split(' ').collect();
+                    let read_only = fields.get(5)?.split(',').any(|option| option == "ro");
+                    (fields.get(4) == Some(path)).then(|| format!("{} {} {}", after.split(' ').next().unwrap_or("?"), fields[3], if read_only { "ro" } else { "rw" }))
+                });
+                let is_dir = std::path::Path::new(path).is_dir();
+                let probe = if is_dir { format!("{path}/written") } else { path.to_string() };
+                let wrote = match is_dir {
+                    true => std::fs::write(&probe, "x").and_then(|()| std::fs::remove_file(&probe)),
+                    false => std::fs::OpenOptions::new().append(true).open(&probe).map(drop),
+                };
+                println!("tell: mount {path} {} write {:?}", mount.as_deref().unwrap_or("none"), wrote.map_err(|e| e.kind()));
+            }
+            let mut said = Vec::new();
+            loop {
+                let mut now = Vec::new();
+                paths.iter().for_each(|path| files(std::path::Path::new(path), &mut now));
+                now.iter().filter(|line| !said.contains(*line)).for_each(|line| println!("tell: file {line}"));
+                if said.is_empty() {
+                    println!("tell: watching");
+                }
+                if paths.is_empty() {
+                    break;
+                }
+                said = now;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...]"),
     }
 }
