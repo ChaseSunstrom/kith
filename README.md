@@ -754,8 +754,12 @@ kith package render packages/hyprland --name office -n desktop \
   `User`, like any container ([What a container is kept from](#what-a-container-is-kept-from)):
   give the image the user the session is to be, since it is not started as root to become
   one. The seat's device nodes are that user's (on kith OS).
-- `kith-panel` is a plain `Workload` for a panel image, placed by node labels
-  (`require`).
+- `kith-panel` is a `Workload` for a panel image that is a window of a seat's session:
+  it holds a claim on `seat` with `access: client`
+  ([an app as a workload of its own](#hardware)), so it runs on the seat's node, is told
+  `KITH_SEAT`, and finds the session's Wayland socket at `display`.
+- The session packages set `XDG_RUNTIME_DIR=/run/seat`, the seat's own directory: the
+  sockets a compositor and PipeWire make there are what a seat's apps connect to.
 - Delete the release and the node is headless again.
 
 ## Sources (GitOps)
@@ -1290,6 +1294,49 @@ spec:
   your own service there is no filter and none is needed: a container there is in a user
   namespace, where the kernel lets no one make a device node, and it has the nodes in its
   `/dev` and no other.
+- **An app can be a workload of its own, shown as a window in a session.** A `DeviceClaim`
+  on a seat that says `access: client` takes none of the seat's devices: any number of
+  workloads hold it beside the session, each on the seat's node. It is a claim of the
+  session's own namespace: a client is placed only while a workload of its namespace
+  holds the seat, and waits otherwise (its claim says so). Each is given the render
+  nodes of the seat's GPUs (not the card: it draws, and is not the screen's master; on
+  NVIDIA's driver, whose programs draw through the driver's own nodes, those but
+  `nvidia-modeset`) and the seat's own directory at `/run/seat`, to read. The seat's
+  holder has the same directory to write, so a session that puts its Wayland and PipeWire
+  sockets there (the desktop packages set `XDG_RUNTIME_DIR=/run/seat`) is where the app
+  opens its window:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: office-apps }
+spec: { seat: office-pc-seat0, access: client }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: editor }
+spec:
+  template:
+    deviceClaims: [office-apps]
+    containers:
+      - name: editor
+        image: registry.example/me/editor:3
+        env:
+          - { name: WAYLAND_DISPLAY, value: /run/seat/wayland-0 }
+          - { name: PIPEWIRE_RUNTIME_DIR, value: /run/seat }
+```
+
+- Such an app has its own image, limits, volumes (its home is a Volume it mounts) and
+  rollback, and `kith get deviceclaim office-apps -o yaml` lists the seat's apps as
+  `status.holders`. It has to run as the session's user: the directory is that user's
+  alone (made so each time a holder of the seat starts, so two sessions sharing a seat
+  are to be one user), and another user's app finds nothing in it; root in a pod on
+  kith OS is held by no file's owner, and reaches it. A workload is a client of one seat
+  and holds none. What a session that died left in the directory is there until the
+  next one replaces it. Not here: an app on another node shown in this session, a real
+  compositor tried (the test's session is a program listening on a socket), and anything
+  between an app and the compositor (a client of a session is in it: see
+  [SECURITY.md](SECURITY.md)).
 - An input device plugged in or pulled (a controller, a keyboard) while a container holds
   its seat is given to that container, or taken from it, as it runs: the node appears in
   its `/dev/input` at the next scan, within half a minute, and nothing is started over. (An

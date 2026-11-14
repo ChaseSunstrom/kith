@@ -73,6 +73,8 @@ struct Slot {
     notes: BTreeMap<String, String>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
     devices: Vec<PathBuf>,
+    /// The seat whose directory it has at `/run/seat`, and whether to read only.
+    seat: Option<(String, bool)>,
     /// What its containers mount: the Volume's directory, where in the container, and read-only
     /// (a changed one replaces the unit, as a changed value does). An exec unit mounts nothing.
     volumes: Vec<(crate::volumes::Dir, String, bool)>,
@@ -380,7 +382,7 @@ impl Controller {
             // ponytail: a NodeWorkload cannot claim (a copy on every node, a device on one), and
             // alone, a node has no name for the Devices to name: both run nothing, and say so.
             let claimed = !template.device_claims.is_empty();
-            let devices = granted.get(&key).cloned().unwrap_or_default();
+            let crate::claims::Granted { devices, seat } = granted.get(&key).cloned().unwrap_or_default();
             let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
             if claimed && resource.kind == "NodeWorkload" {
                 note.push("a NodeWorkload cannot hold DeviceClaims: it runs nothing (use a Workload)".into());
@@ -513,6 +515,7 @@ impl Controller {
                             }),
                             notes: template.annotations.clone(),
                             devices: devices.clone(),
+                            seat: seat.clone(),
                             volumes: mounts_of(unit, &volumes),
                             tuned: None,
                             handle: None,
@@ -569,6 +572,7 @@ impl Controller {
                 || new.notes != slot.notes
                 || new.policy != slot.policy
                 || new.devices != slot.devices
+                || new.seat != slot.seat
                 || new.volumes != slot.volumes
                 || new_values
         };
@@ -1060,6 +1064,20 @@ async fn start(
             read_only: *read_only,
             // (Not a directory of the host's that an admin named: that one is theirs.)
             give: dir.namespace != crate::volumes::SYSTEM,
+        });
+    }
+    if let Some((seat, client)) = &slot.seat {
+        // The seat's own directory: its session puts its sockets there, and its apps find
+        // them. It is the session's user's alone, so an app is that user or has nothing.
+        let host = state.join("seats").join(seat);
+        let made = std::fs::create_dir_all(&host)
+            .and_then(|()| std::fs::set_permissions(&host, std::os::unix::fs::PermissionsExt::from_mode(0o700)));
+        made.map_err(|e| format!("seat {seat}: {e}"))?;
+        unit.mounts.push(kith_runtime::Mount {
+            host,
+            container: "/run/seat".into(),
+            read_only: *client,
+            give: !*client,
         });
     }
     if let Some((pod, hostname)) = &slot.pod {

@@ -776,11 +776,14 @@ spec! {
         pub device: Option<String>,
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
         pub selector: Labels,
+        /// `exclusive` where unsaid. `client` is of a seat: beside whoever holds it, with
+        /// the seat's directory (`/run/seat`, where its session puts its sockets) to read
+        /// and its GPUs' render nodes, and none of its devices.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub access: Option<Access>,
     }
 
-    pub enum Access { Exclusive, Shared }
+    pub enum Access { Exclusive, Shared, Client }
 
     // ---- Packages and GitOps (§4.8, §4.9) ----
 
@@ -1664,7 +1667,11 @@ impl Spec for DeviceClaimSpec {
                 ("device", self.device.is_some()),
                 ("selector", !self.selector.is_empty()),
             ],
-        )
+        )?;
+        if self.access == Some(Access::Client) && self.seat.is_none() {
+            return Err("spec.access: client is of a seat: name one with `seat`".into());
+        }
+        Ok(())
     }
 }
 

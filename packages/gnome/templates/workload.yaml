@@ -14,6 +14,9 @@ spec:
         resources: {{ values.reserve | tojson }}
         env:
           - { name: KITH_SEAT, value: {{ values.seat | tojson }} }
+          # Where its Wayland and PipeWire sockets go, for the seat's apps to find: the
+          # seat's own directory, which kith mounts there.
+          - { name: XDG_RUNTIME_DIR, value: /run/seat }
           - { name: KITH_USER, value: {{ values.user | tojson }} }
           - { name: KITH_APPS, value: {{ values.apps | join(" ") | tojson }} }
           {%- if values.dotfiles %}

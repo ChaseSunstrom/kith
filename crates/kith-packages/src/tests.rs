@@ -310,6 +310,12 @@ fn desktop_packages_lint_and_render() {
         let template = &rendered.resources[1].spec["template"];
         assert_eq!(template["deviceClaims"][0], full.as_str());
         assert_eq!(template["containers"][0]["resources"]["memory"], "4Gi");
+        // Its sockets go to the seat's directory, where the seat's apps find them.
+        let env = template["containers"][0]["env"].as_array().unwrap();
+        assert!(
+            env.contains(&json!({ "name": "XDG_RUNTIME_DIR", "value": "/run/seat" })),
+            "{name}"
+        );
         assert!(rendered.notes.unwrap().contains("office-pc-seat0"));
     }
     let kiosk = load("kiosk").render(office, &[json!({ "seat": "s", "command": ["foot"] })]);
@@ -319,10 +325,15 @@ fn desktop_packages_lint_and_render() {
     );
     let panel = load("kith-panel");
     assert_eq!(panel.lint(), Vec::<String>::new());
-    let rendered = panel
-        .render(office, &[json!({ "require": { "desk": "office" } })])
-        .unwrap();
-    assert_eq!(rendered.resources[0].spec["placement"]["require"]["desk"], "office");
+    // The panel is a window of a seat's session: a client of the seat, so on its node.
+    let rendered = panel.render(office, &[json!({ "seat": "office-pc-seat0" })]).unwrap();
+    assert_eq!(
+        rendered.resources[0].spec,
+        json!({ "seat": "office-pc-seat0", "access": "client" })
+    );
+    let template = &rendered.resources[1].spec["template"];
+    assert_eq!(template["deviceClaims"][0], "office-kith-panel");
+    assert_eq!(template["containers"][0]["env"][0]["value"], "office-pc-seat0");
 }
 
 fn twin() -> Package {

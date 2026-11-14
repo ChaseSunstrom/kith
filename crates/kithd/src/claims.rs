@@ -17,6 +17,17 @@ use std::path::{Path, PathBuf};
 pub struct Held {
     pub node: String,
     pub devices: Vec<String>,
+    /// The seat it has the directory of (a workload's: that of the first claim on one), and
+    /// whether as a client: to read, and with none of the seat's devices.
+    pub seat: Option<(String, bool)>,
+}
+
+/// What a workload is given on its node: device nodes, and a seat's directory.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Granted {
+    pub devices: Vec<PathBuf>,
+    /// The seat whose directory it has at `/run/seat`, and whether to read only.
+    pub seat: Option<(String, bool)>,
 }
 
 /// The answer for every workload that names claims (its key), and every `DeviceClaim` (its key).
@@ -80,9 +91,11 @@ fn resolve_one(store: &Store, claim: &DeviceClaimSpec) -> Result<Held, String> {
     let mut devices = names;
     devices.sort();
     devices.dedup();
+    let client = claim.access == Some(Access::Client);
     Ok(Held {
         node: list(&nodes),
         devices,
+        seat: claim.seat.clone().map(|seat| (seat, client)),
     })
 }
 
@@ -128,7 +141,17 @@ pub fn resolve(store: &Store) -> Claims {
         .filter_map(Value::as_str)
         .collect();
     let mut wanting = claimants(store);
-    wanting.sort_by_key(|(key, ..)| (!recorded.contains(key.as_str()), key.clone()));
+    // (Those with a client claim after the others: a client asks who holds its seat.)
+    let client = |namespace: &str, names: &[String]| {
+        let of = |name: &String| known.get(&format!("DeviceClaim/{namespace}/{name}"));
+        let is = |(_, found): &(bool, Result<Held, String>)| matches!(found, Ok(held) if matches!(held.seat, Some((_, true))));
+        names.iter().filter_map(of).any(is)
+    };
+    wanting.sort_by_key(|(key, namespace, names)| {
+        (!recorded.contains(key.as_str()), client(namespace, names), key.clone())
+    });
+    // The seats that are held, and the namespaces of who holds each: its sessions'.
+    let mut sessions: BTreeSet<(String, String)> = BTreeSet::new();
     // Per Device: (claim key, holder, exclusively) for each way it is held.
     let mut taken: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
     let mut holders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -137,6 +160,7 @@ pub fn resolve(store: &Store) -> Claims {
         let outcome = (|| {
             let mut node: Option<&str> = None;
             let mut devices = BTreeSet::new();
+            let mut seat: Option<(String, bool)> = None;
             for name in &names {
                 let claim = format!("DeviceClaim/{namespace}/{name}");
                 let (shared, found) = known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
@@ -148,6 +172,27 @@ pub fn resolve(store: &Store) -> Claims {
                     ));
                 }
                 node = Some(&held.node);
+                // (One `/run/seat`: a client of one seat is not also of another, nor its holder.)
+                if let (Some(first), Some(this)) = (&seat, &held.seat)
+                    && first != this
+                    && (first.1 || this.1)
+                {
+                    return Err(format!(
+                        "DeviceClaim {name}: a client of a seat names no other seat, and does not hold its own"
+                    ));
+                }
+                seat = seat.or(held.seat.clone());
+                // A client takes no Device: it is beside whoever holds them. And it is an
+                // app of its own namespace's session, not of another's: whoever may write a
+                // claim in one namespace is not thereby let into a session of another.
+                if let Some((seat, true)) = &held.seat {
+                    if !sessions.contains(&(seat.clone(), namespace.clone())) {
+                        return Err(format!(
+                            "waiting for DeviceClaim {name}: no workload of this namespace holds Seat {seat}"
+                        ));
+                    }
+                    continue;
+                }
                 for device in &held.devices {
                     let mut ways = taken.get(device).into_iter().flatten();
                     let clash = ways.find(|(_, by, exclusive)| *by != key && (*exclusive || !shared));
@@ -168,21 +213,27 @@ pub fn resolve(store: &Store) -> Claims {
             Ok(Held {
                 node,
                 devices: devices.into_iter().collect(),
+                seat,
             })
         })();
-        if let Ok(held) = &outcome {
+        if outcome.is_ok() {
             for name in &names {
                 let claim = format!("DeviceClaim/{namespace}/{name}");
                 let shared = known[&claim].0;
                 holders.entry(claim.clone()).or_default().insert(key.clone());
-                for device in &known[&claim].1.as_ref().expect("it resolved").devices {
+                let found = known[&claim].1.as_ref().expect("it resolved");
+                match &found.seat {
+                    Some((_, true)) => continue,
+                    Some((seat, false)) => drop(sessions.insert((seat.clone(), namespace.clone()))),
+                    None => {}
+                }
+                for device in &found.devices {
                     taken
                         .entry(device.clone())
                         .or_default()
                         .push((claim.clone(), key.clone(), !shared));
                 }
             }
-            debug_assert!(!held.devices.is_empty());
         }
         claims.owners.insert(key, outcome);
     }
@@ -190,7 +241,13 @@ pub fn resolve(store: &Store) -> Claims {
         let status = match found {
             Ok(held) => {
                 let holding = holders.remove(&claim).unwrap_or_default();
-                json!({ "node": held.node, "devices": held.devices, "holders": holding })
+                // (A client holds no Device: its holders are the seat's apps.)
+                let devices = if matches!(held.seat, Some((_, true))) {
+                    Vec::new()
+                } else {
+                    held.devices
+                };
+                json!({ "node": held.node, "devices": devices, "holders": holding })
             }
             // (Who held it still does when it is back: a Device gone for a moment, a USB
             // one plugged in again, is not the holder's turn lost.)
@@ -218,28 +275,45 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
         .collect()
 }
 
-/// The device nodes to give each workload that is placed on `me` with claims: its key and
-/// the paths, for what runs there. Only `Device`s of `me` are ever in it. `sys` is `/sys`.
+/// What to give each workload that is placed on `me` with claims: its key, the paths of
+/// its device nodes and the seat whose directory it has, for what runs there. Only
+/// `Device`s of `me` are ever in it. `sys` is `/sys`.
 ///
 /// A plain host process (an exec unit) sees all of `/dev` already and needs none of this;
 /// only a container is given these.
-pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Vec<PathBuf>> {
+pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted> {
     let mut granted = BTreeMap::new();
     for (key, outcome) in resolve(store).owners {
         let Ok(held) = outcome else { continue };
         if held.node != me {
             continue;
         }
+        // A client of a seat draws on the seat's GPUs and has no more of them: the render
+        // nodes, and the nodes of NVIDIA's driver but the one that sets a screen's mode.
+        let drawn = held.seat.as_ref().filter(|(_, client)| *client);
+        let drawn = drawn.and_then(|(seat, _)| store.get(&format!("Seat/{seat}")));
+        let drawn = drawn.and_then(|seat| serde_json::from_value::<SeatSpec>(seat.spec.clone()).ok());
+        let drawn = drawn.map(|seat| seat.devices).unwrap_or_default();
         let mut paths = BTreeSet::new();
-        for name in &held.devices {
+        let all = held.devices.iter().map(|name| (name, true));
+        for (name, whole) in all.chain(drawn.iter().map(|name| (name, false))) {
             let Some(device) = store.get(&format!("Device/{name}")) else {
                 continue;
             };
             let Ok(spec) = serde_json::from_value::<DeviceSpec>(device.spec.clone()) else {
                 continue;
             };
+            if spec.node != me || !(whole || spec.class == DeviceClass::Gpu) {
+                continue;
+            }
+            // (What comes with it: the nodes of NVIDIA's driver.)
+            let nodes = spec
+                .nodes
+                .iter()
+                .filter(|node| whole || !node.ends_with("/nvidia-modeset"));
+            paths.extend(nodes.map(PathBuf::from));
             // (A display has no path: it grants nothing.)
-            let Some(path) = spec.path.filter(|_| spec.node == me) else {
+            let Some(path) = spec.path else {
                 continue;
             };
             if spec.class == DeviceClass::Gpu {
@@ -254,11 +328,12 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Vec<Path
                     }
                 }
             }
-            paths.insert(PathBuf::from(path));
-            // (What comes with it: the nodes of NVIDIA's driver.)
-            paths.extend(spec.nodes.iter().map(PathBuf::from));
+            if whole {
+                paths.insert(PathBuf::from(path));
+            }
         }
-        granted.insert(key, paths.into_iter().collect());
+        let (devices, seat) = (paths.into_iter().collect(), held.seat);
+        granted.insert(key, Granted { devices, seat });
     }
     granted
 }
@@ -539,6 +614,118 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
         );
     }
 
+    /// An app as its own workload: a client of a seat is on the seat's node beside the
+    /// session, holds none of its devices, and is given the GPU's render node and the
+    /// seat's directory to read.
+    #[test]
+    fn a_client_of_a_seat_is_beside_its_session_and_takes_none_of_its_devices() {
+        let nvidia = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-gpu-card0 }\n\
+                      spec: { node: a, class: gpu, path: /dev/dri/card0, nodes: [/dev/nvidiactl, /dev/nvidia-modeset] }\n";
+        let source = [
+            nvidia,
+            &claim("desk", "{ seat: a-seat0 }"),
+            &claim("apps", "{ seat: a-seat0, access: client }"),
+            &claim("cam", "{ device: a-camera-video0 }"),
+            &workload("session", "[desk]"),
+            &workload("editor", "[apps]"),
+            &workload("call", "[cam, apps]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let claims = settle(&mut store);
+        let seat_devices = vec!["a-display-card0-hdmi-a-1".to_string(), "a-gpu-card0".to_string()];
+        assert_eq!(
+            held(&claims, "Workload/default/session"),
+            Ok(("a".into(), seat_devices))
+        );
+        // Any number of clients, each on the seat's node, none holding a Device of it.
+        assert_eq!(held(&claims, "Workload/default/editor"), Ok(("a".into(), vec![])));
+        assert_eq!(
+            held(&claims, "Workload/default/call"),
+            Ok(("a".into(), vec!["a-camera-video0".to_string()]))
+        );
+        // The seat's apps are the holders of its client claims, which hold no Device.
+        let apps = store.get("DeviceClaim/default/apps").unwrap().status.clone().unwrap();
+        assert_eq!(
+            apps["holders"],
+            json!(["Workload/default/call", "Workload/default/editor"])
+        );
+        assert_eq!(apps["devices"], json!([]));
+
+        let root = sys("client");
+        let on_a = granted(&store, "a", &root);
+        let paths = |key: &str| {
+            on_a[key]
+                .devices
+                .iter()
+                .map(|p| p.to_str().unwrap())
+                .collect::<Vec<_>>()
+        };
+        // The session: the card and all that comes with it, and the seat's directory to write.
+        assert_eq!(
+            paths("Workload/default/session"),
+            [
+                "/dev/dri/card0",
+                "/dev/dri/renderD128",
+                "/dev/nvidia-modeset",
+                "/dev/nvidiactl"
+            ]
+        );
+        assert_eq!(on_a["Workload/default/session"].seat, Some(("a-seat0".into(), false)));
+        // An app: the render node, not the card, nor what sets a screen's mode; the directory to read.
+        assert_eq!(
+            paths("Workload/default/editor"),
+            ["/dev/dri/renderD128", "/dev/nvidiactl"]
+        );
+        assert_eq!(on_a["Workload/default/editor"].seat, Some(("a-seat0".into(), true)));
+        assert_eq!(
+            paths("Workload/default/call"),
+            ["/dev/dri/renderD128", "/dev/nvidiactl", "/dev/video0"]
+        );
+        // An app is of its own namespace's session. With none on the seat it waits; and a
+        // claim written in another namespace than the session's lets nobody into it.
+        let apps = [
+            claim("apps", "{ seat: a-seat0, access: client }"),
+            workload("editor", "[apps]"),
+        ]
+        .concat();
+        let waits = Err("waiting for DeviceClaim apps: no workload of this namespace holds Seat a-seat0".to_string());
+        assert_eq!(held(&resolve(&self::store(&apps)), "Workload/default/editor"), waits);
+        let elsewhere = apps.replace("name: apps }", "name: apps, namespace: other }");
+        let elsewhere = elsewhere.replace("name: editor }", "name: editor, namespace: other }");
+        // (And claiming the seat for itself there, which waits behind the session, is no way in.)
+        let pushes = [claim("desk", "{ seat: a-seat0 }"), workload("pushes", "[desk]")].concat();
+        let pushes = pushes
+            .replace("name: desk }", "name: desk, namespace: other }")
+            .replace("name: pushes }", "name: pushes, namespace: other }");
+        let mut store = self::store(&[source.as_str(), &elsewhere, &pushes].concat());
+        let claims = settle(&mut store);
+        assert!(held(&claims, "Workload/default/editor").is_ok());
+        let pushed = held(&claims, "Workload/other/pushes").unwrap_err();
+        assert!(pushed.contains("held by Workload/default/session"), "{pushed}");
+        assert_eq!(held(&claims, "Workload/other/editor"), waits);
+        assert!(!granted(&store, "a", &root).contains_key("Workload/other/editor"));
+        let theirs = store.get("DeviceClaim/other/apps").unwrap().status.clone().unwrap();
+        assert_eq!(theirs["holders"], json!([]));
+        // One seat's directory is one workload's: a client that would also hold the seat is
+        // refused in either order, beside a session (which is not disturbed) or with none.
+        let greedy = |with: &str, both: &str| {
+            let store = self::store(&[with, &claim("mine", "{ seat: a-seat0 }"), &workload("greedy", both)].concat());
+            let claims = resolve(&store);
+            (held(&claims, "Workload/default/greedy").unwrap_err(), claims)
+        };
+        for both in ["[apps, desk]", "[desk, apps]"] {
+            assert!(held(&greedy(&source, both).1, "Workload/default/session").is_ok());
+        }
+        let alone = claim("apps", "{ seat: a-seat0, access: client }");
+        let refused = greedy(&alone, "[mine, apps]").0;
+        assert!(refused.contains("a client of a seat names no other seat"), "{refused}");
+        // A client is of a seat, and of nothing else.
+        let wrong = claim("apps", "{ device: a-gpu-card0, access: client }");
+        assert!(Resource::from_source(&wrong).unwrap().remove(0).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A made-up `/sys` with a render node for `card0`.
     fn sys(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("kith-claims-{}-{name}", std::process::id()));
@@ -563,6 +750,7 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
         let on_a = granted(&store, "a", &root);
         let paths = |key: &str| {
             on_a[key]
+                .devices
                 .iter()
                 .map(|p| p.to_str().unwrap().to_string())
                 .collect::<Vec<_>>()
@@ -578,10 +766,10 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
         let empty = sys("none");
         std::fs::remove_dir_all(empty.join("class")).unwrap();
         assert_eq!(
-            granted(&store, "b", &empty)["Workload/default/far"],
+            granted(&store, "b", &empty)["Workload/default/far"].devices,
             [PathBuf::from("/dev/dri/card0")]
         );
-        assert_eq!(granted(&store, "a", &empty)["Workload/default/kiosk"].len(), 2);
+        assert_eq!(granted(&store, "a", &empty)["Workload/default/kiosk"].devices.len(), 2);
         // A Device that lists further nodes (an NVIDIA card's) gives them with its own.
         let nvidia = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-gpu-card1 }\n\
                       spec: { node: a, class: gpu, path: /dev/dri/card1, nodes: [/dev/nvidiactl, /dev/nvidia0] }\n";
@@ -592,8 +780,14 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
         ]
         .concat();
         assert_eq!(
-            granted(&self::store(&source), "a", &empty)["Workload/default/train"],
+            granted(&self::store(&source), "a", &empty)["Workload/default/train"].devices,
             ["/dev/dri/card1", "/dev/nvidia0", "/dev/nvidiactl"].map(PathBuf::from)
+        );
+        // And a card with no node of its own (no DRM card) still gives those of its driver.
+        let source = source.replace("path: /dev/dri/card1, ", "");
+        assert_eq!(
+            granted(&self::store(&source), "a", &empty)["Workload/default/train"].devices,
+            ["/dev/nvidia0", "/dev/nvidiactl"].map(PathBuf::from)
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);

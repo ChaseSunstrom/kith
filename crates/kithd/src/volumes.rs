@@ -652,6 +652,7 @@ spec: { node: a, path: tiny, size: 1Gi }
         let device = Ok(crate::claims::Held {
             node: "b".into(),
             devices: vec!["b-gpu".into()],
+            seat: None,
         });
         let on_a = found.owners.get("Workload/default/db");
         assert_eq!(

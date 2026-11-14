@@ -1,0 +1,9 @@
+# The seat whose session the panel is a window of: the session's sockets and its GPU's
+# render node, and none of the seat's devices.
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata:
+  name: {{ name }}
+spec:
+  seat: {{ values.seat | tojson }}
+  access: client

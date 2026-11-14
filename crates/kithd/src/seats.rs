@@ -14,7 +14,7 @@ use axum::extract::{Path as Named, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use kith_api::kinds::{Activity, DeviceClaimSpec, SeatSpec, Template, YieldTo};
+use kith_api::kinds::{Access, Activity, DeviceClaimSpec, SeatSpec, Template, YieldTo};
 use kith_api::store::Store;
 use kith_sched::Amount;
 use kith_store::Command;
@@ -43,7 +43,9 @@ fn holders(store: &Store) -> BTreeMap<String, Vec<String>> {
         let names = owner.spec["template"]["deviceClaims"].as_array().into_iter().flatten();
         let seats = names.filter_map(|name| {
             let claim = store.get(&format!("DeviceClaim/{namespace}/{}", name.as_str()?))?;
-            serde_json::from_value::<DeviceClaimSpec>(claim.spec.clone()).ok()?.seat
+            let claim = serde_json::from_value::<DeviceClaimSpec>(claim.spec.clone()).ok()?;
+            // (A client of a seat holds none of it.)
+            claim.seat.filter(|_| claim.access != Some(Access::Client))
         });
         let seats: Vec<String> = seats.collect();
         if !seats.is_empty() {
@@ -258,6 +260,13 @@ spec:
         let (nodes, owners) = reserves(&both);
         assert_eq!((nodes["a"].cpu, owners.len()), (2.0, 1));
         assert_eq!(owners["Workload/default/also"].cpu, 2.0);
+        // An app of the seat (a client) is not its holder: the reserve is the session's still.
+        let app = "---\napiVersion: kith.dev/v1\nkind: DeviceClaim\nmetadata: { name: apps }\nspec: { seat: a-seat0, access: client }\n---\napiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: app }\nspec: { template: { exec: [{ name: run, command: [sleep, inf] }], deviceClaims: [apps] } }\n";
+        let with_app = self::store(&format!("{SEATED}{app}"));
+        let (nodes, owners) = reserves(&with_app);
+        assert_eq!((nodes["a"].cpu, owners.len()), (2.0, 1));
+        assert_eq!(owners["Workload/default/desktop"].cpu, 2.0);
+        assert!(!tunes(&with_app, "a").contains_key("Workload/default/app"));
         // On its node the holder's units are guaranteed the memory; on another node nothing is said.
         assert_eq!(
             tunes(&store, "a")["Workload/default/desktop"],

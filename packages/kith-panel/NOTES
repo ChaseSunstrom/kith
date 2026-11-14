@@ -1,1 +1,2 @@
-{{ name }} runs {{ values.image }}.
+{{ name }} runs {{ values.image }} as a window of the session on the seat {{ values.seat }}.
+The seat's other apps are the holders of its client claims: kith get deviceclaims -A -o yaml.

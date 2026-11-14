@@ -128,6 +128,23 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
+- **An app of a seat is in its session.** A workload with a claim on a seat that says
+  `access: client` is given the seat's directory, where the session's Wayland and
+  PipeWire sockets are, and connects as any program the session started would: it can
+  put windows over others, and has what the compositor and the sound server give a
+  client (the clipboard, sound in and out, a screen where the compositor shares one).
+  It is given no input device and not the GPU's card (on NVIDIA's driver it has the
+  driver's own nodes, all but the one that sets a screen's mode), and cannot write the
+  seat's directory. kith puts nothing between an app and the session. What decides who
+  gets in is the namespace: a client is placed only while a workload of its own
+  namespace holds the seat, so whoever may apply a DeviceClaim and a Workload in the
+  session's namespace can put a program in that session, without waiting for the seat
+  as a second holder would, and nobody of another namespace can, unless the session's
+  own claim says `shared`: a seat held so is held with whoever else claims it `shared`,
+  of any namespace, its directory and its apps with it (the desktop packages hold theirs
+  exclusively). Within the namespace the directory's owner is all there is: it is the
+  session's user's alone, a template says which user its container is, and root in a pod
+  on kith OS is past it.
 - **A container is not a sandbox for a program you do not trust.** The filter is a list
   of what is refused: every other system call reaches the kernel, and so does a claimed
   device (a GPU's render node is a kernel driver's whole interface). There is no AppArmor

@@ -101,6 +101,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    namespaces starts a sandbox in it (this machine's bwrap), one that
                    does not is refused, one that is root is not started; a USB keyboard
                    plugged in is given to the container holding the seat as it runs;
+                   an app that is a client of the seat reaches the socket its session
+                   listens on and cannot write beside it, and another user's cannot;
                    needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
                    KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
@@ -484,8 +486,9 @@ EOF
             # one more node in its /dev that it can open, and nothing is started again for it.
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"seat"},"spec":{"seat":"n1-seat0"}},
+ {"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"apps"},"spec":{"seat":"n1-seat0","access":"client"}},
  {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"session"},"spec":{"template":{"deviceClaims":["seat"],"containers":[
-  {"name":"sees","image":"kith.test/pod:1","command":["/bin/pod","seen","/dev/input"]}]}}}]
+  {"name":"sees","image":"kith.test/pod:1","command":["/bin/pod","seen","/dev/input","/run/seat/wayland-0"]}]}}}]
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the session and its claim on the seat were not applied"
             # How many nodes it can open, by the last it said.
@@ -506,6 +509,16 @@ EOF
             comes_to "the session to open the keyboard plugged in" -gt
             grep -aq 'its input devices changed, and it has them as it runs' "$work/n1.log" || fail "the first node did not say it gave the session the keyboard as it ran"
             plug 'device_del pad'
+            # An app as a workload of its own: a client of the seat is beside the session, and
+            # finds the socket the session listens on in the seat's directory, which it may
+            # not write; one that is another user finds nothing there. (The session's socket
+            # stands in for a compositor's.)
+            app() { job "$1" '"deviceClaims":["apps"],' "\"image\":\"kith.test/pod:1\"$2,\"command\":[\"/bin/pod\",\"call\",\"/run/seat/wayland-0\"]" '^[0-9]+ succeeded'; }
+            app window ''
+            grep -q 'called: a window, wrote Err(ReadOnlyFilesystem)' "$work/window.out" || fail "an app of the seat did not reach its session's socket, or could write the seat's directory: $(cat "$work/window.out" "$work/window.err")"
+            app stranger ',"runAsUser":1000'
+            grep -q 'called: failed: PermissionDenied' "$work/stranger.out" || fail "another user's app was not kept from the session's socket: $(cat "$work/stranger.out" "$work/stranger.err")"
+
             comes_to "the session to lose the keyboard pulled" -eq
             any GET /v1/resources >"$work/found.json" || fail "the cluster's resources could not be read"
             again=$(python3 -c '
@@ -517,7 +530,7 @@ print(len(units), sum(u.get("restarts", 0) for u in units))' "$work/found.json")
             [ "$again" = '1 0' ] || fail "the session was started again for its keyboard (units, restarts): $again"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in"
             exit 0
         fi
         if [ "$test" = kube ]; then

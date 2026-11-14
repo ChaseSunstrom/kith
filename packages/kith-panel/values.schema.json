@@ -2,18 +2,21 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "seat",
     "image"
   ],
   "properties": {
+    "seat": {
+      "type": "string",
+      "minLength": 1
+    },
     "image": {
       "type": "string",
       "minLength": 1
     },
-    "require": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
-      }
+    "display": {
+      "type": "string",
+      "minLength": 1
     },
     "env": {
       "type": "object",

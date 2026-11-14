@@ -1230,7 +1230,8 @@
       "type": "string",
       "enum": [
         "exclusive",
-        "shared"
+        "shared",
+        "client"
       ]
     },
     "AccessRule": {
@@ -1631,7 +1632,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "`exclusive` where unsaid. `client` is of a seat: beside whoever holds it, with\nthe seat's directory (`/run/seat`, where its session puts its sockets) to read\nand its GPUs' render nodes, and none of its devices."
         }
       },
       "description": "Exactly one of `seat` or `device`, or a `selector` over device labels."

@@ -7,8 +7,12 @@
 //!                              adds a line to at each start, how many lines that has
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
-//!   pod seen DIR               for as long as it runs, say the names in DIR each time they
-//!                              change: those it can open with a `+`, the others with a `-`
+//!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
+//!                              change: those it can open with a `+`, the others with a `-`;
+//!                              and answer whoever connects to SOCKET (a path) with a line
+//!   pod call SOCKET            say what whoever listens on SOCKET (a path) answers, waiting
+//!                              a while for it to be there, and whether a file can be made
+//!                              beside it
 //!   pod self                   say which process it is and whose, where it finds itself
 //!   pod node b|c NUMBERS PATH  make at PATH a node of the block or character device whose
 //!                              MAJOR:MINOR the file NUMBERS holds (one of /sys), read from
@@ -67,7 +71,16 @@ fn main() {
                 writeln!(out, "{line}").expect("a line out");
             }
         }
-        ["seen", dir] => {
+        ["seen", dir, hears @ ..] if hears.len() < 2 => {
+            if let [socket] = hears {
+                let _ = std::fs::remove_file(socket);
+                let listener = std::os::unix::net::UnixListener::bind(socket).expect("the socket it answers on");
+                std::thread::spawn(move || {
+                    for mut stream in listener.incoming().flatten() {
+                        let _ = stream.write_all(b"a window\n");
+                    }
+                });
+            }
             let mut said = String::new();
             loop {
                 let names = std::fs::read_dir(dir).into_iter().flatten().flatten();
@@ -85,6 +98,26 @@ fn main() {
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
+        }
+        ["call", socket] => {
+            use std::io::ErrorKind::{ConnectionRefused, NotFound};
+            let mut tries = 0;
+            let answer = loop {
+                match std::os::unix::net::UnixStream::connect(socket) {
+                    Ok(mut stream) => {
+                        let mut said = String::new();
+                        let _ = stream.read_to_string(&mut said);
+                        break said.trim().to_string();
+                    }
+                    // (Not there yet: whoever listens may still be starting.)
+                    Err(e) if tries < 120 && matches!(e.kind(), NotFound | ConnectionRefused) => tries += 1,
+                    Err(e) => break format!("failed: {:?}", e.kind()),
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            };
+            let beside = std::path::Path::new(socket).with_file_name("made-by-a-caller");
+            let wrote = std::fs::write(beside, "x").map_err(|e| e.kind());
+            println!("called: {answer}, wrote {wrote:?}");
         }
         ["self"] => {
             let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
@@ -115,6 +148,6 @@ fn main() {
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
             println!("node: made {made}, read {read:?}");
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR | pod self | pod node b|c NUMBERS PATH"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH"),
     }
 }

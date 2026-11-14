@@ -1,6 +1,8 @@
+# The seat whose session shows the panel, as `kith get seat` names it (NODE-seat0).
+seat: seat0
 # The image that holds the panel. kith ships none: name one you built or trust.
 image: registry.example/desktop/kith-panel:1
-# Labels the node it runs on must have (the one with the session): { desk: office }.
-require: {}
+# The session's Wayland socket, in the seat's directory.
+display: /run/seat/wayland-0
 # More environment variables for the panel: NAME: value.
 env: {}
