@@ -3,7 +3,6 @@
 //! `kith.dev/v1` is stable (`stable.rs`): a field is added, never taken away or narrowed.
 //! Unknown fields are always an error, so a typo never passes silently.
 
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -13,16 +12,18 @@ type Values = serde_json::Map<String, serde_json::Value>;
 
 macro_rules! spec {
     ($($item:item)*) => {$(
-        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         $item
     )*};
 }
 
 /// An amount of CPU, memory or storage: `2`, `500m`, `2Gi`, `1.5G`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(try_from = "String", into = "String")]
-#[schemars(extend("pattern" = r"^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$"))]
+#[cfg_attr(feature = "generate", schemars(extend("pattern" = r"^[0-9]+(\.[0-9]+)?(m|k|M|G|T|Ki|Mi|Gi|Ti)?$")))]
 pub struct Quantity(String);
 
 impl TryFrom<String> for Quantity {
@@ -70,7 +71,8 @@ impl From<Quantity> for String {
 }
 
 /// `{ weight: 50, node.labels.room: closet }`: a weight plus the labels it rewards.
-#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 pub struct Preference {
     pub weight: u32,
     #[serde(flatten)]
@@ -473,7 +475,7 @@ spec! {
         /// Of a `configMap` or `secret`: its files' mode, in octal (`0400`). Without it:
         /// `0444`.
         #[serde(skip_serializing_if = "Option::is_none")]
-        #[schemars(extend("pattern" = "^0?[0-7]{3}$"))]
+        #[cfg_attr(feature = "generate", schemars(extend("pattern" = "^0?[0-7]{3}$")))]
         pub mode: Option<String>,
         /// Of a `configMap` or `secret`: mount this one file of it at `path`, and not the
         /// directory. It stays as it was when the container started.
@@ -589,6 +591,29 @@ spec! {
         /// client's bytes. Off unless true: a backend that does not expect the line breaks.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub proxy_protocol: Option<bool>,
+        /// Requests by their path, each to a Service of this one's namespace: the longest
+        /// path that fits a request wins, and a request none fits is answered 404. With
+        /// none (and no `headers`), the whole host goes to this Service and its HTTP is not
+        /// read.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub paths: Vec<ExposePath>,
+        /// Headers set on each request on its way to the backend, in place of any of the
+        /// same name the client sent.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub headers: BTreeMap<String, String>,
+    }
+
+    /// Where requests under one path go.
+    pub struct ExposePath {
+        /// `/app` fits `/app` and `/app/x`, not `/application`; `/` fits every request.
+        pub path: String,
+        /// Fits only the path itself, not what is under it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub exact: Option<bool>,
+        /// A Service of the exposing Service's namespace.
+        pub service: String,
+        /// The port of that Service.
+        pub port: u16,
     }
 
     pub enum ExposeVia { Edge }
@@ -607,6 +632,44 @@ spec! {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub clients: Vec<String>,
     }
+
+    /// Names kithd's DNS server answers as not there, for the clients it names: a ConfigMap key
+    /// or a list fetched from an https address, in the format of a hosts file or one name a line.
+    /// A listed name blocks every name under it. Exactly one of `configMap` or `url`.
+    ///
+    /// A `url` list is fetched by each node that serves DNS: the host of the list sees that
+    /// node's address and when it asks.
+    pub struct DnsBlockListSpec {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub config_map: Option<BlockListMap>,
+        /// An `https://` address; no other scheme is fetched.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+        /// The list's SHA-256 (64 hex digits): a fetched list that does not match is refused.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+        /// How often a `url` list is fetched again (`90s`, `30m`, `24h`, `7d`). Defaults to 24h;
+        /// at least 5m.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub interval: Option<String>,
+        /// What a listed name gets. Defaults to `nxdomain`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub answer: Option<DnsBlockAnswer>,
+        /// Only clients in these networks (`192.168.0.0/16`, `fd00::/8`, or one address) are
+        /// blocked. Empty: everyone is.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub clients: Vec<String>,
+    }
+
+    /// A key of a ConfigMap in `kith-system`: a list decides names for every node's clients,
+    /// so it is read from where only the cluster's admins write.
+    pub struct BlockListMap {
+        pub name: String,
+        pub key: String,
+    }
+
+    /// `nxdomain`: no such name. `unspecified`: `0.0.0.0` for A and `::` for AAAA.
+    pub enum DnsBlockAnswer { Nxdomain, Unspecified }
 
     pub struct DnsRecordSpec {
         /// Name of the `DNSZone` the record is in.
@@ -1061,7 +1124,8 @@ spec! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "UPPERCASE")]
 pub enum DnsRecordType {
     A,
@@ -1074,7 +1138,8 @@ pub enum DnsRecordType {
 }
 
 /// A port by number or by name.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum PortRef {
     Number(u16),
@@ -1703,15 +1768,106 @@ impl Spec for ServiceSpec {
             return Err("ports: needs at least one port".into());
         }
         // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
-        match &self.expose {
-            Some(expose) if !dns_name(&expose.host) => Err(format!(
+        let Some(expose) = &self.expose else { return Ok(()) };
+        if !dns_name(&expose.host) {
+            return Err(format!(
                 "expose.host: `{}` is not a domain name like `shop.example.org`",
                 expose.host
-            )),
-            Some(expose) => expose_host_refused(&expose.host).map_or(Ok(()), Err),
-            None => Ok(()),
+            ));
         }
+        if let Some(refused) = expose_host_refused(&expose.host) {
+            return Err(refused);
+        }
+        if expose.proxy_protocol == Some(true) && !(expose.paths.is_empty() && expose.headers.is_empty()) {
+            return Err(
+                "expose.proxyProtocol: not with paths or headers, whose requests say the client's address in \
+                 X-Forwarded-For"
+                    .into(),
+            );
+        }
+        if expose.paths.len() > 100 || expose.headers.len() > 32 {
+            return Err("expose: at most 100 paths and 32 headers".into());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, route) in expose.paths.iter().enumerate() {
+            // (Matched as the client sends it, byte for byte: no space, no query, nothing
+            // that is not printable ASCII.)
+            let printable = route
+                .path
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && b != b'?' && b != b'#');
+            if !route.path.starts_with('/') || !printable || route.path.len() > 1024 {
+                return Err(format!(
+                    "expose.paths[{i}].path: `{}` is not a path like `/app` (printable ASCII, no space, `?` or `#`)",
+                    route.path.escape_debug()
+                ));
+            }
+            crate::check_name(&route.service).map_err(|e| format!("expose.paths[{i}].service: {e}"))?;
+            if route.port == 0 {
+                return Err(format!("expose.paths[{i}].port: 0 is no port"));
+            }
+            let exact = route.exact == Some(true);
+            if !seen.insert((exposed_prefix(&route.path, exact), exact)) {
+                return Err(format!("expose.paths[{i}].path: `{}` is there twice", route.path));
+            }
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in &expose.headers {
+            let lower = name.to_ascii_lowercase();
+            if let Some(why) = header_refused(&lower, value) {
+                return Err(format!("expose.headers[{}]: {why}", name.escape_debug()));
+            }
+            if !names.insert(lower) {
+                return Err(format!(
+                    "expose.headers[{name}]: named twice (names are the same in any case)"
+                ));
+            }
+        }
+        Ok(())
     }
+}
+
+/// The part of an `expose.paths[].path` a request's path is matched against: a prefix
+/// loses its last `/` (`/app/` fits `/app` too, as in a Kubernetes Ingress), an exact
+/// path is kept as it is.
+pub fn exposed_prefix(path: &str, exact: bool) -> &str {
+    match exact {
+        true => path,
+        false => path.trim_end_matches('/'),
+    }
+}
+
+/// Why a header may not be set on a request by `expose.headers`, if it may not: `name`
+/// is in lower case.
+fn header_refused(name: &str, value: &str) -> Option<String> {
+    let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    if name.is_empty() || name.len() > 100 || !name.bytes().all(token) {
+        return Some("is not a header name (letters, digits and !#$%&'*+-.^_`|~)".into());
+    }
+    // Hop-by-hop headers, and what frames or addresses the request, are the connection's,
+    // not the application's: one set here would say something else than the bytes do.
+    const HOP: [&str; 9] = [
+        "connection",
+        "keep-alive",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "content-length",
+        "forwarded",
+    ];
+    if HOP.contains(&name) || name.starts_with("proxy-") {
+        return Some("is the connection's, not one to set".into());
+    }
+    if ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"].contains(&name) {
+        return Some("is set by kith itself".into());
+    }
+    // (A line break would start another header, or the body.)
+    if value.len() > 4096 || !value.bytes().all(|b| b == b'\t' || (b' '..=b'~').contains(&b)) {
+        return Some("its value has a line break, a control character or what is not ASCII in it".into());
+    }
+    None
 }
 
 impl Spec for NamespaceSpec {
@@ -1788,18 +1944,75 @@ impl Spec for DnsZoneSpec {
         if domain == "kith" || domain.ends_with(".kith") {
             return Err("domain: names under `kith` are the cluster's own".into());
         }
-        for net in &self.clients {
-            let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
-            let max = match address.parse::<std::net::IpAddr>() {
-                Ok(address) if address.is_ipv4() => 32,
-                Ok(_) => 128,
-                Err(_) => return Err(format!("clients: `{net}` is not a network like `192.168.0.0/16`")),
-            };
-            if bits.is_some_and(|bits| !bits.parse::<u8>().is_ok_and(|bits| bits <= max)) {
-                return Err(format!("clients: `{net}` has a prefix length that is not 0 to {max}"));
+        clients_checked(&self.clients)
+    }
+}
+
+/// Each of `clients` is an address or a network.
+fn clients_checked(clients: &[String]) -> Result<(), String> {
+    for net in clients {
+        let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
+        let max = match address.parse::<std::net::IpAddr>() {
+            Ok(address) if address.is_ipv4() => 32,
+            Ok(_) => 128,
+            Err(_) => return Err(format!("clients: `{net}` is not a network like `192.168.0.0/16`")),
+        };
+        if bits.is_some_and(|bits| !bits.parse::<u8>().is_ok_and(|bits| bits <= max)) {
+            return Err(format!("clients: `{net}` has a prefix length that is not 0 to {max}"));
+        }
+    }
+    Ok(())
+}
+
+/// The shortest time between two fetches of a list, so a typo cannot make a node hammer a host.
+pub const BLOCK_LIST_MIN_INTERVAL: u64 = 300;
+/// How often a list is fetched when it does not say.
+pub const BLOCK_LIST_INTERVAL: u64 = 86_400;
+
+/// Whether `url` is a plain `https://host[:port]/path` address: no user and password in it, no
+/// spaces or control characters, and a host. (The one place kithd and the checks agree on what
+/// it will fetch.)
+pub fn https_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("url: `{url}` is not an https:// address"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("url: needs a host, and no user or password in it".into());
+    }
+    if url.len() > 2048 || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        return Err("url: longer than 2048 characters, or holds a space or control character".into());
+    }
+    Ok(())
+}
+
+impl Spec for DnsBlockListSpec {
+    fn check(&self) -> Result<(), String> {
+        match (&self.config_map, &self.url) {
+            (Some(map), None) => {
+                if map.name.is_empty() || map.key.is_empty() {
+                    return Err("configMap: needs a name and a key".into());
+                }
+                if self.sha256.is_some() || self.interval.is_some() {
+                    return Err("sha256 and interval are for a `url` list".into());
+                }
+            }
+            (None, Some(url)) => https_url(url)?,
+            _ => return Err("give exactly one of configMap or url".into()),
+        }
+        if let Some(sha) = &self.sha256
+            && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err("sha256: not 64 hexadecimal digits".into());
+        }
+        if let Some(interval) = &self.interval {
+            match every(interval) {
+                Some(secs) if secs >= BLOCK_LIST_MIN_INTERVAL => {}
+                Some(_) => return Err("interval: at least 5m".into()),
+                None => return Err(format!("interval: `{interval}` is not like `30m`, `24h` or `7d`")),
             }
         }
-        Ok(())
+        clients_checked(&self.clients)
     }
 }
 

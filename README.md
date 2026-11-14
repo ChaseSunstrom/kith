@@ -150,7 +150,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 34 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 35 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -691,9 +691,44 @@ kith get dnsrecord                   # each one says `served`, or why not
   A CNAME in a zone to a name outside it is answered with the target's
   addresses from those resolvers too, so stub resolvers get one reply to use
   (the CNAME alone when they do not answer).
+- A `DNSBlockList` is names answered as not there, for the clients it names
+  (`clients`, as a zone has them; none: everyone). The names come from a key
+  of a ConfigMap in `kith-system` (`configMap: {name, key}`) or from an
+  `https://` address each node fetches itself (`url`, again every `interval`:
+  24h unless it says, 5m at least). A list is a hosts file, one name a line,
+  or a filter list's plain rules (`||ads.example^`); any other line is skipped
+  and counted. A listed name blocks every name under it. `answer: unspecified`
+  gives `0.0.0.0` and `::` in place of NXDOMAIN. The cluster's own names and
+  zones are answered first, so a list cannot hide one.
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: DNSBlockList
+  metadata: { name: ads }
+  spec:
+    url: https://lists.example/hosts.txt
+    clients: [192.168.0.0/16]
+  ```
+
+  `kith get dnsblocklist` says `loaded`, or why not; `-o yaml` has how many
+  names it holds, how many lines were skipped and when it was read. Only https
+  is fetched, from an address that is not this node's own or on its networks
+  (a list of your own goes in the ConfigMap), no redirect is followed, and no
+  more than 32 MiB is read; `sha256` names the one text that is taken. A fetch
+  that fails, or a list that does not match, leaves the last good list in use
+  and the status says why. A node holds 1,000,000 names in all its lists
+  together, 8 bytes each (100,000 names: 0.8 MB); a list that would pass that
+  is refused whole. Nothing of a list is written to disk. The host of a `url`
+  list sees each node's address and when it asks. A name that is only an alias
+  (a CNAME) of a listed name at the other resolvers is not blocked: lists name
+  the alias too, or it gets through.
+- What the other resolvers answer is kept for as long as its records say, an
+  hour at most, in 4096 answers or 1 MiB, the oldest going first; memory only.
+  A question that carries options of the client's own (its subnet, a cookie)
+  is asked each time.
 - In a cluster every node started with `--dns` answers the same names.
 
-Not yet: DNSSEC, zone transfers, and caching of upstream answers.
+Not yet: DNSSEC and zone transfers.
 
 ## Packages
 
@@ -1059,6 +1094,67 @@ ignored, not reported. Exit status: 0 everything translated, 1 something is
 in the report (the output is still printed), 2 the input could not be read.
 `nodeSelector` becomes a placement requirement, and a pod template's labels
 are added to the workload's, since kith Services select on those.
+
+### From a docker-compose file
+
+`kith import compose docker-compose.yml --node n1 -n media` prints the stack as
+kith resources, the same way: review, then `kith apply -f` it. kith does not
+run compose; this is a translation, once. kith's YAML has no anchors or merge
+keys, and no variables: `docker compose config` prints a file with both
+written out, and a value that still holds a `$` is refused by name.
+
+| compose | kith |
+|---|---|
+| a service | a Workload with `pod: true` (a network of its own, as in compose) and one container |
+| services joined by `network_mode: service:NAME` | containers of NAME's pod: they share `localhost` |
+| `ports`, `expose` | a Service of the compose name, and of `container_name` and each network alias, with the container's ports (TCP) |
+| a directory (`./config:/config`), a named volume | a Volume on the node `--node` names, and its mount (`:ro` carried) |
+| `environment`, `command`, `entrypoint`, `working_dir`, `user` | the same fields of the container |
+| `restart` | `restartPolicy` |
+| `healthcheck` with `curl` or `wget` of an http address on localhost | a `readiness` probe with its interval, timeout and retries |
+
+Refused by path and name, as `kith import k8s` does: `privileged`, `cap_add`,
+`sysctls`, `devices` (a [DeviceClaim](#claiming-hardware) is how kith gives
+hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port
+published on the node's own address, a `depends_on` condition (kith waits for
+nothing: an app retries), two networks in one file (a namespace is one
+network), an absolute host path (kith takes one in `kith-system` only, and
+never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that
+would make one name, and every key it does not know. A variable whose name
+reads as a secret (`PASSWORD`, `TOKEN`, `KEY`) is carried and said: it is in
+the output as plain text, and a Secret with `envFrom` keeps it out of the
+Workload. (The other way, a tool that writes Kubernetes YAML of the file and
+then `kith import k8s`, is two steps and was not tried here.)
+
+## Coming from Proxmox or docker compose
+
+A guest on a hypervisor is a whole system with one job. On kith the job is a Workload
+from the same image the guest would have run, its data a Volume, its name a Service;
+the system around it is not carried, because kith OS is that part. What each kind of
+guest becomes, and what is still missing:
+
+| A guest that is | Becomes | Today |
+|---|---|---|
+| a web app with one port and a data directory (a password manager, a search engine, an automation tool, a package repository) | a Workload, a Volume, a Service with `expose` | works |
+| an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS on the node's own address (the forge's SSH) does not yet |
+| a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
+| a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
+| a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name; by path, and with headers set, not yet |
+| a DNS filter | kith's own [DNS](#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
+| a mail relay, or anything on a port of the LAN that is not HTTPS | a Workload that shares its node's network (root, not a pod) | works only so; a port said in the Workload, not yet |
+| a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |
+| an app that must go out through a VPN | a Workload with an exit | not yet |
+| a VM with no image (an appliance) | a [`vms` unit](#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
+
+Moving a guest's data: stop the guest, apply the Volume, and put the directory into it
+(`kith volume put`, not yet: until then, copy it into the Volume's directory on the node
+that holds it, as [Storage](#storage) says where that is, owned by the user its
+container runs as). Move one guest at a time and
+keep the old one stopped, not deleted, until the new one has run a week.
+
+kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI,
+virtio disk and network), and that is the way to try it beside what runs today. It is
+tested in QEMU, not on Proxmox itself.
 
 ## Kinds of your own
 

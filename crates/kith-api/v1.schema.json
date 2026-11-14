@@ -324,6 +324,42 @@
       "title": "DNSZone",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
+    "DNSBlockList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "DNSBlockList"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsBlockListSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Names kithd's DNS server answers as not there: a ConfigMap key or a list fetched over https",
+      "title": "DNSBlockList",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
     "DNSRecord": {
       "type": "object",
       "additionalProperties": false,
@@ -1353,6 +1389,23 @@
       ],
       "description": "Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3\nhash, and `kith blob put` makes it."
     },
+    "BlockListMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "key"
+      ],
+      "description": "A key of a ConfigMap in `kith-system`: a list decides names for every node's clients,\nso it is read from where only the cluster's admins write."
+    },
     "ClusterSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -1701,6 +1754,70 @@
         "class"
       ]
     },
+    "DnsBlockAnswer": {
+      "type": "string",
+      "enum": [
+        "nxdomain",
+        "unspecified"
+      ],
+      "description": "`nxdomain`: no such name. `unspecified`: `0.0.0.0` for A and `::` for AAAA."
+    },
+    "DnsBlockListSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "configMap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BlockListMap"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "An `https://` address; no other scheme is fetched."
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The list's SHA-256 (64 hex digits): a fetched list that does not match is refused."
+        },
+        "interval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How often a `url` list is fetched again (`90s`, `30m`, `24h`, `7d`). Defaults to 24h;\nat least 5m."
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsBlockAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a listed name gets. Defaults to `nxdomain`."
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Only clients in these networks (`192.168.0.0/16`, `fd00::/8`, or one address) are\nblocked. Empty: everyone is."
+        }
+      },
+      "description": "Names kithd's DNS server answers as not there, for the clients it names: a ConfigMap key\nor a list fetched from an https address, in the format of a hosts file or one name a line.\nA listed name blocks every name under it. Exactly one of `configMap` or `url`.\n\nA `url` list is fetched by each node that serves DNS: the host of the list sees that\nnode's address and when it asks."
+    },
     "DnsRecordSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -1908,6 +2025,20 @@
             "null"
           ],
           "description": "Send the backend a PROXY protocol v1 line with the client's address before the\nclient's bytes. Off unless true: a backend that does not expect the line breaks."
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExposePath"
+          },
+          "description": "Requests by their path, each to a Service of this one's namespace: the longest\npath that fits a request wins, and a request none fits is answered 404. With\nnone (and no `headers`), the whole host goes to this Service and its HTTP is not\nread."
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Headers set on each request on its way to the backend, in place of any of the\nsame name the client sent."
         }
       },
       "required": [
@@ -1915,6 +2046,40 @@
         "via"
       ],
       "description": "Public HTTPS through an edge node."
+    },
+    "ExposePath": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "`/app` fits `/app` and `/app/x`, not `/application`; `/` fits every request."
+        },
+        "exact": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Fits only the path itself, not what is under it."
+        },
+        "service": {
+          "type": "string",
+          "description": "A Service of the exposing Service's namespace."
+        },
+        "port": {
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "The port of that Service."
+        }
+      },
+      "required": [
+        "path",
+        "service",
+        "port"
+      ],
+      "description": "Where requests under one path go."
     },
     "ExposeVia": {
       "type": "string",
