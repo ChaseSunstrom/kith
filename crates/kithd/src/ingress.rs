@@ -216,6 +216,15 @@ fn validity(der: &[u8]) -> Option<(u64, u64)> {
     Some((from, time(tag, until)?))
 }
 
+/// Is what an authority gave worth keeping at `at`: `host`'s, with its key, and not due
+/// for another at once (one that has run out, or is not good yet, would be served instead
+/// of the one held).
+fn fresh(chain: &str, key: &str, host: &str, at: u64) -> bool {
+    let read = crate::pki::certified(chain, key, host).ok();
+    let good = read.and_then(|read| validity(read.cert.first()?));
+    good.is_some_and(|(from, until)| !due(from, until, at))
+}
+
 /// Is a certificate good from `from` until `until` due for another one at `at`? Not
 /// good yet, or in the last third of its time.
 fn due(from: u64, until: u64, at: u64) -> bool {
@@ -649,16 +658,21 @@ async fn order(
         return;
     }
     eprintln!("kithd: ingress: asking {directory} for a certificate for {host}");
-    let ordered = match acme::order(directory, account, host).await {
-        Ok((chain, key)) => {
+    // (An order has ten minutes: an authority that never finishes holds up no other host's.)
+    let whole = tokio::time::timeout(Duration::from_secs(600), acme::order(directory, account, host)).await;
+    let ordered = match whole.unwrap_or(Err("the authority did not finish in ten minutes".into())) {
+        Ok((chain, key)) if fresh(&chain, &key, host, now()) => {
             let secret = tls_secret(host, of);
             put(shared, &secret, json!({ "tls.crt": chain, "tls.key": key })).await
         }
+        Ok(_) => Err("the authority's certificate is not good now".into()),
         Err(e) => Err(e),
     };
     let tls = match ordered {
         Ok(()) => json!({ "state": "ready", "secret": tls_secret(host, of), "source": "acme", "by": me, "at": now() }),
         Err(e) => {
+            // (What the authority said is in it: the status keeps a few lines of it, no more.)
+            let e: String = e.chars().take(500).collect();
             eprintln!("kithd: ingress: no certificate for {host}: {e}");
             json!({ "state": "error", "message": e, "by": me, "at": now() })
         }
@@ -786,6 +800,12 @@ mod tests {
         assert!(due(from, until, from + 60 * 86400) && due(from, until, until + 1));
         let read = crate::pki::certified(&certificate.pem(), &key.serialize_pem(), "shop.example.org").unwrap();
         assert_eq!(validity(&read.cert[0]), Some((from, until)));
+        // What an authority gives is kept while it is good, not once it has run out,
+        // before it starts, or for another host.
+        let fresh = |host, at| fresh(&certificate.pem(), &key.serialize_pem(), host, at);
+        assert!(fresh("shop.example.org", from + 86400));
+        assert!(!fresh("shop.example.org", until + 1) && !fresh("shop.example.org", from - 1));
+        assert!(!fresh("other.example.org", from + 86400));
         assert!(
             crate::pki::certified(
                 &certificate.pem(),

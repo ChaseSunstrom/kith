@@ -371,11 +371,15 @@ mod tests {
                     log.lock().unwrap().push(path.clone());
                     let normal = ca_answer(&at, names, &issuer, &chain, &path, &body);
                     let (status, headers, body) = change(&path, &normal);
-                    let mut reply = format!(
-                        "HTTP/1.1 {status} x\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        body.len()
-                    );
-                    reply += &headers.iter().map(|h| format!("{h}\r\n")).collect::<String>();
+                    // (`no-length` among the headers: the body's length is not said, and
+                    // it ends where the connection does.)
+                    let length = match headers.iter().any(|h| h == "no-length") {
+                        true => String::new(),
+                        false => format!("content-length: {}\r\n", body.len()),
+                    };
+                    let mut reply = format!("HTTP/1.1 {status} x\r\n{length}connection: close\r\n");
+                    let said = headers.iter().filter(|h| *h != "no-length");
+                    reply += &said.map(|h| format!("{h}\r\n")).collect::<String>();
                     reply += "\r\n";
                     let _ = socket.write_all(reply.as_bytes()).await;
                     let _ = socket.write_all(&body).await;
@@ -398,16 +402,23 @@ mod tests {
 
     #[tokio::test]
     async fn acme_capped_answers_are_read_to_a_cap() {
-        // Each kind of answer on its own, one byte past its cap: refused, not held.
+        // Each kind of answer on its own, one byte past its cap: refused, not held, whether
+        // its length was said before it or not.
         let account = an_account();
-        for (path, cap) in [
-            ("/directory", 64 * 1024),
-            ("/order", 64 * 1024),
-            ("/authz/1", 64 * 1024),
-            ("/cert/1", 256 * 1024),
+        for (path, cap, length) in [
+            ("/directory", 64 * 1024, ""),
+            ("/order", 64 * 1024, ""),
+            ("/authz/1", 64 * 1024, ""),
+            ("/cert/1", 256 * 1024, ""),
+            ("/directory", 64 * 1024, "no-length"),
+            ("/cert/1", 256 * 1024, "no-length"),
         ] {
             let (base, _) = authority("shop.example.org", move |asked, answer| match asked == path {
-                true => (200, vec![], vec![b'x'; cap + 1]),
+                true => (
+                    200,
+                    length.split_whitespace().map(str::to_string).collect(),
+                    vec![b'x'; cap + 1],
+                ),
                 false => answer.clone(),
             })
             .await;
