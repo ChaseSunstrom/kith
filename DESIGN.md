@@ -49,7 +49,8 @@ wear Line map.
 - Defaults to avoid 1, 3, 5, 7, 12.
 
 ## Allowed exceptions
-- None: the face is the page's own now.
+- None in what is seen: the face is the page's own now.
+- In the CSS of the website, a line may be drawn as a background of one colour (`linear-gradient(c, c)`, sized to the line: the underlines, the tracks) and a stop's dot as a hard-edged `radial-gradient`. Neither fades; a background that goes from one colour to another is the banned thing. The web UI draws its lines with borders and positioned boxes and needs neither.
 
 ## The website (`docs/`, GitHub Pages)
 

@@ -1,67 +1,73 @@
-/* The kith board. Direction and the reasons for each token: DESIGN.md at the repo root.
-   The colours are the brand's (PLAN.md 11): ink, paper and the one blue. */
+/* The kith board, drawn the way the mark is: a line map. Ink on paper, one blue line for
+   what is live; lines and stops, not boxes. The direction and the reason for each token:
+   DESIGN.md at the repo root. The colours are the brand's (PLAN.md 11). */
+@font-face {
+  font-family: Overpass;
+  src: url(overpass.woff2) format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
 :root {
-  --bg: #16181d;
-  --panel: #1c1f27;
-  --raised: #242833;
-  --line: #2f3440;
-  --text: #f6f5f1;
-  --dim: #a9aebb;
-  --accent: #5b8cff;
-  --accent-text: #8fb0ff;
-  --glow: rgb(91 140 255 / 0.22);
-  --warn: #f2b84b;
-  --bad: #ff7a7a;
-  --on-accent: #0d1017;
+  --bg: #f6f5f1;
+  --sunken: #eceae3;
+  --text: #16181d;
+  --dim: #575c69;
+  --hair: #cfccc2;
+  --accent: #2f5fe0;
+  --accent-text: #2a57cf;
+  --warn: #8f5f00;
+  --bad: #c23030;
+  --on-accent: #ffffff;
+  --stroke: 3px;
   --unit: 4px;
-  --radius: 10px;
-  --radius-small: 6px;
-  --small: 12px;
-  --base: 14px;
-  --large: 20px;
-  --row: 34px;
+  --rail: 27px;
+  --small: 13px;
+  --base: 15px;
+  --large: 21px;
+  --row: 36px;
   --quick: 140ms;
+  --arrive: 220ms;
   --enter: 360ms;
+  --pop: 500ms;
   --flash: 900ms;
+  --grow: 900ms;
   --breath: 2.6s;
   --blink: 1s;
+  --step: 60ms;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
-  --sans: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --sans: Overpass, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
 }
-@media (prefers-color-scheme: light) {
+@media (prefers-color-scheme: dark) {
   :root {
-    --bg: #f6f5f1;
-    --panel: #ffffff;
-    --raised: #f1efe9;
-    --line: #dcd9d0;
-    --text: #16181d;
-    --dim: #575c69;
-    --accent: #3868e8;
-    --accent-text: #2a57cf;
-    --glow: rgb(91 140 255 / 0.18);
-    --warn: #8f5f00;
-    --bad: #c23030;
-    --on-accent: #ffffff;
+    --bg: #16181d;
+    --sunken: #20232b;
+    --text: #f6f5f1;
+    --dim: #a9aebb;
+    --hair: #383d4a;
+    --accent: #5b8cff;
+    --accent-text: #8fb0ff;
+    --warn: #f2b84b;
+    --bad: #ff7a7a;
+    --on-accent: #0d1017;
   }
 }
 
-* { box-sizing: border-box; }
+*, ::before, ::after { box-sizing: border-box; }
 html, body { height: 100%; }
 body {
   margin: 0;
   color: var(--text);
+  background: var(--bg);
   font: 400 var(--base) / 1.5 var(--sans);
   font-variant-numeric: tabular-nums;
   display: flex;
   flex-direction: column;
-  /* One light, from the top left, where the mark is. */
-  background: radial-gradient(900px 420px at 8% -10%, var(--glow), transparent 70%) fixed, var(--bg);
 }
 h1, h2, h3, p, ul, pre { margin: 0; }
 ul { padding: 0; list-style: none; }
 a { color: inherit; }
-pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-size: 13px; }
+pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-size: var(--small); }
 .dim { color: var(--dim); font-weight: 400; }
 .bad { color: var(--bad); }
 .ok { color: var(--accent-text); }
@@ -69,38 +75,44 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
 [hidden] { display: none !important; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* The bar: the mark, who is looking, and whether it is live. */
+/* The bar: the mark, who is looking, and whether it is live. The mark's stem goes on down
+   the page as the line the kinds are stops on. */
 .bar {
   display: flex;
   align-items: center;
   gap: calc(var(--unit) * 3);
   padding: calc(var(--unit) * 3) calc(var(--unit) * 5);
 }
-.brand { display: flex; align-items: center; gap: calc(var(--unit) * 2); text-decoration: none; }
-.brand h1 { font-size: var(--large); font-weight: 600; letter-spacing: -0.02em; }
+.brand { position: relative; display: flex; align-items: center; gap: 10px; text-decoration: none; }
+.brand::after { content: ""; position: absolute; left: 6px; top: 33px; width: var(--stroke); height: 16px; background: var(--text); }
+.brand h1 { font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
 .mark { width: 30px; height: 36px; overflow: visible; }
-.mark line { stroke: var(--text); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 40; animation: draw 900ms var(--ease) both; }
-.mark circle { fill: var(--text); animation: pop 500ms var(--ease) both; animation-delay: 500ms; }
-.mark .hub { fill: var(--accent); animation-delay: 300ms; }
-.mark .ring { fill: none; stroke: var(--accent); stroke-width: 1.5; transform-box: fill-box; transform-origin: center; animation: ring var(--breath) ease-out infinite; }
-.who { padding: 2px calc(var(--unit) * 2.5); border: 1px solid var(--line); border-radius: 999px; font-size: var(--small); }
+.mark line { stroke: var(--text); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 40; animation: draw var(--grow) var(--ease) both; }
+.mark circle { fill: var(--text); transform-box: fill-box; transform-origin: center; animation: pop var(--pop) var(--ease) both; animation-delay: var(--pop); }
+.mark .hub { fill: var(--accent); animation-delay: var(--enter); }
+.mark .ring { fill: none; stroke: var(--accent); stroke-width: 1.5; animation: ring var(--breath) ease-out infinite; }
+.who { font-size: var(--small); color: var(--dim); }
 .who:empty { display: none; }
-.link { display: inline-flex; align-items: center; gap: calc(var(--unit) * 2); font-size: var(--small); font-weight: 600; }
-.link::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 0 currentColor; }
+#generation { font-size: var(--small); }
+/* The link to kithd is a stop too: filled when live, amber while it waits, a broken ring when lost. */
+.link { display: inline-flex; align-items: center; gap: calc(var(--unit) * 2); font-size: var(--small); font-weight: 700; }
+.link::before { content: ""; width: 14px; height: 14px; border: var(--stroke) solid currentColor; border-radius: 50%; }
 .link.ok { color: var(--accent-text); }
-.link.ok::before { animation: beacon var(--breath) ease-out infinite; }
+.link.ok::before { background: currentColor; animation: beat var(--breath) ease-in-out infinite; }
 .link.wait { color: var(--warn); }
 .link.wait::before { animation: blink var(--blink) ease-in-out infinite; }
 .link.bad { color: var(--bad); }
+.link.bad::before { border-width: 2px; border-style: dashed; }
 
-/* The board: 01 down the side, 02 across the top, 03 and 04 side by side. */
+/* The board: 01 down the side, 02 across the top, 03 and 04 side by side. A part hangs
+   from a rule; nothing is boxed. */
 .board {
   flex: 1;
   min-height: 0;
   display: grid;
-  gap: calc(var(--unit) * 3);
+  gap: calc(var(--unit) * 7) calc(var(--unit) * 9);
   padding: 0 calc(var(--unit) * 5) calc(var(--unit) * 5);
-  grid-template-columns: 216px minmax(0, 1fr) minmax(0, 1.25fr);
+  grid-template-columns: 224px minmax(0, 1fr) minmax(0, 1.25fr);
   grid-template-rows: auto minmax(0, 1fr);
   grid-template-areas: "kinds pulse pulse" "kinds list detail";
 }
@@ -114,25 +126,19 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
   display: flex;
   flex-direction: column;
   gap: calc(var(--unit) * 3);
-  padding: calc(var(--unit) * 4);
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  padding-top: calc(var(--unit) * 3);
+  border-top: var(--stroke) solid var(--text);
   animation: rise var(--enter) var(--ease) both;
 }
-.pulse { animation-delay: 60ms; }
-.list { animation-delay: 120ms; }
-.detail { animation-delay: 180ms; }
-.panel > h2, dialog > h2 { display: flex; align-items: baseline; gap: calc(var(--unit) * 2); flex-wrap: wrap; font-size: var(--base); font-weight: 600; overflow-wrap: anywhere; }
-.panel > h2 b {
-  font: 600 11px var(--mono);
-  color: var(--accent-text);
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--glow);
-}
+.pulse { animation-delay: var(--step); }
+.list { animation-delay: calc(var(--step) * 2); }
+.detail { animation-delay: calc(var(--step) * 3); }
+.panel > h2, dialog > h2 { display: flex; align-items: baseline; gap: calc(var(--unit) * 2); flex-wrap: wrap; font-size: var(--base); font-weight: 800; overflow-wrap: anywhere; }
+.panel > h2 b { font-weight: 400; font-size: var(--small); color: var(--dim); }
 .panel > h2 .dim { font-size: var(--small); }
-.scroll { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.scroll { flex: 1; min-height: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--hair) transparent; }
+/* (What scrolls cuts at its edge: room there for the ring round what is in focus.) */
+#pane, #dialog-body { padding: var(--unit); margin: calc(var(--unit) * -1); }
 @media (max-width: 900px) {
   body { height: auto; }
   .bar, .board { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); }
@@ -143,178 +149,220 @@ pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-siz
   #generation { display: none; }
 }
 
-/* 01 */
+/* 01: the line from the mark, a stop for every kind. A ring where the cluster has some of
+   that kind, a tick where it has none, the blue stop where you are. */
+.kinds { position: relative; border-top: 0; padding-top: 0; animation: none; }
+.kinds::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.kinds > h2 { padding-left: var(--rail); }
+.kinds > .scroll { padding: 0 var(--unit) var(--unit) var(--rail); }
+.kinds > h2 { padding-top: calc(var(--unit) * 3); }
 .kinds h3 { font-size: var(--small); font-weight: 400; color: var(--dim); margin: calc(var(--unit) * 3) 0 var(--unit); }
 .kinds h3:first-child { margin-top: 0; }
 .kinds a {
+  position: relative;
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: calc(var(--unit) * 2);
   min-height: 30px;
-  padding: 0 calc(var(--unit) * 2.5);
+  padding-right: calc(var(--unit) * 2);
   text-decoration: none;
-  border-radius: var(--radius-small);
-  transition: background var(--quick), color var(--quick), transform var(--quick);
+  transition: color var(--quick);
 }
-.kinds a:hover { background: var(--raised); transform: translateX(2px); }
-.kinds a[aria-current] { background: var(--glow); color: var(--accent-text); font-weight: 600; }
-.count { font: 11px var(--mono); color: var(--dim); }
-.count:not(:empty) { padding: 0 6px; border-radius: 999px; background: var(--raised); }
+.kinds a::before {
+  content: "";
+  position: absolute;
+  left: calc(0.5px - var(--rail));
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin-top: -7px;
+  border: var(--stroke) solid var(--text);
+  border-radius: 50%;
+  background: var(--bg);
+}
+.kinds a::before, .kinds a:not([aria-current]):has(.count:empty)::before { transition: transform var(--quick), background var(--quick), border-color var(--quick); }
+.kinds a:not([aria-current]):has(.count:empty)::before { left: calc(9px - var(--rail)); width: 8px; height: var(--stroke); margin-top: -1.5px; border: 0; border-radius: 0; background: var(--text); }
+.kinds a:hover { color: var(--accent-text); }
+.kinds a:hover::before { transform: scale(1.2); }
+.kinds a[aria-current] { font-weight: 800; }
+.kinds a[aria-current]::before { border-color: var(--accent); background: var(--accent); }
+.count { font-size: var(--small); color: var(--dim); font-weight: 400; }
 
-/* 02: packets run the mesh, what is ready breathes, what waits blinks. */
+/* 02: the nodes as stops on lines out of the hub, with what passes between them on the
+   lines; under each thing that runs, a stop for every replica. A ring is there, a filled
+   blue ring is live, an amber ring waits, a broken red ring is gone. */
 #pulse { width: 100%; display: block; }
-#pulse text { fill: var(--dim); font: 12px var(--sans); }
-#pulse text.name { fill: var(--text); font-weight: 600; }
-.mesh { fill: none; stroke: var(--line); stroke-width: 1.5; }
-.mesh.bad { stroke: var(--bad); stroke-dasharray: 3 5; }
-.packet { fill: var(--accent); }
+#pulse text { fill: var(--dim); font: var(--small) var(--sans); }
+#pulse text.name { fill: var(--text); font-weight: 700; }
+.mesh, .run { fill: none; stroke: var(--text); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+.mesh.bad { stroke: var(--dim); stroke-dasharray: 1 7; }
+.packet { fill: var(--accent); stroke: var(--bg); stroke-width: 1.5; }
 .hub { fill: var(--accent); }
 .halo { fill: none; stroke: var(--accent); stroke-width: 1.5; transform-box: fill-box; transform-origin: center; animation: ring var(--breath) ease-out infinite; }
-.node .body { fill: var(--panel); stroke: var(--accent); stroke-width: 2; }
+.node .halo { display: none; }
+.node .body { fill: var(--bg); stroke: var(--accent); stroke-width: 3; }
 .node .core { fill: var(--accent); }
-.node.bad .body { stroke: var(--bad); }
-.node.bad .core { fill: var(--bad); }
-.node.bad .halo, .node.none .halo { display: none; }
-.node.none .body { stroke: var(--dim); }
-.node.none .core { fill: var(--dim); }
-.lamp { fill: var(--line); }
-.lamp.ok { fill: var(--accent); animation: breathe var(--breath) ease-in-out infinite; animation-delay: calc(var(--step, 0) * -0.33s); }
-.lamp.wait { fill: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
-.lamp.bad { fill: var(--bad); }
+.node:is(.bad, .none, .wait) .core { display: none; }
+.node.bad .body { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 4 3; }
+.node.none .body { stroke: var(--text); }
+.node.wait .body { stroke: var(--warn); }
+.lamp { fill: var(--bg); stroke: var(--text); stroke-width: 3; transform-box: fill-box; transform-origin: center; }
+.lamp.ok { fill: var(--accent); stroke: var(--accent); animation: beat var(--breath) ease-in-out infinite; animation-delay: calc(var(--step, 0) * -0.33s); }
+.lamp.wait { stroke: var(--warn); animation: wait var(--blink) ease-in-out infinite; }
+.lamp.bad { stroke: var(--bad); stroke-width: 2; stroke-dasharray: 3 2.5; }
 
 @keyframes draw { from { stroke-dashoffset: 40; } }
 @keyframes pop { from { transform: scale(0); } }
 @keyframes ring { from { transform: scale(1); opacity: 0.9; } to { transform: scale(2.6); opacity: 0; } }
-@keyframes beacon { from { box-shadow: 0 0 0 0 currentColor; } to { box-shadow: 0 0 0 9px transparent; } }
-@keyframes breathe { 50% { opacity: 0.5; } }
+@keyframes beat { 50% { transform: scale(0.72); } }
+@keyframes wait { 50% { fill: var(--warn); } }
 @keyframes blink { 50% { opacity: 0.25; } }
-@keyframes flash { from { background: var(--glow); } }
+@keyframes flash { from { background: var(--hair); } }
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
 @keyframes arrive { from { opacity: 0; transform: translateY(6px); } }
-@keyframes open { from { opacity: 0; transform: translateY(12px) scale(0.98); } }
+@keyframes open { from { opacity: 0; transform: translateY(12px); } }
 @keyframes slide { from { opacity: 0; transform: translateX(24px); } }
-.mark circle, .mark .ring { transform-box: fill-box; transform-origin: center; }
 
-/* 03 and every other table */
+/* 03 and every other table: rows on hairlines under one ink rule. */
 .tools { display: flex; align-items: center; gap: calc(var(--unit) * 2); flex-wrap: wrap; }
-.foot { border-top: 1px solid var(--line); padding-top: calc(var(--unit) * 3); }
+.foot { border-top: 1px solid var(--hair); padding-top: calc(var(--unit) * 3); }
 table { width: 100%; border-collapse: collapse; }
-caption { caption-side: bottom; text-align: left; padding: calc(var(--unit) * 3) calc(var(--unit) * 2); }
-th, td { height: var(--row); padding: 0 calc(var(--unit) * 2.5); text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
-th { position: sticky; top: 0; z-index: 1; background: var(--panel); color: var(--dim); font: 600 11px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; }
+caption { caption-side: bottom; text-align: left; padding: calc(var(--unit) * 3) 0; }
+th, td { height: var(--row); padding: 0 calc(var(--unit) * 2.5); text-align: left; white-space: nowrap; border-bottom: 1px solid var(--hair); }
+th { position: sticky; top: 0; z-index: 1; background: var(--bg); color: var(--dim); font: 400 var(--small) var(--sans); border-bottom-color: var(--text); }
 td { max-width: 42ch; overflow: hidden; text-overflow: ellipsis; }
-td a { font-family: var(--sans); font-size: var(--base); font-weight: 600; text-decoration: none; }
+td a { font-family: var(--sans); font-size: var(--base); font-weight: 700; text-decoration: none; transition: color var(--quick); }
 td a:hover { color: var(--accent-text); text-decoration: underline; }
 .num { text-align: right; }
 tbody tr { transition: background var(--quick); }
-tbody tr:hover { background: var(--raised); }
-tr.current { background: var(--glow); }
+/* (The open resource's row carries the blue line; its name is the heavy one.) */
+:is(th, td):first-child { border-left: var(--stroke) solid transparent; }
+tr.current td:first-child { border-left-color: var(--accent); }
+tr.current td a { font-weight: 800; }
 tr.flash { animation: flash var(--flash) ease-out; }
-.lamp-text { font-size: 10px; vertical-align: 1px; }
-.lamp-text.ok { color: var(--accent); }
-.lamp-text.wait { color: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
-.lamp-text.bad { color: var(--bad); }
-.lamp-text.none { color: var(--line); }
+.lamp-text { display: inline-block; width: 12px; height: 12px; border: var(--stroke) solid var(--text); border-radius: 50%; font-size: 0; vertical-align: middle; position: relative; top: -1px; margin-right: 4px; }
+.lamp-text.ok { border-color: var(--accent); background: var(--accent); }
+.lamp-text.wait { border-color: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
+.lamp-text.bad { border: 2px dashed var(--bad); }
+.lamp-text.none { border-color: var(--dim); }
 
-/* Controls */
+/* Controls: a field is a sunken strip of the paper on an ink line; a button is an ink
+   frame, and the one that acts is the blue. Square, all of them. */
 button, input, select, textarea, output {
   font: inherit;
   color: inherit;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-small);
-  min-height: 32px;
+  border-radius: 0;
+  min-height: 34px;
   padding: 0 calc(var(--unit) * 2.5);
-  transition: border-color var(--quick), box-shadow var(--quick), background var(--quick), transform var(--quick);
 }
-:is(input, select, textarea):hover { border-color: var(--dim); }
-:is(input, select, textarea):focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--glow); outline: none; }
+input, select, textarea, output {
+  background: var(--sunken);
+  border: 0;
+  border-bottom: 1px solid var(--text);
+  transition: border-color var(--quick);
+}
+:is(input, select, textarea):hover { border-bottom-color: var(--accent); }
+:is(input, select, textarea):focus { border-bottom-color: var(--accent); }
 textarea { padding: calc(var(--unit) * 1.5) calc(var(--unit) * 2.5); resize: vertical; width: 100%; }
-output { display: inline-flex; align-items: center; color: var(--dim); border-style: dashed; }
-input[readonly] { color: var(--dim); border-style: dashed; }
-[aria-invalid="true"] { border-color: var(--bad); }
+output { display: inline-flex; align-items: center; color: var(--dim); background: none; border-bottom-style: dashed; border-bottom-color: var(--dim); }
+input[readonly] { color: var(--dim); background: none; border-bottom-style: dashed; border-bottom-color: var(--dim); }
+/* (After the two above, and as heavy as they are: a field that is wrong stays red under the pointer and the caret.) */
+:is(input, select, textarea)[aria-invalid="true"] { border-bottom: 2px solid var(--bad); }
 .row-error { color: var(--bad); }
-button { cursor: pointer; background: var(--raised); font-weight: 600; }
-button:hover { border-color: var(--dim); transform: translateY(-1px); }
-button:active { transform: translateY(0); }
-button:disabled { opacity: 0.5; cursor: default; transform: none; }
+button { cursor: pointer; background: none; border: var(--stroke) solid var(--text); font-weight: 700; }
+button, button:not(:disabled), button.primary:not(:disabled), button.danger:not(:disabled), .tabs button:not(:disabled) { transition: background var(--quick), color var(--quick), border-color var(--quick); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-button.primary:hover { box-shadow: 0 4px 18px var(--glow); border-color: var(--accent); }
-button.danger { background: none; border-color: var(--bad); color: var(--bad); }
-button.small { min-height: 26px; min-width: 26px; padding: 0 calc(var(--unit) * 2); font-size: var(--small); }
+button.danger { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: 0.5; cursor: default; }
+/* (A frame fills under a pointer that can leave again; a finger's press would leave it filled.) */
+@media (hover: hover) {
+  button:not(:disabled):hover { background: var(--text); color: var(--bg); }
+  button.primary:not(:disabled):hover { background: var(--text); border-color: var(--text); color: var(--bg); }
+  button.danger:not(:disabled):hover { background: var(--bad); color: var(--bg); }
+  tbody tr:hover { background: var(--sunken); }
+}
+button.small { min-height: 28px; min-width: 28px; padding: 0 calc(var(--unit) * 2); border-width: 2px; font-size: var(--small); }
 #filter { width: 20ch; }
 
 /* 04 */
-.tabs { display: flex; gap: calc(var(--unit) * 1); border-bottom: 1px solid var(--line); }
-.tabs button { position: relative; border: 0; border-radius: var(--radius-small) var(--radius-small) 0 0; background: none; color: var(--dim); }
-.tabs button:hover { color: var(--text); transform: none; }
-.tabs button::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--accent); transform: scaleX(0); transition: transform 220ms var(--ease); }
+.tabs { display: flex; gap: calc(var(--unit) * 5); border-bottom: 1px solid var(--hair); }
+.tabs button { position: relative; border: 0; padding: 0; color: var(--dim); }
+.tabs button:not(:disabled):hover { background: none; color: var(--text); }
+.tabs button::after { content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: var(--stroke); background: var(--accent); transform: scaleX(0); transform-origin: left; transition: transform var(--arrive) var(--ease); }
 .tabs button[aria-selected="true"] { color: var(--text); }
 .tabs button[aria-selected="true"]::after { transform: scaleX(1); }
-#pane > * { animation: arrive 220ms var(--ease) both; }
+#pane > * { animation: arrive var(--arrive) var(--ease) both; }
 .check { overflow-wrap: anywhere; white-space: pre-wrap; flex: 1 1 24ch; font-size: var(--small); }
-.form { display: flex; flex-direction: column; gap: calc(var(--unit) * 4); }
+.form { display: flex; flex-direction: column; gap: calc(var(--unit) * 5); }
 fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
-legend { padding: 0; margin-bottom: calc(var(--unit) * 2); color: var(--dim); font: 600 11px var(--sans); letter-spacing: 0.06em; text-transform: uppercase; }
+legend { padding: 0; margin-bottom: calc(var(--unit) * 2); font-weight: 800; }
 .fields { display: flex; flex-direction: column; gap: calc(var(--unit) * 2.5); }
 .field { display: grid; grid-template-columns: minmax(10ch, 15ch) minmax(0, 1fr); gap: 2px calc(var(--unit) * 3); align-items: center; }
 .field > label { color: var(--dim); overflow-wrap: anywhere; }
 .field > :is(input, select, textarea, output) { width: 100%; }
 .hint { grid-column: 2; color: var(--dim); font-size: var(--small); }
 abbr { color: var(--accent-text); text-decoration: none; margin-left: 2px; }
-.group { border: 1px solid var(--line); border-radius: var(--radius-small); padding: 0 calc(var(--unit) * 3); transition: border-color var(--quick), background var(--quick); }
-.group[open] { padding-bottom: calc(var(--unit) * 3); background: color-mix(in srgb, var(--raised) 35%, transparent); }
-.group:hover { border-color: var(--dim); }
-.group > summary { cursor: pointer; min-height: 32px; display: flex; align-items: center; gap: var(--unit); font-weight: 600; list-style: none; }
+/* A group of fields is a branch: closed, a row on a hairline; open, its fields hang from an ink line. */
+.group { border-top: 1px solid var(--hair); border-left: var(--stroke) solid transparent; padding-left: calc(var(--unit) * 3); transition: border-color var(--quick); }
+.group[open] { border-left-color: var(--text); padding-bottom: calc(var(--unit) * 3); }
+.group > summary { cursor: pointer; min-height: 36px; display: flex; align-items: center; gap: var(--unit); font-weight: 700; list-style: none; transition: color var(--quick); }
+.group > summary:hover { color: var(--accent-text); }
 .group > summary::-webkit-details-marker { display: none; }
-.group > summary::before { content: ""; width: 6px; height: 6px; margin-right: var(--unit); border-right: 1.5px solid var(--dim); border-bottom: 1.5px solid var(--dim); transform: rotate(-45deg); transition: transform var(--quick); }
+.group > summary::before { content: ""; width: 7px; height: 7px; margin-right: calc(var(--unit) * 1.5); border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(-45deg); transition: transform var(--quick); }
 .group[open] > summary::before { transform: rotate(45deg); }
 .group > summary .dim { font-size: var(--small); }
 .group > .hint { display: block; margin-bottom: calc(var(--unit) * 2); }
-.group > :not(summary) { animation: arrive 200ms var(--ease) both; }
+.group > :not(summary) { animation: arrive var(--arrive) var(--ease) both; }
 .items { display: flex; flex-direction: column; gap: calc(var(--unit) * 1.5); align-items: flex-start; }
-.item { display: flex; gap: calc(var(--unit) * 1.5); align-items: flex-start; width: 100%; animation: arrive 200ms var(--ease) both; }
+.item { display: flex; gap: calc(var(--unit) * 1.5); align-items: flex-start; width: 100%; animation: arrive var(--arrive) var(--ease) both; }
 .item > :first-child { flex: 1; min-width: 0; }
 .item > .key { flex: 0 1 18ch; }
 .item > .key + * { flex: 1; min-width: 0; }
-.item > .fields { border: 1px solid var(--line); border-radius: var(--radius-small); padding: calc(var(--unit) * 3); }
-.yaml { height: 100%; min-height: 40vh; resize: none; white-space: pre; tab-size: 2; }
+.item > .fields { border-left: var(--stroke) solid var(--hair); padding: var(--unit) 0 var(--unit) calc(var(--unit) * 3); }
+.yaml { height: 100%; min-height: 40vh; resize: none; white-space: pre; tab-size: 2; border-bottom: 0; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .logs-box { display: flex; flex-direction: column; gap: calc(var(--unit) * 2); height: 100%; }
-.logs { flex: 1; min-height: 30vh; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-small); padding: calc(var(--unit) * 3); }
+.logs { flex: 1; min-height: 30vh; overflow: auto; background: var(--sunken); padding: calc(var(--unit) * 3); }
 
-/* The dialog: the diff, then the yes. */
+/* The dialog: the diff, then the yes. A sheet of the same paper in an ink frame. */
 dialog {
   width: min(92vw, 100ch);
   max-height: 86vh;
   padding: calc(var(--unit) * 5);
-  background: var(--panel);
+  background: var(--bg);
   color: var(--text);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: 0 24px 80px rgb(0 0 0 / 0.45);
+  border: var(--stroke) solid var(--text);
 }
-dialog[open] { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); animation: open 220ms var(--ease); }
-dialog::backdrop { background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(3px); }
+dialog[open] { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); animation: open var(--arrive) var(--ease); }
+dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .plan { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); }
 .plan h3 { display: flex; align-items: center; gap: calc(var(--unit) * 2); font-size: var(--base); font-weight: 400; color: var(--dim); }
-.plan h3 b { color: var(--text); font-family: var(--mono); font-size: 13px; }
-.plan h3::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
-.plan h3.created::before { background: var(--accent); }
-.plan h3.updated::before { background: var(--warn); }
-.diff { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius-small); padding: calc(var(--unit) * 3); white-space: pre; overflow: auto; }
-.diff span { display: block; }
-.diff .add { color: var(--accent-text); background: var(--glow); }
-.diff .del { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
+.plan h3 b { color: var(--text); font-family: var(--mono); font-size: var(--small); }
+.plan h3::before { content: ""; width: 14px; height: 14px; border: var(--stroke) solid var(--text); border-radius: 50%; }
+.plan h3.created::before { border-color: var(--accent); background: var(--accent); }
+.plan h3.updated::before { border-color: var(--warn); }
+.plan h3.deleted::before { border: 2px dashed var(--bad); }
+.diff { background: var(--sunken); padding: calc(var(--unit) * 3) 0; white-space: pre; overflow: auto; }
+.diff span { display: block; padding: 0 calc(var(--unit) * 3); border-left: var(--stroke) solid transparent; }
+.diff .add { color: var(--accent-text); border-left-color: var(--accent); }
+.diff .del { color: var(--bad); border-left-color: var(--bad); }
 .diff .hunk, .diff .head { color: var(--dim); }
 
+/* What was just done, said in ink at the bottom right. */
 .toasts { position: fixed; right: calc(var(--unit) * 5); bottom: calc(var(--unit) * 5); display: flex; flex-direction: column; gap: calc(var(--unit) * 2); max-width: min(90vw, 70ch); }
-.toast { background: var(--raised); border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: var(--radius-small); padding: calc(var(--unit) * 2) calc(var(--unit) * 4); overflow-wrap: anywhere; box-shadow: 0 8px 30px rgb(0 0 0 / 0.3); animation: slide 260ms var(--ease); }
+.toast { background: var(--text); color: var(--bg); border-left: 6px solid var(--accent); padding: calc(var(--unit) * 2.5) calc(var(--unit) * 4); overflow-wrap: anywhere; animation: slide var(--arrive) var(--ease); }
 .toast.bad { border-left-color: var(--bad); }
 
+/* A finger gets 44 px of everything it can press. */
+@media (pointer: coarse) {
+  :root { --row: 44px; }
+  button, button.small, input, select, .kinds a, .group > summary { min-height: 44px; }
+  button.small { min-width: 44px; }
+}
+
 /* Stillness, where it is asked for: colour and shape already say every state. (The page
-   also leaves the packets out of the mesh then.) */
+   also leaves the packets out of the lines then.) */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .mark .ring, .halo { display: none; }

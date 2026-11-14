@@ -24,22 +24,34 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// The page: name under `/ui/`, content type, content.
-const FILES: [(&str, &str, &str); 4] = [
-    ("", "text/html; charset=utf-8", include_str!("../ui/index.html")),
-    ("app.css", "text/css; charset=utf-8", include_str!("../ui/app.css")),
-    ("app.js", "text/javascript; charset=utf-8", include_str!("../ui/app.js")),
+const FILES: [(&str, &str, &[u8]); 5] = [
+    ("", "text/html; charset=utf-8", include_bytes!("../ui/index.html")),
+    ("app.css", "text/css; charset=utf-8", include_bytes!("../ui/app.css")),
+    (
+        "app.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../ui/app.js"),
+    ),
     (
         "forms.js",
         "text/javascript; charset=utf-8",
-        include_str!("../ui/forms.js"),
+        include_bytes!("../ui/forms.js"),
+    ),
+    // The page's face (Overpass, SIL OFL: its copyright and licence are in the file's own
+    // name table and in docs/fonts/OFL.txt). The website's copy: there is one in the tree.
+    (
+        "overpass.woff2",
+        "font/woff2",
+        include_bytes!("../../../docs/fonts/overpass.woff2"),
     ),
 ];
 
-/// The page may run its own script and style and talk to where it came from: nothing
-/// inline, nothing from elsewhere, nobody's frame. (What it shows is other people's text:
+/// The page may run its own script and style, show its own face and talk to where it came
+/// from: nothing inline, nothing from elsewhere, nobody's frame. (What it shows is other people's text:
 /// names, messages, logs.)
 const POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
-                      img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+                      img-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; \
+                      frame-ancestors 'none'";
 
 /// The page's files, for anyone.
 pub fn pages() -> Router {
@@ -284,6 +296,10 @@ mod tests {
             assert_eq!(served.status(), StatusCode::OK);
             assert_eq!(served.headers()[header::CONTENT_TYPE], kind);
             assert_eq!(served.headers()[header::CONTENT_SECURITY_POLICY], POLICY);
+            // (The face is not text: there is nothing in it to read for these.)
+            let Ok(content) = std::str::from_utf8(content) else {
+                continue;
+            };
             // Nothing inline, nothing from elsewhere: the policy would stop it, and the page would be broken.
             for banned in [
                 "style=",
@@ -301,6 +317,21 @@ mod tests {
             }
         }
         assert_eq!(page(Path("../Cargo.toml".into())).await.status(), StatusCode::NOT_FOUND);
+        // What the style sheet loads is a file of the page, and the policy lets it: a face
+        // the policy stops is a page in whatever the browser has.
+        let css = std::str::from_utf8(FILES[1].2).unwrap();
+        let loaded: Vec<&str> = css
+            .split("url(")
+            .skip(1)
+            .filter_map(|rest| rest.split(')').next())
+            .collect();
+        assert_eq!(loaded, ["overpass.woff2"]);
+        assert!(
+            FILES
+                .iter()
+                .any(|(name, kind, _)| *name == "overpass.woff2" && *kind == "font/woff2")
+        );
+        assert!(POLICY.contains("font-src 'self'"));
     }
 
     #[test]

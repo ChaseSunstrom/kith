@@ -165,24 +165,27 @@ function drawPulse() {
   const up = nodes.filter((node) => health(node) !== 'bad').length;
   $('pulse-said').textContent = nodes.length + lampCount === 0
     ? 'no nodes or replicas to show'
-    : `${up}/${nodes.length} nodes up · ${lit}/${lampCount} replicas ready`;
+    : `${up} of ${nodes.length} nodes up, ${lit} of ${lampCount} replicas ready`;
 
   // Drawn to the width there is: side by side on a desk, the lamps under the mesh on a phone.
   const svg = $('pulse');
   const width = Math.max(svg.clientWidth, 300);
   const wide = width >= 760;
-  const rows = running.slice(0, 12);
-  const perColumn = wide ? 4 : Math.max(1, Math.ceil(rows.length / Math.max(1, Math.floor(width / 230))));
+  // The mesh takes the left of a desk, at most 620 px of it; the lamps get the columns that fit beside it.
+  const span = wide ? Math.min(620, Math.round(width * 0.46)) : width;
+  const columns = Math.max(1, Math.floor((wide ? width - span - 48 : width) / 230));
+  const rows = running.slice(0, wide ? columns * 4 : 12);
+  const perColumn = wide ? 4 : Math.max(1, Math.ceil(rows.length / columns));
   const height = wide ? 150 : 150 + perColumn * 28;
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
   svg.setAttribute('height', String(height));
   const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
   const drawn = [];
-  // The mesh, as the mark draws it: a hub (the cluster's store), and a line out to every node,
-  // with what passes between them on it.
-  const span = wide ? 460 : width;
+  // The mesh, as the mark draws it and as a line map would: a hub (the cluster's store), one
+  // trunk out of it, and a branch at 45° to every node's stop, with what passes between them on it.
   const hub = [44, 75];
-  const shown = nodes.slice(0, 8);
+  // (As many stops as stand 44 px apart, eight at most; the rest are counted under them.)
+  const shown = nodes.slice(0, Math.max(1, Math.min(8, Math.floor((span - 210) / 44) + 1)));
   const place = (i) => [
     shown.length === 1 ? Math.min(220, span - 60) : 150 + (i * (span - 210)) / (shown.length - 1),
     shown.length < 3 ? 75 : i % 2 ? 104 : 46,
@@ -190,16 +193,17 @@ function drawPulse() {
   shown.forEach((node, i) => {
     const [x, y] = place(i);
     const down = health(node) === 'bad';
-    const way = `M ${hub[0]} ${hub[1]} C ${hub[0] + 60} ${hub[1]} ${x - 60} ${y} ${x} ${y}`;
+    const off = Math.abs(y - hub[1]);
+    const way = off ? `M ${hub[0]} ${hub[1]} H ${x - off - 26} L ${x - 26} ${y} H ${x}` : `M ${hub[0]} ${hub[1]} H ${x}`;
     drawn.push(h('path', { class: down ? 'mesh bad' : 'mesh', d: way }));
     if (down || still) return;
     // (Out and back, each node out of step with the last.)
     for (const [points, begin] of [['0;1', i * -0.7], ['1;0', i * -0.7 - 1.3]]) {
-      drawn.push(h('circle', { class: 'packet', r: 2.5 },
+      drawn.push(h('circle', { class: 'packet', r: 4 },
         h('animateMotion', { path: way, dur: '2.6s', begin: `${begin}s`, repeatCount: 'indefinite', keyPoints: points, keyTimes: '0;1', calcMode: 'linear' })));
     }
   });
-  if (shown.length > 0) drawn.push(h('circle', { class: 'halo', cx: hub[0], cy: hub[1], r: 9 }), h('circle', { class: 'hub', cx: hub[0], cy: hub[1], r: 9 }));
+  if (shown.length > 0) drawn.push(h('circle', { class: 'halo', cx: hub[0], cy: hub[1], r: 11 }), h('circle', { class: 'hub', cx: hub[0], cy: hub[1], r: 11 }));
   shown.forEach((node, i) => {
     const [x, y] = place(i);
     drawn.push(h('g', { class: `node ${health(node)}` },
@@ -207,25 +211,27 @@ function drawPulse() {
       h('circle', { class: 'halo', cx: x, cy: y, r: 9 }),
       h('circle', { class: 'body', cx: x, cy: y, r: 9 }),
       h('circle', { class: 'core', cx: x, cy: y, r: 3.5 }),
-      h('text', { class: 'name', x, y: y + 28, 'text-anchor': 'middle' }, node.metadata.name.slice(0, 12)),
+      // (A stop above the trunk is named above it: under it, the name would sit on the line.)
+      h('text', { class: 'name', x, y: y < hub[1] ? y - 17 : y + 29, 'text-anchor': 'middle' }, node.metadata.name.slice(0, 12)),
     ));
   });
   if (nodes.length > shown.length) drawn.push(h('text', { x: span - 8, y: 144, 'text-anchor': 'end' }, `+${nodes.length - shown.length} nodes`));
-  // The lamps: a row per thing that runs, a lamp per replica.
+  // The lamps: a short line per thing that runs, a stop on it per replica.
   rows.forEach((entry, i) => {
-    const [left, top] = [(wide ? 500 : 8) + Math.floor(i / perColumn) * 230, (wide ? 30 : 166) + (i % perColumn) * 28];
+    const [left, top] = [(wide ? span + 48 : 8) + Math.floor(i / perColumn) * 230, (wide ? 30 : 166) + (i % perColumn) * 28];
     const name = entry.resource.metadata.name;
     const ready = entry.lamps.filter((lamp) => lamp.state === 'ok').length;
     drawn.push(h('g', {},
       h('title', {}, `${keyOf(entry.resource)}: ${summary(entry.resource)}`),
       h('text', { class: 'name', x: left, y: top + 4 }, name.length > 12 ? `${name.slice(0, 11)}…` : name),
+      h('line', { class: 'run', x1: left + 102, y1: top, x2: left + 102 + (Math.min(entry.lamps.length, 6) - 1) * 18, y2: top }),
       entry.lamps.slice(0, 6).map((lamp, n) => {
-        const bar = h('rect', { class: `lamp ${lamp.state}`, x: left + 96 + n * 15, y: top - 4, width: 12, height: 8, rx: 4 });
+        const stop = h('circle', { class: `lamp ${lamp.state}`, cx: left + 102 + n * 18, cy: top, r: 5 });
         // (Each a little out of step with the last: a row of them breathes, it does not blink.)
-        bar.style.setProperty('--step', String((i * 3 + n) % 8));
-        return bar;
+        stop.style.setProperty('--step', String((i * 3 + n) % 8));
+        return stop;
       }),
-      h('text', { x: left + 100 + Math.min(entry.lamps.length, 6) * 15, y: top + 4 }, `${ready}/${entry.lamps.length}`),
+      h('text', { x: left + 100 + Math.min(entry.lamps.length, 6) * 18, y: top + 4 }, `${ready} of ${entry.lamps.length}`),
     ));
   });
   if (running.length > rows.length) drawn.push(h('text', { x: width - 8, y: height - 6, 'text-anchor': 'end' }, `+${running.length - rows.length} more`));
@@ -398,7 +404,8 @@ function fields(schema, root, value, change, skip = []) {
     const { kind, schema: inner } = shape(node, root);
     const must = required.includes(key);
     const star = must && h('abbr', { title: 'required' }, '*');
-    const hint = inner.description && h('small', { class: 'hint' }, inner.description);
+    // (What a description puts in backticks is code: every other piece of it, split there.)
+    const hint = inner.description && h('small', { class: 'hint' }, inner.description.split('`').map((piece, i) => (i % 2 ? h('code', {}, piece) : piece)));
     if (!['object', 'array', 'map'].includes(kind)) {
       const id = `field-${++ids}`;
       return h('div', { class: 'field' }, h('label', { for: id }, key, star), control(node, root, held[key], set(key), { required: must, id }), hint);
