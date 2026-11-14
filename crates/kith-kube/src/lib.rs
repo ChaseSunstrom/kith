@@ -107,7 +107,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("meta.generateName", Refused, r#""web-""#),
     // A pod.
     ("podmeta.labels", Carried, r#"{"app":"web"}"#),
-    ("podmeta.annotations", Hint, r#"{"a":"b"}"#),
+    ("podmeta.annotations", Carried, r#"{"a":"b"}"#),
     ("pod.containers", Carried, r#"[{"name":"web","image":"nginx"}]"#),
     ("pod.restartPolicy", Carried, r#""Always""#),
     ("pod.nodeSelector", Carried, r#"{"disk":"ssd"}"#),
@@ -362,7 +362,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("Job.spec.completionMode", Refused, r#""Indexed""#),
     ("Job.spec.suspend", Refused, "true"),
     ("CronJob.spec.schedule", Carried, r#""0 * * * *""#),
-    ("CronJob.spec.timeZone", Carried, r#""Europe/Helsinki""#),
+    ("CronJob.spec.timeZone", Carried, r#""Etc/UTC""#),
     ("CronJob.spec.concurrencyPolicy", Carried, r#""Forbid""#),
     ("CronJob.spec.jobTemplate.metadata", Hint, r#"{"labels":{"a":"b"}}"#),
     ("CronJob.spec.jobTemplate.spec.backoffLimit", Carried, "2"),
@@ -947,6 +947,7 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
     let mut md = cx.map(&mut tpl, "metadata", at);
     let mp = join(at, "metadata");
     let labels = cx.strings(&mut md, "labels", &mp);
+    let annotations = cx.strings(&mut md, "annotations", &mp);
     cx.rest(md, &mp);
     let sp = join(at, "spec");
     let mut s = cx.map(&mut tpl, "spec", at);
@@ -1012,6 +1013,7 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
             ("containers", nonempty(json!(units))),
             ("restartPolicy", restart),
             ("pod", Some(json!(true))),
+            ("annotations", nonempty(json!(annotations))),
         ]),
         labels,
         node_selector,
@@ -1077,13 +1079,20 @@ fn claim_spec(cx: &mut Cx, mut s: Map, at: &str) -> Option<Value> {
         cx.hint(&join(at, "accessModes"), &format!("`{mode}` is taken as ReadWriteOnce"));
     }
     drop_default(&mut s, "volumeMode", json!("Filesystem"));
+    // A claim is given a volume by its storage class, whichever that is: kith makes one.
+    // (The class that is no class asks for a volume somebody made: a kith Volume.)
+    let provision = (s.get("storageClassName") != Some(&json!(""))).then_some(true);
     cx.rest(s, at);
     let shared = modes.iter().any(|m| m == "ReadWriteMany").then_some(true);
     let Some(size) = size else {
         cx.note(&join(&rp, "requests.storage"), "is missing: not translated");
         return None;
     };
-    Some(obj([("size", Some(json!(size))), ("shared", some(shared))]))
+    Some(obj([
+        ("size", Some(json!(size))),
+        ("shared", some(shared)),
+        ("provision", some(provision)),
+    ]))
 }
 
 /// Deployment, StatefulSet and DaemonSet.
@@ -1109,7 +1118,8 @@ fn workload(cx: &mut Cx, root: &mut Map, mut meta: Metadata, kind: &str, out: Ou
                 continue;
             };
             let template = std::mem::take(&mut claim.name);
-            claim.name = format!("{template}-{}", meta.name);
+            // (As Kubernetes names the claim of a StatefulSet's first pod.)
+            claim.name = format!("{template}-{}-0", meta.name);
             claim.namespace.clone_from(&meta.namespace);
             if replicas.is_some_and(|n| n > 1) {
                 cx.note(
@@ -1166,7 +1176,8 @@ fn job_spec(cx: &mut Cx, mut spec: Map, at: &str) -> (Value, Strings) {
         ("template", Some(pod.template)),
         ("completions", some(completions)),
         ("parallelism", some(parallelism)),
-        ("retries", some(retries)),
+        // (Kubernetes forgives six failed runs where nothing is said; kith, three.)
+        ("retries", Some(json!(retries.unwrap_or(6)))),
         ("timeoutSeconds", some(timeout)),
         ("placement", placement(&pod.node_selector)),
     ]);
@@ -1174,9 +1185,22 @@ fn job_spec(cx: &mut Cx, mut spec: Map, at: &str) -> (Value, Strings) {
 }
 
 fn cron_job(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
+    // (Kubernetes's own limit: a Job's name is the CronJob's and the minute.)
+    if meta.name.len() > 52 {
+        cx.note("metadata.name", "is longer than the 52 characters a CronJob's may have");
+    }
     let mut spec = cx.map(root, "spec", "");
     let schedule = cx.text(&mut spec, "schedule", "spec");
     let timezone = cx.text(&mut spec, "timeZone", "spec");
+    if timezone
+        .as_deref()
+        .is_some_and(|zone| !["UTC", "Etc/UTC"].contains(&zone))
+    {
+        cx.note(
+            "spec.timeZone",
+            "is not UTC: kith reads a schedule in UTC, and has no table of time zones",
+        );
+    }
     let concurrency = cx.text(&mut spec, "concurrencyPolicy", "spec");
     let concurrency = cx.pick(
         "spec.concurrencyPolicy",
@@ -1194,6 +1218,9 @@ fn cron_job(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
         cx.note("spec.schedule", "is missing: not translated");
         return;
     };
+    if let Err(e) = kith_api::cron::Schedule::parse(&schedule) {
+        cx.note("spec.schedule", &format!("is no schedule: {e}"));
+    }
     meta.labels.extend(labels);
     let spec = obj([
         ("schedule", Some(json!(schedule))),
@@ -1929,12 +1956,12 @@ spec:
     #[test]
     fn import_statefulset_claim_template_becomes_a_volume_claim() {
         let (all, _) = run(TEN);
-        let claim = find(&all, "VolumeClaim", "pgdata-db");
+        let claim = find(&all, "VolumeClaim", "pgdata-db-0");
         assert_eq!(claim.spec["size"], "10Gi");
         let db = find(&all, "Workload", "db");
         assert_eq!(
             db.spec["template"]["containers"][0]["volumeMounts"][0]["volume"],
-            "pgdata-db"
+            "pgdata-db-0"
         );
     }
 

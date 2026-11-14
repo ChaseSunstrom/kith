@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 33);
+    assert_eq!(KINDS.len(), 34);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));

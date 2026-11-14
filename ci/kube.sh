@@ -7,6 +7,8 @@
 #
 #   sh ci/kube.sh            # every test of crates/kithd/tests/kube.rs
 #   sh ci/kube.sh NAME       # the ones whose name has NAME in it
+#   sh ci/kube.sh --vm       # instead: sh ci/vm.sh --test kube with those clients (a pod
+#                            # needs a node to run on: what must run, runs there)
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,5 +47,9 @@ helm "$helm3_version" "$helm3_sha256"
 helm "$helm4_version" "$helm4_sha256"
 
 cd "$root"
-KITH_KUBECTL="$cache/kubectl-$kubectl_version" KITH_HELM="$cache/helm-$helm3_version/linux-amd64/helm:$cache/helm-$helm4_version/linux-amd64/helm" \
-    cargo test -q -p kithd --test kube "$@"
+export KITH_KUBECTL="$cache/kubectl-$kubectl_version" KITH_HELM="$cache/helm-$helm3_version/linux-amd64/helm:$cache/helm-$helm4_version/linux-amd64/helm"
+[ "${1:-}" != --vm ] || exec sh ci/vm.sh --test kube
+# What kubectl and helm send as protobuf is read by a table: it must be the one
+# Kubernetes's own types give (they are fetched once, by hash, like the clients).
+python3 ci/kube_proto.py --check || fail "crates/kithd/src/kubeproto.txt is not what ci/kube_proto.py writes"
+cargo test -q -p kithd --test kube "$@"

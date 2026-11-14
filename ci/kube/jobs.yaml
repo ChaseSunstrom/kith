@@ -1,0 +1,33 @@
+# What runs to its end, once and by the clock: each asks the shop and the db through their
+# Services and writes what it heard.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ask
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ask
+          image: kith.test/pod:1
+          command: ["/bin/pod", "ask", "shop", "80", "db", "80"]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tick
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tick
+              image: kith.test/pod:1
+              command: ["/bin/pod", "ask", "shop", "80", "db", "80"]

@@ -16,6 +16,8 @@
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
+#   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
+#                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
 #
@@ -91,6 +93,17 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes to /dev/stdout by name; needs rustc for
                    x86_64-unknown-linux-musl. With KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
+  --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
+                   one on PATH) and helm (KITH_HELM, several with colons between, or
+                   the one on PATH) asking the first as the cluster's admin: the
+                   manifests of ci/kube applied, rolled out and running, a
+                   StatefulSet's claim given a volume that outlives its
+                   pod, a Job and a CronJob's Job reading all of it through their
+                   Services, kubectl create, expose, scale, set image, rollout
+                   restart, wait and logs, helm install, upgrade and uninstall
+                   with --wait, and nothing left when all is deleted. Skipped
+                   without kubectl. With KITH_E2E=1 also nginx as it is shipped,
+                   pulled from mirror.gcr.io
   --test chaos     instead: three nodes as for rollout, and three writers on this
                    machine, one through each node. Each node in turn has its card on
                    the cluster's network unplugged, then plugged back; each node in
@@ -121,7 +134,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share | pods | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share, pods, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share | pods | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share, pods, kube, chaos" >&2; exit 2 ;; esac
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -152,19 +165,23 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = kube ] || [ "$test" = chaos ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
+        kubectl=${KITH_KUBECTL:-$(command -v kubectl || true)}
+        helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
+        [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$time" -gt 60 ] || time=900
+        [ "$test" != kube ] || time=$((time * 2))
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
-        # (rollout and chaos: three nodes and nothing more said to kithd; share and pods: two,
+        # (rollout and chaos: three nodes and nothing more said to kithd; share, pods and kube: two,
         # on the mesh.)
         others='2 3' more=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = kube ]; then
         others=2 more=--mesh
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
@@ -177,9 +194,10 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
                 echo '{}' >"$image/config.json"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
-                if [ "$test" = pods ]; then
-                    # And what that test's pods run (ci/pod.rs), as an image that names no
-                    # user and as one that names a user who is not root.
+                if [ "$test" != share ]; then
+                    # And what those tests' pods run (ci/pod.rs), as an image that names no
+                    # user, as one that names a user who is not root, and as two that say
+                    # what to start (an image nothing more is said of, as a chart has one).
                     rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
                     digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
                     image=$work/seed/runtime/images/$digest
@@ -188,6 +206,9 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                     echo '{}' >"$image/config.json"
                     printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                     printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
+                    for tag in serve again; do
+                        printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
+                    done
                 fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
@@ -196,7 +217,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
             # (Room for an image that is pulled: the state grows to the disk's end at the first start.)
-            [ "$test${KITH_E2E:-}" != pods1 ] || truncate -s 2G "$1"
+            case $test${KITH_E2E:-} in pods1 | kube1) truncate -s 2G "$1" ;; esac
         }
       elif [ "$test" = rollout ]; then
         # Two releases, both signed: one that runs, and one whose root is not the one its
@@ -386,6 +407,158 @@ EOF
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock"
+            exit 0
+        fi
+        if [ "$test" = kube ]; then
+            # kubectl and helm as they are shipped, on this machine, asking the first node as
+            # the cluster's admin: what they are given has nothing of kith in it but an
+            # image's name. (What they keep for themselves stays in the test's directory.)
+            cat >"$work/kubeconfig" <<EOF
+apiVersion: v1
+kind: Config
+current-context: kith
+clusters:
+- name: kith
+  cluster: { server: "https://127.0.0.1:$((port + 1))", certificate-authority: ca.pem, tls-server-name: kith }
+users:
+- name: root
+  user: { client-certificate: cert.pem, client-key: key.pem }
+contexts:
+- name: kith
+  context: { cluster: kith, user: root }
+EOF
+            mkdir "$work/home"
+            k() { HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" "$@"; }
+            must() { # WHAT IT IS, and a command that has to succeed (what it said: $work/said)
+                what=$1
+                shift
+                "$@" >"$work/said" 2>&1 || fail "$what: $(cat "$work/said"): $(k get pods,jobs,pvc -o wide 2>&1)"
+            }
+            # NAME and what must be in it: wait for that Job to complete, and read what its
+            # pod heard (kubectl logs), which is in $work/NAME.out.
+            heard() {
+                job=$1
+                shift
+                must "the Job $job did not complete" k wait --for=condition=complete "job/$job" --timeout=240s
+                k logs "job/$job" >"$work/$job.out" 2>"$work/said" || fail "kubectl logs job/$job: $(cat "$work/said")"
+                ! grep -q 'failed: ' "$work/$job.out" || fail "the Job $job was not always answered: $(cat "$work/$job.out")"
+                for line in "$@"; do
+                    grep -q "$line" "$work/$job.out" || fail "the Job $job did not hear \"$line\": $(cat "$work/$job.out")"
+                done
+            }
+
+            # The manifests: a Deployment told things by a ConfigMap and a Secret, behind a
+            # Service with an Ingress, and a StatefulSet with a claim nobody made a volume for.
+            waited=0
+            until k get node n2 >/dev/null 2>&1; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "kubectl sees no second node: $(k get nodes 2>&1)"
+                sleep 1
+            done
+            must 'the two nodes are not both ready' k wait --for=condition=Ready node/n1 node/n2 --timeout=120s
+            must 'kubectl apply of the shop and the db' k apply -f "$root/ci/kube/shop.yaml" -f "$root/ci/kube/db.yaml"
+            must 'the Deployment did not roll out' k rollout status deployment/shop --timeout=240s
+            must 'the StatefulSet did not roll out' k rollout status statefulset/db --timeout=240s
+            k get pods -o wide >"$work/pods" 2>&1 || fail "kubectl get pods: $(cat "$work/pods")"
+            [ "$(grep -c ' Running ' "$work/pods")" = 4 ] || fail "not four pods running: $(cat "$work/pods")"
+            [ "$(k get pvc data-db-0 -o 'jsonpath={.status.phase}')" = Bound ] || fail "the StatefulSet's claim is not bound: $(k get pvc 2>&1)"
+            k get ingress shop 2>&1 | grep -q shop.example.com || fail "the Ingress does not say its host: $(k get ingress 2>&1)"
+            must 'kubectl logs of a running pod' k logs shop-0
+            must 'kubectl describe of a running pod' k describe pod shop-0
+            # The ways into a running pod are not here, and say so.
+            if timeout 60 env HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$kubectl" port-forward shop-0 "$((port + 10)):80" >"$work/said" 2>&1; then
+                fail "kubectl port-forward was answered"
+            fi
+            grep -q 'not answered here' "$work/said" || fail "kubectl port-forward was not refused in words: $(cat "$work/said")"
+
+            # A Job, and a CronJob's Job made by the clock: each hears the three of the shop,
+            # what they were told, and the db, which has started once.
+            must 'kubectl apply of the Job and the CronJob' k apply -f "$root/ci/kube/jobs.yaml"
+            heard ask 'shop-0 hello hunter2' 'shop-1 hello hunter2' 'shop-2 hello hunter2' 'db-0 started 1'
+            waited=0
+            until tick=$(k get jobs -o name 2>/dev/null | grep -m 1 '^job.batch/tick-'); do
+                waited=$((waited + 1))
+                [ "$waited" -lt 100 ] || fail "the CronJob made no Job in a minute and a half: $(k get cronjobs,jobs 2>&1)"
+                sleep 1
+            done
+            heard "${tick#job.batch/}" 'shop-0 hello hunter2' 'db-0 started 1'
+            # Restarted, the db is a new pod with the file the old one wrote: a Job made
+            # from the CronJob by hand hears that it has started twice.
+            must 'kubectl rollout restart' k rollout restart statefulset/db
+            must 'the StatefulSet did not roll out again' k rollout status statefulset/db --timeout=240s
+            must 'kubectl create job --from' k create job again --from=cronjob/tick
+            heard again 'db-0 started 2'
+
+            # Without a file: made, shown to others, grown and given another image by hand.
+            must 'kubectl create deployment' k create deployment made --image=kith.test/pod:serve --replicas=2 --port=80
+            must 'kubectl expose' k expose deployment made --port=80
+            must 'the Deployment made by hand did not roll out' k rollout status deployment/made --timeout=240s
+            must 'kubectl scale' k scale deployment/made --replicas=3
+            must 'kubectl set image' k set image deployment/made pod=kith.test/pod:again
+            must 'the Deployment made by hand did not roll out again' k rollout status deployment/made --timeout=240s
+            said=$(k get deployment made -o 'jsonpath={.status.readyReplicas} {.spec.template.spec.containers[0].image}' 2>&1)
+            [ "$said" = '3 kith.test/pod:again' ] || fail "the Deployment made by hand says: $said"
+            must 'kubectl create job' k create job ask-made --image=kith.test/pod:1 -- /bin/pod ask made 80
+            heard ask-made made-0 made-1 made-2
+
+            # Helm, 3 and 4: the chart it starts every chart from, waited for until it is ready.
+            n=0
+            for helm in $helms; do
+                n=$((n + 1))
+                h() { HOME="$work/home" KUBECONFIG="$work/kubeconfig" "$helm" "$@"; }
+                must "helm create ($n)" h create "$work/site$n"
+                must "helm install --wait ($n)" h install "site$n" "$work/site$n" --set image.repository=kith.test/pod --set image.tag=serve --wait --timeout 240s
+                must "helm upgrade --wait ($n)" h upgrade "site$n" "$work/site$n" --reuse-values --set replicaCount=2 --wait --timeout 240s
+                [ "$(k get deployment "site$n" -o 'jsonpath={.status.readyReplicas}')" = 2 ] || fail "helm upgrade --wait ($n) came back before two were ready: $(k get deployments 2>&1)"
+                h list 2>&1 | grep -q "site$n.*deployed" || fail "helm list ($n) does not say deployed: $(h list 2>&1)"
+                must "helm uninstall --wait ($n)" h uninstall "site$n" --wait --timeout 120s
+            done
+
+            stock='no stock image was tried (KITH_E2E=1 pulls one)'
+            if [ "${KITH_E2E:-}" = 1 ]; then
+                # nginx as it is shipped, by hand and as Helm's chart with nothing changed
+                # but where the image comes from.
+                must 'kubectl create deployment of nginx' k create deployment stock --image=mirror.gcr.io/library/nginx:1.27-alpine --replicas=2 --port=80
+                must 'kubectl expose of nginx' k expose deployment stock --port=80
+                must 'nginx did not roll out' k rollout status deployment/stock --timeout=480s
+                must 'kubectl create job, to ask nginx' k create job ask-stock --image=kith.test/pod:1 -- /bin/pod ask stock 80
+                heard ask-stock 'HTTP/1.1 200 OK'
+                if [ -n "$helms" ]; then
+                    helm=${helms%% *}
+                    must 'helm install --wait of nginx' h install stock-site "$work/site1" --set image.repository=mirror.gcr.io/library/nginx --set image.tag=1.27-alpine --wait --timeout 480s
+                    must 'helm uninstall of nginx' h uninstall stock-site --wait --timeout 120s
+                fi
+                must 'kubectl delete of nginx' k delete deployment,service stock
+                must 'kubectl delete of the Job that asked nginx' k delete job ask-stock
+                stock='nginx as it is shipped (mirror.gcr.io/library/nginx:1.27-alpine) rolled out by kubectl create deployment and by helm install --wait, and answered through its Service'
+            fi
+
+            # Deleted, nothing of it is left: not the volume made for the claim either.
+            must 'kubectl delete of the manifests' k delete -f "$root/ci/kube"
+            must 'kubectl delete of what was made by hand' k delete deployment,service made
+            must 'kubectl delete of the Jobs made by hand' k delete job again ask-made
+            must 'kubectl delete of the claim' k delete pvc data-db-0
+            left() {
+                k get all,pvc,configmaps,secrets,ingress -o name 2>&1
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+ours = ("Workload", "Job", "CronJob", "Service", "Volume", "VolumeClaim", "ConfigMap", "Secret", "KubeObject")
+for r in found:
+    if r["kind"] in ours and r["metadata"].get("namespace") != "kith-system":
+        print(r["kind"], r["metadata"]["name"])
+'
+            }
+            waited=0
+            until [ -z "$(left)" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "deleted, this is left: $(left)"
+                sleep 1
+            done
+
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: two nodes, and kubectl and helm as they are shipped asking the first: manifests written for Kubernetes applied (a Deployment of three told things by a ConfigMap and a Secret, its Service and Ingress, a StatefulSet whose claim got a volume made for it), rolled out and running; a Job and a CronJob's Job, made by the clock, heard all of them through their Services (kubectl wait, kubectl logs); after kubectl rollout restart the StatefulSet's new pod had the file the old one wrote; a Deployment made, exposed, scaled and given another image by hand rolled out each time; port-forward was refused in words; helm install, upgrade and uninstall with --wait came back when the chart was ready ($n of helm); deleted, nothing was left; $stock" >&2
             exit 0
         fi
         if [ "$test" = share ]; then

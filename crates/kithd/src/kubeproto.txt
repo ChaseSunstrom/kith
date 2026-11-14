@@ -1,0 +1,914 @@
+=Namespace
+1 metadata ObjectMeta
+2 spec NamespaceSpec
+=ConfigMap
+1 metadata ObjectMeta
+2 data {s
+3 binaryData {y
+4 immutable b
+=Secret
+1 metadata ObjectMeta
+2 data {y
+3 type s!
+4 stringData {s
+5 immutable b
+=ServiceAccount
+1 metadata ObjectMeta
+2 secrets *ObjectReference
+3 imagePullSecrets *LocalObjectReference
+4 automountServiceAccountToken b
+=Service
+1 metadata ObjectMeta
+2 spec ServiceSpec
+=PersistentVolumeClaim
+1 metadata ObjectMeta
+2 spec PersistentVolumeClaimSpec
+=Deployment
+1 metadata ObjectMeta
+2 spec DeploymentSpec
+=StatefulSet
+1 metadata ObjectMeta
+2 spec StatefulSetSpec
+=DaemonSet
+1 metadata ObjectMeta
+2 spec DaemonSetSpec
+=Job
+1 metadata ObjectMeta
+2 spec JobSpec
+=CronJob
+1 metadata ObjectMeta
+2 spec CronJobSpec
+=Ingress
+1 metadata ObjectMeta
+2 spec IngressSpec
+=IngressClass
+1 metadata ObjectMeta
+2 spec IngressClassSpec
+=PodDisruptionBudget
+1 metadata ObjectMeta
+2 spec PodDisruptionBudgetSpec
+=Role
+1 metadata ObjectMeta
+2 rules *PolicyRule
+=RoleBinding
+1 metadata ObjectMeta
+2 subjects *Subject
+3 roleRef RoleRef
+=ClusterRole
+1 metadata ObjectMeta
+2 rules *PolicyRule
+3 aggregationRule AggregationRule
+=ClusterRoleBinding
+1 metadata ObjectMeta
+2 subjects *Subject
+3 roleRef RoleRef
+=DeleteOptions
+1 gracePeriodSeconds i
+2 preconditions Preconditions
+3 orphanDependents b
+4 propagationPolicy s
+5 dryRun *s
+6 ignoreStoreReadErrorWithClusterBreakingPotential b
+=ObjectMeta
+1 name s!
+2 generateName s!
+3 namespace s!
+4 selfLink s!
+5 uid s!
+6 resourceVersion s!
+7 generation i!
+8 creationTimestamp Time
+9 deletionTimestamp Time
+10 deletionGracePeriodSeconds i
+11 labels {s
+12 annotations {s
+13 ownerReferences *OwnerReference
+14 finalizers *s
+=NamespaceSpec
+1 finalizers *s
+=ObjectReference
+1 kind s!
+2 namespace s!
+3 name s!
+4 uid s!
+5 apiVersion s!
+6 resourceVersion s!
+7 fieldPath s!
+=LocalObjectReference
+1 name s!
+=ServiceSpec
+1 ports *ServicePort
+2 selector {s
+3 clusterIP s!
+4 type s!
+5 externalIPs *s
+7 sessionAffinity s!
+8 loadBalancerIP s!
+9 loadBalancerSourceRanges *s
+10 externalName s!
+11 externalTrafficPolicy s!
+12 healthCheckNodePort i!
+13 publishNotReadyAddresses b!
+14 sessionAffinityConfig SessionAffinityConfig
+17 ipFamilyPolicy s
+18 clusterIPs *s
+19 ipFamilies *s
+20 allocateLoadBalancerNodePorts b
+21 loadBalancerClass s
+22 internalTrafficPolicy s
+23 trafficDistribution s
+=PersistentVolumeClaimSpec
+1 accessModes *s
+2 resources VolumeResourceRequirements
+3 volumeName s!
+4 selector LabelSelector
+5 storageClassName s
+6 volumeMode s
+7 dataSource TypedLocalObjectReference
+8 dataSourceRef TypedObjectReference
+9 volumeAttributesClassName s
+=DeploymentSpec
+1 replicas i
+2 selector LabelSelector
+3 template PodTemplateSpec
+4 strategy DeploymentStrategy
+5 minReadySeconds i!
+6 revisionHistoryLimit i
+7 paused b!
+9 progressDeadlineSeconds i
+=StatefulSetSpec
+1 replicas i
+2 selector LabelSelector
+3 template PodTemplateSpec
+4 volumeClaimTemplates *PersistentVolumeClaim
+5 serviceName s
+6 podManagementPolicy s!
+7 updateStrategy StatefulSetUpdateStrategy
+8 revisionHistoryLimit i
+9 minReadySeconds i!
+10 persistentVolumeClaimRetentionPolicy StatefulSetPersistentVolumeClaimRetentionPolicy
+11 ordinals StatefulSetOrdinals
+=DaemonSetSpec
+1 selector LabelSelector
+2 template PodTemplateSpec
+3 updateStrategy DaemonSetUpdateStrategy
+4 minReadySeconds i!
+6 revisionHistoryLimit i
+=JobSpec
+1 parallelism i
+2 completions i
+3 activeDeadlineSeconds i
+4 selector LabelSelector
+5 manualSelector b
+6 template PodTemplateSpec
+7 backoffLimit i
+8 ttlSecondsAfterFinished i
+9 completionMode s
+10 suspend b
+11 podFailurePolicy PodFailurePolicy
+12 backoffLimitPerIndex i
+13 maxFailedIndexes i
+14 podReplacementPolicy s
+15 managedBy s
+16 successPolicy SuccessPolicy
+17 scheduling JobSchedulingConfiguration
+=CronJobSpec
+1 schedule s
+2 startingDeadlineSeconds i
+3 concurrencyPolicy s!
+4 suspend b
+5 jobTemplate JobTemplateSpec
+6 successfulJobsHistoryLimit i
+7 failedJobsHistoryLimit i
+8 timeZone s
+=IngressSpec
+1 defaultBackend IngressBackend
+2 tls *IngressTLS
+3 rules *IngressRule
+4 ingressClassName s
+=IngressClassSpec
+1 controller s!
+2 parameters IngressClassParametersReference
+=PodDisruptionBudgetSpec
+1 minAvailable IntOrString
+2 selector LabelSelector
+3 maxUnavailable IntOrString
+4 unhealthyPodEvictionPolicy s
+=PolicyRule
+1 verbs *s
+2 apiGroups *s
+3 resources *s
+4 resourceNames *s
+5 nonResourceURLs *s
+=Subject
+1 kind s
+2 apiGroup s!
+3 name s
+4 namespace s!
+=RoleRef
+1 apiGroup s
+2 kind s
+3 name s
+=AggregationRule
+1 clusterRoleSelectors *LabelSelector
+=Preconditions
+1 uid s
+2 resourceVersion s
+=OwnerReference
+1 kind s
+3 name s
+4 uid s
+5 apiVersion s
+6 controller b
+7 blockOwnerDeletion b
+=ServicePort
+1 name s!
+2 protocol s!
+3 port i
+4 targetPort IntOrString
+5 nodePort i!
+6 appProtocol s
+=SessionAffinityConfig
+1 clientIP ClientIPConfig
+=VolumeResourceRequirements
+1 limits {Quantity
+2 requests {Quantity
+=LabelSelector
+1 matchLabels {s
+2 matchExpressions *LabelSelectorRequirement
+=TypedLocalObjectReference
+1 apiGroup s
+2 kind s
+3 name s
+=TypedObjectReference
+1 apiGroup s
+2 kind s
+3 name s
+4 namespace s
+=PodTemplateSpec
+1 metadata ObjectMeta
+2 spec PodSpec
+=DeploymentStrategy
+1 type s!
+2 rollingUpdate RollingUpdateDeployment
+=StatefulSetUpdateStrategy
+1 type s!
+2 rollingUpdate RollingUpdateStatefulSetStrategy
+=StatefulSetPersistentVolumeClaimRetentionPolicy
+1 whenDeleted s!
+2 whenScaled s!
+=StatefulSetOrdinals
+1 start i
+=DaemonSetUpdateStrategy
+1 type s!
+2 rollingUpdate RollingUpdateDaemonSet
+=PodFailurePolicy
+1 rules *PodFailurePolicyRule
+=SuccessPolicy
+1 rules *SuccessPolicyRule
+=JobSchedulingConfiguration
+=JobTemplateSpec
+1 metadata ObjectMeta
+2 spec JobSpec
+=IngressBackend
+3 resource TypedLocalObjectReference
+4 service IngressServiceBackend
+=IngressTLS
+1 hosts *s
+2 secretName s!
+=IngressRule
+1 host s!
+2 . IngressRuleValue
+=IngressClassParametersReference
+1 apiGroup s
+2 kind s
+3 name s
+4 scope s
+5 namespace s
+=ClientIPConfig
+1 timeoutSeconds i
+=LabelSelectorRequirement
+1 key s
+2 operator s
+3 values *s
+=PodSpec
+1 volumes *Volume
+2 containers *Container
+3 restartPolicy s!
+4 terminationGracePeriodSeconds i
+5 activeDeadlineSeconds i
+6 dnsPolicy s!
+7 nodeSelector {s
+8 serviceAccountName s!
+9 serviceAccount s!
+10 nodeName s!
+11 hostNetwork b!
+12 hostPID b!
+13 hostIPC b!
+14 securityContext PodSecurityContext
+15 imagePullSecrets *LocalObjectReference
+16 hostname s!
+17 subdomain s!
+18 affinity Affinity
+19 schedulerName s!
+20 initContainers *Container
+21 automountServiceAccountToken b
+22 tolerations *Toleration
+23 hostAliases *HostAlias
+24 priorityClassName s!
+25 priority i
+26 dnsConfig PodDNSConfig
+27 shareProcessNamespace b
+28 readinessGates *PodReadinessGate
+29 runtimeClassName s
+30 enableServiceLinks b
+31 preemptionPolicy s
+32 overhead {Quantity
+33 topologySpreadConstraints *TopologySpreadConstraint
+34 ephemeralContainers *EphemeralContainer
+35 setHostnameAsFQDN b
+36 os PodOS
+37 hostUsers b
+38 schedulingGates *PodSchedulingGate
+39 resourceClaims *PodResourceClaim
+40 resources ResourceRequirements
+41 hostnameOverride s
+43 schedulingGroup PodSchedulingGroup
+44 evictionResponders *EvictionResponder
+=RollingUpdateDeployment
+1 maxUnavailable IntOrString
+2 maxSurge IntOrString
+=RollingUpdateStatefulSetStrategy
+1 partition i
+2 maxUnavailable IntOrString
+=RollingUpdateDaemonSet
+1 maxUnavailable IntOrString
+2 maxSurge IntOrString
+=PodFailurePolicyRule
+1 action s
+2 onExitCodes PodFailurePolicyOnExitCodesRequirement
+3 onPodConditions *PodFailurePolicyOnPodConditionsPattern
+=SuccessPolicyRule
+1 succeededIndexes s
+2 succeededCount i
+=IngressServiceBackend
+1 name s
+2 port ServiceBackendPort
+=IngressRuleValue
+1 http HTTPIngressRuleValue
+=Volume
+1 name s
+2 . VolumeSource
+=Container
+1 name s
+2 image s!
+3 command *s
+4 args *s
+5 workingDir s!
+6 ports *ContainerPort
+7 env *EnvVar
+8 resources ResourceRequirements
+9 volumeMounts *VolumeMount
+10 livenessProbe Probe
+11 readinessProbe Probe
+12 lifecycle Lifecycle
+13 terminationMessagePath s!
+14 imagePullPolicy s!
+15 securityContext SecurityContext
+16 stdin b!
+17 stdinOnce b!
+18 tty b!
+19 envFrom *EnvFromSource
+20 terminationMessagePolicy s!
+21 volumeDevices *VolumeDevice
+22 startupProbe Probe
+23 resizePolicy *ContainerResizePolicy
+24 restartPolicy s
+25 restartPolicyRules *ContainerRestartRule
+=PodSecurityContext
+1 seLinuxOptions SELinuxOptions
+2 runAsUser i
+3 runAsNonRoot b
+4 supplementalGroups *i
+5 fsGroup i
+6 runAsGroup i
+7 sysctls *Sysctl
+8 windowsOptions WindowsSecurityContextOptions
+9 fsGroupChangePolicy s
+10 seccompProfile SeccompProfile
+11 appArmorProfile AppArmorProfile
+12 supplementalGroupsPolicy s
+13 seLinuxChangePolicy s
+=Affinity
+1 nodeAffinity NodeAffinity
+2 podAffinity PodAffinity
+3 podAntiAffinity PodAntiAffinity
+=Toleration
+1 key s!
+2 operator s!
+3 value s!
+4 effect s!
+5 tolerationSeconds i
+=HostAlias
+1 ip s
+2 hostnames *s
+=PodDNSConfig
+1 nameservers *s
+2 searches *s
+3 options *PodDNSConfigOption
+=PodReadinessGate
+1 conditionType s
+=TopologySpreadConstraint
+1 maxSkew i
+2 topologyKey s
+3 whenUnsatisfiable s
+4 labelSelector LabelSelector
+5 minDomains i
+6 nodeAffinityPolicy s
+7 nodeTaintsPolicy s
+8 matchLabelKeys *s
+=EphemeralContainer
+1 . EphemeralContainerCommon
+2 targetContainerName s!
+=PodOS
+1 name s
+=PodSchedulingGate
+1 name s
+=PodResourceClaim
+1 name s
+3 resourceClaimName s
+4 resourceClaimTemplateName s
+=ResourceRequirements
+1 limits {Quantity
+2 requests {Quantity
+3 claims *ResourceClaim
+=PodSchedulingGroup
+1 podGroupName s
+=EvictionResponder
+1 name s
+2 priority i
+=PodFailurePolicyOnExitCodesRequirement
+1 containerName s
+2 operator s
+3 values *i
+=PodFailurePolicyOnPodConditionsPattern
+1 type s
+2 status s
+=ServiceBackendPort
+1 name s!
+2 number i!
+=HTTPIngressRuleValue
+1 paths *HTTPIngressPath
+=VolumeSource
+1 hostPath HostPathVolumeSource
+2 emptyDir EmptyDirVolumeSource
+3 gcePersistentDisk GCEPersistentDiskVolumeSource
+4 awsElasticBlockStore AWSElasticBlockStoreVolumeSource
+5 gitRepo GitRepoVolumeSource
+6 secret SecretVolumeSource
+7 nfs NFSVolumeSource
+8 iscsi ISCSIVolumeSource
+9 glusterfs GlusterfsVolumeSource
+10 persistentVolumeClaim PersistentVolumeClaimVolumeSource
+11 rbd RBDVolumeSource
+12 flexVolume FlexVolumeSource
+13 cinder CinderVolumeSource
+14 cephfs CephFSVolumeSource
+15 flocker FlockerVolumeSource
+16 downwardAPI DownwardAPIVolumeSource
+17 fc FCVolumeSource
+18 azureFile AzureFileVolumeSource
+19 configMap ConfigMapVolumeSource
+20 vsphereVolume VsphereVirtualDiskVolumeSource
+21 quobyte QuobyteVolumeSource
+22 azureDisk AzureDiskVolumeSource
+23 photonPersistentDisk PhotonPersistentDiskVolumeSource
+24 portworxVolume PortworxVolumeSource
+25 scaleIO ScaleIOVolumeSource
+26 projected ProjectedVolumeSource
+27 storageos StorageOSVolumeSource
+28 csi CSIVolumeSource
+29 ephemeral EphemeralVolumeSource
+30 image ImageVolumeSource
+=ContainerPort
+1 name s!
+2 hostPort i!
+3 containerPort i
+4 protocol s!
+5 hostIP s!
+=EnvVar
+1 name s
+2 value s!
+3 valueFrom EnvVarSource
+=VolumeMount
+1 name s
+2 readOnly b!
+3 mountPath s
+4 subPath s!
+5 mountPropagation s
+6 subPathExpr s!
+7 recursiveReadOnly s
+8 bindMountOptions *s
+=Probe
+1 . ProbeHandler
+2 initialDelaySeconds i!
+3 timeoutSeconds i!
+4 periodSeconds i!
+5 successThreshold i!
+6 failureThreshold i!
+7 terminationGracePeriodSeconds i
+=Lifecycle
+1 postStart LifecycleHandler
+2 preStop LifecycleHandler
+3 stopSignal s
+=SecurityContext
+1 capabilities Capabilities
+2 privileged b
+3 seLinuxOptions SELinuxOptions
+4 runAsUser i
+5 runAsNonRoot b
+6 readOnlyRootFilesystem b
+7 allowPrivilegeEscalation b
+8 runAsGroup i
+9 procMount s
+10 windowsOptions WindowsSecurityContextOptions
+11 seccompProfile SeccompProfile
+12 appArmorProfile AppArmorProfile
+=EnvFromSource
+1 prefix s!
+2 configMapRef ConfigMapEnvSource
+3 secretRef SecretEnvSource
+=VolumeDevice
+1 name s
+2 devicePath s
+=ContainerResizePolicy
+1 resourceName s
+2 restartPolicy s
+=ContainerRestartRule
+1 action s!
+2 exitCodes ContainerRestartRuleOnExitCodes
+=SELinuxOptions
+1 user s!
+2 role s!
+3 type s!
+4 level s!
+=Sysctl
+1 name s
+2 value s
+=WindowsSecurityContextOptions
+1 gmsaCredentialSpecName s
+2 gmsaCredentialSpec s
+3 runAsUserName s
+4 hostProcess b
+=SeccompProfile
+1 type s
+2 localhostProfile s
+=AppArmorProfile
+1 type s
+2 localhostProfile s
+=NodeAffinity
+1 requiredDuringSchedulingIgnoredDuringExecution NodeSelector
+2 preferredDuringSchedulingIgnoredDuringExecution *PreferredSchedulingTerm
+=PodAffinity
+1 requiredDuringSchedulingIgnoredDuringExecution *PodAffinityTerm
+2 preferredDuringSchedulingIgnoredDuringExecution *WeightedPodAffinityTerm
+=PodAntiAffinity
+1 requiredDuringSchedulingIgnoredDuringExecution *PodAffinityTerm
+2 preferredDuringSchedulingIgnoredDuringExecution *WeightedPodAffinityTerm
+=PodDNSConfigOption
+1 name s!
+2 value s
+=EphemeralContainerCommon
+1 name s
+2 image s!
+3 command *s
+4 args *s
+5 workingDir s!
+6 ports *ContainerPort
+7 env *EnvVar
+8 resources ResourceRequirements
+9 volumeMounts *VolumeMount
+10 livenessProbe Probe
+11 readinessProbe Probe
+12 lifecycle Lifecycle
+13 terminationMessagePath s!
+14 imagePullPolicy s!
+15 securityContext SecurityContext
+16 stdin b!
+17 stdinOnce b!
+18 tty b!
+19 envFrom *EnvFromSource
+20 terminationMessagePolicy s!
+21 volumeDevices *VolumeDevice
+22 startupProbe Probe
+23 resizePolicy *ContainerResizePolicy
+24 restartPolicy s
+25 restartPolicyRules *ContainerRestartRule
+=ResourceClaim
+1 name s
+2 request s!
+=HTTPIngressPath
+1 path s!
+2 backend IngressBackend
+3 pathType s
+=HostPathVolumeSource
+1 path s
+2 type s
+=EmptyDirVolumeSource
+1 medium s!
+2 sizeLimit Quantity
+3 mode i
+=GCEPersistentDiskVolumeSource
+1 pdName s
+2 fsType s!
+3 partition i!
+4 readOnly b!
+=AWSElasticBlockStoreVolumeSource
+1 volumeID s
+2 fsType s!
+3 partition i!
+4 readOnly b!
+=GitRepoVolumeSource
+1 repository s
+2 revision s!
+3 directory s!
+=SecretVolumeSource
+1 secretName s!
+2 items *KeyToPath
+3 defaultMode i
+4 optional b
+5 defaultUser i
+=NFSVolumeSource
+1 server s
+2 path s
+3 readOnly b!
+=ISCSIVolumeSource
+1 targetPortal s
+2 iqn s
+3 lun i
+4 iscsiInterface s!
+5 fsType s!
+6 readOnly b!
+7 portals *s
+8 chapAuthDiscovery b!
+10 secretRef LocalObjectReference
+11 chapAuthSession b!
+12 initiatorName s
+=GlusterfsVolumeSource
+1 endpoints s
+2 path s
+3 readOnly b!
+=PersistentVolumeClaimVolumeSource
+1 claimName s
+2 readOnly b!
+=RBDVolumeSource
+1 monitors *s
+2 image s
+3 fsType s!
+4 pool s!
+5 user s!
+6 keyring s!
+7 secretRef LocalObjectReference
+8 readOnly b!
+=FlexVolumeSource
+1 driver s
+2 fsType s!
+3 secretRef LocalObjectReference
+4 readOnly b!
+5 options {s
+=CinderVolumeSource
+1 volumeID s
+2 fsType s!
+3 readOnly b!
+4 secretRef LocalObjectReference
+=CephFSVolumeSource
+1 monitors *s
+2 path s!
+3 user s!
+4 secretFile s!
+5 secretRef LocalObjectReference
+6 readOnly b!
+=FlockerVolumeSource
+1 datasetName s!
+2 datasetUUID s!
+=DownwardAPIVolumeSource
+1 items *DownwardAPIVolumeFile
+2 defaultMode i
+3 defaultUser i
+=FCVolumeSource
+1 targetWWNs *s
+2 lun i
+3 fsType s!
+4 readOnly b!
+5 wwids *s
+=AzureFileVolumeSource
+1 secretName s
+2 shareName s
+3 readOnly b!
+=ConfigMapVolumeSource
+1 . LocalObjectReference
+2 items *KeyToPath
+3 defaultMode i
+4 optional b
+5 defaultUser i
+=VsphereVirtualDiskVolumeSource
+1 volumePath s
+2 fsType s!
+3 storagePolicyName s!
+4 storagePolicyID s!
+=QuobyteVolumeSource
+1 registry s
+2 volume s
+3 readOnly b!
+4 user s!
+5 group s!
+6 tenant s!
+=AzureDiskVolumeSource
+1 diskName s
+2 diskURI s
+3 cachingMode s
+4 fsType s
+5 readOnly b
+6 kind s
+=PhotonPersistentDiskVolumeSource
+1 pdID s
+2 fsType s!
+=PortworxVolumeSource
+1 volumeID s
+2 fsType s!
+3 readOnly b!
+=ScaleIOVolumeSource
+1 gateway s
+2 system s
+3 secretRef LocalObjectReference
+4 sslEnabled b!
+5 protectionDomain s!
+6 storagePool s!
+7 storageMode s!
+8 volumeName s!
+9 fsType s!
+10 readOnly b!
+=ProjectedVolumeSource
+1 sources *VolumeProjection
+2 defaultMode i
+3 defaultUser i
+=StorageOSVolumeSource
+1 volumeName s!
+2 volumeNamespace s!
+3 fsType s!
+4 readOnly b!
+5 secretRef LocalObjectReference
+=CSIVolumeSource
+1 driver s
+2 readOnly b
+3 fsType s
+4 volumeAttributes {s
+5 nodePublishSecretRef LocalObjectReference
+=EphemeralVolumeSource
+1 volumeClaimTemplate PersistentVolumeClaimTemplate
+=ImageVolumeSource
+1 reference s!
+2 pullPolicy s!
+=EnvVarSource
+1 fieldRef ObjectFieldSelector
+2 resourceFieldRef ResourceFieldSelector
+3 configMapKeyRef ConfigMapKeySelector
+4 secretKeyRef SecretKeySelector
+5 fileKeyRef FileKeySelector
+=ProbeHandler
+1 exec ExecAction
+2 httpGet HTTPGetAction
+3 tcpSocket TCPSocketAction
+4 grpc GRPCAction
+=LifecycleHandler
+1 exec ExecAction
+2 httpGet HTTPGetAction
+3 tcpSocket TCPSocketAction
+4 sleep SleepAction
+=Capabilities
+1 add *s
+2 drop *s
+=ConfigMapEnvSource
+1 . LocalObjectReference
+2 optional b
+=SecretEnvSource
+1 . LocalObjectReference
+2 optional b
+=ContainerRestartRuleOnExitCodes
+1 operator s!
+2 values *i
+=NodeSelector
+1 nodeSelectorTerms *NodeSelectorTerm
+=PreferredSchedulingTerm
+1 weight i
+2 preference NodeSelectorTerm
+=PodAffinityTerm
+1 labelSelector LabelSelector
+2 namespaces *s
+3 topologyKey s
+4 namespaceSelector LabelSelector
+5 matchLabelKeys *s
+6 mismatchLabelKeys *s
+=WeightedPodAffinityTerm
+1 weight i
+2 podAffinityTerm PodAffinityTerm
+=KeyToPath
+1 key s
+2 path s
+3 mode i
+4 user i
+=DownwardAPIVolumeFile
+1 path s
+2 fieldRef ObjectFieldSelector
+3 resourceFieldRef ResourceFieldSelector
+4 mode i
+5 user i
+=VolumeProjection
+1 secret SecretProjection
+2 downwardAPI DownwardAPIProjection
+3 configMap ConfigMapProjection
+4 serviceAccountToken ServiceAccountTokenProjection
+5 clusterTrustBundle ClusterTrustBundleProjection
+6 podCertificate PodCertificateProjection
+=PersistentVolumeClaimTemplate
+1 metadata ObjectMeta
+2 spec PersistentVolumeClaimSpec
+=ObjectFieldSelector
+1 apiVersion s!
+2 fieldPath s
+=ResourceFieldSelector
+1 containerName s!
+2 resource s
+3 divisor Quantity
+=ConfigMapKeySelector
+1 . LocalObjectReference
+2 key s
+3 optional b
+=SecretKeySelector
+1 . LocalObjectReference
+2 key s
+3 optional b
+=FileKeySelector
+1 volumeName s
+2 path s
+3 key s
+4 optional b
+=ExecAction
+1 command *s
+=HTTPGetAction
+1 path s!
+2 port IntOrString
+3 host s!
+4 scheme s!
+5 httpHeaders *HTTPHeader
+6 protocol s
+=TCPSocketAction
+1 port IntOrString
+2 host s!
+=GRPCAction
+1 port i
+2 service s
+3 mode s
+=SleepAction
+1 seconds i
+=NodeSelectorTerm
+1 matchExpressions *NodeSelectorRequirement
+2 matchFields *NodeSelectorRequirement
+=SecretProjection
+1 . LocalObjectReference
+2 items *KeyToPath
+4 optional b
+=DownwardAPIProjection
+1 items *DownwardAPIVolumeFile
+=ConfigMapProjection
+1 . LocalObjectReference
+2 items *KeyToPath
+4 optional b
+=ServiceAccountTokenProjection
+1 audience s!
+2 expirationSeconds i
+3 path s
+4 user i
+=ClusterTrustBundleProjection
+1 name s
+2 signerName s
+3 labelSelector LabelSelector
+4 path s
+5 optional b
+6 user i
+=PodCertificateProjection
+1 signerName s!
+2 keyType s!
+3 maxExpirationSeconds i
+4 credentialBundlePath s!
+5 keyPath s!
+6 certificateChainPath s!
+7 userAnnotations {s
+8 user i
+=HTTPHeader
+1 name s
+2 value s
+=NodeSelectorRequirement
+1 key s
+2 operator s
+3 values *s

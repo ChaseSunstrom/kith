@@ -1,6 +1,7 @@
 //! kith resources: the envelope every resource shares, the built-in kinds and
 //! their JSON Schemas, and the store that keeps them (PLAN.md §4.2, §4.3).
 
+pub mod cron;
 pub mod kinds;
 pub mod schema;
 pub mod store;
@@ -131,6 +132,7 @@ kinds! {
     Role: RoleSpec, cluster, "A set of permissions";
     RoleBinding: RoleBindingSpec, cluster, "Grants a role to identities";
     Identity: IdentitySpec, cluster, "A user, node or workload that can call the API";
+    KubeObject: KubeObjectSpec, namespaced, "A Kubernetes object kept as it was sent, which nothing in kith reads";
 }
 
 /// Where kithd listens and `kith` connects: `$KITH_SOCKET`, else

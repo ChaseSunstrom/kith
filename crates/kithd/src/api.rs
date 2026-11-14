@@ -178,7 +178,7 @@ pub(crate) fn permit(
 
 /// For `list` and `watch`: a refusal if `caller` may see nothing of the kind anywhere.
 /// What it may see of it is then picked resource by resource ([`seen`]).
-fn sight(shared: &Shared, caller: &Caller, verb: Verb, kind: Option<&str>) -> Result<(), ApiError> {
+pub(crate) fn sight(shared: &Shared, caller: &Caller, verb: Verb, kind: Option<&str>) -> Result<(), ApiError> {
     let any = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         Grants::of(caller, &state.store).anywhere(&verb, kind)
@@ -236,10 +236,18 @@ fn reach(shared: &Shared, caller: &Caller, resources: &[Resource]) -> Result<(),
         let placed = |resource: &Resource| (resource.kind.clone(), place(store, resource));
         resources.iter().map(placed).collect()
     };
-    let written = {
-        let state = shared.store.lock().expect("a handler panicked holding the store");
-        placed(&state.store)
+    // A claim that says `provision` has a Volume made for it on a node: whoever writes
+    // one must be allowed to write a Volume there.
+    let made = |store: &Store| -> Vec<(String, Option<String>)> {
+        let asks = |resource: &&Resource| resource.kind == "VolumeClaim" && resource.spec["provision"] == true;
+        let made = |resource: &Resource| ("Volume".to_string(), place(store, resource));
+        resources.iter().filter(asks).map(made).collect()
     };
+    let (written, made) = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        (placed(&state.store), made(&state.store))
+    };
+    permit(shared, caller, Verb::Apply, |_| made)?;
     reach_of(shared, caller, &written)
 }
 
@@ -253,6 +261,9 @@ fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>
     // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
     // writes one must be allowed to read both.
     permit(shared, caller, Verb::Get, |_| of("Backup", &["Volume", "Secret"]))?;
+    // A CronJob's Jobs are made for it by the cluster, as it says them: whoever writes
+    // one must be allowed to write a Job.
+    permit(shared, caller, Verb::Apply, |_| of("CronJob", &["Job"]))?;
     // An Image is a Volume's files, for every process of every node to read.
     permit(shared, caller, Verb::Get, |_| of("Image", &["Volume"]))?;
     // A Share gives a Volume's files, to read and to write, to whom it names: whoever
@@ -429,9 +440,14 @@ async fn delete(
     Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
 ) -> Reply<Resource> {
-    permit(&shared, &caller, Verb::Delete, |_| vec![place_of(&key)])?;
-    match change(&shared, &caller, "delete", vec![key.clone()], Command::Delete { key }).await? {
-        Done::Deleted(resource) => Ok(Json(*resource)),
+    deleted(&shared, &caller, key).await.map(Json)
+}
+
+/// Delete the resource at `key` as `caller`, if it may: what `DELETE /v1/resources` does.
+pub(crate) async fn deleted(shared: &Arc<Shared>, caller: &Caller, key: String) -> Result<Resource, ApiError> {
+    permit(shared, caller, Verb::Delete, |_| vec![place_of(&key)])?;
+    match change(shared, caller, "delete", vec![key.clone()], Command::Delete { key }).await? {
+        Done::Deleted(resource) => Ok(*resource),
         _ => Err(odd()),
     }
 }
@@ -466,21 +482,21 @@ async fn rollback(
     }
 }
 
-#[derive(Deserialize)]
-struct LogOptions {
+#[derive(Deserialize, Default)]
+pub(crate) struct LogOptions {
     /// A container or exec unit of the template; the first one when left out.
-    unit: Option<String>,
+    pub unit: Option<String>,
     #[serde(default)]
-    replica: u32,
+    pub replica: u32,
     #[serde(default)]
-    stderr: bool,
+    pub stderr: bool,
     #[serde(default)]
-    previous: bool,
-    offset: Option<u64>,
-    tail: Option<u64>,
+    pub previous: bool,
+    pub offset: Option<u64>,
+    pub tail: Option<u64>,
     /// Asked by another node: answer from this node's files, or not at all.
     #[serde(default)]
-    here: bool,
+    pub here: bool,
 }
 
 /// Most bytes of output in one reply.
@@ -491,25 +507,37 @@ async fn logs(
     Extension(caller): Extension<Caller>,
     Path(key): Path<String>,
     Query(options): Query<LogOptions>,
-    axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Reply<serde_json::Value> {
     // What a unit wrote is read by who may read the resource that runs it.
     permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
+    output(&shared, &key, &options).await
+}
+
+/// A chunk of what a unit of the resource at `key` wrote, from whichever node it runs on.
+/// (Whether the caller may read it is asked before.)
+pub(crate) async fn output(shared: &Arc<Shared>, key: &str, options: &LogOptions) -> Reply<serde_json::Value> {
     // A replica that runs on another node: its output is there.
     let elsewhere = shared.cluster.as_ref().filter(|_| !options.here).and_then(|cluster| {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        let status = state.store.get(&key)?.status.as_ref()?;
-        let node = status["nodes"][options.replica.to_string()].as_str()?;
+        let status = state.store.get(key)?.status.as_ref()?;
+        // (A Job is run by one node, all of its runs.)
+        let replica = if key.starts_with("Job/") { 0 } else { options.replica };
+        let node = status["nodes"][replica.to_string()].as_str()?;
         let there = state.store.get(&format!("Node/{node}"))?.status.as_ref()?;
         let address = there["address"].as_str().filter(|_| node != cluster.me.name)?;
         // (Whatever the caller said of `here`, the other node is asked for its own.)
-        let query = query.unwrap_or_default();
-        let query: Vec<&str> = query.split('&').filter(|pair| !pair.starts_with("here")).collect();
-        let query = query.join("&");
-        Some((
-            node.to_string(),
-            format!("https://{address}/v1/logs/{key}?{query}&here=true"),
-        ))
+        let mut query = format!(
+            "replica={}&stderr={}&previous={}&here=true",
+            options.replica, options.stderr, options.previous
+        );
+        for (name, value) in [("offset", options.offset), ("tail", options.tail)] {
+            query.extend(value.map(|value| format!("&{name}={value}")));
+        }
+        let mut url = reqwest::Url::parse(&format!("https://{address}/v1/logs/{key}?{query}")).ok()?;
+        if let Some(unit) = &options.unit {
+            url.query_pairs_mut().append_pair("unit", unit);
+        }
+        Some((node.to_string(), url))
     });
     if let (Some((node, url)), Some(cluster)) = (elsewhere, &shared.cluster) {
         let failed = |e: reqwest::Error| ApiError::Store(Error::Io(format!("asking node {node} for the output: {e}")));
@@ -523,8 +551,8 @@ async fn logs(
         return answer.json().await.map(Json).map_err(failed);
     }
     // `more` is read before the file: when it says the unit is done, the file is complete.
-    let Json((id, more)) = read(&shared, |store| {
-        let resource = store.get(&key).ok_or(Error::NotFound(key.clone()))?;
+    let Json((id, more)) = read(shared, |store| {
+        let resource = store.get(key).ok_or(Error::NotFound(key.to_string()))?;
         crate::controller::log_of(resource, options.unit.as_deref(), options.replica)
     })?;
     let stream = if options.stderr { "err" } else { "out" };
@@ -669,6 +697,20 @@ spec: {}
         let image = one("apiVersion: kith.dev/v1\nkind: Image\nmetadata: {name: i}\nspec: {volume: v}\n");
         assert!(reach(&shared, &bob, &image).is_ok(), "bob may read Volumes");
         assert!(reach(&shared, &Caller::Identity("eve".into()), &image).is_err());
+        // A CronJob is the Jobs made of it, and a claim that asks for a volume is that Volume.
+        let cron = "apiVersion: kith.dev/v1\nkind: CronJob\nmetadata: {name: c}\nspec: {schedule: '* * * * *', job: {template: {exec: [{name: a, command: ['true']}]}}}\n";
+        assert!(reach(&shared, &bob, &one(cron)).is_err(), "bob may not write Jobs");
+        assert!(reach(&shared, &Caller::Admin, &one(cron)).is_ok());
+        let claim = |more: &str| {
+            one(&format!(
+                "apiVersion: kith.dev/v1\nkind: VolumeClaim\nmetadata: {{name: k}}\nspec: {{size: 1Gi{more}}}\n"
+            ))
+        };
+        assert!(reach(&shared, &bob, &claim("")).is_ok());
+        assert!(
+            reach(&shared, &bob, &claim(", provision: true")).is_err(),
+            "bob may not write Volumes"
+        );
         // Going back to a revision of one is writing it.
         assert!(reach_of(&shared, &bob, &[place_of("Share/default/s")]).is_err());
         assert!(reach_of(&shared, &bob, &[place_of("ConfigMap/default/c")]).is_ok());

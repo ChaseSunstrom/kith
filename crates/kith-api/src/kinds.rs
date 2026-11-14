@@ -260,6 +260,10 @@ spec! {
         /// root the replica shares the node's network.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pod: Option<bool>,
+        /// Notes on each replica, which nothing in kith reads. A replica is made anew
+        /// when they change (`kubectl rollout restart` changes one to restart them all).
+        #[serde(default, skip_serializing_if = "Labels::is_empty")]
+        pub annotations: Labels,
     }
 
     pub struct YieldTo {
@@ -702,6 +706,18 @@ spec! {
         /// Node labels the backing volume's node must have.
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
         pub selector: Labels,
+        /// Where no Volume fits, one is made for the claim: of its name and size, on the
+        /// node that has the fewest (of those its `selector` picks). That Volume fits no
+        /// other claim and goes when the claim does; its data stays on the node, as
+        /// every Volume's does.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub provision: Option<bool>,
+    }
+
+    /// What the Kubernetes API's paths keep of an object kith has no kind for (a
+    /// ServiceAccount, a Kubernetes Role): given back as it was sent, and read by nothing.
+    pub struct KubeObjectSpec {
+        pub object: serde_json::Map<String, serde_json::Value>,
     }
 
     pub struct ConfigMapSpec {
@@ -1449,8 +1465,19 @@ impl Spec for JobSpec {
     }
 }
 
+impl Spec for KubeObjectSpec {
+    fn check(&self) -> Result<(), String> {
+        match self.object.get("kind").is_some_and(serde_json::Value::is_string) {
+            true => Ok(()),
+            false => Err("object.kind: a Kubernetes object says what kind it is".into()),
+        }
+    }
+}
+
 impl Spec for CronJobSpec {
     fn check(&self) -> Result<(), String> {
+        // (Its schedule and its timezone are read where it is run, which says in the
+        // CronJob's status what it cannot read: v1 took any text for both, and still does.)
         self.job.template.check("job.template")
     }
 }

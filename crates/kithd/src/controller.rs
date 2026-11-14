@@ -55,6 +55,9 @@ impl Run {
 struct Slot {
     /// Store key of the Workload, NodeWorkload or Job.
     owner: String,
+    /// The revision of its owner it runs: the one it was made for, or a later one that
+    /// would run it no differently.
+    revision: Option<u64>,
     replica: u32,
     run: Run,
     policy: RestartPolicy,
@@ -66,6 +69,8 @@ struct Slot {
     probes: Option<crate::probe::Probes>,
     /// The pod it is of, where its template says `pod`: the pod's id (`pod_of`) and its host name.
     pod: Option<(String, String)>,
+    /// Its template's notes: a unit whose notes changed is replaced, as one whose definition changed.
+    notes: BTreeMap<String, String>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
     devices: Vec<PathBuf>,
     /// What its containers mount: the Volume's directory, where in the container, and read-only
@@ -484,6 +489,7 @@ impl Controller {
                         Err(_) => {}
                         Ok(id) => drop(wanted.entry(id).or_insert(Slot {
                             owner: key.clone(),
+                            revision: resource.metadata.revision,
                             replica,
                             run: unit.clone(),
                             policy: policy.clone(),
@@ -494,6 +500,7 @@ impl Controller {
                                 let name = &resource.metadata.name;
                                 (pod_of(&key, replica), format!("{name}-{replica}"))
                             }),
+                            notes: template.annotations.clone(),
                             devices: devices.clone(),
                             volumes: mounts_of(unit, &volumes),
                             tuned: None,
@@ -522,6 +529,7 @@ impl Controller {
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
             new.run != slot.run
                 || new.pod != slot.pod
+                || new.notes != slot.notes
                 || new.policy != slot.policy
                 || new.devices != slot.devices
                 || new.volumes != slot.volumes
@@ -575,8 +583,12 @@ impl Controller {
         for id in stale {
             stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
         }
-        for (id, slot) in wanted {
-            self.slots.entry(id).or_insert(slot);
+        for (id, new) in wanted {
+            match self.slots.get_mut(&id) {
+                Some(slot) if !differs(&new, slot) => slot.revision = new.revision,
+                Some(_) => {}
+                None => drop(self.slots.insert(id, new)),
+            }
         }
         // A pod none of whose units is wanted any more is let go, its network with it.
         let pods: BTreeSet<&str> = self
@@ -725,7 +737,7 @@ impl Controller {
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
-                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts });
+                    let mut c = json!({ "name": slot.run.name(), "replica": slot.replica, "state": slot.state, "ready": slot.ready(), "restarts": slot.restarts, "revision": slot.revision });
                     if let Some(code) = slot.exit_code {
                         c["exitCode"] = json!(code);
                     }

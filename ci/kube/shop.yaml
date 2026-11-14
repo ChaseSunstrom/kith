@@ -1,0 +1,90 @@
+# What `sh ci/vm.sh --test kube` gives kubectl: manifests as they are written for
+# Kubernetes, with nothing of kith in them but the image (ci/pod.rs, which the test's
+# nodes have without asking a registry).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-config
+data:
+  GREETING: hello
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: shop-secret
+type: Opaque
+data:
+  password: aHVudGVyMg== # pragma: allowlist secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+  labels:
+    app: shop
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: shop
+  template:
+    metadata:
+      labels:
+        app: shop
+    spec:
+      containers:
+        - name: web
+          image: kith.test/pod:1
+          command: ["/bin/pod", "serve"]
+          ports:
+            - name: http
+              containerPort: 80
+          env:
+            - name: GREETING
+              valueFrom:
+                configMapKeyRef:
+                  name: shop-config
+                  key: GREETING
+            - name: PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: shop-secret
+                  key: password
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector:
+    app: shop
+  ports:
+    - port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+spec:
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shop
+                port:
+                  number: 80

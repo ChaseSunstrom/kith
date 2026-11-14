@@ -10,5 +10,8 @@ fn main() {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no-unwind.ld");
         println!("cargo::rustc-link-arg-bins=-Wl,-T,{}", script.display());
         println!("cargo::rustc-link-arg-bins=-Wl,--no-eh-frame-hdr");
+        // The addresses to set right when it starts, written packed (the start files of
+        // Rust's own musl read them so).
+        println!("cargo::rustc-link-arg-bins=-Wl,-z,pack-relative-relocs");
     }
 }

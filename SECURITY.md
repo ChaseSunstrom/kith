@@ -49,6 +49,23 @@ Only the newest version is fixed. There are no security releases of older ones.
   `no_new_privs`, on a read-only image, behind a seccomp filter that refuses some forty
   system calls: mounting, new namespaces, loading modules, bpf, perf, io_uring, keyrings,
   another process's memory, the clock. An image that names root as its user gets nobody.
+- **A pod** (a template that says `pod: true`, and so every Deployment, StatefulSet,
+  DaemonSet and Job sent through the Kubernetes API) is a container with three of those
+  taken off, as Kubernetes has them: it is the user its image names, root included; root
+  there has the fourteen capabilities a container runtime gives by default, and no
+  other; and its root file system is its own to write. It keeps `no_new_privs`, the
+  seccomp filter and its namespaces, and has a network namespace of its own.
+- **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
+  is checked as the kith kind and namespace it comes to, by the Roles of the
+  certificate's Identity; a write is asked for before anything is said of what is
+  there, and a patch, which is answered with the whole object, also needs the right to
+  read it. Kubernetes's own Roles, bindings and ServiceAccounts are kept as text and
+  give nothing; a pod is given no token and no API to ask. `privileged`, the host's
+  namespaces, `hostPath` and added capabilities have no field in kith, and an object
+  that asks for one is refused by its name. Of a body in protobuf 50,000 fields are read.
+- **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
+  must be allowed to write a Job, and whoever writes a claim that says `provision`
+  (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -76,8 +93,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 - **Whoever may apply a Workload, a NodeWorkload or a Job runs code on the cluster's
   nodes.** A container is kept small by default (see "A container" above), and its
   template is where each of those defaults is taken off: `runAsUser: 0`, `seccomp: {
-  unconfined: true }`. On kith OS there is no user namespace, so `runAsUser: 0` there is
-  the node's root with three capabilities. Containers share the node's network, and an
+  unconfined: true }`, `pod: true`. On kith OS there is no user namespace, so `runAsUser: 0`
+  there is the node's root with three capabilities, and root in a pod is the node's root
+  with fourteen (T-0280). Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
@@ -171,6 +189,16 @@ The hardening of containers (their user, capabilities, the seccomp filter, signe
 images) was written after this review, in answer to its first "not defended" entry. It
 had one reading of its own, by a reviewer who did not write it; nothing was run against
 it either, beyond its tests.
+
+The Kubernetes API and pods were written after 1.0. They had a reading of their own
+for security, by a reviewer who did not write them, with the question "is this a way
+past the Roles?"; nothing was run against them beyond their tests. It found four
+things, all fixed before the API was first committed: a patch answered a caller who
+may write a kind but not read it with the whole object (a Secret's data too); a
+CronJob was a way to run a Job without the right to write one; a write or a delete
+told a caller with no right whether the object was there; and a body in protobuf made
+of empty fields cost far more to read than its length. Not read then: how deep a
+strategic merge patch may nest, and the YAML reader's limits for a Source's manifests.
 
 ### Not reviewed
 

@@ -1187,6 +1187,42 @@
       "description": "A user, node or workload that can call the API",
       "title": "Identity",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "KubeObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "KubeObject"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KubeObjectSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A Kubernetes object kept as it was sent, which nothing in kith reads",
+      "title": "KubeObject",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
     }
   },
   "$defs": {
@@ -2094,6 +2130,20 @@
         "kind",
         "schema"
       ]
+    },
+    "KubeObjectSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "object": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "object"
+      ],
+      "description": "What the Kubernetes API's paths keep of an object kith has no kind for (a\nServiceAccount, a Kubernetes Role): given back as it was sent, and read by nothing."
     },
     "MeshSpec": {
       "type": "object",
@@ -3228,6 +3278,13 @@
             "null"
           ],
           "description": "Run each replica as Kubernetes runs a pod: its containers share a network of\ntheir own (any port is theirs, `localhost` is each other, and the replica has\nan address on the mesh), each may write its root file system unless it says\n`readOnlyRoot`, and each is the user its image names, root included (with what\na container runtime gives root, and nothing of the node's). Where kithd is not\nroot the replica shares the node's network."
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Notes on each replica, which nothing in kith reads. A replica is made anew\nwhen they change (`kubectl rollout restart` changes one to restart them all)."
         }
       },
       "description": "The units one replica runs: containers, exec units and virtual machines."
@@ -3449,6 +3506,13 @@
             "type": "string"
           },
           "description": "Node labels the backing volume's node must have."
+        },
+        "provision": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Where no Volume fits, one is made for the claim: of its name and size, on the\nnode that has the fewest (of those its `selector` picks). That Volume fits no\nother claim and goes when the claim does; its data stays on the node, as\nevery Volume's does."
         }
       },
       "required": [

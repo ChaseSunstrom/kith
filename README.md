@@ -99,7 +99,8 @@ is still there when it starts again.
 | Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](#kiths-own-language) |
 | Install an app with its settings, and upgrade it | [Packages](#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](#sources-gitops) |
-| Bring manifests or a chart over from Kubernetes | [Importing from Kubernetes and Helm](#importing-from-kubernetes-and-helm) |
+| Use kubectl, Helm and the manifests you have, unchanged | [kubectl and Helm, as they are](#kubectl-and-helm-as-they-are) |
+| Turn manifests or a chart into kith's own files | [Importing from Kubernetes and Helm](#importing-from-kubernetes-and-helm) |
 | Add a kind of your own, with its controller | [Kinds of your own](#kinds-of-your-own) |
 | Let other people and programs in, each with their own rights | [Who may do what](#who-may-do-what) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](#hardware) |
@@ -149,7 +150,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 33 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 34 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -191,6 +192,16 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   and so does taking longer than `timeoutSeconds`. `kith get job` shows
   `running`, `succeeded` or `failed: <why>`. A finished Job runs again only when
   you change it; one that kithd was restarted under starts over.
+- Makes a `CronJob`'s Jobs by the clock: at each minute its `schedule` names
+  (cron's five fields, or a name such as `@hourly`; read in UTC), the node that
+  leads makes a Job of its `job`,
+  called `<name>-<minute>`. `concurrency: forbid` waits for one that is still
+  running, `replace` removes it first. The last three that finished are kept, and
+  all of them go when the CronJob does. A minute in which no node led is not
+  made up for. A CronJob that names a `timezone` other than `UTC`, whose
+  schedule cannot be read, or whose name is longer than 54 characters (a Job's
+  name is its and the minute) is not run, and its status says why. Whoever applies
+  a CronJob must be allowed to apply a Job.
 - Keeps each unit's output: `kith logs KIND/NAME` prints it, with `--unit`,
   `--replica` (or the run of a Job), `--stderr`, `--tail LINES` and `-f` to
   follow until the unit is done. A log file that passes 10 MiB (`kithd
@@ -308,6 +319,43 @@ spec:
   not once for a cluster or a registry; an `exec` unit is none of this: it is a process
   of the host. The user namespace of the first kind (kithd as your service) has been run;
   the kith OS kind has been run in VMs with the default user and with root.
+
+### A replica as a pod
+
+`pod: true` on a template runs each replica as Kubernetes runs a pod. It is what
+a Deployment sent through [the Kubernetes API](#kubectl-and-helm-as-they-are)
+says, and a kith file can say it too:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  replicas: 3
+  template:
+    pod: true
+    containers:
+      - name: web
+        image: nginx:1.27-alpine
+        ports: [{ port: 80 }]
+```
+
+- **A network of its own.** The replica's containers share one: any port is theirs
+  (three replicas on one node each listen on port 80), `localhost` is each other, and
+  the replica has an address of its own, on the cluster's mesh where there is one
+  (`--mesh`), so every node reaches it and Services send to it. What it asks outside
+  the cluster leaves from behind its node's address. It is told this node's DNS, with
+  the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+- **A root file system to write.** Each container may write its own (what it writes
+  goes when it does), unless it says `readOnlyRoot: true`.
+- **The image's user.** Each container is the user its image names, root included,
+  with the capabilities a container runtime gives root and no more, in namespaces
+  and a root of its own and behind the same filter on system calls as every container.
+- Where kithd is not root (a service of your user) a pod shares the node's network
+  like any replica, and its root is root of a user namespace only.
+- Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
+  capabilities and the filter (no user namespace); what a pod writes to its root has
+  no quota; the range pods' addresses are taken from is fixed.
 
 ## More than one node
 
@@ -752,6 +800,110 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
 
 Not yet: signed-commit verification, credentials for private repositories.
 
+## kubectl and Helm, as they are
+
+kithd answers the Kubernetes API on the port it answers its own (`/api` and
+`/apis` beside `/v1`), so `kubectl` and `helm` (3 and 4) work against a kith
+cluster with the manifests and charts you already have. Nothing is rewritten and
+nothing is migrated. And nothing of Kubernetes runs: there is no API server, no
+etcd and no kubelet behind it, and kith never starts, packages or fetches one.
+kithd holds each object as the kith resource it means, and gives it back as it
+was sent.
+
+A kubeconfig is an Identity's certificate ([Who may do what](#who-may-do-what)):
+
+```sh
+kith identity cert alice --out .    # alice.crt, alice.key and the cluster's ca.crt
+```
+
+```
+# kubeconfig, beside those three files
+apiVersion: v1
+kind: Config
+current-context: kith
+clusters:
+- name: kith
+  cluster: { server: "https://NODE:7443", certificate-authority: ca.crt, tls-server-name: kith }
+users:
+- name: alice
+  user: { client-certificate: alice.crt, client-key: alice.key }
+contexts:
+- name: kith
+  context: { cluster: kith, user: alice }
+```
+
+```sh
+export KUBECONFIG=$PWD/kubeconfig
+kubectl apply -f manifests/               # a directory written for Kubernetes
+kubectl rollout status deployment/shop
+kubectl get pods -o wide                  # a pod each, with an address of its own
+kubectl logs shop-0
+helm install site ./chart --wait
+```
+
+| Kubernetes | What kith holds |
+|---|---|
+| Deployment, StatefulSet | a Workload whose replicas are pods (`pod: true`: [a pod](#a-replica-as-a-pod)) |
+| DaemonSet | a NodeWorkload |
+| Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC; the last three that finished are kept) |
+| Service | a Service |
+| Ingress | `expose` on the Service behind each host; the Ingress itself is kept to be read back |
+| ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
+| PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
+| Namespace | a Namespace |
+| ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, PodDisruptionBudget, IngressClass | kept as sent (a `KubeObject`), read back, and said to give nothing |
+| Pod, ReplicaSet, Node, Event | made for reading from what kith runs: `kubectl get pods`, `describe`, `logs` |
+
+What works, by the real clients in the tests (`sh ci/kube.sh`, and
+`sh ci/kube.sh --vm` for what needs pods that run):
+
+- **kubectl**: `apply` (client-side and `--server-side`), `create` (deployment,
+  job, `job --from=cronjob/…`, cronjob, configmap, secret, namespace,
+  serviceaccount), `get` (tables, `-o yaml|json|wide|name|jsonpath`, `-A`,
+  `--watch`, `get all`), `describe`, `diff`, `replace`, `patch` (strategic and
+  merge), `label`, `annotate`, `scale`, `expose`, `set image`, `rollout status`,
+  `rollout restart`, `wait`, `logs` (`-f`, `--tail`, of a pod, a Deployment or a
+  Job), `delete`.
+- **helm**: `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`,
+  `history`, `get manifest`, each with and without `--wait`, into a namespace it
+  creates.
+- **GitOps**: a [Source](#sources-gitops) follows a repository of Kubernetes
+  manifests as they are; a file's objects are read exactly as the API reads them.
+
+Every field of an object is accounted for, by one table
+(`crates/kith-kube/src/lib.rs`): it is carried into the kith resource, or it is
+taken and a `Warning:` says it changes nothing (kubectl prints it), or the
+object is refused with a status that names the field. Nothing is dropped in
+silence, and `kubectl get -o yaml` gives back what was sent.
+
+Not answered, each refused in words:
+
+- `exec`, `attach`, `port-forward`, `cp` and `kubectl run` (a pod alone); `kubectl top`.
+- CustomResourceDefinitions, and so other people's operators; admission
+  webhooks; NetworkPolicy, HorizontalPodAutoscaler.
+- Of a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`,
+  added capabilities (kith gives no Workload these, by any API); and, not yet,
+  volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
+  `initContainers`, `runAsNonRoot`.
+- A StatefulSet with a claim template and more than one replica; a CronJob in a
+  time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
+- `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
+  `kubectl patch --type json`; `kubectl logs --previous`, `--since` and
+  `--timestamps` (a unit's output is kept as it was written, not when).
+
+What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
+budget of 13 MB is not raised; kithd is 10.7 MB). With pods and CronJobs, kithd
+with nothing to do holds 8.1 MB of memory where it held 7.8 MB. A node that no
+Kubernetes client asks runs none of it.
+
+Who may do what is kith's own: a request on `/api` is checked as the same
+request on `/v1` would be, for the kith kind it means, by the Roles bound to the
+certificate's Identity (a `kubectl patch`, which is answered with the whole
+object, needs `get` as well as `apply`; a CronJob needs `apply` on Job, a
+PersistentVolumeClaim on Volume). Kubernetes's Roles and ServiceAccounts are kept
+and give nothing. What kith's own files made is not shown as a Kubernetes object, and is
+not written over through this API.
+
 ## Importing from Kubernetes and Helm
 
 `kith import k8s -f manifests.yaml` (`-f -` reads stdin; `-f` may repeat; a
@@ -763,18 +915,21 @@ installed `helm template` and translates what it prints (no helm: pipe
 
 | Kubernetes | kith |
 |---|---|
-| Deployment, StatefulSet | Workload (a StatefulSet's `volumeClaimTemplates` become one shared VolumeClaim `<template>-<name>`) |
+| Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
 | DaemonSet | NodeWorkload |
 | Service | Service |
 | Ingress | `expose: {host, via: edge, proxyProtocol}` on the Service behind each host |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
-| PersistentVolumeClaim | VolumeClaim |
-| Job, CronJob | Job, CronJob |
+| PersistentVolumeClaim | VolumeClaim, with `provision: true` unless it says `storageClassName: ""` |
+| Job, CronJob | Job, CronJob (a `timeZone` other than UTC is refused) |
 
-Nothing is dropped silently. Every field that is not carried over (an
-`affinity`, a `securityContext`, an unknown kind, an object that would not
-validate) is named on stderr by path, such as
-`not translated: Deployment/web: spec.template.spec.affinity not translated`.
+Nothing is dropped silently. Every field that is not carried over is named on
+stderr by path: one that kith has nothing for (`hostNetwork`, an unknown kind, an
+object that would not validate), such as
+`not translated: Deployment/web: spec.template.spec.hostNetwork not translated`,
+and one that is taken and changes nothing (an `affinity`, most of a
+`securityContext`). It is the table of fields
+[the Kubernetes API](#kubectl-and-helm-as-they-are) answers by.
 Status, `managedFields`, `uid`, `resourceVersion` and Helm's own labels are
 ignored, not reported. Exit status: 0 everything translated, 1 something is
 in the report (the output is still printed), 2 the input could not be read.
@@ -1265,6 +1420,13 @@ spec:
   takes no other (the workload would start on empty data): make the Volume again, or delete
   the claim and apply it again. Every replica of a workload shares the one directory. Deleting a claim frees its Volume, data
   kept.
+- A claim that says `provision: true` and finds no Volume gets one made for it: of its
+  name and size, a directory of its own in the node's state, on the ready node (of those its
+  `selector` picks) that has the fewest Volumes. That Volume fits no other claim and is
+  removed with the claim; the directory stays on the node, as every Volume's does, and
+  a claim of the same name made later finds what was written. Whoever applies such a
+  claim must be allowed to apply a Volume. (It is how a PersistentVolumeClaim sent by
+  `kubectl` gets its volume.)
 - The container sees the directory as a bind mount (`readOnly: true` makes it read-only).
   The directory is made on the node when the unit starts. In a namespace other than
   `kith-system` it is `<state>/volumes/<namespace>/<name>/<path>`: `path` must be relative,
@@ -2615,6 +2777,9 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
+sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
+sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)
 KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```

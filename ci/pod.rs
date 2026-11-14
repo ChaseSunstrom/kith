@@ -1,10 +1,12 @@
 //! What `sh ci/vm.sh --test pods` runs in its pods: one file, built static with rustc
 //! alone, and put in the nodes as a container image (they reach no registry there).
 //!
-//!   pod serve                  make a file in the root, then answer every connection on
-//!                              port 80 with this pod's name
+//!   pod serve [FILE]           make a file in the root, then answer every connection on
+//!                              port 80 (as HTTP) with this pod's name, what GREETING and
+//!                              PASSWORD say where it is told them, and, given a FILE it
+//!                              adds a line to at each start, how many lines that has
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
-//!                              line once, to /dev/stdout opened by that name
+//!                              and last line once, to /dev/stdout opened by that name
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,16 +18,27 @@ fn asked(host: &str, port: &str) -> std::io::Result<String> {
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
     let mut answer = String::new();
     stream.read_to_string(&mut answer)?;
-    Ok(answer.lines().next().unwrap_or_default().to_string())
+    let (first, last) = (answer.lines().next().unwrap_or_default(), answer.lines().last().unwrap_or_default());
+    Ok(format!("{first} {last}"))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match &args[1..] {
-        ["serve"] => {
+        ["serve", keeps @ ..] if keeps.len() < 2 => {
             std::fs::write("/made-here", "a pod's root takes a file").expect("a file in the root");
-            let name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
+            let mut name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
+            name = format!("HTTP/1.0 200 OK\r\n\r\n{}", name.trim());
+            for told in ["GREETING", "PASSWORD"] {
+                name += &std::env::var(told).map(|told| format!(" {told}")).unwrap_or_default();
+            }
+            if let [file] = keeps {
+                let mut kept = std::fs::OpenOptions::new().create(true).append(true).open(file).expect("the file it keeps");
+                kept.write_all(b"started\n").expect("a line in the file it keeps");
+                let lines = std::fs::read_to_string(file).expect("the file it keeps, read").lines().count();
+                name += &format!(" started {lines}");
+            }
             let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
             for mut stream in listener.incoming().flatten() {
                 // (What asks is read first: closing on it unread would cut the answer off.)
@@ -48,6 +61,6 @@ fn main() {
                 writeln!(out, "{line}").expect("a line out");
             }
         }
-        _ => panic!("pod serve | pod ask HOST PORT [HOST PORT ...]"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...]"),
     }
 }

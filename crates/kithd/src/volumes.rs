@@ -58,6 +58,8 @@ struct Vol {
     replicas: u32,
     size: Option<f64>,
     shared: bool,
+    /// Made for the claim of its name ([`provision`]): it fits no other.
+    made: bool,
     refused: Option<String>,
 }
 
@@ -125,6 +127,7 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
                     dir,
                     size: spec.size.map(|size| size.value()),
                     shared,
+                    made: volume.metadata.annotations.contains_key(MADE_FOR_CLAIM),
                 }
             }
             Err(e) => Vol {
@@ -132,6 +135,7 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
                 replicas: 1,
                 size: None,
                 shared: false,
+                made: false,
                 refused: Some(e.to_string()),
             },
         };
@@ -195,6 +199,7 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
                 && !taken.contains_key(*volume_key)
                 && vol.size.is_none_or(|size| size >= want)
                 && (!shared || vol.shared)
+                && (!vol.made || vol.dir.name == name)
                 && on_node(&vol.dir.node)
         };
         let found = vols.iter().filter(|(k, _)| k.starts_with(&prefix)).find(fits);
@@ -215,6 +220,73 @@ fn bind(store: &Store, vols: &BTreeMap<String, Vol>) -> Bound {
         bound.insert(key, Err(message));
     }
     (bound, taken)
+}
+
+/// On a Volume: it was made for the claim of its name (one that says `provision`).
+pub const MADE_FOR_CLAIM: &str = "kith.dev/made-for-claim";
+
+/// What the claims that say `provision` ask for: a Volume to make for each that is bound to
+/// none and has none of its name, on the node with the fewest Volumes (of those `ready`
+/// whose labels the claim selects); and the Volumes made so whose claim is gone, to remove.
+pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>, Vec<String>) {
+    let nodes = store.list(Some("Node")).filter(|node| ready(&node.metadata.name));
+    let mut nodes: BTreeMap<&str, (usize, &Resource)> =
+        nodes.map(|node| (node.metadata.name.as_str(), (0, node))).collect();
+    for volume in store.list(Some("Volume")) {
+        if let Some((count, _)) = volume.spec["node"].as_str().and_then(|node| nodes.get_mut(node)) {
+            *count += 1;
+        }
+    }
+    let there = |kind: &str, namespace: &str, name: &str| store.get(&format!("{kind}/{namespace}/{name}")).is_some();
+    // ponytail: binding is worked out here a second time each pass (`writes` did it once);
+    // hand it in if a store has so many claims that it shows.
+    let (bound, _) = bind(store, &volumes(store));
+    let mut make = Vec::new();
+    for claim in store.list(Some("VolumeClaim")) {
+        let key = claim.key();
+        let (namespace, name) = parts(&key);
+        // (In kith-system a path is anywhere on the host: none is made up there.)
+        let asks = claim.spec["provision"] == true && matches!(bound.get(&key), Some(Err(_)));
+        if !asks || namespace == SYSTEM || there("Volume", namespace, name) {
+            continue;
+        }
+        let selected = |node: &Resource| {
+            let wants = claim.spec["selector"].as_object().into_iter().flatten();
+            wants
+                .into_iter()
+                .all(|(label, value)| node.metadata.labels.get(label).map(String::as_str) == value.as_str())
+        };
+        let fewest = nodes
+            .iter_mut()
+            .filter(|(_, (_, node))| selected(node))
+            .min_by_key(|(name, (count, _))| (*count, **name));
+        let Some((node, (count, _))) = fewest else { continue };
+        *count += 1;
+        let mut spec = serde_json::json!({ "node": node, "path": "data", "size": claim.spec["size"] });
+        if claim.spec["shared"] == true {
+            spec["shared"] = true.into();
+        }
+        make.push(Resource {
+            api_version: kith_api::API_VERSION.into(),
+            kind: "Volume".into(),
+            metadata: kith_api::Metadata {
+                name: name.into(),
+                namespace: Some(namespace.into()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]),
+                revision: Some(0),
+            },
+            spec,
+            status: None,
+        });
+    }
+    let made = store
+        .list(Some("Volume"))
+        .filter(|volume| volume.metadata.annotations.contains_key(MADE_FOR_CLAIM));
+    let gone = made
+        .map(Resource::key)
+        .filter(|key| !there("VolumeClaim", parts(key).0, parts(key).1));
+    (make, gone.collect())
 }
 
 /// The names of the volumes a workload's containers mount.
@@ -663,6 +735,67 @@ spec: { node: a, path: tiny, size: 1Gi }
         assert!(gone["message"].as_str().unwrap().contains("is gone"), "{gone}");
         assert!(again.owners["Workload/default/app"].is_err());
         assert!(mounts(&store, "a").is_empty());
+    }
+
+    #[test]
+    fn a_claim_that_says_provision_gets_a_volume_made_where_none_fits() {
+        let source = [
+            res("VolumeClaim", "default", "db", "{ size: 10Gi, provision: true }"),
+            res(
+                "VolumeClaim",
+                "default",
+                "huge",
+                "{ size: 10Ti, provision: true, selector: { disk: hdd } }",
+            ),
+            res("VolumeClaim", "default", "plain", "{ size: 10Ti }"),
+            res(
+                "VolumeClaim",
+                "kith-system",
+                "anywhere",
+                "{ size: 10Ti, provision: true }",
+            ),
+            res(
+                "VolumeClaim",
+                "shop",
+                "cart",
+                "{ size: 1Gi, provision: true, shared: true }",
+            ),
+        ]
+        .concat();
+        let mut store = store(&source);
+        // A node that is not there now gets none; nor does a claim that picks only such nodes.
+        let (make, _) = provision(&store, &|node| node != "b");
+        let made: Vec<String> = make.iter().map(Resource::key).collect();
+        assert_eq!(made, ["Volume/shop/cart"]);
+        // `db` has a Volume that fits (`fast`), `plain` did not ask, and kith-system is the host's.
+        let (make, gone) = provision(&store, &|_| true);
+        let made: Vec<(String, &Value)> = make.iter().map(|volume| (volume.key(), &volume.spec)).collect();
+        let huge = json!({ "node": "b", "path": "data", "size": "10Ti" });
+        // (Then each node has two Volumes: the first by name.)
+        let cart = json!({ "node": "a", "path": "data", "size": "1Gi", "shared": true });
+        assert_eq!(
+            made,
+            [
+                ("Volume/default/huge".into(), &huge),
+                ("Volume/shop/cart".into(), &cart)
+            ]
+        );
+        assert!(gone.is_empty());
+        for volume in make {
+            assert_eq!(volume.metadata.revision, Some(0), "made, never written over");
+            store.apply(volume).unwrap();
+        }
+        settle(&mut store);
+        assert_eq!(status(&store, "VolumeClaim/default/huge"), json!({ "volume": "huge" }));
+        assert_eq!(status(&store, "VolumeClaim/default/db"), json!({ "volume": "fast" }));
+        // What was made for one claim is no other's, however well it fits.
+        assert!(status(&store, "VolumeClaim/default/plain")["message"].is_string());
+        let (make, gone) = provision(&store, &|_| true);
+        assert!(make.is_empty() && gone.is_empty());
+        // It goes when its claim does; a Volume somebody made stays when its claim goes.
+        store.delete("VolumeClaim/default/huge").unwrap();
+        store.delete("VolumeClaim/default/db").unwrap();
+        assert_eq!(provision(&store, &|_| true).1, ["Volume/default/huge"]);
     }
 
     #[test]

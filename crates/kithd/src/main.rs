@@ -16,6 +16,7 @@ mod claims;
 mod cluster;
 mod controller;
 mod controllers;
+mod cron;
 mod crypt;
 mod devices;
 mod dhcp;
@@ -27,6 +28,7 @@ mod ingress;
 mod init;
 mod install;
 mod kube;
+mod kubeproto;
 mod members;
 mod mesh;
 mod netboot;
@@ -636,6 +638,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 }
             };
             let hardware = devices::run(shared.clone(), stopping.clone());
+            let crons = cron::run(shared.clone(), stopping.clone());
             tokio::join!(
                 units,
                 releases,
@@ -645,7 +648,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 plans,
                 system,
                 key,
-                hardware
+                hardware,
+                crons
             );
         };
         let names = async {

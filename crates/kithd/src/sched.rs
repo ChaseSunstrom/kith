@@ -221,9 +221,11 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let capacity = shared.members.capacity(name);
             (capacity, lost.or(capacity.is_none().then_some(Duration::ZERO)))
         };
-        let (fields, left, claimed) = {
+        let (fields, left, claimed, (made, gone)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let (fields, left) = plan(&state.store, &seen, grace);
+            // The Volumes to make for claims that ask for one made, and those to remove.
+            let volumes = crate::volumes::provision(&state.store, &|node| seen(node).1.is_none());
             let mut claimed = crate::claims::writes(&state.store);
             claimed.extend(crate::volumes::writes(&state.store));
             claimed.extend(crate::seats::writes(&state.store));
@@ -232,9 +234,20 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
             let lost = |name: &str| seen(name).1;
             let mut fields = fields;
             fields.extend(crate::replicas::writes(&state.store, &lost, grace));
-            (fields, left, claimed)
+            (fields, left, claimed, volumes)
         };
         // What a lost node ran stops counting as ready before its replicas get a new home.
+        // (One that cannot be made is said, and holds nothing else back.)
+        let gone = gone.into_iter().map(|key| Command::Delete { key });
+        let made = made.into_iter().map(|volume| Command::Apply {
+            resources: vec![volume],
+            at: kith_api::store::now(),
+        });
+        for command in gone.chain(made) {
+            if let Err(e) = shared.submit(command).await {
+                eprintln!("kithd: a Volume for a claim: {e}");
+            }
+        }
         let mut commands = Vec::new();
         for (node, key) in left {
             let statuses = vec![(key, None)];

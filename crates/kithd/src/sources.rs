@@ -54,6 +54,8 @@ pub struct Fetched {
     pub skipped: Vec<String>,
     /// The resources in the files, once worked out (see `desired`).
     pub resources: OnceLock<Fallible<Vec<Resource>>>,
+    /// What its Kubernetes manifests say that is taken and changes nothing (set with `resources`).
+    pub said: OnceLock<Vec<String>>,
 }
 
 /// May a Source name this git URL? Over the network only (`file://` for tests, when
@@ -470,6 +472,7 @@ async fn fetch_within(
         files,
         skipped,
         resources: OnceLock::new(),
+        said: OnceLock::new(),
     })
 }
 
@@ -501,6 +504,7 @@ pub async fn fetch_oci(reference: &str, path: Option<&str>, outward: bool) -> Fa
             .collect(),
         skipped: Vec::new(),
         resources: OnceLock::new(),
+        said: OnceLock::new(),
     })
 }
 
@@ -514,46 +518,70 @@ fn clone_of(state: &Path, source: &str) -> PathBuf {
 /// unless it names one, marked as the Source's, and where a Source may put things.
 fn desired(key: &str, fetched: &Fetched) -> Fallible<Vec<Resource>> {
     let home = key.split('/').nth(1).unwrap_or_default();
-    let mut resources: Vec<Resource> = Vec::new();
+    // Each resource: the file it is in, and whether it says where it goes.
+    let mut found: Vec<(&str, bool, Resource)> = Vec::new();
+    let mut objects = Vec::new();
     for (path, text) in &fetched.files {
         let shown = |e: kith_yaml::Error| e.render(path, text);
         for document in kith_yaml::parse(text).map_err(shown)? {
+            // What was written for Kubernetes is taken as kithd's Kubernetes API takes it.
+            let version = document.get("apiVersion").and_then(kith_yaml::Node::as_str);
+            if version.is_some_and(crate::kube::speaks) {
+                objects.push(kith_yaml::from_node(&document).map_err(shown)?);
+                continue;
+            }
             let placed = document
                 .get("metadata")
                 .is_some_and(|metadata| metadata.get("namespace").is_some());
-            let mut resource = Resource::from_node(&document).map_err(shown)?;
-            // (A kind some KindDefinition makes is placed when the store is at hand: `settled`.)
-            let own = kith_api::kind(&resource.kind);
-            let scoped = own.is_some_and(|kind| kind.namespaced);
-            if !placed && scoped {
-                resource.metadata.namespace = Some(home.to_string());
-            }
-            let at = resource.key();
-            if home != "kith-system" && own.is_some() {
-                if !scoped || resource.kind == "Source" {
-                    return Err(format!(
-                        "{path}: {at}: only a Source in kith-system gets to make a {}",
-                        resource.kind
-                    ));
-                }
-                if resource.metadata.namespace.as_deref() != Some(home) {
-                    return Err(format!(
-                        "{path}: {at}: a Source stays in its own namespace ({home}) unless it is in kith-system"
-                    ));
-                }
-            }
-            if at == key {
-                return Err(format!("{path}: {at}: a Source does not apply itself"));
-            }
-            if resources.iter().any(|other| other.key() == at) {
-                return Err(format!("{path}: {at} is in the source twice"));
-            }
-            (resource.metadata.revision, resource.status) = (None, None);
-            resource.metadata.annotations.insert(OWNER.into(), key.to_string());
-            resources.push(resource);
+            found.push((path, placed, Resource::from_node(&document).map_err(shown)?));
         }
     }
+    let (taken, said) = crate::kube::from_files(objects, home)?;
+    let _ = fetched.said.set(said);
+    let theirs = taken
+        .into_iter()
+        .map(|resource| ("a Kubernetes manifest", true, resource));
+    found.extend(theirs);
+    let mut resources: Vec<Resource> = Vec::new();
+    for (path, placed, mut resource) in found {
+        // (A kind some KindDefinition makes is placed when the store is at hand: `settled`.)
+        let own = kith_api::kind(&resource.kind);
+        let scoped = own.is_some_and(|kind| kind.namespaced);
+        if !placed && scoped {
+            resource.metadata.namespace = Some(home.to_string());
+        }
+        let at = resource.key();
+        if home != "kith-system" && own.is_some() {
+            if !scoped || resource.kind == "Source" {
+                return Err(format!(
+                    "{path}: {at}: only a Source in kith-system gets to make a {}",
+                    resource.kind
+                ));
+            }
+            if resource.metadata.namespace.as_deref() != Some(home) {
+                return Err(format!(
+                    "{path}: {at}: a Source stays in its own namespace ({home}) unless it is in kith-system"
+                ));
+            }
+        }
+        if at == key {
+            return Err(format!("{path}: {at}: a Source does not apply itself"));
+        }
+        if resources.iter().any(|other| other.key() == at) {
+            return Err(format!("{path}: {at} is in the source twice"));
+        }
+        (resource.metadata.revision, resource.status) = (None, None);
+        resource.metadata.annotations.insert(OWNER.into(), key.to_string());
+        resources.push(resource);
+    }
     Ok(resources)
+}
+
+/// What of a Source's files did nothing: the files that were passed over, and what its
+/// Kubernetes manifests say that kith takes and has no use for.
+fn skipped(fetched: &Fetched) -> Vec<String> {
+    let said = fetched.said.get().into_iter().flatten();
+    fetched.skipped.iter().chain(said).cloned().collect()
 }
 
 /// A message with nothing in it for a terminal to act on (it may quote a file's name
@@ -665,14 +693,14 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
                     let removed = done.delete.iter().map(|key| format!("-{key}"));
                     let changes: Vec<String> = done.apply.iter().map(Resource::key).chain(removed).collect();
                     json!({
-                        "state": "pending", "message": null, "skipped": fetched.skipped,
+                        "state": "pending", "message": null, "skipped": skipped(fetched),
                         "pending": { "revision": fetched.revision, "changes": changes },
                         "observedRevision": source.metadata.revision,
                     })
                 } else {
                     let mut status = json!({
                         "state": "synced", "message": null, "revision": fetched.revision, "pending": null,
-                        "resources": done.kept, "skipped": fetched.skipped, "observedRevision": source.metadata.revision,
+                        "resources": done.kept, "skipped": skipped(fetched), "observedRevision": source.metadata.revision,
                     });
                     // Changed since this very revision was applied: someone's doing,
                     // undone. (The list stays until a new revision or more drift.)
@@ -1017,12 +1045,87 @@ mod tests {
                 .collect(),
             skipped: Vec::new(),
             resources: OnceLock::new(),
+            said: OnceLock::new(),
         };
         Fetches::from([("Source/shop/repo".to_string(), Ok(fetched))])
     }
 
     const SOURCE: &str = "apiVersion: kith.dev/v1\nkind: Source\nmetadata: { name: repo, namespace: shop }\n\
                           spec: { git: { url: 'https://example.org/a.git' }, prune: true }\n";
+
+    #[test]
+    fn a_source_takes_kubernetes_manifests_as_they_are() {
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
+        apply(&mut store, SOURCE);
+        // A repository written for Kubernetes, with one file of kith's own beside it.
+        let web = "apiVersion: apps/v1\nkind: Deployment\nmetadata: { name: web }\nspec:\n  replicas: 2\n  \
+                   revisionHistoryLimit: 3\n  selector: { matchLabels: { app: web } }\n  template:\n    \
+                   metadata: { labels: { app: web } }\n    spec:\n      containers: [{ name: web, image: nginx }]\n\
+                   ---\napiVersion: v1\nkind: Service\nmetadata: { name: web }\n\
+                   spec: { selector: { app: web }, ports: [{ port: 80 }] }\n";
+        let way_in = "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata: { name: web }\nspec:\n  rules:\n    \
+                      - host: web.example.org\n      http:\n        paths:\n          \
+                      - { path: /, pathType: Prefix, backend: { service: { name: web, port: { number: 80 } } } }\n";
+        let files = [
+            ("k8s/ingress.yaml", way_in.to_string()),
+            ("k8s/web.yaml", web.to_string()),
+            ("own.yaml", map("a", "red")),
+        ];
+        settle(&mut store, &at("r1", &files));
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        // Each is the kith resource it means, in the Source's namespace and its own;
+        let held = store.get("Workload/shop/web").unwrap();
+        assert_eq!(held.spec["replicas"], 2);
+        assert_eq!(crate::releases::owner(held), Some("Source/shop/repo"));
+        // the Ingress, in a file of its own, is the Service's way in;
+        assert_eq!(
+            store.get("Service/shop/web").unwrap().spec["expose"]["host"],
+            "web.example.org"
+        );
+        assert!(store.get("KubeObject/shop/ingresses.web").is_some());
+        // each is held as it was written, which is how kubectl is shown it;
+        let sent: Value = serde_json::from_str(&held.metadata.annotations[crate::kube::SENT]).unwrap();
+        assert_eq!(sent["spec"]["revisionHistoryLimit"], 3);
+        assert_eq!(sent["metadata"]["namespace"], "shop");
+        // and what is taken and changes nothing is said.
+        let said = status(&store)["skipped"].to_string();
+        assert!(said.contains("Deployment/web: spec.revisionHistoryLimit"), "{said}");
+        // Fetched again it is the same: nothing is written.
+        assert!(plan(&store, &at("r1", &files)).is_empty());
+
+        // What kith would run otherwise than asked is the Source's error, by its field;
+        let no = web.replace("containers:", "hostNetwork: true\n      containers:");
+        settle(&mut store, &at("r2", &[("k8s/web.yaml", no)]));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            message.contains("Deployment/web: spec.template.spec.hostNetwork"),
+            "{message}"
+        );
+        // as is a kind that is not here, and an object put in another namespace.
+        let policy = "apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata: { name: none }\n";
+        settle(&mut store, &at("r3", &[("k8s/policy.yaml", policy.to_string())]));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            message.contains("networking.k8s.io/v1 has no kind NetworkPolicy here"),
+            "{message}"
+        );
+        let elsewhere = web.replace(
+            "metadata: { name: web }\nspec:\n  replicas",
+            "metadata: { name: web, namespace: other }\nspec:\n  replicas",
+        );
+        settle(&mut store, &at("r4", &[("k8s/web.yaml", elsewhere)]));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            message.contains("a Source stays in its own namespace (shop)"),
+            "{message}"
+        );
+        assert_eq!(
+            store.get("Workload/shop/web").unwrap().spec["replicas"],
+            2,
+            "what was applied stays"
+        );
+    }
 
     #[test]
     fn a_source_is_applied_pruned_and_put_back() {
