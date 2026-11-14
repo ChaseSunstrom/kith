@@ -825,6 +825,20 @@ spec! {
         /// Its signature of the file's header.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub signature: Option<String>,
+        /// The keys a node takes releases from once it runs this one.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub handover: Option<Handover>,
+    }
+
+    /// A release key handing over to others (`sh os/update.sh --handover`).
+    pub struct Handover {
+        /// The public keys (hex) that count from this release on: 1 to 8, the
+        /// release's own among them if it is to go on counting.
+        pub keys: Vec<String>,
+        /// The release's key's signature of the handover.
+        pub signature: String,
+        /// The same, by one of `keys`: someone holds a key that is handed to.
+        pub proof: String,
     }
 
     pub struct UpdatePlanSpec {
@@ -974,7 +988,6 @@ no_checks!(
     PackageSpec,
     ReleaseSpec,
     RepositorySpec,
-    OsReleaseSpec,
     UpdatePlanSpec,
     NodeKeySpec,
     RoleSpec,
@@ -1593,6 +1606,34 @@ impl Spec for DeviceClaimSpec {
                 ("selector", !self.selector.is_empty()),
             ],
         )
+    }
+}
+
+impl Spec for OsReleaseSpec {
+    fn check(&self) -> Result<(), String> {
+        let Some(handover) = &self.handover else {
+            return Ok(());
+        };
+        let hex = |text: &str, digits: usize| text.len() == digits && text.bytes().all(|b| b.is_ascii_hexdigit());
+        if handover.keys.is_empty() || handover.keys.len() > 8 {
+            return Err(format!(
+                "handover.keys: a handover is to 1 to 8 keys, not {}",
+                handover.keys.len()
+            ));
+        }
+        if let Some(key) = handover.keys.iter().find(|key| !hex(key, 64)) {
+            return Err(format!(
+                "handover.keys: `{key}` is not a public key (64 hex digits, as `kith package keygen` prints it)"
+            ));
+        }
+        for (name, signature) in [("signature", &handover.signature), ("proof", &handover.proof)] {
+            if !hex(signature, 128) {
+                return Err(format!(
+                    "handover: `{name}` is not a signature (128 hex digits, as `sh os/update.sh --handover` prints it)"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 

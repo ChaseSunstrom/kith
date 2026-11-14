@@ -183,7 +183,11 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         sh "$root/os/update.sh" 9.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
             "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
         public=$("$root/target/debug/kith" package keygen "$work/key")
-        sign() { sh "$root/os/update.sh" --sign "$work/key" "$work/www/$1.update"; }
+        sign() { sh "$root/os/update.sh" --sign "$work/${2:-key}" "$work/www/$1.update"; }
+        # A second key, which the first hands over to in the release every node takes.
+        public2=$("$root/target/debug/kith" package keygen "$work/key2")
+        handed() { sh "$root/os/update.sh" --handover "$work/$1" "$work/www/next.update" "$public2"; } # KEYFILE
+        by=$public more='' allow=''
         (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
         web=$!
       fi
@@ -235,12 +239,16 @@ print(status.get("phase", "-"), updating, versions or "-", status.get("reason", 
             done
             echo "vm.sh: $1: $line" >&2
         }
-        release() { # NAME VERSION SIGNATURE: that release, and a plan that gives it to every node
+        # NAME VERSION SIGNATURE [FILE]: that release, and a plan that gives it to every node.
+        # (Signed by the key $by; $more is more of the release's spec and $allow of the
+        # plan's, for this one release.)
+        release() {
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"OSRelease","metadata":{"name":"$1"},
-  "spec":{"version":"$2","image":"http://10.0.2.2:$((port + 9))/${4:-$1}.update","publicKey":"$public","signature":"$3"}},
- {"apiVersion":"kith.dev/v1","kind":"UpdatePlan","metadata":{"name":"all"},"spec":{"release":"$1"}}]
+  "spec":{"version":"$2","image":"http://10.0.2.2:$((port + 9))/${4:-$1}.update","publicKey":"$by","signature":"$3"$more}},
+ {"apiVersion":"kith.dev/v1","kind":"UpdatePlan","metadata":{"name":"all"},"spec":{"release":"$1"$allow}}]
 EOF
+            more='' allow=''
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the release $1 was not applied"
         }
         starts() { grep -ac "Kernel command line:.*kith.slot=$2" "$work/n$1.log"; }
@@ -589,14 +597,36 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
         [ "$(starts 1 a)$(starts 2 a)$(starts 3 a)" = 111 ] || fail "a node restarted for a release it refused"
 
         # The release, signed: every node takes it, one at a time, and it is one cluster still.
+        # It hands its key over to a second one, which signs with the first that it is held.
+        more=",\"handover\":{\"keys\":[\"$public2\"],\"signature\":\"$(handed key)\",\"proof\":\"$(handed key2)\"}"
         release next 9.0.0-next "$(sign next)"
         until_says "all three on the release" "^Done 0 9.0.0-next,9.0.0-next,9.0.0-next "
         [ "$(starts 1 b)$(starts 2 b)$(starts 3 b)" = 111 ] || fail "not every node started its other slot once"
         ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+        # (Each takes the keys handed over once it has called the release's slot good.)
+        tries=0
+        until [ "$(grep -al 'handed over its release keys' "$work"/n?.log | wc -l)" = 3 ]; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 60 ] || fail "not every node took the keys the release handed over"
+            sleep 1
+        done
+        on=9.0.0-next,9.0.0-next,9.0.0-next
+
+        # A release under what every node has now run well, in a plan that allows going
+        # back and signed by the key they now take: refused, with nothing fetched.
+        by=$public2 allow=',"allowDowngrade":true'
+        release under 0.0.1 "$(sign next key2)" next
+        until_says "a release under the floor refused, though its plan allows going back" "^Paused 0 $on .*the newest this node has run well"
+        # One signed by the key that was left out: refused too.
+        by=$public
+        release left-out 9.0.1 "$(sign next)" next
+        until_says "a release signed by the key that handed over refused" "^Paused 0 $on .*not signed by a key this node takes releases from"
+        [ "$(starts 1 b)$(starts 2 b)$(starts 3 b)" = 111 ] || fail "a node restarted for a release it refused"
+        by=$public2
 
         # A release that cannot start: the first node tries it three times and is back on
         # what it ran; the plan is paused, and no other node is given it.
-        release broken 9.0.0-broken "$(sign broken)"
+        release broken 9.0.0-broken "$(sign broken key2)"
         until_says "a release that cannot start stopped at the first node" "^Paused 0 9.0.0-next,9.0.0-next,9.0.0-next .* did not take 9.0.0-broken: it did not come up"
         # (It says so once it has called its own slot good, ten seconds after it started.)
         tries=0
@@ -606,7 +636,7 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
             sleep 1
         done
         [ "$(($(starts 1 a) + $(starts 2 a) + $(starts 3 a)))" = 6 ] || fail "expected three tries of the broken release on one node"
-        echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster; one that cannot start tried by one node, which came back, and the plan paused: $line"
+        echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster, and with it the key it handed over to; a release under their floor and one by the key left out refused; one that cannot start, signed by the new key, tried by one node, which came back, and the plan paused: $line"
         exit 0
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ]; then

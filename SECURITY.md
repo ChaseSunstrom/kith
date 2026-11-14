@@ -107,7 +107,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   restore, a replica's copy and its sync take as many bytes as they are sent: a bucket
   someone else writes can fill a node's disk. (T-0230.)
 - **A node started with no `--release-key` trusts the key of the first OSRelease it
-  takes.** Give the key when installing. (T-0231.)
+  takes.** Give the key when installing. (T-0231.) What a taken admin credential can
+  still do with OSRelease and UpdatePlan is restart nodes into releases their keys
+  signed that are no older than the newest each node has run well (its floor,
+  `os-release-floor`): not into an older one, and not onto other keys, since a
+  handover must be signed by a key the node has and by one it is handed to. A node
+  with no state partition keeps neither floor nor keys, and whoever holds a release
+  key the nodes take still decides everything they run.
 - **Answers from an ACME authority** are read without a cap on size, and the
   certificate that comes back is not checked to be for the host that was asked for.
   (T-0232.)

@@ -1786,6 +1786,75 @@ release names and nowhere else: a redirect is not followed. Even so, give
 OSRelease and UpdatePlan to nobody who is not the cluster's admin: they still
 decide when nodes restart, and what a node with no key yet takes first.
 
+**A key hands over to others in a release.** `handover` names the keys that count
+once a node runs that release (the release's own among them, if it is to go on
+counting), signed by the release's key and by one of the keys named:
+
+```sh
+kith package keygen next.key                                   # prints the new public key, NEWKEY
+sh os/update.sh --handover release.key kith-os.update NEWKEY   # prints handover.signature
+sh os/update.sh --handover next.key kith-os.update NEWKEY      # prints handover.proof
+```
+
+```yaml
+apiVersion: kith.dev/v1
+kind: OSRelease
+metadata:
+  name: v1-0-2
+spec:
+  version: 1.0.2
+  image: http://files.example/kith-os-1.0.2.update
+  publicKey: <the key the nodes have>
+  signature: <what --sign printed, with release.key>
+  handover:
+    keys: [c43685f967c3766aa98d5516f48db84ce1d27db7b480230f8a8e4fab95874d7e]   # 1 to 8
+    signature: 63bc974e91261f724d8409a95701ef183622325d0c1d796656d33b50912a6b5a021b7a5779c68228bfa47ddcdd884d46478080a4b5110387db8ffe7a128e1c8a
+    proof: 2178dab95346eac739a287cf07fdcda76983016620bd3857a0c0f48433ab9f096b880f0843c5899ef9c89460de046777a5b78faf2ba288d3bcd138ca6a508996
+```
+
+A node that takes this release puts the keys aside, and they become its keys when
+it has started on 1.0.2 and marked it good (the ones it had are left beside them, in
+`os-release-keys.before`): a release signed by a key that was left out is refused from
+then on. Until then nothing has changed, so an update that does not come up is tried
+again under the keys the node had. A handover that is not signed by both, or names
+no key or more than eight, is the release refused, and the plan says why. The two
+signatures are over the keys, the release's version and the update's header, so a
+handover is good with that release and no other; and one in a release of the version
+a node's keys came with, or of an older one, changes nothing (an old release shown
+again brings no key back). Hand over in a release with a higher number than the last
+handover's: two versions that differ only in a word after their numbers (`1.1-rc1`,
+`1.1-rc2`) are ones a node cannot put in order, and it refuses the second handover.
+Put the stanza in one release and leave it out of the ones after it. A node started
+with `--release-key` takes its keys from there, and from no release.
+
+Only a node whose kithd knows handovers takes one. A cluster from before them does
+not take the stanza at all (`kith apply` says it does not know `handover`), and in
+one that is half way a node still on the older release takes the update and keeps
+the key it had. So the release that hands over is not the first one built from this
+version: put one out without a handover first, and hand over in the next, when every
+node runs the first. (A node that was missed is started with `--release-key`.)
+
+Keep signing with the old key until every node runs a release that hands over: a
+node that was off in the meantime takes that release first, and it knows the old key
+only. A lost key cannot hand over, since nothing signs for it: each node is then
+started with `--release-key`, as above. So hand over to two keys, and keep one of
+them where the other is not.
+
+**The floor.** A node keeps the newest version it ever ran well in its state
+(`os-release-floor`, written when the slot it started from is marked good) and takes
+no release under it: not when it has fallen back to its older slot, and not when a
+plan says `allowDowngrade: true`. A cluster whose admin's credentials are taken is
+not walked back to a release with a hole that was since mended. To go back on
+purpose, release the older system again under a newer version; or remove
+`os-release-floor` from the node's state, at the node (nothing in the cluster's API
+does it; on kith OS that is the state partition, reached from another system
+started on that machine). So `allowDowngrade` now takes back only a node with no
+floor above the release: one with no state partition, or whose floor was removed. A
+floor that cannot be read is not "no floor": the node takes no update until the file
+says a version or is gone. The floor is for releases that come through the cluster:
+an update stick (`kith.update=DEVICE`) is written whatever it says, as whoever is at
+the machine with a stick is its admin already.
+
 The node that leads the cluster picks who goes next: nodes that do not vote
 on the store first, `maxUnavailable` at a time; then the voters, one at a
 time, each only while every other voter is up, and itself last. A node whose

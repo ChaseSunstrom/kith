@@ -844,6 +844,66 @@ fn a_vm_unit_names_what_it_starts_by_absolute_paths_and_its_memory() {
     assert!(job(twice).unwrap_err().contains("two units are named `vm`"));
 }
 
+/// A release may hand its key over to others: what it says is checked for its shape when
+/// it is applied (whether it is signed, by the node that would take it).
+#[test]
+fn handover_names_keys_and_carries_two_signatures() {
+    let release = |handover: &str| {
+        let text = format!(
+            "apiVersion: kith.dev/v1\nkind: OSRelease\nmetadata: {{ name: r }}\nspec: {{ version: '2', image: 'http://h/u', {handover} }}\n"
+        );
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let (key, signature) = ("ab".repeat(32), "cd".repeat(64));
+    release("publicKey: aa").unwrap();
+    release(&format!(
+        "handover: {{ keys: [{key}, {}], signature: {signature}, proof: {signature} }}",
+        key.to_uppercase()
+    ))
+    .unwrap();
+    // (A key of digits and one `e` is a number to most YAML readers: here it is the text it is.)
+    let number = format!("1e{}", "7".repeat(62));
+    release(&format!(
+        "handover: {{ keys: [{number}], signature: {signature}, proof: {signature} }}"
+    ))
+    .unwrap();
+    let nine = [key.as_str(); 9].join(", ");
+    for (wrong, said) in [
+        (
+            format!("handover: {{ keys: [], signature: {signature}, proof: {signature} }}"),
+            "1 to 8 keys",
+        ),
+        (
+            format!("handover: {{ keys: [{nine}], signature: {signature}, proof: {signature} }}"),
+            "1 to 8 keys",
+        ),
+        (
+            format!("handover: {{ keys: [{key}zz], signature: {signature}, proof: {signature} }}"),
+            "64 hex digits",
+        ),
+        (
+            format!("handover: {{ keys: [{key}], signature: {key}, proof: {signature} }}"),
+            "`signature`",
+        ),
+        (
+            format!("handover: {{ keys: [{key}], signature: {signature}, proof: later }}"),
+            "`proof`",
+        ),
+        (
+            format!("handover: {{ keys: [{key}], signature: {signature} }}"),
+            "proof",
+        ),
+        (
+            format!("handover: {{ keys: [{key}], signature: {signature}, proof: {signature}, to: all }}"),
+            "to",
+        ),
+    ] {
+        let e = release(&wrong).expect_err(&wrong);
+        assert!(e.contains(said), "{wrong}: {e}");
+    }
+}
+
 /// A container's user and what its filter lets through: said by the template, and checked
 /// when it is applied.
 #[test]

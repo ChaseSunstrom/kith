@@ -378,15 +378,18 @@ fn version_in(os_release: &str) -> Option<String> {
 /// Whose releases this node becomes: the keys it was started with (`--release-key`), or
 /// else the key of the first release it took, kept in its state. An OSRelease names its
 /// own `publicKey`, and whoever may apply one may name any: the node is who must know.
+#[derive(Clone)]
 pub struct Keys {
     given: Vec<String>,
     kept: PathBuf,
+    /// Where the floor is kept: see `floor`.
+    floor: PathBuf,
 }
 
 impl Keys {
     pub fn new(given: Vec<String>, state: &Path) -> Keys {
-        let kept = state.join("os-release-keys");
-        Keys { given, kept }
+        let (kept, floor) = (state.join("os-release-keys"), state.join("os-release-floor"));
+        Keys { given, kept, floor }
     }
 
     /// Refuses a release whose key is not one of this node's. `Ok(true)`: it has none
@@ -397,7 +400,8 @@ impl Keys {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             kept => kept.map_err(|e| format!("reading this node's release keys ({}): {e}", self.kept.display()))?,
         };
-        let kept = kept.lines().map(str::trim).filter(|key| !key.is_empty());
+        let kept = kept.lines().map(str::trim);
+        let kept = kept.filter(|key| !key.is_empty() && !key.starts_with('#'));
         let mine: Vec<&str> = match self.given.is_empty() {
             true => kept.collect(),
             false => self.given.iter().map(|key| key.trim()).collect(),
@@ -413,6 +417,125 @@ impl Keys {
             )),
         }
     }
+
+    /// Where keys a release hands over wait until this node runs that release.
+    fn next(&self) -> PathBuf {
+        self.kept.with_extension("next")
+    }
+
+    /// The keys `release` hands over to, as this node keeps them once it runs it. None: it
+    /// hands nothing over, or this node was started with its keys, or its keys were handed
+    /// over at that version or a later one already (an old release, shown again to bring a
+    /// key back). A handover that is not whole is the release refused: whoever made it
+    /// believes the nodes have new keys.
+    fn handed(&self, release: &Value, version: &str, header: &[u8]) -> Result<Option<String>, String> {
+        let handover = &release["handover"];
+        if handover.is_null() || !self.given.is_empty() {
+            return Ok(None);
+        }
+        let named: Vec<String> = serde_json::from_value(handover["keys"].clone()).unwrap_or_default();
+        let key = |key: &String| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+        if named.is_empty() || named.len() > 8 || !named.iter().all(key) {
+            return Err("the release's handover names 1 to 8 keys (64 hex digits each), and this one does not".into());
+        }
+        let kept = std::fs::read_to_string(&self.kept).unwrap_or_default();
+        if let Some(since) = kept.lines().find_map(|line| line.strip_prefix(SINCE)) {
+            let since = since.trim();
+            if since == version || before(version, since) {
+                return Ok(None);
+            }
+            if !before(since, version) {
+                return Err(format!(
+                    "the release hands keys over as kith OS {version}, and this node's keys came with {since}: it \
+                     cannot tell which of the two is the later (they differ after their numbers). Hand keys \
+                     over in a release with a higher number"
+                ));
+            }
+        }
+        let text = handover_text(version, header, &named);
+        let by = |field: &str, key: &str| {
+            let signature = handover[field].as_str().unwrap_or_default();
+            kith_packages::artifact::signed_by(&text, signature, key).unwrap_or(false)
+        };
+        if !release["publicKey"]
+            .as_str()
+            .is_some_and(|public| by("signature", public))
+        {
+            return Err(
+                "the release's handover is not signed by the release's key over these keys, this \
+                        version and this update (`handover.signature`)"
+                    .into(),
+            );
+        }
+        if !named.iter().any(|key| by("proof", key)) {
+            return Err(
+                "the release's handover is signed by none of the keys it names (`handover.proof`): \
+                        keys nobody has shown they hold are not taken"
+                    .into(),
+            );
+        }
+        let mut named: Vec<String> = named.iter().map(|key| key.to_ascii_lowercase()).collect();
+        named.sort();
+        Ok(Some(format!("{SINCE}{version}\n{}\n", named.join("\n"))))
+    }
+
+    /// For an update this node, which runs `runs`, is about to write: what its release
+    /// hands over is put aside, and what an update that never ran had put aside is taken
+    /// away. Not what the release this node runs put aside: those keys are waiting for
+    /// its slot to be called good, and the update waits with them.
+    fn pend(&self, release: &Value, version: &str, header: &[u8], runs: &str) -> Result<(), String> {
+        let next = self.next();
+        let failed = |e: std::io::Error| format!("keeping the keys the release hands over ({}): {e}", next.display());
+        let handed = self.handed(release, version, header)?;
+        let waiting = std::fs::read_to_string(&next).unwrap_or_default();
+        if waiting.lines().next() == Some(&format!("{SINCE}{runs}")) {
+            return Err(crate::os::TOO_EARLY.into());
+        }
+        match handed {
+            Some(text) => crate::pki::write_whole(&next, text.as_bytes()).map_err(failed),
+            None => match std::fs::remove_file(&next) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(failed(e)),
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// This node runs `version` well: keys the release of that version handed over are its
+    /// keys from now on (`true`), and the ones it had are left beside them (`.before`).
+    /// Not before: an update that does not come up is tried again, under the keys it had.
+    fn taken(&self, version: &str) -> Result<bool, String> {
+        let failed = |e: std::io::Error| format!("taking the keys handed over ({}): {e}", self.kept.display());
+        let next = match std::fs::read_to_string(self.next()) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            next => next.map_err(failed)?,
+        };
+        if next.lines().next() != Some(&format!("{SINCE}{version}")) {
+            return Ok(false);
+        }
+        // (Stopped after the keys were written and before the note was removed: only that is left.)
+        if std::fs::read_to_string(&self.kept).ok().as_deref() != Some(&next) {
+            match std::fs::copy(&self.kept, self.kept.with_extension("before")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(failed(e)),
+                _ => {}
+            }
+            crate::pki::write_whole(&self.kept, next.as_bytes()).map_err(failed)?;
+        }
+        std::fs::remove_file(self.next()).map_err(failed)?;
+        Ok(true)
+    }
+}
+
+/// In a node's kept keys: the version of the release that handed them over.
+const SINCE: &str = "# since ";
+
+/// What a handover's two signatures are over: the keys, and the release they come with
+/// (its version, and the hash of its update's signed header), under a first line no
+/// other signed text of kith's begins with. `sh os/update.sh --handover` writes the same.
+fn handover_text(version: &str, header: &[u8], keys: &[String]) -> Vec<u8> {
+    let mut keys: Vec<String> = keys.iter().map(|key| key.trim().to_ascii_lowercase()).collect();
+    keys.sort();
+    let sum = crate::pki::hex(ring::digest::digest(&ring::digest::SHA256, header).as_ref());
+    format!("kith os-release keys v1\n{version}\n{sum}\n{}\n", keys.join("\n")).into_bytes()
 }
 
 /// Is version `a` before `b`? Their numbers compare as numbers (1.9 is before 1.10), and
@@ -442,6 +565,49 @@ fn not_back(version: &str, floor: Option<&str>) -> Result<(), String> {
     }
 }
 
+/// The floor: the newest version this node ever ran well (its slot was marked good), kept
+/// in its state beside its keys. No release under it is taken, whatever slot the node
+/// runs from now and whatever a plan allows: a node that fell back to its older slot, or
+/// whose cluster was taken, is not walked down to a release with a hole that was since
+/// mended. It is taken away by removing the file at the node, and by nothing else.
+fn floor(file: &Path) -> Result<Option<String>, String> {
+    let unread = |why: String| {
+        let file = file.display();
+        format!("this node's floor ({file}) {why}: no update is taken until it says a version, or is removed")
+    };
+    match std::fs::read_to_string(file) {
+        // (Only a file that is not there is no floor: one that cannot be read is not.)
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(unread(format!("cannot be read ({e})"))),
+        Ok(text) if text.trim().starts_with(|c: char| c.is_ascii_digit()) => Ok(Some(text.trim().to_string())),
+        Ok(_) => Err(unread("says no version".into())),
+    }
+}
+
+/// Refuses a release under the floor.
+fn above(file: &Path, version: &str) -> Result<(), String> {
+    match floor(file)? {
+        Some(floor) if before(version, &floor) => Err(format!(
+            "kith OS {version} is older than {floor}, the newest this node has run well: it takes nothing under \
+             that, whatever a plan allows (to go back, release the older system again under a newer version; \
+             the floor is {})",
+            file.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// This node runs `version` well: that is the floor, if the floor was lower.
+fn raise(file: &Path, version: &str) -> Result<(), String> {
+    match floor(file)? {
+        Some(floor) if !before(&floor, version) => Ok(()),
+        // (A version that is no number is no floor: `above` could not compare with it.)
+        _ if !version.starts_with(|c: char| c.is_ascii_digit()) => Ok(()),
+        _ => crate::pki::write_whole(file, format!("{version}\n").as_bytes())
+            .map_err(|e| format!("keeping this node's floor ({}): {e}", file.display())),
+    }
+}
+
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
 /// by its key, and the version it says.
 async fn fetch(
@@ -450,12 +616,14 @@ async fn fetch(
     release: &Value,
     slot: char,
     keys: &Keys,
-    floor: Option<&String>,
+    runs: &str,
+    back: bool,
 ) -> Result<String, String> {
     let text = |field: &str| release[field].as_str().map(str::to_string);
     let (signature, public) = (text("signature"), text("publicKey"));
+    above(&keys.floor, &wanted)?;
     let first = keys.refused(public.as_deref())?;
-    let (kept, floor) = (keys.kept.clone(), floor.cloned());
+    let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
     let client = reqwest::Client::builder()
         // (The address is the release's, and the release is what was applied: nowhere else.)
         .redirect(reqwest::redirect::Policy::none())
@@ -505,14 +673,14 @@ async fn fetch(
             match named["version"].as_str() {
                 // (The version is the signed header's: what the store says is not asked.)
                 Some(version) if version == wanted => {
-                    not_back(version, floor.as_deref())?;
+                    not_back(version, (!back).then_some(runs.as_str()))?;
                     // (The first release this node takes, signed and the version asked
                     // for: its key is the one it takes from now on.)
                     if let (true, Some(public)) = (first, &public) {
                         let keep = crate::pki::write_whole(&kept, format!("{public}\n").as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
-                    Ok(())
+                    keys.pend(&release, version, header, &runs)
                 }
                 version => Err(format!(
                     "the update at that address is kith OS {}",
@@ -561,7 +729,27 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
     };
     let me = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
+    let (mut raised, mut unraised) = (false, String::new());
     loop {
+        // (Its slot is marked good a little after the start, and no update is taken before.)
+        if !raised && crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed) {
+            match raise(&keys.floor, &version).and_then(|()| keys.taken(&version)) {
+                Ok(taken) => {
+                    if taken {
+                        let kept = keys.kept.display();
+                        eprintln!(
+                            "kithd: kith OS {version} handed over its release keys: this node takes releases from those in {kept} now (the ones before: {kept}.before)"
+                        );
+                    }
+                    raised = true;
+                }
+                Err(e) if e != unraised => {
+                    eprintln!("kithd: {e}");
+                    unraised = e;
+                }
+                Err(_) => {}
+            }
+        }
         let said = report(&state, &version, slot);
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
@@ -617,7 +805,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
             let write =
                 |trying: &Tried| crate::pki::write_whole(&tried(&state), &serde_json::to_vec(trying).expect("text"));
             let wrote = match write(&trying) {
-                Ok(()) => fetch(&url, wanted.clone(), &release, slot, &keys, (!back).then_some(&version)).await,
+                Ok(()) => fetch(&url, wanted.clone(), &release, slot, &keys, &version, back).await,
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
             };
             match wrote {
@@ -696,8 +884,246 @@ mod tests {
         let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
         let release = json!({ "publicKey": "bb22", "signature": "00" });
         let keys = Keys::new(vec!["aa11".into()], &dir);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, None).await.unwrap_err();
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true)
+            .await
+            .unwrap_err();
         assert!(said.contains("not signed by a key this node takes"), "{said}");
+        let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(asked.is_err(), "nothing was to be fetched");
+    }
+
+    /// A release key: what signs with it, and its public half as an OSRelease names it.
+    fn pair() -> (impl Fn(&[u8]) -> String, String) {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let made = Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pair = Ed25519KeyPair::from_pkcs8(made.as_ref()).unwrap();
+        let public = crate::pki::hex(pair.public_key().as_ref());
+        (move |text: &[u8]| crate::pki::hex(pair.sign(text).as_ref()), public)
+    }
+
+    #[test]
+    fn handover_makes_the_named_keys_this_nodes_once_it_runs_the_release() {
+        let keys = Keys::new(Vec::new(), &scratch("handover"));
+        let ((old, old_public), (new, new_public), (_, spare_public)) = (pair(), pair(), pair());
+        crate::pki::write_whole(&keys.kept, format!("{old_public}\n").as_bytes()).unwrap();
+        let header = [b' '; 64];
+        let named = [spare_public.to_uppercase(), new_public.clone()];
+        let text = handover_text("1.6", &header, &named);
+        let release = |by: &str, named: Value, signature: String, proof: String| json!({ "publicKey": by, "handover": { "keys": named, "signature": signature, "proof": proof } });
+        let good = release(&old_public, json!(named), old(&text), new(&text));
+
+        // Signed by another than the release's key (which is the kept one), or by none of
+        // the keys it names (keys nobody holds); for another version, or another update.
+        let said = keys.handed(
+            &release(&old_public, json!(named), new(&text), new(&text)),
+            "1.6",
+            &header,
+        );
+        assert!(
+            said.clone().unwrap_err().contains("not signed by the release's key"),
+            "{said:?}"
+        );
+        let said = keys.handed(
+            &release(&old_public, json!(named), old(&text), old(&text)),
+            "1.6",
+            &header,
+        );
+        assert!(
+            said.clone().unwrap_err().contains("none of the keys it names"),
+            "{said:?}"
+        );
+        assert!(keys.handed(&good, "1.7", &header).is_err() && keys.handed(&good, "1.6", b"another").is_err());
+        // No keys, more than eight, or what is no key.
+        let nine: Vec<String> = (0..9).map(|_| pair().1).collect();
+        for wrong in [json!([]), json!(nine), json!(["aa11"]), json!("all")] {
+            let text = handover_text("1.6", &header, &[]);
+            let said = keys.handed(&release(&old_public, wrong, old(&text), new(&text)), "1.6", &header);
+            assert!(said.clone().unwrap_err().contains("1 to 8 keys"), "{said:?}");
+        }
+        // Each of those is a release refused, and none changed anything.
+        for refused in [json!([]), json!(["aa11"])] {
+            assert!(
+                keys.pend(
+                    &release(&old_public, refused, String::new(), String::new()),
+                    "1.6",
+                    &header,
+                    "1.5"
+                )
+                .is_err()
+            );
+        }
+        assert!(!keys.next().exists());
+        assert!(keys.refused(Some(&new_public)).is_err() && keys.refused(Some(&old_public)) == Ok(false));
+
+        // Signed by both: kept aside until this node runs that release well...
+        keys.pend(&good, "1.6", &header, "1.5").unwrap();
+        assert!(keys.refused(Some(&new_public)).is_err() && keys.refused(Some(&old_public)) == Ok(false));
+        // It has started on 1.6 and is shown 1.7 before it called its slot good: the keys
+        // 1.6 handed over are still waiting, and an update that would put others in their
+        // place (or none) waits for them to be taken, as it waits for the slot.
+        let waiting = std::fs::read_to_string(keys.next()).unwrap();
+        let later = handover_text("1.7", &header, &named);
+        let later = release(&old_public, json!(named), old(&later), new(&later));
+        for next in [json!({ "publicKey": old_public }), later] {
+            assert_eq!(
+                keys.pend(&next, "1.7", &header, "1.6"),
+                Err(crate::os::TOO_EARLY.to_string())
+            );
+            assert_eq!(std::fs::read_to_string(keys.next()).unwrap(), waiting);
+        }
+        // ...which it does not, back on the system it had: the update is tried again, and
+        // its release is still one this node takes.
+        assert_eq!(keys.taken("1.5"), Ok(false));
+        assert_eq!(keys.refused(Some(&old_public)), Ok(false));
+        // It does: the keys named are this node's, and the one left out signs nothing more.
+        assert_eq!(keys.taken("1.6"), Ok(true));
+        assert_eq!(keys.refused(Some(&new_public)), Ok(false));
+        assert_eq!(keys.refused(Some(&spare_public)), Ok(false));
+        assert!(keys.refused(Some(&old_public)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(keys.kept.with_extension("before")).unwrap(),
+            format!("{old_public}\n")
+        );
+        assert!(!keys.next().exists() && keys.taken("1.6") == Ok(false));
+
+        // A handover of the version these keys were written at, or of one before (an old
+        // release shown again, to bring a key back): the release may be taken, its keys not.
+        let back = [old_public.clone()];
+        for version in ["1.6", "1.5"] {
+            let text = handover_text(version, &header, &back);
+            let again = release(&new_public, json!(back), new(&text), old(&text));
+            assert_eq!(keys.handed(&again, version, &header), Ok(None));
+        }
+        // One at a version this node cannot place after the one its keys came with (a
+        // word after the same numbers) is refused aloud: taken in silence, the release
+        // would run and its keys would not count.
+        let text = handover_text("1.6-b", &header, &back);
+        let worded = release(&new_public, json!(back), new(&text), old(&text));
+        assert_eq!(keys.handed(&worded, "1.6-b", &header), Ok(None), "1.6-b is before 1.6");
+        let kept = std::fs::read_to_string(&keys.kept).unwrap();
+        std::fs::write(&keys.kept, kept.replace("# since 1.6\n", "# since 1.6-a\n")).unwrap();
+        let said = keys.handed(&worded, "1.6-b", &header);
+        assert!(said.clone().unwrap_err().contains("cannot tell"), "{said:?}");
+        std::fs::write(&keys.kept, kept).unwrap();
+        // A later one is taken as the first was, and a release that hands nothing over
+        // takes away what an update that never ran had put aside.
+        let text = handover_text("1.7", &header, &back);
+        keys.pend(
+            &release(&new_public, json!(back), new(&text), old(&text)),
+            "1.7",
+            &header,
+            "1.6",
+        )
+        .unwrap();
+        assert!(keys.next().exists());
+        keys.pend(&json!({ "publicKey": new_public }), "1.7", &header, "1.6")
+            .unwrap();
+        assert!(!keys.next().exists() && keys.taken("1.7") == Ok(false));
+
+        // A node started with its keys takes them from nobody else.
+        let given = Keys::new(vec![old_public.clone()], &scratch("handover-given"));
+        let text = handover_text("1.6", &header, &named);
+        assert_eq!(given.handed(&good, "1.6", &header), Ok(None));
+        assert!(text.starts_with(b"kith os-release keys v1\n1.6\n"));
+    }
+
+    /// What `sh os/update.sh --handover` signs is what a node checks. (Where openssl and
+    /// xxd are, as for a release's own signature: skipped elsewhere.)
+    #[test]
+    fn handover_signed_by_the_script_is_one_a_node_takes() {
+        let sh = |script: &str| std::process::Command::new("sh").args(["-c", script]).output().unwrap();
+        if !sh("command -v openssl && command -v xxd").status.success() {
+            eprintln!("skipped: no openssl or no xxd here");
+            return;
+        }
+        let dir = scratch("handover-script");
+        let key = |name: &str| {
+            let (secret, public) = kith_packages::artifact::keygen().unwrap();
+            std::fs::write(dir.join(name), secret).unwrap();
+            public
+        };
+        let (old, new) = (key("old.key"), key("new.key"));
+        let header = format!("{:<4095}\n", r#"{"format":1,"version":"1.6","hash":"00","pieces":[]}"#);
+        std::fs::write(dir.join("update"), format!("{header}the pieces")).unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../os/update.sh");
+        let sign = |by: &str| {
+            let (dir, new) = (dir.display(), new.to_uppercase());
+            let made = sh(&format!("sh {script} --handover {dir}/{by} {dir}/update {old} {new}"));
+            assert!(made.status.success(), "{}", String::from_utf8_lossy(&made.stderr));
+            String::from_utf8(made.stdout)
+                .unwrap()
+                .split_whitespace()
+                .collect::<String>()
+        };
+        let keys = Keys::new(Vec::new(), &dir);
+        let handover = json!({ "keys": [new, old], "signature": sign("old.key"), "proof": sign("new.key") });
+        let release = json!({ "publicKey": old, "handover": handover });
+        let said = keys.handed(&release, "1.6", header.as_bytes());
+        assert!(said.clone().is_ok_and(|keys| keys.is_some()), "{said:?}");
+        // What is no public key (the key file's name, say) is not signed for.
+        let made = sh(&format!(
+            "sh {script} --handover {0}/old.key {0}/update {0}/new.key",
+            dir.display()
+        ));
+        let said = String::from_utf8_lossy(&made.stderr);
+        assert!(!made.status.success() && said.contains("is not a public key"), "{said}");
+    }
+
+    #[test]
+    fn floor_is_the_newest_version_called_good_and_is_never_lowered() {
+        let keys = Keys::new(Vec::new(), &scratch("floor"));
+        let kept = || std::fs::read_to_string(&keys.floor).unwrap();
+        // None yet: anything is above it.
+        assert!(above(&keys.floor, "0.1").is_ok());
+        raise(&keys.floor, "1.10").unwrap();
+        assert_eq!(kept(), "1.10\n");
+        // Back on an older slot, which is called good again: the floor stays.
+        raise(&keys.floor, "1.9").unwrap();
+        assert_eq!(kept(), "1.10\n");
+        let said = above(&keys.floor, "1.9").unwrap_err();
+        assert!(said.contains("1.10") && said.contains("os-release-floor"), "{said}");
+        assert!(above(&keys.floor, "1.10").is_ok() && above(&keys.floor, "1.11").is_ok());
+        raise(&keys.floor, "1.11").unwrap();
+        assert_eq!(kept(), "1.11\n");
+        assert!(above(&keys.floor, "1.10").is_err());
+        // A floor that cannot be read, or says no version, is not "no floor": nothing is
+        // taken, and nothing is written over it.
+        for unread in ["", "newest\n"] {
+            std::fs::write(&keys.floor, unread).unwrap();
+            let said = above(&keys.floor, "99").unwrap_err();
+            assert!(
+                said.contains("os-release-floor") && said.contains("no update is taken"),
+                "{said}"
+            );
+            assert!(raise(&keys.floor, "99").is_err());
+            assert_eq!(kept(), unread);
+        }
+        std::fs::remove_file(&keys.floor).unwrap();
+        std::fs::create_dir(&keys.floor).unwrap();
+        assert!(above(&keys.floor, "99").is_err() && raise(&keys.floor, "99").is_err());
+        // Taken away at the node: there is none.
+        std::fs::remove_dir(&keys.floor).unwrap();
+        assert!(above(&keys.floor, "0.1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn floor_holds_on_an_older_slot_and_under_a_plan_that_allows_going_back() {
+        let keys = Keys::new(vec!["aa11".into()], &scratch("floor-held"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
+        let release = json!({ "publicKey": "aa11", "signature": "00" });
+        raise(&keys.floor, "1.10").unwrap();
+        // The node is back on the slot of 1.8 and its plan allows a downgrade (so what it
+        // runs is no limit): 1.9 is still under what it once ran well.
+        let said = fetch(&url, "1.9".into(), &release, 'a', &keys, "1", true)
+            .await
+            .unwrap_err();
+        assert!(said.contains("1.10") && said.contains("os-release-floor"), "{said}");
+        std::fs::write(&keys.floor, "?").unwrap();
+        let said = fetch(&url, "2.0".into(), &release, 'a', &keys, "1", true)
+            .await
+            .unwrap_err();
+        assert!(said.contains("no update is taken"), "{said}");
         let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(asked.is_err(), "nothing was to be fetched");
     }
@@ -740,7 +1166,9 @@ mod tests {
         });
         let release = json!({ "publicKey": "aa11", "signature": "00" });
         let keys = Keys::new(Vec::new(), &dir);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, None).await.unwrap_err();
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true)
+            .await
+            .unwrap_err();
         assert!(said.contains("302") && said.contains("redirect"), "{said}");
         answering.await.unwrap();
         let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;

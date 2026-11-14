@@ -1830,6 +1830,33 @@
         "url"
       ]
     },
+    "Handover": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The public keys (hex) that count from this release on: 1 to 8, the\nrelease's own among them if it is to go on counting."
+        },
+        "signature": {
+          "type": "string",
+          "description": "The release's key's signature of the handover."
+        },
+        "proof": {
+          "type": "string",
+          "description": "The same, by one of `keys`: someone holds a key that is handed to."
+        }
+      },
+      "required": [
+        "keys",
+        "signature",
+        "proof"
+      ],
+      "description": "A release key handing over to others (`sh os/update.sh --handover`)."
+    },
     "HttpProbe": {
       "type": "object",
       "additionalProperties": false,
@@ -2344,6 +2371,17 @@
             "null"
           ],
           "description": "Its signature of the file's header."
+        },
+        "handover": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Handover"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The keys a node takes releases from once it runs this one."
         }
       },
       "required": [

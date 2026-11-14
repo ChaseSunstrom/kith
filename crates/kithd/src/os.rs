@@ -241,6 +241,9 @@ pub fn wait(failures: u32) -> std::time::Duration {
     std::time::Duration::from_secs((WAIT << doublings).min(WAIT_MAX))
 }
 
+/// Whether the slot this node runs from is marked good: `settle` has found it so, or made it so.
+pub static GOOD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// This node came up from `slot`: mark it good (the boot loader stops counting its
 /// tries), and say what became of a slot that did not come up. What to say is returned.
 /// The count of failed starts is cleared too: this start came up.
@@ -267,7 +270,14 @@ pub fn settle(slot: char, esp: &Path) -> Vec<String> {
             _ => {}
         }
     }
+    GOOD.fetch_or(good(slot, esp), std::sync::atomic::Ordering::Relaxed);
     said
+}
+
+/// Is `slot` marked good: there, and its tries no longer counted?
+fn good(slot: char, esp: &Path) -> bool {
+    let is = |(_, _, its, tries): &(String, u64, char, Option<u32>)| *its == slot && tries.is_none();
+    entries(esp).iter().any(is)
 }
 
 /// The ESP's directory of kernel images, mounted for as long as `with` runs.
@@ -504,7 +514,14 @@ mod tests {
     fn os_marks_its_slot_good_and_says_which_slot_failed() {
         let places = places("settles");
         std::fs::write(places.esp.join("kith-2-b+2-1.efi"), "b").unwrap();
+        // (While its tries are counted a slot is not good; the other one here is.)
+        assert!(!good('b', &places.esp) && good('a', &places.esp) && !good('c', &places.esp));
         assert_eq!(settle('b', &places.esp), ["slot b is good"]);
+        assert!(good('b', &places.esp));
+        assert!(
+            GOOD.load(std::sync::atomic::Ordering::Relaxed),
+            "and the node's floor may be raised"
+        );
         assert_eq!(names(&places.esp), ["kith-1-a.efi", "kith-2-b.efi"]);
         assert!(settle('b', &places.esp).is_empty());
 
