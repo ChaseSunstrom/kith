@@ -1520,8 +1520,16 @@ by name, that has them. `--via` names the program that carries the window (defau
   --secctx dev.kith.run`, Wayland's security-context-v1), so that it keeps them from what
   it keeps such a program from: reading the screen, typing as you. A waypipe before 0.9,
   a compositor without that protocol or another `--via` program does not take the tag:
-  the app is then started without it, and `kith run` says so and why. (The tag has been
-  run against a stand-in here, not against waypipe and a compositor.)
+  the app is then started without it, and `kith run` says so and why. What was seen,
+  in a container: with waypipe 0.11 under sway 1.12 the app's window has
+  `sandbox_engine` `waypipe` and `sandbox_app_id` `dev.kith.run` in `swaymsg -t
+  get_tree` (a window carried without the tag has neither), and sway offers that
+  program, through waypipe, 35 of the 53 interfaces it offers another: not screen capture, the clipboard
+  managers, virtual keyboards and pointers, input methods, the layer shell or the
+  session lock. Under cage 0.3, which has no such protocol, and with waypipe 0.8, which
+  has no such option, waypipe stops before it listens: that is what `kith run` takes
+  for "no tag". What is kept from a tagged program is each compositor's own to decide
+  (sway 1.10 has the protocol, and its tree does not show the tag).
 - **Who may:** only who may run the node itself: a Role rule with `verbs: [exec]` on
   `kinds: [Node]` and no `namespaces` (`admin` has it). The app runs as kithd's user on
   the node, outside any container, so a right in one namespace is never enough. It is
