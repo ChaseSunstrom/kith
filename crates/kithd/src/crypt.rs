@@ -9,6 +9,8 @@
 //! secret: …      32 bytes only this disk has: what the key is wrapped with for the cluster
 //! recovery: …    the key wrapped with the recovery key the installer showed, once
 //! key: …         the key itself, only until another node holds it
+//! tpm: …         the key as this machine's TPM sealed it, if the cluster lets it
+//! passphrase: …  the key wrapped under its owner's passphrase, if one was given
 //! peers: …       where to ask
 //! ```
 //!
@@ -27,6 +29,14 @@
 //! cluster as before and, once open, seals again. The cost is said plainly: such a
 //! machine, taken whole, opens its state by itself; locked or wiped, it drops the seal
 //! when it hears of it, not before.
+//!
+//! And a passphrase its owner gives it (`kith node passphrase`), for the machine without a
+//! TPM, or whose owner will not have the machine alone be enough: a `passphrase:` line,
+//! the key wrapped under what Argon2id draws from the passphrase. Typed at the console
+//! where the recovery key is typed, it opens the state with no node in reach. The cost:
+//! the key is on the disk again, behind a secret a person chose, which whoever has the
+//! disk can guess at for as long as they like; a locked node drops the line when it
+//! hears of it.
 //!
 //! Neither the store alone (the key is wrapped with what only the disk has) nor the disk
 //! alone opens the state. Who answers `/v1/unlock` is not checked by certificate (the
@@ -65,7 +75,27 @@ pub struct Record {
     key: Option<Vec<u8>>,
     /// The key as this machine's TPM sealed it (tpm.rs).
     tpm: Option<Vec<u8>>,
+    pass: Option<Pass>,
     peers: Vec<String>,
+}
+
+/// The key wrapped under a passphrase: what drawing the wrapping key from it costs
+/// (Argon2id's memory in KiB, and its passes), the salt, and the wrapped key.
+#[derive(Clone, Debug, PartialEq)]
+struct Pass {
+    cost: (u32, u32),
+    salt: Vec<u8>,
+    wrapped: Vec<u8>,
+}
+
+/// What a passphrase given now costs to try: 19 MiB and 2 passes, in one lane (OWASP's
+/// floor for Argon2id; a record says its own, so this can rise).
+const COST: (u32, u32) = (19 << 10, 2);
+/// What can be a passphrase: 8 characters or more, of those every keyboard has (a console
+/// at start has the kernel's layout and no way to compose others), and no more than a line.
+fn chosen(passphrase: &str) -> bool {
+    let typed = |byte: u8| byte == b' ' || byte.is_ascii_graphic();
+    (8..=256).contains(&passphrase.len()) && passphrase.bytes().all(typed)
 }
 
 /// How a state was opened at a start: by its owner (the key was still on the disk, or
@@ -116,6 +146,44 @@ fn unwrap(secret: &[u8], wrapped: &[u8]) -> Option<Vec<u8>> {
     key.ok().map(|key| key.to_vec())
 }
 
+fn drawn(passphrase: &str, salt: &[u8], (memory, passes): (u32, u32)) -> Option<[u8; 32]> {
+    let cost = argon2::Params::new(memory, passes, 1, Some(32)).ok()?;
+    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, cost);
+    let mut key = [0; 32];
+    let filled = argon.hash_password_into(passphrase.as_bytes(), salt, &mut key);
+    filled.ok().map(|()| key)
+}
+
+impl Pass {
+    fn new(passphrase: &str, key: &[u8], cost: (u32, u32)) -> Option<Pass> {
+        let salt: [u8; 16] = random();
+        let wrapped = wrap(&drawn(passphrase, &salt, cost)?, key);
+        Some(Pass {
+            cost,
+            salt: salt.to_vec(),
+            wrapped,
+        })
+    }
+
+    /// The key, if `passphrase` is the one it was wrapped under.
+    fn open(&self, passphrase: &str) -> Option<Vec<u8>> {
+        unwrap(&drawn(passphrase, &self.salt, self.cost)?, &self.wrapped)
+    }
+
+    fn parse(line: &str) -> Option<Pass> {
+        let mut words = line.split_whitespace();
+        let cost: (u32, u32) = (words.next()?.parse().ok()?, words.next()?.parse().ok()?);
+        let (salt, wrapped) = (unhex(words.next()?)?, unhex(words.next()?)?);
+        // (Whoever wrote the record does not have a start take a quarter of a GiB or more.)
+        (cost.0 <= 1 << 18 && cost.1 <= 16).then_some(Pass { cost, salt, wrapped })
+    }
+
+    fn text(&self) -> String {
+        let (memory, passes) = self.cost;
+        format!("{memory} {passes} {} {}", hex(&self.salt), hex(&self.wrapped))
+    }
+}
+
 /// The recovery key as shown and typed: 32 hex digits in fours.
 fn shown(recovery: &[u8]) -> String {
     let digits = hex(recovery);
@@ -142,6 +210,8 @@ impl Record {
                 "recovery" => record.recovery = unhex(value)?,
                 "key" => record.key = Some(unhex(value)?),
                 "tpm" => record.tpm = Some(unhex(value)?),
+                // (One that cannot be read opens nothing: the node asks as if it had none.)
+                "passphrase" => record.pass = Pass::parse(value),
                 "peers" => record.peers = value.split_whitespace().map(str::to_string).collect(),
                 // (A line of a later kithd's.)
                 _ => {}
@@ -162,6 +232,9 @@ impl Record {
         // (Before the peers: what does not fit the record's room is cut from its end.)
         if let Some(sealed) = &self.tpm {
             text += &format!("tpm: {}\n", hex(sealed));
+        }
+        if let Some(pass) = &self.pass {
+            text += &format!("passphrase: {}\n", pass.text());
         }
         if !self.peers.is_empty() {
             text += &format!("peers: {}\n", self.peers.join(" "));
@@ -262,6 +335,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         recovery: wrap(&recovery, &key),
         key: Some(key.to_vec()),
         tpm: None,
+        pass: None,
         peers: Vec::new(),
     };
     record.write(&disk, config + AT)?;
@@ -295,17 +369,48 @@ async fn asked(client: &reqwest::Client, peer: &str, record: &Record) -> Result<
     key.ok_or(format!("what {peer} answered is not this node's key"))
 }
 
-/// The key, from the cluster or from whoever types the recovery key: asked until one
-/// gives it. And which did.
+/// Whether the machine's consoles show what is typed at them.
+fn echo(shown: bool) {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    let active = std::fs::read_to_string("/sys/class/tty/console/active").unwrap_or_default();
+    for name in active.split_whitespace() {
+        let Ok(console) = File::open(format!("/dev/{name}")) else {
+            continue;
+        };
+        if let Ok(mut how) = tcgetattr(&console) {
+            how.local_flags.set(LocalFlags::ECHO, shown);
+            let _ = tcsetattr(&console, SetArg::TCSANOW, &how);
+        }
+    }
+}
+
+/// The key, from the cluster or from whoever types the recovery key or the node's
+/// passphrase: asked until one gives it. And which did.
 async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
     let (client, lines) = (client(), crate::install::keyboard());
+    let pass = record.pass.as_ref();
     // (Read all the while: a peer that does not answer takes its time to say so.)
     let console = async {
         loop {
             while let Ok(line) = lines.try_recv() {
-                match typed(&line).and_then(|recovery| unwrap(&recovery, &record.recovery)) {
-                    Some(key) => return key,
-                    None if !line.is_empty() => eprintln!("kithd: init: that is not this node's recovery key"),
+                let recovery = typed(&line).and_then(|recovery| unwrap(&recovery, &record.recovery));
+                let key = recovery.map(|key| (key, "the recovery key"));
+                // (A passphrase costs its tries: only what can be one is tried, and not on
+                // the thread that asks the cluster.)
+                let tried = match (pass.filter(|_| key.is_none() && chosen(&line)), line.clone()) {
+                    (Some(pass), line) => {
+                        let pass = pass.clone();
+                        let opened = tokio::task::spawn_blocking(move || pass.open(&line)).await;
+                        opened.ok().flatten().map(|key| (key, "its passphrase"))
+                    }
+                    (None, _) => None,
+                };
+                match key.or(tried) {
+                    Some(opened) => return opened,
+                    None if !line.is_empty() => eprintln!(
+                        "kithd: init: that is not this node's recovery key{}",
+                        if pass.is_some() { ", nor its passphrase" } else { "" }
+                    ),
                     None => {}
                 }
             }
@@ -330,15 +435,28 @@ async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
         }
     };
     eprintln!(
-        "kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type the recovery key here.)"
+        "kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type {}.)",
+        if pass.is_some() {
+            "its passphrase, or the recovery key, here: neither is shown"
+        } else {
+            "the recovery key here"
+        }
     );
-    tokio::select! {
+    // (A passphrase is not for whoever looks at the screen.)
+    if pass.is_some() {
+        echo(false);
+    }
+    let fetched = tokio::select! {
         key = cluster => (key, By::Cluster),
-        key = console => {
-            eprintln!("kithd: init: opened with the recovery key");
+        (key, with) = console => {
+            eprintln!("kithd: init: opened with {with}");
             (key, By::Owner)
         }
+    };
+    if pass.is_some() {
+        echo(true);
     }
+    fetched
 }
 
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
@@ -377,6 +495,11 @@ pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By
     Ok((key, by))
 }
 
+/// A passphrase to give this node's state (none: to take away), and where to say how it
+/// went: from [`pass`] to [`keep`], which alone writes the record.
+type Chosen = (Option<String>, tokio::sync::oneshot::Sender<Result<(), String>>);
+static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::sync::OnceLock::new();
+
 /// For as long as the node runs: have the cluster hold the key and take it off the disk
 /// once another node does; restart when the cluster locks this node, and end when it
 /// wipes it. `opened`: the key the state was opened with, and who gave it at this start
@@ -386,6 +509,9 @@ pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By
 /// And the TPM's seal: made while the cluster's NodeKey says `seal` and the node is not
 /// locked (again after a start the TPM refused: the system is another now), dropped as
 /// soon as it says otherwise; the NodeKey's status says which, and why not.
+///
+/// And the passphrase: its line is written when one is given ([`pass`]), and dropped when
+/// one is taken away or the cluster locks this node.
 pub async fn keep(
     shared: Arc<Shared>,
     config: PathBuf,
@@ -408,6 +534,9 @@ pub async fn keep(
     let mut was_locked = (by != By::Owner).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
     let (mut fits, mut unsealed) = (by == By::Tpm, None::<String>);
+    let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
+    let _ = CHOSEN.set(chosen);
+    let mut shut = false;
     loop {
         let (mine, peers) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -442,19 +571,25 @@ pub async fn keep(
             (Some(spec), key) => {
                 let locked = spec["locked"] == true;
                 let seal = spec["seal"] == true && !locked;
-                if !seal && record.tpm.is_some() {
-                    let plain = Record {
-                        tpm: None,
-                        ..record.clone()
-                    };
-                    if write(&plain) {
+                shut = locked;
+                // (What opens the state with no node asked goes when the cluster says so.)
+                let left = Record {
+                    tpm: record.tpm.clone().filter(|_| seal),
+                    pass: record.pass.clone().filter(|_| !locked),
+                    ..record.clone()
+                };
+                if left != record && write(&left) {
+                    if left.tpm != record.tpm {
                         eprintln!("kithd: this machine's TPM no longer holds the key of its state");
-                        record.tpm = None;
                     }
+                    if left.pass != record.pass {
+                        eprintln!("kithd: the cluster has locked this node: its passphrase no longer opens its state");
+                    }
+                    (record.tpm, record.pass) = (left.tpm, left.pass);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
-                // the node would open by its TPM, locked or not.)
-                if locked && was_locked == Some(false) && record.tpm.is_none() {
+                // the node would open by its TPM, locked or not. And so a passphrase.)
+                if locked && was_locked == Some(false) && record.tpm.is_none() && record.pass.is_none() {
                     // (This node's store may be behind, just after an unlock: a peer that
                     // still hands the key out says it is not locked, or not yet.)
                     let mut stale = false;
@@ -517,10 +652,13 @@ pub async fn keep(
                     }
                 }
                 let sealed = record.tpm.is_some();
-                let status = match unsealed.as_ref().filter(|_| seal && !sealed) {
+                let mut status = match unsealed.as_ref().filter(|_| seal && !sealed) {
                     Some(why) => json!({ "sealed": false, "message": why }),
                     None => json!({ "sealed": sealed }),
                 };
+                if record.pass.is_some() {
+                    status["passphrase"] = true.into();
+                }
                 if said.flatten() != Some(status.clone()) {
                     let statuses = vec![(me.clone(), Some(status))];
                     if let Err(e) = shared.submit(Command::Status { statuses }).await {
@@ -545,6 +683,25 @@ pub async fn keep(
             _ = generation.changed() => {}
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             _ = stopping.changed() => return,
+            Some((passphrase, done)) = chosen_here.recv() => {
+                let pass = match passphrase {
+                    None => Ok(None),
+                    _ if shut => Err("the cluster has locked this node: unlock it first".to_string()),
+                    Some(passphrase) => {
+                        // (Off the threads that serve: it takes its memory and its time.)
+                        let key = opened.clone();
+                        let made = tokio::task::spawn_blocking(move || Pass::new(&passphrase, &key, COST)).await;
+                        let made = made.ok().flatten().map(Some);
+                        made.ok_or("no key could be drawn from the passphrase (19 MiB of memory are needed)".to_string())
+                    }
+                };
+                let with = pass.and_then(|pass| {
+                    let with = Record { pass, ..record.clone() };
+                    let wrote = write(&with).then_some(with);
+                    wrote.ok_or("the lock record could not be written".to_string())
+                });
+                let _ = done.send(with.map(|with| record = with));
+            }
         }
     }
 }
@@ -630,6 +787,75 @@ pub async fn set(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct Given {
+    passphrase: Option<String>,
+}
+
+/// `POST /v1/lock/NAME/passphrase {passphrase}` (`kith node passphrase`): NAME's state
+/// opens with it from then on, typed at its console, with no node in reach; with none in
+/// the body, no longer. For who may apply NodeKeys. The passphrase goes to NAME alone
+/// (another node asks it, as itself, having checked the caller) and is kept nowhere: not
+/// in the store, nor in the audit log.
+pub async fn pass(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Named(name): Named<String>,
+    Json(given): Json<Given>,
+) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+        return refused.into_response();
+    }
+    let passphrase = given.passphrase.map(|passphrase| passphrase.trim().to_string());
+    let what = if passphrase.is_some() {
+        "passphrase"
+    } else {
+        "no passphrase"
+    };
+    let done = async {
+        if passphrase.as_ref().is_some_and(|passphrase| !chosen(passphrase)) {
+            let why = "a passphrase has 8 characters or more (256 at most): letters, digits, spaces and signs of ASCII, which the console of a starting machine can type";
+            return Err(why.to_string());
+        }
+        let cluster = shared.cluster.as_ref();
+        let cluster = cluster.ok_or("this node is in no cluster: the key of its state is its own to keep")?;
+        if name != cluster.me.name {
+            // (Asked by a node, this is the node it meant, or nobody is.)
+            let address = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                let there = state.store.get(&format!("Node/{name}")).filter(|_| !matches!(caller, Caller::Node(_)));
+                there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()))
+            };
+            let address = address.ok_or(format!("{name} is not a node known here with an address"))?;
+            let ask = cluster.client.post(format!("https://{address}/v1/lock/{name}/passphrase"));
+            let ask = ask.timeout(Duration::from_secs(60)).json(&json!({ "passphrase": passphrase }));
+            let unreached = |e: reqwest::Error| format!("{name} cannot be reached, and a passphrase is its own to keep ({e})");
+            let answer = ask.send().await.map_err(unreached)?;
+            let fine = answer.status().is_success();
+            let said: Value = answer.json().await.map_err(unreached)?;
+            return match said["error"].as_str() {
+                _ if fine => Ok(()),
+                why => Err(why.map_or(format!("{name} refused"), String::from)),
+            };
+        }
+        let here = CHOSEN.get().ok_or(format!("{name}'s state is not encrypted"))?;
+        let (done, said) = tokio::sync::oneshot::channel();
+        let gone = format!("{name} is stopping");
+        let sent = here.send((passphrase.clone(), done)).await;
+        sent.map_err(|_| gone.clone())?;
+        said.await.map_err(|_| gone)?
+    }
+    .await;
+    shared
+        .audit
+        .record(&caller, what, vec![format!("NodeKey/{name}")], done.clone());
+    match done {
+        Ok(()) => Json(json!({ "node": name, "passphrase": passphrase.is_some() })).into_response(),
+        Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -661,12 +887,53 @@ mod tests {
     }
 
     #[test]
+    fn crypt_passphrases_open_what_they_wrapped() {
+        let key: [u8; 64] = random();
+        // (A small cost: the test is of the wrapping, and is run unoptimised.)
+        let pass = Pass::new("correct horse battery", &key, (64, 1)).unwrap();
+        assert_eq!(pass.open("correct horse battery").as_deref(), Some(&key[..]));
+        assert_eq!(pass.open("correct horse batterz"), None);
+        assert_eq!(pass.open(""), None);
+        // The line of a record says its own cost, and is read back as written.
+        let read = Pass::parse(&pass.text()).unwrap();
+        assert_eq!(read, pass);
+        assert_eq!(read.open("correct horse battery").as_deref(), Some(&key[..]));
+        // The same passphrase wraps to another line each time, and the key is not in it.
+        let again = Pass::new("correct horse battery", &key, (64, 1)).unwrap();
+        assert!(again.salt != pass.salt && again.wrapped != pass.wrapped);
+        assert!(!pass.wrapped.windows(16).any(|window| window == &key[..16]));
+        // Argon2id, version 19, one lane: what the reference implementation's own tests
+        // have for "password", "somesalt", 2 passes (64 MiB, and 256 KiB).
+        let reference = |memory| drawn("password", b"somesalt", (memory, 2)).map(|key| hex(&key));
+        let known = "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7"; // pragma: allowlist secret
+        assert_eq!(reference(1 << 16).as_deref(), Some(known));
+        let known = "9dfeb910e80bad0311fee20f9c0e2b12c17987b4cac90c2ef54d5b3021c68bfe"; // pragma: allowlist secret
+        assert_eq!(reference(256).as_deref(), Some(known));
+        // A cost no machine should pay at its start, and a line that is not one: no passphrase.
+        assert_eq!(Pass::parse("4294967295 2 00 00"), None);
+        assert_eq!(Pass::parse("262145 2 00 00"), None);
+        // What a console at start can type, and no less than eight of it.
+        assert!(chosen("correct horse battery") && chosen("a1!~ {}z"));
+        assert!(!chosen("short") && !chosen("") && !chosen("pässwörter") && !chosen("tab\tin the middle"));
+        assert!(!chosen(&"a".repeat(257)));
+        assert_eq!(Pass::parse("19456 2 zz 00"), None);
+        assert_eq!(Pass::parse("19456"), None);
+        let record = b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\npassphrase: later\n"; // pragma: allowlist secret
+        assert_eq!(Record::parse(record).map(|record| record.pass), Some(None));
+    }
+
+    #[test]
     fn crypt_records_are_read_as_written() {
         let record = Record {
             secret: vec![7; 32],
             recovery: vec![1, 2, 3],
             key: Some(vec![9; 64]),
             tpm: Some(vec![5; 300]),
+            pass: Some(Pass {
+                cost: COST,
+                salt: vec![3; 16],
+                wrapped: vec![4; 92],
+            }),
             peers: vec!["10.0.0.1:7443".into(), "[fd00::2]:7443".into()],
         };
         let path = std::env::temp_dir().join(format!("kith-crypt-record-{}", std::process::id()));
@@ -701,7 +968,7 @@ mod tests {
         many.write(&disk, AT).unwrap();
         disk.read_exact_at(&mut bytes, AT).unwrap();
         let read = Record::parse(&bytes).unwrap();
-        assert!(read.tpm == held.tpm && read.peers.len() > 100 && read.peers.len() < 400);
+        assert!(read.tpm == held.tpm && read.pass == held.pass && read.peers.len() > 100 && read.peers.len() < 400);
         assert_ne!(held.id(), hex(&held.secret));
 
         // Nothing there, another format, a secret that is not one: no record.

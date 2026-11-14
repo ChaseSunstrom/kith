@@ -75,7 +75,7 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    its disk and joins the node's cluster
   --test crypt     instead: the same, the machine installed with its state encrypted:
                    the node holds its key; it is locked, unlocked, opened with its
-                   recovery key and wiped
+                   recovery key and wiped; and opened away from its cluster with a passphrase
   --test tpm       instead: the same machine with a software TPM (swtpm): told to
                    (`kith node seal`), it seals its key to the system it runs and
                    starts with no node asked; started with another command line, or
@@ -1135,7 +1135,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["passphrase"] * (b"\npassphrase: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -1290,17 +1290,64 @@ with open(sys.argv[1], "r+b") as disk:
                 sleep 5
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the machine did not give its key again once it was deleted"
                 ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
-                # Locked again: the recovery key, typed at the machine, opens it all the same.
+                # A passphrase, given through the other node (which keeps none of it): too short
+                # a one is refused; taken away, the disk has no line of it; given again, it has.
+                pass() { api POST /v1/lock/kith-000902/passphrase -H 'Content-Type: application/json' -d "$1"; }
+                passes() { # WHETHER: the NodeKey's status comes to say so
+                    tries=0
+                    until [ "$(api GET /v1/resources/NodeKey/kith-000902 | grep -c '"passphrase": *true')" = "$1" ]; do
+                        tries=$((tries + 1))
+                        [ "$tries" -lt 100 ] || fail "the cluster does not say whether the machine has a passphrase (expected $1)"
+                        sleep 0.2
+                    done
+                }
+                pass '{"passphrase":"short"}' | grep -qF 'characters or more' || fail "a passphrase of five characters was taken"
+                pass '{"passphrase":"pässwörter und mehr"}' | grep -qF 'signs of ASCII' || fail "a passphrase the console of a starting machine cannot type was taken"
+                pass '{"passphrase":"correct horse battery"}' | grep -q '"passphrase": *true' || fail "the machine was given no passphrase"
+                passes 1
+                pass '{}' | grep -q '"passphrase": *false' || fail "the machine's passphrase was not taken away"
+                passes 0
+                pass '{"passphrase":"correct horse battery"}' | grep -q '"passphrase": *true' || fail "the machine was given no passphrase a second time"
+                passes 1
+                ! api GET /v1/resources | grep -qF 'correct horse' || fail "the passphrase is in the store"
+                ! grep -aqF 'correct horse' "$work/alpha.log" "$work/beta3.log" || fail "a node said the passphrase"
+                kill "$vm"
+                wait "$vm" 2>/dev/null || true
+                [ "$(says "$work/beta.disk")" = 'sealed held passphrase' ] || fail "the disk of the machine with a passphrase, read from outside: $(says "$work/beta.disk")"
+                ! grep -aqF 'correct horse' "$work/beta.disk" || fail "the passphrase is on the machine's disk as it was typed"
+                # Away from its cluster (started without its card): no node answers, and it opens
+                # its state once the passphrase is typed at it, not before and not for another.
+                vm away -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0
+                hears away 'Or type its passphrase, or the recovery key'
+                hears away 'still locked'
+                printf 'correct horse batterz\n' | socat - "unix-connect:$work/away.tty" >/dev/null
+                hears away "that is not this node's recovery key, nor its passphrase"
+                ! grep -aqF 'state on' "$work/away.log" || fail "a machine away from its cluster opened its state without its passphrase"
+                printf 'correct horse battery\n' | socat - "unix-connect:$work/away.tty" >/dev/null
+                hears away 'kithd: init: opened with its passphrase'
+                hears away 'kithd: init: state on /dev/dm-'
+                ! grep -aqF 'correct horse' "$work/away.log" || fail "the machine's console showed the passphrase as it was typed"
+                kill "$vm"
+                wait "$vm" 2>/dev/null || true
+                beta home ''
+                up home
+                # Locked again: it drops its passphrase, and the recovery key, typed at the
+                # machine, opens it all the same.
                 lock lock >/dev/null
-                hears beta3 'kithd: the cluster has locked this node'
+                hears home 'its passphrase no longer opens its state'
+                hears home 'kithd: the cluster has locked this node: restarting'
                 wait "$vm" || true
                 beta beta4 ''
+                hears beta4 'Or type the recovery key here'
                 hears beta4 'still locked'
-                printf 'aaaa-bbbb\n' | socat - "unix-connect:$work/beta4.tty" >/dev/null
+                printf 'correct horse battery\n' | socat - "unix-connect:$work/beta4.tty" >/dev/null
                 hears beta4 "that is not this node's recovery key"
+                ! grep -aqF 'state on' "$work/beta4.log" || fail "a locked machine opened its state with the passphrase it had"
                 printf '%s\n' "${recovery##* }" | socat - "unix-connect:$work/beta4.tty" >/dev/null
                 hears beta4 'kithd: init: opened with the recovery key'
                 up beta4
+                pass '{"passphrase":"correct horse battery"}' | grep -qF 'unlock it first' || fail "a locked machine was given a passphrase"
+                pass '{}' | grep -q '"passphrase": *false' || fail "a locked machine could not have its passphrase taken away"
                 # Wiped: the cluster forgets the key, the machine erases its record and ends;
                 # what is left on its disk opens for nobody.
                 lock wipe | grep -q '"wiped": *true' || fail "the machine could not be wiped"
@@ -1310,7 +1357,7 @@ with open(sys.argv[1], "r+b") as disk:
                 lock unlock | grep -qF 'was wiped' || fail "a wiped machine could be unlocked"
                 beta beta5 ''
                 hears beta5 'the state partition is damaged'
-                echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; locked again, the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody"
+                echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; given a passphrase (through the node, which kept none of it) and started without its card, it opened its state once the passphrase was typed at it, and not for another; locked again, it dropped the passphrase, and the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody"
                 exit 0
             fi
             echo "vm.sh: ok: a node told to install the machine with card $mac answered its network boot (beside the network's own DHCP server), served it the installer once over TFTP; the machine installed on its only disk, started from it and joined the node's cluster; netboot off again"

@@ -386,6 +386,14 @@ enum NodeCommand {
         #[arg(long)]
         off: bool,
     },
+    /// Give NAME a passphrase that opens its encrypted state where no node is in reach, typed at its
+    /// console when it starts (a laptop away from home): its key then lies on its disk, behind the passphrase
+    Passphrase {
+        name: String,
+        /// Take it away: the node asks the cluster again, and nothing else
+        #[arg(long)]
+        off: bool,
+    },
     /// Forget the key of NAME's encrypted state for good: what its disk holds can no longer be read
     Wipe {
         name: String,
@@ -563,6 +571,40 @@ fn escape(key: &str) -> String {
             }
         })
         .collect()
+}
+
+/// What is typed at the terminal after `prompt`, unseen and twice the same; from a pipe,
+/// its first line.
+fn secret(prompt: &str) -> Result<String, String> {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let line = || {
+        let mut line = String::new();
+        let read = stdin.read_line(&mut line).or_else(|e| fail(format!("stdin: {e}")));
+        read.map(|_| line.trim().to_string())
+    };
+    let shown = stdin.is_terminal().then(|| tcgetattr(&stdin).ok()).flatten();
+    let Some(shown) = shown else {
+        return line();
+    };
+    // ponytail: an interrupt while it is typed leaves the terminal unseen (`stty echo`
+    // brings it back); a signal handler, if anyone trips on it.
+    let mut unseen = shown.clone();
+    unseen.local_flags.remove(LocalFlags::ECHO);
+    let typed = |prompt: &str| {
+        eprint!("{prompt}");
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, &unseen);
+        let typed = line();
+        let _ = tcsetattr(&stdin, SetArg::TCSANOW, &shown);
+        eprintln!();
+        typed
+    };
+    let (first, again) = (typed(prompt)?, typed("Once more: ")?);
+    if first != again {
+        return fail("the two are not the same: nothing was done");
+    }
+    Ok(first)
 }
 
 /// One HTTP request to kithd over its unix socket.
@@ -969,6 +1011,29 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                         "{name} drops its TPM's seal when it hears of it: from then on it asks the cluster for its key"
                     ),
                     _ => format!("{name} is wiped: the cluster has forgotten the key of its state"),
+                }
+            );
+        }
+        Command::Node {
+            command: NodeCommand::Passphrase { name, off },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            let passphrase = match off {
+                true => None,
+                false => Some(secret(&format!("A passphrase for {name}'s state: "))?),
+            };
+            let body = serde_json::json!({ "passphrase": passphrase }).to_string();
+            let _: serde_json::Value =
+                request(&kithd, "POST", &format!("/v1/lock/{name}/passphrase"), body.as_bytes())?;
+            println!(
+                "{}",
+                match off {
+                    true => format!("{name} has no passphrase: it asks the cluster for the key of its state"),
+                    false => format!(
+                        "{name} opens its state with that passphrase, typed at its console when it starts and no node answers (as its keys lie at start: the kernel's own layout, US). Take it away with --off"
+                    ),
                 }
             );
         }

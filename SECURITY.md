@@ -163,6 +163,19 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   starts); after a start the TPM refused, the node seals again for whatever system
   the cluster then handed the key to; and all of it has run against a software TPM
   only.
+- **The offline unlock gives up that the key is not on the machine.** A node that
+  opens its encrypted state with no node in reach has its key on its own disk again:
+  sealed to its TPM (above), or, with `kith node passphrase` (off unless one is given),
+  wrapped under a key drawn from a passphrase by Argon2id (19 MiB, 2 passes). Whoever
+  has that disk can try passphrases offline, at that cost a try and for as long as
+  they like: the passphrase's strength is then all that keeps the state, where
+  without one it is the cluster's lock or the recovery key's 128 random bits. A lock
+  makes a node drop its passphrase only once it hears of it; a wipe erases it with
+  the rest. Passphrase and seal are each a way in, not two factors. The passphrase
+  goes from the node that was asked to the node it is for over the cluster's TLS and
+  is kept by neither, nor by the store or the audit log; it is in kithd's memory on
+  both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
+  disk keeps of sectors it has replaced is not kith's to say.
 - **Confidential machines (SEV-SNP, TDX) and device passthrough** have never been run on
   real hardware.
 

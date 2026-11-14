@@ -18,6 +18,8 @@ kith-kube = { path = "../kith-kube" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+# A passphrase is typed unseen (`kith node passphrase`).
+nix = { version = "0.29", features = ["term"] }
 
 [lints]
 workspace = true

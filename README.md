@@ -2373,6 +2373,8 @@ kith node unlock beta                  # beta is handed its key again, and start
 kith node wipe beta --erase beta       # the key is forgotten for good: beta's state is gone
 kith node seal beta                    # beta's own TPM keeps the key too: it starts with no node asked
 kith node seal beta --off              # taken back: beta asks the cluster again
+kith node passphrase beta              # asks for one, twice, unseen: typed at beta's console, it opens beta's state away from home
+kith node passphrase beta --off        # taken away
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
 sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
 ```
@@ -2423,6 +2425,32 @@ probed while the machine starts (the key crosses its bus as it is), nor a
 machine with no TPM. It has run against a software TPM only, never on a real
 one.
 
+**A passphrase.** For a machine with no TPM, or whose owner will not have
+the machine alone be enough: `kith node passphrase beta` asks for a
+passphrase (eight characters or more, of ASCII; several unrelated words are
+better)
+and gives it to beta, which from then on takes it at its console where it
+takes the recovery key: a start with no node in reach waits, and opens once
+the passphrase is typed. What is typed at the machine's consoles is then
+not shown. Run it on
+any node: that node hands the passphrase to beta over the cluster's TLS and
+keeps none of it; it is not in the store, and the audit log says only that
+one was given, and by whom. `kith get NodeKey beta` says `passphrase: true`
+while beta has one; giving another replaces it, and `--off` takes it away.
+
+What the passphrase costs: the key is on the node's disk again, wrapped
+under a key drawn from the passphrase (Argon2id, 19 MiB and 2 passes for
+each try). Whoever has the disk can try passphrases for as long as they
+like, on machines of their own: a short or guessable one is no protection,
+and the recovery key's 128 random bits are no longer what stands between a
+taken disk and its state. A locked node drops its passphrase when it hears
+of the lock (and takes no new one until it is unlocked); one that was off,
+or away, did not hear, and still opens for whoever types it. It is another way in, not a second lock: a node that also
+has its TPM's seal opens by that, with nothing typed. And it is typed as the
+keys lie when the machine starts, which is the kernel's own layout (US): a
+passphrase with letters that sit elsewhere on your keyboard is typed where
+they sit there.
+
 What is and is not protected:
 
 - The cluster holds the key wrapped with a secret that only the node's disk
@@ -2442,8 +2470,8 @@ What is and is not protected:
 - A stolen machine that is not locked, started on the cluster's own network,
   is handed its key: lock it when it goes missing.
 
-Not yet: a passphrase in the TPM's place for a machine without one,
-encrypting a node that was not installed that way, a new recovery key for a
+Not yet: a passphrase and the TPM both asked for (two locks, where these are
+two doors), a keyboard layout at the console, encrypting a node that was not installed that way, a new recovery key for a
 running node.
 
 ### Not in kith OS yet
