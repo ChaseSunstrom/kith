@@ -16,7 +16,7 @@ use zones::{Found, key};
 
 pub use blocklist::{Block, Names, Parsed, parse_list};
 pub use cache::{Cache, CacheStats};
-pub use server::serve;
+pub use server::{LOCAL_NETWORKS, serve};
 pub use wire::SERVFAIL;
 pub use zones::{Cidr, Rdata, Record, Records, View, Zones};
 

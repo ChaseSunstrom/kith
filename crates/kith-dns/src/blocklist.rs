@@ -77,8 +77,7 @@ fn listable(name: &str) -> bool {
         && name.parse::<IpAddr>().is_err()
 }
 
-/// Reads a list: a hosts file (`0.0.0.0 ads.example tracker.example`, `#` starts a comment) or one
-/// name a line, or a mix. At most `max` names are kept.
+/// The machine's own names a hosts file begins with: they are not for blocking.
 const LOCAL_NAMES: [&str; 6] = [
     "localhost",
     "localhost.localdomain",
@@ -88,11 +87,25 @@ const LOCAL_NAMES: [&str; 6] = [
     "ip6-loopback",
 ];
 
+/// Reads a list: a hosts file (`0.0.0.0 ads.example tracker.example`, `#` starts a comment), one
+/// name a line, a filter list's plain rules (`||ads.example^`, `!` starts a comment), or a mix.
+/// Any other line (a rule with a path, an option or an exception) is skipped and counted. At most
+/// `max` names are kept.
 pub fn parse_list(text: &str, max: usize) -> Parsed {
     let state = RandomState::new();
     let (mut hashes, mut skipped, mut over) = (Vec::new(), 0, false);
-    'lines: for line in text.lines() {
-        let line = line.split('#').next().unwrap_or_default();
+    // (A file saved with a byte-order mark begins with one; it is not part of the first name.)
+    'lines: for line in text.trim_start_matches('\u{feff}').lines() {
+        // (A `#` starts a comment at the start of a line or after a space: `site.example##.banner`,
+        // a rule about a page's parts, is not the name before it.)
+        let comment =
+            |&(at, c): &(usize, char)| c == '#' && line[..at].chars().next_back().is_none_or(char::is_whitespace);
+        let line = &line[..line.char_indices().find(comment).map_or(line.len(), |(at, _)| at)];
+        if line.trim_start().starts_with(['!', '[']) {
+            continue;
+        }
+        let rule = line.trim().strip_prefix("||").and_then(|rest| rest.strip_suffix('^'));
+        let line = rule.unwrap_or(line);
         let mut words = line.split_whitespace().peekable();
         let Some(&first) = words.peek() else { continue };
         // A hosts line names an address first; anything else with several words is not a list line.
@@ -107,8 +120,7 @@ pub fn parse_list(text: &str, max: usize) -> Parsed {
             skipped += 1;
         }
         for name in words {
-            // Hosts files begin with the machine's own names; they are not for blocking.
-            if hosts && LOCAL_NAMES.contains(&name) {
+            if hosts && LOCAL_NAMES.iter().any(|local| local.eq_ignore_ascii_case(name)) {
                 continue;
             }
             if !listable(name) {

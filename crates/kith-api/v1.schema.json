@@ -1393,13 +1393,6 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "namespace": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "description": "The ConfigMap's namespace. Defaults to `default`."
-        },
         "name": {
           "type": "string"
         },
@@ -1410,7 +1403,8 @@
       "required": [
         "name",
         "key"
-      ]
+      ],
+      "description": "A key of a ConfigMap in `kith-system`: a list decides names for every node's clients,\nso it is read from where only the cluster's admins write."
     },
     "ClusterSpec": {
       "type": "object",

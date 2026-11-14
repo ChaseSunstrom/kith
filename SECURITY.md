@@ -40,8 +40,8 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
   command on another node) take a node's certificate only.
 - **What a node fetches or sends for someone who is not the admin** (a Source's
-  repository, a package pushed to a registry) goes only to addresses that are not this
-  node's own or on its networks, each redirect and each place a registry sends an upload
+  repository, a package pushed to a registry, a `DNSBlockList`'s `url`) goes only to
+  addresses that are not this node's own or on its networks, each redirect and each place a registry sends an upload
   included, and to the address that was checked, not to the name looked up again. So the
   API is not a way to reach what only the node can reach.
 - **A container** runs as a user that is not root (its template's, its image's, or
@@ -144,6 +144,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   would give a container more than kith gives (`privileged`, capabilities, devices, the
   node's network, `/`, `/proc`, `/sys`, `/dev` and a docker socket as a volume, even in
   `kith-system`), and reads no variable of the shell it runs in.
+- **A block list is trusted for the names it lists, by every client of the resolver.** A
+  `DNSBlockList` is the cluster's (no namespace), and its ConfigMap is read from
+  `kith-system` only: whoever may write either decides which names every node answers as
+  not there. The host of a `url` list sees each node's address and when it asks, and what
+  it serves is taken as the list unless `sha256` pins it. A name that is only an alias (a
+  CNAME) of a listed name at the other resolvers is still answered. What those resolvers
+  say is kept for up to an hour and given to every client that asks the same question:
+  kith checks no DNSSEC signature, so an answer forged on the way from them lasts that
+  long, and answers given from what is kept do not count toward a client's limit on
+  forwarded questions.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can

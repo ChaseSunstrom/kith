@@ -1227,9 +1227,6 @@ fn upstream() -> u16 {
 
 #[test]
 fn dns_answers_from_the_store() {
-    if !e2e() {
-        return;
-    }
     let port = free_port();
     let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
     let other: &'static str = Box::leak(format!("127.0.0.1:{}", upstream()).into_boxed_str());
@@ -1273,6 +1270,56 @@ fn dns_answers_from_the_store() {
     assert_eq!(resolve(port, "x.apps.home.example"), Err(3));
     daemon.ok(&["delete", "dnsrecord/nas"]);
     wait_for("the name to be gone", || resolve(port, "nas.home.example") == Err(3));
+}
+
+/// A `DNSBlockList` from a ConfigMap in `kith-system`: its names are not there for the
+/// resolver's clients, every other name is what the other resolver says. Nothing is fetched.
+#[test]
+fn dns_block_lists_from_the_store() {
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let other: &'static str = Box::leak(format!("127.0.0.1:{}", upstream()).into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--dns", listen, "--dns-upstream", other]));
+    let daemon = Daemon::start_with("dnsblock", args);
+    wait_for("the other resolver's answer", || {
+        resolve(port, "ads.example") == Ok([198, 51, 100, 7])
+    });
+    let list = |answer: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: lists, namespace: kith-system }}\n\
+             spec:\n  data:\n    hosts: |\n      0.0.0.0 ads.example\n      ||tracker.example^\n      not a name!\n\
+             ---\napiVersion: kith.dev/v1\nkind: DNSBlockList\nmetadata: {{ name: ads }}\n\
+             spec:\n  configMap: {{ name: lists, key: hosts }}\n{answer}"
+        )
+    };
+    daemon.apply(&list(""));
+    wait_for("the list", || daemon.status("dnsblocklist/ads")["state"] == "loaded");
+    let status = daemon.status("dnsblocklist/ads");
+    assert_eq!(
+        (&status["names"], &status["skipped"]),
+        (&serde_json::json!(2), &serde_json::json!(1)),
+        "{status}"
+    );
+    // A listed name and every name under it: not there (3), though it was answered and kept before.
+    for name in ["ads.example", "a.b.ads.example", "tracker.example"] {
+        assert_eq!(resolve(port, name), Err(3), "{name}");
+        assert_eq!(resolve_over(true, port, name), Err(3), "{name}");
+    }
+    assert_eq!(resolve(port, "example.org"), Ok([198, 51, 100, 7]));
+    // `answer: unspecified` gives 0.0.0.0 in its place.
+    daemon.apply(&list("  answer: unspecified\n"));
+    wait_for("the other answer", || resolve(port, "ads.example") == Ok([0, 0, 0, 0]));
+    // A list is read from kith-system only: the field for another namespace is not taken.
+    let elsewhere = "apiVersion: kith.dev/v1\nkind: DNSBlockList\nmetadata: { name: theirs }\n\
+                     spec:\n  configMap: { namespace: default, name: lists, key: hosts }\n";
+    std::fs::write(daemon.dir.join("elsewhere.yaml"), elsewhere).unwrap();
+    let (code, _, said) = daemon.kith(&["apply", "-f", "elsewhere.yaml"]);
+    assert!(code != 0 && said.contains("namespace"), "{said}");
+    // The list gone, the names are the other resolver's again.
+    daemon.ok(&["delete", "dnsblocklist/ads"]);
+    wait_for("the name to be back", || {
+        resolve(port, "ads.example") == Ok([198, 51, 100, 7])
+    });
 }
 
 /// A package pushed to the daemon, and a Release of it: installed, upgraded (what is no

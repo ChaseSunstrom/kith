@@ -181,6 +181,11 @@ pub async fn vetted(url: &str) -> Fallible<(String, u16, Vec<std::net::SocketAdd
             "{url}: a Source's address is scheme://host[:port]/path, and no more"
         ));
     }
+    // (A name with a dot at its end is another spelling of the name: whoever connects may
+    // look it up again under the one that was not held.)
+    if host.ends_with('.') {
+        return Err(format!("{url}: a host is written with no dot at its end"));
+    }
     let after = authority.rsplit_once(']').map_or(authority, |(_, after)| after);
     let port: u16 = match after.rsplit_once(':') {
         Some((_, port)) => port.parse().map_err(|_| format!("{url}: {port:?} is not a port"))?,

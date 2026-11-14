@@ -74,6 +74,8 @@ pub struct Query {
     pub edns: Option<u16>,
     /// The extended rcode, version and flags of that record (the DO bit is in them).
     pub edns_ttl: Option<u32>,
+    /// That record carries options (a client's subnet, a cookie): they are that client's own.
+    pub edns_options: bool,
     /// Where that size sits in the packet.
     edns_at: usize,
 }
@@ -87,13 +89,18 @@ impl Query {
         let (qname, p) = read_name(b, 12)?;
         let (qtype, qclass) = (u16_at(b, p)?, u16_at(b, p + 2)?);
         let (an, ns, ar) = (u16_at(b, 6)?, u16_at(b, 8)?, u16_at(b, 10)?);
-        let (mut p, mut edns, mut edns_ttl, mut edns_at) = (p + 4, None, None, 0);
+        let (mut p, mut edns, mut edns_ttl, mut edns_at, mut edns_options) = (p + 4, None, None, 0, false);
         for i in 0..u32::from(an) + u32::from(ns) + u32::from(ar) {
             p = read_name(b, p)?.1;
             let rdlen = usize::from(u16_at(b, p + 8)?);
-            if i >= u32::from(an) + u32::from(ns) && u16_at(b, p)? == 41 && edns.is_none() {
+            if i >= u32::from(an) + u32::from(ns) && u16_at(b, p)? == 41 {
+                // (One OPT record at most, RFC 6891: a second is what the first was not read for.)
+                if edns.is_some() {
+                    return None;
+                }
                 (edns, edns_at) = (Some(u16_at(b, p + 2)?), p + 2);
                 edns_ttl = Some(u32::from(u16_at(b, p + 4)?) << 16 | u32::from(u16_at(b, p + 6)?));
+                edns_options = rdlen > 0;
             }
             p += 10 + rdlen;
             if p > b.len() {
@@ -108,6 +115,7 @@ impl Query {
             qclass,
             edns,
             edns_ttl,
+            edns_options,
             edns_at,
         })
     }

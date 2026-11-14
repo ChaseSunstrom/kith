@@ -268,8 +268,12 @@ pub async fn run(
     mut upstreams: Vec<SocketAddr>,
     mut stopping: watch::Receiver<bool>,
 ) {
-    // This node's pods are its own to ask for any name, whatever their addresses are.
-    let pods = format!("{}/16", kith_mesh::pod::GATEWAY).parse::<Cidr>().ok();
+    // This node's pods are its own to ask for any name, whatever their addresses are. (A list
+    // takes the place of the local networks, so they are named with it: a list of the pods'
+    // network alone had every other client refused.)
+    let pods = format!("{}/16", kith_mesh::pod::GATEWAY);
+    let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
+    let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
     upstreams.retain(|upstream| !is_self(*upstream, listen));
     eprintln!("kithd: serving DNS on {listen}; other names go to {upstreams:?}");
@@ -344,7 +348,7 @@ pub async fn run(
         }
     };
     tokio::select! {
-        () = kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect(), cache) => {}
+        () = kith_dns::serve(udp, tcp, served, upstreams, forwarders, cache) => {}
         () = feed => {}
         () = relist => {}
         () = blocks => {}

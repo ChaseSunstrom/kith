@@ -5,12 +5,16 @@
 //! - A fetched list is asked for again every `interval` (24h unless it says). A fetch that fails, a
 //!   body over the size cap, one that does not match `sha256`, or a list over the per-node bound
 //!   leaves the list in use as it was, and the status says why.
-//! - Only https is fetched, no redirect is followed, and no more than `MAX_BYTES` is read.
+//! - Only https is fetched, from an address that is not this node or its networks (the check
+//!   Sources have: `sources::vetted`, the address then held for the connection), no redirect is
+//!   followed, and no more than `MAX_BYTES` is read.
+//! - A ConfigMap list is a key of a ConfigMap in `kith-system`: whoever writes it decides names
+//!   for every node's clients.
 //! - The names of all lists together are bounded by `MAX_NAMES` (8 bytes each once held).
 //! - Each list's status says its state, name count, when it was fetched and by which node.
 //!
 //! A URL list is fetched by every node that serves DNS: the host of the list sees each node's
-//! address and when it asks. That is in SECURITY.md.
+//! address and when it asks (SECURITY.md, "A block list is trusted…").
 //
 // ponytail: every node writes the same status, so with several nodes the last writer's `node`,
 // `fetched` and cache numbers are what is shown; per-node status once someone needs to tell them apart.
@@ -38,8 +42,6 @@ const MAX_BYTES: usize = 32 << 20;
 /// How long a fetch may take in all, and to connect.
 const FETCH: Duration = Duration::from_secs(60);
 const CONNECT: Duration = Duration::from_secs(10);
-/// How often the cache's numbers are put in the status of the lists.
-const CACHE_EVERY: Duration = Duration::from_secs(300);
 
 /// A list the store holds, and where its text comes from.
 pub struct Want {
@@ -79,8 +81,9 @@ pub struct Lists {
     held: BTreeMap<String, Held>,
     /// The status last written for each list, so the same one is not written twice.
     written: BTreeMap<String, Value>,
+    /// The cache's numbers as they were when a list was last read: a status is not written
+    /// again only to say them.
     cache: Value,
-    cache_at: Option<Instant>,
     /// The lists last given to the server.
     published: Vec<Block>,
     max: usize,
@@ -92,7 +95,6 @@ impl Default for Lists {
             held: BTreeMap::new(),
             written: BTreeMap::new(),
             cache: Value::Null,
-            cache_at: None,
             published: Vec::new(),
             max: MAX_NAMES,
         }
@@ -126,14 +128,29 @@ fn check_url(url: &str) -> Result<(), String> {
 async fn fetch_list(url: &str, sha256: Option<&str>) -> Result<String, String> {
     check_url(url)?;
     let failed = |e: reqwest::Error| format!("{url}: {e}");
-    // (No redirect is followed: the address is the one the spec names.)
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    // kithd fetches as root from inside the cluster: not from this node or its networks, and
+    // from the address that was looked at (not one a second lookup gives).
+    let (host, _, addresses) = crate::sources::vetted(&parsed.origin().ascii_serialization())
+        .await
+        .map_err(|e| match e.contains("its own networks") {
+            true => format!(
+                "{url}: a list is not fetched from this node or its own networks (a list of your own goes in a \
+                 ConfigMap in kith-system)"
+            ),
+            false => e,
+        })?;
+    // (No redirect is followed: the address is the one the spec names. Nor a proxy, which
+    // would look the name up again itself.)
     let client = reqwest::Client::builder()
+        .resolve_to_addrs(&host, &addresses)
+        .no_proxy()
         .timeout(FETCH)
         .connect_timeout(CONNECT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(failed)?;
-    let reply = client.get(url).send().await.map_err(failed)?;
+    let reply = client.get(parsed).send().await.map_err(failed)?;
     let status = reply.status();
     if status.is_redirection() {
         return Err(format!("{url}: {status}; a redirect is not followed"));
@@ -159,14 +176,9 @@ impl Lists {
             .is_none_or(|held| held.spec.as_ref() != Some(spec) || held.seen != Some(hash))
     }
 
-    /// When something is next to do on its own: a URL list's fetch, or the cache's numbers.
+    /// When something is next to do on its own: a URL list's fetch.
     pub fn due(&self) -> Option<Instant> {
-        let fetches = self.held.values().filter_map(|held| held.next);
-        let cache = self
-            .cache_at
-            .filter(|_| !self.held.is_empty())
-            .map(|at| at + CACHE_EVERY);
-        fetches.chain(cache).min()
+        self.held.values().filter_map(|held| held.next).min()
     }
 
     /// Forgets what was written for these keys, so the next pass writes them again.
@@ -235,14 +247,9 @@ impl Lists {
             after
         });
 
-        if reloaded
-            || self
-                .cache_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= CACHE_EVERY)
-        {
+        if reloaded || self.cache.is_null() {
             let s = cache.stats();
             self.cache = json!({ "entries": s.entries, "bytes": s.bytes, "hits": s.hits, "misses": s.misses });
-            self.cache_at = Some(now);
         }
         let mut statuses = Vec::new();
         for (want, _) in &wants {
@@ -267,14 +274,20 @@ impl Lists {
             if used + good.names.len() > self.max {
                 continue;
             }
+            // A network this cannot read (an apply refuses one) would leave the list with fewer
+            // clients than it names, or with none, which is everyone: such a list is not served.
+            let Ok(nets) = want
+                .spec
+                .clients
+                .iter()
+                .map(|net| net.parse::<Cidr>())
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                continue;
+            };
             used += good.names.len();
             blocks.push(Block {
-                nets: want
-                    .spec
-                    .clients
-                    .iter()
-                    .filter_map(|net| net.parse::<Cidr>().ok())
-                    .collect(),
+                nets,
                 names: good.names.clone(),
                 null: want.spec.answer == Some(DnsBlockAnswer::Unspecified),
             });
@@ -284,6 +297,13 @@ impl Lists {
 
     fn status(&self, key: &str, node: &str) -> Value {
         let held = &self.held[key];
+        // (See `blocks`: such a list is not served.)
+        let clients = held.spec.iter().flat_map(|spec| &spec.clients);
+        let unread = clients.clone().find(|net| net.parse::<Cidr>().is_err());
+        if let Some(net) = unread {
+            let message = format!("clients: `{net}` is not a network: the list is not served");
+            return json!({ "state": "error", "node": node, "message": message });
+        }
         let mut status = json!({ "state": if held.error.is_some() || held.good.is_none() { "error" } else { "loaded" }, "node": node });
         if let Some(good) = &held.good {
             status["names"] = good.names.len().into();
@@ -335,11 +355,7 @@ fn wants(shared: &Shared, lists: &Lists) -> Vec<(Want, Option<Value>)> {
         };
         let source = match &spec.config_map {
             Some(map) => {
-                let key = format!(
-                    "ConfigMap/{}/{}",
-                    map.namespace.as_deref().unwrap_or("default"),
-                    map.name
-                );
+                let key = format!("ConfigMap/kith-system/{}", map.name);
                 let text = state.store.get(&key).and_then(|cm| cm.spec["data"][&map.key].as_str());
                 match text {
                     None => Source::Text {
@@ -405,6 +421,8 @@ mod tests {
     /// Serves `(status, body)` for every request, from this machine; the pair can be changed.
     async fn serve(reply: Arc<Mutex<(u16, String)>>) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        // (This test's "outside" is this machine.)
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -456,7 +474,6 @@ mod tests {
     fn text_list(key: &str, text: &str, edit: impl FnOnce(&mut DnsBlockListSpec)) -> (Want, Option<Value>) {
         let mut spec = DnsBlockListSpec {
             config_map: Some(kith_api::kinds::BlockListMap {
-                namespace: None,
                 name: "lists".into(),
                 key: key.into(),
             }),
@@ -590,6 +607,52 @@ mod tests {
             )
             .await;
         assert_eq!(blocked(&round.blocks.unwrap(), "ads.example"), Some(false));
+    }
+
+    #[tokio::test]
+    async fn blocklist_a_list_is_not_fetched_from_this_node_or_its_networks() {
+        // kithd fetches as root from inside the cluster: what answers there is not a list's to ask.
+        for url in [
+            "https://127.0.0.1:6443/list",
+            "https://localhost/list",
+            "https://[::1]:8080/list",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1/list",
+            "https://192.168.1.1:8443/hosts",
+            "https://0x7f.1/list",
+            "https://2130706433/list",
+        ] {
+            let said = fetch_list(url, None).await.unwrap_err();
+            assert!(
+                said.contains("its own networks") && said.contains("ConfigMap"),
+                "{url}: {said}"
+            );
+        }
+        // Nor an address written so that one reader takes another host from it.
+        let said = fetch_list("https://lists.example@127.0.0.1/list", None)
+            .await
+            .unwrap_err();
+        assert!(said.contains("no user or password"), "{said}");
+        // Nor a second spelling of a name, which would be looked up again when connecting.
+        let said = fetch_list("https://lists.example./list", None).await.unwrap_err();
+        assert!(said.contains("no dot at its end"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn blocklist_a_list_whose_clients_cannot_be_read_is_not_served() {
+        // (An apply refuses such a list; one that got in must not come to block everyone.)
+        let (cache, mut lists, now) = (Cache::default(), Lists::default(), Instant::now());
+        let want = text_list("hosts", "ads.example\n", |spec| {
+            spec.clients = vec!["192.168.0.0/16".into(), "not a network".into()];
+        });
+        let round = lists.round(vec![want], now, &cache, "alpha").await;
+        assert!(round.blocks.is_none_or(|blocks| blocks.is_empty()));
+        let status = round.statuses[0].1.clone().unwrap();
+        assert_eq!(status["state"], "error", "{status}");
+        assert!(
+            status["message"].as_str().unwrap().contains("not a network"),
+            "{status}"
+        );
     }
 
     #[tokio::test]

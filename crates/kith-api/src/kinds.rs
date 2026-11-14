@@ -638,10 +638,9 @@ spec! {
         pub clients: Vec<String>,
     }
 
+    /// A key of a ConfigMap in `kith-system`: a list decides names for every node's clients,
+    /// so it is read from where only the cluster's admins write.
     pub struct BlockListMap {
-        /// The ConfigMap's namespace. Defaults to `default`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub namespace: Option<String>,
         pub name: String,
         pub key: String,
     }

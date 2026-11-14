@@ -68,6 +68,18 @@ impl Drop for Held {
 
 /// Whether a client may use the forwarder: one in `allowed`, or, when that is empty, one on a
 /// loopback, private, link-local or unique-local address.
+/// The local networks, for a list that is to hold them and more: a list takes their place.
+pub const LOCAL_NETWORKS: [&str; 8] = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
+
 pub(crate) fn may_forward(ip: IpAddr, allowed: &[Cidr]) -> bool {
     let ip = ip.to_canonical();
     if !allowed.is_empty() {
@@ -98,7 +110,10 @@ struct Cached {
 impl Shared {
     /// Looks `query` up in the cache.
     fn cached(&self, query: &[u8]) -> Cached {
-        let key = Query::parse(query).map(|q| Key::new(&q));
+        // A question with options of its own goes to the upstreams with them, and what comes
+        // back may be for that client alone (its subnet) or echo what is its own (a cookie):
+        // it is neither looked up nor kept.
+        let key = Query::parse(query).filter(|q| !q.edns_options).map(|q| Key::new(&q));
         let hit = key.as_ref().and_then(|k| self.cache.get(k, query, Instant::now()));
         Cached { key, hit }
     }

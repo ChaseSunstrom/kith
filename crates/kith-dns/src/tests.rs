@@ -428,6 +428,11 @@ fn hostile_packets_are_rejected_without_panicking() {
         };
         assert_eq!(r[3] & 0xF, 1);
     };
+    // Two OPT records (RFC 6891: one at most): the second could carry what the first was read without.
+    let mut two = query(7, "example.com", A, Some(1232));
+    two[11] = 2;
+    two.extend([0u8, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+    formerr(two);
     // A pointer to itself, to a later byte, and two pointers in a loop.
     formerr([&head(1)[..], &[0xC0, 12, 0, 1, 0, 1]].concat());
     formerr([&head(1)[..], &[0xC0, 40, 0, 1, 0, 1]].concat());
@@ -596,6 +601,33 @@ fn only_private_clients_may_forward_unless_a_list_says_otherwise() {
     }
     let nets = ["8.8.8.0/24".parse().unwrap()];
     assert!(may_forward(ip("8.8.8.8"), &nets) && !may_forward(ip("10.0.0.1"), &nets));
+    // The local networks as a list (kithd names them with its pods' network) are the same clients.
+    let local: Vec<Cidr> = crate::server::LOCAL_NETWORKS
+        .iter()
+        .map(|net| net.parse().unwrap())
+        .collect();
+    for who in [
+        "127.0.0.1",
+        "10.1.2.3",
+        "172.16.0.1",
+        "172.31.255.255",
+        "192.168.1.1",
+        "169.254.1.1",
+        "::1",
+        "fe80::1",
+        "fc00::1",
+        "fd12::9",
+        "::ffff:192.168.1.1",
+        "8.8.8.8",
+        "172.32.0.1",
+        "100.64.0.1",
+        "192.169.0.1",
+        "2001:db8::1",
+        "fec0::1",
+        "::ffff:8.8.8.8",
+    ] {
+        assert_eq!(may_forward(ip(who), &local), may_forward(ip(who), &[]), "{who}");
+    }
 }
 
 #[test]
@@ -1553,6 +1585,67 @@ async fn cache_serves_a_repeat_without_asking_upstream_again() {
     assert_eq!(asked.load(SeqCst), 2);
     let s = cache.stats();
     assert_eq!((s.entries, s.hits, s.misses), (2, 3, 2));
+}
+
+#[tokio::test]
+async fn cache_asks_again_for_a_question_with_options_of_the_clients_own() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (up, asked) = counting_upstream().await;
+    let cache = Arc::new(Cache::default());
+    let (u, _t, _tx) = start_cached(zones(), vec![up], vec![], cache.clone()).await;
+    // An OPT record that carries an option (a cookie: code 10, 8 bytes): the answer may be
+    // for this client only, so it is neither kept nor given from what is kept.
+    let mut q = query(21, "example.com", A, Some(1232));
+    let at = q.len() - 2;
+    q[at..].copy_from_slice(&12u16.to_be_bytes());
+    q.extend([0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
+    // (Not decoded: this test's upstream puts its answer after the question's OPT record.)
+    let ask = |q: Vec<u8>| async move {
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.send_to(&q, u).await.unwrap();
+        let mut buf = [0; 512];
+        let (n, _) = timeout(Duration::from_secs(5), s.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((u16_at(&buf, 0), &buf[n - 4..n]), (u16_at(&q, 0), &[1, 2, 3, 4][..]));
+    };
+    for _ in 0..2 {
+        ask(q.clone()).await;
+    }
+    assert_eq!((asked.load(SeqCst), cache.stats().entries), (2, 0));
+    // The same question with no option is kept as before.
+    for _ in 0..2 {
+        ask(query(22, "example.com", A, None)).await;
+    }
+    assert_eq!((asked.load(SeqCst), cache.stats().entries), (3, 1));
+}
+
+#[test]
+fn block_lists_read_a_filter_lists_plain_rules() {
+    let text = "\u{feff}[Adblock Plus 2.0]\n! Title: a filter list\n||ads.example^\n||tracker.example^ \n\
+                ||cdn.example^$third-party\n@@||good.example^\n||site.example/banner\nsite.example##.banner\n\
+                plain.example\n0.0.0.0 hosts.example\n";
+    let parsed = parse_list(text, 100);
+    for name in [
+        "ads.example",
+        "sub.ads.example",
+        "tracker.example",
+        "plain.example",
+        "hosts.example",
+    ] {
+        assert!(parsed.names.blocks(name), "{name}");
+    }
+    // A rule with an option, an exception, a path or a page's parts names no host to block:
+    // skipped and counted, and never read as the name it begins with.
+    for name in ["cdn.example", "good.example", "site.example"] {
+        assert!(!parsed.names.blocks(name), "{name}");
+    }
+    assert_eq!((parsed.names.len(), parsed.skipped), (4, 4));
+    // The machine's own names are left out however they are written.
+    assert!(!parse_list("127.0.0.1 LOCALHOST\n", 10).names.blocks("localhost"));
+    // A byte-order mark is not part of the first name.
+    assert!(parse_list("\u{feff}first.example\n", 10).names.blocks("first.example"));
 }
 
 #[tokio::test]
