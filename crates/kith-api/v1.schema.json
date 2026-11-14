@@ -2121,6 +2121,13 @@
           "type": "object",
           "additionalProperties": true,
           "description": "Namespace-wide package values."
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The hosts only this namespace's Services expose: a name, or `*.example.org`\nfor every name under one. A namespace that names any exposes no others."
         }
       }
     },

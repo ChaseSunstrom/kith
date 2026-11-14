@@ -84,7 +84,7 @@ pub struct Peer {
 /// few guest slots and is cut off after `GUEST_TIME`: a join is two short requests.
 pub struct Connection {
     stream: TlsStream<TcpStream>,
-    guest: Option<(OwnedSemaphorePermit, Pin<Box<tokio::time::Sleep>>)>,
+    guest: Option<(Slot, Pin<Box<tokio::time::Sleep>>)>,
 }
 
 impl Connection {
@@ -136,11 +136,69 @@ const GUESTS: usize = 64;
 /// How long a handshake may take, and how long a guest connection may last.
 const GUEST_TIME: Duration = Duration::from_secs(15);
 
+/// Of the [`GUESTS`] slots, how many one address may hold: a host that opens connections
+/// and says nothing fills its own share, and nobody else's.
+//
+// ponytail: many addresses still fill the slots between them. A firewall then, or slots
+// kept apart for the addresses the members have, if that is ever seen.
+const GUESTS_EACH: u32 = GUESTS as u32 / 8;
+
+/// How many slots each address holds now.
+#[derive(Default)]
+struct Crowd(std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>);
+
+/// A guest slot and its address's hold on it.
+type Slot = (OwnedSemaphorePermit, Place);
+
+/// One address's hold on a slot, given back when dropped.
+struct Place(Arc<Crowd>, Option<std::net::IpAddr>);
+
+impl Crowd {
+    /// A place for a connection from `from`, unless that address holds its share already.
+    /// An IPv6 /64 is one address here (it is one host's to hand out), and this machine's
+    /// own are not counted: only what runs on it can use them.
+    fn place(self: &Arc<Crowd>, from: std::net::IpAddr) -> Option<Place> {
+        use std::net::IpAddr;
+        let from = match from {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(from, IpAddr::V4),
+            v4 => v4,
+        };
+        if from.is_loopback() {
+            return Some(Place(self.clone(), None));
+        }
+        let from = match from {
+            IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into()),
+            v4 => v4,
+        };
+        let mut held = self.0.lock().expect("nothing panics holding the crowd");
+        let count = held.entry(from).or_default();
+        if *count >= GUESTS_EACH {
+            return None;
+        }
+        *count += 1;
+        Some(Place(self.clone(), Some(from)))
+    }
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        let Some(from) = self.1 else { return };
+        let mut held = self.0.0.lock().expect("nothing panics holding the crowd");
+        if let Some(count) = held.get_mut(&from) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&from);
+            }
+        }
+    }
+}
+
 pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::Result<TlsListener> {
     let local = tcp.local_addr()?;
     let (tx, ready) = mpsc::channel(GUESTS);
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let slots = Arc::new(Semaphore::new(GUESTS));
+    let crowd = Arc::new(Crowd::default());
     tokio::spawn(async move {
         loop {
             let Ok(slot) = slots.clone().acquire_owned().await else {
@@ -151,6 +209,11 @@ pub fn listen(tcp: TcpListener, config: Arc<rustls::ServerConfig>) -> std::io::R
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             };
+            // An address that holds its share already is hung up on: it waits for itself.
+            let Some(place) = crowd.place(addr.ip()) else {
+                continue;
+            };
+            let slot: Slot = (slot, place);
             let (acceptor, tx) = (acceptor.clone(), tx.clone());
             tokio::spawn(async move {
                 // A client that connects and says nothing does not hold a slot for long.
@@ -810,5 +873,39 @@ mod tests {
         assert!(String::from_utf8_lossy(&why).contains("carol may not apply Node"));
         assert!(!read.load(Ordering::SeqCst), "the body was read before the refusal");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guests_of_one_address_hold_only_their_share() {
+        let crowd = Arc::new(Crowd::default());
+        let from = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
+        // One host fills its share and no more; another host is not kept out by it.
+        let mut held: Vec<_> = (0..GUESTS_EACH)
+            .map(|_| crowd.place(from("203.0.113.9")).unwrap())
+            .collect();
+        assert!(crowd.place(from("203.0.113.9")).is_none());
+        assert!(
+            crowd.place(from("::ffff:203.0.113.9")).is_none(),
+            "the same host, as IPv6 sees it"
+        );
+        assert!(crowd.place(from("203.0.113.10")).is_some());
+        // A place given back is one more to take.
+        held.pop();
+        let again = crowd.place(from("203.0.113.9"));
+        assert!(again.is_some() && crowd.place(from("203.0.113.9")).is_none());
+        drop((held, again));
+        assert!(
+            crowd.0.lock().unwrap().is_empty(),
+            "nothing is remembered of who has left"
+        );
+        // A /64 is one host's to hand out; this machine itself is not counted.
+        let _held: Vec<_> = (0..GUESTS_EACH)
+            .map(|n| crowd.place(from(&format!("2001:db8::{n:x}"))).unwrap())
+            .collect();
+        assert!(crowd.place(from("2001:db8::ffff")).is_none());
+        assert!(crowd.place(from("2001:db8:0:1::1")).is_some());
+        let local: Vec<_> = (0..GUESTS).filter_map(|_| crowd.place(from("127.0.0.1"))).collect();
+        assert_eq!(local.len(), GUESTS);
+        assert!(crowd.place(from("::1")).is_some());
     }
 }

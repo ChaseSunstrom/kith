@@ -208,6 +208,10 @@ spec! {
         /// Namespace-wide package values.
         #[serde(default, skip_serializing_if = "Values::is_empty")]
         pub values: Values,
+        /// The hosts only this namespace's Services expose: a name, or `*.example.org`
+        /// for every name under one. A namespace that names any exposes no others.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub hosts: Vec<String>,
     }
 
     // ---- Workloads ----
@@ -939,7 +943,6 @@ no_checks!(
     BlobSpec,
     ClusterSpec,
     NodeSpec,
-    NamespaceSpec,
     NetworkPolicySpec,
     VolumeClaimSpec,
     ConfigMapSpec,
@@ -1338,6 +1341,37 @@ impl Spec for ServiceSpec {
             Some(expose) => expose_host_refused(&expose.host).map_or(Ok(()), Err),
             None => Ok(()),
         }
+    }
+}
+
+impl Spec for NamespaceSpec {
+    fn check(&self) -> Result<(), String> {
+        for host in &self.hosts {
+            let name = host.strip_prefix("*.").unwrap_or(host);
+            if !dns_name(name) {
+                return Err(format!(
+                    "hosts: `{host}` is not a domain name like `shop.example.org`, or `*.example.org` for every name \
+                     under one"
+                ));
+            }
+            if let Some(refused) = expose_host_refused(name) {
+                return Err(format!("hosts: {refused}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl NamespaceSpec {
+    /// Is `host` (in lower case) one of this namespace's own?
+    pub fn keeps(&self, host: &str) -> bool {
+        self.hosts.iter().any(|kept| {
+            let kept = kept.to_ascii_lowercase();
+            match kept.strip_prefix("*.") {
+                Some(domain) => host.strip_suffix(domain).is_some_and(|under| under.ends_with('.')),
+                None => kept == host,
+            }
+        })
     }
 }
 

@@ -264,7 +264,13 @@ kith node status                                   # who leads the store, who vo
   `expose.host` has to be a domain name a certificate authority issues for:
   an IP address, a label that starts or ends with `-`, or a `_` is refused
   when applied. Two Services with one host: the older has it, and the other's
-  status says `expose: refused` and why. Each port takes 1024 connections at
+  status says `expose: refused` and why. Until a host is kept for a namespace,
+  whoever may write a Service anywhere has it by being first: a Namespace
+  with `spec: { hosts: ['*.example.org', example.org] }` (a name, or `*.` and
+  a domain for every name under it; YAML wants the `*` quoted) keeps those
+  for its own Services, whichever came first, and exposes no others; a
+  Service that asks otherwise is refused the same way, and no certificate is
+  ordered for it. Each port takes 1024 connections at
   a time, 64 of them from one source (an IPv4 address, or an IPv6 /64); more
   are hung up on. One with no byte either way for 5 minutes on 443 is closed,
   and one on 80 after 30 seconds whatever it does. Inside the mesh, a node
@@ -697,6 +703,8 @@ On a node, whoever can open kithd's socket is the admin: `kith` there may do
 everything. From anywhere else, a person or a program calls a node's TLS port
 (`--listen`) as an **Identity**, with a certificate from the cluster's CA,
 and may do what the **Roles** bound to it allow. Nothing, to begin with.
+What each of them is trusted with, what kith does not defend against, and how
+to report a hole: [SECURITY.md](SECURITY.md).
 
 ```sh
 kith identity cert alice --out ~/alice    # on the node the cluster was started on
@@ -1305,6 +1313,11 @@ spec:
 - Applying a Backup needs `get` on `Volume` and `Secret` in the namespace as well as
   `apply` on `Backup`: it sends the one where it says, with the other's keys.
 - Restored files keep their owner, mode and times, less setuid and setgid.
+- An archive holds the volume's files, directories and links. A link is kept as a link
+  and never followed, also when a program in the volume puts one where a file was while
+  the archive is made. Pipes, sockets and device files are left out. A volume more than
+  128 directories deep, or with a file kithd cannot read, is not archived: the Backup's
+  status says which.
 - A backup that fails says why in `status.message` and is tried again in ten minutes.
 - Not yet: the archive is of the directory as it is while it is read (what a crash at that
   moment would leave), not of a snapshot: stop what writes to it for a backup that must be

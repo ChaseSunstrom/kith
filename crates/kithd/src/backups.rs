@@ -84,14 +84,110 @@ fn kept(mut backups: Vec<Value>, new: Value, keep: usize) -> (Vec<Value>, Vec<Va
 }
 
 /// `dir` as a tar in the blob store at `blobs`: the blob's name and size.
+///
+/// Whatever runs in the volume can change it while it is read, so nothing in it is reached
+/// by a path the volume could turn elsewhere: every directory is held open and its entries
+/// are opened from that handle, never through a link. A link is kept as the link it is
+/// (what it points at is not this volume's to read); an entry that became a link while it
+/// was looked at is left out. Entries go in by name, so the same files make the same blob.
 pub(crate) fn archive(dir: &Path, blobs: &Path) -> Result<(String, u64), String> {
     let failed = |e: std::io::Error| format!("archiving {}: {e}", dir.display());
     let mut tar = tar::Builder::new(Incoming::new(blobs).map_err(failed)?);
-    // (A link is kept as a link: what it points at is not this volume's to read.)
-    tar.follow_symlinks(false);
-    tar.mode(tar::HeaderMode::Complete);
-    tar.append_dir_all(".", dir).map_err(failed)?;
+    let root = std::fs::File::open(dir).map_err(failed)?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&root.metadata().map_err(failed)?);
+    tar.append_data(&mut header, ".", std::io::empty()).map_err(failed)?;
+    pack(&mut tar, &root, Path::new(".")).map_err(failed)?;
     tar.into_inner().map_err(failed)?.keep(None)
+}
+
+/// `name` in the directory `dir` is open at, as a path through that handle.
+fn within(dir: &std::fs::File, name: &std::ffi::OsStr) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    Path::new("/proc/self/fd").join(dir.as_raw_fd().to_string()).join(name)
+}
+
+/// Open `name` in `dir`: not if it is a link, and without waiting on a pipe put there.
+fn open_in(dir: &std::fs::File, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_NOCTTY;
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true).custom_flags(flags.bits()).open(within(dir, name))
+}
+
+/// How many directories deep an archive goes.
+// ponytail: a directory inside another is a call inside another and one more open file,
+// and a volume's own program can nest them without end (a held directory has no longest
+// path), so the walk stops here and the archive fails with these words. Walk with a list
+// of its own instead if a real volume is ever deeper.
+const DEEPEST: usize = 128;
+
+/// Every entry of the directory `dir` is open at into `tar`, under `at`.
+fn pack(tar: &mut tar::Builder<Incoming>, dir: &std::fs::File, at: &Path) -> std::io::Result<()> {
+    if at.components().count() > DEEPEST {
+        let said = format!("{} is more than {DEEPEST} directories deep", at.display());
+        return Err(std::io::Error::other(said));
+    }
+    let listed = std::fs::read_dir(within(dir, ".".as_ref()))?;
+    let mut names = listed
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    for name in names {
+        // (One that is gone since it was listed is no part of the archive.)
+        if let Ok(seen) = std::fs::symlink_metadata(within(dir, &name)) {
+            put(tar, dir, &name, &at.join(&name), &seen)?;
+        }
+    }
+    Ok(())
+}
+
+/// What opening an entry says when it is no longer the file or directory it was: a link
+/// now, gone, or a socket.
+const SWAPPED: [nix::errno::Errno; 3] = [
+    nix::errno::Errno::ELOOP,
+    nix::errno::Errno::ENOENT,
+    nix::errno::Errno::ENXIO,
+];
+
+/// `name` in `dir` into `tar` as `path`. `seen` is what it looked like a moment ago, and
+/// decides only how it is opened: what is written is what was opened.
+fn put(
+    tar: &mut tar::Builder<Incoming>,
+    dir: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+    seen: &std::fs::Metadata,
+) -> std::io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    if seen.file_type().is_symlink() {
+        if let Ok(to) = std::fs::read_link(within(dir, name)) {
+            header.set_metadata(seen);
+            tar.append_link(&mut header, path, to)?;
+        }
+    } else if seen.is_dir() || seen.is_file() {
+        // (A link put there since, or gone since: nothing of it goes in. Anything else
+        // that keeps a file from being read is an archive that was not made.)
+        let file = match open_in(dir, name) {
+            Ok(file) => file,
+            Err(e) if SWAPPED.iter().any(|gone| e.raw_os_error() == Some(*gone as i32)) => return Ok(()),
+            Err(e) => return Err(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+        };
+        let found = file.metadata()?;
+        header.set_metadata(&found);
+        if found.is_dir() {
+            tar.append_data(&mut header, path, std::io::empty())?;
+            pack(tar, &file, path)?;
+        } else if found.is_file() {
+            // (As long as it was a moment ago, whether it grows or is cut short meanwhile:
+            // an entry of another length than its header says breaks every entry after it.)
+            let whole = std::io::Read::chain(file, std::io::repeat(0));
+            tar.append_data(&mut header, path, std::io::Read::take(whole, found.len()))?;
+        }
+    }
+    // (Pipes, sockets and devices are no part of an archive, and are never opened.)
+    Ok(())
 }
 
 /// The tar at `archive` into `dir`, which must have nothing in it. Unpacked beside it and
@@ -625,6 +721,90 @@ mod tests {
         // Not over what is there.
         let refused = unpack(&blobs.join(&name), &into).unwrap_err();
         assert!(refused.contains("restored into an empty volume"), "{refused}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a workload does to its volume while the node archives it: a directory or a
+    /// file swapped for a link out of the volume. The walk holds each directory open and
+    /// opens nothing through a link, so the link is left out and never followed.
+    #[test]
+    fn archive_follows_no_link_put_in_its_way() {
+        let root = temp("swap");
+        let (from, blobs, outside) = (root.join("from"), root.join("blobs"), root.join("outside"));
+        std::fs::create_dir_all(from.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(from.join("sub/inner"), b"the volume's own").unwrap();
+        std::fs::write(from.join("file"), b"the volume's own").unwrap();
+        std::fs::write(outside.join("secret"), b"the node's").unwrap();
+        let held = std::fs::File::open(&from).unwrap();
+        let seen = |name: &str| std::fs::symlink_metadata(from.join(name)).unwrap();
+        let (was_dir, was_file) = (seen("sub"), seen("file"));
+        let sub = open_in(&held, "sub".as_ref()).unwrap();
+
+        // Swapped after they were looked at, and after `sub` was walked into.
+        std::fs::rename(from.join("sub"), root.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, from.join("sub")).unwrap();
+        std::fs::remove_file(from.join("file")).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), from.join("file")).unwrap();
+        assert!(open_in(&held, "sub".as_ref()).is_err() && open_in(&held, "file".as_ref()).is_err());
+
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        put(&mut tar, &held, "sub".as_ref(), Path::new("./sub"), &was_dir).unwrap();
+        put(&mut tar, &held, "file".as_ref(), Path::new("./file"), &was_file).unwrap();
+        // The directory that was walked into is still the volume's, wherever its name points now.
+        pack(&mut tar, &sub, Path::new("./walked")).unwrap();
+        let (name, _) = tar.into_inner().unwrap().keep(None).unwrap();
+        let mut packed = tar::Archive::new(std::fs::File::open(blobs.join(name)).unwrap());
+        let mut found = Vec::new();
+        for entry in packed.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text).unwrap();
+            found.push((entry.path().unwrap().display().to_string(), text));
+        }
+        assert_eq!(found, [("walked/inner".to_string(), "the volume's own".to_string())]);
+
+        // As it is now, links and all: each link is kept as a link, and nothing it names is read.
+        let (name, _) = archive(&from, &blobs).unwrap();
+        let mut packed = tar::Archive::new(std::fs::File::open(blobs.join(name)).unwrap());
+        let kinds: Vec<_> = packed
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.path().unwrap().display().to_string(),
+                    entry.header().entry_type().is_symlink(),
+                    entry.size(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (".".to_string(), false, 0),
+                ("file".to_string(), true, 0),
+                ("sub".to_string(), true, 0)
+            ]
+        );
+
+        // Directories without end are not walked without end.
+        let deep = root.join("deep");
+        std::fs::create_dir_all(deep.join("d/".repeat(DEEPEST + 1))).unwrap();
+        let said = archive(&deep, &blobs).unwrap_err();
+        assert!(said.contains("more than 128 directories deep"), "{said}");
+        std::fs::create_dir_all(root.join("fits").join("d/".repeat(DEEPEST - 1))).unwrap();
+        archive(&root.join("fits"), &blobs).unwrap();
+
+        // A file that cannot be read is an archive that is not made, not one without it.
+        // (Root reads whatever the mode: nothing to see there.)
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(root.join("fits/shut"), b"x").unwrap();
+        std::fs::set_permissions(root.join("fits/shut"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(root.join("fits/shut")).is_err() {
+            let said = archive(&root.join("fits"), &blobs).unwrap_err();
+            assert!(said.contains("shut: "), "{said}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use kith_api::Resource;
-use kith_api::kinds::{Protocol, SecretSpec, ServiceSpec};
+use kith_api::kinds::{NamespaceSpec, Protocol, SecretSpec, ServiceSpec};
 use kith_api::store::{Store, now};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -71,8 +71,12 @@ pub struct Exposed {
 
 /// The exposed hosts, and the Services refused one: Service key to why. (Two Services
 /// with one host: the older has it, the others are refused; one name for a host no
-/// certificate authority issues for is refused too.)
+/// certificate authority issues for is refused too; and so is a host some Namespace
+/// keeps for itself, or one a Namespace that keeps any does not name.)
 //
+// ponytail: two Namespaces that keep the same host both expose it (the older Service
+// has it): the people who write Namespaces are the cluster's own. Refuse the second
+// Namespace when it is applied if that is ever not so.
 // ponytail: "older" is the time of the oldest revision the store still keeps of the
 // Service (all nodes agree on it), so a Service edited more than `HISTORY_LIMIT` times
 // looks as new as its oldest kept edit. A creation time in the metadata would fix that.
@@ -83,6 +87,11 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
         let kept = store.history(&service.key()).ok();
         kept.and_then(|kept| kept.first()).map_or(u64::MAX, |first| first.at)
     };
+    let kept = store.list(Some("Namespace")).filter_map(|namespace| {
+        let spec = serde_json::from_value::<NamespaceSpec>(namespace.spec.clone()).ok()?;
+        (!spec.hosts.is_empty()).then_some((namespace.metadata.name.as_str(), spec))
+    });
+    let kept: BTreeMap<&str, NamespaceSpec> = kept.collect();
     let mut services: Vec<&Resource> = store.list(Some("Service")).collect();
     // (Stable: of the same age, by key.)
     services.sort_by_key(|service| born(service));
@@ -99,6 +108,21 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
         let address = kith_mesh::service_address(prefix, namespace, &service.metadata.name);
         let host = expose.host.to_ascii_lowercase();
         if let Some(message) = kith_api::kinds::expose_host_refused(&host) {
+            refused.insert(key, message);
+            continue;
+        }
+        let kept_for = match kept.get(namespace) {
+            Some(own) if own.keeps(&host) => None,
+            Some(own) => Some(format!(
+                "the namespace {namespace} exposes only its Namespace's hosts ({}), and {host} is not one",
+                own.hosts.join(", ").to_ascii_lowercase()
+            )),
+            None => kept
+                .iter()
+                .find(|(_, other)| other.keeps(&host))
+                .map(|(other, _)| format!("the host {host} is kept for the namespace {other} (its Namespace's hosts)")),
+        };
+        if let Some(message) = kept_for {
             refused.insert(key, message);
             continue;
         }
@@ -1115,6 +1139,86 @@ mod tests {
             refused,
             BTreeMap::from([("Service/default/a".to_string(), said.to_string())])
         );
+    }
+
+    /// Whoever may write a Service in one namespace could otherwise take a host another
+    /// namespace means to serve, by being there first: a Namespace names the hosts that
+    /// are its own, and then exposes only those.
+    #[test]
+    fn reserved_hosts_are_exposed_by_their_namespace_alone() {
+        let mut store = Store::default();
+        let apply = |store: &mut Store, at: u64, source: String| {
+            store.at(Some(at));
+            let resource = Resource::from_source(&source).unwrap().remove(0);
+            resource
+                .map_err(|e| e.msg)
+                .and_then(|resource| store.apply(resource).map_err(|e| e.to_string()))
+        };
+        let namespace = |name: &str, hosts: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: {{ name: {name} }}\nspec: {{ hosts: {hosts} }}\n"
+            )
+        };
+        let service = |namespace: &str, name: &str, host: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name}, namespace: {namespace} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: {host}, via: edge }}\n"
+            )
+        };
+        // The one who was there first, and the namespace the host is kept for.
+        apply(&mut store, 100, service("other", "squat", "shop.example.org")).unwrap();
+        apply(&mut store, 200, namespace("shop", "['*.Example.org', example.org]")).unwrap();
+        apply(&mut store, 300, service("shop", "web", "Shop.example.org")).unwrap();
+        apply(&mut store, 300, service("shop", "apex", "example.org")).unwrap();
+        apply(&mut store, 300, service("shop", "stray", "stray.example.net")).unwrap();
+        // A namespace that names none exposes what nobody keeps.
+        apply(&mut store, 300, namespace("other", "[]")).unwrap();
+        apply(&mut store, 300, service("other", "free", "free.example.net")).unwrap();
+        apply(&mut store, 300, service("other", "near", "badexample.org")).unwrap();
+        apply(&mut store, 300, service("nowhere", "deep", "a.b.example.org")).unwrap();
+
+        let (hosts, refused) = exposed(&store, kith_mesh::prefix(b"ca"));
+        let served: BTreeMap<&str, &str> = hosts
+            .iter()
+            .map(|(host, to)| (host.as_str(), to.service.as_str()))
+            .collect();
+        assert_eq!(
+            served,
+            BTreeMap::from([
+                ("badexample.org", "Service/other/near"),
+                ("example.org", "Service/shop/apex"),
+                ("free.example.net", "Service/other/free"),
+                ("shop.example.org", "Service/shop/web"),
+            ])
+        );
+        let said = |service: &str| refused[service].as_str();
+        assert_eq!(
+            said("Service/other/squat"),
+            "the host shop.example.org is kept for the namespace shop (its Namespace's hosts)"
+        );
+        assert_eq!(
+            said("Service/nowhere/deep"),
+            "the host a.b.example.org is kept for the namespace shop (its Namespace's hosts)"
+        );
+        assert_eq!(
+            said("Service/shop/stray"),
+            "the namespace shop exposes only its Namespace's hosts (*.example.org, example.org), and stray.example.net \
+             is not one"
+        );
+        assert_eq!(refused.len(), 3);
+
+        // What is no host, or a pattern of some other kind, is refused when applied.
+        for hosts in [
+            "['*']",
+            "['*.*.example.org']",
+            "['shop.*.org']",
+            "['203.0.113.7']",
+            "['a b']",
+            "['']",
+        ] {
+            let said = apply(&mut store, 400, namespace("bad", hosts)).unwrap_err();
+            assert!(said.contains("hosts"), "{hosts}: {said}");
+        }
     }
 
     #[test]

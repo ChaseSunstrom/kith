@@ -855,7 +855,9 @@ async fn push(
         }
     };
     let what = vec![format!("{name}:{version} to {}", asked.to)];
-    let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature).await;
+    // (As a pull: an Identity names only registries outside this node and its networks.)
+    let outward = matches!(caller, Caller::Identity(_));
+    let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature, outward).await;
     shared
         .audit
         .record(&caller, "push", what, pushed.as_ref().map(drop).map_err(String::clone));

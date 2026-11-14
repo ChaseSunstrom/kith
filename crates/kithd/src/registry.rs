@@ -10,7 +10,9 @@
 // own scheme, host and port, or at an https one that is outside this node and its
 // networks (Docker Hub's auth.docker.io), and a redirect stays on the registry (T-0054).
 // For a Source that is not the cluster's own (`outward`), every connection is made to an
-// address that was just vetted (sources::vetted), the blob's and each redirect's too.
+// address that was just vetted (sources::vetted), the blob's and each redirect's too; and
+// so is every request of a push an Identity asks for, where the registry sends each blob
+// included.
 
 use crate::Shared;
 use crate::releases::REPOSITORY;
@@ -277,17 +279,83 @@ async fn patiently<T>(what: &Reference, asked: impl Future<Output = oci_client::
     }
 }
 
+/// One request of an outward push: to an address that was just vetted, following nothing.
+async fn sent(method: reqwest::Method, url: &reqwest::Url, kind: &str, body: Vec<u8>) -> Fallible<reqwest::Response> {
+    let asked = held(url).await?.request(method, url.clone());
+    let asked = asked.header("content-type", kind).body(body);
+    asked.send().await.map_err(|e| e.to_string())
+}
+
+/// `blob` into the repository at `base` (`…/v2/REPOSITORY/`) as a registry takes one:
+/// asked where it goes, then put there, if that is outside this node's networks too.
+async fn upload(base: &reqwest::Url, digest: &str, blob: Vec<u8>) -> Fallible<()> {
+    const BYTES: &str = "application/octet-stream";
+    let start = base.join("blobs/uploads/").map_err(|e| e.to_string())?;
+    let started = sent(reqwest::Method::POST, &start, BYTES, Vec::new()).await?;
+    let to = started.headers().get("location").and_then(|to| to.to_str().ok());
+    let (202, Some(mut to)) = (started.status().as_u16(), to.and_then(|to| start.join(to).ok())) else {
+        // (No login to give: see the module's note.)
+        return Err(format!("{start}: {}, not where to send it", started.status()));
+    };
+    if start.scheme() == "https" && to.scheme() != "https" {
+        return Err(format!("sent on from https to {to}"));
+    }
+    to.query_pairs_mut().append_pair("digest", digest);
+    let done = sent(reqwest::Method::PUT, &to, BYTES, blob).await?;
+    match done.status().is_success() {
+        true => Ok(()),
+        false => Err(format!("{to}: {}", done.status())),
+    }
+}
+
 /// Put a blob (a package's, a Source's files) in the repository `url` as `name` at
 /// `version`, with its signature if it has one. Says where.
-pub async fn push(url: &str, name: &str, version: &str, blob: Vec<u8>, signature: Option<String>) -> Fallible<String> {
-    let (client, reference, _) = place(url, name, version, false)?;
+///
+/// `outward`: whoever asks is not the node, and may send only where a pull may come from:
+/// every request (the registry's, and where it says each blob goes) is made by a client
+/// that connects only to an address just vetted, and oci-client, which goes wherever it
+/// is sent, is not used.
+pub async fn push(
+    url: &str,
+    name: &str,
+    version: &str,
+    blob: Vec<u8>,
+    signature: Option<String>,
+    outward: bool,
+) -> Fallible<String> {
+    let (client, reference, web) = place(url, name, version, outward)?;
     let layers = [ImageLayer::new(blob, LAYER.to_string(), None)];
     let config = Config::new(b"{}".to_vec(), CONFIG.to_string(), None);
     let annotations = signature.map(|signature| BTreeMap::from([(SIGNATURE.to_string(), signature)]));
     let manifest = OciImageManifest::build(&layers, &config, annotations);
-    let pushing = client.push(&reference, &layers, config, &Anonymous, Some(manifest));
-    patiently(&reference, pushing).await?;
-    Ok(reference.to_string())
+    if !outward {
+        let pushing = client.push(&reference, &layers, config, &Anonymous, Some(manifest));
+        patiently(&reference, pushing).await?;
+        return Ok(reference.to_string());
+    }
+    let what = |e: String| format!("{reference}: {e}");
+    let registry = reference.resolve_registry();
+    let base = format!("{}://{registry}/v2/{}/", web.scheme, reference.repository());
+    let base = reqwest::Url::parse(&base).map_err(|e| what(e.to_string()))?;
+    let [layer] = layers;
+    let blobs = [
+        (layer.sha256_digest(), layer.data.to_vec()),
+        (config.sha256_digest(), config.data.to_vec()),
+    ];
+    for (digest, blob) in blobs {
+        upload(&base, &digest, blob).await.map_err(what)?;
+    }
+    let to = base
+        .join(&format!("manifests/{version}"))
+        .map_err(|e| what(e.to_string()))?;
+    let body = serde_json::to_vec(&manifest).map_err(|e| what(e.to_string()))?;
+    let done = sent(reqwest::Method::PUT, &to, MANIFEST_TYPE, body)
+        .await
+        .map_err(what)?;
+    match done.status().is_success() {
+        true => Ok(reference.to_string()),
+        false => Err(what(format!("{to}: {}", done.status()))),
+    }
 }
 
 /// The blob and the signature of `name` at `version` in the repository `url`: not yet
@@ -604,7 +672,20 @@ mod tests {
                             Ok(n) => head.extend_from_slice(&buf[..n]),
                         }
                     }
+                    let sent = head.len() - head.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0) - 4;
                     let head = String::from_utf8_lossy(&head).to_lowercase();
+                    // (What is sent with it is read to its end, and thrown away.)
+                    let length = head.lines().find_map(|line| line.strip_prefix("content-length: "));
+                    let mut left = length
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .saturating_sub(sent);
+                    while left > 0 {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => left = left.saturating_sub(n),
+                        }
+                    }
                     let path = head.split(' ').nth(1).unwrap_or_default().to_string();
                     let authed = head.lines().any(|line| line == "authorization: bearer tok");
                     log.lock().unwrap().push(path.clone());
@@ -743,5 +824,62 @@ mod tests {
         assert!(pull(&url(port), "pkg", "1.0.0", false).await.is_err());
         assert!(versions(&url(port), "pkg").await.is_err());
         assert!(reached.lock().unwrap().is_empty(), "the other host was asked");
+    }
+
+    /// Whoever is not the node pushes only where a pull may come from: never to this
+    /// node or its networks, whatever listens there.
+    #[tokio::test]
+    async fn push_outward_goes_to_no_address_of_this_node_or_its_networks() {
+        for inward in [
+            "oci://127.0.0.1:1/x",
+            "oci://localhost:1/x",
+            "oci://10.0.0.7/x",
+            "oci://169.254.169.254/x",
+        ] {
+            let refused = push(inward, "p", "1.0.0", b"{}".to_vec(), None, true)
+                .await
+                .unwrap_err();
+            assert!(refused.contains("this node or its own networks"), "{inward}: {refused}");
+        }
+        // The node itself may: that one is tried, and nothing listens there.
+        let tried = push("oci://127.0.0.1:1/x", "p", "1.0.0", b"{}".to_vec(), None, false)
+            .await
+            .unwrap_err();
+        assert!(!tried.contains("its own networks"), "{tried}");
+    }
+
+    /// A registry says where each blob of a push goes. For whoever is not the node, the
+    /// blob goes there only if that is outside too: asked hop by hop, as a pull is.
+    #[tokio::test]
+    async fn push_outward_is_sent_on_only_to_where_a_pull_may_come_from() {
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let (port, asked) = fake(|_, path, _| match path.ends_with("/blobs/uploads/") {
+            true => (202, vec!["location: /up/1?state=x".to_string()], vec![]),
+            false => (201, vec![], vec![]),
+        })
+        .await;
+        let at = push(&url(port), "pkg", "1.0.0", BLOB.to_vec(), Some("sig".into()), true).await;
+        assert!(at.unwrap().ends_with("pkg:1.0.0"));
+        let asked = asked.lock().unwrap().clone();
+        let put = |blob: &[u8]| format!("/up/1?state=x&digest={}", digest(blob).replace(':', "%3a"));
+        assert_eq!(asked.len(), 5, "{asked:?}");
+        assert!(
+            asked[0].ends_with("/pkg/blobs/uploads/") && asked[2] == asked[0],
+            "{asked:?}"
+        );
+        assert_eq!([&asked[1], &asked[3]], [&put(BLOB), &put(b"{}")]);
+        assert!(asked[4].ends_with("/pkg/manifests/1.0.0"), "{asked:?}");
+
+        // Sent on to this node's own side: not followed, and nothing arrives there.
+        let (elsewhere, reached) = fake(|_, _, _| (201, vec![], vec![])).await;
+        let location = format!("location: http://0.0.0.0:{elsewhere}/up");
+        let (port, _) = fake(move |_, _, _| (202, vec![location.clone()], vec![])).await;
+        let refused = push(&url(port), "pkg", "1.0.0", BLOB.to_vec(), None, true).await;
+        let refused = refused.unwrap_err();
+        assert!(refused.contains("its own networks"), "{refused}");
+        assert!(
+            reached.lock().unwrap().is_empty(),
+            "this node's own side was sent the blob"
+        );
     }
 }
