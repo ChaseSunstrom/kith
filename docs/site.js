@@ -47,7 +47,7 @@ const versus = [
   ["The same, each told to wait about a minute", "lost60", "s"],
 ].filter(([, what]) => N[`cmp.kith.${what}`] != null && N[`cmp.k3s.${what}`] != null);
 if (versus.length) {
-  $("#versus-said").textContent = `kith ${N.version} and k3s ${N["cmp.k3s.version"]} (on Alpine), three QEMU machines each. The middle of ${N["cmp.runs"]} runs; shorter is less.`;
+  $("#versus-said").textContent = `kith ${N.version} and k3s ${N["cmp.k3s.version"]} as it comes (on Alpine, which alone has ${N["cmp.k3s.before"]} MB in use before k3s starts), three QEMU machines each. The middle of ${N["cmp.runs"]} runs (the last pair: one run each), on a machine that was doing other work; shorter is less.`;
   // Only this file's own words and numbers from #measured go in: nothing a reader typed.
   $("#versus-chart").innerHTML = versus.map(([name, what, unit]) => {
     const kith = N[`cmp.kith.${what}`], k3s = N[`cmp.k3s.${what}`], most = Math.max(kith, k3s);

@@ -1,9 +1,9 @@
 {
- "apply.peak": 2.59,
+ "apply.peak": 2.77,
  "apply.peak.budget": 4,
  "by_crate": {
   "kith-cli": [
-   4476,
+   4497,
    30
   ],
   "kith-yaml": [
@@ -43,22 +43,36 @@
    3
   ],
   "kithd": [
-   30530,
+   30561,
    227
   ]
  },
+ "cmp.k3s.apply": 0.53,
+ "cmp.k3s.before": 233,
+ "cmp.k3s.control": 994,
+ "cmp.k3s.lost": 351,
+ "cmp.k3s.lost60": 60,
+ "cmp.k3s.version": "v1.37.2",
+ "cmp.k3s.worker": 454,
+ "cmp.kith.apply": 0.03,
+ "cmp.kith.boot": 2.5,
+ "cmp.kith.control": 64,
+ "cmp.kith.lost": 300,
+ "cmp.kith.lost60": 60,
+ "cmp.kith.worker": 64,
+ "cmp.runs": 3,
  "crates": 11,
  "kinds": 33,
  "kith.size": 2.84,
  "kith.size.budget": 3,
- "kithd.idle": 7.59,
+ "kithd.idle": 8.38,
  "kithd.idle.budget": 9,
- "kithd.size": 12.52,
+ "kithd.size": 12.55,
  "kithd.size.budget": 13,
- "measured": "2026-11-13",
+ "measured": "2026-11-14",
  "os.image": 282,
- "os.root": 6.2,
- "os.update": 32.1,
+ "os.root": 6.3,
+ "os.update": 32.2,
  "refused": 40,
  "refused.names": [
   "mount",
@@ -102,7 +116,7 @@
   "kcmp",
   "pidfd_getfd"
  ],
- "rust_lines": 49156,
+ "rust_lines": 49208,
  "tests": 399,
  "version": "1.0.0",
  "vm_tests": 10

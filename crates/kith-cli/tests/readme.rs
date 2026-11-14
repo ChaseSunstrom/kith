@@ -99,6 +99,38 @@ fn readme_says_nothing_that_was_true_once() {
     }
 }
 
+/// The table beside k3s is the one `sh ci/compare.sh` wrote down: not numbers typed in.
+#[test]
+fn readme_carries_the_measured_comparison() {
+    let measured = std::fs::read_to_string(root().join("ci/compare.txt")).expect("ci/compare.txt");
+    // (The table and the two lines under it; over it is what was run, under it every run.)
+    let said: Vec<&str> = measured
+        .lines()
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| !line.starts_with("The runs"))
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(said.len() > 6, "ci/compare.txt has no table: {measured}");
+    let section = README
+        .split("\n## Beside k3s\n")
+        .nth(1)
+        .expect("README.md: ## Beside k3s");
+    let section = section.split("\n## ").next().unwrap_or(section);
+    for line in &said {
+        assert!(
+            section.contains(line),
+            "README.md's table beside k3s lacks, or has another, {line}"
+        );
+    }
+    // (And no row of its own: a line of the README's table that the file does not have.)
+    for row in section.lines().filter(|line| line.starts_with('|')) {
+        assert!(
+            said.contains(&row),
+            "README.md's table beside k3s has a row ci/compare.txt lacks: {row}"
+        );
+    }
+}
+
 #[test]
 fn readme_links_and_paths_lead_somewhere() {
     let mut seen = 0;

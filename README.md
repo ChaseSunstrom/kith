@@ -2158,6 +2158,45 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 - where a field is a string, the text is taken as written, so `version: 1.0` is `"1.0"`;
 - unknown fields are errors.
 
+## Beside k3s
+
+`sh ci/compare.sh` starts the same three machines twice (QEMU with KVM, 2 CPUs and
+2048 MB each, on a network of their own): as three kith OS nodes, and as Alpine 3.24
+with k3s v1.37.2 as it comes (a server and two agents, with the DNS, ingress, load
+balancer, metrics and storage k3s starts by itself). It measures both from outside,
+the same way, and writes the table down ([ci/compare.txt](ci/compare.txt)):
+
+| | kith | k3s |
+| --- | --- | --- |
+| Memory in use on an idle node: the first node / the server | 64 MB (64 to 65, 3 runs) | 994 MB (993 to 1010, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 64 MB (64 to 65, 3 runs) | 454 MB (452 to 482, 3 runs) |
+| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.03, 3 runs) | 0.53 s (0.48 to 0.64, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 351 s (348 to 351, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 60 s |
+
+Alpine alone, before k3s is started on it, has 233 MB (212 to 234, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.5 s (2.3 to 2.5, 3 runs) after it is switched on (firmware included).
+
+- **Memory in use** is `MemTotal - MemAvailable` in a node's `/proc/meminfo`, read by
+  one small container on every node three minutes after all of them run: the kernel,
+  the system, and that container. For k3s that includes Alpine (the line under the
+  table); kith OS is a kernel and kithd.
+- **From apply to a ready container** is from sending a workload of one replica
+  (busybox, `sleep`) to the API until the API says its container is ready, which
+  for both is "started", there being no probe. The image is on the node already. The
+  middle of five in each run.
+- **A node lost**: the machine that runs a replica is killed, as if its power went,
+  and the time is until the replica is ready on another node. As they come, kith
+  waits five minutes (`--lost-after`), and k3s calls the node lost 50 seconds after it
+  last heard from it and then waits 300 more, by a toleration every pod is given. In
+  the last row both are told to wait about a minute: `--lost-after 60`, and a
+  toleration of 10 seconds. That row is one run of each.
+
+What it does not say: anything about throughput, many nodes or many workloads. It is
+one image and one shape of machine, a few runs, on a machine that was doing other work
+at the time (so the times under a second move). And the two are not the same thing:
+k3s is Kubernetes, with its API and all that is written for it, and kith is not.
+
 ## Layout
 
 | Where | What it is |

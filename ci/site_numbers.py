@@ -51,7 +51,14 @@ def measured(old):
         lines, tests = n["by_crate"].setdefault(path.relative_to(ROOT / "crates").parts[0], [0, 0])
         n["by_crate"][path.relative_to(ROOT / "crates").parts[0]] = [lines + t.count("\n"), tests + len(re.findall(r"#\[(?:tokio::)?test\b", t))]
     n["version"] = re.search(r'^version = "(.*)"', (ROOT / "Cargo.toml").read_text(), re.M).group(1)
-    compared = ROOT / "ci/compare.txt"
+    n.update(compared())
+    n["measured"] = datetime.date.today().isoformat()
+    return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in sorted(n.items())}
+
+
+def compared():
+    """cmp.*: the middle run of each number ci/compare.sh wrote down beside k3s."""
+    n, compared = {}, ROOT / "ci/compare.txt"
     if compared.exists():
         runs = {}
         for system, setting, rest in re.findall(r"^\s+(kith|k3s) (default|\d+) (.*)$", compared.read_text(), re.M):
@@ -63,8 +70,7 @@ def measured(old):
                 n[key] = round(statistics.median(values), 2 if what == "apply" else 1 if what == "boot" else 0)
         n["cmp.runs"] = len(runs.get(("kith", "default", "control"), []))
         n["cmp.k3s.version"] = re.search(r"k3s (v[\d.]+)", compared.read_text()).group(1)
-    n["measured"] = datetime.date.today().isoformat()
-    return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in sorted(n.items())}
+    return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in n.items()}
 
 
 def filled(page, n):
@@ -100,6 +106,8 @@ def main():
     if missing:
         sys.exit(f"docs/index.html shows numbers docs/numbers.json lacks: {', '.join(sorted(set(missing)))}")
     if check:
+        if {k: v for k, v in n.items() if k.startswith("cmp.")} != compared():
+            sys.exit("docs/numbers.json has other numbers beside k3s than ci/compare.txt: python3 ci/site_numbers.py takes them")
         if page != PAGE.read_text():
             sys.exit("docs/index.html shows other numbers than docs/numbers.json: python3 ci/site_numbers.py puts them in")
         print(f"ok: {len(re.findall('data-n=', page))} numbers in the page, all from docs/numbers.json")

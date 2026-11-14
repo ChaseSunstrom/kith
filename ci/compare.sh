@@ -51,6 +51,9 @@ while [ $# -gt 0 ]; do
     esac
 done
 case $only in '' | kith | k3s) ;; *) echo "compare.sh: --only kith or --only k3s" >&2; exit 2 ;; esac
+case $runs in '' | 0* | *[!0-9]*) echo "compare.sh: --runs takes a number, 1 or more" >&2; exit 2 ;; esac
+# (Under 51 s there is nothing left for k3s's pods to tolerate: it waits 50 by itself.)
+case $lost in '') ;; *[!0-9]*) echo "compare.sh: --lost takes seconds" >&2; exit 2 ;; *) [ "$lost" -ge 51 ] || { echo "compare.sh: --lost takes 51 s or more" >&2; exit 2; } ;; esac
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 raw=$root/target/compare.raw
@@ -117,9 +120,12 @@ done
 
 work=$(mktemp -d)
 vms=''
-trap 'kill $vms 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
+# (A signal ends the script, and ending it is what puts the machines and the files away.)
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'kill $vms 2>/dev/null || true; rm -rf "$work"' EXIT
 port=$((20000 + $$ % 20000))
-fail() { tail -n 20 "$work"/n?.log 2>/dev/null; echo "compare.sh: FAIL: $1" >&2; exit 1; }
+fail() { tail -n 20 "$work"/n?.log "$work"/n?.err 2>/dev/null; echo "compare.sh: FAIL: $1" >&2; exit 1; }
 note() { echo "compare.sh: $1" >&2; }
 
 # What is fetched, once, and what it must be.
@@ -188,19 +194,24 @@ machine() { # N and the rest of QEMU's line
     it=$1
     shift
     timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m "$mem" -smp 2 -display none -machine q35 "$@" \
-        -serial "file:$work/n$it.log" -monitor none </dev/null >/dev/null 2>&1 &
-    eval "pid$it=$!"
+        -serial "file:$work/n$it.log" -monitor none -pidfile "$work/n$it.pid" </dev/null >"$work/n$it.err" 2>&1 &
     vms="$vms $!"
 }
+# A machine's power goes: QEMU itself is killed (the pid above is of the timeout that minds it).
+lose() { kill -9 "$(cat "$work/n$1.pid")" || fail "machine $1 could not be killed"; }
 lan() { echo "-netdev socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1 -device virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1"; }
 used() { awk '{ printf "%d", ($2 - $5) / 1024 }'; } # of "MemTotal: N kB MemAvailable: N kB"
 loop='while :; do echo $(grep -E "^(MemTotal|MemAvailable):" /proc/meminfo); sleep 10; done'
-middle() { sort -n | sed -n "$((($# + 1) / 2))p"; }
+middle() { sort -n >"$work/sorted" && sed -n "$((($(wc -l <"$work/sorted") + 1) / 2))p" "$work/sorted"; } # of the lines it is given
 mean() { echo $((($1 + $2) / 2)); }
 
 # ---- kith: three kith OS nodes -------------------------------------------------------
 kith() { # the wait for a lost node, or nothing
-    [ -f "$root/target/os/kith-os.raw" ] || sh "$root/os/build.sh" >&2 || skip "this machine cannot build kith OS's image"
+    # (The image there is, unless a source is newer than it: what is measured is this tree.)
+    os=$root/target/os/kith-os.raw
+    if ! [ -f "$os" ] || [ -n "$(find "$root/crates" "$root/os" "$root/Cargo.lock" -type f -newer "$os" | head -n 1)" ]; then
+        sh "$root/os/build.sh" >&2 || skip "this machine cannot build kith OS's image"
+    fi
     more=${1:+--lost-after $1}
     node() { # N [kithd's further arguments]
         cp "$root/target/os/kith-os.raw" "$work/n$1.raw"
@@ -272,7 +283,7 @@ EOF
         api timed 300 "/v1/resources/Workload/default/a$i" '(j.get("status") or {}).get("ready") == 1' POST /v1/apply "$work/apply.json" >>"$work/applies" || fail "the workload a$i did not run"
         api call DELETE "/v1/resources/Workload/default/a$i" >/dev/null || fail "a$i was not deleted"
     done
-    applied=$(middle 1 2 3 4 5 <"$work/applies")
+    applied=$(middle <"$work/applies")
 
     apply <<EOF || fail "the workload to move was not applied"
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"move"},"spec":{"placement":{"require":{"node.labels.role":"worker"}},
@@ -281,7 +292,7 @@ EOF
     api wait 300 /v1/resources/Workload/default/move '(j.get("status") or {}).get("ready") == 1' >/dev/null || fail "the workload to move did not run"
     on=$(api call GET /v1/resources/Workload/default/move | python3 -c 'import json, sys; print(*json.load(sys.stdin)["status"]["nodes"].values())')
     case $on in n2 | n3) ;; *) fail "the workload to move runs on '$on', not on one of the two it may" ;; esac
-    eval "kill -9 \$pid${on#n}"
+    lose "${on#n}"
     gone=$(LOST=$on API_EVERY=0.5 api wait 1200 /v1/resources/Workload/default/move \
         '(j["status"].get("ready") == 1) and os.environ["LOST"] not in j["status"]["nodes"].values()') || fail "the replica of the lost node $on ran nowhere else"
     echo "kith ${1:-default} control=$control worker=$worker apply=$applied lost=$gone boot=$boot" >>"$raw"
@@ -392,14 +403,15 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
             POST /apis/apps/v1/namespaces/default/deployments "$work/apply.json" >>"$work/applies" || fail "the deployment a$i did not run"
         api call DELETE "/apis/apps/v1/namespaces/default/deployments/a$i" >/dev/null || fail "a$i was not deleted"
     done
-    applied=$(middle 1 2 3 4 5 <"$work/applies")
+    applied=$(middle <"$work/applies")
 
-    # (k3s waits for a node 40 s and then, by each pod's own toleration, 300 s more: a run
-    # told to wait about N has the pod tolerate the lost node for N - 40.)
+    # (k3s calls a node lost 50 s after it last heard from it (node-monitor-grace-period as it
+    # comes) and then, by each pod's own toleration, waits 300 s more: a run told to wait
+    # about N has the pod tolerate the lost node for N - 50.)
     tolerate=''
     if [ -n "${1:-}" ]; then
         for taint in unreachable not-ready; do
-            tolerate="$tolerate${tolerate:+,}{\"key\":\"node.kubernetes.io/$taint\",\"operator\":\"Exists\",\"effect\":\"NoExecute\",\"tolerationSeconds\":$(($1 - 40))}"
+            tolerate="$tolerate${tolerate:+,}{\"key\":\"node.kubernetes.io/$taint\",\"operator\":\"Exists\",\"effect\":\"NoExecute\",\"tolerationSeconds\":$(($1 - 50))}"
         done
         tolerate=",\"tolerations\":[$tolerate]"
     fi
@@ -408,7 +420,7 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
     api wait 300 /apis/apps/v1/namespaces/default/deployments/move '(j.get("status") or {}).get("readyReplicas") == 1' >/dev/null || fail "the deployment to move did not run"
     where=$(api call GET '/api/v1/namespaces/default/pods?labelSelector=app%3Dmove' | python3 -c 'import json, sys; print(*[x["spec"]["nodeName"] for x in json.load(sys.stdin)["items"]])')
     case $where in k2 | k3) ;; *) fail "the deployment to move runs on '$where', not on one of the two it may" ;; esac
-    eval "kill -9 \$pid${where#k}"
+    lose "${where#k}"
     gone=$(LOST=$where API_EVERY=0.5 api wait 1200 '/api/v1/namespaces/default/pods?labelSelector=app%3Dmove' \
         "any(x[\"spec\"].get(\"nodeName\") not in (None, os.environ[\"LOST\"]) and $is_ready for x in j[\"items\"])") || fail "the replica of the lost node $where ran nowhere else"
     echo "k3s ${1:-default} control=$control worker=$worker apply=$applied lost=$gone before=$before" >>"$raw"
