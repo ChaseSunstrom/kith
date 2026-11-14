@@ -1,24 +1,46 @@
 kith 1.0.0 beside k3s v1.37.2+k3s1 (on Alpine: generic_alpine-3.24.1-x86_64-bios-cloudinit): three QEMU machines each (KVM, 2 CPUs, 2048 MB),
-one workload (mirror.gcr.io/library/busybox:1.36), measured by ci/compare.sh. The middle run, and the lowest and highest.
+the same workloads on both (mirror.gcr.io/library/busybox:1.36 and, behind the Service, nginx), measured by ci/compare.sh.
+The middle run, and the lowest and highest.
 
 | | kith | k3s |
 | --- | --- | --- |
-| Memory in use on an idle node: the first node / the server | 64 MB (64 to 65, 3 runs) | 994 MB (993 to 1010, 3 runs) |
-| Memory in use on an idle node: another node / an agent | 64 MB (64 to 65, 3 runs) | 454 MB (452 to 482, 3 runs) |
-| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.03, 3 runs) | 0.53 s (0.48 to 0.64, 3 runs) |
-| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 351 s (348 to 351, 3 runs) |
-| The same, each told to wait about 60 s | 60 s | 60 s |
+| Memory in use on an idle node: the first node / the server | 66 MB (66 to 66, 3 runs) | 1028 MB (1008 to 1046, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 66 MB (65 to 66, 3 runs) | 471 MB (470 to 485, 3 runs) |
+| From apply to a ready container, its image on the node | 0.04 s (0.03 to 0.06, 3 runs) | 0.48 s (0.47 to 0.50, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 346 s (345 to 351, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 70 s |
+| From switching a machine on to a node that is ready | 2.8 s (2.6 to 2.8, 3 runs) | 30.6 s (29.9 to 35.5, 3 runs) |
+| CPU in use on an idle node: the first node / the server | 1.0 % of one CPU (0.9 to 1.5, 3 runs) | 11.7 % of one CPU (11.2 to 14.4, 3 runs) |
+| CPU in use on an idle node: another node / an agent | 1.1 % of one CPU (0.8 to 1.2, 3 runs) | 5.7 % of one CPU (5.0 to 7.6, 3 runs) |
+| On the first node's disk at the end | 249 MB (248 to 249, 3 runs) | 1261 MB (1261 to 1261, 3 runs) |
 
-Alpine alone, before k3s is started on it, has 233 MB (212 to 234, 3 runs) in use; kith OS has no such moment (kithd is its first process).
-A kith OS machine answers on its API 2.5 s (2.3 to 2.5, 3 runs) after it is switched on (firmware included).
+The same workloads, sent to each system's API in the same way (ci/compare_workloads.py):
 
-The runs (system, the wait for a lost node, then what was measured: MB, MB, s, s):
+| | kith | k3s |
+| --- | --- | --- |
+| One workload of 30 replicas: until all are ready | 0.19 s (0.19 to 0.21, 3 runs) | 3.50 s (3.21 to 5.16, 3 runs) |
+| Memory in use that each of those replicas adds | 0.4 MB (0.3 to 0.5, 3 runs) | 12.3 MB (10.7 to 12.4, 3 runs) |
+| 20 workloads at once: until all are ready | 0.25 s (0.17 to 0.75, 3 runs) | 4.31 s (4.25 to 4.34, 3 runs) |
+| A change to a workload of 6 replicas: until all 6 run it | 0.12 s (0.11 to 0.15, 3 runs) | 1.42 s (1.33 to 1.55, 3 runs) |
+| A container that exits: until it runs again | 1.01 s (1.01 to 1.02, 3 runs) | 0.89 s (0.66 to 1.00, 3 runs) |
+| A Job that does nothing: until it has succeeded | 0.09 s (0.06 to 0.09, 3 runs) | 3.00 s (2.95 to 3.12, 3 runs) |
+| Requests a second through a Service to 3 web servers, a connection each | 3957 (1282 to 4235, 3 runs) | 6212 (6044 to 6562, 3 runs) |
+| Of those requests, half took under | 5 ms (5 to 13, 3 runs) | 3 ms (3 to 3, 3 runs) |
+| and 99 in 100 under | 15 ms (14 to 67, 3 runs) | 12 ms (10 to 13, 3 runs) |
+| Requests a second over connections that are kept | 21198 (14570 to 24172, 3 runs) | 24001 (19299 to 27389, 3 runs) |
 
-    k3s default control=993 worker=482 apply=0.483 lost=351.462 before=233
-    k3s default control=994 worker=454 apply=0.636 lost=351.138 before=212
-    k3s default control=1010 worker=452 apply=0.525 lost=348.203 before=234
-    kith default control=64 worker=64 apply=0.032 lost=300.121 boot=2.5
-    kith default control=65 worker=65 apply=0.029 lost=300.125 boot=2.3
-    kith default control=64 worker=64 apply=0.034 lost=300.092 boot=2.5
-    kith 60 control=66 worker=66 apply=0.029 lost=60.122 boot=2.5
-    k3s 60 control=1063 worker=455 apply=0.479 lost=60.378 before=234
+Alpine alone, before k3s is started on it, has 211 MB (185 to 240, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.7 s (2.5 to 2.7, 3 runs) after it is switched on (firmware included).
+
+Of k3s's time to a ready node, 23.9 s (23.6 to 29.0, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
+
+The runs (system, the wait for a lost node, then what was measured, each under its name in ci/compare.sh):
+
+    kith default control=66 worker=66 apply=0.035 lost=300.250 boot=2.7 ready=2.8 disk=249 cpu=1.0 cpu2=1.1 scale=0.21 each=0.4 burst=0.17 roll=0.15 crash=1.02 job=0.06 rps=4235 p50=5 p99=14 kept=21198
+    kith default control=66 worker=65 apply=0.032 lost=300.152 boot=2.7 ready=2.8 disk=249 cpu=0.9 cpu2=0.8 scale=0.19 each=0.5 burst=0.75 roll=0.11 crash=1.01 job=0.09 rps=3957 p50=5 p99=15 kept=24172
+    kith default control=66 worker=66 apply=0.055 lost=300.370 boot=2.5 ready=2.6 disk=248 cpu=1.5 cpu2=1.2 scale=0.19 each=0.3 burst=0.25 roll=0.12 crash=1.01 job=0.09 rps=1282 p50=13 p99=67 kept=14570
+    kith 60 control=66 worker=65 apply=0.034 lost=60.119 boot=2.6 ready=2.7 disk=203
+    k3s default control=1008 worker=471 apply=0.497 lost=346.432 before=185 ready=30.6 login=23.9 disk=1261 cpu=11.2 cpu2=5.0 scale=3.50 each=10.7 burst=4.25 roll=1.42 crash=1.00 job=3.00 rps=6044 p50=3 p99=10 kept=27389
+    k3s default control=1046 worker=485 apply=0.483 lost=350.707 before=240 ready=29.9 login=23.6 disk=1261 cpu=14.4 cpu2=7.6 scale=5.16 each=12.4 burst=4.34 roll=1.55 crash=0.66 job=2.95 rps=6212 p50=3 p99=12 kept=24001
+    k3s default control=1028 worker=470 apply=0.468 lost=344.660 before=211 ready=35.5 login=29.0 disk=1261 cpu=11.7 cpu2=5.7 scale=3.21 each=12.3 burst=4.31 roll=1.33 crash=0.89 job=3.12 rps=6562 p50=3 p99=13 kept=19299
+    k3s 60 control=1000 worker=484 apply=0.518 lost=69.971 before=225 ready=30.3 login=24.1 disk=1103

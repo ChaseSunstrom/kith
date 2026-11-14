@@ -58,6 +58,10 @@ def measured(old):
     return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in sorted(n.items())}
 
 
+# How many places after the point a measured number keeps (none where not named).
+PLACES = {"apply": 2, "scale": 2, "burst": 2, "roll": 2, "crash": 2, "job": 2, "boot": 1, "ready": 1, "login": 1, "cpu": 1, "cpu2": 1, "each": 1}
+
+
 def compared():
     """cmp.*: the middle run of each number ci/compare.sh wrote down beside k3s."""
     n, compared = {}, ROOT / "ci/compare.txt"
@@ -69,7 +73,7 @@ def compared():
         for (system, setting, what), values in runs.items():
             if setting == "default" or what == "lost":
                 key = f"cmp.{system}.{what}" + ("" if setting == "default" else setting)
-                n[key] = round(statistics.median(values), 2 if what == "apply" else 1 if what == "boot" else 0)
+                n[key] = round(statistics.median(values), PLACES.get(what, 0))
         n["cmp.runs"] = len(runs.get(("kith", "default", "control"), []))
         n["cmp.k3s.version"] = re.search(r"k3s (v[\d.]+)", compared.read_text()).group(1)
     return {k: int(v) if isinstance(v, float) and v == int(v) else v for k, v in n.items()}
@@ -82,8 +86,12 @@ SCHEMES = {"light": ("#f6f5f1", "#16181d", "#575c69", "#2f5fe0", "#8f5f00"), "da
 ROWS = [  # each its own scale: they are not one measure
     ("control", "MB", "Memory in use, idle: the first node, or the server"),
     ("worker", "MB", "Memory in use, idle: another node, or an agent"),
+    ("cpu", "% of a CPU", "CPU in use, idle: the first node, or the server"),
+    ("ready", "s", "From switching a machine on to a ready node"),
     ("apply", "s", "From apply to a ready container"),
-    ("lost", "s", "A node lost: its replica ready on another"),
+    ("scale", "s", "One workload of 30 replicas: until all are ready"),
+    ("lost", "s", "A node lost: its replica ready on another, as each is set to wait"),
+    ("kept", "a second", "Requests through a Service, connections kept (the one row where more is better)"),
 ]
 
 
@@ -98,7 +106,7 @@ def chart(n, scheme):
         f"<title>kith beside k3s, measured</title><desc>{said}.</desc>",
         f'<rect width="100%" height="100%" rx="10" fill="{surface}"/>',
         f'<text x="{left}" y="36" font-size="17" font-weight="700" fill="{text}">kith beside k3s {n["cmp.k3s.version"]}, measured</text>',
-        f'<text x="{left}" y="58" font-size="12.5" fill="{quiet}">Three QEMU machines each, the middle of {n["cmp.runs"]} runs (ci/compare.sh). Shorter is less; each pair has its own scale.</text>',
+        f'<text x="{left}" y="58" font-size="12.5" fill="{quiet}">Three QEMU machines each, the middle of {n["cmp.runs"]} runs (ci/compare.sh). Each pair has its own scale.</text>',
     ]
     for at, (name, colour) in enumerate(zip(("kith", "k3s"), colours)):
         out.append(f'<rect x="{720 + at * 70}" y="26" width="12" height="12" rx="2" fill="{colour}"/><text x="{738 + at * 70}" y="36.5" font-size="13" fill="{text}">{name}</text>')

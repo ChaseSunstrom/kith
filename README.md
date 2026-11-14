@@ -2460,43 +2460,109 @@ vim.api.nvim_create_autocmd("FileType", {
 2048 MB each, on a network of their own): as three kith OS nodes, and as Alpine 3.24
 with k3s v1.37.2 as it comes (a server and two agents, with the DNS, ingress, load
 balancer, metrics and storage k3s starts by itself). It measures both from outside,
-the same way, and writes the table down ([ci/compare.txt](ci/compare.txt)):
+the same way, runs the same workloads on both, and writes the tables down
+([ci/compare.txt](ci/compare.txt)):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/beside-k3s-dark.svg">
-  <img src="docs/assets/diagrams/beside-k3s-light.svg" alt="kith beside k3s as bars, each pair on its own scale: memory in use on an idle first node 64 MB against 994 MB on the k3s server, on another node 64 MB against 454 MB, from apply to a ready container 0.03 s against 0.53 s, a lost node's replica ready on another after 300 s against 351 s" width="100%">
+  <img src="docs/assets/diagrams/beside-k3s-light.svg" alt="kith beside k3s as bars, each pair on its own scale: Memory in use, idle: the first node, or the server: kith 66 MB, k3s 1028 MB; Memory in use, idle: another node, or an agent: kith 66 MB, k3s 471 MB; CPU in use, idle: the first node, or the server: kith 1 % of a CPU, k3s 11.7 % of a CPU; From switching a machine on to a ready node: kith 2.8 s, k3s 30.6 s; From apply to a ready container: kith 0.04 s, k3s 0.48 s; One workload of 30 replicas: until all are ready: kith 0.19 s, k3s 3.5 s; A node lost: its replica ready on another, as each is set to wait: kith 300 s, k3s 346 s; Requests through a Service, connections kept (the one row where more is better): kith 21198 a second, k3s 24001 a second." width="100%">
 </picture>
 
 | | kith | k3s |
 | --- | --- | --- |
-| Memory in use on an idle node: the first node / the server | 64 MB (64 to 65, 3 runs) | 994 MB (993 to 1010, 3 runs) |
-| Memory in use on an idle node: another node / an agent | 64 MB (64 to 65, 3 runs) | 454 MB (452 to 482, 3 runs) |
-| From apply to a ready container, its image on the node | 0.03 s (0.03 to 0.03, 3 runs) | 0.53 s (0.48 to 0.64, 3 runs) |
-| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 351 s (348 to 351, 3 runs) |
-| The same, each told to wait about 60 s | 60 s | 60 s |
+| Memory in use on an idle node: the first node / the server | 66 MB (66 to 66, 3 runs) | 1028 MB (1008 to 1046, 3 runs) |
+| Memory in use on an idle node: another node / an agent | 66 MB (65 to 66, 3 runs) | 471 MB (470 to 485, 3 runs) |
+| From apply to a ready container, its image on the node | 0.04 s (0.03 to 0.06, 3 runs) | 0.48 s (0.47 to 0.50, 3 runs) |
+| A node lost: until its replica is ready on another, as each system comes | 300 s (300 to 300, 3 runs) | 346 s (345 to 351, 3 runs) |
+| The same, each told to wait about 60 s | 60 s | 70 s |
+| From switching a machine on to a node that is ready | 2.8 s (2.6 to 2.8, 3 runs) | 30.6 s (29.9 to 35.5, 3 runs) |
+| CPU in use on an idle node: the first node / the server | 1.0 % of one CPU (0.9 to 1.5, 3 runs) | 11.7 % of one CPU (11.2 to 14.4, 3 runs) |
+| CPU in use on an idle node: another node / an agent | 1.1 % of one CPU (0.8 to 1.2, 3 runs) | 5.7 % of one CPU (5.0 to 7.6, 3 runs) |
+| On the first node's disk at the end | 249 MB (248 to 249, 3 runs) | 1261 MB (1261 to 1261, 3 runs) |
 
-Alpine alone, before k3s is started on it, has 233 MB (212 to 234, 3 runs) in use; kith OS has no such moment (kithd is its first process).
-A kith OS machine answers on its API 2.5 s (2.3 to 2.5, 3 runs) after it is switched on (firmware included).
+The same workloads, sent to each system's API in the same way (ci/compare_workloads.py):
+
+| | kith | k3s |
+| --- | --- | --- |
+| One workload of 30 replicas: until all are ready | 0.19 s (0.19 to 0.21, 3 runs) | 3.50 s (3.21 to 5.16, 3 runs) |
+| Memory in use that each of those replicas adds | 0.4 MB (0.3 to 0.5, 3 runs) | 12.3 MB (10.7 to 12.4, 3 runs) |
+| 20 workloads at once: until all are ready | 0.25 s (0.17 to 0.75, 3 runs) | 4.31 s (4.25 to 4.34, 3 runs) |
+| A change to a workload of 6 replicas: until all 6 run it | 0.12 s (0.11 to 0.15, 3 runs) | 1.42 s (1.33 to 1.55, 3 runs) |
+| A container that exits: until it runs again | 1.01 s (1.01 to 1.02, 3 runs) | 0.89 s (0.66 to 1.00, 3 runs) |
+| A Job that does nothing: until it has succeeded | 0.09 s (0.06 to 0.09, 3 runs) | 3.00 s (2.95 to 3.12, 3 runs) |
+| Requests a second through a Service to 3 web servers, a connection each | 3957 (1282 to 4235, 3 runs) | 6212 (6044 to 6562, 3 runs) |
+| Of those requests, half took under | 5 ms (5 to 13, 3 runs) | 3 ms (3 to 3, 3 runs) |
+| and 99 in 100 under | 15 ms (14 to 67, 3 runs) | 12 ms (10 to 13, 3 runs) |
+| Requests a second over connections that are kept | 21198 (14570 to 24172, 3 runs) | 24001 (19299 to 27389, 3 runs) |
+
+Alpine alone, before k3s is started on it, has 211 MB (185 to 240, 3 runs) in use; kith OS has no such moment (kithd is its first process).
+A kith OS machine answers on its API 2.7 s (2.5 to 2.7, 3 runs) after it is switched on (firmware included).
+
+Of k3s's time to a ready node, 23.9 s (23.6 to 29.0, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
 
 - **Memory in use** is `MemTotal - MemAvailable` in a node's `/proc/meminfo`, read by
   one small container on every node three minutes after all of them run: the kernel,
   the system, and that container. For k3s that includes Alpine (the line under the
-  table); kith OS is a kernel and kithd.
+  tables); kith OS is a kernel and kithd.
 - **From apply to a ready container** is from sending a workload of one replica
   (busybox, `sleep`) to the API until the API says its container is ready, which
   for both is "started", there being no probe. The image is on the node already. The
-  middle of five in each run.
+  middle of five in each run. The clock starts before the connection to the API is
+  opened, and the API is asked every 0.02 s: no number can be much under that.
 - **A node lost**: the machine that runs a replica is killed, as if its power went,
   and the time is until the replica is ready on another node. As they come, kith
   waits five minutes (`--lost-after`), and k3s calls the node lost 50 seconds after it
   last heard from it and then waits 300 more, by a toleration every pod is given. In
-  the last row both are told to wait about a minute: `--lost-after 60`, and a
+  the row after it both are told to wait about a minute: `--lost-after 60`, and a
   toleration of 10 seconds. That row is one run of each.
+- **From switching a machine on to a ready node** is from the moment the script turns
+  to the first machine (it makes the machine's disk from the image, then starts it)
+  until the system says that node is ready. For k3s that is until Alpine takes a
+  login and then from starting k3s by hand, which a machine set up to run it would
+  have started by itself; the line under the tables says how much of it is Alpine.
+- **CPU in use** is how busy a node was over the three minutes before the workloads
+  (`/proc/stat`), as a share of one of its two CPUs. Nothing runs in them but the
+  container that reads it and, at their end, the five applies of one replica above.
+- **On the disk** is not measured alike, and cannot be: for kith it is how much of
+  the machine's disk file has ever been written (the image with both of its slots,
+  and everything since, deleted or not); for k3s it is what `df` says is in use
+  inside the machine, without the archive of its images the script copies in.
+- **The workloads** are sent to each system's own API by one piece of code
+  ([ci/compare_workloads.py](ci/compare_workloads.py)): the same containers, the
+  same counts, the same clock, and every image pulled before a clock that needs it
+  starts. Ready is what each system says is ready, with no probe. The memory each
+  replica adds is the memory in use on all three nodes with the 30 replicas, less
+  what it was without them, over 30. The 20 workloads go to kith in one request,
+  as its API takes them, and to k3s in one request each, as `kubectl apply` sends
+  them. A change is rolled out as each system does it when told nothing, and is
+  done for kith when every replica's output shows it, for k3s when the Deployment
+  says all six are updated, ready and available. The container that exits sleeps
+  three seconds first; the time is from its exit until it has started again, the
+  first time that happens. The Job runs `true`, and is done when the system says it
+  has succeeded. The requests are `ab` in a container on the first node, 20,000 of
+  them, 20 at a time, to a Service in front of three nginx (each system puts them
+  on the nodes it chooses): first a new connection for every request, which the
+  two rows under it are also of, then connections that are kept.
 
-What it does not say: anything about throughput, many nodes or many workloads. It is
-one image and one shape of machine, a few runs, on a machine that was doing other work
-at the time (so the times under a second move). And the two are not the same thing:
-k3s is Kubernetes, with its API and all that is written for it, and kith is not.
+What it does not say: anything about many nodes, or about more containers than
+these. It is one shape of machine, a few runs, on a machine that was doing other
+work at the time (so the times under a second move, and so do the requests). Where
+the two differ in what they do, the numbers are not of the same thing:
+
+- A kith container on kith OS shares its node's network; a pod has a network of
+  its own, with an address, set up before its containers start. Much of the
+  difference in starting many replicas is that.
+- kith replaces all replicas of a changed workload that are on different nodes
+  at once; Kubernetes goes a quarter at a time unless told otherwise.
+- A kith Service is on the mesh, TCP only, and kithd itself passes every byte on
+  between the two connections; k3s's is rules in the kernel. That is why k3s
+  serves more requests. What goes from one kith node to another over the mesh is
+  encrypted (WireGuard); between k3s's nodes, as it comes, it is not.
+- nginx runs with a configuration of its own on both (it listens on 8080 and
+  writes only under `/tmp`): as its image comes it wants to start as root and
+  write into its image, which a kith container may not.
+- And the two are not the same thing: k3s is Kubernetes, with its API and all
+  that is written for it, and kith is not.
 
 ## Layout
 

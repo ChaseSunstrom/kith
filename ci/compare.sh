@@ -21,13 +21,25 @@
 #   lost     a machine that runs a replica is killed (as if its power went): until the
 #            replica is ready on another node
 #   boot     kith only: from starting the first machine until kithd answers on its port
+#   ready    from starting the first machine until the system says that node is ready; for
+#            k3s that is until Alpine takes a login (`login`) and then from starting k3s
+#            by hand, which a machine set up to run it would have started by itself
+#   disk     MB in use on the first node's disk at the end (k3s: without the archive of
+#            its images this script copies in to spare it the registry)
+#   and what ci/compare_workloads.py measures of the workloads it runs on both, where a
+#   run is as each system comes: CPU in use while idle, many replicas, many workloads, a
+#   rolling update, a container that exits, a Job, and requests through a Service
+#
+# The kith nodes are on kith's mesh (--mesh), which its Services need; k3s has its own
+# network (flannel) as it comes.
 #
 # k3s and Alpine's image are fetched once into ~/.cache/kith-compare and checked against
-# the hashes below; the nodes pull one image (busybox) from mirror.gcr.io. Exit 77: this
-# machine cannot run it (no KVM, no QEMU, ...).
+# the hashes below; the nodes pull three images (busybox, nginx, and httpd for its ab)
+# from mirror.gcr.io. Exit 77: this machine cannot run it (no KVM, no QEMU, ...).
+# KITH_COMPARE_RAW names another file for the rows (to try the script out).
 #
-# ponytail: one machine shape, one workload, three runs: enough to say which is bigger
-# and by about how much, not a benchmark. Throughput and scale when someone needs them.
+# ponytail: one machine shape, three nodes, three runs: enough to say which is bigger and
+# by about how much, not a benchmark. More nodes and more load when someone needs them.
 set -eu
 
 k3s_version=v1.37.2+k3s1
@@ -56,7 +68,7 @@ case $runs in '' | 0* | *[!0-9]*) echo "compare.sh: --runs takes a number, 1 or 
 case $lost in '') ;; *[!0-9]*) echo "compare.sh: --lost takes seconds" >&2; exit 2 ;; *) [ "$lost" -ge 51 ] || { echo "compare.sh: --lost takes 51 s or more" >&2; exit 2; } ;; esac
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-raw=$root/target/compare.raw
+raw=${KITH_COMPARE_RAW:-$root/target/compare.raw}
 cache=${XDG_CACHE_HOME:-$HOME/.cache}/kith-compare
 skip() { echo "compare.sh: skipped: $1" >&2; exit 77; }
 
@@ -74,7 +86,7 @@ def cell(system, setting, what, unit, digits):
     if not found:
         return "not measured"
     said = lambda n: f"{n:.{digits}f}"
-    middle = f"{said(statistics.median(found))} {unit}"
+    middle = f"{said(statistics.median(found))} {unit}".strip()
     return middle if len(found) == 1 else f"{middle} ({said(min(found))} to {said(max(found))}, {len(found)} runs)"
 tuned = sorted({setting for _, setting in rows if setting != "default"})
 lines = [
@@ -83,19 +95,46 @@ lines = [
     ("From apply to a ready container, its image on the node", "default", "apply", "s", 2),
     ("A node lost: until its replica is ready on another, as each system comes", "default", "lost", "s", 0),
 ] + [(f"The same, each told to wait about {setting} s", setting, "lost", "s", 0) for setting in tuned]
+machines = [
+    ("From switching a machine on to a node that is ready", "default", "ready", "s", 1),
+    ("CPU in use on an idle node: the first node / the server", "default", "cpu", "% of one CPU", 1),
+    ("CPU in use on an idle node: another node / an agent", "default", "cpu2", "% of one CPU", 1),
+    ("On the first node's disk at the end", "default", "disk", "MB", 0),
+]
+workloads = [
+    ("One workload of 30 replicas: until all are ready", "default", "scale", "s", 2),
+    ("Memory in use that each of those replicas adds", "default", "each", "MB", 1),
+    ("20 workloads at once: until all are ready", "default", "burst", "s", 2),
+    ("A change to a workload of 6 replicas: until all 6 run it", "default", "roll", "s", 2),
+    ("A container that exits: until it runs again", "default", "crash", "s", 2),
+    ("A Job that does nothing: until it has succeeded", "default", "job", "s", 2),
+    ("Requests a second through a Service to 3 web servers, a connection each", "default", "rps", "", 0),
+    ("Of those requests, half took under", "default", "p50", "ms", 0),
+    ("and 99 in 100 under", "default", "p99", "ms", 0),
+    ("Requests a second over connections that are kept", "default", "kept", "", 0),
+]
+def rows_of(lines):
+    print("| | kith | k3s |")
+    print("| --- | --- | --- |")
+    for name, setting, what, unit, digits in lines:
+        print(f"| {name} | {cell('kith', setting, what, unit, digits)} | {cell('k3s', setting, what, unit, digits)} |")
 print(f"kith {kith} beside k3s {k3s} (on Alpine: {alpine}): three QEMU machines each (KVM, 2 CPUs, {mem} MB),")
-print(f"one workload ({image}), measured by ci/compare.sh. The middle run, and the lowest and highest.")
+print(f"the same workloads on both ({image} and, behind the Service, nginx), measured by ci/compare.sh.")
+print("The middle run, and the lowest and highest.")
 print()
-print("| | kith | k3s |")
-print("| --- | --- | --- |")
-for name, setting, what, unit, digits in lines:
-    print(f"| {name} | {cell('kith', setting, what, unit, digits)} | {cell('k3s', setting, what, unit, digits)} |")
+rows_of(lines + machines)
+print()
+print("The same workloads, sent to each system's API in the same way (ci/compare_workloads.py):")
+print()
+rows_of(workloads)
 before = cell("k3s", "default", "before", "MB", 0)
 print()
 print(f"Alpine alone, before k3s is started on it, has {before} in use; kith OS has no such moment (kithd is its first process).")
 print(f"A kith OS machine answers on its API {cell('kith', 'default', 'boot', 's', 1)} after it is switched on (firmware included).")
 print()
-print("The runs (system, the wait for a lost node, then what was measured: MB, MB, s, s):")
+print(f"Of k3s's time to a ready node, {cell('k3s', 'default', 'login', 's', 1)} is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.")
+print()
+print("The runs (system, the wait for a lost node, then what was measured, each under its name in ci/compare.sh):")
 print()
 for line in open(raw):
     print("    " + line.strip())
@@ -125,7 +164,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'kill $vms 2>/dev/null || true; rm -rf "$work"' EXIT
 port=$((20000 + $$ % 20000))
-fail() { tail -n 20 "$work"/n?.log "$work"/n?.err 2>/dev/null; echo "compare.sh: FAIL: $1" >&2; exit 1; }
+fail() { tail -n 20 "$work"/n?.log "$work"/n?.err >&2 2>/dev/null; echo "compare.sh: FAIL: $1" >&2; exit 1; }
 note() { echo "compare.sh: $1" >&2; }
 
 # What is fetched, once, and what it must be.
@@ -201,9 +240,18 @@ machine() { # N and the rest of QEMU's line
 lose() { kill -9 "$(cat "$work/n$1.pid")" || fail "machine $1 could not be killed"; }
 lan() { echo "-netdev socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1 -device virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1"; }
 used() { awk '{ printf "%d", ($2 - $5) / 1024 }'; } # of "MemTotal: N kB MemAvailable: N kB"
-loop='while :; do echo $(grep -E "^(MemTotal|MemAvailable):" /proc/meminfo); sleep 10; done'
+# (What the container on every node says each 10 s: memory, and the CPU time there has been.)
+loop='while :; do echo $(grep -E "^(MemTotal|MemAvailable):" /proc/meminfo) $(head -n 1 /proc/stat); sleep 10; done'
 middle() { sort -n >"$work/sorted" && sed -n "$((($(wc -l <"$work/sorted") + 1) / 2))p" "$work/sorted"; } # of the lines it is given
 mean() { echo $((($1 + $2) / 2)); }
+since() { echo "$(date +%s.%N) $1" | awk '{ printf "%.1f", $1 - $2 }'; } # seconds from then until now
+# The workloads both systems run, where a run is as each comes (a run told how long to wait
+# for a lost node measures that wait only).
+workloads() { # kith|k3s, and the wait for a lost node or nothing
+    [ -z "${2:-}" ] || return 0
+    note "$1: the workloads"
+    NODE_CPUS=2 python3 "$root/ci/compare_workloads.py" "$1" || fail "the workloads did not all run on $1"
+}
 
 # ---- kith: three kith OS nodes -------------------------------------------------------
 kith() { # the wait for a lost node, or nothing
@@ -214,11 +262,12 @@ kith() { # the wait for a lost node, or nothing
     fi
     more=${1:+--lost-after $1}
     node() { # N [kithd's further arguments]
-        cp "$root/target/os/kith-os.raw" "$work/n$1.raw"
+        # (A disk of 8 GB, as the Alpine machines have: the node's state grows to it.)
+        cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && truncate -s 8G "$work/n$1.raw"
         # shellcheck disable=SC2046
         machine "$1" -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" $(lan "$1") \
             -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
-            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}"
+            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 --mesh 51820 $more ${2:-}"
     }
     field() { python3 -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]], end="")' "$1"; }
     begun=$(date +%s.%N)
@@ -231,28 +280,31 @@ kith() { # the wait for a lost node, or nothing
         sleep 0.2
     done
     # (From the machine's start, firmware included, until kithd answers on its port.)
-    boot=$(echo "$(date +%s.%N) $begun" | awk '{ printf "%.1f", $1 - $2 }')
+    boot=$(since "$begun")
     claimed=$(curl -sk --max-time 10 -H 'Content-Type: application/json' -d "{\"token\":\"${token##* }\",\"name\":\"root\"}" "https://127.0.0.1:$((port + 1))/v1/claim")
     for part in ca cert key; do
         printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
     done
     export API_PORT=$((port + 1)) API_NAME=kith API_CA="$work/ca.pem" API_CERT="$work/cert.pem" API_KEY="$work/key.pem"
+    API_EVERY=0.1 api wait 600 /v1/resources/Node/n1 '(j.get("status") or {}).get("state") == "ready"' >/dev/null || fail "the first kith node did not become ready"
+    ready=$(since "$begun")
     for n in 2 3; do
         join=$(api call POST /v1/tokens | field token) || fail "no join token"
         node "$n" "--join 10.9.0.1:7443 --token $join"
     done
-    ready='sum(1 for r in (j if isinstance(j, list) else j.get("resources", j.get("items", []))) if r["kind"] == "Node" and (r.get("status") or {}).get("state") == "ready") == 3'
-    API_EVERY=1 api wait 600 /v1/resources "$ready" >/dev/null || fail "three kith nodes did not become ready"
+    three='sum(1 for r in (j if isinstance(j, list) else j.get("resources", j.get("items", []))) if r["kind"] == "Node" and (r.get("status") or {}).get("state") == "ready") == 3'
+    API_EVERY=1 api wait 600 /v1/resources "$three" >/dev/null || fail "three kith nodes did not become ready"
     note "kith: three nodes"
 
-    # The two that joined are where the workload that loses its node may run.
-    for n in 2 3; do
+    # The two that joined are where the workload that loses its node may run; the first is
+    # where requests are sent from.
+    for n in 1 2 3; do
         api call GET "/v1/resources/Node/n$n" | python3 -c '
 import json, sys
 node = json.load(sys.stdin)
 node.pop("status", None)
-node["metadata"].setdefault("labels", {})["role"] = "worker"
-json.dump([node], sys.stdout)' >"$work/apply.json"
+node["metadata"].setdefault("labels", {})["role"] = "first" if sys.argv[1] == "1" else "worker"
+json.dump([node], sys.stdout)' "$n" >"$work/apply.json"
         api call POST /v1/apply "$work/apply.json" >/dev/null || fail "n$n was not labelled"
     done
     apply() { cat >"$work/apply.json" && api call POST /v1/apply "$work/apply.json" >/dev/null; }
@@ -284,6 +336,9 @@ EOF
         api call DELETE "/v1/resources/Workload/default/a$i" >/dev/null || fail "a$i was not deleted"
     done
     applied=$(middle <"$work/applies")
+    more=$(workloads kith "${1:-}")
+    # (What the image's file holds by now, not the size it was made: the state it wrote too.)
+    disk=$(du -m "$work/n1.raw" | cut -f 1)
 
     apply <<EOF || fail "the workload to move was not applied"
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"move"},"spec":{"placement":{"require":{"node.labels.role":"worker"}},
@@ -295,7 +350,7 @@ EOF
     lose "${on#n}"
     gone=$(LOST=$on API_EVERY=0.5 api wait 1200 /v1/resources/Workload/default/move \
         '(j["status"].get("ready") == 1) and os.environ["LOST"] not in j["status"]["nodes"].values()') || fail "the replica of the lost node $on ran nowhere else"
-    echo "kith ${1:-default} control=$control worker=$worker apply=$applied lost=$gone boot=$boot" >>"$raw"
+    echo "kith ${1:-default} control=$control worker=$worker apply=$applied lost=$gone boot=$boot ready=$ready disk=$disk $more" >>"$raw"
     note "kith: $(tail -n 1 "$raw")"
 }
 
@@ -321,35 +376,42 @@ k3s() { # the wait for a lost node, or nothing
         machine "$1" -drive "file=$work/n$1.qcow2,format=qcow2,if=virtio" -drive "file=$work/seed$1.iso,format=raw,if=virtio,readonly=on" \
             -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:22,hostfwd=tcp:127.0.0.1:$((port + $1))-:6443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $(lan "$1")
     }
+    begun=$(date +%s.%N)
     for n in 1 2 3; do node "$n"; done
+    login=''
     for n in 1 2 3; do
         tries=0
         until on "$n" true 2>/dev/null; do
             tries=$((tries + 1))
-            [ "$tries" -lt 150 ] || fail "the Alpine machine $n did not take a login"
-            sleep 2
+            [ "$tries" -lt 600 ] || fail "the Alpine machine $n did not take a login"
+            sleep 0.5
         done
+        login=${login:-$(since "$begun")}
     done
     before=$(on 1 "echo \$(grep -E '^(MemTotal|MemAvailable):' /proc/meminfo)" | used)
     # k3s as its release is: the binary, and its own images beside it so that it asks no
     # registry for them. The iptables it brings is pointed at its nft build before it
     # first runs: as unpacked it is the legacy one, which Alpine's kernel has no module for.
+    # (Put on every machine first, so that starting it is all that is timed.)
+    for n in 1 2 3; do
+        scp -q -i "$work/id" -P "$((port + 10 + n))" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$cache/k3s" "$cache/k3s-airgap-images-amd64.tar.zst" alpine@127.0.0.1:/tmp/ || fail "k3s was not copied to machine $n"
+        on "$n" "doas rc-service -q cgroups start && doas install -m 755 /tmp/k3s /usr/local/bin/k3s && doas mkdir -p /var/lib/rancher/k3s/agent/images \
+            && doas mv /tmp/k3s-airgap-images-amd64.tar.zst /var/lib/rancher/k3s/agent/images/ && rm /tmp/k3s \
+            && { doas k3s kubectl version --client >/dev/null 2>&1 || true; } && cd /var/lib/rancher/k3s/data/current/bin/aux \
+            && for tool in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do doas ln -sf xtables-nft-multi \$tool || exit 1; done" || fail "k3s was not put on machine $n"
+    done
     start() { # N and k3s's arguments
         to=$1
         shift
-        scp -q -i "$work/id" -P "$((port + 10 + to))" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$cache/k3s" "$cache/k3s-airgap-images-amd64.tar.zst" alpine@127.0.0.1:/tmp/ || fail "k3s was not copied to machine $to"
-        on "$to" "doas rc-service -q cgroups start && doas install -m 755 /tmp/k3s /usr/local/bin/k3s && doas mkdir -p /var/lib/rancher/k3s/agent/images \
-            && doas mv /tmp/k3s-airgap-images-amd64.tar.zst /var/lib/rancher/k3s/agent/images/ && rm /tmp/k3s \
-            && { doas k3s kubectl version --client >/dev/null 2>&1 || true; } && cd /var/lib/rancher/k3s/data/current/bin/aux \
-            && for tool in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do doas ln -sf xtables-nft-multi \$tool || exit 1; done \
-            && doas sh -c 'setsid nohup k3s $* >/var/log/k3s.log 2>&1 </dev/null &'" || fail "k3s was not started on machine $to"
+        on "$to" "doas sh -c 'setsid nohup k3s $* >/var/log/k3s.log 2>&1 </dev/null &'" || fail "k3s was not started on machine $to"
     }
+    started=$(date +%s.%N)
     start 1 server --node-ip 10.9.0.1 --flannel-iface eth1 --token compare --tls-san 127.0.0.1 --write-kubeconfig-mode 644
     tries=0
     until on 1 'cat /etc/rancher/k3s/k3s.yaml' >"$work/kubeconfig" 2>/dev/null && [ -s "$work/kubeconfig" ]; do
         tries=$((tries + 1))
-        [ "$tries" -lt 150 ] || fail "the k3s server wrote no kubeconfig: $(on 1 'tail -n 5 /var/log/k3s.log' 2>&1)"
-        sleep 2
+        [ "$tries" -lt 600 ] || fail "the k3s server wrote no kubeconfig: $(on 1 'tail -n 5 /var/log/k3s.log' 2>&1)"
+        sleep 0.5
     done
     python3 - "$work" <<'EOF'
 import base64, os, re, sys
@@ -359,16 +421,20 @@ for field, file in (("certificate-authority-data", "ca.pem"), ("client-certifica
         out.write(base64.b64decode(re.search(field + r":\s*(\S+)", text).group(1)))
 EOF
     export API_PORT=$((port + 1)) API_NAME=127.0.0.1 API_CA="$work/ca.pem" API_CERT="$work/cert.pem" API_KEY="$work/key.pem"
-    for n in 2 3; do start "$n" agent --server https://10.9.0.1:6443 --token compare --node-ip "10.9.0.$n" --flannel-iface eth1; done
     is_ready='any(c["type"] == "Ready" and c["status"] == "True" for c in (x["status"].get("conditions") or []))'
+    API_EVERY=0.1 api wait 900 /api/v1/nodes "any($is_ready for x in j[\"items\"])" >/dev/null || fail "the k3s server's node did not become ready"
+    ready=$(echo "$login $(since "$started")" | awk '{ printf "%.1f", $1 + $2 }')
+    for n in 2 3; do start "$n" agent --server https://10.9.0.1:6443 --token compare --node-ip "10.9.0.$n" --flannel-iface eth1; done
     API_EVERY=1 api wait 900 /api/v1/nodes "sum(1 for x in j[\"items\"] if $is_ready) == 3" >/dev/null || fail "three k3s nodes did not become ready"
     # (What k3s starts by itself: its DNS, its ingress and load balancer, its metrics and storage.)
     API_EVERY=1 api wait 900 /api/v1/namespaces/kube-system/pods \
         'len(j["items"]) >= 7 and all(x["status"]["phase"] == "Succeeded" or all(c.get("ready") for c in x["status"].get("containerStatuses") or [{}]) for x in j["items"])' >/dev/null || fail "k3s's own pods did not all run"
     note "k3s: a server and two agents"
 
-    for n in 2 3; do
-        echo '{"metadata":{"labels":{"role":"worker"}}}' >"$work/apply.json"
+    for n in 1 2 3; do
+        role=worker
+        [ "$n" != 1 ] || role=first
+        echo "{\"metadata\":{\"labels\":{\"role\":\"$role\"}}}" >"$work/apply.json"
         api call PATCH "/api/v1/nodes/k$n" "$work/apply.json" application/merge-patch+json >/dev/null || fail "k$n was not labelled"
     done
     deployment() { # NAME SECONDS [more of the pod's spec]
@@ -404,6 +470,9 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
         api call DELETE "/apis/apps/v1/namespaces/default/deployments/a$i" >/dev/null || fail "a$i was not deleted"
     done
     applied=$(middle <"$work/applies")
+    more=$(workloads k3s "${1:-}")
+    # (What is in use on the disk, less the archive of k3s's images that was copied in.)
+    disk=$(on 1 "df -m / | awk 'END { print \$3 }'; doas du -sm /var/lib/rancher/k3s/agent/images | cut -f 1" | tr '\n' ' ' | awk '{ print $1 - $2 }')
 
     # (k3s calls a node lost 50 s after it last heard from it (node-monitor-grace-period as it
     # comes) and then, by each pod's own toleration, waits 300 s more: a run told to wait
@@ -423,7 +492,7 @@ print(next(x["metadata"]["name"] for x in json.load(open(sys.argv[1]))["items"] 
     lose "${where#k}"
     gone=$(LOST=$where API_EVERY=0.5 api wait 1200 '/api/v1/namespaces/default/pods?labelSelector=app%3Dmove' \
         "any(x[\"spec\"].get(\"nodeName\") not in (None, os.environ[\"LOST\"]) and $is_ready for x in j[\"items\"])") || fail "the replica of the lost node $where ran nowhere else"
-    echo "k3s ${1:-default} control=$control worker=$worker apply=$applied lost=$gone before=$before" >>"$raw"
+    echo "k3s ${1:-default} control=$control worker=$worker apply=$applied lost=$gone before=$before ready=$ready login=$login disk=$disk $more" >>"$raw"
     note "k3s: $(tail -n 1 "$raw")"
 }
 
