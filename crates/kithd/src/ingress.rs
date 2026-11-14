@@ -536,7 +536,7 @@ fn look(
         let key = tls_secret(host, exposed);
         let held = secret(store, &key);
         let read = held.get("tls.crt").zip(held.get("tls.key"));
-        let read = read.and_then(|(chain, key)| crate::pki::certified(chain, key).ok());
+        let read = read.and_then(|(chain, key)| crate::pki::certified(chain, key, host).ok());
         let good = read.as_ref().and_then(|read| validity(read.cert.first()?));
         if good.is_none_or(|(from, until)| due(from, until, at)) {
             wanting.push((host.clone(), exposed.clone()));
@@ -604,7 +604,6 @@ async fn say(shared: &Shared, service: &str, tls: Value) -> bool {
 /// Order a certificate for `host`, unless one was asked for within the hour.
 async fn order(
     shared: &Shared,
-    client: &reqwest::Client,
     directory: &str,
     account: &acme::Account,
     host: &str,
@@ -650,7 +649,7 @@ async fn order(
         return;
     }
     eprintln!("kithd: ingress: asking {directory} for a certificate for {host}");
-    let ordered = match acme::order(client, directory, account, host).await {
+    let ordered = match acme::order(directory, account, host).await {
         Ok((chain, key)) => {
             let secret = tls_secret(host, of);
             put(shared, &secret, json!({ "tls.crt": chain, "tls.key": key })).await
@@ -702,10 +701,6 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
 
     // (reqwest's TLS wants to be told once which crypto to use.)
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(client) => client,
-        Err(e) => return eprintln!("kithd: no ingress: {e}"),
-    };
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
     loop {
@@ -733,7 +728,7 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
                     }
                     Some(account) => {
                         for (host, of) in &wanting {
-                            order(&shared, &client, directory, &account, host, of, &mut tried).await;
+                            order(&shared, directory, &account, host, of, &mut tried).await;
                         }
                     }
                 }
@@ -789,10 +784,15 @@ mod tests {
         assert_eq!((from, until), (1_772_323_200, 1_772_323_200 + 90 * 86400));
         assert!(due(from, until, from - 1) && !due(from, until, from + 59 * 86400));
         assert!(due(from, until, from + 60 * 86400) && due(from, until, until + 1));
-        let read = crate::pki::certified(&certificate.pem(), &key.serialize_pem()).unwrap();
+        let read = crate::pki::certified(&certificate.pem(), &key.serialize_pem(), "shop.example.org").unwrap();
         assert_eq!(validity(&read.cert[0]), Some((from, until)));
         assert!(
-            crate::pki::certified(&certificate.pem(), &rcgen::KeyPair::generate().unwrap().serialize_pem()).is_err()
+            crate::pki::certified(
+                &certificate.pem(),
+                &rcgen::KeyPair::generate().unwrap().serialize_pem(),
+                "shop.example.org"
+            )
+            .is_err()
         );
 
         // Port 80: a challenge's answer once there is an account, HTTPS for a host we
