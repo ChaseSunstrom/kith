@@ -1,0 +1,17 @@
+// The Service in front of the server and, if there is a page, the page.
+[
+    Service {
+        metadata: { name },
+        spec: {
+            selector: { app: name },
+            ports: [{ port: 80, targetPort: "http" }],
+            expose: if (values.expose.host ?? "") != ""
+                then { host: values.expose.host, via: "edge" }
+                else null,
+        },
+    },
+    if (values.page ?? "") != "" then ConfigMap {
+        metadata: { name: "${name}-page" },
+        spec: { data: { "index.html": values.page } },
+    } else null,
+]

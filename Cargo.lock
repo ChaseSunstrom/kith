@@ -1246,6 +1246,7 @@ version = "1.0.0"
 dependencies = [
  "clap",
  "kith-api",
+ "kith-lang",
  "kith-packages",
  "kith-yaml",
  "serde",
@@ -1267,6 +1268,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kith-lang"
+version = "1.0.0"
+dependencies = [
+ "kith-api",
+ "kith-yaml",
+ "serde_json",
+]
+
+[[package]]
+name = "kith-lsp"
+version = "1.0.0"
+dependencies = [
+ "kith-api",
+ "kith-lang",
+ "kith-yaml",
+ "serde_json",
+]
+
+[[package]]
 name = "kith-mesh"
 version = "1.0.0"
 dependencies = [
@@ -1283,6 +1303,7 @@ name = "kith-packages"
 version = "1.0.0"
 dependencies = [
  "kith-api",
+ "kith-lang",
  "kith-yaml",
  "minijinja",
  "ring",

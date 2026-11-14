@@ -1,0 +1,9 @@
+// The server's one container: workload.kith imports it.
+{
+    name: "web",
+    image: values.image,
+    ports: [{ name: "http", port: values.port }],
+    env: if len(values.env) > 0
+        then [for name in sort(keys(values.env)): { name, value: values.env[name] }]
+        else null,
+}

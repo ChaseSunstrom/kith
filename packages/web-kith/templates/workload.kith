@@ -1,0 +1,7 @@
+Workload {
+    metadata: { name, labels: { app: name } },
+    spec: {
+        replicas: values.replicas,
+        template: { containers: [import "./_container.kith"] },
+    },
+}

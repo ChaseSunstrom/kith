@@ -1,0 +1,6 @@
+# packages/web again, its templates in kith's own language instead of YAML templates:
+# the same values give the same resources (crates/kith-packages proves it).
+name: web
+version: 0.1.0
+description: A small web server with a page of your own
+kithVersion: ">=1.0.0"

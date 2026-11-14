@@ -715,6 +715,41 @@ mod tests {
         assert!(store.get("ConfigMap/shop/kith-values").is_some());
     }
 
+    /// A package written in kith's own language is installed as one in YAML is: the
+    /// same resources, marked the release's own, and a mistake in it is the release's
+    /// error, said with its place in the package's file.
+    #[test]
+    fn kith_template_is_installed_as_a_yaml_one_is() {
+        const KITH: &str = "[\n    ConfigMap { metadata: { name }, spec: { data: { colour: values.colour } } },\n    \
+                            if values.extra then ConfigMap { metadata: { name: \"${name}-extra\" }, spec: { data: { a: \"b\" } } } else null,\n]\n";
+        let installed = |template: (&str, &str)| {
+            let (mut store, mut renders) = (Store::default(), Renders::new());
+            apply(&mut store, RELEASE);
+            store.apply(package("1.0.0", &[template])).unwrap();
+            settle(&mut store, &mut renders);
+            store
+        };
+        let owned = |store: &Store| -> Vec<serde_json::Value> {
+            let owned = store.list(None).filter(|resource| owner(resource).is_some());
+            owned
+                .map(|resource| json!([resource.key(), resource.metadata.annotations, resource.spec]))
+                .collect()
+        };
+        let (kith, yaml) = (installed(("map.kith", KITH)), installed(("map.yaml", MAP)));
+        assert_eq!(owned(&kith).len(), 2);
+        assert_eq!(owned(&kith), owned(&yaml));
+
+        let wrong = installed(("map.kith", &KITH.replace("{ a: \"b\" }", "[\"b\"]")));
+        let status = wrong.get("Release/shop/mine").unwrap().status.clone().unwrap();
+        assert_eq!(status["state"], "error");
+        let message = status["message"].as_str().unwrap();
+        assert!(
+            message.contains("templates/map.kith:3:") && message.contains("ConfigMap.spec.data"),
+            "{message}"
+        );
+        assert_eq!(owned(&wrong), Vec::<serde_json::Value>::new());
+    }
+
     #[test]
     fn a_release_keeps_to_itself() {
         let (mut store, mut renders) = (Store::default(), Renders::new());

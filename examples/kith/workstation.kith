@@ -1,0 +1,14 @@
+// examples/workstation.yaml: a desktop is a package released into a seat.
+Release {
+    metadata: { name: "workstation", namespace: "desktop" },
+    spec: {
+        package: { repo: "kith-community", name: "hyprland", version: "^1.2" },
+        values: {
+            seat: "office-pc/seat0",
+            user: "casun",
+            reserve: { cpu: "4", memory: "8Gi" },
+            apps: ["firefox", "code", "steam"],
+            dotfiles: { git: "https://github.com/me/dotfiles" },
+        },
+    },
+}

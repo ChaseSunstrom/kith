@@ -1,0 +1,36 @@
+// examples/jellyfin.yaml: a workload and the service in front of it. The name, the
+// namespace and the port's name are each said once.
+let app = "jellyfin";
+let namespace = "media";
+
+[
+    Namespace { metadata: { name: namespace } },
+    Workload {
+        metadata: { name: app, namespace, labels: { app } },
+        spec: {
+            replicas: 1,
+            template: {
+                containers: [{
+                    name: app,
+                    image: "docker.io/jellyfin/jellyfin:10",
+                    resources: { cpu: "2", memory: "2Gi" },
+                    ports: [{ name: "http", port: 8096 }],
+                    volumeMounts: [{ volume: "media", path: "/media" }],
+                }],
+            },
+            placement: {
+                require: { "node.labels.disks": "hdd" },
+                prefer: [{ weight: 50, "node.labels.room": "closet" }],
+            },
+        },
+    },
+    Service {
+        metadata: { name: app, namespace },
+        spec: {
+            selector: { app },
+            ports: [{ name: "http", port: 80, targetPort: "http" }],
+            // Public HTTPS through an edge node.
+            expose: { host: "media.example.com", via: "edge" },
+        },
+    },
+]

@@ -1,0 +1,15 @@
+// examples/dns.yaml: names for the house. A record is said once, as a function, and
+// each name is one line.
+let zone = "home";
+
+fn a(name, at, values, ttl = null) = DNSRecord {
+    metadata: { name },
+    spec: { zone, name: at, type: "A", values, ttl },
+};
+
+[
+    DNSZone { metadata: { name: zone }, spec: { domain: "home.example" } },
+    a("nas", "nas", ["192.168.1.20"]),
+    // Every name under apps.home.example goes to the same two machines.
+    a("apps", "*.apps", ["192.168.1.10", "192.168.1.11"], 60),
+]

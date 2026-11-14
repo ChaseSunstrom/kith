@@ -303,6 +303,11 @@ Requested after the first draft. Each is placed in an existing phase; none chang
 - **DNS.** The mesh DNS server (§4.4) is native to kithd and grows into a general one: `DNSZone` and `DNSRecord` kinds for custom names, upstream forwarders, split-horizon answers, and optionally serving the LAN on port 53 so every device in the house uses it. Filtering resolvers (AdGuard Home, Pi-hole, Unbound) and full custom DNS servers run as packages and can be set as the upstream. *(Native: Phase 2. Packages: Phase 3.)*
 - **Reverse proxy.** `Service.expose` with the built-in ingress (§4.4) stays the simple path. Caddy, Traefik and nginx are official packages for people who want their own proxy config; they claim ports 80/443 on a node through the ordinary `Service` mechanism. *(Phase 3.)*
 
+### 4.15 Additions (2026-11-13)
+
+- **A language of its own.** YAML stays the format, and every YAML file stays valid. Beside it, a file named `*.kith` works the same resources out: values with names, functions, `if`, lists and records built from others, and imports of files beside it. It is checked against the kinds' own schemas by the code that checks YAML (a mistake is refused at its line and column, with the path into the resource), reads nothing of the machine it runs on, and is held to a number of steps and a size, so kithd can evaluate a package's `templates/*.kith` from a registry. Packages may be written in it instead of in templates. `kith-lsp`, an optional program, serves editors (what is wrong, completion from the schemas, hover). No dependency is added for it: an existing language would outweigh the `kith` binary.
+
+
 ---
 
 ## 5. Tech stack
@@ -345,6 +350,7 @@ kith/
 │  ├─ kith-devices/      # seats, devices, claims
 │  ├─ kith-storage/      # volumes, blobs, sharing, backups
 │  ├─ kith-packages/     # templating, releases, repositories, import
+│  ├─ kith-lang/         # kith's own language (.kith), and kith-lsp beside it
 │  ├─ kith-controllers/  # built-in reconcilers (workloads, sources, updates…)
 │  ├─ kith-client/       # Rust client library
 │  └─ kith-cli/          # `kith` command

@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 kith-yaml.workspace = true
 kith-api.workspace = true
+# `templates/*.kith`: kith's own language.
+kith-lang = { path = "../kith-lang" }
 serde.workspace = true
 serde_json.workspace = true
 # The templates' language (PLAN.md §4.8). `fuel` stops a template that would never end.

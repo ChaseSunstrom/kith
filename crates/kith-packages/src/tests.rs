@@ -324,3 +324,85 @@ fn desktop_packages_lint_and_render() {
         .unwrap();
     assert_eq!(rendered.resources[0].spec["placement"]["require"]["desk"], "office");
 }
+
+fn twin() -> Package {
+    Package::load(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../packages/web-kith"
+    )))
+    .unwrap()
+}
+
+/// packages/web-kith is packages/web with `.kith` files for templates: whatever the
+/// values, the two give the same resources.
+#[test]
+fn kith_templates_give_what_the_yaml_templates_give() {
+    assert_eq!(twin().lint(), Vec::<String>::new());
+    let values = [
+        json!({}),
+        json!({ "replicas": 3, "expose": { "host": "shop.example.org" }, "env": { "MODE": "fast", "B": "2" } }),
+        json!({ "page": "", "image": "example.org/web:2", "port": 8080 }),
+    ];
+    for values in values {
+        let layers = [values];
+        let (yaml, kith) = (
+            example().render(SHOP, &layers).unwrap(),
+            twin().render(SHOP, &layers).unwrap(),
+        );
+        let said = |rendered: &Rendered| serde_json::to_value(&rendered.resources).unwrap();
+        assert_eq!(said(&kith), said(&yaml), "with {}", layers[0]);
+    }
+}
+
+/// A package's `.kith` files are held as its templates are, see only the package, and
+/// say where a mistake was written.
+#[test]
+fn kith_templates_are_held_and_see_only_the_package() {
+    let package = |file: &str| {
+        let files = [
+            ("package.yaml", "name: p\nversion: 1.0.0\n"),
+            ("values.yaml", "replicas: two\n"),
+            ("templates/a.kith", file),
+            ("templates/_lib.kith", "{ twice: |n| n * 2 }\n"),
+            (
+                "templates/b.yaml",
+                "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: b }\nspec: { data: { a: b } }\n",
+            ),
+        ];
+        let files = files
+            .into_iter()
+            .map(|(name, text)| (name.to_string(), text.to_string()));
+        Package::from_files(files.collect()).unwrap().render(SHOP, &[])
+    };
+    let map =
+        |extra: &str| format!("ConfigMap {{ metadata: {{ name: \"a\" }}, spec: {{ data: {{ a: {extra} }} }} }}\n");
+
+    // Beside a YAML template, importing a file of the package, with a template's names.
+    let rendered = package(&map(
+        "\"${(import \"./_lib.kith\").twice(21)} ${release.name} ${package.version}\"",
+    ))
+    .unwrap();
+    let keys: Vec<String> = rendered.resources.iter().map(Resource::key).collect();
+    assert_eq!(keys, ["ConfigMap/store/a", "ConfigMap/store/b"]);
+    assert_eq!(rendered.resources[0].spec["data"]["a"], "42 shop 1.0.0");
+    assert_eq!(rendered.resources[0].metadata.labels[LABEL_RELEASE], "shop");
+
+    // A file that never ends stops; one outside the package is not read; the same
+    // resource from two files is said; a wrong value is refused where it was written.
+    let never = package("fn again(n) = again(n + 1);\nagain(0)\n").unwrap_err();
+    assert!(never.contains("templates/a.kith:1:"), "{never}");
+    for outside in ["../values.yaml", "/etc/hostname", "../../package.yaml", "./values.kith"] {
+        let refused = package(&format!("import \"{outside}\"\n")).unwrap_err();
+        assert!(refused.contains("templates/a.kith:1:"), "{outside}: {refused}");
+    }
+    let twice = package(&map("\"x\"").replace("\"a\"", "\"b\"")).unwrap_err();
+    assert!(twice.contains("ConfigMap/store/b is rendered twice"), "{twice}");
+    let wrong = package(
+        "Workload {\n  metadata: { name: \"a\" },\n  spec: { replicas: values.replicas, template: { exec: [{ name: \"a\", command: [\"true\"] }] } },\n}\n",
+    );
+    let wrong = wrong.unwrap_err();
+    assert!(
+        wrong.contains("templates/a.kith:3:") && wrong.contains("Workload.spec.replicas"),
+        "{wrong}"
+    );
+}

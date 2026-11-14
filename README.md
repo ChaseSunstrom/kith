@@ -96,6 +96,7 @@ is still there when it starts again.
 | Run containers, plain processes and jobs, and change them safely | [What kithd does today](#what-kithd-does-today) |
 | Make several machines one cluster | [More than one node](#more-than-one-node) |
 | Give what runs a name, inside and outside | [DNS](#dns); a host of its own with a certificate: [More than one node](#more-than-one-node) |
+| Say a thing once: names, functions and imports instead of YAML repeated | [kith's own language](#kiths-own-language) |
 | Install an app with its settings, and upgrade it | [Packages](#packages) |
 | Keep a cluster in step with a git repository | [Sources (GitOps)](#sources-gitops) |
 | Bring manifests or a chart over from Kubernetes | [Importing from Kubernetes and Helm](#importing-from-kubernetes-and-helm) |
@@ -2285,6 +2286,174 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 - where a field is a string, the text is taken as written, so `version: 1.0` is `"1.0"`;
 - unknown fields are errors.
 
+## kith's own language
+
+YAML says what there is. When the same thing is said five times with one word changed, a
+file named `*.kith` can work it out instead: values with names, functions, `if`, lists and
+records built from other lists and records, and other files imported. What such a file
+gives is the resources a YAML file would have held, checked by the same code, so
+`kith apply`, `kith lint` and `kith diff` take a `.kith` file wherever they take YAML (in a
+directory too, beside YAML files), and `kith eval FILE` prints what it gives, as YAML.
+Nothing has to be written in it: every YAML file stays as valid as it was.
+
+```kith
+// web.kith: a workload and the service in front of it.
+let app = "web";
+let ports = { http: 80, metrics: 9090 };
+
+fn container(image, env = {}) = {
+    name: app,
+    image,
+    ports: [for p in entries(ports): { name: p.key, port: p.value }],
+    env: [for e in entries(env): { name: e.key, value: e.value }],
+};
+
+[
+    Workload {
+        metadata: { name: app, labels: { app } },
+        spec: {
+            replicas: 3,
+            template: { containers: [container("docker.io/library/nginx:1.27-alpine", { MODE: "production" })] },
+        },
+    },
+    Service {
+        metadata: { name: app },
+        spec: { selector: { app }, ports: [{ port: 80, targetPort: "http" }] },
+    },
+]
+```
+
+A kind's name before a record makes it a resource of that kind (`apiVersion` and `kind` are
+written for you); a kind of your own is a record that says its own `apiVersion`. A file
+gives one resource, a list of them (lists inside it are taken apart), or `null`. What is
+`null` is left out: a field that is `null` is not written and neither is a `null` item of a
+list, which is how a part is made optional (`expose: if host != "" then { host, via: "edge" } else null`).
+
+A mistake is refused where it was said, with the path into the resource, whether the
+value was written there or worked out three functions away:
+
+```
+web.kith:16:23: Workload.spec.replicas: invalid type: string "three", expected u32
+  |             replicas: "three",
+  |                       ^
+```
+
+### All of it
+
+```
+file    = { "let" NAME "=" expr ";" | "fn" NAME "(" params ")" "=" expr ";" } expr
+params  = [ NAME [ "=" expr ] { "," NAME [ "=" expr ] } ]
+expr    = "if" expr "then" expr "else" expr
+        | "|" params "|" expr                      a function without a name
+        | expr OP expr                             ??  ||  &&  == != < <= > >=  + -  * / %
+        | ( "!" | "-" ) expr
+        | expr "." NAME | expr "[" expr "]" | expr "(" [ expr { "," expr } ] ")"
+        | "import" STRING                          what another file gives
+        | KIND "{" fields "}"                      a resource of that kind
+        | "{" fields "}" | "[" items "]" | "(" expr ")"
+        | "{" { let | fn } expr "}"                names for one value only
+        | STRING | NUMBER | "true" | "false" | "null" | NAME
+fields  = [ field { "," field } [ "," ] ]
+field   = NAME ":" expr | NAME | STRING ":" expr | "[" expr "]" ":" expr | ".." expr
+items   = [ item { "," item } [ "," ] ]
+item    = expr | ".." expr | "for" NAME "in" expr [ "if" expr ] ":" expr
+```
+
+- **Values** are `null`, `true` and `false`, whole numbers and numbers with a fraction,
+  strings, lists, records and functions. Nothing changes once it has a name.
+- **Strings** are in double quotes; `${…}` puts a value in (`"${app}-${n}"`), and
+  `\n \t \r \" \\ \$` are the escapes. Three quotes open a string of several lines, which
+  loses the indentation its closing quotes stand at.
+- **Records**: `{ app }` is `{ app: app }`; `..base` puts another record's fields in, and a
+  field said after it replaces the one it brought; `[key]: value` works the field's name
+  out. A name said twice in one record is a mistake.
+- **`??`** gives its right side when the left is `null` or names a field or an item that is
+  not there: `values.replicas ?? 1`.
+- **Operators** bind as listed above, loosest first. `+` adds numbers and joins strings
+  and lists; `/` of two whole numbers is a whole number; `==` compares whole values.
+- **`import "./lib.kith"`** gives what that file gives (usually a record of functions). The
+  path is from the importing file, ends in `.kith` and stays inside the directory of the
+  file `kith` was given; a file that imports itself, through others or not, is refused.
+- **Comments** run from `//` to the end of the line.
+
+The builtins:
+
+| | |
+| --- | --- |
+| `len(x)` | how many items a list, fields a record or characters a string has |
+| `map(list, f)` | a list of f(item) for each item |
+| `filter(list, f)` | the items f(item) is true of |
+| `range(n) or range(from, to)` | the whole numbers from 0 (or `from`) up to, not including, the last |
+| `sort(list)` | a list of strings or a list of numbers, the smallest first |
+| `keys(record)` | its fields' names, in order |
+| `values(record)` | its fields' values, in order |
+| `entries(record)` | a list of { key, value }, one for each field |
+| `record(list)` | a record from a list of { key, value } |
+| `has(x, y)` | whether a record has the field y, a list the item y or a string the text y |
+| `merge(a, b)` | record a with b's fields over it, records inside merged the same way |
+| `join(list, between)` | its items as one string |
+| `split(string, at)` | the pieces of a string between each `at` |
+| `replace(string, from, to)` | the string with every `from` made `to` |
+| `string(x)` | a number, true or false as text |
+| `int(x)` | a whole number from a string or from a number with a fraction (which is cut off) |
+| `json(x)` | a value written out as JSON |
+| `yaml(x)` | a value written out as YAML |
+| `b64(string)` | its bytes in base64 |
+| `error(message)` | stops here with that message |
+
+A file cannot read the machine it is evaluated on, the time or the network, so the same
+file gives the same resources everywhere. It is held, too: it ends in 500,000 steps,
+nested 3,000 deep (a function that calls itself gets a thousand calls or so down) and 1 MB
+of output, or is refused, which is what lets kithd evaluate a package's files from a
+registry.
+
+### In a package
+
+A package's `templates/` may hold `.kith` files instead of (or beside) YAML templates:
+each gives resources as above and has the names a YAML template has (`values`, `release`,
+`package`, `name`, `labels`). A file whose name starts with `_` is only there to be
+imported. [`packages/web-kith`](packages/web-kith) is [`packages/web`](packages/web)
+written this way, and gives the same resources. Its `templates/service.kith`:
+
+```kith
+// The Service in front of the server and, if there is a page, the page.
+[
+    Service {
+        metadata: { name },
+        spec: {
+            selector: { app: name },
+            ports: [{ port: 80, targetPort: "http" }],
+            expose: if (values.expose.host ?? "") != ""
+                then { host: values.expose.host, via: "edge" }
+                else null,
+        },
+    },
+    if (values.page ?? "") != "" then ConfigMap {
+        metadata: { name: "${name}-page" },
+        spec: { data: { "index.html": values.page } },
+    } else null,
+]
+```
+
+### In an editor
+
+`kith-lsp` is a language server for `.kith` files (`cargo build --release -p kith-lsp`; it
+is its own small program, and nothing else of kith needs it). It says what is wrong as you
+type, by the same messages `kith lint` gives; offers the kinds, the fields of the kind the
+cursor is inside (from the same schemas `kith schema` prints), the builtins and the file's
+own names; and says what a field or a builtin is when pointed at. A file in a package's
+`templates/` is read with the names a template has, its `values` the package's own
+`values.yaml`. Any editor that speaks LSP starts it with no arguments, for files named
+`*.kith`. In Neovim:
+
+```lua
+vim.filetype.add({ extension = { kith = "kith" } })
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "kith",
+  callback = function() vim.lsp.start({ name = "kith-lsp", cmd = { "kith-lsp" } }) end,
+})
+```
+
 ## Beside k3s
 
 `sh ci/compare.sh` starts the same three machines twice (QEMU with KVM, 2 CPUs and
@@ -2341,6 +2510,8 @@ k3s is Kubernetes, with its API and all that is written for it, and kith is not.
 | `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
 | `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan |
 | `crates/kith-packages` | Packages: templates and values rendered into resources |
+| `crates/kith-lang` | kith's own language: its parser and its evaluator, from a `.kith` file to resources |
+| `crates/kith-lsp` | `kith-lsp`, the language server for `.kith` files |
 | `crates/kith-dm-sys` | The one crate of the workspace with `unsafe`: device-mapper, loop devices, growing a file system and a partition's new length, by ioctl, for encrypted volumes and kith OS's state |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |

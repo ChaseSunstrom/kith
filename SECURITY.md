@@ -55,7 +55,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   signed only by keys it was checked against there.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
-  runs with limits on memory and time, and its templates with limits on size.
+  runs with limits on memory and time, and its templates with limits on size. A
+  template in kith's own language (`.kith`) is evaluated inside kithd: it ends in
+  500,000 steps, nested 3,000 deep and 1 MB of output or is refused, and it can read
+  the package's own `templates/` and nothing else (no file of the node, no time, no
+  network).
 - **kith OS updates** are taken only with a signature, and never to an older version.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload

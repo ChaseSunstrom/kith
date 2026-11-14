@@ -61,6 +61,11 @@ enum Command {
         #[command(flatten)]
         files: Files,
     },
+    /// Print what a `.kith` file gives, as YAML
+    Eval {
+        /// A file in kith's own language
+        file: PathBuf,
+    },
     /// List resources, or show one
     Get {
         /// KIND or KIND/NAME; everything when omitted
@@ -384,7 +389,7 @@ enum NodeCommand {
 
 #[derive(Args)]
 struct Files {
-    /// YAML or JSON file, a directory of them, or `-` for stdin
+    /// YAML, JSON or `.kith` file, a directory of them, or `-` for stdin
     #[arg(short, long = "file", value_name = "PATH", required = true)]
     files: Vec<PathBuf>,
 }
@@ -638,6 +643,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Lint { files } => {
             let n = load(&files)?.len();
             println!("{n} resource{} ok", if n == 1 { "" } else { "s" });
+        }
+        Command::Eval { file } => {
+            let found = lang(&file, false).map_err(|wrong| wrong.join("\n"))?;
+            let documents: Vec<String> = found.iter().map(kith_api::Resource::to_yaml).collect();
+            print!("{}", documents.join("---\n"));
         }
         Command::Diff { files } => {
             let mut counts = [0; 3];
@@ -1458,6 +1468,30 @@ impl Target {
     }
 }
 
+/// What a file in kith's own language gives (README: kith's own language), or all that
+/// is wrong with it, each with its place. `listed`: it is one of a directory, where a
+/// file that is only there to be imported gives nothing and is no mistake.
+fn lang(path: &Path, listed: bool) -> Result<Vec<Resource>, Vec<String>> {
+    // (Imports are of files beside it: its directory is all it can read.)
+    let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let beside = kith_lang::dir(dir.unwrap_or(Path::new(".")));
+    // (The file that was named may be a link, as a YAML file may: what it imports may not.)
+    let named = std::fs::read_to_string(path).map_err(|e| e.to_string());
+    let read = |file: &str| if file == name { named.clone() } else { beside(file) };
+    let found = match listed {
+        true => kith_lang::resources_if_any(&name, &read, &[]),
+        false => kith_lang::resources(&name, &read, &[]),
+    };
+    // (A place is said by the file's name in that directory: here, by its path.)
+    let shown = |wrong: kith_lang::Error| match (&wrong.at, dir) {
+        (Some(_), Some(dir)) => format!("{}/{wrong}", dir.display()),
+        (Some(_), None) => wrong.to_string(),
+        (None, _) => format!("{}: {wrong}", path.display()),
+    };
+    found.map_err(|wrong| wrong.into_iter().map(shown).collect())
+}
+
 /// Read and validate every document in the given files. All problems are
 /// reported at once, each as `file:line:column: message`.
 fn load(files: &Files) -> Result<Vec<Resource>, String> {
@@ -1467,16 +1501,28 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
             let entries = std::fs::read_dir(path).or_else(|e| fail(format!("{}: {e}", path.display())))?;
             let mut found: Vec<PathBuf> = entries
                 .filter_map(|e| Some(e.ok()?.path()))
-                .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml" | "json")))
+                .filter(|p| {
+                    matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("yaml" | "yml" | "json" | "kith")
+                    )
+                })
                 .collect();
             found.sort();
-            paths.extend(found);
+            paths.extend(found.into_iter().map(|found| (found, true)));
         } else {
-            paths.push(path.clone());
+            paths.push((path.clone(), false));
         }
     }
     let (mut resources, mut errors) = (Vec::new(), Vec::new());
-    for path in paths {
+    for (path, listed) in paths {
+        if path.extension().is_some_and(|extension| extension == "kith") {
+            match lang(&path, listed) {
+                Ok(found) => resources.extend(found),
+                Err(wrong) => errors.extend(wrong),
+            }
+            continue;
+        }
         let (name, src) = if path.as_os_str() == "-" {
             let mut src = String::new();
             std::io::stdin()

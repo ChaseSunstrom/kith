@@ -1,10 +1,14 @@
 {
- "apply.peak": 2.51,
+ "apply.peak": 2.59,
  "apply.peak.budget": 4,
  "by_crate": {
   "kith-cli": [
-   4497,
-   30
+   4748,
+   34
+  ],
+  "kith-lsp": [
+   898,
+   1
   ],
   "kith-yaml": [
    942,
@@ -15,8 +19,8 @@
    30
   ],
   "kith-packages": [
-   852,
-   8
+   958,
+   10
   ],
   "kith-sched": [
    913,
@@ -29,6 +33,10 @@
   "kith-dns": [
    2351,
    41
+  ],
+  "kith-lang": [
+   2628,
+   15
   ],
   "kith-mesh": [
    789,
@@ -43,8 +51,8 @@
    3
   ],
   "kithd": [
-   31189,
-   233
+   31228,
+   234
   ]
  },
  "cmp.k3s.apply": 0.53,
@@ -61,13 +69,13 @@
  "cmp.kith.lost60": 60,
  "cmp.kith.worker": 64,
  "cmp.runs": 3,
- "crates": 11,
+ "crates": 13,
  "kinds": 33,
- "kith.size": 2.84,
+ "kith.size": 2.92,
  "kith.size.budget": 3,
- "kithd.idle": 8.37,
+ "kithd.idle": 8.52,
  "kithd.idle.budget": 9,
- "kithd.size": 12.56,
+ "kithd.size": 12.65,
  "kithd.size.budget": 13,
  "measured": "2026-11-14",
  "os.image": 282,
@@ -116,8 +124,8 @@
   "kcmp",
   "pidfd_getfd"
  ],
- "rust_lines": 49860,
- "tests": 405,
+ "rust_lines": 53782,
+ "tests": 428,
  "version": "1.0.0",
  "vm_tests": 10
 }

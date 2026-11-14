@@ -217,3 +217,58 @@ fn readme_links_and_paths_lead_somewhere() {
         rows.len()
     );
 }
+
+/// kith's own language as README.md shows it: the file it shows gives the resources it
+/// says, the mistake it shows is refused in those very words, the package's file is the
+/// one in the repository, and the builtins it lists are the ones there are.
+#[test]
+fn readme_shows_the_language_as_it_is() {
+    let shown = blocks("kith");
+    assert_eq!(shown.len(), 2, "README.md: a whole file, and the package's");
+    let given = |text: String| {
+        let load = move |name: &str| match name {
+            "web.kith" => Ok(text.clone()),
+            _ => Err("no such file".to_string()),
+        };
+        kith_lang::resources("web.kith", &load, &[])
+    };
+    let said = |wrong: Vec<kith_lang::Error>| wrong.iter().map(|wrong| wrong.to_string()).collect::<String>();
+    let found = given(shown[0].1.clone()).unwrap_or_else(|wrong| panic!("README.md:{}:\n{}", shown[0].0, said(wrong)));
+    let keys: Vec<String> = found.iter().map(Resource::key).collect();
+    assert_eq!(keys, ["Workload/default/web", "Service/default/web"]);
+
+    let wrong = given(shown[0].1.replace("replicas: 3", "replicas: \"three\"")).map(|_| ());
+    let wrong = said(wrong.expect_err("a string for replicas"));
+    let block = format!("```\n{}\n```", wrong.trim_end());
+    assert!(
+        README.contains(&block),
+        "README.md shows another refusal than:\n{block}"
+    );
+
+    let service = std::fs::read_to_string(root().join("packages/web-kith/templates/service.kith")).unwrap();
+    assert_eq!(
+        shown[1].1, service,
+        "README.md shows another service.kith than packages/web-kith has"
+    );
+
+    for (name, usage) in kith_lang::BUILTINS {
+        let (call, what) = usage.split_once(": ").expect("how it is called, and what it gives");
+        assert!(
+            README.contains(&format!("| `{call}` | {what} |")),
+            "README.md does not list {name} as: {usage}"
+        );
+    }
+    let listed = README
+        .lines()
+        .filter(|line| line.starts_with("| `") && line.contains("(") && line.contains(")` | "));
+    let section = README
+        .split("\n## kith's own language\n")
+        .nth(1)
+        .expect("README.md: ## kith's own language");
+    let section = section.split("\n## ").next().unwrap_or(section);
+    assert_eq!(
+        listed.filter(|line| section.contains(line)).count(),
+        kith_lang::BUILTINS.len(),
+        "README.md lists a builtin there is not"
+    );
+}

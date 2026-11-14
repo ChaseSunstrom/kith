@@ -13,6 +13,7 @@ path = "src/main.rs"
 kith-yaml.workspace = true
 kith-api.workspace = true
 kith-packages = { path = "../kith-packages" }
+kith-lang = { path = "../kith-lang" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true

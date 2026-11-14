@@ -6,13 +6,15 @@
 //! values.yaml           the default values
 //! values.schema.json    what values may be (optional)
 //! templates/*.yaml      resources, as templates; `_name` files are only included
+//! templates/*.kith      resources, in kith's own language; `_name` files are only imported
 //! NOTES                 what to tell whoever installed it, a template too (optional)
 //! ```
 //!
 //! Templates are Jinja (minijinja). They see `values`, `release.name`,
 //! `release.namespace`, `package.name`, `package.version`, `name` (a name for the
 //! release's resources) and `labels` (what every resource of the release is labelled
-//! with); the filter `toYaml`, and `required(value, "why")`.
+//! with); the filter `toYaml`, and `required(value, "why")`. A `.kith` file (kith-lang)
+//! has the same names and is no template: it gives its resources itself.
 //
 // ponytail: `dependencies` are read and not rendered: that takes somewhere to get them
 // from (Repository). The schema check knows the keywords in `KEYWORDS`, and says so
@@ -256,6 +258,7 @@ impl Package {
         for (path, source) in self
             .templates
             .iter()
+            .filter(|(path, _)| !path.ends_with(".kith"))
             .map(|(path, source)| (path.as_str(), source))
             .chain(notes)
         {
@@ -290,33 +293,54 @@ impl Package {
                 text => Ok(text),
             }
         };
-        let mut resources = Vec::new();
+        let mut resources: Vec<Resource> = Vec::new();
+        // One resource a file gave: in the release's namespace unless it says another,
+        // labelled as the release's, and no other file's too.
+        let mut add = |path: &str, mut resource: Resource, placed: bool| -> Fallible<()> {
+            if !placed && kith_api::kind(&resource.kind).is_some_and(|kind| kind.namespaced) {
+                resource.metadata.namespace = Some(release.namespace.to_string());
+            }
+            for (label, value) in labels.as_object().into_iter().flatten() {
+                let value = value.as_str().unwrap_or_default().to_string();
+                resource.metadata.labels.insert(label.clone(), value);
+            }
+            if let Some(twin) = resources.iter().find(|other| other.key() == resource.key()) {
+                return Err(format!("{path}: {} is rendered twice", twin.key()));
+            }
+            resources.push(resource);
+            Ok(())
+        };
+        let placed = |document: &kith_yaml::Node| {
+            let metadata = document.get("metadata");
+            metadata.is_some_and(|metadata| metadata.get("namespace").is_some())
+        };
         let is_resource = |path: &&String| {
             let name = path.trim_start_matches("templates/");
-            !name.starts_with('_') && (name.ends_with(".yaml") || name.ends_with(".yml"))
+            !name.starts_with('_') && [".yaml", ".yml", ".kith"].iter().any(|end| name.ends_with(end))
+        };
+        // A `.kith` file has the names a template has, and imports only the package's files.
+        let names = context.as_object().into_iter().flatten();
+        let names: Vec<(&str, Value)> = names.map(|(name, value)| (name.as_str(), value.clone())).collect();
+        let file = |name: &str| {
+            self.templates
+                .get(name)
+                .cloned()
+                .ok_or_else(|| "the package has no such file".to_string())
         };
         for path in self.templates.keys().filter(is_resource) {
+            if path.ends_with(".kith") {
+                let output = kith_lang::eval(path, &file, &names).map_err(|e| e.to_string())?;
+                for document in &output.docs {
+                    let resource = Resource::from_node(document).map_err(|e| output.said(document, &e).to_string())?;
+                    add(path, resource, placed(document))?;
+                }
+                continue;
+            }
             let rendered = text(path)?;
             let shown = |e: kith_yaml::Error| format!("what {path} renders to:\n{}", e.render(path, &rendered));
             for document in kith_yaml::parse(&rendered).map_err(shown)? {
-                let placed = document
-                    .get("metadata")
-                    .is_some_and(|metadata| metadata.get("namespace").is_some());
-                let mut resource = Resource::from_node(&document).map_err(shown)?;
-                if !placed && kith_api::kind(&resource.kind).is_some_and(|kind| kind.namespaced) {
-                    resource.metadata.namespace = Some(release.namespace.to_string());
-                }
-                let Value::Object(labels) = &labels else {
-                    unreachable!("an object")
-                };
-                for (label, value) in labels {
-                    let value = value.as_str().unwrap_or_default().to_string();
-                    resource.metadata.labels.insert(label.clone(), value);
-                }
-                if let Some(twin) = resources.iter().find(|other: &&Resource| other.key() == resource.key()) {
-                    return Err(format!("{path}: {} is rendered twice", twin.key()));
-                }
-                resources.push(resource);
+                let resource = Resource::from_node(&document).map_err(shown)?;
+                add(path, resource, placed(&document))?;
             }
         }
         let notes = self.notes.as_ref().map(|_| text(NOTES)).transpose()?;

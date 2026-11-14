@@ -1,0 +1,18 @@
+// examples/backup-job.yaml: a Job that runs a plain process of the host to completion.
+let archive = "/tmp/etc-backup.tar.gz";
+
+Job {
+    metadata: { name: "backup" },
+    spec: {
+        // Failed runs to forgive before the Job has failed.
+        retries: 2,
+        timeoutSeconds: 600,
+        template: {
+            exec: [{
+                name: "archive",
+                command: ["sh", "-c", "tar -czf ${archive} -C /etc os-release && echo archived"],
+                resources: { memory: "64Mi" },
+            }],
+        },
+    },
+}

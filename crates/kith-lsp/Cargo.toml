@@ -1,0 +1,15 @@
+[package]
+name = "kith-lsp"
+description = "A language server for kith's own language (*.kith files), over stdio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kith-lang = { path = "../kith-lang" }
+kith-api.workspace = true
+kith-yaml.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
