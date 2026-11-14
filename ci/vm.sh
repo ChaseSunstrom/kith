@@ -12,6 +12,7 @@
 #   sh ci/vm.sh --test vps      the installer started from memory, as os/vps.sh starts it
 #   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
+#   sh ci/vm.sh --test tpm      the same machine with a TPM: its key sealed to the system it runs
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -75,7 +76,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test crypt     instead: the same, the machine installed with its state encrypted:
                    the node holds its key; it is locked, unlocked, opened with its
                    recovery key and wiped
-  --test share     instead: two nodes on the mesh, each with kith as a container image
+  --test tpm       instead: the same machine with a software TPM (swtpm): told to
+                   (`kith node seal`), it seals its key to the system it runs and
+                   starts with no node asked; started with another command line, or
+                   a changed boot file, it is refused the key, asks the cluster and
+                   seals anew; locked, it drops the seal and waits; needs swtpm
+  --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
                    other way round; no NFS is answered from outside the mesh until a
@@ -134,7 +140,10 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | share | pods | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, share, pods, kube, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, kube, chaos" >&2; exit 2 ;; esac
+# (From here on the TPM test is the encrypted one, with its own end.)
+sealing=''
+[ "$test" != tpm ] || test=crypt sealing=1
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -930,7 +939,7 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
         exit 0
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ]; then
-        for tool in curl python3 cpio; do
+        for tool in curl python3 cpio ${sealing:+swtpm}; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
         # (mcopy puts the answers on the stick; where it is missing nix has it, as for os/build.sh.)
@@ -1044,6 +1053,7 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
             mac=52:54:00:00:09:02 more=''
             # (Six starts of the machine: the node has to outlast them all.)
             [ "$test" = netboot ] || more='&encrypt=true' time=$((time * 2))
+            [ -z "$sealing" ] || time=$((time * 3 / 2))
             python3 "$root/ci/dhcpd.py" "$((port + 9))" 52:54:00:00:09:01=10.9.0.1 "$mac=10.9.0.2" &
             vms="$vms $!"
             sleep 0.5
@@ -1125,7 +1135,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held")' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -1138,6 +1148,127 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                 hears beta 'still on its disk: no other node holds it yet'
                 up beta
                 hears beta "10.9.0.1:7443 holds the key of this node's state"
+                if [ -n "$sealing" ]; then
+                    tpm=''
+                    mkdir "$work/tpm"
+                    own() { # LOG [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept)
+                        machine=$1
+                        shift
+                        [ -z "$tpm" ] || kill "$tpm" 2>/dev/null || true
+                        rm -f "$work/tpm.sock"
+                        swtpm socket --tpm2 --tpmstate "dir=$work/tpm" --ctrl "type=unixio,path=$work/tpm.sock" >/dev/null 2>&1 &
+                        tpm=$!
+                        vms="$vms $tpm"
+                        tries=0
+                        until [ -S "$work/tpm.sock" ]; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 50 ] || fail "swtpm did not start"
+                            sleep 0.1
+                        done
+                        vm "$machine" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
+                            -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac" \
+                            -chardev "socket,id=tpmc,path=$work/tpm.sock" -tpmdev emulator,id=tpm0,chardev=tpmc -device tpm-tis,tpmdev=tpm0 "$@"
+                    }
+                    off() { # the machine's power cut
+                        kill "$vm"
+                        wait "$vm" 2>/dev/null || true
+                    }
+                    told() { # WHAT: the cluster's NodeKey of the machine comes to say it
+                        tries=0
+                        until api GET /v1/resources/NodeKey/kith-000902 | grep -q "$1"; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "the machine's NodeKey never said $1: $(api GET /v1/resources/NodeKey/kith-000902)"
+                            sleep 0.2
+                        done
+                    }
+                    # Told to seal, a machine with no TPM says why not, and runs on as it was.
+                    lock seal | grep -q '"seal": *true' || fail "the machine could not be told to seal its key"
+                    hears beta 'is not sealed: this machine has no TPM'
+                    told 'no TPM'
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
+                    # With its TPM: it asks the node this once, and seals its key to what it runs.
+                    own beta2
+                    hears beta2 'asking the cluster for its key'
+                    up beta2
+                    hears beta2 "this machine's TPM holds the key of its state"
+                    told '"sealed": *true'
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm' ] || fail "the sealed machine's disk, read from outside: $(says "$work/beta.disk")"
+                    # Started again: its own TPM gives the key, and no node is asked.
+                    own beta3
+                    hears beta3 'TPM gave the key of its state: no node was asked'
+                    up beta3
+                    ! grep -aqF 'asking the cluster' "$work/beta3.log" || fail "a machine whose TPM holds its key asked the cluster for it"
+                    off
+                    # A word of its config partition changed (a space after the last): the TPM
+                    # refuses, the node is asked, and the key is sealed to what runs now.
+                    python3 -c '
+import struct, sys
+with open(sys.argv[1], "r+b") as disk:
+    disk.seek(512 + 72)
+    entries = struct.unpack("<Q", disk.read(8))[0] * 512
+    for index in range(128):
+        disk.seek(entries + index * 128)
+        entry = disk.read(128)
+        if entry[56:].decode("utf-16-le").rstrip("\0") == "config":
+            at = struct.unpack("<Q", entry[32:40])[0] * 512
+            disk.seek(at)
+            disk.seek(at + disk.read(64 << 10).index(b"\0"))
+            disk.write(b" ")
+            sys.exit(0)
+    sys.exit(1)' "$work/beta.disk" || fail "the machine's disk has no config partition to change"
+                    refused() { # LOG: the TPM gave no key, the node did, and the key is sealed anew
+                        hears "$1" 'this is not the system it was sealed for'
+                        hears "$1" 'asking the cluster for its key'
+                        up "$1"
+                        hears "$1" "this machine's TPM holds the key of its state"
+                        off
+                    }
+                    own beta4
+                    refused beta4
+                    # The boot file changed (a letter of the command line in it): the same.
+                    python3 -c '
+import mmap, sys
+with open(sys.argv[1], "r+b") as disk:
+    disk, found = mmap.mmap(disk.fileno(), 0), 0
+    at = disk.find(b"console=tty0 dm-mod.create")
+    while at >= 0:
+        disk[at : at + 12], found = b"console=tty1", found + 1
+        at = disk.find(b"console=tty0 dm-mod.create", at)
+    sys.exit(found == 0)' "$work/beta.disk" || fail "the machine's disk has no boot file with the command line this test changes"
+                    own beta5
+                    refused beta5
+                    # A command line beside the boot file's: the same. And with that one again,
+                    # its own TPM gives the key, and no node is asked.
+                    beside='type=11,value=io.systemd.stub.kernel-cmdline-extra=loglevel=7'
+                    own beta6 -smbios "$beside"
+                    refused beta6
+                    own beta7 -smbios "$beside"
+                    hears beta7 'TPM gave the key of its state: no node was asked'
+                    up beta7
+                    ! grep -aqF 'asking the cluster' "$work/beta7.log" || fail "the machine, sealed anew, asked the cluster for its key"
+                    # Locked: it drops the seal, restarts and waits; unlocked, it seals again.
+                    lock lock | grep -q '"locked": *true' || fail "the sealed machine could not be locked"
+                    hears beta7 "this machine's TPM no longer holds the key of its state"
+                    hears beta7 'kithd: the cluster has locked this node'
+                    wait "$vm" || true
+                    [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the locked machine's disk, read from outside: $(says "$work/beta.disk")"
+                    own beta8
+                    hears beta8 'still locked: 10.9.0.1:7443 does not hand this node'
+                    ! grep -aqF 'state on' "$work/beta8.log" || fail "a locked machine opened its state"
+                    lock unlock | grep -q '"locked": *false' || fail "the machine could not be unlocked"
+                    up beta8
+                    hears beta8 "this machine's TPM holds the key of its state"
+                    # Taken back: the seal is dropped, and the NodeKey says so.
+                    lock unseal | grep -q '"seal": *false' || fail "the seal could not be taken back"
+                    hears beta8 "this machine's TPM no longer holds the key of its state"
+                    told '"sealed": *false'
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside, once its seal was taken back: $(says "$work/beta.disk")"
+                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none"
+                    exit 0
+                fi
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"
                 kill "$vm"
                 wait "$vm" 2>/dev/null || true

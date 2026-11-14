@@ -152,6 +152,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   handed its disk's key. Lock it when it goes missing. The config partition and the
   system itself are not encrypted, and an update stick (`kith.update=`) is not signed:
   whoever is at the machine with a stick is its admin.
+- **A node whose key is sealed to its TPM** (`kith node seal`, off unless asked for)
+  opens its state with no node asked while PCRs 0, 4, 7, 9, 12 and 15 stand as they
+  were sealed: other firmware, another boot file or command line, another Secure Boot
+  state, or other words in its config partition (kithd measures those itself, into
+  15) is refused the key and asks the cluster. The boot file is not signed for Secure
+  Boot: a changed one starts, and is refused the key. Taken whole and started as it is, it
+  opens by itself: no lock reaches a machine that does not hear its cluster. The key
+  crosses the TPM's bus as it is (a chip's pins can be probed while the machine
+  starts); after a start the TPM refused, the node seals again for whatever system
+  the cluster then handed the key to; and all of it has run against a software TPM
+  only.
 - **Confidential machines (SEV-SNP, TDX) and device passthrough** have never been run on
   real hardware.
 

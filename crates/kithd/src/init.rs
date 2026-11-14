@@ -572,12 +572,13 @@ pub fn early() -> Boot {
     let installing = options(&line).0.install.is_some();
     // What the installer was told of this node, from the disk the node runs from. (The
     // installer itself has none, and keeps nothing: its state is in memory.)
-    let config = labelled("config").filter(|_| !installing).and_then(|device| {
+    let told = labelled("config").filter(|_| !installing).and_then(|device| {
         use std::io::Read;
         let mut text = Vec::new();
         let read = std::fs::File::open(device).ok()?.take(64 << 10).read_to_end(&mut text);
-        read.ok().map(|_| configured(&String::from_utf8_lossy(&text)))
+        read.ok().map(|_| text)
     });
+    let config = told.as_ref().map(|text| configured(&String::from_utf8_lossy(text)));
     let (config, args) = config.unwrap_or_default();
     // (An encrypted state waits for its key, and that for the network: see `main`.)
     let sealed = labelled("config").filter(|_| !installing);
@@ -588,6 +589,11 @@ pub fn early() -> Boot {
             end(true)
         }
     });
+    // What the config says is obeyed below and measured by no firmware: it goes into the
+    // TPM before the TPM is asked for the state's key (tpm.rs).
+    if let (Some(told), Some(_)) = (&told, &sealed) {
+        crate::tpm::measure(told);
+    }
     if !installing && !options(&line).0.keep {
         widen();
     }

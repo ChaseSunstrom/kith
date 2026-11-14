@@ -2292,6 +2292,13 @@
             "null"
           ],
           "description": "Forgotten for good (`kith node wipe`)."
+        },
+        "seal": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The node may have its own TPM keep the key too, sealed to the system it runs:\nit then opens its state with no node asked (`kith node seal`)."
         }
       },
       "required": [

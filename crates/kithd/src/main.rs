@@ -45,6 +45,7 @@ mod seats;
 mod services;
 mod share;
 mod sources;
+mod tpm;
 mod ui;
 mod update;
 mod vm;

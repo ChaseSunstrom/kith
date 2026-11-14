@@ -20,6 +20,14 @@
 //! the cluster refuse, `kith node wipe` has it forget. The recovery key, typed at the
 //! machine's console, opens it where no cluster answers.
 //!
+//! A node the cluster lets (`kith node seal`) also has its own TPM keep the key, sealed to
+//! the system it runs (tpm.rs): a `tpm:` line of the record. It then opens its state with
+//! no node asked (a laptop away from home), for as long as it starts that very system: a
+//! start the TPM refuses (an update, other firmware, another command line) asks the
+//! cluster as before and, once open, seals again. The cost is said plainly: such a
+//! machine, taken whole, opens its state by itself; locked or wiped, it drops the seal
+//! when it hears of it, not before.
+//!
 //! Neither the store alone (the key is wrapped with what only the disk has) nor the disk
 //! alone opens the state. Who answers `/v1/unlock` is not checked by certificate (the
 //! node's own are in the state it cannot read yet): what comes back is sealed with the
@@ -55,7 +63,18 @@ pub struct Record {
     secret: Vec<u8>,
     recovery: Vec<u8>,
     key: Option<Vec<u8>>,
+    /// The key as this machine's TPM sealed it (tpm.rs).
+    tpm: Option<Vec<u8>>,
     peers: Vec<String>,
+}
+
+/// How a state was opened at a start: by its owner (the key was still on the disk, or
+/// the recovery key was typed), by the cluster's answer, or by the machine's own TPM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum By {
+    Owner,
+    Cluster,
+    Tpm,
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -122,6 +141,7 @@ impl Record {
                 "secret" => record.secret = unhex(value)?,
                 "recovery" => record.recovery = unhex(value)?,
                 "key" => record.key = Some(unhex(value)?),
+                "tpm" => record.tpm = Some(unhex(value)?),
                 "peers" => record.peers = value.split_whitespace().map(str::to_string).collect(),
                 // (A line of a later kithd's.)
                 _ => {}
@@ -138,6 +158,10 @@ impl Record {
         );
         if let Some(key) = &self.key {
             text += &format!("key: {}\n", hex(key));
+        }
+        // (Before the peers: what does not fit the record's room is cut from its end.)
+        if let Some(sealed) = &self.tpm {
+            text += &format!("tpm: {}\n", hex(sealed));
         }
         if !self.peers.is_empty() {
             text += &format!("peers: {}\n", self.peers.join(" "));
@@ -237,6 +261,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         secret: secret.to_vec(),
         recovery: wrap(&recovery, &key),
         key: Some(key.to_vec()),
+        tpm: None,
         peers: Vec::new(),
     };
     record.write(&disk, config + AT)?;
@@ -271,8 +296,8 @@ async fn asked(client: &reqwest::Client, peer: &str, record: &Record) -> Result<
 }
 
 /// The key, from the cluster or from whoever types the recovery key: asked until one
-/// gives it. And whether the cluster did.
-async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, bool) {
+/// gives it. And which did.
+async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
     let (client, lines) = (client(), crate::install::keyboard());
     // (Read all the while: a peer that does not answer takes its time to say so.)
     let console = async {
@@ -308,48 +333,64 @@ async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, bool) {
         "kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type the recovery key here.)"
     );
     tokio::select! {
-        key = cluster => (key, true),
+        key = cluster => (key, By::Cluster),
         key = console => {
             eprintln!("kithd: init: opened with the recovery key");
-            (key, false)
+            (key, By::Owner)
         }
     }
 }
 
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
-/// however long the key takes to come: the key, and whether the cluster handed it out.
-pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, bool), String> {
+/// however long the key takes to come: the key, and who gave it.
+pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By), String> {
     let device = init::labelled("state").ok_or("this node's state is encrypted, and no partition is labelled state")?;
     let name = device.file_name().unwrap_or_default().to_string_lossy();
     let sectors = std::fs::read_to_string(format!("/sys/class/block/{name}/size"));
     let sectors = sectors.ok().and_then(|size| size.trim().parse::<u64>().ok());
     let sectors = sectors.ok_or(format!("{}: how long is it?", device.display()))?;
-    let (key, handed) = match &record.key {
-        Some(key) => {
+    // (The TPM is asked first: it answers at once, and where no node is in reach.)
+    let own = |sealed: &Vec<u8>| crate::tpm::open().and_then(|mut tpm| tpm.unseal(sealed));
+    let sealed = record.tpm.as_ref().filter(|_| record.key.is_none());
+    let (key, by) = match (&record.key, sealed.map(own)) {
+        (Some(key), _) => {
             eprintln!(
                 "kithd: init: the key of this node's encrypted state is still on its disk: no other node holds it yet"
             );
-            (key.clone(), false)
+            (key.clone(), By::Owner)
         }
-        None => fetched(record, join).await,
+        (None, Some(Ok(key))) => {
+            eprintln!("kithd: init: this machine's TPM gave the key of its state: no node was asked");
+            (key, By::Tpm)
+        }
+        (None, refused) => {
+            if let Some(Err(why)) = refused {
+                eprintln!("kithd: init: {why}");
+            }
+            fetched(record, join).await
+        }
     };
     let mapped = kith_dm_sys::crypt("kith-state", &device, 0, sectors, &key);
     let mapped = mapped.map_err(|e| format!("opening {} under its key: {e}", device.display()))?;
     drop(opened(&mapped));
     init::mount_state(&mapped);
-    Ok((key, handed))
+    Ok((key, by))
 }
 
 /// For as long as the node runs: have the cluster hold the key and take it off the disk
 /// once another node does; restart when the cluster locks this node, and end when it
-/// wipes it. `opened`: the key the state was opened with, and whether the cluster handed
-/// it out at this start (so it was not locked). A NodeKey that is gone, or was written
-/// over with what is not this key, is given again: without it the next start has no key.
+/// wipes it. `opened`: the key the state was opened with, and who gave it at this start
+/// (the cluster: so it was not locked). A NodeKey that is gone, or was written over with
+/// what is not this key, is given again: without it the next start has no key.
+///
+/// And the TPM's seal: made while the cluster's NodeKey says `seal` and the node is not
+/// locked (again after a start the TPM refused: the system is another now), dropped as
+/// soon as it says otherwise; the NodeKey's status says which, and why not.
 pub async fn keep(
     shared: Arc<Shared>,
     config: PathBuf,
     mut record: Record,
-    (opened, handed): (Vec<u8>, bool),
+    (opened, by): (Vec<u8>, By),
     mut stopping: tokio::sync::watch::Receiver<bool>,
 ) {
     let Some(cluster) = &shared.cluster else {
@@ -364,7 +405,9 @@ pub async fn keep(
     };
     // (Locked before this start: then it was opened with the recovery key, by its owner,
     // and stays open.)
-    let mut was_locked = handed.then_some(false);
+    let mut was_locked = (by != By::Owner).then_some(false);
+    // Whether the record's seal is one this system opens, and why none could be made.
+    let (mut fits, mut unsealed) = (by == By::Tpm, None::<String>);
     loop {
         let (mine, peers) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -379,8 +422,9 @@ pub async fn keep(
                 (node.metadata.name != cluster.me.name).then(|| there.to_string())
             };
             let peers: Vec<String> = state.store.list(Some("Node")).filter_map(address).collect();
-            (mine.map(|key| key.spec.clone()), peers)
+            (mine.map(|key| (key.spec.clone(), key.status.clone())), peers)
         };
+        let (mine, said) = mine.unzip();
         match (&mine, &record.key) {
             (Some(spec), _) if spec["wiped"] == true => {
                 eprintln!(
@@ -397,7 +441,20 @@ pub async fn keep(
             }
             (Some(spec), key) => {
                 let locked = spec["locked"] == true;
-                if locked && was_locked == Some(false) {
+                let seal = spec["seal"] == true && !locked;
+                if !seal && record.tpm.is_some() {
+                    let plain = Record {
+                        tpm: None,
+                        ..record.clone()
+                    };
+                    if write(&plain) {
+                        eprintln!("kithd: this machine's TPM no longer holds the key of its state");
+                        record.tpm = None;
+                    }
+                }
+                // (A seal that could not be dropped is tried again: restarted beside it,
+                // the node would open by its TPM, locked or not.)
+                if locked && was_locked == Some(false) && record.tpm.is_none() {
                     // (This node's store may be behind, just after an unlock: a peer that
                     // still hands the key out says it is not locked, or not yet.)
                     let mut stale = false;
@@ -432,6 +489,43 @@ pub async fn keep(
                 } else if record.peers != peers && !peers.is_empty() {
                     record.peers = peers;
                     write(&record);
+                }
+                // (Once the key is off the disk: beside it, a seal keeps nothing.)
+                let due = seal && record.key.is_none() && !(fits && record.tpm.is_some());
+                if due && unsealed.is_none() {
+                    let sealed = crate::tpm::open().and_then(|mut tpm| tpm.seal(&opened));
+                    let kept = sealed.and_then(|sealed| {
+                        let with = Record {
+                            tpm: Some(sealed),
+                            ..record.clone()
+                        };
+                        write(&with)
+                            .then_some(with)
+                            .ok_or("the lock record could not be written".into())
+                    });
+                    match kept {
+                        Ok(with) => {
+                            eprintln!(
+                                "kithd: this machine's TPM holds the key of its state, for this system: it opens with no node asked"
+                            );
+                            (record, fits) = (with, true);
+                        }
+                        Err(why) => {
+                            eprintln!("kithd: the key of this node's state is not sealed: {why}");
+                            unsealed = Some(why);
+                        }
+                    }
+                }
+                let sealed = record.tpm.is_some();
+                let status = match unsealed.as_ref().filter(|_| seal && !sealed) {
+                    Some(why) => json!({ "sealed": false, "message": why }),
+                    None => json!({ "sealed": sealed }),
+                };
+                if said.flatten() != Some(status.clone()) {
+                    let statuses = vec![(me.clone(), Some(status))];
+                    if let Err(e) = shared.submit(Command::Status { statuses }).await {
+                        eprintln!("kithd: saying whether this node's key is sealed: {e}");
+                    }
                 }
             }
             (None, _) => {
@@ -485,8 +579,8 @@ pub async fn unlock(State(shared): State<Arc<Shared>>, Json(asked): Json<Asked>)
     }
 }
 
-/// `POST /v1/lock/NAME?do=lock|unlock|wipe` (`kith node lock`, `unlock`, `wipe`): for who
-/// may apply NodeKeys.
+/// `POST /v1/lock/NAME?do=lock|unlock|wipe|seal|unseal` (`kith node lock`, `unlock`,
+/// `wipe`, `seal`): for who may apply NodeKeys.
 pub async fn set(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
@@ -512,9 +606,15 @@ pub async fn set(
             "unlock" if wiped => return Err(format!("{name} was wiped: its key is gone")),
             "unlock" => drop(held.spec.as_object_mut().and_then(|spec| spec.remove("locked"))),
             "wipe" => held.spec = json!({ "id": held.spec["id"], "wiped": true }),
-            _ => return Err("do=lock, unlock or wipe".to_string()),
+            "seal" if wiped => return Err(format!("{name} was wiped: its key is gone")),
+            "seal" => held.spec["seal"] = true.into(),
+            "unseal" => drop(held.spec.as_object_mut().and_then(|spec| spec.remove("seal"))),
+            _ => return Err("do=lock, unlock, wipe, seal or unseal".to_string()),
         }
-        let said = json!({ "node": name, "locked": held.spec["locked"] == true, "wiped": held.spec["wiped"] == true });
+        let said = json!({
+            "node": name, "locked": held.spec["locked"] == true, "wiped": held.spec["wiped"] == true,
+            "seal": held.spec["seal"] == true,
+        });
         let (resources, at) = (vec![held], kith_api::store::now());
         let applied = shared.submit(Command::Apply { resources, at }).await;
         applied.map(|_| said).map_err(|e| e.to_string())
@@ -566,6 +666,7 @@ mod tests {
             secret: vec![7; 32],
             recovery: vec![1, 2, 3],
             key: Some(vec![9; 64]),
+            tpm: Some(vec![5; 300]),
             peers: vec!["10.0.0.1:7443".into(), "[fd00::2]:7443".into()],
         };
         let path = std::env::temp_dir().join(format!("kith-crypt-record-{}", std::process::id()));
@@ -592,6 +693,15 @@ mod tests {
         assert_eq!(Record::parse(&bytes), Some(held.clone()));
         assert!(!bytes.windows(4).any(|window| window == b"key:"));
         assert_eq!(held.id().len(), 64);
+        // More peers than there is room for: the last are left out, the TPM's seal is not.
+        let many = Record {
+            peers: (0..400).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..held.clone()
+        };
+        many.write(&disk, AT).unwrap();
+        disk.read_exact_at(&mut bytes, AT).unwrap();
+        let read = Record::parse(&bytes).unwrap();
+        assert!(read.tpm == held.tpm && read.peers.len() > 100 && read.peers.len() < 400);
         assert_ne!(held.id(), hex(&held.secret));
 
         // Nothing there, another format, a secret that is not one: no record.

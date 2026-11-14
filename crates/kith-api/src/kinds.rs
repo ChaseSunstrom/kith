@@ -909,6 +909,10 @@ spec! {
         /// Forgotten for good (`kith node wipe`).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub wiped: Option<bool>,
+        /// The node may have its own TPM keep the key too, sealed to the system it runs:
+        /// it then opens its state with no node asked (`kith node seal`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub seal: Option<bool>,
     }
 
     // ---- Extensibility and access (§4.10, §4.13) ----

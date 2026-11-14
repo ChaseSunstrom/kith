@@ -378,6 +378,14 @@ enum NodeCommand {
     Lock { name: String },
     /// Hand the key of NAME's encrypted state out again
     Unlock { name: String },
+    /// Let NAME's own TPM keep the key of its encrypted state, sealed to the system it runs: it then
+    /// starts with no node asked (a laptop away from home), and so does whoever takes it whole
+    Seal {
+        name: String,
+        /// Take that back: the node drops its seal when it hears of it
+        #[arg(long)]
+        off: bool,
+    },
     /// Forget the key of NAME's encrypted state for good: what its disk holds can no longer be read
     Wipe {
         name: String,
@@ -932,7 +940,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Command::Node {
-            command: command @ (NodeCommand::Lock { .. } | NodeCommand::Unlock { .. } | NodeCommand::Wipe { .. }),
+            command:
+                command @ (NodeCommand::Lock { .. }
+                | NodeCommand::Unlock { .. }
+                | NodeCommand::Seal { .. }
+                | NodeCommand::Wipe { .. }),
         } => {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("keys are held by kithd: leave out --store");
@@ -940,6 +952,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let (name, what) = match command {
                 NodeCommand::Lock { name } => (name, "lock"),
                 NodeCommand::Unlock { name } => (name, "unlock"),
+                NodeCommand::Seal { name, off } => (name, if off { "unseal" } else { "seal" }),
                 NodeCommand::Wipe { name, erase } if name == erase => (name, "wipe"),
                 _ => return fail("--erase is not the node's name: nothing was done"),
             };
@@ -949,6 +962,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 match what {
                     "lock" => format!("{name} is locked: it restarts, and waits until `kith node unlock {name}`"),
                     "unlock" => format!("{name} is unlocked: it is handed its key when it asks"),
+                    "seal" => format!(
+                        "{name} may seal the key of its state to its own TPM: `kith get NodeKey {name}` says once it has, or why not"
+                    ),
+                    "unseal" => format!(
+                        "{name} drops its TPM's seal when it hears of it: from then on it asks the cluster for its key"
+                    ),
                     _ => format!("{name} is wiped: the cluster has forgotten the key of its state"),
                 }
             );

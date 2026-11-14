@@ -2371,7 +2371,10 @@ console), or `kith node netboot --encrypt`.
 kith node lock beta                    # the cluster stops handing beta's key out: beta restarts, and waits
 kith node unlock beta                  # beta is handed its key again, and starts
 kith node wipe beta --erase beta       # the key is forgotten for good: beta's state is gone
+kith node seal beta                    # beta's own TPM keeps the key too: it starts with no node asked
+kith node seal beta --off              # taken back: beta asks the cluster again
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
+sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
 ```
 
 `lock` is for a machine that is lost or about to leave the house; a locked
@@ -2392,6 +2395,34 @@ opens a locked node too, as whoever has it owns the machine; only `wipe`,
 reaching a running node, ends that. An install that nobody watched (from a
 URL, or from the network) has a recovery key that nobody saw.
 
+**The machine's own TPM.** `kith node seal beta` lets beta keep its key
+itself, sealed to its TPM and to the system it runs: from then on it opens
+its state at start with no node asked, which is what a laptop away from home
+needs. The TPM gives the key only while PCRs 0, 4, 7, 9, 12 and 15 (SHA-256)
+stand as they stood when it was sealed: the firmware (0); what it started,
+which is the boot loader and kith OS's boot file, with the kernel and the
+command line that names the system image by its hash (4); whether Secure Boot
+is on and whose keys it trusts (7); a command line or an initramfs given from
+outside the boot file (9 and 12); and what the node's config partition says
+(its name, its addresses, kithd's arguments), which no firmware measures and
+kithd does itself before it asks for the key (15). Started with anything
+else, the node is refused the key, asks the cluster as before and, once open,
+seals again: an update, or new firmware, costs one start that needs the
+cluster or the recovery key. (kith OS's boot file is not signed for Secure
+Boot: where that is off, PCR 7 says so and no more, and a changed boot file
+is refused the key by PCR 4, not kept from starting.) `kith get NodeKey beta` says whether the key is sealed, or why
+not (a machine with no TPM, or one whose firmware measures nothing, goes on
+asking the cluster). `--off` takes it back, and a locked or wiped node drops
+its seal when it hears of it.
+
+What the seal does not cover: a machine taken whole and started as it is
+opens its state by itself, and no lock reaches it until it hears its cluster
+again; what stands between whoever holds it and its state is then the running
+system alone. Nor a system taken while it runs, nor a TPM chip whose pins are
+probed while the machine starts (the key crosses its bus as it is), nor a
+machine with no TPM. It has run against a software TPM only, never on a real
+one.
+
 What is and is not protected:
 
 - The cluster holds the key wrapped with a secret that only the node's disk
@@ -2411,9 +2442,9 @@ What is and is not protected:
 - A stolen machine that is not locked, started on the cluster's own network,
   is handed its key: lock it when it goes missing.
 
-Not yet: sealing the key to the machine's TPM (so a laptop starts away from
-home without typing), encrypting a node that was not installed that way, a
-new recovery key for a running node.
+Not yet: a passphrase in the TPM's place for a machine without one,
+encrypting a node that was not installed that way, a new recovery key for a
+running node.
 
 ### Not in kith OS yet
 
