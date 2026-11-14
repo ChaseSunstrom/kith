@@ -38,14 +38,31 @@ impl Log {
             redb::DatabaseError::DatabaseAlreadyOpen => format!("{} is in use by another kithd", path.display()),
             e => failed(&e),
         })?;
-        // Reading a table that was never written is an error: make both now.
-        let made = (|| {
-            let txn = db.begin_write().map_err(|e| e.to_string())?;
-            txn.open_table(LOG).map_err(|e| e.to_string())?;
-            txn.open_table(META).map_err(|e| e.to_string())?;
-            txn.commit().map_err(|e| e.to_string())
+        fn text(e: impl std::fmt::Display) -> String {
+            e.to_string()
+        }
+        // Reading a table that was never written is an error: make both now, and say
+        // which format this is. A file with no number is from before they were numbered.
+        let stamped = (|| {
+            let txn = db.begin_write().map_err(text)?;
+            {
+                let mut meta = txn.open_table(META).map_err(text)?;
+                let old = meta.get("format").map_err(text)?;
+                let old = old.map(|value| serde_json::from_slice::<u32>(value.value()));
+                let format = old.transpose().map_err(text)?.unwrap_or(1);
+                if format > crate::FORMAT {
+                    // Nothing is committed: a newer file is left as it was.
+                    return Ok(format);
+                }
+                // (An older format is brought up to this one here, when there is one.)
+                let now = crate::FORMAT.to_string();
+                meta.insert("format", now.as_bytes()).map_err(text)?;
+            }
+            txn.open_table(LOG).map_err(text)?;
+            txn.commit().map_err(text)?;
+            Ok(crate::FORMAT)
         })();
-        made.map_err(|e: String| failed(&e))?;
+        crate::known(stamped.map_err(|e: String| failed(&e))?, path)?;
         Ok(Log { db: Arc::new(db) })
     }
 
@@ -63,6 +80,18 @@ impl Log {
         let txn = self.db.begin_write().map_err(writing)?;
         change(&txn)?;
         txn.commit().map_err(writing)
+    }
+
+    /// Write `entries`, durably.
+    pub(crate) fn put(&self, entries: impl IntoIterator<Item = Entry<TypeConfig>>) -> Result<(), Failed> {
+        self.write(|txn| {
+            let mut table = txn.open_table(LOG).map_err(writing)?;
+            for entry in entries {
+                let value = serde_json::to_vec(&entry).map_err(writing)?;
+                table.insert(entry.log_id.index, value.as_slice()).map_err(writing)?;
+            }
+            Ok(())
+        })
     }
 
     fn set_meta(&self, key: &str, value: &impl Serialize) -> Result<(), Failed> {
@@ -136,15 +165,8 @@ impl RaftLogStorage<TypeConfig> for Log {
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        self.write(|txn| {
-            let mut table = txn.open_table(LOG).map_err(writing)?;
-            for entry in entries {
-                let value = serde_json::to_vec(&entry).map_err(writing)?;
-                table.insert(entry.log_id.index, value.as_slice()).map_err(writing)?;
-            }
-            Ok(())
-        })?;
-        // The commit above is the flush.
+        self.put(entries)?;
+        // The commit in there is the flush.
         callback.log_io_completed(Ok(()));
         Ok(())
     }

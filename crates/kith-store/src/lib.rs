@@ -29,6 +29,22 @@ use std::io::Cursor;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// The format of the two files a replica is on disk, the log and the snapshot. It goes up
+/// when a build writes what an earlier build would misread; a file with no number is 1.
+/// `fixtures/format-N` is a state as format N's builds wrote it, and stays readable.
+pub const FORMAT: u32 = 1;
+
+/// A file in a format this build does not know is refused, never read as if it were its own.
+fn known(format: u32, file: &Path) -> Result<(), String> {
+    if format > FORMAT {
+        let file = file.display();
+        return Err(format!(
+            "{file} is in format {format} and this kithd reads up to format {FORMAT}: start the kithd that wrote it, or a newer one"
+        ));
+    }
+    Ok(())
+}
+
 /// One change to the store. Everything a replica needs to repeat it exactly is in here,
 /// the time included.
 #[derive(Debug, Clone, Serialize, Deserialize)]

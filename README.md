@@ -1563,6 +1563,32 @@ good is refused: the slot it would replace is the only one known to start.
 Nothing checks who made a file given that way: whoever can plug a disk in and
 change the kernel command line has the machine anyway.
 
+### What an update keeps: the format of the store
+
+```sh
+cargo test -p kith-store format        # this build reads a state written in format 1
+```
+
+A node's copy of the cluster's resources is two files in its state,
+`raft/log.redb` and `raft/snapshot.json`. Both say which format they are in:
+1 today, and a file from before the number was written is 1 too.
+
+- A kithd reads every format up to its own. `crates/kith-store/fixtures/format-1`
+  is a state as format 1 is written, every kind of change in its log, and the
+  test above has each later build open it, read every entry of the log back
+  as it was written, and end with the same resources. A build that cannot does not pass; a build that changes what is written
+  takes the next number, adds a fixture of its own and keeps the old ones.
+- A kithd refuses a state in a format newer than its own and leaves the
+  files as they were, rather than read them as if they were its own:
+  `raft/log.redb is in format 2 and this kithd reads up to format 1: start
+  the kithd that wrote it, or a newer one`. So going back to an older release
+  is sure only while both write the same format, and a release that takes a
+  new number will say so.
+
+Not numbered yet: what nodes say to each other (a snapshot one node sends
+another is written down by the node that takes it, in its own format), and
+the other files in a node's state (its keys, blobs and volumes).
+
 ### Rolling a release through the cluster
 
 ```sh

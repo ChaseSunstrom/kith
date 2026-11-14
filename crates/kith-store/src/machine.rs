@@ -25,8 +25,29 @@ pub struct State {
 /// The snapshot file: a state and the description Raft keeps of it.
 #[derive(Serialize, Deserialize)]
 struct Saved {
+    /// [`crate::FORMAT`] when it was written.
+    #[serde(default = "first")]
+    format: u32,
     meta: SnapshotMeta<u64, BasicNode>,
     state: State,
+}
+
+fn first() -> u32 {
+    1
+}
+
+/// The snapshot in `bytes`, if this build knows its format. The number is read on its own
+/// first: the rest of a newer file may not read at all, or worse, may.
+fn read(bytes: &[u8], file: &Path) -> Result<Saved, String> {
+    #[derive(Deserialize)]
+    struct Stamp {
+        #[serde(default = "first")]
+        format: u32,
+    }
+    let reading = |e: serde_json::Error| format!("reading {}: {e}", file.display());
+    let stamp: Stamp = serde_json::from_slice(bytes).map_err(reading)?;
+    crate::known(stamp.format, file)?;
+    serde_json::from_slice(bytes).map_err(reading)
 }
 
 #[derive(Clone)]
@@ -44,10 +65,7 @@ impl Machine {
     pub fn open(dir: &Path, changed: Arc<dyn Fn() + Send + Sync>) -> Result<Machine, String> {
         let file = dir.join("snapshot.json");
         let state = match std::fs::read(&file) {
-            Ok(bytes) => {
-                let saved: Result<Saved, _> = serde_json::from_slice(&bytes);
-                saved.map_err(|e| format!("reading {}: {e}", file.display()))?.state
-            }
+            Ok(bytes) => read(&bytes, &file)?.state,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(format!("reading {}: {e}", file.display())),
         };
@@ -92,7 +110,7 @@ impl Machine {
         let failed =
             |e: &dyn std::fmt::Display| -> Failed { StorageIOError::read_snapshot(None, AnyError::error(e)).into() };
         match std::fs::read(&self.file) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| failed(&e)),
+            Ok(bytes) => read(&bytes, &self.file).map(Some).map_err(|e| failed(&e)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(failed(&e)),
         }
@@ -119,7 +137,11 @@ impl RaftSnapshotBuilder<TypeConfig> for Machine {
             last_membership: state.membership.clone(),
             snapshot_id: id,
         };
-        let saved = Saved { meta, state };
+        let saved = Saved {
+            format: crate::FORMAT,
+            meta,
+            state,
+        };
         self.save(&saved)?;
         snapshot(saved)
     }
@@ -178,6 +200,7 @@ impl RaftStateMachine<TypeConfig> for Machine {
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
         let saved = Saved {
+            format: crate::FORMAT,
             meta: meta.clone(),
             state,
         };
