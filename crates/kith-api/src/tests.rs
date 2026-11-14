@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 34);
+    assert_eq!(KINDS.len(), 35);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -460,6 +460,47 @@ fn expose_asks_for_the_proxy_protocol() {
     let off = service("{ host: a.example.org, via: edge }").unwrap();
     assert_eq!(off.expose.unwrap().proxy_protocol, None);
     assert!(service("{ host: a.example.org, via: edge, proxyProtocol: yes please }").is_err());
+}
+
+#[test]
+fn dns_block_list_is_checked() {
+    let list = |spec: &str| {
+        let yaml = format!("apiVersion: kith.dev/v1\nkind: DNSBlockList\nmetadata: {{ name: ads }}\nspec: {spec}\n");
+        let docs = Resource::from_source(&yaml).map_err(|e| e.msg)?;
+        docs.into_iter().try_for_each(|doc| doc.map(drop).map_err(|e| e.msg))
+    };
+    let sha = "a".repeat(64);
+    for ok in [
+        "{ url: 'https://lists.example/hosts.txt' }".to_string(),
+        format!("{{ url: 'https://lists.example:8443/h?x=1', sha256: {sha}, interval: 6h, answer: unspecified }}"),
+        "{ configMap: { name: ads, key: hosts }, clients: [192.168.0.0/16, 'fd00::/8'] }".to_string(),
+        "{ configMap: { namespace: dns, name: ads, key: hosts }, answer: nxdomain }".to_string(),
+    ] {
+        assert_eq!(list(&ok), Ok(()), "{ok}");
+    }
+    for (bad, why) in [
+        ("{}", "exactly one"),
+        (
+            "{ url: 'https://a.example/x', configMap: { name: a, key: b } }",
+            "exactly one",
+        ),
+        ("{ url: 'http://a.example/x' }", "not an https://"),
+        ("{ url: 'ftp://a.example/x' }", "not an https://"),
+        ("{ url: 'https://' }", "needs a host"),
+        ("{ url: 'https://user:pw@a.example/x' }", "no user or password"),
+        ("{ url: 'https://a.example/a b' }", "space or control"),
+        ("{ url: 'https://a.example/x', sha256: abc }", "64 hexadecimal"),
+        ("{ url: 'https://a.example/x', interval: 1m }", "at least 5m"),
+        ("{ url: 'https://a.example/x', interval: soon }", "not like"),
+        ("{ configMap: { name: a, key: b }, interval: 1h }", "for a `url` list"),
+        ("{ configMap: { name: '', key: b } }", "name and a key"),
+        ("{ url: 'https://a.example/x', clients: [lan] }", "not a network"),
+        ("{ url: 'https://a.example/x', answer: redirect }", "unknown variant"),
+        ("{ url: 'https://a.example/x', extra: 1 }", "extra"),
+    ] {
+        let said = list(bad).unwrap_err();
+        assert!(said.contains(why), "{bad}: {said}");
+    }
 }
 
 #[test]

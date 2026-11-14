@@ -324,6 +324,42 @@
       "title": "DNSZone",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
+    "DNSBlockList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "DNSBlockList"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsBlockListSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "Names kithd's DNS server answers as not there: a ConfigMap key or a list fetched over https",
+      "title": "DNSBlockList",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
     "DNSRecord": {
       "type": "object",
       "additionalProperties": false,
@@ -1353,6 +1389,29 @@
       ],
       "description": "Bytes kept by content: a Blob's name is the first 62 hex digits of their BLAKE3\nhash, and `kith blob put` makes it."
     },
+    "BlockListMap": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The ConfigMap's namespace. Defaults to `default`."
+        },
+        "name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "key"
+      ]
+    },
     "ClusterSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -1700,6 +1759,70 @@
         "node",
         "class"
       ]
+    },
+    "DnsBlockAnswer": {
+      "type": "string",
+      "enum": [
+        "nxdomain",
+        "unspecified"
+      ],
+      "description": "`nxdomain`: no such name. `unspecified`: `0.0.0.0` for A and `::` for AAAA."
+    },
+    "DnsBlockListSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "configMap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BlockListMap"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "An `https://` address; no other scheme is fetched."
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The list's SHA-256 (64 hex digits): a fetched list that does not match is refused."
+        },
+        "interval": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How often a `url` list is fetched again (`90s`, `30m`, `24h`, `7d`). Defaults to 24h;\nat least 5m."
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DnsBlockAnswer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a listed name gets. Defaults to `nxdomain`."
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Only clients in these networks (`192.168.0.0/16`, `fd00::/8`, or one address) are\nblocked. Empty: everyone is."
+        }
+      },
+      "description": "Names kithd's DNS server answers as not there, for the clients it names: a ConfigMap key\nor a list fetched from an https address, in the format of a hosts file or one name a line.\nA listed name blocks every name under it. Exactly one of `configMap` or `url`.\n\nA `url` list is fetched by each node that serves DNS: the host of the list sees that\nnode's address and when it asks."
     },
     "DnsRecordSpec": {
       "type": "object",
