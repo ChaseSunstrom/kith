@@ -1,7 +1,6 @@
 //! Specs of the built-in kinds (PLAN.md §4.2).
 //!
-//! Kinds whose controllers arrive in later phases (seats, packages, updates,
-//! access control) carry the fields the plan names and are expected to grow.
+//! `kith.dev/v1` is stable (`stable.rs`): a field is added, never taken away or narrowed.
 //! Unknown fields are always an error, so a typo never passes silently.
 
 use schemars::JsonSchema;
@@ -231,7 +230,7 @@ spec! {
 
     pub enum Strategy { Rolling, Recreate, BlueGreen }
 
-    /// The units one replica runs. `vm` and `wasm` units join in Phase 7.
+    /// The units one replica runs: containers, exec units and virtual machines.
     pub struct Template {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub containers: Vec<Container>,
@@ -674,7 +673,7 @@ spec! {
         pub data: BTreeMap<String, String>,
     }
 
-    /// Encrypted at rest once the Raft store lands (§4.3); the Phase 0 local store is plain JSON.
+    /// Kept in the store as it is given: on a node's disk it is as safe as the node's state.
     pub struct SecretSpec {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub data: BTreeMap<String, String>,

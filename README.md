@@ -6,12 +6,19 @@ A tiny, immutable operating system that turns all of your machines into one
 cluster, configured entirely through declarative resources. The design is in
 [PLAN.md](PLAN.md).
 
-## Status: one node, in agent mode
+## Status
 
-`kithd` runs as a service on an existing Linux distro, owns the store, and keeps
-the containers and processes on that machine matching the `Workload`s and `Job`s
-you apply. Clustering,
-networking and the OS image come next (Phase 2 onwards in the plan).
+Every phase of the plan has been worked through, and the tree is at version
+1.0.0: `kith.dev/v1` [is stable](#kithdevv1-is-stable). No release has been
+tagged. Each section below says what works and, under "Not yet", what does not
+(some of it named by the plan); what was read for security,
+and what kith does not defend against, is in [SECURITY.md](SECURITY.md).
+
+`kithd` runs as a service on an existing Linux distro (agent mode), or as the
+first process of [kith OS](#kith-os-kithd-as-the-machines-first-process); on
+one machine, or on several [joined into a cluster](#more-than-one-node). It owns
+the store and keeps the containers, processes and machines on its node matching
+the resources you apply. On one node, in agent mode:
 
 ```sh
 cargo build --release
@@ -34,7 +41,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 26 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 33 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -94,24 +101,23 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   `ConfigMap` or `Secret` value in its `env` changes.
 - On SIGTERM it stops everything it started.
 
-Not yet: ports and `exec` probes are accepted but do nothing
-(the status says so for `exec` probes), a replica is stopped before
+Not yet: `exec` probes are accepted but do nothing (the status says so), a
+container's `ports` only name them for probes and Services (nothing is opened or
+mapped: containers share the host's network), a replica is stopped before
 its replacement starts (so `replicas: 1` is down for a moment during an update;
 `blueGreen` is treated as rolling), containers share the host's
 network and a read-only image (tmpfs on `/tmp` and `/run`), pulls are anonymous, layers
 must be gzip or plain tar, the image's `User` is ignored (containers run as
 root inside their user namespace), and there is no seccomp filter. The log cap
 is checked every 10 s, so a file can pass it by what its unit writes in that
-time, and output written in the instant a file is moved aside is lost. Kinds other than
-`Workload`, `NodeWorkload`, `Job`, `ConfigMap` and `Secret` are stored and validated but nothing acts
-on them. Running as root is untested.
+time, and output written in the instant a file is moved aside is lost. As a service on a
+distro, running as root is untested (on kith OS kithd is root: it is the first
+process).
 
 [`dist/kithd.service`](dist/kithd.service) is a systemd user unit for it; it has
 not been run under systemd yet.
 
-## More than one node (in progress)
-
-Phase 2 of the plan is being built. What works today:
+## More than one node
 
 ```sh
 kithd --listen 192.168.1.10:7443 --name alpha      # first start: makes the cluster's CA
@@ -289,13 +295,14 @@ hypervisor loses what the guest had not yet handed to its disk and nothing
 else: a disk that says it flushed and did not, a write torn in half, delay
 and loss on the network, and real machines are not what this shows.
 
-Not yet: the nodes still talk to each other at their plain addresses, not
-over the mesh, workloads have no addresses on it, and two nodes that
-are both behind NAT only reach each other through an edge node.
+Not yet: nodes that do not roam still talk to each other at their plain
+addresses, not over the mesh, workloads have no addresses of their own on it (a
+Service has one), and two nodes that are both behind NAT only reach each other
+through an edge node.
 Replicas of one Workload on different nodes are all replaced at once
 when it changes (on one node it is one at a time; a `NodeWorkload` is always
-replaced all at once), and replicas on a node that is unreachable still count as ready until they are
-moved. A change whose answer was lost with the leader may or may not have
+replaced all at once), and replicas on a node that is unreachable still count as ready until it has been
+so for `--lost-after` (five minutes); a roaming node's count as ready however long it is away. A change whose answer was lost with the leader may or may not have
 happened; `kith get` tells. Joining needs an empty `--state`. A joined node
 that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and
@@ -314,8 +321,10 @@ kith get dnsrecord                   # each one says `served`, or why not
 ```
 
 - `<node>.node.kith` is the address each node of the cluster is reached at,
-  `<node>.mesh.kith` its address on the mesh (if it is on it).
-  Names under `kith` are the cluster's own: a zone cannot take them.
+  `<node>.mesh.kith` its address on the mesh (if it is on it), and
+  `<service>.<namespace>.kith` a Service's address on the mesh (where the
+  node asked is on it). Names under `kith` are the cluster's own: a zone
+  cannot take them.
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
   zone itself. Names in values are full names (`nas.home.example`).
@@ -334,10 +343,9 @@ kith get dnsrecord                   # each one says `served`, or why not
   (the CNAME alone when they do not answer).
 - In a cluster every node started with `--dns` answers the same names.
 
-Not yet: `<service>.<namespace>.kith` (with the load balancer), DNSSEC, zone
-transfers, and caching of upstream answers.
+Not yet: DNSSEC, zone transfers, and caching of upstream answers.
 
-## Packages (in progress)
+## Packages
 
 A package is a directory of resource templates with default values
 ([`packages/web`](packages/web) is one):
@@ -948,7 +956,7 @@ apiVersion: kith.dev/v1
 kind: Workload
 metadata: { name: windows }
 spec:
-  placement: { nodeSelector: { kith.dev/node: desk } }
+  placement: { require: { node.labels.seat: desk } }
   template:
     deviceClaims: [card]              # a DeviceClaim for a GPU set aside for machines
     vms:
@@ -996,8 +1004,11 @@ spec:
 processor, out of reach of the node they run on (AMD SEV-SNP, or Intel TDX):
 
 ```yaml
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: sealed }
 spec:
-  placement: { nodeSelector: { kith.dev/node: epyc } }
+  placement: { require: { node.labels.cpu: epyc } }
   template:
     confidential: true
     vms:
@@ -1279,7 +1290,8 @@ kith blob get NAME -o backup.tar  # from any node, whichever nodes hold them
 - `put` answers once the bytes are on the node it was asked on; the other copies follow
   within seconds. Until a second node is in `status.nodes`, that node's disk is the only
   place they are.
-- Not yet: nothing else uses blobs (images, packages and revisions are kept as before); a
+- Not yet: only Backups and Images keep what they hold as blobs (pulled images, packages
+  and revisions are kept as before); a
   blob passes through the CLI's memory whole; no size limit or quota but the disk; a holder
   does not read its copies again to find one the disk has spoiled.
 
@@ -1476,7 +1488,7 @@ The page itself is open; everything it asks is not.
 Not yet: logging in without a certificate (OIDC), secrets hidden on screen
 until asked for, metrics.
 
-## kith OS: kithd as the machine's first process (in progress)
+## kith OS: kithd as the machine's first process
 
 On a kith OS machine there is the kernel and kithd, nothing else: no systemd, no
 shell. When kithd finds it is process 1 it does what an init does:
@@ -1971,7 +1983,7 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 
 ## Layout
 
-| Crate | What it is |
+| Where | What it is |
 |---|---|
 | `crates/kith-yaml` | The strict parser, a serde deserializer that keeps source positions, and a YAML writer |
 | `crates/kith-api` | The resource envelope, the built-in kinds, JSON Schemas, and the store (apply, diff, revisions) |
@@ -1981,9 +1993,16 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `crates/kith-dns` | The DNS server: wire format, zones, split horizon, forwarding |
 | `crates/kith-sched` | The scheduler, as a pure function from nodes and replicas to a plan |
 | `crates/kith-packages` | Packages: templates and values rendered into resources |
+| `crates/kith-dm-sys` | The one crate of the workspace with `unsafe`: device-mapper, loop devices and growing a file system, by ioctl, for encrypted volumes |
 | `crates/kith-mesh` | The mesh: addresses and peers worked out from the nodes, and the kernel's WireGuard set up over netlink |
 | `crates/kithd` | The daemon: API server, store replica, scheduler, mesh, DNS and Workload controller |
 | `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |
+| `os/` | kith OS: what builds its image (`build.sh`), an update (`update.sh`) and the installer for a rented machine (`vps.sh`), and the kernel's configuration |
+| `packages/` | Packages that come with kith: `web`, `nas`, `kith-build`, `kith-panel`, and the desktops (`gnome`, `hyprland`, `kiosk`) |
+| `examples/` | Resources to apply as they are |
+| `ci/` | The budgets, the benchmark and the VM tests (`vm.sh`) |
+| `dist/` | A systemd user unit for agent mode |
+| `docs/` | The pictures this file shows |
 
 ## Development
 
@@ -1993,7 +2012,7 @@ KITH_E2E=1 cargo test -p kithd -p kith-runtime --test e2e   # pulls an image and
 cargo clippy --workspace --all-targets -- -D warnings
 rustup target add wasm32-unknown-unknown   # once: without it the WASM end-to-end tests skip themselves
 python3 ci/budgets.py            # binary-size and memory budgets, enforced in CI
-python3 ci/bench.py              # Phase 1 numbers: cached start < 150 ms, 20+ containers under 30 MB of kithd
+python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
@@ -2027,7 +2046,7 @@ edge node is not covered here: kithd falls back to it only after 180 s of
 silence (`QUIET` in `crates/kithd/src/mesh.rs`), and `kith-mesh` has unit tests
 for the choice.
 
-`ci/vm.sh` is the launcher Phase 5's image, installer and update tests reuse. It
+`ci/vm.sh` is the launcher the image, installer, update and cluster tests reuse. It
 builds the static kithd, makes an initramfs whose `/init` is that kithd, boots the
 host's kernel with it under QEMU and KVM, and prints the console. `--kernel`,
 `--initrd` and `--disk` take any other; a disk image is attached with `-snapshot`

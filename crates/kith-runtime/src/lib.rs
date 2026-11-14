@@ -1,4 +1,5 @@
-//! kith's workload runtime (PLAN.md §4.5), containers only for now.
+//! kith's workload runtime (PLAN.md §4.5): containers and exec units. (Virtual
+//! machines are kithd's own: `crates/kithd/src/vm.rs`.)
 //!
 //! - [`ImageStore`] pulls OCI images into a content-addressed blob store and
 //!   unpacks each image once.

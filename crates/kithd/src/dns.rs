@@ -1,7 +1,8 @@
 //! kithd's DNS server (`--dns ADDR:PORT`): what it answers comes from the store.
 //!
 //! - `<node>.node.kith`: the address each Node is reached at; `<node>.mesh.kith`: its
-//!   address on the mesh, if it is on it.
+//!   address on the mesh, if it is on it; `<service>.<namespace>.kith`: a Service's
+//!   address on the mesh.
 //! - `DNSZone` and `DNSRecord`: names of your own. A zone with `clients` is split
 //!   horizon: clients in those networks get it, and not a zone for everyone with the
 //!   same domain.
@@ -10,9 +11,8 @@
 //! The server itself is the `kith-dns` crate; this builds its zones again whenever a
 //! resource they are made from changes, and reports on each DNSZone and DNSRecord.
 //
-// ponytail: `<service>.<namespace>.kith` waits for Services to have addresses (the
-// load balancer). A client inside two zones' different `clients` lists gets only the
-// first of them by name; give zones that belong together the same list.
+// ponytail: a client inside two zones' different `clients` lists gets only the first
+// of them by name; give zones that belong together the same list.
 
 use crate::Shared;
 use kith_api::Resource;

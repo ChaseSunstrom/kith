@@ -134,7 +134,7 @@ fn within_cidr(cidr: &str, address: IpAddr) -> bool {
 }
 
 /// Can a rule's peer be told from where a connection comes from? Workloads share their
-/// node's addresses for now, so one named by namespace or labels cannot.
+/// node's addresses, so one named by namespace or labels cannot.
 fn told_apart(peer: &Peer) -> bool {
     peer.namespace.is_none() && peer.selector.is_empty()
 }

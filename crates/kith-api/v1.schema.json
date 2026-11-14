@@ -2811,7 +2811,7 @@
           }
         }
       },
-      "description": "Encrypted at rest once the Raft store lands (§4.3); the Phase 0 local store is plain JSON."
+      "description": "Kept in the store as it is given: on a node's disk it is as safe as the node's state."
     },
     "ServicePort": {
       "type": "object",
@@ -3132,7 +3132,7 @@
           "description": "Hold this replica back (a sliver of one CPU) while a seat of its node is busy."
         }
       },
-      "description": "The units one replica runs. `vm` and `wasm` units join in Phase 7."
+      "description": "The units one replica runs: containers, exec units and virtual machines."
     },
     "UpdatePlanSpec": {
       "type": "object",

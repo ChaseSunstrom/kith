@@ -1,7 +1,7 @@
 #!/bin/sh
 # Boot a kernel in QEMU and print what it said: by default the host's kernel with the
-# static kithd as init (so, the kernel and kithd, nothing else). Phase 5's image,
-# installer and update tests reuse it with their own kernel, initramfs and disk image.
+# static kithd as init (so, the kernel and kithd, nothing else). The image,
+# installer, update and cluster tests reuse it with their own kernel, initramfs and disk image.
 #
 #   sh ci/vm.sh [--kernel FILE] [--initrd FILE] [--disk IMAGE] [--append ARGS] [--time SECONDS]
 #   sh ci/vm.sh --test init     kithd as the first process: up, serving, restarts when told

@@ -2,8 +2,9 @@
 //! `Workload`s, `NodeWorkload`s and `Job`s in the store, restarts them when they exit, and reports
 //! what it sees in each one's status.
 //!
-// ponytail: one node. Not handled yet, each said so in the status where it
-// matters: ports (units share the host's network) and exec probes.
+// ponytail: this node's share of each (the scheduler says which replicas are its own).
+// Not handled, and said so in the status where it matters: exec probes. A container's
+// ports only name them (units share the host's network).
 // A rolling update replaces one replica at a time, the old one stopped before the
 // new one starts: unit ids (cgroup, log file) are per replica, so two generations
 // of a replica cannot run side by side. Images are pulled one at a time.

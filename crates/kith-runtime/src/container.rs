@@ -144,7 +144,7 @@ impl Runtime {
     ///
     // ponytail: the image's rootfs is shared read-only, with tmpfs on /tmp and /run,
     // and the host's network. A writable overlay per container and a network
-    // namespace on the mesh come with volumes and Phase 2.
+    // namespace of its own are not there: volumes are where a container writes.
     pub fn create(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
         let what = format!("creating container `{id}`");
         let bundle = self.root.join("containers").join(id);
@@ -455,7 +455,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     } else {
         Spec::rootless(uid.as_raw(), gid.as_raw())
     };
-    // No network namespace, as root too: containers share the host's network until the mesh (Phase 2).
+    // No network namespace, as root too: containers share the host's network.
     let mut linux = spec.linux().clone().unwrap_or_default();
     let mut namespaces = linux.namespaces().clone().unwrap_or_default();
     namespaces.retain(|ns| ns.typ() != oci_spec::runtime::LinuxNamespaceType::Network);
@@ -513,7 +513,7 @@ fn spec(id: &str, image: &Image, unit: &Unit, cgroup: &str) -> std::result::Resu
     let mut mounts = spec.mounts().clone().unwrap_or_default();
     mounts.push(tmpfs("/tmp")?);
     mounts.push(tmpfs("/run")?);
-    // The container shares the host's network for now, so it needs the host's resolver.
+    // The container shares the host's network, so it needs the host's resolver.
     if Path::new("/etc/resolv.conf").exists() {
         let options = ["rbind", "ro"].map(String::from).to_vec();
         let resolv = MountBuilder::default().destination("/etc/resolv.conf").typ("bind");

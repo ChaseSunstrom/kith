@@ -1,8 +1,9 @@
 //! The resource store: apply, diff and per-resource revision history.
 //!
-//! Phase 0 keeps everything in memory and, for the CLI, in one JSON file.
-// ponytail: whole-file JSON under a file lock; kith-store (openraft + redb, §4.3) replaces it in Phase 2.
-// Not here yet: field ownership (server-side apply) and watch streams, both Phase 1.
+//! Everything is in memory. `kith --store FILE` keeps it in one JSON file; kithd keeps
+//! it behind `kith-store` (Raft, its log in redb), which applies each change to one of these.
+// ponytail: whole-file JSON under a file lock for the CLI's own file: for trying things
+// out. Not here: field ownership (server-side apply).
 
 use crate::Resource;
 use serde::{Deserialize, Serialize};
