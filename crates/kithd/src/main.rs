@@ -12,6 +12,7 @@ mod api;
 mod audit;
 mod backups;
 mod blobs;
+mod blocklist;
 mod claims;
 mod cluster;
 mod controller;

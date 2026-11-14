@@ -323,7 +323,7 @@ Requested after the first draft. Each is placed in an existing phase; none chang
 | VMs | `cloud-hypervisor` / Firecracker, QEMU for passthrough |
 | WASM | `wasmtime` (controllers, scheduler plugins, admission, workloads) |
 | API | `tonic`, `axum`, `rustls` |
-| Config | `serde`, a strict YAML parser (`saphyr`-based, or a vetted `serde_yaml` fork), `schemars` |
+| Config | `serde`, a strict YAML parser (`saphyr`-based, or a vetted `serde_yaml` fork), `schemars` (in the tests that write `v1.schema.json`; the binaries read that file) |
 | Templating | `minijinja` |
 | UI | Leptos or SolidJS, embedded with `rust-embed` |
 | OS build | `mkosi` or a custom Rust builder, erofs, dm-verity, UKI, system extensions |

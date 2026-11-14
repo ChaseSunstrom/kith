@@ -5,12 +5,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# A binary reads the kinds' schemas out of v1.schema.json (build.rs); this links what makes them.
+generate = ["dep:schemars"]
+
 [dependencies]
 kith-yaml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-schemars.workspace = true
+# What writes v1.schema.json from the kinds: for the tests that keep that file as the code is.
+schemars = { workspace = true, optional = true }
 similar.workspace = true
+
+[dev-dependencies]
+# (Its own tests are the one build with the generator in it.)
+kith-api = { path = ".", features = ["generate"] }
 
 [lints]
 workspace = true

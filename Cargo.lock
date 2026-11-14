@@ -1276,6 +1276,7 @@ dependencies = [
 name = "kith-api"
 version = "1.0.0"
 dependencies = [
+ "kith-api",
  "kith-yaml",
  "schemars",
  "serde",
