@@ -867,8 +867,8 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
         ("hostNetwork: true", "spec.template.spec.hostNetwork"),
         ("hostPID: true", "spec.template.spec.hostPID"),
         (
-            "initContainers: [{ name: first, image: busybox }]",
-            "spec.template.spec.initContainers",
+            "initContainers: [{ name: first, image: busybox, restartPolicy: Always }]",
+            "spec.template.spec.initContainers[first].restartPolicy",
         ),
         (
             "volumes: [{ name: host, hostPath: { path: / } }]",
