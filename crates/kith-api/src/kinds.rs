@@ -44,6 +44,16 @@ impl TryFrom<String> for Quantity {
 }
 
 impl Quantity {
+    /// The amount in whole bytes, where it is some: `512Mi` is 536870912. `500m` is none, and so is
+    /// a number at 2^53 or more, where a float stops counting bytes.
+    pub fn bytes(&self) -> Option<u64> {
+        let value = self.value();
+        let whole = value.round();
+        // (The float's rounding is not a fraction of a byte: `1.1G` is 1100000000.)
+        let exact = (value - whole).abs() <= whole * 4.0 * f64::EPSILON;
+        (exact && whole > 0.0 && whole < 9007199254740992.0).then_some(whole as u64)
+    }
+
     /// The amount as a plain number: `500m` is 0.5, `2Gi` is 2147483648.
     pub fn value(&self) -> f64 {
         let number = self.0.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -910,9 +920,18 @@ spec! {
         /// and its GPUs' render nodes, and none of its devices.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub access: Option<Access>,
+        /// With `access: shared`: the vram the claim asks for on each Device it holds, which the
+        /// scheduler counts against the Device's `vram` label. Nothing enforces it (see the README).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub share: Option<DeviceShare>,
     }
 
     pub enum Access { Exclusive, Shared, Client }
+
+    /// `{ vram: 512Mi }`: what a shared claim asks for of a Device's vram.
+    pub struct DeviceShare {
+        pub vram: Quantity,
+    }
 
     // ---- Packages and GitOps (§4.8, §4.9) ----
 
@@ -2076,6 +2095,14 @@ impl Spec for DeviceClaimSpec {
         )?;
         if self.access == Some(Access::Client) && self.seat.is_none() {
             return Err("spec.access: client is of a seat: name one with `seat`".into());
+        }
+        if let Some(share) = &self.share {
+            if self.access != Some(Access::Shared) {
+                return Err("spec.share: a share is of a shared claim: say `access: shared`".into());
+            }
+            if share.vram.bytes().is_none() {
+                return Err("spec.share.vram: a share is whole bytes, above 0 and below 8192Ti (such as 512Mi)".into());
+            }
         }
         Ok(())
     }

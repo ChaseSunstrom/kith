@@ -1708,6 +1708,17 @@
             }
           ],
           "description": "`exclusive` where unsaid. `client` is of a seat: beside whoever holds it, with\nthe seat's directory (`/run/seat`, where its session puts its sockets) to read\nand its GPUs' render nodes, and none of its devices."
+        },
+        "share": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceShare"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "With `access: shared`: the vram the claim asks for on each Device it holds, which the\nscheduler counts against the Device's `vram` label. Nothing enforces it (see the README)."
         }
       },
       "description": "Exactly one of `seat` or `device`, or a `selector` over device labels."
@@ -1723,6 +1734,19 @@
         "camera",
         "other"
       ]
+    },
+    "DeviceShare": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vram": {
+          "$ref": "#/$defs/Quantity"
+        }
+      },
+      "required": [
+        "vram"
+      ],
+      "description": "`{ vram: 512Mi }`: what a shared claim asks for of a Device's vram."
     },
     "DeviceSpec": {
       "type": "object",
