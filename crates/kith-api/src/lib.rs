@@ -108,6 +108,7 @@ kinds! {
     CronJob: CronJobSpec, namespaced, "A scheduled task";
     Service: ServiceSpec, namespaced, "Stable name, load balancing and optional public exposure";
     DNSZone: DnsZoneSpec, cluster, "A domain kithd's DNS server answers for";
+    DNSBlockList: DnsBlockListSpec, cluster, "Names kithd's DNS server answers as not there: a ConfigMap key or a list fetched over https";
     DNSRecord: DnsRecordSpec, cluster, "Names in a DNSZone: A, AAAA, CNAME, TXT, SRV, NS, PTR";
     NetworkPolicy: NetworkPolicySpec, namespaced, "Allow or deny traffic between workloads, namespaces and nodes";
     Volume: VolumeSpec, namespaced, "Storage on a node, optionally shared over the mesh";

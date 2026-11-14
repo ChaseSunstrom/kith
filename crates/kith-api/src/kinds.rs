@@ -608,6 +608,45 @@ spec! {
         pub clients: Vec<String>,
     }
 
+    /// Names kithd's DNS server answers as not there, for the clients it names: a ConfigMap key
+    /// or a list fetched from an https address, in the format of a hosts file or one name a line.
+    /// A listed name blocks every name under it. Exactly one of `configMap` or `url`.
+    ///
+    /// A `url` list is fetched by each node that serves DNS: the host of the list sees that
+    /// node's address and when it asks.
+    pub struct DnsBlockListSpec {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub config_map: Option<BlockListMap>,
+        /// An `https://` address; no other scheme is fetched.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub url: Option<String>,
+        /// The list's SHA-256 (64 hex digits): a fetched list that does not match is refused.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub sha256: Option<String>,
+        /// How often a `url` list is fetched again (`90s`, `30m`, `24h`, `7d`). Defaults to 24h;
+        /// at least 5m.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub interval: Option<String>,
+        /// What a listed name gets. Defaults to `nxdomain`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub answer: Option<DnsBlockAnswer>,
+        /// Only clients in these networks (`192.168.0.0/16`, `fd00::/8`, or one address) are
+        /// blocked. Empty: everyone is.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub clients: Vec<String>,
+    }
+
+    pub struct BlockListMap {
+        /// The ConfigMap's namespace. Defaults to `default`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub namespace: Option<String>,
+        pub name: String,
+        pub key: String,
+    }
+
+    /// `nxdomain`: no such name. `unspecified`: `0.0.0.0` for A and `::` for AAAA.
+    pub enum DnsBlockAnswer { Nxdomain, Unspecified }
+
     pub struct DnsRecordSpec {
         /// Name of the `DNSZone` the record is in.
         pub zone: String,
@@ -1788,18 +1827,75 @@ impl Spec for DnsZoneSpec {
         if domain == "kith" || domain.ends_with(".kith") {
             return Err("domain: names under `kith` are the cluster's own".into());
         }
-        for net in &self.clients {
-            let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
-            let max = match address.parse::<std::net::IpAddr>() {
-                Ok(address) if address.is_ipv4() => 32,
-                Ok(_) => 128,
-                Err(_) => return Err(format!("clients: `{net}` is not a network like `192.168.0.0/16`")),
-            };
-            if bits.is_some_and(|bits| !bits.parse::<u8>().is_ok_and(|bits| bits <= max)) {
-                return Err(format!("clients: `{net}` has a prefix length that is not 0 to {max}"));
+        clients_checked(&self.clients)
+    }
+}
+
+/// Each of `clients` is an address or a network.
+fn clients_checked(clients: &[String]) -> Result<(), String> {
+    for net in clients {
+        let (address, bits) = net.split_once('/').map_or((net.as_str(), None), |(a, b)| (a, Some(b)));
+        let max = match address.parse::<std::net::IpAddr>() {
+            Ok(address) if address.is_ipv4() => 32,
+            Ok(_) => 128,
+            Err(_) => return Err(format!("clients: `{net}` is not a network like `192.168.0.0/16`")),
+        };
+        if bits.is_some_and(|bits| !bits.parse::<u8>().is_ok_and(|bits| bits <= max)) {
+            return Err(format!("clients: `{net}` has a prefix length that is not 0 to {max}"));
+        }
+    }
+    Ok(())
+}
+
+/// The shortest time between two fetches of a list, so a typo cannot make a node hammer a host.
+pub const BLOCK_LIST_MIN_INTERVAL: u64 = 300;
+/// How often a list is fetched when it does not say.
+pub const BLOCK_LIST_INTERVAL: u64 = 86_400;
+
+/// Whether `url` is a plain `https://host[:port]/path` address: no user and password in it, no
+/// spaces or control characters, and a host. (The one place kithd and the checks agree on what
+/// it will fetch.)
+pub fn https_url(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("url: `{url}` is not an https:// address"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("url: needs a host, and no user or password in it".into());
+    }
+    if url.len() > 2048 || url.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control()) {
+        return Err("url: longer than 2048 characters, or holds a space or control character".into());
+    }
+    Ok(())
+}
+
+impl Spec for DnsBlockListSpec {
+    fn check(&self) -> Result<(), String> {
+        match (&self.config_map, &self.url) {
+            (Some(map), None) => {
+                if map.name.is_empty() || map.key.is_empty() {
+                    return Err("configMap: needs a name and a key".into());
+                }
+                if self.sha256.is_some() || self.interval.is_some() {
+                    return Err("sha256 and interval are for a `url` list".into());
+                }
+            }
+            (None, Some(url)) => https_url(url)?,
+            _ => return Err("give exactly one of configMap or url".into()),
+        }
+        if let Some(sha) = &self.sha256
+            && !(sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err("sha256: not 64 hexadecimal digits".into());
+        }
+        if let Some(interval) = &self.interval {
+            match every(interval) {
+                Some(secs) if secs >= BLOCK_LIST_MIN_INTERVAL => {}
+                Some(_) => return Err("interval: at least 5m".into()),
+                None => return Err(format!("interval: `{interval}` is not like `30m`, `24h` or `7d`")),
             }
         }
-        Ok(())
+        clients_checked(&self.clients)
     }
 }
 

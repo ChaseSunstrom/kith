@@ -164,7 +164,7 @@ fn text<'a>(from: &'a Value, field: &str, of: &str) -> Fallible<&'a str> {
 }
 
 /// A reply's body, if it is at most `cap` bytes.
-async fn capped(mut reply: reqwest::Response, url: &str, cap: usize) -> Fallible<Vec<u8>> {
+pub(crate) async fn capped(mut reply: reqwest::Response, url: &str, cap: usize) -> Fallible<Vec<u8>> {
     let longer = || format!("{url}: longer than {cap} bytes");
     if reply.content_length().is_some_and(|length| length > cap as u64) {
         return Err(longer());

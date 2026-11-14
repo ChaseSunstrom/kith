@@ -72,6 +72,8 @@ pub struct Query {
     pub qclass: u16,
     /// The UDP size from the query's OPT record, when it has one.
     pub edns: Option<u16>,
+    /// The extended rcode, version and flags of that record (the DO bit is in them).
+    pub edns_ttl: Option<u32>,
     /// Where that size sits in the packet.
     edns_at: usize,
 }
@@ -85,12 +87,13 @@ impl Query {
         let (qname, p) = read_name(b, 12)?;
         let (qtype, qclass) = (u16_at(b, p)?, u16_at(b, p + 2)?);
         let (an, ns, ar) = (u16_at(b, 6)?, u16_at(b, 8)?, u16_at(b, 10)?);
-        let (mut p, mut edns, mut edns_at) = (p + 4, None, 0);
+        let (mut p, mut edns, mut edns_ttl, mut edns_at) = (p + 4, None, None, 0);
         for i in 0..u32::from(an) + u32::from(ns) + u32::from(ar) {
             p = read_name(b, p)?.1;
             let rdlen = usize::from(u16_at(b, p + 8)?);
             if i >= u32::from(an) + u32::from(ns) && u16_at(b, p)? == 41 && edns.is_none() {
                 (edns, edns_at) = (Some(u16_at(b, p + 2)?), p + 2);
+                edns_ttl = Some(u32::from(u16_at(b, p + 4)?) << 16 | u32::from(u16_at(b, p + 6)?));
             }
             p += 10 + rdlen;
             if p > b.len() {
@@ -104,6 +107,7 @@ impl Query {
             qtype,
             qclass,
             edns,
+            edns_ttl,
             edns_at,
         })
     }
@@ -329,6 +333,85 @@ pub fn answers(b: &[u8]) -> Vec<Record> {
         let Some((r, next)) = record_at(b, p) else { break };
         out.extend(r);
         p = next;
+    }
+    out
+}
+
+/// Where each record of a message sits, OPT records left out: the offset of its TTL, of the
+/// start of its data and of the end of that, and its type.
+struct Span {
+    ty: u16,
+    ttl_at: usize,
+    data: usize,
+    end: usize,
+}
+
+/// The offset after the name at `p`, without reading it (a pointer ends it).
+fn skip_name(b: &[u8], mut p: usize) -> Option<usize> {
+    loop {
+        match *b.get(p)? {
+            0 => return Some(p + 1),
+            n if n & 0xC0 == 0xC0 => return Some(p + 2),
+            n => p += 1 + usize::from(n),
+        }
+    }
+}
+
+fn spans(b: &[u8]) -> Option<Vec<Span>> {
+    let (.., mut p) = question(b)?;
+    let mut out = vec![];
+    for _ in 0..u32::from(u16_at(b, 6)?) + u32::from(u16_at(b, 8)?) + u32::from(u16_at(b, 10)?) {
+        let at = skip_name(b, p)?;
+        let (ty, len) = (u16_at(b, at)?, usize::from(u16_at(b, at + 8)?));
+        let end = at + 10 + len;
+        if end > b.len() {
+            return None;
+        }
+        if ty != 41 {
+            out.push(Span {
+                ty,
+                ttl_at: at + 4,
+                data: at + 10,
+                end,
+            });
+        }
+        p = end;
+    }
+    Some(out)
+}
+
+fn u32_at(b: &[u8], p: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(b.get(p..p + 4)?.try_into().ok()?))
+}
+
+/// How many seconds a response may be kept: the least TTL of its records, and for an SOA the
+/// least of that and its minimum (RFC 2308 says that is how long a negative answer holds).
+/// `None` for a message with no record to say, or one that is not well formed.
+pub fn lifetime(reply: &[u8]) -> Option<u32> {
+    let mut least: Option<u32> = None;
+    for s in spans(reply)? {
+        let mut ttl = u32_at(reply, s.ttl_at)?;
+        if s.ty == 6 && s.end >= s.data + 4 {
+            ttl = ttl.min(u32_at(reply, s.end - 4)?);
+        }
+        least = Some(least.map_or(ttl, |l| l.min(ttl)));
+    }
+    least
+}
+
+/// `reply` with `secs` taken off every TTL (and an SOA's minimum), none below 0.
+pub fn aged(reply: &[u8], secs: u32) -> Vec<u8> {
+    let mut out = reply.to_vec();
+    for s in spans(reply).unwrap_or_default() {
+        let mut take = |at: usize| {
+            if let Some(v) = u32_at(reply, at) {
+                out[at..at + 4].copy_from_slice(&v.saturating_sub(secs).to_be_bytes());
+            }
+        };
+        take(s.ttl_at);
+        if s.ty == 6 && s.end >= s.data + 4 {
+            take(s.end - 4);
+        }
     }
     out
 }

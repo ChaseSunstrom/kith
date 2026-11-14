@@ -151,7 +151,7 @@ fn zones() -> Zones {
     }
     Zones {
         records: r,
-        views: vec![],
+        ..Zones::default()
     }
 }
 
@@ -731,11 +731,20 @@ async fn start_for(
     upstreams: Vec<SocketAddr>,
     forwarders: Vec<Cidr>,
 ) -> (SocketAddr, SocketAddr, watch::Sender<Arc<Zones>>) {
+    start_cached(z, upstreams, forwarders, Arc::default()).await
+}
+
+async fn start_cached(
+    z: Zones,
+    upstreams: Vec<SocketAddr>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<Cache>,
+) -> (SocketAddr, SocketAddr, watch::Sender<Arc<Zones>>) {
     let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (u, t) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let (tx, rx) = watch::channel(Arc::new(z));
-    tokio::spawn(serve(udp, tcp, rx, upstreams, forwarders));
+    tokio::spawn(serve(udp, tcp, rx, upstreams, forwarders, cache));
     (u, t, tx)
 }
 
@@ -1223,4 +1232,337 @@ async fn a_tcp_connection_serves_many_queries_and_junk_ends_it() {
         timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap(),
         Ok(0) | Err(_)
     ));
+}
+
+// --- block lists ---
+
+/// `zones()` with one block list of `list` for clients in `nets` (everyone when empty).
+fn blocking(list: &str, nets: &[&str], null: bool) -> Zones {
+    let nets = nets.iter().map(|n| n.parse().unwrap()).collect();
+    let names = Arc::new(parse_list(list, 1000).names);
+    Zones {
+        blocks: vec![Block { nets, names, null }],
+        ..zones()
+    }
+}
+
+fn forwarded(z: &Zones, client: &str, name: &str) -> bool {
+    let q = query(7, name, A, None);
+    matches!(answer(&q, client.parse().unwrap(), z, true), Answer::Forward)
+}
+
+#[test]
+fn block_a_name_and_every_name_under_it_is_not_there() {
+    let z = blocking("ads.example\n", &[], false);
+    for name in ["ads.example", "ADS.Example", "x.ads.example", "a.b.c.ads.example"] {
+        for ty in [A, 28, TXT] {
+            let r = ask(&z, name, ty);
+            assert_eq!((r.rcode(), r.an.len(), r.ns.len()), (3, 0, 0), "{name}");
+        }
+    }
+    // Names that only look like it, its parent and the rest are asked upstream as before.
+    for name in [
+        "example",
+        "adsx.example",
+        "myads.example",
+        "example.com",
+        "ads.example.com",
+    ] {
+        assert!(forwarded(&z, "127.0.0.1", name), "{name}");
+    }
+    // Our own zones come first: a list cannot hide a name the cluster serves.
+    let z = blocking("web.default.kith\nkith\n", &[], false);
+    assert_eq!(ask(&z, "web.default.kith", A).rcode(), 0);
+}
+
+#[test]
+fn block_can_answer_the_unspecified_address_instead() {
+    let z = blocking("ads.example\n", &[], true);
+    let a = ask(&z, "x.ads.example", A);
+    assert_eq!((a.rcode(), a.an.len(), a.ns.len()), (0, 1, 0));
+    assert_eq!(a.data(&a.an[0]), [0, 0, 0, 0]);
+    let aaaa = ask(&z, "ads.example", 28);
+    assert_eq!((aaaa.rcode(), aaaa.an.len()), (0, 1));
+    assert_eq!(aaaa.data(&aaaa.an[0]), [0; 16]);
+    // Nothing of other types: the name exists, with no such record.
+    for ty in [TXT, 15, ANY] {
+        let r = ask(&z, "ads.example", ty);
+        assert_eq!((r.rcode(), r.an.len()), (0, 0), "type {ty}");
+    }
+    assert!(forwarded(&z, "127.0.0.1", "example.com"));
+}
+
+#[test]
+fn block_applies_to_the_clients_it_names() {
+    let z = blocking("ads.example\n", &["192.168.0.0/16"], false);
+    let blocked = |client: &str| {
+        let q = query(7, "ads.example", A, None);
+        matches!(answer(&q, client.parse().unwrap(), &z, true), Answer::Reply(r) if decode(r.clone()).rcode() == 3)
+    };
+    assert!(blocked("192.168.4.5"));
+    assert!(!blocked("10.1.1.1"));
+    assert!(forwarded(&z, "10.1.1.1", "ads.example"));
+    // Two lists: the first of those that name the client and the name decides.
+    let mut z = blocking("ads.example\n", &["10.0.0.0/8"], true);
+    z.blocks.push(Block {
+        nets: vec![],
+        names: Arc::new(parse_list("ads.example\nmore.example\n", 10).names),
+        null: false,
+    });
+    let a = |name, client: &str| match answer(&query(7, name, A, None), client.parse().unwrap(), &z, true) {
+        Answer::Reply(r) => decode(r),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(a("ads.example", "10.2.2.2").rcode(), 0);
+    assert_eq!(a("ads.example", "11.2.2.2").rcode(), 3);
+    assert_eq!(a("more.example", "10.2.2.2").rcode(), 3);
+}
+
+#[test]
+fn block_lists_are_read_as_hosts_files_or_one_name_a_line() {
+    let text = "# a hosts file\n127.0.0.1 localhost\n0.0.0.0 ads.example tracker.example # two\n\
+                ::1 ip6-localhost\nplain.example\n\nUPPER.Example\r\nnot a name at all\n0.0.0.0\n\
+                1.2.3.4\nbad!.name\n0.0.0.0 0.0.0.0\n";
+    let parsed = parse_list(text, 100);
+    assert!(!parsed.over);
+    // Skipped, and counted: a line of several words that is no hosts line, an address with no
+    // name, an address alone, a name that is not one, and an address given as a name.
+    assert_eq!(parsed.skipped, 5);
+    assert_eq!(parsed.names.len(), 4);
+    for name in ["ads.example", "tracker.example", "plain.example", "upper.example"] {
+        assert!(parsed.names.blocks(name), "{name}");
+    }
+    // The machine's own names a hosts file begins with are left out, not counted as skipped.
+    for name in ["example", "bad!.name", "localhost", "ip6-localhost"] {
+        assert!(!parsed.names.blocks(name), "{name}");
+    }
+    // More names than the bound: the list is not taken.
+    let over = parse_list("a.example\nb.example\nc.example\n", 2);
+    assert!(over.over && over.names.len() <= 2);
+}
+
+#[test]
+fn block_names_are_eight_bytes_each_and_none_allocates_nothing() {
+    let text: String = (0..100_000).map(|i| format!("host{i}.ads.example\n")).collect();
+    let parsed = parse_list(&text, 1_000_000);
+    assert_eq!((parsed.names.len(), parsed.skipped), (100_000, 0));
+    assert_eq!(parsed.names.bytes(), 800_000);
+    assert!(parsed.names.blocks("HOST99999.ads.example") && !parsed.names.blocks("host100000.ads.example"));
+    assert_eq!(parse_list("", 10).names.bytes(), 0);
+    assert!(Zones::default().blocks.is_empty());
+}
+
+// --- the answer cache ---
+
+fn key_of(q: &[u8]) -> cache::Key {
+    cache::Key::new(&wire::Query::parse(q).unwrap())
+}
+
+/// An upstream reply to `q` with `rcode`, `an` and `ns` records (each written out by `rr`).
+fn reply_of(q: &[u8], rcode: u16, an: &[Vec<u8>], ns: &[Vec<u8>]) -> Vec<u8> {
+    let mut r = [u16_at(q, 0), 0x8180 | rcode, 1, an.len() as u16, ns.len() as u16, 0]
+        .iter()
+        .flat_map(|v| v.to_be_bytes())
+        .collect::<Vec<_>>();
+    r.extend(&q[12..]);
+    r.extend(an.concat());
+    r.extend(ns.concat());
+    r
+}
+
+/// SOA data for `example.com` whose negative TTL is `minimum`.
+fn soa_data(minimum: u32) -> Vec<u8> {
+    let mut d = b"\x02ns\x07example\x03com\x00\x04root\x07example\x03com\x00".to_vec();
+    for v in [1u32, 2, 3, 4, minimum] {
+        d.extend(v.to_be_bytes());
+    }
+    d
+}
+
+const SEC: Duration = Duration::from_secs(1);
+
+#[test]
+fn cache_gives_the_remaining_ttl_to_the_clients_id_and_case_and_nothing_past_it() {
+    let (cache, t0) = (Cache::default(), std::time::Instant::now());
+    let q = query(1, "Example.COM", A, None);
+    cache.put(key_of(&q), &upstream_reply(&q, 1), t0);
+    let again = query(9, "eXample.com", A, None);
+    let hit = |after: Duration| cache.get(&key_of(&again), &again, t0 + after).map(decode);
+    let r = hit(20 * SEC).unwrap();
+    assert_eq!((u16_at(&r.raw, 0), ttl(&r, &r.an[0])), (9, 40));
+    assert_eq!(read_name(&r.raw, 12).unwrap().0, "eXample.com");
+    assert_eq!(r.an[0].name, "eXample.com");
+    assert_eq!(r.data(&r.an[0]), [1, 2, 3, 4]);
+    assert_eq!(ttl(&hit(59 * SEC).unwrap(), &r.an[0]), 1);
+    assert!(hit(60 * SEC).is_none());
+    assert!(hit(500 * SEC).is_none());
+    // Once past its TTL it is gone, not kept.
+    assert_eq!(cache.stats().entries, 0);
+}
+
+#[test]
+fn cache_keeps_no_more_than_its_bounds_and_says_so() {
+    let t0 = std::time::Instant::now();
+    let name = |i: usize| format!("n{i}.example");
+    let put = |c: &Cache, i: usize| {
+        let q = query(1, &name(i), A, None);
+        c.put(key_of(&q), &upstream_reply(&q, 1), t0);
+    };
+    let has = |c: &Cache, i: usize| {
+        let q = query(2, &name(i), A, None);
+        c.get(&key_of(&q), &q, t0).is_some()
+    };
+    // Entries: the oldest go first.
+    let c = Cache::new(3, 1 << 20);
+    (0..5).for_each(|i| put(&c, i));
+    assert_eq!((c.stats().entries, c.stats().max_entries), (3, 3));
+    assert!(!has(&c, 0) && !has(&c, 1) && has(&c, 2) && has(&c, 4));
+    // Bytes: what is held, the entries and their keys, stays inside the bound.
+    let c = Cache::new(1000, 600);
+    (0..20).for_each(|i| put(&c, i));
+    let s = c.stats();
+    assert!(
+        s.entries >= 1 && s.entries < 20 && s.bytes <= 600 && s.max_bytes == 600,
+        "{s:?}"
+    );
+    assert!(has(&c, 19) && !has(&c, 0));
+    // One bigger than the whole bound is not taken.
+    let c = Cache::new(10, 50);
+    put(&c, 0);
+    assert_eq!(c.stats().entries, 0);
+    assert_eq!(Cache::default().stats().entries, 0);
+}
+
+#[test]
+fn cache_keeps_no_answer_it_should_not() {
+    let t0 = std::time::Instant::now();
+    let q = query(1, "example.com", A, None);
+    let a = |ttl| rr("example.com", A, ttl, &[1, 2, 3, 4]);
+    let soa = |ttl, min| rr("example.com", 6, ttl, &soa_data(min));
+    let held = |reply: Vec<u8>| {
+        let c = Cache::default();
+        c.put(key_of(&q), &reply, t0);
+        c.stats().entries
+    };
+    assert_eq!(held(reply_of(&q, 0, &[a(60)], &[])), 1);
+    // A SERVFAIL, a REFUSED, a truncated reply, a TTL of 0, and nothing to say how long.
+    assert_eq!(held(reply_of(&q, 2, &[], &[])), 0);
+    assert_eq!(held(reply_of(&q, 5, &[], &[])), 0);
+    let mut truncated = reply_of(&q, 0, &[a(60)], &[]);
+    truncated[2] |= 2;
+    assert_eq!(held(truncated), 0);
+    assert_eq!(held(reply_of(&q, 0, &[a(0)], &[])), 0);
+    assert_eq!(held(reply_of(&q, 0, &[], &[])), 0);
+    assert_eq!(held(reply_of(&q, 3, &[], &[])), 0);
+    // A query (not a response) is no answer.
+    let mut asked = reply_of(&q, 0, &[a(60)], &[]);
+    asked[2] &= 0x7F;
+    assert_eq!(held(asked), 0);
+    // "No such name" with an SOA lasts as long as the SOA's TTL and its minimum, whichever is less.
+    let c = Cache::default();
+    c.put(key_of(&q), &reply_of(&q, 3, &[], &[soa(300, 30)]), t0);
+    let again = query(5, "example.com", A, None);
+    let hit = |after: Duration| c.get(&key_of(&again), &again, t0 + after).map(decode);
+    let r = hit(10 * SEC).unwrap();
+    assert_eq!((r.rcode(), r.ns.len(), ttl(&r, &r.ns[0])), (3, 1, 290));
+    // The minimum a resolver downstream reads counts down too.
+    let min = r.raw.len() - 4;
+    assert_eq!(u32::from_be_bytes(r.raw[min..].try_into().unwrap()), 20);
+    assert!(hit(30 * SEC).is_none());
+    c.put(key_of(&q), &reply_of(&q, 3, &[], &[soa(20, 300)]), t0);
+    assert!(hit(19 * SEC).is_some() && hit(20 * SEC).is_none());
+}
+
+#[test]
+fn cache_tells_apart_types_flags_and_edns() {
+    let (c, t0) = (Cache::default(), std::time::Instant::now());
+    let q = query(1, "example.com", A, None);
+    c.put(key_of(&q), &upstream_reply(&q, 1), t0);
+    let held = |q: &[u8]| c.get(&key_of(q), q, t0).is_some();
+    assert!(held(&q));
+    // Another type, a client that speaks EDNS (its reply has an OPT record), one that asks for
+    // DNSSEC records, one that turns checking off.
+    assert!(!held(&query(1, "example.com", 28, None)));
+    assert!(!held(&query(1, "example.com", A, Some(1232))));
+    let mut dnssec = query(1, "example.com", A, Some(1232));
+    let n = dnssec.len();
+    dnssec[n - 4] = 0x80;
+    assert_ne!(key_of(&dnssec), key_of(&query(1, "example.com", A, Some(1232))));
+    let mut checking = q.clone();
+    checking[3] |= 0x10;
+    assert!(!held(&checking));
+    // The size a client offers is not part of it: the reply is cut to it afterwards.
+    assert_eq!(
+        key_of(&query(1, "example.com", A, Some(1232))),
+        key_of(&query(2, "EXAMPLE.com", A, Some(4096)))
+    );
+}
+
+/// An upstream on a UDP port that counts what it is asked, and says 1.2.3.4 with TTL 60.
+async fn counting_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (addr, asked) = (
+        udp.local_addr().unwrap(),
+        Arc::<std::sync::atomic::AtomicUsize>::default(),
+    );
+    let count = asked.clone();
+    tokio::spawn(async move {
+        let mut buf = [0; 512];
+        loop {
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            udp.send_to(&upstream_reply(&buf[..n], u16_at(&buf, 0)), from)
+                .await
+                .unwrap();
+        }
+    });
+    (addr, asked)
+}
+
+async fn udp_ask_from(from: &str, to: SocketAddr, q: &[u8]) -> Reply {
+    let s = UdpSocket::bind(format!("{from}:0")).await.unwrap();
+    s.send_to(q, to).await.unwrap();
+    let mut buf = vec![0; 4096];
+    let (n, _) = timeout(Duration::from_secs(5), s.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    decode(buf[..n].to_vec())
+}
+
+#[tokio::test]
+async fn cache_serves_a_repeat_without_asking_upstream_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (up, asked) = counting_upstream().await;
+    let cache = Arc::new(Cache::default());
+    let (u, t, _tx) = start_cached(zones(), vec![up], vec![], cache.clone()).await;
+    let ask_as = |who: &'static str, name: &'static str, id| async move {
+        let r = udp_ask_from(who, u, &query(id, name, A, None)).await;
+        assert_eq!((u16_at(&r.raw, 0), r.data(&r.an[0])), (id, &[1, 2, 3, 4][..]));
+    };
+    ask_as("127.0.0.1", "example.com", 11).await;
+    ask_as("127.0.0.1", "example.com", 12).await;
+    // Another client gets the same answer to the same question.
+    ask_as("127.0.0.2", "Example.com", 13).await;
+    assert_eq!(asked.load(SeqCst), 1);
+    // TCP clients are served from it too, with the whole message.
+    let r = tcp_ask(t, &query(15, "EXAMPLE.com", A, None)).await;
+    assert_eq!((u16_at(&r.raw, 0), r.an.len(), asked.load(SeqCst)), (15, 1, 1));
+    // Another name is asked.
+    ask_as("127.0.0.1", "example.org", 16).await;
+    assert_eq!(asked.load(SeqCst), 2);
+    let s = cache.stats();
+    assert_eq!((s.entries, s.hits, s.misses), (2, 3, 2));
+}
+
+#[tokio::test]
+async fn cache_is_not_asked_about_names_a_list_blocks_or_zones_hold() {
+    let (up, asked) = counting_upstream().await;
+    let z = blocking("ads.example\n", &[], false);
+    let (u, _, _tx) = start(z, vec![up]).await;
+    for id in 1..4 {
+        assert_eq!(udp_ask(u, &query(id, "x.ads.example", A, None)).await.rcode(), 3);
+        assert_eq!(udp_ask(u, &query(id, "web.default.kith", A, None)).await.rcode(), 0);
+    }
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

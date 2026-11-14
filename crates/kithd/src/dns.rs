@@ -213,7 +213,15 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
     };
     let views = lists.iter().filter(|clients| !clients.is_empty()).map(view).collect();
     let records = assemble(&[]);
-    (Zones { records, views }, status)
+    // (The block lists come from `blocklist`, put in by `run`.)
+    (
+        Zones {
+            records,
+            views,
+            blocks: Vec::new(),
+        },
+        status,
+    )
 }
 
 /// The resolvers in `/etc/resolv.conf`, for names that are not ours.
@@ -269,6 +277,19 @@ pub async fn run(
         eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
     }
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
+    // The lists of names to answer as not there, and the answers kept from the upstreams.
+    let cache = Arc::new(kith_dns::Cache::default());
+    let (listed, mut lists) = watch::channel(Arc::new(Vec::<kith_dns::Block>::new()));
+    let lists_now = lists.clone();
+    let blocks = crate::blocklist::run(shared.clone(), cache.clone(), listed);
+    let relist = async {
+        // A change to the lists goes into the zones being served; the cache needs no flush, for
+        // it sits behind them.
+        while lists.changed().await.is_ok() {
+            let blocks = lists.borrow_and_update().to_vec();
+            zones.send_modify(|zones| Arc::make_mut(zones).blocks = blocks);
+        }
+    };
     let feed = async {
         let mut generation = shared.generation.subscribe();
         // What the zones were last built from: most changes to the store are not about DNS.
@@ -296,7 +317,8 @@ pub async fn run(
                         .cluster
                         .as_ref()
                         .map(|cluster| crate::mesh::prefix(&cluster.me.ca));
-                    let (built, reports) = zones_of(&state.store, mesh);
+                    let (mut built, reports) = zones_of(&state.store, mesh);
+                    built.blocks = lists_now.borrow().to_vec();
                     zones.send_replace(Arc::new(built));
                     let stale = |(key, report): &(String, Value)| {
                         let live = state.store.get(key).and_then(|resource| resource.status.as_ref());
@@ -322,8 +344,10 @@ pub async fn run(
         }
     };
     tokio::select! {
-        () = kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect()) => {}
+        () = kith_dns::serve(udp, tcp, served, upstreams, pods.into_iter().collect(), cache) => {}
         () = feed => {}
+        () = relist => {}
+        () = blocks => {}
         _ = stopping.changed() => {}
     }
 }
