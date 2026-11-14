@@ -1517,6 +1517,19 @@ spec:
   it holds together.
 - `kith get deviceclaim render -o yaml` shows `status.node`, `status.devices` and
   `status.holders`; a claim that comes to nothing has a `status.message` instead.
+- **A share of a GPU's vram.** A `shared` claim may say `share: { vram: 512Mi }`: what it
+  asks for of each Device it holds, counted against the Device's `vram` label (a node writes
+  it from the card's total vram). A workload's shares add up; a share that does not fit
+  waits, and its message gives the numbers (`has 0 of its 1073741824 vram bytes free, and
+  the share asks for 536870912`). `status.share` gives each Device's `asked` and `of`, and
+  `status.shareBytes` the share the claim was admitted with; a Device with no `vram` label
+  it can read admits the share and says `counted: false`. A holder keeps its share when the
+  label drops below what they ask, but a claim that asks for more than it held is fitted
+  again. **Nothing enforces a
+  share: it is cooperative.** kith counts it and does not stop an app that uses more vram
+  than it asked for. No driver is held to it by kith yet. Untried options: a driver's own
+  memory limit where the driver has one (the kernel's `dmem` cgroup controller), NVIDIA's
+  MPS limits, and MIG partitions, which would be Devices of their own.
 - A container is given the device nodes of its Devices in its own `/dev`, beside the few
   every container has (`null`, `zero`, `full`, `random`, `urandom`, `tty`). A GPU brings its render
   node (`/dev/dri/renderD*`) with its card, and a card on NVIDIA's driver its `nodes`; a
