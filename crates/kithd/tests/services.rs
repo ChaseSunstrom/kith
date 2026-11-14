@@ -256,8 +256,13 @@ fn the_api_answers_as_fast_with_the_proxy_busy() {
     let named_busy = a.names_in("a.node.kith");
     eprintln!("the API answers in {idle:?} with the proxy idle, {busy:?} with it busy");
     eprintln!("DNS answers in {named:?} with the proxy idle, {named_busy:?} with it busy");
-    // (Twice as long, and a millisecond, for a machine busy with other things.)
-    let as_fast = |idle: Duration, busy: Duration| busy <= idle * 2 + Duration::from_millis(1);
+    // (Below three cores the proxy's threads and kithd's own share them: nothing to compare.)
+    if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) < 3 {
+        return;
+    }
+    // (Four times as long, and two milliseconds, for a machine busy with other things: the
+    // API on the proxy's thread took fifteen times as long, 0.36 ms to 5.4 ms.)
+    let as_fast = |idle: Duration, busy: Duration| busy <= idle * 4 + Duration::from_millis(2);
     assert!(as_fast(idle, busy), "the API: {idle:?} idle, {busy:?} busy");
     assert!(as_fast(named, named_busy), "DNS: {named:?} idle, {named_busy:?} busy");
 }

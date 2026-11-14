@@ -825,9 +825,8 @@ pub async fn run(
             if listening.contains_key(&key) {
                 continue;
             }
-            // (One that fails is dropped with the ones bound before it, and all tried again.)
-            let at = SocketAddr::new(key.0.into(), key.1);
-            let Ok(listeners) = threads.iter().map(|_| listen(at)).collect::<std::io::Result<Vec<_>>>() else {
+            // (Until the last thread's handle on the one bound before is dropped, tried again.)
+            let Ok(listeners) = listen(SocketAddr::new(key.0.into(), key.1), threads.len()) else {
                 waiting = true;
                 continue;
             };
@@ -865,18 +864,23 @@ pub async fn run(
         .for_each(tokio::task::JoinHandle::abort);
 }
 
-/// A listener on `at` that the other threads' listeners of it share the port with.
-fn listen(at: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+/// `threads` handles on one listener on `at`, one for each thread: one accept queue,
+/// which whichever thread is free takes from, and a port no other socket may share.
+fn listen(at: SocketAddr, threads: usize) -> std::io::Result<Vec<std::net::TcpListener>> {
     let socket = if at.is_ipv6() {
         tokio::net::TcpSocket::new_v6()?
     } else {
         tokio::net::TcpSocket::new_v4()?
     };
-    // (Only a process of kithd's own user may share it: the kernel says so.)
-    socket.set_reuseport(true)?;
     socket.set_reuseaddr(true)?;
     socket.bind(at)?;
-    socket.listen(1024)?.into_std()
+    // (Not blocking, as a runtime needs: and so are its clones, which share that.)
+    let listener = socket.listen(1024)?.into_std()?;
+    let mut all = (1..threads)
+        .map(|_| listener.try_clone())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    all.push(listener);
+    Ok(all)
 }
 
 /// The threads the connections to Services are on, each with a runtime of its own: the
@@ -1086,7 +1090,7 @@ spec:
     }
 
     #[tokio::test]
-    async fn services_are_on_a_thread_a_core_each_listening_on_the_same_port() {
+    async fn services_are_on_a_thread_a_core_taking_from_one_listener() {
         let named = || {
             let tasks = std::fs::read_dir("/proc/self/task").unwrap().flatten();
             let comm = |task: std::fs::DirEntry| std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
@@ -1104,29 +1108,49 @@ spec:
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(named() - before, cores.min(THREADS));
-        // Each thread's listener of a port shares it with the others'.
-        let first = listen("127.0.0.1:0".parse().unwrap()).unwrap();
-        let at = first.local_addr().unwrap();
-        let second = listen(at).unwrap();
+        // Every thread takes from the one listener of a port; each connection is taken once.
+        let listeners = listen("127.0.0.1:0".parse().unwrap(), threads.len()).unwrap();
+        let at = listeners[0].local_addr().unwrap();
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let on = |listener: std::net::TcpListener, thread: &tokio::runtime::Handle| {
-            thread.spawn(async move { TcpListener::from_std(listener).unwrap().accept().await.is_ok() })
+            let taken = taken.clone();
+            thread.spawn(async move {
+                let listener = TcpListener::from_std(listener).unwrap();
+                while let Ok((stream, _)) = listener.accept().await {
+                    taken.fetch_add(1, Ordering::Relaxed);
+                    drop(stream);
+                }
+            })
         };
-        let (first, second) = (on(first, &threads[0]), on(second, &threads[threads.len() - 1]));
-        // (Refused once both have taken one and closed, before the loop sees it.)
-        let mut clients = Vec::new();
-        for _ in 0..1000 {
-            if first.is_finished() && second.is_finished() {
-                break;
-            }
-            clients.push(TcpStream::connect(at).await);
+        let tasks: Vec<_> = listeners
+            .into_iter()
+            .zip(&threads)
+            .map(|(l, thread)| on(l, thread))
+            .collect();
+        for _ in 0..200 {
+            TcpStream::connect(at).await.unwrap();
         }
-        let both = tokio::time::timeout(Duration::from_secs(5), async {
-            first.await.unwrap() && second.await.unwrap()
-        });
-        assert!(
-            both.await.unwrap_or(false),
-            "the kernel gave every connection to one listener"
-        );
+        let all = async {
+            while taken.load(Ordering::Relaxed) < 200 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(5), all).await.is_ok());
+        assert_eq!(taken.load(Ordering::Relaxed), 200);
+        tasks.iter().for_each(tokio::task::JoinHandle::abort);
+    }
+
+    /// A Service's port is kithd's alone: another socket asking to share it (as one of the
+    /// same user may) is refused, and takes none of its connections before they are admitted.
+    #[tokio::test]
+    async fn no_other_socket_shares_a_services_port() {
+        let ours = listen("127.0.0.1:0".parse().unwrap(), 2).unwrap();
+        let at = ours[0].local_addr().unwrap();
+        let other = tokio::net::TcpSocket::new_v4().unwrap();
+        other.set_reuseport(true).unwrap();
+        other.set_reuseaddr(true).unwrap();
+        let bound = other.bind(at).and_then(|()| other.listen(1).map(drop));
+        assert_eq!(bound.map_err(|e| e.kind()), Err(std::io::ErrorKind::AddrInUse));
     }
 
     /// Two connected loopback sockets: (the one a client holds, the one the proxy holds).
