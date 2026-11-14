@@ -179,11 +179,12 @@ pub fn remove(name: &str) -> Result<()> {
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
 /// (the kernel takes what is past the request's end as zeros). What the kernel answers.
 ///
-/// For the two commands of [`cgroup_program`] only: neither has the kernel write through
-/// the request, and what the request points at is alive for the call.
+/// For the two commands of [`cgroup_program`] only: the kernel writes only to the log
+/// room a load may point at, and what the request points at is alive for the call.
 fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
     // SAFETY: `request` is `request.len()` readable bytes, and the pointers in it (see
-    // `cgroup_program`) are to memory its caller holds until this returns.
+    // `cgroup_program`) are to memory its caller holds until this returns, the log room
+    // writable and as big as the request says.
     let said = unsafe { libc::syscall(libc::SYS_bpf, command, request.as_ptr(), request.len()) };
     if said < 0 {
         Err(Error::last_os_error())
@@ -224,7 +225,25 @@ fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Resu
     load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
     load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
     load[68..72].copy_from_slice(&attach.to_ne_bytes());
-    let loaded = bpf(5, &load)?;
+    let loaded = match bpf(5, &load) {
+        Ok(loaded) => loaded,
+        Err(refused) => {
+            // Loaded once more with room for what the verifier says (at 24: how much, how
+            // big the room is, where it is), whose last lines say why.
+            let mut log = vec![0u8; 1 << 16];
+            load[24..28].copy_from_slice(&1u32.to_ne_bytes());
+            load[28..32].copy_from_slice(&(log.len() as u32).to_ne_bytes());
+            load[32..40].copy_from_slice(&(log.as_mut_ptr() as u64).to_ne_bytes());
+            if let Ok(loaded) = bpf(5, &load) {
+                loaded
+            } else {
+                let said = String::from_utf8_lossy(&log[..log.iter().position(|&b| b == 0).unwrap_or(log.len())]);
+                let lines: Vec<&str> = said.lines().filter(|line| !line.trim().is_empty()).collect();
+                let tail = lines[lines.len().saturating_sub(6)..].join(" / ");
+                return Err(Error::new(refused.kind(), format!("{refused}: the verifier: {tail}")));
+            }
+        }
+    };
     // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
     let loaded = unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) };
     // BPF_PROG_ATTACH: to which cgroup, which program, as what, and with no flags: the

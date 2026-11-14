@@ -358,7 +358,9 @@ fn main() {
             }
         }
         ["echo"] => {
-            let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
+            // (On IPv6 and IPv4 both, where the pod has IPv6: the kernel sends a connection
+            // on the node's own network to a replica's IPv6 address only.)
+            let listener = TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).expect("port 80");
             for stream in listener.incoming().flatten() {
                 std::thread::spawn(move || echo(stream));
             }

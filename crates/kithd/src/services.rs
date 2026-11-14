@@ -808,6 +808,25 @@ pub async fn run(
             };
             (table, reports, plans)
         };
+        // Where each replica here the kernel may pass to is asked; then, before anything that
+        // waits, what may no longer be passed (a NetworkPolicy, a replica gone, a pod made
+        // again) is taken from the kernel, and only then are the new ones asked. (Taken only:
+        // what is added waits for this round's table, with the ports to kithd in it.)
+        let asked: BTreeMap<Backend, Vec<Ipv6Addr>> = {
+            let pods = shared.pods.lock().expect("nothing panics holding the pods");
+            let at = |(_, _, workload, replica): &Backend| {
+                let pod = replica.map_or_else(Vec::new, |replica| {
+                    pods.addresses(&crate::controller::pod_of(workload, replica))
+                });
+                reachable(*replica, pod)
+            };
+            let here = plans.iter().flat_map(|plan| &plan.here);
+            here.map(|backend| (backend.clone(), at(backend))).collect()
+        };
+        forget(&mut probed, &asked);
+        let mut kept = kernel_entries(&plans, &probed, &mut Table::new());
+        kept.retain(|entry| kernel.as_ref().is_some_and(|(_, last)| last.contains(entry)));
+        install(&mut kernel, kept, &listening);
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) && !reports.is_empty() {
             let reported = shared.submit(kith_store::Command::Patch { statuses: reports }).await;
@@ -815,10 +834,10 @@ pub async fn run(
                 eprintln!("kithd: services: writing their status: {e}");
             }
         }
-        let mut entries = match kernel {
-            Some(_) => kernel_entries(&shared, &plans, &mut probed, &mut wanted).await,
-            None => Vec::new(),
-        };
+        if kernel.is_some() {
+            ask_where(&asked, &mut probed).await;
+        }
+        let entries = kernel_entries(&plans, &probed, &mut wanted);
         // The relay, and one listener for each Service port; one whose address is not on
         // the interface yet (the mesh puts it there) is tried again shortly.
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
@@ -872,26 +891,7 @@ pub async fn run(
             });
             listening.insert(key, tasks.collect());
         }
-        // The kernel's program, made again when what it passes changes: never sending a
-        // share to a port of kithd's that is not listened on yet. (Between a replica going
-        // and this rebuild, which the store's change wakes, its share still goes to it.)
-        if let Some((netns, last)) = &mut kernel {
-            entries.retain(|entry| {
-                entry
-                    .elsewhere
-                    .is_none_or(|port| listening.contains_key(&(entry.service.0, port)))
-            });
-            if entries != *last {
-                if let Err(e) = connect::attach(&entries, *netns) {
-                    // (Left with nothing in it, if the kernel takes that much.)
-                    let _ = connect::attach(&[], *netns);
-                    eprintln!("kithd: services: kithd passes every connection itself: the kernel's program: {e}");
-                    kernel = None;
-                } else {
-                    *last = entries;
-                }
-            }
-        }
+        install(&mut kernel, entries, &listening);
         let again = Duration::from_millis(if waiting { 500 } else { 5000 });
         tokio::select! {
             _ = generation.changed() => {}
@@ -908,6 +908,41 @@ pub async fn run(
         .flatten()
         .chain(&stray)
         .for_each(tokio::task::JoinHandle::abort);
+}
+
+/// The kernel's program (`kernel`: the network namespace it passes for, and what it has),
+/// made again when what it passes changes: never sending a share to a port of kithd's that
+/// is not listened on yet. (Between a replica going and the rebuild, which the store's
+/// change wakes, its share still goes to it.) Refused, it is emptied, and kithd passes
+/// every connection itself from then on.
+fn install(
+    kernel: &mut Option<(u64, Vec<connect::Entry>)>,
+    mut entries: Vec<connect::Entry>,
+    listening: &BTreeMap<(Ipv6Addr, u16), Vec<tokio::task::JoinHandle<()>>>,
+) {
+    let Some((netns, last)) = kernel else {
+        return;
+    };
+    entries.retain(|entry| {
+        entry
+            .elsewhere
+            .is_none_or(|port| listening.contains_key(&(entry.service.0, port)))
+    });
+    if entries == *last {
+        return;
+    }
+    let Err(e) = connect::attach(&entries, *netns) else {
+        *last = entries;
+        return;
+    };
+    match connect::attach(&[], *netns) {
+        Ok(()) => eprintln!("kithd: services: kithd passes every connection itself: the kernel's program: {e}"),
+        Err(left) => eprintln!(
+            "kithd: services: the kernel's program: {e}; nor could it be emptied ({left}): \
+             the one before may still pass connections to a replica here"
+        ),
+    }
+    *kernel = None;
 }
 
 /// A Service port the kernel may pass on ([`connect`]): its backends here, which it
@@ -962,58 +997,66 @@ fn kernel_plan(store: &Store, table: &Table, me: &str) -> Vec<Plan> {
     plans
 }
 
-/// Where a replica here answers on `port`: at one of its pod's addresses (`pod`, the first
-/// that does: a replica may listen on IPv4 only), or with no pod on the machine's loopback,
-/// v4 first.
-async fn probe(pod: Vec<IpAddr>, port: u16) -> Option<std::net::SocketAddrV6> {
-    let loopback = vec![std::net::Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()];
-    for ip in if pod.is_empty() { loopback } else { pod } {
+/// Each replica here the kernel may pass to, where it answered, and the addresses it was
+/// asked at ([`reachable`] then): kept while those stay what it would be asked at.
+type Probed = BTreeMap<Backend, (Vec<Ipv6Addr>, std::net::SocketAddrV6)>;
+
+/// Where a replica here is asked: its pod's IPv6 addresses, of `pod` (none before its pod
+/// is made: never the machine's loopback, where something else may listen), or with no pod
+/// the machine's IPv6 loopback. Never an IPv4 one: a socket made IPv6-only could not reach
+/// it once the kernel wrote it in, so a replica on IPv4 only is left to kithd.
+fn reachable(replica: Option<u32>, pod: Vec<IpAddr>) -> Vec<Ipv6Addr> {
+    match replica {
+        None => vec![Ipv6Addr::LOCALHOST],
+        Some(_) => pod
+            .into_iter()
+            .filter_map(|ip| match ip {
+                IpAddr::V6(ip) => Some(ip),
+                IpAddr::V4(_) => None,
+            })
+            .collect(),
+    }
+}
+
+/// Where a replica answers on `port`: the first of `at` that does.
+async fn probe(at: Vec<Ipv6Addr>, port: u16) -> Option<std::net::SocketAddrV6> {
+    for ip in at {
         if within(TcpStream::connect((ip, port))).await.is_ok() {
-            let ip = match ip {
-                IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-                IpAddr::V6(ip) => ip,
-            };
             return Some(std::net::SocketAddrV6::new(ip, port, 0, 0));
         }
     }
     None
 }
 
-/// The program's entries for `plans`, each replica here where it answered (asked once
-/// while it stays in the table, `probed`); a port with one that does not is left to kithd.
-/// The ports to kithd for the others go into `wanted`.
-async fn kernel_entries(
-    shared: &Shared,
-    plans: &[Plan],
-    probed: &mut BTreeMap<Backend, std::net::SocketAddrV6>,
-    wanted: &mut Table,
-) -> Vec<connect::Entry> {
-    probed.retain(|backend, _| plans.iter().any(|plan| plan.here.contains(backend)));
-    let asked: BTreeSet<&Backend> = plans
+/// Forget each replica `probed` that is not to be asked again at the same addresses
+/// (`asked`, from [`reachable`]): gone from the plans, or its pod made again elsewhere.
+fn forget(probed: &mut Probed, asked: &BTreeMap<Backend, Vec<Ipv6Addr>>) {
+    probed.retain(|backend, (at, _)| asked.get(backend) == Some(at));
+}
+
+/// Ask each replica of `asked` not in `probed` where it answers; keep what does. One with
+/// nowhere to ask, or that does not answer, is asked again next time.
+async fn ask_where(asked: &BTreeMap<Backend, Vec<Ipv6Addr>>, probed: &mut Probed) {
+    let new: Vec<(&Backend, &Vec<Ipv6Addr>)> = asked
         .iter()
-        .flat_map(|plan| &plan.here)
-        .filter(|backend| !probed.contains_key(*backend))
+        .filter(|(backend, at)| !at.is_empty() && !probed.contains_key(*backend))
         .collect();
-    let pods: Vec<Vec<IpAddr>> = {
-        let pods = shared.pods.lock().expect("nothing panics holding the pods");
-        let pod = |(_, _, workload, replica): &Backend| {
-            replica.map_or_else(Vec::new, |replica| {
-                pods.addresses(&crate::controller::pod_of(workload, replica))
-            })
-        };
-        asked.iter().map(|backend| pod(backend)).collect()
-    };
-    let found =
-        futures_util::future::join_all(asked.iter().zip(pods).map(|(backend, pod)| probe(pod, backend.1))).await;
-    probed.extend(
-        asked
-            .into_iter()
-            .zip(found)
-            .filter_map(|(backend, at)| Some((backend.clone(), at?))),
-    );
+    let found = futures_util::future::join_all(new.iter().map(|(backend, at)| probe(at.to_vec(), backend.1))).await;
+    for ((backend, at), found) in new.into_iter().zip(found) {
+        if let Some(found) = found {
+            probed.insert(backend.clone(), (at.clone(), found));
+        }
+    }
+}
+
+/// The program's entries for `plans`, each replica here where it answered (`probed`); a
+/// port with one that has not is left to kithd. The ports to kithd for the others go into
+/// `wanted`.
+fn kernel_entries(plans: &[Plan], probed: &Probed, wanted: &mut Table) -> Vec<connect::Entry> {
     let mut entries = Vec::new();
     for plan in plans {
-        let Some(here) = plan.here.iter().map(|backend| probed.get(backend).copied()).collect() else {
+        let here = plan.here.iter().map(|backend| probed.get(backend).map(|(_, at)| *at));
+        let Some(here) = here.collect() else {
             continue;
         };
         if let Some(port) = plan.elsewhere {
@@ -1807,25 +1850,60 @@ spec:
     }
 
     #[tokio::test]
-    async fn the_kernel_sends_a_connection_only_where_a_replica_answers() {
-        // On the machine's loopback, as kithd reaches one: by its v4 address, mapped.
-        let v4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let port = v4.local_addr().unwrap().port();
-        let mapped = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
-        assert_eq!(
-            probe(Vec::new(), port).await,
-            Some(std::net::SocketAddrV6::new(mapped, port, 0, 0))
-        );
-        // A pod's by one of its own addresses: the IPv4 one, where it listens on no other
-        // (as ci/pod.rs's echo, on 0.0.0.0, with a mesh address first).
-        let pod = vec![Ipv6Addr::LOCALHOST.into(), std::net::Ipv4Addr::LOCALHOST.into()];
-        assert_eq!(
-            probe(pod.clone(), port).await,
-            Some(std::net::SocketAddrV6::new(mapped, port, 0, 0))
-        );
+    async fn the_kernel_sends_a_connection_only_where_a_replica_answers_on_ipv6() {
+        // Where a replica here is asked: its pod's IPv6 addresses (a socket made IPv6-only
+        // reaches no IPv4 one the kernel writes in), none before its pod is made (never the
+        // machine's loopback, where something else may listen), and with no pod that loopback.
+        let mesh: Ipv6Addr = "fd00::7".parse().unwrap();
+        let v4 = std::net::Ipv4Addr::new(100, 88, 0, 7);
+        assert_eq!(reachable(Some(0), vec![mesh.into(), v4.into()]), [mesh]);
+        assert!(reachable(Some(0), vec![v4.into()]).is_empty());
+        assert!(reachable(Some(0), vec![]).is_empty());
+        assert_eq!(reachable(None, vec![]), [Ipv6Addr::LOCALHOST]);
+        // A replica that listens on IPv4 only is left to kithd.
+        let only_v4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = only_v4.local_addr().unwrap().port();
+        assert_eq!(probe(vec![Ipv6Addr::LOCALHOST], port).await, None);
+        // (A replica's address here is the IPv4 loopback's mapped one: what runs the tests
+        // may have no IPv6 loopback.)
+        let replica = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = replica.local_addr().unwrap().port();
+        let loopback = std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        let backend = ("a".to_string(), port, "Workload/default/web".to_string(), Some(0));
+        let plans = [Plan {
+            service: ("fd00::80".parse().unwrap(), 80),
+            here: vec![backend.clone()],
+            others: vec![],
+            elsewhere: None,
+        }];
+        let entry = |ip| connect::Entry {
+            service: plans[0].service,
+            here: vec![std::net::SocketAddrV6::new(ip, port, 0, 0)],
+            all: 1,
+            elsewhere: None,
+        };
+        let mut probed = Probed::new();
+        // Its pod not made yet: the port stays kithd's this round, and nothing is kept.
+        let mut asked = BTreeMap::from([(backend.clone(), vec![])]);
+        forget(&mut probed, &asked);
+        ask_where(&asked, &mut probed).await;
+        assert_eq!(kernel_entries(&plans, &probed, &mut Table::new()), []);
+        assert!(probed.is_empty());
+        // Made: asked, kept, and the kernel's.
+        asked.insert(backend.clone(), vec![loopback]);
+        forget(&mut probed, &asked);
+        ask_where(&asked, &mut probed).await;
+        assert_eq!(kernel_entries(&plans, &probed, &mut Table::new()), [entry(loopback)]);
+        // What was kept of a pod made before under the same name, at other addresses (its
+        // number given again), is forgotten, and the pod there now asked.
+        let old = std::net::SocketAddrV6::new(mesh, port, 0, 0);
+        probed.insert(backend.clone(), (vec![mesh], old));
+        forget(&mut probed, &asked);
+        assert_eq!(kernel_entries(&plans, &probed, &mut Table::new()), []);
+        ask_where(&asked, &mut probed).await;
+        assert_eq!(kernel_entries(&plans, &probed, &mut Table::new()), [entry(loopback)]);
         // Nothing listening: none, and kithd passes that Service port's connections itself.
-        drop(v4);
-        assert_eq!(probe(Vec::new(), port).await, None);
-        assert_eq!(probe(pod, port).await, None);
+        drop(replica);
+        assert_eq!(probe(vec![loopback], port).await, None);
     }
 }

@@ -423,7 +423,8 @@ sys.exit(1)
             done
             # A Job on the same node sending to it through the Service, twice: in a pod of its
             # own (kithd passes its bytes), and on the node's own network (the kernel sends
-            # its connections straight to the replica). What each says is in $work/JOB.out.
+            # its connections straight to the replica's IPv6 address, never a v4 one an
+            # IPv6-only socket could not reach). What each says is in $work/JOB.out.
             checked=''
             for job in check near; do
                 if [ "$job" = check ]; then pod='"pod":true,' to=echo; else pod='' to=$address; fi
@@ -450,7 +451,7 @@ EOF
                 if [ "$job" = check ]; then
                     [ "$reached" = "[$address]:80" ] || fail "a pod's connection to the Service reached $reached, not kithd at [$address]:80"
                 else
-                    case $reached in "[$address]:80" | [!0-9[]*) fail "a connection on the node's own network to the Service reached $reached, not the replica: the kernel did not send it there" ;; esac
+                    case $reached in "[$address]:80" | "[::ffff:"* | [![]*) fail "a connection on the node's own network to the Service reached $reached, not the replica: the kernel did not send it there" ;; esac
                 fi
                 checked="$checked${checked:+; }$job: ${said#check: }, reached $reached"
             done
