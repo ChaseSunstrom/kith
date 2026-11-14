@@ -1,0 +1,109 @@
+{
+ "apply.peak": 2.59,
+ "apply.peak.budget": 4,
+ "by_crate": {
+  "kith-cli": [
+   4476,
+   30
+  ],
+  "kith-yaml": [
+   942,
+   9
+  ],
+  "kith-api": [
+   3869,
+   30
+  ],
+  "kith-packages": [
+   852,
+   8
+  ],
+  "kith-sched": [
+   913,
+   21
+  ],
+  "kith-runtime": [
+   3146,
+   21
+  ],
+  "kith-dns": [
+   2351,
+   41
+  ],
+  "kith-mesh": [
+   789,
+   2
+  ],
+  "kith-store": [
+   1085,
+   7
+  ],
+  "kith-dm-sys": [
+   203,
+   3
+  ],
+  "kithd": [
+   30530,
+   227
+  ]
+ },
+ "crates": 11,
+ "kinds": 33,
+ "kith.size": 2.84,
+ "kith.size.budget": 3,
+ "kithd.idle": 7.59,
+ "kithd.idle.budget": 9,
+ "kithd.size": 12.52,
+ "kithd.size.budget": 13,
+ "measured": "2026-11-13",
+ "os.image": 282,
+ "os.root": 6.2,
+ "os.update": 32.1,
+ "refused": 40,
+ "refused.names": [
+  "mount",
+  "umount2",
+  "pivot_root",
+  "open_tree",
+  "move_mount",
+  "fsopen",
+  "fsconfig",
+  "fsmount",
+  "fspick",
+  "mount_setattr",
+  "open_by_handle_at",
+  "unshare",
+  "setns",
+  "clone",
+  "clone3",
+  "init_module",
+  "finit_module",
+  "delete_module",
+  "kexec_load",
+  "kexec_file_load",
+  "reboot",
+  "swapon",
+  "swapoff",
+  "acct",
+  "settimeofday",
+  "clock_settime",
+  "bpf",
+  "perf_event_open",
+  "userfaultfd",
+  "io_uring_setup",
+  "io_uring_enter",
+  "io_uring_register",
+  "add_key",
+  "request_key",
+  "keyctl",
+  "ptrace",
+  "process_vm_readv",
+  "process_vm_writev",
+  "kcmp",
+  "pidfd_getfd"
+ ],
+ "rust_lines": 49156,
+ "tests": 399,
+ "version": "1.0.0",
+ "vm_tests": 10
+}

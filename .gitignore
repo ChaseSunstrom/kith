@@ -2,3 +2,4 @@
 .kith/
 /sdk/**/target
 /sdk/**/Cargo.lock
+__pycache__/

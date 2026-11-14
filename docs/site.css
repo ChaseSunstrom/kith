@@ -1,0 +1,308 @@
+/* kith's page, drawn as a line map: paper, ink, and one blue line (DESIGN.md, "Direction").
+   The page's rail is the stem of the k in the bar, carried down; every part is a stop on it. */
+@font-face {
+  font-family: Overpass;
+  src: url(fonts/overpass.woff2) format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+:root {
+  --bg: #f6f5f1;
+  --sunken: #eceae3;
+  --text: #16181d;
+  --dim: #575c69;
+  --hair: #cfccc2;
+  --accent: #2f5fe0;
+  --accent-text: #2a57cf;
+  --warn: #8f5f00;
+  --bad: #c23030;
+  --on-accent: #ffffff;
+  --stroke: 3px;
+  --stop: 20px;
+  --small: 13px;
+  --note: 15px;
+  --base: 17px;
+  --large: 21px;
+  --head: 28px;
+  --title: 48px;
+  --quick: 140ms;
+  --arrive: 220ms;
+  --enter: 360ms;
+  --pop: 500ms;
+  --reveal: 600ms;
+  --grow: 900ms;
+  --write: 2.2s;
+  --step: 80ms;
+  --breath: 2.6s;
+  --blink: 1s;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --sans: Overpass, "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+  --mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --gutter: 24px;
+  --rail: 56px;
+  --gap: 128px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181d;
+    --sunken: #20232b;
+    --text: #f6f5f1;
+    --dim: #a9aebb;
+    --hair: #383d4a;
+    --accent: #5b8cff;
+    --accent-text: #8fb0ff;
+    --warn: #f2b84b;
+    --bad: #ff7a7a;
+    --on-accent: #0d1017;
+  }
+}
+@media (max-width: 720px) {
+  :root { --gutter: 16px; --rail: 28px; --gap: 80px; --title: 28px; --head: 21px; --large: 17px; --base: 16px; }
+}
+
+*, ::before, ::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 400 var(--base) / 1.55 var(--sans); font-variant-numeric: tabular-nums; overflow-x: hidden; }
+h1, h2, h3, p, ul, ol, pre, figure { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+a { color: var(--accent-text); text-underline-offset: 3px; }
+code, pre { font-family: var(--mono); font-size: 0.86em; }
+.dim { color: var(--dim); font-weight: 400; }
+.fine { color: var(--dim); font-size: var(--note); max-width: 64ch; }
+:focus-visible { outline: var(--stroke) solid var(--accent); outline-offset: 2px; }
+
+/* The bar. The line under the mark is the k's stem going on down the page. */
+.bar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 24px; padding-block: 12px; padding-inline: max(var(--gutter), calc((100vw - 1120px) / 2)); background: var(--bg); }
+.scrolled .bar { border-bottom: 1px solid var(--hair); padding-bottom: 11px; }
+.brand { position: relative; display: flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); font-size: var(--large); font-weight: 800; letter-spacing: -0.02em; }
+.brand::after { content: ""; position: absolute; left: 6px; top: 33px; width: var(--stroke); height: 15px; background: var(--text); }
+.bar nav { display: flex; gap: 24px; margin-left: auto; font-size: var(--note); font-weight: 600; }
+.bar nav a { color: var(--text); text-decoration: none; background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 100% / 0 var(--stroke); padding-bottom: 4px; transition: background-size var(--arrive) var(--ease); }
+.bar nav a:hover { background-size: 100% var(--stroke); }
+@media (max-width: 720px) { .bar nav { display: none; } .bar .button { margin-left: auto; } }
+
+.button { display: inline-block; padding: 11px 20px; border: var(--stroke) solid var(--accent); background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: var(--note); text-decoration: none; transition: background var(--quick), color var(--quick); }
+.button::after { content: "\2192"; display: inline-block; margin-left: 10px; transition: transform var(--quick); }
+.button:hover::after { transform: translateX(4px); }
+.button.quiet { background: none; border-color: var(--text); color: var(--text); transition: background var(--quick), color var(--quick); }
+.button.quiet:hover { background: var(--text); color: var(--bg); }
+.bar .button { padding: 5px 14px; }
+.bar .button::after { content: none; }
+
+/* The mark in the bar: it draws itself, and its hub keeps a pulse. */
+.mark { width: 30px; height: 36px; overflow: visible; }
+.mark line { stroke: var(--text); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 40; animation: draw var(--grow) var(--ease) both; }
+.mark circle { fill: var(--text); transform-box: fill-box; transform-origin: center; animation: pop var(--pop) var(--ease) both; animation-delay: var(--pop); }
+.mark .hub { fill: var(--accent); animation-delay: var(--enter); }
+.mark .ring { fill: none; stroke: var(--accent); stroke-width: 1.5; animation: ring var(--breath) ease-out infinite; }
+
+/* The rail and its stops. */
+main { position: relative; max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 0 var(--gutter) 0 calc(var(--gutter) + var(--rail)); }
+main::before, main::after { content: ""; position: absolute; left: calc(var(--gutter) + 6px); top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+main::after { background: var(--accent); transform: scaleY(var(--run, 0)); transform-origin: top; }
+.end { position: absolute; left: calc(var(--gutter) - 3px); bottom: 0; width: 21px; height: var(--stroke); background: var(--text); z-index: 1; }
+.part { position: relative; padding-top: var(--gap); }
+.part:last-of-type { padding-bottom: 96px; }
+.part::before { content: ""; position: absolute; z-index: 1; left: calc(7.5px - var(--rail) - var(--stop) / 2); top: calc(var(--gap) + 2px); width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--enter), border-color var(--enter); }
+.part.seen::before { border-color: var(--accent); background: radial-gradient(var(--accent) 38%, var(--bg) 42%); }
+
+/* The top: where you are going, first and largest. */
+.hero { display: grid; grid-template-columns: 1.25fr 0.75fr; align-items: center; gap: 40px; min-height: min(82vh, 800px); padding-block: 56px 72px; }
+.hero .say > * { animation: rise var(--enter) var(--ease) both; }
+.hero .say > :nth-child(2) { animation-delay: var(--step); }
+.hero .say > :nth-child(3) { animation-delay: calc(var(--step) * 2); }
+.hero .say > :nth-child(4) { animation-delay: calc(var(--step) * 3); }
+.hero .say > :nth-child(5) { animation-delay: calc(var(--step) * 4); }
+.word { font-size: var(--note); color: var(--dim); }
+.word b { color: var(--text); font-weight: 800; }
+h1 { font-size: clamp(44px, 7.4vw, 100px); line-height: 0.98; letter-spacing: -0.035em; font-weight: 800; margin-block: 20px 28px; text-wrap: balance; }
+.under { background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 96% / 100% 0.08em; animation: rule var(--grow) var(--ease) var(--pop) both; }
+.lead { font-size: var(--large); line-height: 1.45; max-width: 31em; }
+.acts { display: flex; flex-wrap: wrap; gap: 12px; margin-block: 32px 20px; }
+
+/* The mark as the map it is: four machines on three lines, and what runs between them. */
+.map { display: block; width: 100%; max-width: 440px; height: auto; overflow: visible; margin-left: auto; }
+.map line { stroke: var(--text); stroke-width: 4; stroke-linecap: round; stroke-dasharray: 40; animation: draw calc(var(--grow) * 1.5) var(--ease) both; }
+.map .stopped { fill: var(--bg); stroke: var(--text); stroke-width: 1.5; }
+.map .hub { fill: var(--accent); stroke: var(--bg); stroke-width: 1.2; }
+.map .stopped, .map .hub, .map .halo { transform-box: fill-box; transform-origin: center; }
+.map .stopped, .map .hub { animation: pop var(--pop) var(--ease) var(--pop) both; }
+.map .halo { fill: none; stroke: var(--accent); stroke-width: 0.5; animation: halo calc(var(--breath) * 2) ease-out infinite; }
+.map .halo.late { animation-delay: var(--breath); }
+.map text { font: 700 3.1px var(--sans); fill: var(--text); animation: rise var(--enter) var(--ease) var(--grow) both; }
+.map text.dim { font-weight: 400; fill: var(--dim); }
+.packets circle { fill: var(--accent); stroke: var(--bg); }
+@media (max-width: 860px) {
+  .hero { grid-template-columns: 1fr; min-height: 0; padding-block: 32px 56px; }
+  .map { max-width: 300px; margin-inline: 0 auto; }
+}
+
+/* Four numbers, on a band. */
+.strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0 32px; border-top: var(--stroke) solid var(--text); }
+.stat { padding-top: 18px; }
+.stat > b { display: block; font-size: var(--title); line-height: 1.05; letter-spacing: -0.03em; font-weight: 800; }
+.stat small { font-size: var(--note); font-weight: 600; letter-spacing: 0; margin-left: 4px; }
+.stat p { color: var(--dim); font-size: var(--note); margin-top: 6px; max-width: 26ch; }
+@media (max-width: 860px) { .strip { grid-template-columns: 1fr 1fr; row-gap: 12px; } }
+
+/* A part: its code on the line, its name, and what it shows. */
+.head { max-width: 46em; margin-bottom: 36px; }
+.no { font-size: var(--note); font-weight: 700; display: flex; align-items: center; gap: 10px; }
+.no b { font: 700 var(--small) var(--mono); color: var(--bg); background: var(--text); padding: 2px 6px; }
+h2 { font-size: var(--title); line-height: 1.04; letter-spacing: -0.03em; font-weight: 800; margin-block: 14px 16px; text-wrap: balance; }
+.head > p:last-child { color: var(--dim); max-width: 62ch; }
+h3 { font-size: var(--large); font-weight: 800; letter-spacing: -0.01em; }
+
+/* A figure hangs from a rule, as a sign hangs from its band. */
+.panel { border-top: var(--stroke) solid var(--text); padding-top: 10px; min-width: 0; }
+figcaption { display: flex; align-items: baseline; gap: 12px; font-size: var(--small); font-weight: 700; margin-bottom: 12px; }
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.pair.wide { grid-template-columns: 1.1fr 0.9fr; gap: 56px; }
+@media (max-width: 860px) { .pair, .pair.wide { grid-template-columns: 1fr; } }
+
+pre { background: var(--sunken); padding: 20px; line-height: 1.7; font-size: var(--small); overflow-x: auto; }
+.k { color: var(--accent-text); }
+.c { color: var(--dim); }
+.ok { color: var(--accent-text); font-weight: 700; }
+.bad { color: var(--bad); }
+.js .term .line { opacity: 0; }
+.js .seen .term .line { animation: arrive var(--arrive) var(--ease) both; animation-delay: var(--at, 0ms); }
+
+/* Replicas are stops on a short line: ready ones are filled, a waiting one blinks. */
+.lamps { display: inline-flex; gap: 10px; background: linear-gradient(var(--text), var(--text)) no-repeat center / 100% var(--stroke); }
+.lamp { width: 14px; height: 14px; border-radius: 50%; border: var(--stroke) solid var(--text); background: var(--bg); transition: background var(--enter), border-color var(--enter); }
+.lamp.ok { background: var(--accent); border-color: var(--accent); animation: beat var(--breath) ease-in-out infinite; }
+.lamp.ok:nth-child(2) { animation-delay: calc(var(--breath) / -3); }
+.lamp.ok:nth-child(3) { animation-delay: calc(var(--breath) / -1.5); }
+.lamp.wait { border-color: var(--warn); animation: wait var(--blink) ease-in-out infinite; }
+
+/* Pulse: three stops, and what happens when one is gone. */
+.pulse svg { display: block; width: 100%; height: auto; transition: opacity var(--enter); }
+.pulse.cut svg, .pulse.cut .rows { opacity: 0; }
+.pulse .edges path { fill: none; stroke: var(--text); stroke-width: 3; stroke-linecap: round; transition: stroke var(--enter); }
+.pulse .packets circle { stroke-width: 1.5; transition: opacity var(--quick); }
+.pulse .dot { fill: var(--bg); stroke: var(--text); stroke-width: 3; transition: fill var(--enter), stroke var(--enter); }
+.pulse .lead { fill: none; stroke: var(--accent); stroke-width: 3; opacity: 0; transition: opacity var(--enter); }
+.pulse .leads .dot { fill: var(--accent); stroke: var(--accent); }
+.pulse .leads .lead { opacity: 1; }
+.pulse text { fill: var(--text); font: 700 14px var(--sans); text-anchor: middle; }
+.pulse .gone .dot { stroke: var(--bad); stroke-dasharray: 4 4; }
+.pulse .gone text { fill: var(--dim); }
+.pulse[data-state="lost"] .edges .to-g { stroke: var(--dim); stroke-dasharray: 1 9; }
+.pulse[data-state="lost"] .packets .to-g { opacity: 0; }
+.rows { border-top: 1px solid var(--hair); margin-top: 8px; padding-top: 12px; font-size: var(--note); transition: opacity var(--enter); }
+.rows li { display: flex; align-items: center; gap: 14px; min-height: 30px; }
+.rows b { width: 56px; }
+.points li { color: var(--dim); padding-block: 14px; border-top: 1px solid var(--hair); max-width: 52ch; }
+.points li:first-child { border-top: 0; padding-top: 0; }
+.points b { color: var(--text); }
+
+/* A node's disk: one slot runs, the other takes the update. */
+.parts { display: grid; grid-template-columns: 0.8fr 1.3fr 1.3fr 1.6fr; gap: 4px; }
+.p { position: relative; overflow: hidden; background: var(--sunken); border-left: var(--stroke) solid var(--hair); padding: 14px 14px 20px; min-height: 96px; transition: border-color var(--enter); }
+.p b { display: block; font: 700 var(--small) var(--mono); }
+.p small { color: var(--dim); font-size: var(--small); line-height: 1.4; display: block; margin-top: 4px; }
+.slot i { position: absolute; inset: auto 0 0 0; height: var(--stroke); background: var(--accent); transform: scaleX(0); transform-origin: left; }
+.slot b::after { font: 700 var(--small) var(--sans); margin-left: 10px; }
+.slot.runs { border-color: var(--accent); }
+.slot.runs b::after { content: "running"; color: var(--accent-text); }
+.slot.writing i { transform: scaleX(1); transition: transform var(--write) linear; }
+.slot.trying { border-color: var(--warn); }
+.slot.trying b::after { content: "starting"; color: var(--warn); animation: blink var(--blink) ease-in-out infinite; }
+.slot.failed { border-color: var(--bad); }
+.slot.failed b::after { content: "did not come up"; color: var(--bad); }
+.steps { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 16px; }
+.steps li { position: relative; margin-top: 28px; border-top: var(--stroke) solid var(--text); padding: 20px 24px 0 0; color: var(--dim); font-size: var(--note); }
+.steps li::before { content: ""; position: absolute; left: 0; top: calc((var(--stop) + var(--stroke)) / -2); width: var(--stop); height: var(--stop); border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: background var(--enter), border-color var(--enter); }
+.steps .now::before { background: var(--accent); border-color: var(--accent); }
+.steps b { color: var(--text); display: block; }
+.after { margin-top: 28px; }
+@media (max-width: 860px) { .parts, .steps { grid-template-columns: 1fr 1fr; } }
+
+/* A measure is a line run out to a stop; its budget is where the line would end. */
+.bars { display: grid; gap: 14px; padding-top: 18px; }
+.row { display: grid; grid-template-columns: 230px 1fr 150px; align-items: center; gap: 20px; font-size: var(--note); }
+.row > b { font-weight: 700; text-align: right; white-space: nowrap; }
+.row small, .vs small { font-weight: 400; color: var(--dim); font-size: inherit; }
+.track { position: relative; height: 16px; overflow: hidden; background: linear-gradient(var(--hair), var(--hair)) no-repeat center / 100% 1px; }
+.track i { position: absolute; inset: 0; color: var(--accent); background: linear-gradient(currentColor, currentColor) no-repeat center / 100% var(--stroke); transform: translateX(-100%); transition: transform var(--grow) var(--ease); }
+.track i::after { content: ""; position: absolute; right: 0; top: 1px; width: 14px; height: 14px; border: var(--stroke) solid currentColor; border-radius: 50%; background: var(--bg); }
+.track i.other { color: var(--text); }
+.seen .track i { transform: translateX(max(calc((var(--v, 0) - 1) * 100%), calc(14px - 100%))); }
+.row[data-of] .track::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.row:nth-child(2) .track i { transition-delay: var(--step); }
+.row:nth-child(3) .track i { transition-delay: calc(var(--step) * 2); }
+.row:nth-child(4) .track i { transition-delay: calc(var(--step) * 3); }
+@media (max-width: 720px) {
+  .row { grid-template-columns: 1fr auto; gap: 6px 12px; }
+  .row .track { grid-column: 1 / -1; grid-row: 2; }
+}
+.versus, .where { margin-top: 64px; }
+.versus h3, .where h3 { font-size: var(--head); letter-spacing: -0.02em; margin-bottom: 12px; }
+.versus .panel { display: grid; gap: 22px; margin-block: 16px; padding-top: 18px; }
+.vs { display: grid; grid-template-columns: 44px 1fr 110px; align-items: center; gap: 6px 14px; font-size: var(--note); }
+.vs p { grid-column: 1 / -1; font-weight: 700; }
+.vs b { text-align: right; white-space: nowrap; }
+.where .row { grid-template-columns: 150px 1fr 210px; }
+@media (max-width: 720px) {
+  .where .row { grid-template-columns: 1fr auto; }
+  .pulse text { font-size: 22px; }
+}
+.counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 32px; margin-top: 64px; border-top: var(--stroke) solid var(--text); padding-top: 18px; }
+.counts b { font-size: var(--head); letter-spacing: -0.02em; font-weight: 800; }
+.counts p { color: var(--dim); font-size: var(--note); max-width: 26ch; }
+@media (max-width: 860px) { .counts { grid-template-columns: 1fr 1fr; } }
+
+/* The kinds: each family is a line, and each kind a stop on it. */
+.groups { border-top: var(--stroke) solid var(--text); }
+.group { display: grid; grid-template-columns: 250px 1fr; gap: 12px 32px; padding-block: 20px 22px; border-bottom: 1px solid var(--hair); }
+.group small { color: var(--dim); font-size: var(--small); display: block; margin-top: 2px; max-width: 30ch; }
+.group p { display: flex; flex-wrap: wrap; align-content: start; padding-top: 2px; }
+.group span { position: relative; margin-top: 12px; border-top: var(--stroke) solid var(--text); padding: 12px 26px 0 0; font: var(--small) var(--mono); }
+.group span:last-child { padding-right: 8px; }
+.group span::before { content: ""; position: absolute; left: 0; top: -10.5px; width: 18px; height: 18px; border: var(--stroke) solid var(--text); border-radius: 50%; background: var(--bg); transition: transform var(--enter) var(--ease), background var(--quick), border-color var(--quick); }
+.js .group span::before { transform: scale(0); }
+.js .seen .group span::before { transform: none; }
+.group span:nth-child(2)::before { transition-delay: var(--step); }
+.group span:nth-child(3)::before { transition-delay: calc(var(--step) * 2); }
+.group span:nth-child(4)::before { transition-delay: calc(var(--step) * 3); }
+.group span:nth-child(5)::before { transition-delay: calc(var(--step) * 4); }
+.group span:nth-child(6)::before { transition-delay: calc(var(--step) * 5); }
+.group:hover span::before { background: var(--accent); border-color: var(--accent); }
+@media (max-width: 720px) { .group { grid-template-columns: 1fr; } }
+
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; }
+.cards h3 { margin-bottom: 8px; text-wrap: balance; }
+.cards p { color: var(--dim); font-size: var(--note); }
+.cards p b { color: var(--text); }
+@media (max-width: 860px) { .cards { grid-template-columns: 1fr; } }
+.wall { margin-top: 40px; }
+.calls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.calls s { font: var(--small) var(--mono); text-decoration: none; padding: 3px 8px; background: linear-gradient(var(--bad), var(--bad)) no-repeat 8px 52% / 0 1px var(--sunken); transition: background-size var(--enter) var(--ease), color var(--enter); transition-delay: calc(var(--i) * var(--step) / 2 + var(--enter)); }
+.seen .calls s { background-size: calc(100% - 16px) 1px; color: var(--dim); }
+
+footer { max-width: calc(1120px + 2 * var(--gutter)); margin-inline: auto; padding: 20px var(--gutter) 48px calc(var(--gutter) + var(--rail)); font-size: var(--note); display: flex; flex-wrap: wrap; gap: 6px 32px; justify-content: space-between; }
+
+/* What is in a part rises once, when the part is first seen; its stop on the rail is always there. */
+.js [data-see] > * { opacity: 0; transform: translateY(14px); transition: opacity var(--reveal) var(--ease), transform var(--reveal) var(--ease); }
+.js [data-see].seen > * { opacity: 1; transform: none; }
+
+@keyframes draw { from { stroke-dashoffset: 40; } }
+@keyframes pop { from { transform: scale(0); } }
+@keyframes ring { from { transform: scale(1); opacity: 0.9; } to { transform: scale(2.6); opacity: 0; } }
+@keyframes halo { from { transform: scale(0.5); opacity: 0.8; } to { transform: scale(2.6); opacity: 0; } }
+@keyframes beat { 50% { transform: scale(0.72); } }
+@keyframes wait { 50% { background: var(--warn); } }
+@keyframes blink { 50% { opacity: 0.25; } }
+@keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+@keyframes arrive { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; } }
+@keyframes rule { from { background-size: 0 0.08em; } }
+
+/* Asked for less motion: everything is where it ends up, and nothing loops. */
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, ::before, ::after { animation: none !important; transition: none !important; }
+  .js [data-see] > *, .js .term .line { opacity: 1; transform: none; }
+  .js .group span::before { transform: none; }
+  .packets, .mark .ring, .map .halo { display: none; }
+}

@@ -11,10 +11,18 @@ never be mistaken for a terminal theme or a generic admin template.
 3. Never: a green-on-black console; a wizard (user, and assumed)
 
 ## Direction
-The brand (PLAN.md §11) leads: ink `#16181d`, paper `#f6f5f1`, accent `#5b8cff`,
-and the mark, a "k" drawn as a hub with nodes. Audacity bold.
-Runner-up: Instrument (a mono, mint-on-black mixing desk), built first and rejected by the user as dated and green.
-Taste words: modern, animated → modern owns type, colour and shape; animated gets motion and the mark.
+**Line map.** kith's mark is a small network map (a hub, four stops, three lines), and
+everything kith shows is drawn the way the mark is: in ink on paper, with one blue line
+for what is live. Ink `#16181d`, paper `#f6f5f1`, and the blue (PLAN.md §11) stay.
+Structure is made of lines and stops, not of boxes: a 3 px stroke with a ring where
+something is, a filled blue ring where it is live, a dashed red ring where it is gone.
+Corners are square; nothing glows, nothing casts a shadow, nothing is a gradient.
+The face is Overpass (after the lettering of road signs; SIL OFL, served from the page's
+own host), 800 for what you are going to and 400 for the rest.
+Runner-ups, both built and both rejected by the user: Instrument (a mono, mint-on-black
+mixing desk: "dated", "dark green"), and Front panel (Inter on navy with rounded
+bordered panels, pills and a glow: "very generic AI"). The website wears Line map; the
+web UI still wears Front panel, which the sections below describe, until it is redrawn.
 
 ## Knobs
 - Type: a sans for the interface (Inter where the machine has it, as the wordmark uses; else the system's), a monospace only for what is code: YAML, diffs, logs, table values. Base 14 px; sizes 11 / 12 / 14 / 20; weights 400 and 600. System stacks because the page may load nothing from outside the cluster (CSP, air-gapped nodes).
@@ -40,3 +48,16 @@ Taste words: modern, animated → modern owns type, colour and shape; animated g
 
 ## Allowed exceptions
 - Default 2 (a system typeface): Inter is the brand's, but nothing may be fetched; the stack names it first and falls back to the system's sans.
+
+## The website (`docs/`, GitHub Pages)
+
+One page about kith for someone who has not run it yet, in Line map. Nothing on it comes
+from another host (the typeface is in `docs/fonts/`).
+
+- The rail: the stem of the k in the bar goes on down the left of the page as a 3 px line, and each part of the page is a stop on it. The line turns blue as far as the page has been read.
+- Paper first: light is paper with ink, dark is ink with paper (`prefers-color-scheme`); tokens in `docs/site.css`. Sizes 13 / 15 / 17 / 21 / 28 / 48, the title up to 100 px; a column of at most 1120 px; 128 px between parts.
+- Figures hang from a 3 px rule with their name under it. Code sits in a flat sunken block. Replicas are stops on a short line. A measure is a line run out to a ring, and its budget is the tick where the line would end. The kinds are nine lines with a stop for each kind.
+- Numbers: every figure is measured by `ci/site_numbers.py` into `docs/numbers.json` and written into the page by it (`data-n`); the charts are drawn from the same file. A figure nobody measured is not on the page.
+- Motion: what is in a part rises once when it is first seen; lines run out to their value, stops pop in, counts run up once. Three things keep moving because they show something that does: the mark with what runs along its lines, a cluster that loses its leader and recovers, and a node that updates into its other slot. Under `prefers-reduced-motion` everything is in its final state and nothing loops.
+- States: without JavaScript the page is whole (the numbers are in the HTML); the comparison with k3s is shown only when `docs/numbers.json` has its runs.
+- Banned here: rounded panels, pills, glows, gradients, shadows, a phrase of the title tinted in the accent, Inter.

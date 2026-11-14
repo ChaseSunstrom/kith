@@ -6,6 +6,8 @@ A tiny, immutable operating system that turns all of your machines into one
 cluster, configured entirely through declarative resources. The design is in
 [PLAN.md](PLAN.md).
 
+A page that shows it, with every number measured: <https://chasesunstrom.github.io/kith/>.
+
 ## Status
 
 Every phase of the plan has been worked through, and the tree is at version
@@ -2172,9 +2174,9 @@ kith reads a strict subset of YAML (and JSON, which is a subset of that):
 | `os/` | kith OS: what builds its image (`build.sh`), an update (`update.sh`) and the installer for a rented machine (`vps.sh`), and the kernel's configuration |
 | `packages/` | Packages that come with kith: `web`, `nas`, `kith-build`, `kith-panel`, and the desktops (`gnome`, `hyprland`, `kiosk`) |
 | `examples/` | Resources to apply as they are |
-| `ci/` | The budgets, the benchmark and the VM tests (`vm.sh`) |
+| `ci/` | The budgets, the benchmark, the VM tests (`vm.sh`), and what measures and photographs the website (`site_numbers.py`, `site_shots.py`) |
 | `dist/` | A systemd user unit for agent mode |
-| `docs/` | The pictures this file shows |
+| `docs/` | The website (GitHub Pages serves this folder: `index.html`, `site.css`, `site.js`, its numbers and typeface), and the pictures this file shows |
 
 ## Development
 
