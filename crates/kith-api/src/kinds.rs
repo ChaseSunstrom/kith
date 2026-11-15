@@ -1127,6 +1127,18 @@ spec! {
         /// it then opens its state with no node asked (`kith node seal`).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub seal: Option<bool>,
+        /// The public key (hex) of this node's duress code (`kith node duress`): typed at
+        /// its waiting console, the code has the cluster forget this key.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub duress: Option<String>,
+        /// And of the cluster's (`kith node duress --all`): every key under it is forgotten.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub duress_all: Option<String>,
+        /// The cluster's duress code was typed at another node: the key is gone from here,
+        /// the node runs on, and its recovery key opens it (`kith node unlock` has the
+        /// cluster hold its key again).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub forgotten: Option<bool>,
     }
 
     // ---- Extensibility and access (§4.10, §4.13) ----

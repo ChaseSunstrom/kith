@@ -770,6 +770,10 @@ async function watch() {
       state.resources = got.resources;
       await kinds();
       linked('ok', 'live');
+      // (What kithd warns of: nodes' keys held, and no recovery key anybody was shown.)
+      const { warning } = await api('GET', 'lock').catch(() => ({}));
+      $('warning').textContent = warning ?? '';
+      $('warning').hidden = !warning;
       $('generation').textContent = got.generation == null ? '' : `generation ${got.generation}`;
       drawPulse();
       if (first) await route();

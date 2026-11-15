@@ -2635,6 +2635,27 @@
             "null"
           ],
           "description": "The node may have its own TPM keep the key too, sealed to the system it runs:\nit then opens its state with no node asked (`kith node seal`)."
+        },
+        "duress": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The public key (hex) of this node's duress code (`kith node duress`): typed at\nits waiting console, the code has the cluster forget this key."
+        },
+        "duressAll": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "And of the cluster's (`kith node duress --all`): every key under it is forgotten."
+        },
+        "forgotten": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The cluster's duress code was typed at another node: the key is gone from here,\nthe node runs on, and its recovery key opens it (`kith node unlock` has the\ncluster hold its key again)."
         }
       },
       "required": [
