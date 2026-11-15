@@ -249,6 +249,19 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **What a replica writes outside its Volumes is counted, not held at the write.** Its
+  containers' writable roots and its disk scratch share the node's state disk, with no
+  quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`
+  limit, and every pod while the disk has less than twice its reserve free) and replaces
+  a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
+  5% of it and at most 1 GiB unless said), the one that wrote the most. A fast writer is
+  not stopped between two counts: at the disk's speed it can write past its limit, or fill
+  the disk, before the next count sees it (10 to 20 seconds), and then kithd's store, logs
+  and other replicas' writes fail until it is replaced. A count walks every file, so one
+  that made millions of small files is slow to count and is counted less often; an empty
+  file costs the disk an inode and the count nothing, and a directory kithd cannot
+  read (where it is not root) is passed over. A limit
+  held at the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
   that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound

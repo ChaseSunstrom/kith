@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Under which every replica's directory is, in `state` and in [`memory`].
-const REPLICAS: &str = "replicas";
+pub(crate) const REPLICAS: &str = "replicas";
 /// The link the files of a mounted map are read through: renamed over, so they change at once.
 const DATA: &str = "..data";
 

@@ -10,6 +10,8 @@
 // of a replica cannot run side by side. Images are pulled one at a time.
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
+mod storage;
+
 use crate::Shared;
 use kith_api::Resource;
 use kith_api::kinds::{
@@ -174,12 +176,25 @@ struct Controller {
     owners: Option<BTreeSet<String>>,
     /// The status report on its way to the store, if one is.
     report: Option<tokio::task::JoinHandle<()>>,
+    /// Bytes the state disk keeps free: under them the pod that wrote the most is replaced.
+    /// `None` for the default (`storage::default_reserve`); 0 for none.
+    reserve: Option<u64>,
+    /// The count of what pods wrote outside their volumes, on its way, and when it began.
+    count: Option<(Instant, tokio::task::JoinHandle<Counted>)>,
+    /// When the last count began.
+    counted: Option<Instant>,
+    /// The last count found the state disk under its reserve with no pod to replace for it.
+    low: bool,
 }
+
+/// What a count found: the state disk's free bytes, its reserve, and each pod counted.
+type Counted = Result<(u64, u64, Vec<storage::Pod>), tokio::task::JoinError>;
 
 pub async fn run(
     shared: std::sync::Arc<Shared>,
     runtime: kith_runtime::Result<Runtime>,
     log_cap: u64,
+    reserve: Option<u64>,
     mut stopping: watch::Receiver<bool>,
 ) {
     let runtime = match runtime.and_then(|rt| rt.cleanup().map(|old| (rt, old))) {
@@ -229,6 +244,10 @@ pub async fn run(
         jobs: BTreeMap::new(),
         owners: None,
         report: None,
+        reserve,
+        count: None,
+        counted: None,
+        low: false,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -1004,6 +1023,10 @@ impl Controller {
             crate::share::release(self.logs.parent().unwrap_or(&self.logs), &theirs);
         }
 
+        // What pods wrote outside their volumes: one past its limit, or the biggest writer on a
+        // disk under its reserve, is killed here and noticed as an exit below.
+        self.tend_storage(shared, &state);
+
         // 3. Notice exits, then start whatever is due.
         // A Job's unit that ended is accounted for in step 1, and a unit that started may be
         // what a rolling update waits for in step 2: go round again at once.
@@ -1096,8 +1119,10 @@ impl Controller {
                     Ok(handle) => {
                         slot.handle = Some(handle);
                         slot.tuned = None;
+                        // Why it was replaced for what it wrote stays said while it runs again.
+                        let replaced = slot.message.take().filter(|m| m.starts_with(storage::REPLACED));
                         (slot.state, slot.message, slot.start_at, slot.started) =
-                            ("running", None, None, Instant::now());
+                            ("running", replaced, None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
                             slot.probes = crate::probe::start(shared.clone(), c, pod);
@@ -1383,6 +1408,104 @@ impl Controller {
             }
         }
         self.owners = Some(owners);
+    }
+
+    /// Counts what each pod wrote outside its volumes, at most every `TICK`, one count at a time
+    /// and off the async threads; replaces what the last count says must go (`storage::choose`).
+    fn tend_storage(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
+        use futures_util::FutureExt;
+        if self.count.as_ref().is_some_and(|(_, job)| job.is_finished())
+            && let Some((began, job)) = self.count.take()
+            && let Some(Ok(Ok((free, reserve, pods)))) = job.now_or_never()
+        {
+            let chosen = storage::choose(&pods, free, reserve);
+            let low = free < reserve && chosen.is_empty();
+            if low && !self.low {
+                eprintln!(
+                    "kithd: the state disk has {free} bytes free, under its reserve of {reserve}, and no pod wrote enough outside its volumes to free it"
+                );
+            }
+            self.low = low;
+            for (i, why) in chosen {
+                self.replace(&pods[i].id, began, &why, state);
+            }
+        }
+        if self.count.is_some() || self.counted.is_some_and(|at| at.elapsed() < TICK) {
+            return;
+        }
+        // (A disk that cannot be asked keeps no reserve: the limits still hold.)
+        let disk = nix::sys::statvfs::statvfs(state).ok();
+        let free = disk
+            .as_ref()
+            .map_or(u64::MAX, |d| d.blocks_available() * d.fragment_size());
+        let total = disk.as_ref().map_or(0, |d| d.blocks() * d.fragment_size());
+        let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total));
+        // Per pod: its limit, the sum of its containers', and the roots of those running.
+        let mut pods: BTreeMap<String, (Option<u64>, Vec<PathBuf>)> = BTreeMap::new();
+        for slot in self.slots.values() {
+            let Run::Container(c) = &slot.run else { continue };
+            let (limit, roots) = pods.entry(pod_of(&slot.owner, slot.replica)).or_default();
+            if let Some(bytes) = c.resources.as_ref().and_then(|r| r.storage.as_ref()?.bytes()) {
+                *limit = Some(limit.unwrap_or(0).saturating_add(bytes));
+            }
+            roots.extend(slot.handle.as_ref().filter(|_| !slot.leaving).and_then(Handle::upper));
+        }
+        let replicas = state.join(crate::files::REPLICAS);
+        let pods: Vec<(storage::Pod, Vec<PathBuf>)> = pods
+            .into_iter()
+            .filter(|(_, (limit, roots))| !roots.is_empty() && storage::walked(*limit, free, reserve))
+            .map(|(id, (limit, mut roots))| {
+                roots.push(replicas.join(&id).join("scratch"));
+                (storage::Pod { id, limit, bytes: 0 }, roots)
+            })
+            .collect();
+        if pods.is_empty() {
+            return;
+        }
+        let began = Instant::now();
+        self.counted = Some(began);
+        let changed = shared.changed.clone();
+        let job = tokio::task::spawn_blocking(move || {
+            let pods = pods.into_iter().map(|(mut pod, roots)| {
+                pod.bytes = storage::count(&roots, pod.limit.unwrap_or(u64::MAX));
+                pod
+            });
+            (free, reserve, pods.collect())
+        });
+        // Done, it wakes the loop to act on it.
+        let job = tokio::spawn(async move {
+            let counted = job.await;
+            changed.notify_one();
+            counted
+        });
+        self.count = Some((began, job));
+    }
+
+    /// Kills every running unit of the pod `pod`, saying `why`, and empties its disk scratch: each
+    /// starts again as its restart policy says, from an empty root. A pod one of whose units
+    /// started after the count `began` is left to the next count.
+    fn replace(&mut self, pod: &str, began: Instant, why: &str, state: &Path) {
+        let mine =
+            |slot: &&mut Slot| pod_of(&slot.owner, slot.replica) == pod && slot.handle.is_some() && !slot.leaving;
+        let mut units: Vec<(&String, &mut Slot)> = self.slots.iter_mut().filter(|(_, slot)| mine(slot)).collect();
+        if units.is_empty() || units.iter().any(|(_, slot)| slot.started > began) {
+            return;
+        }
+        eprintln!("kithd: {pod}: {why}");
+        for (id, slot) in &mut units {
+            slot.message = Some(why.to_string());
+            if let Some(Err(e)) = slot.handle.as_mut().map(Handle::kill) {
+                eprintln!("kithd: {id}: {e}");
+            }
+        }
+        // Moved aside at once, so what starts next makes a new one, and removed off the async threads.
+        if let Some(gone) = storage::aside(&state.join(crate::files::REPLICAS).join(pod).join("scratch")) {
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = std::fs::remove_dir_all(&gone) {
+                    eprintln!("kithd: removing {}: {e}", gone.display());
+                }
+            });
+        }
     }
 }
 

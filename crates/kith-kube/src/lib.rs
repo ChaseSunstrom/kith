@@ -133,7 +133,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("pod.volumes[].secret.optional", Hint, "true"),
     ("pod.volumes[].emptyDir", Carried, "{}"),
     ("pod.volumes[].emptyDir.medium", Carried, r#""Memory""#),
-    ("pod.volumes[].emptyDir.sizeLimit", Hint, r#""1Gi""#),
+    ("pod.volumes[].emptyDir.sizeLimit", Carried, r#""1Gi""#),
     ("pod.volumes[].projected", Refused, r#"{"sources":[]}"#),
     ("pod.volumes[].downwardAPI", Refused, r#"{"items":[]}"#),
     ("pod.securityContext.runAsUser", Carried, "1000"),
@@ -239,7 +239,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("container.resources.limits.cpu", Carried, r#""100m""#),
     ("container.resources.limits.memory", Carried, r#""64Mi""#),
     ("container.resources.requests.ephemeral-storage", Hint, r#""1Gi""#),
-    ("container.resources.limits.ephemeral-storage", Hint, r#""1Gi""#),
+    ("container.resources.limits.ephemeral-storage", Carried, r#""1Gi""#),
     ("container.volumeMounts[].name", Carried, r#""data""#),
     ("container.volumeMounts[].mountPath", Carried, r#""/data""#),
     ("container.volumeMounts[].readOnly", Carried, "true"),
@@ -750,11 +750,50 @@ fn quantities(cx: &mut Cx, mut res: Map, at: &str) -> Option<Value> {
             }
         });
     }
+    // What it may write outside its volumes is a limit, not an amount it is placed by: the
+    // request is only said.
+    let storage = cx.text(&mut limits, "ephemeral-storage", &lp);
+    let storage = storage.filter(|q| match whole_bytes(q) {
+        Some(_) => true,
+        None => {
+            let at = join(&lp, "ephemeral-storage");
+            cx.note(&at, &format!("not translated: `{q}` is not a whole number of bytes"));
+            false
+        }
+    });
     cx.rest(requests, &rp);
     cx.rest(limits, &lp);
     cx.rest(res, at);
     let [cpu, memory] = amounts;
-    nonempty(obj([("cpu", some(cpu)), ("memory", some(memory))]))
+    nonempty(obj([
+        ("cpu", some(cpu)),
+        ("memory", some(memory)),
+        ("storage", some(storage)),
+    ]))
+}
+
+fn whole_bytes(q: &str) -> Option<u64> {
+    Quantity::try_from(q.to_string()).ok()?.bytes()
+}
+
+/// A disk emptyDir's `sizeLimit` added to what the first of `units` that mounts it may
+/// write (kith counts a pod's root and its scratch as one amount); whether one did.
+// ponytail: a container that had no limit of its own gets one, its root counted in it too:
+// stricter than Kubernetes, which limits such an emptyDir alone.
+fn add_storage(units: &mut [Value], scratch: &str, size: &str) -> bool {
+    let mounts = |c: &&mut Value| {
+        let mounts = c["volumeMounts"].as_array();
+        mounts.is_some_and(|mounts| mounts.iter().any(|m| m["scratch"] == scratch))
+    };
+    let Some(c) = units.iter_mut().find(mounts) else {
+        return false;
+    };
+    let own = c["resources"]["storage"].as_str().and_then(whole_bytes);
+    c["resources"]["storage"] = match (own, whole_bytes(size)) {
+        (Some(own), Some(bytes)) => json!(own.saturating_add(bytes).to_string()),
+        _ => json!(size),
+    };
+    true
 }
 
 /// A `{name, key}` reference from `secretKeyRef` or `configMapKeyRef`.
@@ -826,8 +865,8 @@ enum Vol {
         items: Strings,
         mode: Option<String>,
     },
-    /// An `emptyDir`, and whether it is in memory.
-    Scratch(bool),
+    /// An `emptyDir`, whether it is in memory, and its `sizeLimit` on a disk.
+    Scratch(bool, Option<String>),
     /// Nothing kith has.
     Other,
 }
@@ -1016,13 +1055,13 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_p
                     "not translated: its volume is not a PersistentVolumeClaim, a ConfigMap, a Secret or an emptyDir";
                 cx.note(&mp, why)
             }
-            (Some(Vol::Claim(_) | Vol::Scratch(_)), _) if part.is_some() => cx.note(&join(&mp, "subPath"), whole),
+            (Some(Vol::Claim(_) | Vol::Scratch(..)), _) if part.is_some() => cx.note(&join(&mp, "subPath"), whole),
             (Some(Vol::Claim(claim)), Some(path)) => mounts.push(obj([
                 ("volume", Some(json!(claim))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
             ])),
-            (Some(Vol::Scratch(memory)), Some(path)) => mounts.push(obj([
+            (Some(Vol::Scratch(memory, _)), Some(path)) => mounts.push(obj([
                 ("scratch", Some(json!(volume))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
@@ -1137,8 +1176,23 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
             let (mut empty, ep) = (cx.map(&mut v, "emptyDir", &vp), join(&vp, "emptyDir"));
             let medium = cx.text(&mut empty, "medium", &ep).filter(|medium| !medium.is_empty());
             let medium = cx.pick(&join(&ep, "medium"), medium, &[("Memory", "memory")]);
+            let (size, sp) = (cx.text(&mut empty, "sizeLimit", &ep), join(&ep, "sizeLimit"));
+            let size = match size {
+                Some(_) if medium.is_some() => {
+                    cx.hint(
+                        &sp,
+                        "is not used: a memory emptyDir is counted in its container's memory",
+                    );
+                    None
+                }
+                Some(size) if whole_bytes(&size).is_none() => {
+                    cx.note(&sp, &format!("not translated: `{size}` is not a whole number of bytes"));
+                    None
+                }
+                size => size,
+            };
             cx.rest(empty, &ep);
-            vol = Vol::Scratch(medium.is_some());
+            vol = Vol::Scratch(medium.is_some(), size);
         }
         cx.rest(v, &vp);
         vols.insert(name, vol);
@@ -1157,7 +1211,14 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
             .filter_map(|c| container(cx, c, &sp, list, &vols, of_pod));
         made.collect()
     };
-    let (first, units) = (contained(cx, "initContainers"), contained(cx, "containers"));
+    let (mut first, mut units) = (contained(cx, "initContainers"), contained(cx, "containers"));
+    for (name, vol) in &vols {
+        if let Vol::Scratch(false, Some(size)) = vol
+            && !add_storage(&mut units, name, size)
+        {
+            add_storage(&mut first, name, size);
+        }
+    }
     // What Kubernetes assumes anyway, and tools write out.
     for (key, default) in [
         ("hostNetwork", json!(false)),
@@ -2384,6 +2445,74 @@ spec:
         assert!(
             said.iter()
                 .any(|line| line.contains("volumes[work] names more than one source")),
+            "{said:?}"
+        );
+    }
+
+    /// `limits.ephemeral-storage` is what a container may write outside its volumes, and an
+    /// emptyDir's `sizeLimit` is added to the first container that mounts it: kith counts
+    /// a pod's root and its scratch as one amount. Neither is only said any more.
+    #[test]
+    fn import_storage_limit_and_size_limit_are_carried() {
+        let chart = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: site }
+spec:
+  selector: { matchLabels: { app: site } }
+  template:
+    metadata: { labels: { app: site } }
+    spec:
+      containers:
+        - name: web
+          image: nginx
+          resources:
+            requests: { ephemeral-storage: 1Gi }
+            limits: { ephemeral-storage: 2Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: cache, mountPath: /cache }
+        - name: side
+          image: busybox
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: logs, mountPath: /logs }
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 1Gi }
+        - name: cache
+          emptyDir: { medium: Memory, sizeLimit: 64Mi }
+        - name: logs
+          emptyDir: { sizeLimit: 100M }
+"#;
+        let (all, said) = run(chart);
+        for r in &all {
+            r.clone().validated().unwrap_or_else(|e| panic!("{}: {e}", r.key()));
+        }
+        let containers = &find(&all, "Workload", "site").spec["template"]["containers"];
+        // 2Gi of its own and the 1Gi of `work`; `side` mounts `work` too, and gets `logs`.
+        assert_eq!(containers[0]["resources"], json!({ "storage": "3221225472" }));
+        assert_eq!(containers[1]["resources"], json!({ "storage": "100M" }));
+        // The request is only said; and a memory emptyDir is counted as memory, not here.
+        assert!(
+            said.iter().any(|line| line.contains("requests.ephemeral-storage")),
+            "{said:?}"
+        );
+        assert!(
+            said.iter()
+                .any(|line| line.contains("volumes[cache].emptyDir.sizeLimit")),
+            "{said:?}"
+        );
+        assert!(
+            !said.iter().any(|line| line.contains("limits.ephemeral-storage")),
+            "{said:?}"
+        );
+        assert!(!said.iter().any(|line| line.contains("volumes[work]")), "{said:?}");
+        // What is not a whole number of bytes is refused by its place.
+        let (_, said) = run(&chart.replace("ephemeral-storage: 2Gi", "ephemeral-storage: 500m"));
+        assert!(
+            said.iter()
+                .any(|line| line.contains("limits.ephemeral-storage") && line.contains("whole number of bytes")),
             "{said:?}"
         );
     }

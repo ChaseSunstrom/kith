@@ -3135,6 +3135,17 @@
               "type": "null"
             }
           ]
+        },
+        "storage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Quantity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What a container's pod may write outside its Volumes, in bytes: its writable root\nand its disk scratch, counted together for the pod. Past it the pod is replaced."
         }
       }
     },

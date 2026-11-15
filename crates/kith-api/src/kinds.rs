@@ -128,6 +128,10 @@ spec! {
         pub cpu: Option<Quantity>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub memory: Option<Quantity>,
+        /// What a container's pod may write outside its Volumes, in bytes: its writable root
+        /// and its disk scratch, counted together for the pod. Past it the pod is replaced.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub storage: Option<Quantity>,
     }
 
     // ---- Cluster, Node, Namespace ----
@@ -1728,6 +1732,19 @@ impl Template {
         for vm in &self.vms {
             vm.check().map_err(|e| format!("{at}, vm `{}`: {e}", vm.name))?;
         }
+        let stored = |r: &Option<Resources>| r.as_ref().is_some_and(|r| r.storage.is_some());
+        if let Some(e) = self.exec.iter().find(|e| stored(&e.resources)) {
+            return Err(format!(
+                "{at}, exec `{}`: resources.storage: an exec unit has no root of its own to count",
+                e.name
+            ));
+        }
+        if let Some(vm) = self.vms.iter().find(|vm| stored(&vm.resources)) {
+            return Err(format!(
+                "{at}, vm `{}`: resources.storage: a VM writes to its disks, not to a root of its own",
+                vm.name
+            ));
+        }
         if self.confidential == Some(true) {
             if self.containers().next().is_some() || !self.exec.is_empty() {
                 return Err(format!(
@@ -1803,6 +1820,14 @@ impl Template {
             }
             if c.run_as_non_root == Some(true) && c.run_as_user == Some(0) {
                 return Err(format!("{at}: runAsNonRoot, and runAsUser: 0 is root"));
+            }
+            if let Some(storage) = c.resources.as_ref().and_then(|r| r.storage.as_ref())
+                && storage.bytes().is_none()
+            {
+                return Err(format!(
+                    "{at}: resources.storage: `{}` is not a whole number of bytes",
+                    String::from(storage.clone())
+                ));
             }
             for mount in &c.volume_mounts {
                 mount

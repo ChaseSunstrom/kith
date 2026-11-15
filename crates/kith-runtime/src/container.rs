@@ -609,6 +609,12 @@ impl Handle {
         self.pid.as_raw()
     }
 
+    /// Where a container's writes to its root land: `None` for an exec unit. A read-only root
+    /// never makes the directory.
+    pub fn upper(&self) -> Option<PathBuf> {
+        self.container.as_ref().map(|_| self.bundle.join("upper"))
+    }
+
     pub fn start(&mut self) -> Result<()> {
         match &mut self.container {
             Some(container) => container.start().ctx("starting the container"),
