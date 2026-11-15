@@ -76,9 +76,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   deleted node's own certificate (signed by the CA) still answers there until the
   membership change is through: seconds, longer with no leader or majority. A node's
   certificate outlives its Node, and nothing revokes it.
-  **A join talks only to the node that made its token.** A token holds that node's name
-  and key print beside the CA's fingerprint, and the joining node, which has no store,
-  takes no other certificate at the `--join` address: another node of the CA that
+  **A join with a token that names its maker talks only to that node.** A token holds
+  that node's name and key print beside the CA's fingerprint, and the joining node, which
+  has no store, talks only to the node that made the token: it takes no other
+  certificate at the `--join` address, and another node of the CA that
   answers there (a taken worker on the address) is sent nothing, not the token's secret
   and not the joiner's name, and the joiner says which node it called and which
   answered. What is left: the node that made the token, which holds the CA's key, makes

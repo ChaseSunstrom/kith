@@ -214,7 +214,10 @@ fn nodes_join_over_mutual_tls() {
     let args = ["--name", "x6", "--join", &beta.address(), "--token", elsewhere.trim()];
     let _ = std::fs::remove_dir_all(scratch.join("x6"));
     let said = kithd_fails(&scratch.join("x6"), &args);
-    assert!(said.contains("node alpha was called, and node beta answered"), "{said}");
+    assert!(
+        said.contains("node alpha was called, and a certificate naming beta answered"),
+        "{said}"
+    );
     // A state directory that holds a store is not thrown away by joining.
     std::fs::create_dir_all(scratch.join("x5/state/raft")).unwrap();
     let args = ["--name", "x5", "--join", &alpha.address(), "--token", token];

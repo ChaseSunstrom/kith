@@ -471,10 +471,18 @@ impl ServerCertVerifier for Maker {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        match &self.0 {
-            Some(pin) if !pinned(end_entity, pin) => Err(rustls::Error::General(unpinned(end_entity, pin))),
-            _ => Ok(ServerCertVerified::assertion()),
-        }
+        let Some(pin) = self.0.as_ref().filter(|pin| !pinned(end_entity, pin)) else {
+            return Ok(ServerCertVerified::assertion());
+        };
+        // (Nobody has checked this certificate: the name in it is only what it says.)
+        let said = match subject_of(end_entity) {
+            Some(Subject::Node(name, ..)) if pin.0.is(&name) => {
+                format!("a certificate naming {name} answered, with another key than the token names")
+            }
+            Some(Subject::Node(name, ..)) => format!("a certificate naming {name} answered"),
+            _ => "what answered shows no node's certificate".to_string(),
+        };
+        Err(rustls::Error::General(format!("{} was called, and {said}", pin.0)))
     }
 
     fn verify_tls12_signature(
@@ -575,7 +583,8 @@ pub type TokenParts<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
 pub fn token_parts(token: &str) -> Fallible<TokenParts<'_>> {
     let mut parts = token.trim().split('.');
     let mut next = || parts.next();
-    let hash = |part: &str| part.len() == 64 && part.bytes().all(|b| b.is_ascii_hexdigit());
+    // (Lowercase only: the key print is compared as `key_print` writes it.)
+    let hash = |part: &str| part.len() == 64 && part.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
     match (next(), next(), next(), next(), next(), next()) {
         (Some("kith1"), Some(secret), Some(ca), None, ..) if secret.len() == 64 && ca.len() == 64 => {
             Ok((secret, ca, None))
@@ -752,6 +761,8 @@ mod tests {
             format!("{head}.Node"),
             format!("{head}."),
             format!("{three}.ab.node-1"),
+            // (An uppercased print would never match the lowercase one it is compared with.)
+            format!("{three}.{}.node-1", print.to_uppercase()),
             head.to_string(),
         ] {
             assert!(token_parts(&bad).is_err(), "{bad}");

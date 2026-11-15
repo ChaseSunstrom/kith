@@ -194,7 +194,7 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
                 !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c))
             };
             let (address, token) = (join.address.trim(), join.token.trim());
-            if !plain(address, ".-:[]") || !address.contains(':') {
+            if !plain(address, ".-:[]") || !address.contains(':') || address.starts_with('-') {
                 return Err(format!("`{address}` is not a node's address: ADDRESS:PORT"));
             }
             // A token ends in the name of the node that made it, which may hold `-`.
@@ -679,6 +679,7 @@ mod tests {
             "disk: sda\njoin: { address: '10.0.0.7:7443 --claim', token: kith1.ab }\n",
             "disk: sda\njoin: { address: 10.0.0.7:7443, token: 'kith1.ab --state /tmp' }\n",
             "disk: sda\njoin: { address: 10.0.0.7:7443, token: --claim }\n",
+            "disk: sda\njoin: { address: '--claim:7443', token: kith1.ab }\n",
         ] {
             assert!(config(bad, &two).is_err(), "{bad}");
         }

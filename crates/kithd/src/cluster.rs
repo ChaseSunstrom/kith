@@ -139,13 +139,14 @@ pub fn why(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// Whether TLS refused what answered (a certificate that is not the one called): not a node
-/// that is not up yet, which may be asked again.
+/// Whether our certificate check refused what answered (a certificate that is not the one
+/// called): not a node that is not up yet, or a handshake cut short, which may be asked again.
 fn refused_tls(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut cause = Some(error);
     while let Some(e) = cause {
-        if e.is::<rustls::Error>() {
-            return true;
+        if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+            // (The pinned check refuses with General; the CA's check with InvalidCertificate.)
+            return matches!(tls, rustls::Error::InvalidCertificate(_) | rustls::Error::General(_));
         }
         // (An io::Error's source skips the error it wraps, and the handshake's error comes
         // wrapped twice: step into each.)
@@ -1613,6 +1614,25 @@ pub(crate) mod pinned_peer {
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
     }
 
+    /// Only our certificate check's refusal ends a join's asking; a handshake cut short (an alert)
+    /// or a node not up yet is asked again.
+    #[test]
+    fn only_a_refused_certificate_is_not_asked_again() {
+        use std::io::{Error, ErrorKind};
+        // (As hyper-rustls hands it on: an io::Error around an io::Error around the TLS error.)
+        let wrapped = |tls: rustls::Error| Error::other(Error::new(ErrorKind::InvalidData, tls));
+        assert!(refused_tls(&wrapped(rustls::Error::General(
+            "node a was called".into()
+        ))));
+        assert!(refused_tls(&wrapped(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer
+        ))));
+        assert!(!refused_tls(&wrapped(rustls::Error::AlertReceived(
+            rustls::AlertDescription::HandshakeFailure
+        ))));
+        assert!(!refused_tls(&Error::from(ErrorKind::ConnectionRefused)));
+    }
+
     /// A join token names the node that made it, and a joiner talks to that node alone: another node
     /// of the CA that answers at the --join address is refused in the handshake and asked nothing
     /// (not even for the CA), and the error says who was called and who answered. A token from
@@ -1640,13 +1660,28 @@ pub(crate) mod pinned_peer {
             .await
             .err()
             .unwrap();
-        assert!(said.contains("node a was called, and node x answered"), "{said}");
+        assert!(
+            said.contains("node a was called, and a certificate naming x answered"),
+            "{said}"
+        );
         assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
         assert_eq!(
             to_x.load(Ordering::SeqCst),
             0,
             "the node in the middle was asked something"
         );
+
+        // Nor one outside the CA that names itself after the maker.
+        let (posing, to_posing) = answering_as(&node(&pki::Ca::create().unwrap(), "a")).await;
+        let said = request_join(&posing, &token, "joiner", 7000, None, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            said.contains("node a was called, and a certificate naming a answered, with another key"),
+            "{said}"
+        );
+        assert_eq!(to_posing.load(Ordering::SeqCst), 0, "the impostor was asked something");
 
         // What is sent is the token as an admitting side from before reads one (`kith1.SECRET.CA`).
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();

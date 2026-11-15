@@ -576,7 +576,9 @@ kith node status                                   # who leads the store, who vo
   other node that answers at the `--join` address is sent nothing (the joiner
   says which node it called and which answered). A token made before tokens
   named their maker still joins, and the joiner says that it names no node:
-  then any node of the cluster that answers there is sent it.
+  then any node of the cluster that answers there is sent it. A kithd from
+  before cannot join with a token made after (it says "not a join token"):
+  update the joining node's image first.
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
 - With `--mesh` (optionally `--mesh 51820`, the UDP port) a node joins the
