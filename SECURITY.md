@@ -93,14 +93,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   makes no device nodes.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
-  keeps its devices and its name, and a unit that wants them, or a device plugged into a
-  running unit, waits until a later pass finds its cgroup empty. What is left: kithd holds
-  this in memory, so a restart of kithd forgets it; a process that moved out of the unit's
-  cgroup is not counted; a cgroup whose processes cannot be read is taken to still run;
-  devices are compared by the path they were given, so two paths to one node are not
-  matched; at kithd's shutdown a failed stop is not retried, and its processes outlive
-  kithd until the next start's cleanup, which ignores kill and remove errors; a unit that
-  failed before it was handed out keeps its id until that same cleanup, if processes remain.
+  keeps its devices and its name, its stop is retried at a later pass and no more often than
+  every 2 s, and a unit that wants those devices waits until the unit is gone. A device
+  plugged into a running unit that is refused keeps that unit running, and is tried again at
+  the next pass. Its id is refused at create and exec while its last run still has processes,
+  and the next start of kithd, whose cleanup kills and removes what it finds with errors
+  ignored, clears it. Only a real path under /dev counts (a link or an alias is refused where
+  a device is given or plugged), so one node has one path. What is left: kithd holds this in
+  memory, so a restart of kithd forgets the devices held; a process that moved out of the
+  unit's cgroup is not counted; a cgroup whose processes cannot be read is taken to still
+  run; at kithd's shutdown a failed stop is not retried, and its processes outlive kithd
+  until the next start's cleanup.
 - **A pod** (a template that says `pod: true`, and so every Deployment, StatefulSet,
   DaemonSet and Job sent through the Kubernetes API) is a container with three of those
   taken off, as Kubernetes has them: it is the user its image names, root included; root
@@ -152,8 +155,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   Every start from one of the node's Images asks this registry for the manifest, whatever
   the pull policy, so an Image deleted, or whose namespace was deleted and made again under
   the same name, is not started from the copy kept on the node; the old bytes stay on the
-  node's disk until the Image is removed. And kithd pulls an Image only for what runs in
-  the Image's own namespace: an Image is a packed Volume. Reading kithd's memory is being
+  node's disk until the Image is removed. And kithd pulls an Image only for what runs in the Image's
+  own namespace: an Image is a packed Volume. Reading kithd's memory is being
   root on the node outside any container, which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload

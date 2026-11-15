@@ -32,6 +32,9 @@ const SETTLED: Duration = Duration::from_secs(60);
 /// or a child exit wakes it sooner (`until_woken`). What this covers is a Job's next run and a
 /// failed status report, retried on the next pass. Neither is on the measured paths (T-0185).
 const TICK: Duration = Duration::from_secs(10);
+/// How long a unit whose stop failed with processes left waits before its stop is tried again: a try
+/// can block for about 100 ms, on the async thread.
+const STOP_RETRY: Duration = Duration::from_secs(2);
 /// Failed runs a Job shrugs off when it does not say (`retries`).
 const JOB_RETRIES: u32 = 3;
 
@@ -106,6 +109,11 @@ struct Slot {
     /// Its handle could not be deleted while processes remain: it is still stopping, and its
     /// id and device nodes are held back from new units until a later pass finds it gone.
     leaving: bool,
+    /// Stopped to be replaced or dropped (stale or no longer wanted): once it is gone its slot goes,
+    /// and what is wanted starts afresh. Not set for one that ended on its own (see `kept_once_gone`).
+    drop: bool,
+    /// When its stop was last tried: one still stopping is tried again at most every `STOP_RETRY`.
+    tried: Option<Instant>,
     /// Its job run was counted as ended (a run stopped by its revision is counted once).
     accounted: bool,
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
@@ -256,8 +264,9 @@ fn stop(id: &str, slot: &mut Slot) {
         slot.leaving = false;
         return;
     };
+    slot.tried = Some(Instant::now());
     if let Err(undeleted) = handle.delete() {
-        slot.handle = undeleted.handle;
+        slot.handle = undeleted.handle.map(|handle| *handle);
         if slot.handle.is_some() {
             slot.probes = None;
             if slot.state == "running" {
@@ -279,14 +288,34 @@ fn stop(id: &str, slot: &mut Slot) {
     slot.leaving = slot.handle.is_some();
 }
 
-/// Stops the unit `id` if it has one, and keeps its slot only while it is still `leaving`.
-fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str) {
+/// Stops the unit `id` if it has one. Its slot is kept while it is `leaving`, and once it is gone
+/// unless it is dropped: `drop` marks one stopped to be replaced or dropped (see `kept_once_gone`).
+fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str, drop: bool) {
     if let Some(mut slot) = slots.remove(id) {
+        slot.drop |= drop;
         stop(id, &mut slot);
-        if slot.leaving {
+        if slot.leaving || kept_once_gone(slot.drop) {
             slots.insert(id.to_string(), slot);
         }
     }
+}
+
+/// Whether a slot whose handle is gone is kept. One stopped to be replaced or dropped is not: what
+/// is wanted starts afresh. One that ended on its own is, with its state, exit code and restarts
+/// (and its backoff), so it is not run again.
+fn kept_once_gone(drop: bool) -> bool {
+    !drop
+}
+
+/// Whether the running container `slot` takes the devices of `new` as it runs, with no new start
+/// (see `in_place`). Then a difference in devices alone is no reason to replace it: a plug that is
+/// refused is tried again at the next pass, and the unit keeps running.
+fn plugs_in_place(slot: &Slot, new: &Slot) -> bool {
+    let running = slot.handle.is_some() && !slot.leaving && matches!(slot.run, Run::Container(_));
+    let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
+        (slot.devices.iter().collect(), new.devices.iter().collect());
+    let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
+    running && in_place(&was, &now, &gone)
 }
 
 /// Why a unit `id` with the device nodes `devices` waits: a unit still stopping has its id, and
@@ -676,6 +705,8 @@ impl Controller {
                             after: at.min(inits) as u32,
                             held: false,
                             leaving: false,
+                            drop: false,
+                            tried: None,
                             accounted: false,
                             tuned: None,
                             handle: None,
@@ -719,42 +750,16 @@ impl Controller {
             {
                 let _ = handle.try_wait();
             }
-            stop_unit(&mut self.slots, id);
-        }
-        // The devices of the units still stopping: a device one holds is not plugged into another
-        // running unit until it is gone (what waits for it says so in its status).
-        let leaving_now: Vec<(String, Vec<PathBuf>)> = self
-            .slots
-            .iter()
-            .filter(|(_, s)| s.leaving)
-            .map(|(id, s)| (id.clone(), s.devices.clone()))
-            .collect();
-        for (id, slot) in &mut self.slots {
-            let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
-                continue;
-            };
-            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
-                (slot.devices.iter().collect(), new.devices.iter().collect());
-            let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
-            if !in_place(&was, &now, &gone) || !matches!(slot.run, Run::Container(_)) {
+            // A stop that failed is tried again after STOP_RETRY: each try can block for a while.
+            if self
+                .slots
+                .get(id)
+                .and_then(|slot| slot.tried)
+                .is_some_and(|at| at.elapsed() < STOP_RETRY)
+            {
                 continue;
             }
-            let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
-            if let Some(why) = held_by_leaving(id, &added, &leaving_now) {
-                slot.message = Some(why);
-                continue;
-            }
-            let given = now.difference(&was).try_for_each(|path| handle.plug(path));
-            let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
-            match taken {
-                Ok(()) => {
-                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
-                    slot.devices = new.devices.clone();
-                    slot.message = None;
-                }
-                // (Started over, as before: by the comparison below.)
-                Err(e) => eprintln!("kithd: {id}: {e}"),
-            }
+            stop_unit(&mut self.slots, id, false);
         }
         let mut stale: Vec<String> = Vec::new();
         fn of(slot: &Slot) -> (&str, u32) {
@@ -765,11 +770,13 @@ impl Controller {
         let differs = |new: &Slot, slot: &Slot| {
             // A Job's run is not started over because a value changed under it.
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
+            // (Input devices plugged in or out do not replace a running container: see plugs_in_place.)
+            let devices = new.devices != slot.devices && !plugs_in_place(slot, new);
             new.run != slot.run
                 || new.pod != slot.pod
                 || new.notes != slot.notes
                 || new.policy != slot.policy
-                || new.devices != slot.devices
+                || devices
                 || new.seat != slot.seat
                 || new.volumes != slot.volumes
                 || new_values
@@ -837,7 +844,46 @@ impl Controller {
             .collect();
         stale.extend(first);
         for id in stale {
-            stop_unit(&mut self.slots, &id);
+            stop_unit(&mut self.slots, &id, true);
+        }
+        // The input devices of running units, given or taken as they run. After the stops above: a
+        // device a unit still stopping holds (one stopped this pass that did not go included) is not
+        // given to another, and what waits for it says so in its status.
+        let leaving_now: Vec<(String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, s)| (id.clone(), s.devices.clone()))
+            .collect();
+        for (id, slot) in &mut self.slots {
+            let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
+                continue;
+            };
+            if !plugs_in_place(slot, new) {
+                continue;
+            }
+            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
+                (slot.devices.iter().collect(), new.devices.iter().collect());
+            let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
+            if let Some(why) = held_by_leaving(id, &added, &leaving_now) {
+                slot.message = Some(why);
+                continue;
+            }
+            let given = now.difference(&was).try_for_each(|path| handle.plug(path));
+            let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
+            match taken {
+                Ok(()) => {
+                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
+                    slot.devices = new.devices.clone();
+                    slot.message = None;
+                }
+                // Still running: the comparison above does not replace it for this, so the plug is
+                // tried again at the next pass.
+                Err(e) => {
+                    eprintln!("kithd: {id}: {e}");
+                    slot.message = Some(format!("waiting: {e}"));
+                }
+            }
         }
         let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
@@ -1167,7 +1213,7 @@ impl Controller {
         if job.revision != revision {
             // Applied again with changes: it runs again.
             for id in mine(&self.slots, None) {
-                stop_unit(&mut self.slots, &id);
+                stop_unit(&mut self.slots, &id, true);
             }
             *job = Progress {
                 revision,
@@ -1216,7 +1262,7 @@ impl Controller {
                 }
             }
             for id in ids {
-                stop_unit(&mut self.slots, &id);
+                stop_unit(&mut self.slots, &id, true);
             }
         }
         let timeout = spec.timeout_seconds.map(|s| Duration::from_secs(s.into()));
@@ -1230,7 +1276,7 @@ impl Controller {
         }
         if job.outcome.is_some() {
             for id in mine(&self.slots, None) {
-                stop_unit(&mut self.slots, &id);
+                stop_unit(&mut self.slots, &id, true);
             }
             return (Vec::new(), Instant::now());
         }
@@ -1705,6 +1751,44 @@ mod tests {
             None
         );
         assert_eq!(held_by_leaving("w_a_b_0_y", &paths(&["/dev/dri/card0"]), &[]), None);
+    }
+
+    /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit
+    /// code and restarts stay and it is not run again. One stopped to be replaced or dropped is removed.
+    #[test]
+    fn leaving_exit_is_not_run_again() {
+        assert!(kept_once_gone(false), "an exit is kept, not run again");
+        assert!(
+            !kept_once_gone(true),
+            "a replaced unit goes, and what is wanted starts afresh"
+        );
+    }
+
+    /// A plug of an input device into a running container is no reason to start it over: a plug that
+    /// is refused keeps the unit running, and it is tried again at the next pass. A device that cannot
+    /// be plugged (a DRI node, or an input device the unit did not start with) still restarts it.
+    #[test]
+    fn refused_plug_keeps_running() {
+        let (input, other, card) = (
+            PathBuf::from("/dev/input/event0"),
+            PathBuf::from("/dev/input/event1"),
+            PathBuf::from("/dev/dri/card0"),
+        );
+        assert!(in_place(
+            &[&input].into_iter().collect(),
+            &[&input, &other].into_iter().collect(),
+            &[]
+        ));
+        assert!(!in_place(
+            &[&input].into_iter().collect(),
+            &[&input, &card].into_iter().collect(),
+            &[]
+        ));
+        assert!(!in_place(
+            &[&card].into_iter().collect(),
+            &[&input, &other].into_iter().collect(),
+            &[]
+        ));
     }
 
     #[test]

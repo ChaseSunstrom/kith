@@ -212,6 +212,16 @@ impl Runtime {
         let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
             .validate_id()
             .ctx(&what)?;
+        let state = self.root.join("state").join(id);
+        clear_kept(
+            &state,
+            &bundle,
+            &Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            || {
+                let _ = manager(&cgroup).remove();
+            },
+        )
+        .ctx(&what)?;
         let spec = spec(id, image, unit, &cgroup, &bundle).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -270,7 +280,6 @@ impl Runtime {
         };
         // Before its program runs: the devices it may open, and no other. (Where kithd is
         // root; elsewhere the container is a user namespace, which makes no device node.)
-        let state = self.root.join("state").join(id);
         if nix::unistd::getuid().is_root()
             && let Err(e) = devfilter::attach(&handle.cgroup, &allowed(&spec))
         {
@@ -299,8 +308,18 @@ impl Runtime {
         };
         let limits = resources(unit).ctx(&what)?;
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
-        // Marks the id as taken, and tells `cleanup` about the cgroup after a crash.
+        // Marks the id as taken, and tells `cleanup` about the cgroup after a crash. Its marker is
+        // its state and its bundle: a kept id (see `discard_leftovers`) is taken only once it is gone.
         let marker = self.root.join("state").join(id);
+        clear_kept(
+            &marker,
+            &marker,
+            &Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            || {
+                let _ = manager(&cgroup).remove();
+            },
+        )
+        .ctx(&what)?;
         fs::create_dir(&marker).ctx(&what)?;
         let child = Command::new(&self.shim)
             .arg(SHIM)
@@ -666,7 +685,7 @@ impl Handle {
         match deleted {
             Err(error) if has_processes(&self.cgroup) => Err(Undeleted {
                 error,
-                handle: Some(self),
+                handle: Some(Box::new(self)),
             }),
             deleted => {
                 // It was killed just now: collect it, or it stays a zombie for as long as we live.
@@ -685,7 +704,7 @@ impl Handle {
 /// are gone and only the cleanup failed: nothing of the unit runs.
 pub struct Undeleted {
     pub error: crate::Error,
-    pub handle: Option<Handle>,
+    pub handle: Option<Box<Handle>>,
 }
 
 /// What a discarded unit leaves: a failed delete with processes left keeps its state (the
@@ -698,6 +717,25 @@ fn discard_leftovers(state: &Path, deleted: std::result::Result<(), Undeleted>) 
             let _ = fs::remove_dir_all(state);
         }
     }
+}
+
+/// Clears the kept id `state` (see [`discard_leftovers`]) before a unit takes it: once its cgroup
+/// has no processes, the empty cgroup, state and bundle go. While processes remain nothing is removed
+/// and the id is refused. The check comes first: removing a cgroup kills what is in it.
+fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl FnOnce()) -> Result<()> {
+    if !state.exists() {
+        return Ok(());
+    }
+    if has_processes(cgroup) {
+        return err(format!(
+            "the last run of this id still has processes: it can be run again once they are gone ({})",
+            state.display()
+        ));
+    }
+    remove_cgroup();
+    let _ = fs::remove_dir_all(state);
+    let _ = fs::remove_dir_all(bundle);
+    Ok(())
 }
 
 /// Whether a cgroup still has processes. A cgroup that is gone has none; one whose
@@ -1873,6 +1911,35 @@ mod tests {
         assert!(state.exists() && bundle.exists(), "the processes are still there");
         discard_leftovers(&state, fresh("").finish(err("removing the cgroup")));
         assert!(!state.exists() && !bundle.exists(), "only the cleanup failed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A kept id is refused by `create` and `exec` (through `clear_kept`, which both call before
+    /// they take the id) while its last run has processes: nothing of it is removed. Once they are
+    /// gone the id is cleared and can be taken.
+    #[test]
+    fn create_refuses_a_kept_id() {
+        let root = std::env::temp_dir().join(format!("kith-kept-id-{}", std::process::id()));
+        let (state, bundle, cgroup) = (root.join("state"), root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: &str| {
+            let _ = fs::remove_dir_all(&root);
+            for dir in [&state, &bundle, &cgroup] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+        };
+        fresh("4242\n");
+        let refused = clear_kept(&state, &bundle, &cgroup, || {
+            panic!("a cgroup with processes is not removed")
+        });
+        assert!(refused.is_err(), "the processes are still there");
+        assert!(state.exists() && bundle.exists(), "nothing of a live run is removed");
+        fresh("");
+        assert!(clear_kept(&state, &bundle, &cgroup, || {}).is_ok());
+        assert!(
+            !state.exists() && !bundle.exists(),
+            "its last run is gone: the id is free"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
