@@ -268,57 +268,93 @@ impl Shared {
             return crate::view::write(self, &command).await;
         }
         let deadline = Instant::now() + PATIENCE;
+        let mut refused = None;
         loop {
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
             let leader = match written {
                 Ok(Ok(written)) => return written.data.map(|done| (done, written.log_id.index)),
                 Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to)))) => to.leader_id.zip(to.leader_node),
                 Ok(Err(e)) => return Err(unavailable(e)),
-                Err(_) => return Err(unavailable(NO_MAJORITY)),
+                Err(_) => return Err(no_majority(refused)),
             };
-            // The change may hold a Secret: it goes to the node the leader is by its Node, and to
-            // no other at that address. A leader no Node names is not sent it; asking again waits
-            // for the store to say.
-            let named = leader.and_then(|(id, leader)| {
-                let state = self.store.lock().expect("a handler panicked holding the store");
-                let node = state.store.list(Some("Node")).find(|node| {
-                    node.status
-                        .as_ref()
-                        .is_some_and(|status| status["raftId"].as_str() == Some(&id.to_string()))
-                });
-                Some((crate::view::Upstream::of(node?)?, leader))
-            });
-            if let (Some((there, leader)), Some(cluster)) = (named, &self.cluster)
-                && !leader.addr.is_empty()
-                && let Ok(client) = cluster.to(&there)
-            {
-                let call = client.post(format!("https://{}/v1/raft/write", leader.addr));
-                match call.timeout(PATIENCE).json(&command).send().await {
-                    Ok(reply) => {
-                        if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
-                            // What a client writes through this node, it can read from this node.
-                            let caught_up = self.raft.wait(Some(PATIENCE));
-                            let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                            return reply.map(|done| (done, index));
-                        }
-                    }
-                    // Never reached it: nothing happened, and asking again is safe.
-                    Err(e) if e.is_connect() => {}
-                    Err(e) => {
-                        let why = format!(
-                            "the leader at {} did not answer ({}); look before trying again",
-                            leader.addr,
-                            crate::cluster::why(&e)
-                        );
-                        return Err(unavailable(why));
-                    }
+            if let Some((id, leader)) = leader {
+                match self.forward(id, &leader, &command).await {
+                    Forward::Done(reply, index) => return reply.map(|done| (done, index)),
+                    Forward::Failed(e) => return Err(e),
+                    Forward::Again(why) => refused = why.or(refused),
                 }
             }
             if Instant::now() > deadline {
-                return Err(unavailable(NO_MAJORITY));
+                return Err(no_majority(refused));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+    }
+
+    /// The change, sent to the leader the store says is node `id`.
+    //
+    // The change may hold a Secret: it goes to the node the leader is by its Node, and to no
+    // other at that address. A leader no Node names is not sent it; asking again waits for
+    // the store to say.
+    async fn forward(&self, id: NodeId, leader: &BasicNode, command: &Command) -> Forward {
+        let named = {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            let node = state.store.list(Some("Node")).find(|node| {
+                let status = node.status.as_ref();
+                status.is_some_and(|status| status["raftId"].as_str() == Some(&id.to_string()))
+            });
+            node.and_then(crate::view::Upstream::of)
+        };
+        let at = &leader.addr;
+        let (Some(there), Some(cluster)) = (named, &self.cluster) else {
+            return Forward::Again(Some(format!("no Node names the leader (raft id {id}) at {at}")));
+        };
+        let client = match cluster.to(&there) {
+            Ok(client) if !at.is_empty() => client,
+            Ok(_) => return Forward::Again(None),
+            Err(e) => return Forward::Again(Some(e)),
+        };
+        let call = client.post(format!("https://{at}/v1/raft/write"));
+        match call.timeout(PATIENCE).json(command).send().await {
+            Ok(reply) => {
+                if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
+                    // What a client writes through this node, it can read from this node.
+                    let caught_up = self.raft.wait(Some(PATIENCE));
+                    let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
+                    return Forward::Done(reply, index);
+                }
+                Forward::Again(None)
+            }
+            // Never reached it (or refused it, which is the same to the change): nothing
+            // happened, and asking again is safe.
+            Err(e) if e.is_connect() => Forward::Again(Some(format!(
+                "the leader at {at} was not reached: {}",
+                crate::cluster::why(&e)
+            ))),
+            Err(e) => {
+                let why = format!(
+                    "the leader at {at} did not answer ({}); look before trying again",
+                    crate::cluster::why(&e)
+                );
+                Forward::Failed(unavailable(why))
+            }
+        }
+    }
+}
+
+/// What came of sending a change to the leader.
+enum Forward {
+    Done(Reply, u64),
+    Failed(Error),
+    /// Not sent, or not reached: ask again, and say why if it is still so at the deadline.
+    Again(Option<String>),
+}
+
+/// The change was not taken in time; `refused` is why the last leader called was not reached.
+fn no_majority(refused: Option<String>) -> Error {
+    match refused {
+        Some(why) => unavailable(format!("{NO_MAJORITY} (the last try: {why})")),
+        None => unavailable(NO_MAJORITY),
     }
 }
 
@@ -559,6 +595,38 @@ mod tests {
         roaming: &BTreeSet<NodeId>,
     ) -> Option<ChangeMembers<NodeId, BasicNode>> {
         super::next_change(me, wanted, known, voters, current, lost, roaming, &BTreeSet::new())
+    }
+
+    #[tokio::test]
+    async fn pinned_peer_is_sent_no_write_and_the_refusal_is_what_a_person_is_told() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use std::sync::atomic::Ordering;
+        let ca = pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        // Node/b, raft id 1, is where another node of the cluster answers now.
+        let (taken, to_x) = answering_as(&x).await;
+        let there = at("b", &taken, Some(pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("write", a, &[there]).await;
+        let command = Command::Delete {
+            key: "Secret/default/s".into(),
+        };
+        let leader = BasicNode::new(&taken);
+        let Forward::Again(why) = shared.forward(1, &leader, &command).await else {
+            panic!("a write was taken by another node than the leader");
+        };
+        let why = why.expect("the refusal is kept");
+        assert!(why.contains("node b was called, and node x answered"), "{why}");
+        assert_eq!(to_x.load(Ordering::SeqCst), 0, "x was sent the write");
+        // A leader that no Node names is sent nothing either, and that is what is said.
+        let Forward::Again(why) = shared.forward(7, &leader, &command).await else {
+            panic!("a write was sent to a leader no Node names");
+        };
+        assert!(why.is_some_and(|why| why.contains("no Node names")));
+        assert_eq!(to_x.load(Ordering::SeqCst), 0);
+        // What a person is told when no leader takes it, and why.
+        let said = no_majority(Some("the leader at 127.0.0.1:1 was refused".into())).to_string();
+        assert!(said.contains("no leader") && said.contains("was refused"), "{said}");
+        assert_eq!(no_majority(None).to_string(), unavailable(NO_MAJORITY).to_string());
     }
 
     #[test]

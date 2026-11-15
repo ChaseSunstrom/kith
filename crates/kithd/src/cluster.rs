@@ -95,6 +95,13 @@ impl Cluster {
         made.insert(to.name.clone(), (to.certificate.clone(), client.clone()));
         Ok(client)
     }
+
+    /// Forget the clients of nodes that are no more (`is_node` says which are), so what [`Cluster::to`]
+    /// holds is as big as the nodes there are, whatever Nodes came and went.
+    pub fn forget_but(&self, is_node: impl Fn(&str) -> bool) {
+        let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
+        made.retain(|name, _| is_node(name));
+    }
 }
 
 /// An error with what caused it: a refused certificate is the last of the chain, and names
@@ -1181,6 +1188,10 @@ pub(crate) mod pinned_peer {
         assert_eq!(to_b.load(Ordering::SeqCst), 2);
         // One client for a node, replaced when its key changes: the map is as big as the nodes called.
         assert_eq!(cluster.pinned.lock().unwrap().len(), 1);
+        // A node whose Node is deleted is forgotten, and the others are not.
+        cluster.to(&at("c", &home, None)).unwrap();
+        cluster.forget_but(|name| name == "c");
+        assert_eq!(cluster.pinned.lock().unwrap().keys().collect::<Vec<_>>(), ["c"]);
         // The plain client takes any node of the cluster: it is not for what is meant for one.
         let any = cluster.client.post(format!("https://{taken}/v1/secret")).send().await;
         assert!(any.unwrap().status().is_success() && to_x.load(Ordering::SeqCst) == 1);
@@ -1202,19 +1213,34 @@ pub(crate) mod pinned_peer {
     }
 
     /// A call that carries what is meant for one node goes through `Cluster::to`, which pins the
-    /// peer to its name and key. The calls that use the cluster's plain client, which takes any
-    /// node of the cluster, are these and no others, each with its reason.
+    /// peer to its name and key. Every other way a client is made or used here (the cluster's plain
+    /// client, which takes any node of the cluster; a client of one's own; the TLS settings of one)
+    /// is on this list, each with its reason, and no others.
     #[test]
     fn every_call_to_a_node_is_pinned_or_on_the_short_list() {
         let short_list = [
-            // A ping carries nothing: it asks whether an address answers.
-            ("src/members.rs", 1),
-            // A blob is named by its digest and checked against it, whoever sends it.
-            ("src/blobs.rs", 3),
-            // The probe of a candidate voter asks for the CA, which every node hands out.
-            ("src/raft.rs", 1),
+            // The upload to a bucket: a client of the world outside, by the name it was given.
+            ("src/backups.rs", 1),
+            // A blob fetched by digest and checked against it, whoever sends it (two calls).
+            ("src/blobs.rs", 2),
+            // The boot-time unlock: only a key wrapped under the disk's own secret goes.
+            ("src/crypt.rs", 1),
+            // The probe of a candidate voter asks for the CA, which every node hands out; and the
+            // Raft links, which hold the plain client they were made with (T-0424).
+            ("src/raft.rs", 2),
             // The Raft links are made before the store is: they know an id and an address.
             ("src/main.rs", 1),
+            // `client_for` (the pinned clients and the plain one) and the join, which the token's
+            // hash of the CA makes safe: its client takes any certificate, and the CA it is handed
+            // has to be the token's.
+            ("src/cluster.rs", 3),
+            // The TLS settings of a client, which `client_for` is given a pin for.
+            ("src/pki.rs", 1),
+            // The world outside: registries, images, ACME, the update, the installer.
+            ("src/registry.rs", 2),
+            ("src/acme.rs", 3),
+            ("src/update.rs", 1),
+            ("src/install.rs", 1),
         ];
         let mut files = Vec::new();
         sources(
@@ -1223,11 +1249,18 @@ pub(crate) mod pinned_peer {
         );
         assert!(files.len() > 20, "the sources were not found");
         for (file, code) in &files {
-            let plain = code.matches("cluster.client").count();
+            // (`.client` takes in `cluster.client` and an alias of it: `&c.client`, a closure.)
+            // (Not `.clients`, a field of its own: what follows the name is not a letter.)
+            let field = code
+                .split(".client")
+                .skip(1)
+                .filter(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+                .count();
+            let plain = code.matches("Client::builder").count() + code.matches("client_config(").count() + field;
             let allowed = short_list.iter().find(|(name, _)| name == file).map_or(0, |(_, n)| *n);
             assert_eq!(
                 plain, allowed,
-                "{file} calls by the plain client {plain} times; the short list says {allowed}"
+                "{file} makes or uses a client {plain} times; the short list says {allowed}"
             );
             // The key a Node names is only ever put in a pin here and in `to`.
             if file != "src/cluster.rs" && file != "src/pki.rs" {
@@ -1245,6 +1278,8 @@ pub(crate) mod pinned_peer {
             "src/replicas.rs",
             "src/view.rs",
             "src/raft.rs",
+            "src/blobs.rs",
+            "src/members.rs",
         ] {
             let (_, code) = files.iter().find(|(name, _)| name == relay).unwrap();
             assert!(code.contains("cluster.to("), "{relay} does not pin");

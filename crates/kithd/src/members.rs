@@ -10,6 +10,7 @@
 
 use crate::Shared;
 use crate::cluster::Peer;
+use crate::view::Upstream;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,27 @@ pub async fn ping(
     Json(shared.members.view(now))
 }
 
+/// What `client` is told of the nodes by the one at `address`, for this node's view of them.
+async fn ask(client: &reqwest::Client, address: &str, view: &View) -> Option<View> {
+    let call = client.post(format!("https://{address}/v1/ping"));
+    let mut answer = call
+        .timeout(Duration::from_secs(1))
+        .json(view)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = answer.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > 64 << 10 {
+            return None;
+        }
+    }
+    serde_json::from_slice(&body).ok()
+}
+
 /// Tell every other node what this one knows, and take in what they know, until stopped.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
@@ -165,12 +187,9 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             () = tokio::time::sleep(PERIOD) => {}
             _ = stopping.changed() => return,
         }
-        let peers: BTreeMap<String, String> = {
+        let peers: BTreeMap<String, Upstream> = {
             let store = shared.store.lock().expect("nothing panics holding the store");
-            let at = |node: &kith_api::Resource| {
-                let address = node.status.as_ref()?["address"].as_str()?;
-                Some((node.metadata.name.clone(), address.to_string()))
-            };
+            let at = |node: &kith_api::Resource| Some((node.metadata.name.clone(), Upstream::of(node)?));
             store.store.list(Some("Node")).filter_map(at).collect()
         };
         // Only Nodes are remembered, so what a member can make this node hold is bounded;
@@ -179,27 +198,18 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         {
             let mut heard = shared.members.heard();
             heard.retain(|name, _| peers.contains_key(name));
+            cluster.forget_but(|name| peers.contains_key(name));
             for name in peers.keys() {
                 heard.entry(name.clone()).or_insert((sent, None));
             }
         }
         let view = shared.members.view(sent);
         let mut calls = tokio::task::JoinSet::new();
-        for (name, address) in peers.iter().filter(|(name, _)| **name != cluster.me.name) {
-            let call = cluster.client.post(format!("https://{address}/v1/ping"));
-            let call = call.timeout(Duration::from_secs(1)).json(&view);
-            let name = name.clone();
-            calls.spawn(async move {
-                let mut answer = call.send().await.ok()?.error_for_status().ok()?;
-                let mut body = Vec::new();
-                while let Some(chunk) = answer.chunk().await.ok()? {
-                    body.extend_from_slice(&chunk);
-                    if body.len() > 64 << 10 {
-                        return None;
-                    }
-                }
-                Some((name, serde_json::from_slice::<View>(&body).ok()?))
-            });
+        for (name, there) in peers.iter().filter(|(name, _)| **name != cluster.me.name) {
+            // (That node and no other: what answers is taken for what that node says.)
+            let Ok(client) = cluster.to(there) else { continue };
+            let (name, address, view) = (name.clone(), there.address.clone(), view.clone());
+            calls.spawn(async move { Some((name, ask(&client, &address, &view).await?)) });
         }
         while let Some(answer) = calls.join_next().await {
             // Ages count from when the call was made: time on the way is not news.
@@ -214,6 +224,32 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pinned_peer_is_pinged_and_what_another_node_says_is_not_its_word() {
+        use crate::cluster::pinned_peer::{answering_as, at, node};
+        use std::sync::atomic::Ordering;
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let cluster = crate::cluster::Cluster::new(a, None).unwrap();
+        let (stolen, to_x) = answering_as(&x).await;
+        // x answers at the address of b, and says what a view says (`{}`: nobody).
+        let there = at("b", &stolen, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let client = cluster.to(&there).unwrap();
+        assert_eq!(ask(&client, &stolen, &View::new()).await, None);
+        assert_eq!(
+            to_x.load(Ordering::SeqCst),
+            0,
+            "x was pinged, and its answer is taken for b's"
+        );
+        // Where b answers, and where its Node names no key yet, the answer is taken.
+        let (home, to_b) = answering_as(&b).await;
+        for print in [None, Some(crate::pki::print_of(&b.cert).unwrap())] {
+            let client = cluster.to(&at("b", &home, print)).unwrap();
+            assert_eq!(ask(&client, &home, &View::new()).await, Some(View::new()));
+        }
+        assert_eq!(to_b.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn news_is_passed_on_and_grows_old() {

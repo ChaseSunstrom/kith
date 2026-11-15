@@ -20,6 +20,7 @@ use crate::Shared;
 use crate::access::Caller;
 use crate::api::{ApiError, permit};
 use crate::cluster::Peer;
+use crate::view::Upstream;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Extension, Path as UrlPath, Query, State};
@@ -473,20 +474,26 @@ pub async fn get(
         let blob = state.store.get(&key).filter(|_| named(&name)).ok_or_else(missing)?;
         let nodes = blob.status.as_ref().and_then(|status| status["nodes"].as_array());
         let nodes = nodes.into_iter().flatten().filter_map(Value::as_str);
-        let address = |node: &str| {
-            let there = state.store.get(&format!("Node/{node}"))?.status.as_ref()?;
-            Some(there["address"].as_str()?.to_string())
-        };
-        let elsewhere: Vec<String> = nodes.filter(|node| *node != me).filter_map(address).collect();
+        let there = |node: &str| Upstream::of(state.store.get(&format!("Node/{node}"))?);
+        let elsewhere: Vec<Upstream> = nodes.filter(|node| *node != me).filter_map(there).collect();
         (blob.spec["size"].as_u64(), elsewhere)
     };
     if let Ok(reply) = file_reply(&dir(&shared).join(&name)) {
         return Ok(reply);
     }
     let mut failed = format!("no node says it holds blob {name} yet");
-    for address in elsewhere {
+    for there in elsewhere {
         let Some(cluster) = &shared.cluster else { break };
-        let asked = cluster.client.get(format!("https://{address}/v1/blob-copy/{name}"));
+        // (The holder the Blob names and no other at its address: its bytes are passed on unchecked.)
+        let client = match cluster.to(&there) {
+            Ok(client) => client,
+            Err(e) => {
+                failed = format!("asking node {} for blob {name}: {e}", there.name);
+                continue;
+            }
+        };
+        let address = &there.address;
+        let asked = client.get(format!("https://{address}/v1/blob-copy/{name}"));
         match asked.send().await.and_then(reqwest::Response::error_for_status) {
             // (Passed on as it comes: the node it comes from checked the bytes when it took them.)
             Ok(answer) => {
@@ -496,7 +503,13 @@ pub async fn get(
                 });
                 return Ok(([(header::CONTENT_LENGTH, size)], Body::from_stream(chunks)).into_response());
             }
-            Err(e) => failed = format!("asking {address} for blob {name}: {e}"),
+            Err(e) => {
+                failed = format!(
+                    "asking node {} for blob {name}: {}",
+                    there.name,
+                    crate::cluster::why(&e)
+                )
+            }
         }
     }
     Err(io(failed))
@@ -542,6 +555,44 @@ mod tests {
         let mut incoming = Incoming::new(dir).unwrap();
         incoming.write(bytes).unwrap();
         incoming.keep(expected)
+    }
+
+    #[tokio::test]
+    async fn pinned_peer_is_asked_for_a_blob_and_no_other_gives_one() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use std::sync::atomic::Ordering;
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        // Node/b holds the Blob, and is where another node of the cluster answers now.
+        let (taken, to_x) = answering_as(&x).await;
+        let there = at("b", &taken, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("blob", a, &[there]).await;
+        let name = "ab".repeat(31);
+        let source =
+            format!("apiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: {name} }}\nspec: {{ size: 2 }}\n");
+        {
+            let blob = kith_api::Resource::from_source(&source).unwrap().remove(0).unwrap();
+            let mut state = shared.store.lock().unwrap();
+            state.store.apply(blob).unwrap();
+            let status = Some(json!({ "nodes": ["b"] }));
+            state.store.set_status(&format!("Blob/default/{name}"), status).unwrap();
+        }
+        let asked = get(
+            State(shared),
+            Extension(Caller::Admin),
+            UrlPath(("default".into(), name)),
+        )
+        .await;
+        let answer = asked.into_response();
+        assert_ne!(answer.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("node b was called, and node x answered"), "{said}");
+        assert_eq!(
+            to_x.load(Ordering::SeqCst),
+            0,
+            "x was asked, and its bytes could have been passed on"
+        );
     }
 
     #[test]

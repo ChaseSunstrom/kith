@@ -384,8 +384,16 @@ async fn tend(
         // ponytail: one node after another, each given `QUIET` to answer; all at once when
         // a cluster is big enough for that to be felt.
         // (Each is the node it is, and not another at its address: a key is for that node's volume.)
-        let Some(client) = cluster.and_then(|cluster| cluster.to(peer).ok()) else {
-            continue;
+        let Some(cluster) = cluster else { continue };
+        let client = match cluster.to(peer) {
+            Ok(client) => client,
+            Err(why) => {
+                eprintln!(
+                    "kithd: no call to node {} for the key of {}/{}: {why}",
+                    peer.name, dir.namespace, dir.name
+                );
+                continue;
+            }
         };
         match &*key {
             Some(key) if is_open => drop(give(&client, &peer.address, dir, key).await),
