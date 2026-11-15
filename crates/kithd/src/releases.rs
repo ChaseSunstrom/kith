@@ -162,6 +162,9 @@ fn package<'a>(store: &'a Store, release: &Resource, spec: &ReleaseSpec) -> Resu
     kept.filter(fitting).or_else(newest).ok_or(match &spec.package.repo {
         None => format!("there is no Package {name}{wanted}: `kith package push` puts one here"),
         Some(repo) if store.get(&format!("Repository/{repo}")).is_none() => format!("there is no Repository/{repo}"),
+        Some(repo) if let Err(why) = supplied(store, release) => {
+            format!("there is no Package {name}{wanted} from Repository/{repo}: {why}")
+        }
         Some(repo) => format!(
             "there is no Package {name}{wanted} from Repository/{repo} (yet): its status says if it cannot be asked"
         ),
@@ -493,6 +496,32 @@ pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone:
         Some(refused) => Err(short(refused)),
         None => Ok(()),
     }
+}
+
+/// Why kithd asks no Repository for `release`'s Package, if so: reaching a registry
+/// through kithd takes `apply` on `Package` (as a pull or a push by hand does, `api.rs`),
+/// and it is asked of whoever applied the Release. Else one who may write Releases alone
+/// would have kithd ask any Repository there is and store what it answers.
+pub fn supplied(store: &Store, release: &Resource) -> Result<(), String> {
+    use crate::access::{Caller, Grants};
+    let key = release.key();
+    let Some(writer) = release.metadata.annotations.get(WRITER) else {
+        return Err(format!(
+            "nobody is written down as having applied {key}, so nothing is fetched for it: apply it again"
+        ));
+    };
+    let Some(caller) = Caller::named(writer) else {
+        return Err(format!(
+            "{key} was applied by {writer}, for whom kithd fetches nothing: apply it again"
+        ));
+    };
+    if Grants::of(&caller, store).may(&kith_api::kinds::Verb::Apply, "Package", None) {
+        return Ok(());
+    }
+    Err(format!(
+        "{key} was applied by {writer}, and {writer} may not apply Package (in every namespace: a Package is in none), \
+         so nothing is fetched for it"
+    ))
 }
 
 fn failed(why: &str, revision: Option<u64>) -> Value {
@@ -1111,5 +1140,65 @@ mod tests {
             assert!(message.contains("apply it again"), "{message}");
             assert_eq!(keys(&store).len(), 1);
         }
+    }
+
+    /// A Release that names a Repository is supplied from it only when whoever applied it
+    /// may apply Packages, the right a pull by hand takes (T-0546). Without it the status
+    /// says whose right fell short; a Package that is here already installs as before.
+    #[test]
+    fn fetch_rights_a_release_is_supplied_only_when_its_writer_may_apply_packages() {
+        const HUB: &str = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\n\
+                           spec: { url: 'oci://127.0.0.1:1/kith' }\n";
+        let from_hub = RELEASE.replace("name: maps }", "name: maps, repo: hub }");
+        let as_bob = from_hub.replace("local socket", "bob");
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(&mut store, HUB);
+        // A Role in one namespace reaches no Package, whatever kinds it lists: Packages are
+        // in no namespace.
+        bob(&mut store, "Release, ConfigMap, Package");
+        apply(&mut store, &as_bob);
+        let release = |store: &Store| store.get("Release/shop/mine").unwrap().clone();
+        let refused = supplied(&store, &release(&store)).unwrap_err();
+        assert!(refused.contains("bob may not apply Package"), "{refused}");
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error");
+        assert!(
+            message.contains("Repository/hub") && message.contains("bob may not apply Package"),
+            "{message}"
+        );
+
+        // With the right, in every namespace: asked for, and said to be on its way.
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: packages }\n\
+             spec: { rules: [{ kinds: [Package], verbs: [apply] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-packages }\n\
+             spec: { role: packages, subjects: [bob] }\n",
+        );
+        assert_eq!(supplied(&store, &release(&store)), Ok(()));
+        // The local socket's; and nobody's, or a node's, for whom nothing is fetched.
+        apply(&mut store, &from_hub);
+        assert_eq!(supplied(&store, &release(&store)), Ok(()));
+        for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
+            apply(
+                &mut store,
+                &as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written),
+            );
+            let refused = supplied(&store, &release(&store)).unwrap_err();
+            assert!(refused.contains("apply it again"), "{refused}");
+        }
+
+        // The right gone again, and the Package here already (from that Repository): it
+        // installs, since what it makes is asked of bob as ever.
+        store.delete("RoleBinding/bob-packages").unwrap();
+        apply(&mut store, &as_bob);
+        let mut here = package("1.0.0", &[("map.yaml", MAP)]);
+        here.metadata
+            .annotations
+            .insert(REPOSITORY.into(), origin(&store, "hub").unwrap());
+        store.apply(here).unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, json!("installed"), "{}", said(&store).1);
     }
 }
