@@ -482,21 +482,34 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     are not held to this (it can lead: the cluster is taken with it). How much and
     how often a worker writes is held too, by each control node it asks: a write is
     at most 1 MiB (an honest report of 300 units, each with a long message and
-    notes, is 131 KiB), and a worker makes at most 10 a second, 50 at once after a
-    rest, a write counting once more for each 64 KiB (so at most about 640 KiB a
-    second); one over the size is refused, one past the rate is answered 429 with
-    the seconds to wait, and the worker's own kithd sends it again then. Neither
-    reaches the log, and a worker's refusals are written in the audit log once a
-    minute at most. What is left: a taken worker can still write that much, within
-    its list, to each control node it reaches (three control nodes, three times as
-    much), and the log between two snapshots (about 1100 entries) can then hold
-    some 1.1 GiB of it on every node, which takes such a worker about half an hour
-    to write through one control node. Nothing bounds the store's whole size or
+    notes, is 131 KiB; a larger report is sent in parts of at most half that, a
+    status whole in each), and a worker makes at most 10 a second, 50 at once
+    after a rest, a write counting once more for each 64 KiB (so at most about
+    640 KiB a second). Every write a worker sends counts, before a byte of it is
+    read: one refused for its list, one that is not a change, and the empty write
+    its controller makes before it starts a unit (one a second at most) too. One
+    past the rate is answered 429 with the seconds to wait, and is not read; the
+    worker's own kithd sends it again then. One that says it is over the size is
+    refused unread, and one that turns out larger is cut off there. None of them
+    reaches the log. In the audit log under the worker's name, a write refused for
+    its list or as no change is written each time; one refused for its size, or
+    for its rate, a line a minute of each, which says how many were not written
+    since the last. What is left: a taken worker can still write that much, within
+    its list, to each control node it reaches (each holds it to its own count:
+    three control nodes, three times as much), and the log between two snapshots
+    (about 1100 entries) can then hold some 1.1 GiB of it on every node, which
+    takes such a worker about half an hour to write through one control node. What
+    it writes over its own status is replaced, but **the Devices and Seats it makes
+    under its own name are not counted**: each write can be a new one, so the store
+    itself (and every snapshot, on every node) can grow by up to about 2.2 GiB an
+    hour through one control node (640 KiB a second for 3600 seconds), until
+    someone deletes them or its Node. Nothing bounds the store's whole size or
     what the disk has left. For the round (3 seconds) in which another node still
     has the file of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
     a moment ago) is still followed, still has the store, and what it writes as the
-    node that leads is held to no list: delete its Node. It cannot read a Secret
+    node that leads, or sends on Raft's own routes, is held to no list, no size but
+    the 64 MiB any node's write may be, and no rate: delete its Node. It cannot read a Secret
     nothing placed on it names, or one that says `trust: control`; it is not sent a
     Volume it is no replica of, a Blob nothing on it names, or the key of an
     encrypted Volume.
