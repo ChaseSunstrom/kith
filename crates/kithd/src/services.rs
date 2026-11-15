@@ -20,7 +20,7 @@
 mod connect;
 
 use crate::Shared;
-use crate::ingress::{Idle, Limits};
+use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PortRef, Protocol, ServiceSpec, WorkloadSpec};
@@ -85,9 +85,9 @@ const SERVING: usize = 4096;
 const RELAYING: usize = 4096;
 /// How many of the relayed ones one other node may hold.
 const RELAYING_PER_NODE: usize = 1024;
-/// How many connections past [`RELAYING`] this node keeps to say no to, in all, and how many
-/// one other node may hold: a node that keeps asking a full node costs it at most these
-/// sockets, and the rest of its asks are hung up on ([`admit`]).
+/// The sockets a node over its relaying limit keeps open to say no with, in all and for one
+/// other node: the most it holds for a node that keeps asking, and past those its asks are
+/// hung up on at once ([`admit`]).
 const SPARE: usize = 256;
 const SPARE_PER_NODE: usize = 64;
 /// The most threads the connections to Services are on, one to a core. Each connection
@@ -298,11 +298,11 @@ struct Proxy {
     prefix: Ipv6Addr,
     table: Mutex<Table>,
     turns: Turns,
-    /// Places for the connections of this node's own clients, and for those another node
-    /// passes on to a replica here.
+    /// Places for the connections of this node's own clients.
     serving: Limits,
+    /// Places for the connections another node passes on to a replica here.
     relaying: Limits,
-    /// Places for the over-limit connections of other nodes, to be said no to ([`admit`]).
+    /// Spares for the over-limit connections of other nodes, to be said no to ([`admit`]).
     spares: Limits,
     /// The connections to each other node's kithd that no client's is on now, and since when.
     /// (As the kernel's, on no thread's runtime: the next client's may be on another.)
@@ -593,10 +593,10 @@ async fn ask(relay: &mut Relay, line: &str, early: &[u8]) -> std::io::Result<boo
 /// the client's bytes follow in frames ([`carry`]) without waiting: `+` and the replica's
 /// in frames, or `-` (and then the client's are nobody's, to where it says they end), and
 /// then the next line. A node of before asks with no such word, once: `+` and the bytes
-/// as they are, or it is hung up on. With no `room` (the node is over its limit) nothing is
-/// looked for: each kept asking is said no to in the same way, and a node of before is
-/// hung up on.
-async fn taken<F, Fut>(from: TcpStream, room: bool, find: F) -> Option<()>
+/// as they are, or it is hung up on. Over the limit (no place for it at this asking) nothing
+/// is looked for: each kept asking is said no to in the same way, and a node of before is
+/// hung up on. Each asking looks for a place again ([`Hold::room`]).
+async fn taken<F, Fut>(from: TcpStream, mut hold: Hold<'_>, find: F) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
@@ -622,7 +622,7 @@ where
             Some(replica) => Some(replica.parse::<u32>().ok()?),
             None => None,
         };
-        let replica = match room {
+        let replica = match hold.room() {
             true => tokio::time::timeout(FOUND, find(port, workload.to_string(), replica))
                 .await
                 .ok()
@@ -643,11 +643,14 @@ where
                 relay.to.write_all(b"-").await.ok()?;
                 let skipped = async {
                     loop {
-                        let size = u64::from(relay.from.read_u16().await?);
+                        let size = relay.from.read_u16().await?;
                         if size == 0 {
                             return Ok(());
                         }
-                        tokio::io::copy(&mut (&mut relay.from).take(size), &mut tokio::io::sink()).await?;
+                        if usize::from(size) > CHUNK {
+                            return Err(std::io::Error::other("a frame too long"));
+                        }
+                        tokio::io::copy(&mut (&mut relay.from).take(u64::from(size)), &mut tokio::io::sink()).await?;
                     }
                 };
                 within(skipped).await.ok()?;
@@ -657,28 +660,53 @@ where
     }
 }
 
-/// [`taken`] for a connection from node `caller`, with its place: one for relaying (room for
-/// replicas), or past the relayed ones, a spare ([`SPARE`]), which only says no. Held while
-/// the connection lasts. Past the spares, the line is read (so the hang-up is an end, not a
-/// reset) and the connection is hung up on with no answer.
+/// What a connection from another node holds while it is kept: a place to relay (room for
+/// replicas), or else a spare ([`SPARE`]), which only says no. Each asking looks for a place
+/// again; the first to get one keeps it for the rest of the connection, and the spare goes.
+struct Hold<'a> {
+    relaying: &'a Limits,
+    caller: IpAddr,
+    place: Option<Place>,
+    spare: Option<Place>,
+}
+
+impl Hold<'_> {
+    /// Whether this asking may look for a replica: a place held, or one got now.
+    fn room(&mut self) -> bool {
+        if self.place.is_none() {
+            self.place = self.relaying.take(self.caller);
+            if self.place.is_some() {
+                self.spare = None;
+            }
+        }
+        self.place.is_some()
+    }
+}
+
+/// [`taken`] for a connection from node `caller`, with a place for relaying if one is free,
+/// else a spare ([`SPARE`]) to say no with. Past the spares, the connection is dropped at once:
+/// nothing is read from it, and no answer is given.
 async fn admit<F, Fut>(relaying: &Limits, spares: &Limits, caller: IpAddr, from: TcpStream, find: F) -> Option<()>
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
 {
-    let (room, _held) = match relaying.take(caller) {
-        Some(place) => (true, place),
-        None => match spares.take(caller) {
-            Some(spare) => (false, spare),
-            None => {
-                let mut from = BufReader::new(from);
-                let mut line = Vec::new();
-                let _ = within((&mut from).take(300).read_until(b'\n', &mut line)).await;
-                return None;
-            }
-        },
+    let place = relaying.take(caller);
+    let spare = match place.is_some() {
+        true => None,
+        false => Some(spares.take(caller)?),
     };
-    taken(from, room, find).await
+    taken(
+        from,
+        Hold {
+            relaying,
+            caller,
+            place,
+            spare,
+        },
+        find,
+    )
+    .await
 }
 
 /// Bytes both ways between `local` (a client here, or a replica) and the other node's
@@ -1513,16 +1541,27 @@ spec:
             while let Ok((stream, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::Relaxed);
                 let lines = lines.clone();
-                tokio::spawn(taken(stream, true, move |port, workload: String, which| {
-                    lines.lock().unwrap().push(format!("{port} {workload} {which:?}"));
-                    async move {
-                        match workload.as_str() {
-                            "shut" => None,
-                            "slow" => std::future::pending().await,
-                            _ => TcpStream::connect(replica).await.ok(),
-                        }
-                    }
-                }));
+                tokio::spawn(async move {
+                    let (relaying, spares) = (Limits::new(1, 1), Limits::new(1, 1));
+                    let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+                    admit(
+                        &relaying,
+                        &spares,
+                        local,
+                        stream,
+                        move |port, workload: String, which| {
+                            lines.lock().unwrap().push(format!("{port} {workload} {which:?}"));
+                            async move {
+                                match workload.as_str() {
+                                    "shut" => None,
+                                    "slow" => std::future::pending().await,
+                                    _ => TcpStream::connect(replica).await.ok(),
+                                }
+                            }
+                        },
+                    )
+                    .await
+                });
             }
         });
         (at, had, asked)
@@ -1641,36 +1680,99 @@ spec:
         assert_eq!(old.read_to_end(&mut heard).await.unwrap(), 0);
     }
 
-    /// Past the spares too, an over-limit connection is hung up on with no answer, a kept
-    /// asking included: a node that keeps asking a full node holds at most [`SPARE`] of
-    /// them, and the next reads end of file, not a no.
+    /// Past the spares, for the node or in all, a connection is dropped at once: nothing is
+    /// read from it or waited for, so a silent one is ended before the time to wait for a line.
     #[tokio::test]
     async fn over_its_limit_and_past_the_spare_is_hung_up_on() {
         use tokio::io::AsyncReadExt;
         let (replica, replicas) = replica().await;
         let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        // One spare held: with one in all, and with room in all but none for this node.
+        for (total, per_node) in [(1, 1), (4, 1)] {
+            let full = Limits::new(1, 1);
+            let _held = full.take(local).unwrap();
+            let spares = Limits::new(total, per_node);
+            let _spare = spares.take(local).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let at = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (relaying, spare) = (full.clone(), spares.clone());
+                    tokio::spawn(async move {
+                        admit(&relaying, &spare, local, stream, move |_, _: String, _| async move {
+                            TcpStream::connect(replica).await.ok()
+                        })
+                        .await
+                    });
+                }
+            });
+            let mut relay = TcpStream::connect(at).await.unwrap();
+            let mut heard = Vec::new();
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(1), relay.read_to_end(&mut heard)).await;
+            assert_eq!(ended.expect("hung up on at once").unwrap(), 0);
+        }
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+    }
+
+    /// A kept connection admitted with no room is said no to; once the node has room again, the
+    /// next asking on that same connection gets a place and reaches the replica.
+    #[tokio::test]
+    async fn over_its_limit_has_room_again() {
+        let (replica, replicas) = replica().await;
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let full = Limits::new(1, 1);
-        let _held = full.take(local).unwrap();
-        let spares = Limits::new(1, 1);
-        let _spare = spares.take(local).unwrap();
+        let held = full.take(local).unwrap();
+        let spares = Limits::new(2, 2);
+        let finds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = finds.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                let (relaying, spare) = (full.clone(), spares.clone());
+                let (relaying, spare, counted) = (full.clone(), spares.clone(), counted.clone());
                 tokio::spawn(async move {
-                    admit(&relaying, &spare, local, stream, move |_, _: String, _| async move {
-                        TcpStream::connect(replica).await.ok()
+                    admit(&relaying, &spare, local, stream, move |_, _: String, _| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        async move { TcpStream::connect(replica).await.ok() }
                     })
                     .await
                 });
             }
         });
+        let mut relay = Relay::new(TcpStream::connect(at).await.unwrap());
+        assert!(!ask(&mut relay, "kept 8080 web 1\n", b"said").await.unwrap());
+        drop(held);
+        assert!(ask(&mut relay, "kept 8080 web 1\n", b"more").await.unwrap());
+        assert_eq!(finds.load(Ordering::Relaxed), 1);
+        assert_eq!(replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// A frame longer than a chunk, sent where a refused asking's early bytes go, hangs the
+    /// connection up at once: it is not waited for.
+    #[tokio::test]
+    async fn a_frame_too_long_after_a_refused_asking_is_hung_up_on() {
+        use tokio::io::AsyncReadExt;
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let full = Limits::new(1, 1);
+        let _held = full.take(local).unwrap();
+        let spares = Limits::new(2, 2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (relaying, spare) = (full.clone(), spares.clone());
+                tokio::spawn(
+                    async move { admit(&relaying, &spare, local, stream, |_, _: String, _| async { None }).await },
+                );
+            }
+        });
         let mut relay = TcpStream::connect(at).await.unwrap();
         relay.write_all(b"kept 8080 web 1\n").await.unwrap();
+        assert_eq!(relay.read_u8().await.unwrap(), b'-');
+        relay.write_all(&u16::MAX.to_be_bytes()).await.unwrap();
         let mut heard = Vec::new();
-        assert_eq!(relay.read_to_end(&mut heard).await.unwrap(), 0);
-        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(1), relay.read_to_end(&mut heard)).await;
+        assert_eq!(ended.expect("hung up on at once").unwrap(), 0);
     }
 
     /// A client's connection that ends as none does (here: silent for the idle time) takes
