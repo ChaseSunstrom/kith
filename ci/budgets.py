@@ -318,12 +318,17 @@ def relro_sealed(bin_dir, tmp, limit):
                     sys.exit(f"{name} did not start for the RELRO check")
                 time.sleep(0.05)
             time.sleep(0.5)  # past startup
-            writable, size = relro_writable(binary, proc.pid)
+            try:
+                writable, size = relro_writable(binary, proc.pid)
+            except OSError as e:
+                sys.exit(f"{name} ended before its maps could be read for the RELRO check: {e}")
         finally:
             proc.kill()
+            proc.stdin.close()
             proc.wait()
-        ok = writable <= limit
-        print(f"{'ok  ' if ok else 'FAIL'} {name}: {writable} of {size} bytes of its PT_GNU_RELRO writable while it runs (budget {max(limit, 0)})")
+        ok = size > 0 and writable <= limit
+        why = "" if size > 0 else " (no PT_GNU_RELRO: nothing to hold read-only)"
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {writable} of {size} bytes of its PT_GNU_RELRO writable while it runs (budget {max(limit, 0)}){why}")
         results.append(ok)
     return results
 
@@ -342,10 +347,14 @@ def relro_writable(binary, pid):
     maps = []
     with open(f"/proc/{pid}/maps") as lines:
         for line in lines:
-            span, perms, *rest = line.split()
+            # address perms offset dev inode [path]: the path may hold spaces.
+            span, perms, *rest = line.rstrip("\n").split(None, 5)
             start, end = (int(x, 16) for x in span.split("-"))
             maps.append((start, end, perms, rest[-1] if len(rest) > 3 else ""))
-    base = min(start for start, _, _, path in maps if path == os.path.realpath(binary)) - first
+    mine = [start for start, _, _, path in maps if path == os.path.realpath(binary)]
+    if not mine:
+        sys.exit(f"no mapping of {binary} in /proc/{pid}/maps for the RELRO check")
+    base = min(mine) - first
     writable = size = 0
     for kind, _flags, _offset, vaddr, _paddr, _filesz, memsz, _align in parts:
         if kind == 0x6474E552:  # PT_GNU_RELRO
@@ -356,7 +365,7 @@ def relro_writable(binary, pid):
 
 
 def main():
-    root =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = "--self-test" in sys.argv
     # The binaries the image ships, built by the one command line that builds them for it: a

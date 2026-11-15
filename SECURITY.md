@@ -804,9 +804,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   first thing each does, before any thread and before it reads an argument, is to make
   that part (the linker's `PT_GNU_RELRO`, about 480 kB in kithd and 77 kB in kith)
   read-only after the start: a write that goes astray in kithd, root and PID 1 on kith
-  OS, can then no longer change where a call goes through one of those tables. What is
-  not read-only after the start: the heap, the stacks of every thread, and the program's
-  `.data` and `.bss`. A node where making the part read-only fails (the kernel says no)
+  OS, can then no longer change the tables themselves. It does not protect the pointers
+  to a table: those live in the heap, a stack or `.data`, and can still be pointed at a
+  table someone made up. Nor does it stop someone who can already make the program call
+  `mprotect`. What is not read-only after the start: the heap, the stacks of every
+  thread, and the program's `.data` and `.bss`. A node where making the part read-only fails (the kernel says no)
   says so once on its error output and goes on, as a node that cannot protect itself
   still has to boot. `python3 ci/budgets.py` runs both shipped programs and fails when
   any byte of the part is still writable in `/proc/PID/maps`.

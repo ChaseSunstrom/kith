@@ -319,13 +319,22 @@ pub fn seal_relro() -> Result<usize> {
         };
         // SAFETY: sysconf has no precondition.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-        for (start, end) in relro_ranges(headers.iter().map(|h| (h.p_type, h.p_vaddr as usize, h.p_memsz as usize)), page) {
+        for (start, end) in relro_ranges(
+            headers
+                .iter()
+                .map(|h| (h.p_type, h.p_vaddr as usize, h.p_memsz as usize)),
+            page,
+        ) {
             // SAFETY: the range is whole pages of this program's own mapping, which nothing
             // writes after the start files have run (that is what the linker's header says).
             let shut = unsafe { libc::mprotect((base + start) as *mut c_void, end - start, libc::PROT_READ) };
             // SAFETY: `data` is the `usize` passed to dl_iterate_phdr below.
             let total = unsafe { &mut *data.cast::<usize>() };
-            *total = if shut == 0 { total.saturating_add(end - start) } else { usize::MAX };
+            *total = if shut == 0 {
+                total.saturating_add(end - start)
+            } else {
+                usize::MAX
+            };
         }
         1
     }
@@ -355,12 +364,14 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
         .clone()
         .filter(|(kind, _, _)| *kind == PT_GNU_RELRO)
         .filter_map(|(_, at, size)| {
-            let (end, up) = (at + size, down(at + size + page - 1));
+            // (Headers are the file's to say: a size of 0 or one that wraps is no range.)
+            let end = at.checked_add(size).filter(|_| size > 0)?;
+            let up = down(end.checked_add(page - 1)?);
             // (The part's own PT_LOAD ends where it does or goes on past it: only what begins
             // or goes on inside the rest of the page counts.)
             let shared = headers
                 .clone()
-                .any(|(kind, from, len)| kind == PT_LOAD && from < up && from + len > end);
+                .any(|(kind, from, len)| kind == PT_LOAD && from < up && from.saturating_add(len) > end);
             let (start, end) = (down(at), if shared { down(end) } else { up });
             (start < end).then_some((start, end))
         })
@@ -381,7 +392,12 @@ mod tests {
 
     #[test]
     fn relro_ends_on_a_page() {
-        let headers = [load(0, 0x1000), load(0x1000, 0x3000), relro(0x1000, 0x2000), load(0x4000, 0x800)];
+        let headers = [
+            load(0, 0x1000),
+            load(0x1000, 0x3000),
+            relro(0x1000, 0x2000),
+            load(0x4000, 0x800),
+        ];
         assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x3000)]);
     }
 
@@ -409,13 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn a_header_near_the_top_of_the_address_space_gives_no_range_and_no_panic() {
+        for headers in [
+            [relro(usize::MAX - 0x100, 0x80)],
+            [relro(usize::MAX - 0x100, 0x200)],
+            [relro(usize::MAX, usize::MAX)],
+        ] {
+            assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+        }
+        // A segment whose size wraps does not make the part shared, or panic.
+        let headers = [load(usize::MAX - 1, usize::MAX), relro(0x1000, 0x1000)];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x2000)]);
+    }
+
+    #[test]
+    fn a_relro_header_of_size_zero_gives_no_range() {
+        let headers = [load(0x1000, 0x3000), relro(0x1000, 0)];
+        assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+    }
+
+    #[test]
     fn no_relro_header_no_range() {
         let headers = [load(0, 0x1000), load(0x1000, 0x1000), (7, 0x1000, 0x100)];
         assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
     }
 
-    /// A program that is not static has had it done by the loader, so this is a no-op or
-    /// shuts what is already shut: either way it answers and the program goes on.
+    /// Only that the stub answers: this test program is built for glibc, where `seal_relro`
+    /// does nothing (the loader did it). That the shipped musl programs are sealed is shown by
+    /// `python3 ci/budgets.py`, against their /proc/PID/maps.
     #[test]
     fn sealing_a_running_test_program_answers() {
         assert!(seal_relro().is_ok());

@@ -222,7 +222,11 @@ fn main() -> ExitCode {
     // this same program started again): what musl's start code left writable is shut. A node
     // that cannot shut it still has to boot, so a failure is only said.
     if let Err(e) = kith_dm_sys::seal_relro() {
-        eprintln!("kithd: could not make its tables of functions read-only: {e}");
+        // (Not `eprintln!`: it panics when stderr cannot be written, and PID 1 may not.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: could not make its tables of functions read-only: {e}\n"),
+        );
     }
     // Started again by the runtime as an exec unit's helper? Then this never returns.
     kith_runtime::exec_shim();
