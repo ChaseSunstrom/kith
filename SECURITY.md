@@ -246,6 +246,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   Each host a Service exposes under a zone's domain (and its Namespace keeps for it) is given the LAN
   address of every node serving ingress, unless a DNSRecord has the name. Whoever may write a Service
   or a Namespace decides which names those are, and the answer is only as private as the zone's `clients`.
+  Once a house's resolver forwards the zone to a node, the client kithd sees is that resolver: `clients`
+  must name it, and then no longer tells one device of the house from another. Which nodes are answered
+  is each node's own word (`status.serves`, and the address it joined from): a worker that is sent the
+  whole store can say it serves ingress and is then answered beside the others; a worker that runs from
+  a view cannot.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can
