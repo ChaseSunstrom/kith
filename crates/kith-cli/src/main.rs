@@ -454,6 +454,24 @@ enum NodeCommand {
         #[arg(long, value_name = "NAME")]
         erase: String,
     },
+    /// Have NAME, running, make a new recovery key for its encrypted state and show it, once: the
+    /// one it had opens it no more (an install nobody watched printed a key nobody saw)
+    Recovery { name: String },
+    /// Make a duress code for NAME and show it, once: typed at NAME's waiting console in place of
+    /// the recovery key, it erases what that disk opens with and has the cluster forget its key,
+    /// and the console answers as it does a wrong key. There is no way back
+    Duress {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// One code for the whole cluster: typed at any encrypted node's waiting console, it erases
+        /// that node as above and has the cluster forget the key of every other, which then opens
+        /// with its own recovery key alone (so each must have one somebody was shown)
+        #[arg(long)]
+        all: bool,
+        /// Take the code away: it does nothing from when the node hears of it
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 #[derive(Args)]
@@ -1019,6 +1037,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 Output::Table => {
                     let rows = found.iter().map(table_row);
                     print_table(["KIND", "NAMESPACE", "NAME", "REVISION", "STATUS"], rows.collect());
+                    // (While the cluster holds nodes' keys and nobody was shown a recovery
+                    // key of any; a kithd from before this, or one that refuses, says nothing.)
+                    if let (Some("Node"), Ok(Backend::Daemon(kithd))) =
+                        (info.as_ref().map(|i| i.kind.as_str()), backend())
+                    {
+                        let said = request::<serde_json::Value>(&kithd, "GET", "/v1/lock", b"").ok();
+                        if let Some(warning) = said.as_ref().and_then(|said| said["warning"].as_str()) {
+                            eprintln!("warning: {warning}");
+                        }
+                    }
                 }
             }
         }
@@ -1328,6 +1356,56 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                         "{name} drops its TPM's seal when it hears of it: from then on it asks the cluster for its key"
                     ),
                     _ => format!("{name} is wiped: the cluster has forgotten the key of its state"),
+                }
+            );
+        }
+        Command::Node {
+            command: NodeCommand::Recovery { name },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            // (The node writes the new key before it answers: an answer that is lost on
+            // its way leaves a key nobody was shown, and the old one opens no more.)
+            let made = request::<serde_json::Value>(&kithd, "POST", &format!("/v1/lock/{name}/recovery"), b"{}");
+            let made = made.map_err(|e| {
+                format!("{e}\nNo recovery key was shown. If {name} made one before this failed, the key it had opens it no more: run this again while {name} runs.")
+            })?;
+            println!(
+                "{name}'s recovery key, shown this once and kept nowhere: write it down. Typed at {name}'s console when it starts and no node hands its key out, it opens its state; the key {name} had before opens it no more.\n\n    {}\n",
+                made["recovery"].as_str().unwrap_or_default()
+            );
+        }
+        Command::Node {
+            command: NodeCommand::Duress { name, all, off },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            let path = match (&name, off) {
+                (Some(name), _) => format!("/v1/lock/{name}?do={}", if off { "no-duress" } else { "duress" }),
+                (None, true) => "/v1/duress?off".to_string(),
+                (None, false) => "/v1/duress".to_string(),
+            };
+            let made: serde_json::Value = request(&kithd, "POST", &path, b"")?;
+            let nodes: Vec<&str> = made["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|node| node.as_str())
+                .collect();
+            let whose = name.clone().unwrap_or(nodes.join(", "));
+            let code = made["code"].as_str().unwrap_or_default();
+            println!(
+                "{}",
+                match (all, off) {
+                    (_, true) => format!("{whose}: no duress code from when each hears of it"),
+                    (false, false) => format!(
+                        "A duress code for {whose}, shown this once and kept nowhere:\n\n    {code}\n\nTyped at {whose}'s console while it waits for its key, it erases what the disk opens with (its recovery key and passphrase open it no more) and has the cluster forget its key; the console says what it says of a wrong key. There is no way back, and a disk copied beforehand, with its recovery key, still opens. Take the code away with --off."
+                    ),
+                    (true, false) => format!(
+                        "A duress code for the whole cluster ({whose}), shown this once and kept nowhere:\n\n    {code}\n\nTyped at the waiting console of any of them, it erases what that node's disk opens with and has the cluster forget the key of every one of them: the others run on, and open from then on with their own recovery keys alone, until `kith node unlock NAME`. A node that joins later is not under it. Take the code away with --all --off."
+                    ),
                 }
             );
         }

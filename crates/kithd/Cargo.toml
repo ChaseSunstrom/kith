@@ -56,6 +56,8 @@ blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
 sha2 = "0.11"
 
 [dev-dependencies]
+# (A clock a test owns: the waiting console answers at a fixed time.)
+tokio = { version = "1", features = ["test-util"] }
 serde_json.workspace = true
 # (The ACME tests' authority reads the CSR it is sent: rcgen's parser, already in the tree.)
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }

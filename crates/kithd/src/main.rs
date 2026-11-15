@@ -593,8 +593,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     // ponytail: past this, a stop waits for the serving below (the membership and the replica
     // open in moments, not as long as a key); it is kept until then.
     let mut opened = None;
-    if let Some((record, _)) = &sealed {
-        let key = crypt::open(record, args.join.as_ref());
+    if let Some((record, config)) = &sealed {
+        let key = crypt::open(record, config, args.join.as_ref());
         opened = Some(match &mut early {
             Some((term, int)) => rt.block_on(async {
                 tokio::select! {

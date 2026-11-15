@@ -13,6 +13,7 @@
 #   sh ci/vm.sh --test netboot  a node installing a machine that starts from the network
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #   sh ci/vm.sh --test tpm      the same machine with a TPM: its key sealed to the system it runs
+#   sh ci/vm.sh --test duress   the same machine given a new recovery key and a duress code, which is typed
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -89,6 +90,12 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    starts with no node asked; started with another command line, or
                    a changed boot file, it is refused the key, asks the cluster and
                    seals anew; locked, it drops the seal and waits; needs swtpm
+  --test duress    instead: the same encrypted machine: the cluster warns that nobody
+                   saw its recovery key until it shows a new one (the old one opens
+                   no more); its key forgotten as the cluster's duress code does, it
+                   runs on until unlocked; its own duress code, typed at its waiting
+                   console, is answered as a wrong key is, its lock record is erased,
+                   the cluster forgets its key, and nothing opens it after
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -181,10 +188,11 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | services | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, services, kube, worker, chaos, access" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | services | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, services, kube, worker, chaos, access" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
-sealing=''
+sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
+[ "$test" != duress ] || test=crypt duress=1
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -200,8 +208,9 @@ if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 vms='' web=''
-# (What a test left running goes with it.)
-trap 'kill $vms $web 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
+# (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
+# names a directory, for a failure that does not come again.)
+trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
@@ -1758,7 +1767,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["passphrase"] * (b"\npassphrase: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -1893,6 +1902,102 @@ with open(sys.argv[1], "r+b") as disk:
                     exit 0
                 fi
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"
+                if [ -n "$duress" ]; then
+                    key() { api GET /v1/resources/NodeKey/kith-000902; }
+                    comes() { # WHAT WHY: the machine's NodeKey comes to hold WHAT
+                        tries=0
+                        until key | grep -q "$1"; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "$2: $(key)"
+                            sleep 0.2
+                        done
+                    }
+                    wrong() { # LOG TIMES: the console said so often that what was typed opens nothing
+                        tries=0
+                        until [ "$(grep -acF "kithd: init: that does not open this node's state" "$work/$1.log")" -ge "$2" ]; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "the console answered what was typed at it fewer than $2 times"
+                            sleep 0.2
+                        done
+                    }
+                    types() { printf '%s\n' "$2" | socat - "unix-connect:$work/$1.tty" >/dev/null; }
+                    # Nobody watched the install: the cluster says so, and makes no code for
+                    # all of its nodes while one of them could then be opened by nobody.
+                    api GET /v1/lock | grep -qF 'nobody was shown the recovery key of any node' || fail "the cluster does not warn of a recovery key nobody saw: $(api GET /v1/lock)"
+                    api POST /v1/duress | grep -qF 'nobody was shown the recovery key of kith-000902' || fail "a duress code for the whole cluster was made while the machine's recovery key was never shown"
+                    # A new recovery key, through the other node (which keeps none of it): the
+                    # machine's record says it was shown, and the cluster warns no more.
+                    new=$(api POST /v1/lock/kith-000902/recovery | field recovery) || fail "the machine made no new recovery key"
+                    [ "${#new}" = 39 ] && [ "$new" != "${recovery##* }" ] || fail "what the machine answered is no new recovery key: $new"
+                    comes '"recoverySeen": *true' "the cluster does not say the machine's recovery key was shown"
+                    [ "$(api GET /v1/lock | field warning)" = None ] || fail "the cluster still warns once a recovery key was shown: $(api GET /v1/lock)"
+                    ! api GET /v1/resources | grep -qF "$new" || fail "the new recovery key is in the store"
+                    ! grep -aqF "$new" "$work/alpha.log" "$work/beta.log" || fail "a node said the new recovery key"
+                    kill "$vm"
+                    wait "$vm" 2>/dev/null || true
+                    [ "$(says "$work/beta.disk")" = 'sealed held seen' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
+                    beta beta2 ''
+                    up beta2
+                    # Now there is a code for all. What it does to a node it was not typed at:
+                    # the cluster forgets the key (written here as the forget writes it), the
+                    # machine runs on, gives no key again and takes no other word but unlock.
+                    all=$(api POST /v1/duress | field code) || fail "no duress code for the whole cluster was made"
+                    comes '"duressAll": *true' "the machine did not take the cluster's duress code to its record"
+                    id=$(key | python3 -c 'import json, sys; print(json.load(sys.stdin)["spec"]["id"], end="")')
+                    printf '[{"apiVersion":"kith.dev/v1","kind":"NodeKey","metadata":{"name":"kith-000902"},"spec":{"id":"%s","forgotten":true}}]' "$id" >"$work/forgotten.json"
+                    api POST /v1/apply -H 'Content-Type: application/json' --data-binary "@$work/forgotten.json" >/dev/null
+                    hears beta2 'kithd: the cluster has forgotten the key of this node'
+                    sleep 5
+                    ! key | grep -q '"wrapped"' || fail "the machine gave the cluster the key it had forgotten"
+                    ! grep -aqF 'restarting' "$work/beta2.log" || fail "a machine whose key was forgotten did not run on"
+                    lock lock | grep -qF 'has forgotten' || fail "a machine whose key was forgotten could be locked"
+                    lock unlock | grep -q '"locked": *false' || fail "the cluster could not be told to hold the machine's key again"
+                    comes '"wrapped"' "the machine did not give its key again once it was unlocked"
+                    ! api GET /v1/resources | grep -qF "$all" || fail "the cluster's duress code is in the store"
+                    # A code of its own; then locked, so that it waits at its console with the
+                    # cluster in reach.
+                    code=$(lock duress | field code) || fail "no duress code was made for the machine"
+                    [ "${#code}" = 39 ] || fail "what was made is no duress code: $code"
+                    comes '"duress": *true' "the machine did not take its duress code to its record"
+                    ! api GET /v1/resources | grep -qF "$code" || fail "the duress code is in the store"
+                    ! grep -aqF "$code" "$work/alpha.log" "$work/beta2.log" || fail "a node said the duress code"
+                    lock lock | grep -q '"locked": *true' || fail "the machine could not be locked"
+                    hears beta2 'kithd: the cluster has locked this node'
+                    wait "$vm" || true
+                    [ "$(says "$work/beta.disk")" = 'sealed held seen duress' ] || fail "the disk of the machine with a duress code, read from outside: $(says "$work/beta.disk")"
+                    beta beta3 ''
+                    hears beta3 'still locked: 10.9.0.1:7443 does not hand this node'
+                    # A key that is none, and the key the installer showed (it opens no more).
+                    types beta3 0000-0000-0000-0000-0000-0000-0000-0000
+                    wrong beta3 1
+                    types beta3 "${recovery##* }"
+                    wrong beta3 2
+                    # The duress code: answered as those were, and nothing else is said of it
+                    # on the machine; the other node forgets its key, and says so.
+                    types beta3 "$code"
+                    wrong beta3 3
+                    hears alpha 'kithd: a duress code was typed: forgetting NodeKey/kith-000902'
+                    comes '"wiped": *true' "the cluster did not forget the key of the machine a duress code was typed at"
+                    ! key | grep -q '"wrapped"' || fail "the cluster still has the key of the machine a duress code was typed at"
+                    # Its recovery key, which opened it a moment ago, opens nothing now.
+                    types beta3 "$new"
+                    wrong beta3 4
+                    sleep 3
+                    ! grep -aqF 'state on' "$work/beta3.log" || fail "the machine opened its state after its duress code was typed"
+                    [ "$(grep -acF "kithd: init: that does not open this node's state" "$work/beta3.log")" = 4 ] || fail "the console said something else of one of the four lines typed at it"
+                    ! grep -aiE 'kithd: .*(duress|eras|forg)' "$work/beta3.log" || fail "the machine's console says a duress code was typed"
+                    lock unlock | grep -qF 'was wiped' || fail "a machine whose duress code was typed could be unlocked"
+                    # Nor does an earlier version of its NodeKey, which has the key, come back.
+                    api POST '/v1/rollback/NodeKey/kith-000902?to=1' | grep -qF 'a NodeKey is not rolled back' || fail "a forgotten NodeKey could be rolled back"
+                    ! key | grep -q '"wrapped"' || fail "the cluster has the key again of the machine a duress code was typed at"
+                    kill "$vm"
+                    wait "$vm" 2>/dev/null || true
+                    [ "$(says "$work/beta.disk")" = 'sealed none' ] || fail "the disk of the machine its duress code was typed at, read from outside: $(says "$work/beta.disk")"
+                    beta beta4 ''
+                    hears beta4 'the state partition is damaged'
+                    echo "vm.sh: ok: a machine installed with its state encrypted and nobody watching: the cluster warned that nobody saw a recovery key and made no duress code for all; the machine made a new recovery key, shown once, and the warning went; its key forgotten as the cluster's code forgets it, it ran on, gave no key and was held again once unlocked; given a duress code of its own and locked, it waited: a wrong key, the installer's old recovery key and the duress code were each answered with the same line; the code erased its lock record and had the other node forget its key, the new recovery key opened nothing after, and its disk opens for nobody"
+                    exit 0
+                fi
                 kill "$vm"
                 wait "$vm" 2>/dev/null || true
                 [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside: $(says "$work/beta.disk")"
@@ -1910,8 +2015,13 @@ with open(sys.argv[1], "r+b") as disk:
                 up beta3
                 # Its key deleted from the store: the running machine gives it again, and has not restarted.
                 api DELETE /v1/resources/NodeKey/kith-000902 >/dev/null
-                sleep 5
-                api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the machine did not give its key again once it was deleted"
+                tries=0
+                until api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"'; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 150 ] || fail "the machine did not give its key again once it was deleted"
+                    sleep 0.2
+                done
+                echo "vm.sh: the machine gave its key again after $tries tries of 0.2 s"
                 ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
                 # A passphrase, given through the other node (which keeps none of it): too short
                 # a one is refused; taken away, the disk has no line of it; given again, it has.
@@ -1944,7 +2054,7 @@ with open(sys.argv[1], "r+b") as disk:
                 hears away 'Or type its passphrase, or the recovery key'
                 hears away 'still locked'
                 printf 'correct horse batterz\n' | socat - "unix-connect:$work/away.tty" >/dev/null
-                hears away "that is not this node's recovery key, nor its passphrase"
+                hears away "kithd: init: that does not open this node's state"
                 ! grep -aqF 'state on' "$work/away.log" || fail "a machine away from its cluster opened its state without its passphrase"
                 printf 'correct horse battery\n' | socat - "unix-connect:$work/away.tty" >/dev/null
                 hears away 'kithd: init: opened with its passphrase'
@@ -1964,7 +2074,7 @@ with open(sys.argv[1], "r+b") as disk:
                 hears beta4 'Or type the recovery key here'
                 hears beta4 'still locked'
                 printf 'correct horse battery\n' | socat - "unix-connect:$work/beta4.tty" >/dev/null
-                hears beta4 "that is not this node's recovery key"
+                hears beta4 "kithd: init: that does not open this node's state"
                 ! grep -aqF 'state on' "$work/beta4.log" || fail "a locked machine opened its state with the passphrase it had"
                 printf '%s\n' "${recovery##* }" | socat - "unix-connect:$work/beta4.tty" >/dev/null
                 hears beta4 'kithd: init: opened with the recovery key'
