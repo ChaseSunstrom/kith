@@ -1,18 +1,18 @@
 {
- "apply.peak": 2.8,
+ "apply.peak": 2.87,
  "apply.peak.budget": 4,
  "by_crate": {
   "kithd": [
-   52244,
-   432
+   52459,
+   435
   ],
   "kith-cli": [
-   4359,
-   42
+   4381,
+   43
   ],
   "kith-api": [
-   5160,
-   37
+   5199,
+   38
   ],
   "kith-lsp": [
    898,
@@ -31,8 +31,8 @@
    21
   ],
   "kith-runtime": [
-   4735,
-   39
+   5454,
+   47
   ],
   "kith-dns": [
    3340,
@@ -51,7 +51,7 @@
    4
   ],
   "kith-store": [
-   1236,
+   1237,
    9
   ],
   "kith-dm-sys": [
@@ -106,9 +106,9 @@
  "kinds": 35,
  "kith.size": 2.92,
  "kith.size.budget": 3,
- "kithd.idle": 8.73,
+ "kithd.idle": 8.91,
  "kithd.idle.budget": 9,
- "kithd.size": 11.2,
+ "kithd.size": 11.21,
  "kithd.size.budget": 13,
  "measured": "2026-11-15",
  "os.image": 282,
@@ -157,8 +157,8 @@
   "kcmp",
   "pidfd_getfd"
  ],
- "rust_lines": 82637,
- "tests": 692,
+ "rust_lines": 83633,
+ "tests": 705,
  "version": "1.0.0",
  "vm_tests": 15
 }
