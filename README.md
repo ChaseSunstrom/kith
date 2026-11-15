@@ -1444,10 +1444,11 @@ What works, by the real clients in the tests (`sh ci/kube.sh`, and
   next apply goes, when no other manager has it. Fields are owned by their exact
   path, a list that has no one key to merge by is owned whole, and only an apply makes
   a manager (a `replace` or a `patch` takes a field from whoever had it). Applying
-  onto an object that exists needs `get` as well as `apply`, as a patch does.
-  `kubectl get namespaces` and `get nodes` show an AGE: the time of the oldest
-  revision the store kept (an implicit namespace, one that only holds objects, has
-  none).
+  onto an object that exists, or replacing one, needs `get` as well as `apply`, as a
+  patch does. `kubectl get namespaces` and `get nodes` show an AGE: the time of the
+  oldest revision the store kept, which is when it was made unless the history was
+  trimmed or the node is a worker that runs from a view and holds only what the view
+  carried (an implicit namespace, one that only holds objects, has none).
 - **Watches**: `kubectl get --watch` reads what the store says changed, so one
   change among 2000 objects makes and compares one object, not 2000 (what it shows
   is what a list shows: the same Roles apply to every read). It reads the kind again

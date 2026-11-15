@@ -449,7 +449,9 @@ fn made_at(resource: &Resource) -> u64 {
 }
 
 /// The time (as [`rfc3339`] writes it) of the oldest revision the store kept of `resource`:
-/// when a thing that no client made here (a namespace, a node) was first seen.
+/// when a thing that no client made here (a namespace, a node) was first seen. That is not
+/// always when it was made: a worker that runs from a view has only the revisions the view
+/// carried, and a history that was trimmed starts later.
 fn oldest(store: &Store, resource: &Resource) -> String {
     let first = store.history(&resource.key()).ok().and_then(|history| history.first());
     rfc3339(first.map_or(0, |first| first.at))
@@ -2187,6 +2189,9 @@ async fn write(
                 "fieldManager: must be no more than {MANAGER_NAME} characters"
             )));
         }
+    }
+    // (A replace is answered with the managers' fields too: it needs `get` of what is there.)
+    if matches!(how, How::Apply | How::Replace) {
         there = call
             .shared
             .store
@@ -2761,6 +2766,11 @@ mod tests {
             .unwrap();
         let held = "
 apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: carol}
+spec: {}
+---
+apiVersion: kith.dev/v1
 kind: Role
 metadata: {name: writer}
 spec:
@@ -2802,6 +2812,25 @@ spec: {role: writer, subjects: [carol]}
             code(done),
             Some(StatusCode::FORBIDDEN),
             "a patch is answered with all of it"
+        );
+        // A replace of what is there is answered with all of it, managers' fields too: the same.
+        let sent = json!({ "metadata": { "name": "kept" }, "stringData": { "password": "other" } }); // pragma: allowlist secret
+        let done = write(
+            &carol,
+            secrets,
+            Some("default"),
+            Some("kept"),
+            How::Replace,
+            sent.clone(),
+        )
+        .await;
+        assert_eq!(code(done), Some(StatusCode::FORBIDDEN), "a replace of what is there");
+        let sent = json!({ "metadata": { "name": "fresh" }, "stringData": { "password": "x" } }); // pragma: allowlist secret
+        let done = write(&carol, secrets, Some("default"), Some("fresh"), How::Replace, sent).await;
+        assert_eq!(
+            code(done),
+            Some(StatusCode::NOT_FOUND),
+            "a replace of what is not there answers 404, as to any writer"
         );
         // What is there and what is not are the same to who may not ask.
         let eve = call("eve");
@@ -3111,8 +3140,10 @@ spec: {role: writer, subjects: [carol]}
     /// The lists a strategic patch merges by a key are the ones Kubernetes's types tag with
     /// `patchMergeKey`: what ci/kube_proto.py reads of them is the table in this file. It
     /// fails, and does not skip, where that source is not there (run ci/kube_proto.py once to
-    /// have it); nothing is fetched here.
+    /// have it); nothing is fetched here. Ignored in a plain `cargo test`, which touches no
+    /// outside host and holds no cache: `ci/kube.sh` fetches the files and runs it with `--ignored`.
     #[test]
+    #[ignore = "needs the Kubernetes type files ci/kube.sh fetches (cargo test -- --ignored merge_keys)"]
     fn merge_keys_are_those_of_the_kubernetes_types() {
         let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/kube_proto.py");
         let read = std::process::Command::new("python3")
