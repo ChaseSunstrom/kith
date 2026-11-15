@@ -212,49 +212,6 @@ struct Job<T> {
 /// How long a job runs before it is said not to have ended: a thread cannot be killed.
 const HUNG: Duration = Duration::from_secs(60);
 
-impl<T> Job<T> {
-    /// Runs `work` on a thread of its own, waking the loop when it is done; `None` when the
-    /// system gives no thread, to be tried again the next pass.
-    fn start(name: &str, changed: &std::sync::Arc<Notify>, work: impl FnOnce() -> T + Send + 'static) -> Option<Self>
-    where
-        T: Send + 'static,
-    {
-        let (done, waiting) = tokio::sync::oneshot::channel();
-        let changed = changed.clone();
-        let run = move || {
-            let _ = done.send(work());
-            changed.notify_one();
-        };
-        match std::thread::Builder::new().name(name.into()).spawn(run) {
-            Ok(_) => Some(Job {
-                began: Instant::now(),
-                waiting,
-                slow: false,
-            }),
-            Err(e) => {
-                eprintln!("kithd: no thread for {name}, tried again next pass: {e}");
-                None
-            }
-        }
-    }
-
-    /// What it came to once it is done (`None` within when its thread ended without it); still
-    /// on its way, `None`, and `hung` is said once it has been for `HUNG`.
-    fn done(&mut self, hung: impl FnOnce() -> String) -> Option<Option<T>> {
-        use tokio::sync::oneshot::error::TryRecvError;
-        match self.waiting.try_recv() {
-            Err(TryRecvError::Empty) => {
-                if !self.slow && self.began.elapsed() >= HUNG {
-                    eprintln!("kithd: {}", hung());
-                    self.slow = true;
-                }
-                None
-            }
-            done => Some(done.ok()),
-        }
-    }
-}
-
 pub async fn run(
     shared: std::sync::Arc<Shared>,
     runtime: kith_runtime::Result<Runtime>,
@@ -1702,6 +1659,51 @@ impl Controller {
             // Moved aside at once, so what starts next makes a new one.
             storage::aside(&state.join(crate::files::REPLICAS).join(pod).join("scratch"));
             self.replacing.insert(pod.to_string(), (Instant::now(), None));
+        }
+    }
+}
+
+// (After `impl Controller`: an impl block before it renames its functions, and kithd.order
+// links them by name.)
+impl<T> Job<T> {
+    /// Runs `work` on a thread of its own, waking the loop when it is done; `None` when the
+    /// system gives no thread, to be tried again the next pass.
+    fn start(name: &str, changed: &std::sync::Arc<Notify>, work: impl FnOnce() -> T + Send + 'static) -> Option<Self>
+    where
+        T: Send + 'static,
+    {
+        let (done, waiting) = tokio::sync::oneshot::channel();
+        let changed = changed.clone();
+        let run = move || {
+            let _ = done.send(work());
+            changed.notify_one();
+        };
+        match std::thread::Builder::new().name(name.into()).spawn(run) {
+            Ok(_) => Some(Job {
+                began: Instant::now(),
+                waiting,
+                slow: false,
+            }),
+            Err(e) => {
+                eprintln!("kithd: no thread for {name}, tried again next pass: {e}");
+                None
+            }
+        }
+    }
+
+    /// What it came to once it is done (`None` within when its thread ended without it); still
+    /// on its way, `None`, and `hung` is said once it has been for `HUNG`.
+    fn done(&mut self, hung: impl FnOnce() -> String) -> Option<Option<T>> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        match self.waiting.try_recv() {
+            Err(TryRecvError::Empty) => {
+                if !self.slow && self.began.elapsed() >= HUNG {
+                    eprintln!("kithd: {}", hung());
+                    self.slow = true;
+                }
+                None
+            }
+            done => Some(done.ok()),
         }
     }
 }
