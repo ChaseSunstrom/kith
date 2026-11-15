@@ -1777,6 +1777,43 @@ spec:
   built, never run here) and a real GPU passed through, which needs a machine with a spare
   card and its owner's say.
 
+### Switching one GPU
+
+A desktop and a machine can take turns on one GPU of a node, with no reboot. It needs:
+
+- an IOMMU, on, and the `vfio-pci` driver in the node's kernel (kith OS's kernel has no
+  VFIO today, so this is a node of its own, in agent mode, that its owner set up);
+- the desktop's driver let go of the card and `vfio-pci` bound to it, by the owner, before
+  the switch. kithd never unbinds a driver or binds one.
+
+The session and the machine each name one exclusive `DeviceClaim` for the card, and
+`kith switch` says which of them holds it:
+
+```sh
+kith switch gpu windows   # the machine takes the card
+kith switch gpu desktop   # the session takes it back
+```
+
+- A claim's `holder` is the workload that takes the Device ahead of the others who want
+  it. That priority is for this claim's Devices only, and only if the workload lists the
+  claim in its template. It takes the Device from a holder of its own namespace; a holder
+  of another namespace keeps it, and the named workload waits behind it, as its claim's
+  status says. The current holder is stopped, and only then is the new one started, in the
+  same pass of the controller. The holder stays until another `kith switch`. A holder with
+  no replicas takes nothing: the one holding the card keeps it.
+- A card keeps its `pci` label (its place on the bus) under either driver, so a claim with
+  `selector: { pci: "0000:01:00.0" }` names the same card as a `gpu` and as a passed-through
+  Device. A `holder` is of an exclusive claim only.
+- **What a switch loses.** A switch takes seconds: the session stops and the machine starts.
+  The session's windows are lost, and the desktop comes back as a new session with none of
+  them. An app that is its own workload (a client claim on the seat, above) is not the
+  session: it waits until a session holds the seat again, and its Volumes are kept.
+- Two GPUs are not built: a machine with a second card keeps it to itself. A frame relay
+  that shows the machine's screen in the session is named here and not built.
+- **Proven only with stand-ins.** The tests use stand-in Devices, and no real GPU, VFIO
+  bind or driver unbind was tried. Until its owner runs it on such hardware, a switch is
+  untried.
+
 ### Confidential machines
 
 `confidential: true` on a template has its machines run with their memory encrypted by the

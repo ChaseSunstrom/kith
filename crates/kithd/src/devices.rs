@@ -67,6 +67,16 @@ type Found = (&'static str, String, Option<String>, Vec<(&'static str, String)>)
 /// own node (`nvidiaN`, N being the minor the driver gives it in `proc`), and the nodes all
 /// its cards share. Only those that are there: the driver makes none itself (its
 /// `nvidia-modprobe` does, or udev).
+/// Whether a name is a PCI address as the kernel writes it: `0000:01:00.0`.
+fn is_pci_address(name: &str) -> bool {
+    name.len() == 12
+        && name.char_indices().all(|(i, c)| match i {
+            4 | 7 => c == ':',
+            10 => c == '.',
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
 fn nvidia(proc: &Path, dev: &Path, address: &str) -> (Option<String>, Vec<String>) {
     let said = read(&proc.join("driver/nvidia/gpus").join(address).join("information"));
     let minor = |line: &str| line.strip_prefix("Device Minor:")?.trim().parse::<u32>().ok();
@@ -105,6 +115,7 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
             let driver = driver.and_then(|link| Some(label(link.file_name()?.to_str()?)));
             let place = std::fs::canonicalize(&device).ok();
             let place = place.and_then(|real| Some(real.file_name()?.to_str()?.to_string()));
+            labels.extend(place.clone().filter(|bus| is_pci_address(bus)).map(|bus| ("pci", bus)));
             if let Some(place) = place.filter(|_| driver.as_deref() == Some("nvidia")) {
                 let (own, mut nodes) = nvidia(proc, dev, &place);
                 nodes.extend(own);
@@ -170,7 +181,7 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         // A card on NVIDIA's driver that is no DRM card (the driver loaded to compute, not
         // to draw): a GPU all the same, its node the driver's own.
         if driver == Some("nvidia") && kind.starts_with("0x03") && !drawing.contains(&name) {
-            let mut labels = vec![("driver", "nvidia".to_string())];
+            let mut labels = vec![("driver", "nvidia".to_string()), ("pci", name.clone())];
             labels.extend(id(&dir.join("vendor")).map(|vendor| ("vendor", vendor)));
             labels.extend(id(&dir.join("device")).map(|model| ("model", model)));
             let (own, nodes) = nvidia(proc, dev, &name);
@@ -189,7 +200,11 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
             Some("0c03") => "usb",
             _ => "other",
         };
-        let mut labels = vec![("driver", "vfio-pci".to_string()), ("function", function.to_string())];
+        let mut labels = vec![
+            ("driver", "vfio-pci".to_string()),
+            ("function", function.to_string()),
+            ("pci", name.clone()),
+        ];
         labels.extend(id(&dir.join("vendor")).map(|vendor| ("vendor", vendor)));
         labels.extend(id(&dir.join("device")).map(|model| ("model", model)));
         found.push(("pci", name.clone(), Some(format!("{}/{name}", crate::vm::PCI)), labels));
@@ -554,6 +569,43 @@ mod tests {
         // And it is what a vm unit is given.
         let path = std::path::PathBuf::from(gpu.spec["path"].as_str().unwrap());
         assert_eq!(crate::vm::pci(&[path]), ["0000:01:00.0"]);
+    }
+
+    /// A Device of a card or a PCI device carries its PCI address as the `pci` label, whichever
+    /// driver has it: that is how a `vm` unit's card is found again, and what `kith switch` names.
+    #[test]
+    fn a_device_carries_its_pci_address_as_a_label_under_either_driver() {
+        let root = tree("pci-label");
+        for (address, driver) in [
+            ("0000:04:00.0", "amdgpu"),
+            ("0000:01:00.0", "nvidia"),
+            ("0000:03:00.0", "nvidia"),
+            ("0000:02:00.0", "vfio-pci"),
+        ] {
+            let dir = format!("bus/pci/devices/{address}");
+            put(&root, &format!("{dir}/class"), "0x030000\n");
+            put(&root, &format!("{dir}/vendor"), "0x10de\n");
+            put(&root, &format!("{dir}/device"), "0x2684\n");
+            std::os::unix::fs::symlink(format!("../../drivers/{driver}"), root.join(&dir).join("driver")).unwrap();
+        }
+        // Two of them draw: their DRM cards point at the PCI device.
+        for (card, address) in [("card0", "0000:04:00.0"), ("card1", "0000:01:00.0")] {
+            std::fs::create_dir_all(root.join("class/drm").join(card)).unwrap();
+            let link = root.join("class/drm").join(card).join("device");
+            std::os::unix::fs::symlink(format!("../../../bus/pci/devices/{address}"), link).unwrap();
+        }
+        let found = scan_in(&root, &root.join("proc"), &root.join("dev"), "n1");
+        assert_eq!(get(&found, "n1-gpu-card0").metadata.labels["pci"], "0000:04:00.0");
+        assert_eq!(get(&found, "n1-gpu-card1").metadata.labels["pci"], "0000:01:00.0");
+        assert_eq!(
+            get(&found, "n1-gpu-0000-03-00.0").metadata.labels["pci"],
+            "0000:03:00.0"
+        );
+        assert_eq!(
+            get(&found, "n1-pci-0000-02-00.0").metadata.labels["pci"],
+            "0000:02:00.0"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

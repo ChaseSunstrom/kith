@@ -589,3 +589,60 @@ fn import_helm_without_helm_says_what_to_do() {
         "{err}"
     );
 }
+
+#[test]
+fn switch_hands_a_device_claim_to_a_workload() {
+    let sb = Sandbox::new("switch");
+    sb.write(
+        "gpu.yaml",
+        "\
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: desktop }
+spec:
+  replicas: 1
+  template:
+    containers:
+      - { name: desktop, image: desktop:1 }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: game }
+spec:
+  replicas: 1
+  template:
+    containers:
+      - { name: game, image: game:1 }
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: gpu }
+spec:
+  device: gpu0
+",
+    );
+    assert_eq!(sb.kith(&["apply", "-f", "gpu.yaml"]).0, 0);
+
+    // One apply of the claim: revision 2. What came of it is the claim's status, not this line.
+    let (code, out, err) = sb.kith(&["switch", "gpu", "game"]);
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            0,
+            "DeviceClaim/default/gpu asks for Workload/game (revision 2): `kith get deviceclaim gpu` shows who holds it\n"
+        ),
+        "{err}"
+    );
+    let (_, yaml, _) = sb.kith(&["get", "DeviceClaim/gpu", "-o", "yaml"]);
+    assert!(yaml.contains("holder: Workload/game\n"), "{yaml}");
+
+    // A holder that is not there, or not a workload, changes nothing.
+    let (code, _, err) = sb.kith(&["switch", "gpu", "Job/nobody"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("Job/nobody"), "{err}");
+    let (code, _, err) = sb.kith(&["switch", "gpu", "Seat/game"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("not a workload of this namespace"), "{err}");
+    let (_, out, _) = sb.kith(&["history", "DeviceClaim/gpu"]);
+    assert_eq!(out.lines().count(), 3, "{out}");
+}
