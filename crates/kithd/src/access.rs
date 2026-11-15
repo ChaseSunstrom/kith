@@ -142,11 +142,12 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 23] = [
+const FOR_IDENTITIES: [&str; 24] = [
     "/v1/backups",
     "/v1/blobs",
     "/v1/volumes",
     "/v1/seats",
+    "/v1/drain",
     "/v1/tokens",
     "/v1/run",
     "/v1/lock",
@@ -481,7 +482,7 @@ mod tests {
     #[tokio::test]
     async fn refused_certificates_are_audited() {
         let dir = std::env::temp_dir().join(format!("kithd-401-audited-{}", std::process::id()));
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         let other = pki::Subject::User("alice".into(), vec![1, 2, 3]);
         let (status, _) = who(&shared, Some(&other), "POST", "/v1/apply", None).unwrap_err();
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -588,7 +589,7 @@ spec: {role: gone, subjects: [bob]}
     #[tokio::test]
     async fn a_node_caller_has_no_right_of_its_own_and_names_who_asked_only_where_nodes_pass_on() {
         let dir = std::env::temp_dir().join(format!("kithd-node-caller-{}", std::process::id()));
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         {
             let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: n1}\nspec: {}\n";
             let node = Resource::from_source(node).unwrap().remove(0).unwrap();

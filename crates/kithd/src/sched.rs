@@ -1,8 +1,9 @@
 //! The scheduler, on the node that leads the store: says which node runs each replica of
 //! a Workload and which one runs a Job, and writes that into their status as `nodes`
 //! (replica to node name) and `unschedulable` (replica to why not); a NodeWorkload gets a
-//! replica number for each node that matches. Every node's controller runs what is bound to it. The rules are the `kith-sched` crate's: a replica stays where
-//! it is until its node has been out of contact for `--lost-after`.
+//! replica number for each node that matches. Every node's controller runs what is bound to
+//! it. The rules are the `kith-sched` crate's: a replica stays where it is until its node has
+//! been out of contact for `--lost-after`.
 //
 // ponytail: every pass looks at every Workload and Job; fine for hundreds. Past that, plan
 // only what changed.
@@ -11,7 +12,7 @@ use crate::Shared;
 use kith_api::Resource;
 use kith_api::kinds::{JobSpec, NodeSpec, NodeWorkloadSpec, WorkloadSpec};
 use kith_api::store::Store;
-use kith_sched::{Amount, Node, Replica};
+use kith_sched::{Amount, Node, Plan, Replica};
 use kith_store::Command;
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,11 +93,79 @@ fn every_node(resource: &Resource, nodes: &[Node], grace: Duration, control: boo
 /// For a node name: what it has (CPUs, bytes), and for how long it has been lost.
 type Seen<'a> = &'a dyn Fn(&str) -> (Option<(f64, f64)>, Option<Duration>);
 
-fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
+/// The keys of the Secrets that are for control nodes only.
+fn guarded(store: &Store) -> BTreeSet<String> {
+    let secrets = store.list(Some("Secret")).filter(|secret| secret.spec["trust"] == "control");
+    secrets.map(Resource::key).collect()
+}
+
+/// The Workloads, Jobs and NodeWorkloads of the store, the ones that have copies on nodes.
+fn owners(store: &Store) -> impl Iterator<Item = &Resource> {
+    ["Workload", "Job", "NodeWorkload"]
+        .into_iter()
+        .flat_map(|kind| store.list(Some(kind)))
+}
+
+/// Puts the drain on a Node's spec: cordoned, and the `kith.dev/drain` NoExecute taint. A node
+/// an owner cordoned already keeps its cordon: its taint says so (`owner`), and undrain
+/// leaves it.
+pub(crate) fn drain_on(spec: &mut Value) {
+    let mut taints = spec["taints"].as_array().cloned().unwrap_or_default();
+    if taints.iter().any(|taint| taint["key"] == kith_sched::DRAIN) {
+        return;
+    }
+    let owned = spec["unschedulable"] == true;
+    let mut taint = json!({ "key": kith_sched::DRAIN, "effect": "noExecute" });
+    if owned {
+        taint["value"] = "owner".into();
+    } else {
+        spec["unschedulable"] = Value::Bool(true);
+    }
+    taints.push(taint);
+    spec["taints"] = Value::Array(taints);
+}
+
+/// Takes the drain off a Node's spec: its taint, and the cordon too unless an owner set it.
+pub(crate) fn drain_off(spec: &mut Value) {
+    let Some(mut taints) = spec["taints"].as_array().cloned() else {
+        return;
+    };
+    let Some(at) = taints.iter().position(|taint| taint["key"] == kith_sched::DRAIN) else {
+        return;
+    };
+    let taint = taints.remove(at);
+    spec["taints"] = Value::Array(taints);
+    if taint["value"] != "owner" {
+        if let Some(spec) = spec.as_object_mut() {
+            spec.remove("unschedulable");
+        }
+    }
+}
+
+/// What the scheduler is told of each node at `now`: its capacity, and for how long it has
+/// been lost.
+pub(crate) fn seen_at(shared: &Shared, now: Instant) -> impl Fn(&str) -> (Option<(f64, f64)>, Option<Duration>) + '_ {
+    move |name: &str| {
+        // Not heard from for a moment is not lost; too early to say is not lost either.
+        let lost = shared.members.lost_for(name, now);
+        let lost = lost.filter(|lost| *lost >= crate::members::GRACE);
+        // A node that has never said what it has gets nothing new; what it has stays.
+        let capacity = shared.members.capacity(name);
+        (capacity, lost.or(capacity.is_none().then_some(Duration::ZERO)))
+    }
+}
+
+/// The nodes, the replicas asked to be placed and where the scheduler puts them. `drain` is a
+/// node to plan with its drain on, as `kith node drain` would leave it.
+fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (Vec<Node>, Vec<Replica>, Plan) {
     let node = |node: &Resource| {
         let (capacity, lost_for) = seen(&node.metadata.name);
         let (cpu, memory) = capacity.unwrap_or_default();
-        let spec = serde_json::from_value::<NodeSpec>(node.spec.clone()).ok()?;
+        let mut value = node.spec.clone();
+        if drain == Some(node.metadata.name.as_str()) {
+            drain_on(&mut value);
+        }
+        let spec = serde_json::from_value::<NodeSpec>(value).ok()?;
         // A node that roams is away, not lost, however long: it keeps what it runs and
         // gets nothing new until it is back.
         let lost_for = lost_for.map(|lost| {
@@ -131,20 +200,11 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
     for node in &mut nodes {
         node.capacity = less(node.capacity, reserved.get(&node.name));
     }
-    let owners = || {
-        let kinds = ["Workload", "Job", "NodeWorkload"];
-        kinds.into_iter().flat_map(|kind| store.list(Some(kind)))
-    };
     let claims = crate::claims::resolve(store).owners;
     let mounts = crate::volumes::resolve(store).owners;
-    let guarded: BTreeSet<String> = {
-        let secrets = store
-            .list(Some("Secret"))
-            .filter(|secret| secret.spec["trust"] == "control");
-        secrets.map(Resource::key).collect()
-    };
+    let guarded = guarded(store);
     let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
-    for resource in owners() {
+    for resource in owners(store) {
         let Some((count, requests, mut placement)) = wants(resource) else {
             continue;
         };
@@ -163,6 +223,8 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
                 continue;
             }
         };
+        // A Job that is running now: a drain leaves it where it runs.
+        let running = resource.kind == "Job" && resource.status.as_ref().is_some_and(|s| s["state"] == "running");
         for replica in 0..count {
             let bound = resource
                 .status
@@ -176,11 +238,18 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
                 placement: placement.clone(),
                 bound: bound.map(str::to_string),
                 node: node.clone(),
+                running,
             });
         }
     }
     let mut made = kith_sched::schedule(&nodes, &replicas, grace);
     made.unschedulable.extend(waiting);
+    (nodes, replicas, made)
+}
+
+fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
+    let (nodes, _, made) = decide(store, seen, grace, None);
+    let guarded = guarded(store);
     let of = |key: &str, by_id: &BTreeMap<String, String>| {
         let mine = by_id.iter().filter_map(|(id, value)| {
             let (owner, replica) = id.rsplit_once('#')?;
@@ -194,7 +263,7 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         .map(|node| node.name.as_str())
         .collect();
     let (mut fields, mut left) = (Vec::new(), Vec::new());
-    for resource in owners() {
+    for resource in owners(store) {
         let key = resource.key();
         let empty = json!({});
         let status = resource.status.as_ref().unwrap_or(&Value::Null);
@@ -238,6 +307,68 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
     (fields, left)
 }
 
+/// What `kith node drain` would do to what runs on `node`, as the scheduler works it out with
+/// the drain on: one line per Workload, Job and NodeWorkload that has a copy there now.
+pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str) -> Vec<Value> {
+    let (nodes, replicas, made) = decide(store, seen, grace, Some(node));
+    let mut lines = Vec::new();
+    for r in &replicas {
+        let after = made.bind.get(&r.id).map(String::as_str);
+        if r.bound.as_deref() != Some(node) && after != Some(node) {
+            continue;
+        }
+        let (key, replica) = r.id.rsplit_once('#').unwrap_or((r.id.as_str(), "0"));
+        let (outcome, to, why) = match after {
+            Some(to) if to == node => ("stays", None, made.stays.get(&r.id).cloned().unwrap_or_default()),
+            Some(to) => ("moves", Some(to.to_string()), String::new()),
+            None => ("unplaced", None, made.unschedulable.get(&r.id).cloned().unwrap_or_default()),
+        };
+        let if_lost = if r.node.is_some() {
+            "waits for the node: pinned by its Volume or Device"
+        } else if r.running {
+            "starts over on another node once the node is lost, if one can take it"
+        } else {
+            "moves to another node once the node is lost, if one can take it"
+        };
+        lines.push(line(key.into(), Some(replica), outcome, to, why, if_lost));
+    }
+    let guarded = guarded(store);
+    for resource in owners(store).filter(|resource| resource.kind == "NodeWorkload") {
+        let Some(bound) = every_node(resource, &nodes, grace, control_only(&guarded, resource)) else {
+            continue;
+        };
+        let had = resource.status.as_ref().and_then(|s| s["nodes"].as_object());
+        let had = had.is_some_and(|m| m.values().any(|v| v.as_str() == Some(node)));
+        let kept = bound.values().any(|v| v.as_str() == Some(node));
+        if !had && !kept {
+            continue;
+        }
+        let (outcome, why, if_lost) = if kept {
+            ("stays", "one copy runs on each node its selector matches", "its copy waits for the node")
+        } else {
+            ("removed", "another NoExecute taint is on the node", "its copy comes back when the node does")
+        };
+        lines.push(line(resource.key(), None, outcome, None, why.into(), if_lost));
+    }
+    lines
+}
+
+/// One line of [`drain_lines`]: what a resource's copy on the drained node does.
+fn line(key: String, replica: Option<&str>, outcome: &str, to: Option<String>, why: String, if_lost: &str) -> Value {
+    let parts: Vec<&str> = key.split('/').collect();
+    let namespace = (parts.len() == 3).then(|| parts[1]);
+    json!({
+        "kind": parts[0],
+        "namespace": namespace,
+        "key": key,
+        "replica": replica,
+        "outcome": outcome,
+        "to": to,
+        "why": why,
+        "if_lost": if_lost,
+    })
+}
+
 /// Schedule whenever the store changes and every few seconds (nodes come and go without
 /// a change to the store), while this node leads.
 pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Receiver<bool>) {
@@ -252,15 +383,7 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         if metrics.current_leader != Some(metrics.id) {
             continue;
         }
-        let now = Instant::now();
-        let seen = |name: &str| {
-            // Not heard from for a moment is not lost; too early to say is not lost either.
-            let lost = shared.members.lost_for(name, now);
-            let lost = lost.filter(|lost| *lost >= crate::members::GRACE);
-            // A node that has never said what it has gets nothing new; what it has stays.
-            let capacity = shared.members.capacity(name);
-            (capacity, lost.or(capacity.is_none().then_some(Duration::ZERO)))
-        };
+        let seen = seen_at(&shared, Instant::now());
         let (fields, left, claimed, (made, gone)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let (fields, left) = plan(&state.store, &seen, grace);
@@ -746,5 +869,184 @@ spec: {{ template: {{ {} }} }}
             toobig["nodes"].is_null() && toobig["unschedulable"]["0"].is_string(),
             "{toobig}"
         );
+    }
+
+    /// The store as `kith node drain a` leaves it: `a` cordoned and under the `kith.dev/drain`
+    /// NoExecute taint, with what runs on it given as statuses.
+    fn drained_store(source: &str, statuses: &[(&str, Value)]) -> Store {
+        let mut store = Store::default();
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        for (key, status) in statuses {
+            store.set_status(key, Some(status.clone())).unwrap();
+        }
+        store
+    }
+
+    const DRAINED: &str = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: { unschedulable: true, taints: [{ key: kith.dev/drain, effect: noExecute }] }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: a-gpu-card0 }
+spec: { node: a, class: gpu, path: /dev/dri/card0 }
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: gpu }
+spec: { device: a-gpu-card0 }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: pinned }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }], deviceClaims: [gpu] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web }
+spec:
+  replicas: 2
+  template:
+    exec: [{ name: run, command: [sleep, inf], resources: { cpu: 1, memory: 1Gi } }]
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: batch }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
+";
+
+    #[test]
+    fn drain_moves_what_can_move_and_keeps_a_pinned_replica_and_a_running_job() {
+        let store = drained_store(
+            DRAINED,
+            &[
+                ("Workload/default/web", json!({ "nodes": { "0": "a", "1": "a" } })),
+                ("Workload/default/pinned", json!({ "nodes": { "0": "a" } })),
+                ("Job/default/batch", json!({ "state": "running", "nodes": { "0": "a" } })),
+            ],
+        );
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        // (Only the `nodes` field is looked at: a drain changes where a thing runs, not its count.)
+        let nodes = |key: &str| fields.iter().find(|(of, _)| of == key).and_then(|(_, f)| f.get("nodes").cloned());
+        assert_eq!(nodes("Workload/default/web"), Some(json!({ "0": "b", "1": "b" })));
+        assert_eq!(nodes("Workload/default/pinned"), None, "pinned by its Device: stays on a");
+        assert_eq!(nodes("Job/default/batch"), None, "a running Job is not moved by a drain");
+    }
+
+    #[test]
+    fn drain_keeps_a_replica_that_no_other_node_can_take() {
+        // `big` asks for 64 CPUs and b has 4: a is its last node, so it stays and is said so.
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: { unschedulable: true, taints: [{ key: kith.dev/drain, effect: noExecute }] }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: big }
+spec: { template: { exec: [{ name: run, command: [sleep, inf], resources: { cpu: 64, memory: 1Gi } }] } }
+";
+        let store = drained_store(source, &[("Workload/default/big", json!({ "nodes": { "0": "a" } }))]);
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let moved = fields.iter().find(|(key, _)| key == "Workload/default/big").and_then(|(_, f)| f.get("nodes"));
+        assert!(moved.is_none(), "{fields:?}");
+    }
+
+    #[test]
+    fn drain_leaves_a_node_workload_copy_on_the_drained_node() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: { unschedulable: true, taints: [{ key: kith.dev/drain, effect: noExecute }] }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: NodeWorkload
+metadata: { name: each }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
+";
+        let copies = json!({ "0": "a", "1": "b" });
+        let store = drained_store(source, &[("NodeWorkload/default/each", json!({ "nodes": copies }))]);
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let moved = fields.iter().find(|(key, _)| key == "NodeWorkload/default/each").and_then(|(_, f)| f.get("nodes"));
+        assert!(moved.is_none(), "{fields:?}");
+    }
+
+    #[test]
+    fn a_taint_other_than_the_drain_still_moves_a_running_job() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: { taints: [{ key: example.dev/other, effect: noExecute }] }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: batch }
+spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
+";
+        let store = drained_store(source, &[("Job/default/batch", json!({ "state": "running", "nodes": { "0": "a" } }))]);
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let nodes = fields.iter().find(|(of, _)| of == "Job/default/batch").map(|(_, f)| f["nodes"].clone());
+        assert_eq!(nodes, Some(json!({ "0": "b" })));
+    }
+
+    #[test]
+    fn drain_undone_places_a_replica_on_the_node_again() {
+        // After `kith node undrain a` (no taint, no cordon) a new replica that needs `role: gpu`
+        // is placed on a, the only node that has it.
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a, labels: { role: gpu } }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: gpu-work }
+spec:
+  placement: { require: { role: gpu } }
+  template:
+    exec: [{ name: run, command: [sleep, inf] }]
+";
+        let store = drained_store(source, &[]);
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let nodes = fields.iter().find(|(of, _)| of == "Workload/default/gpu-work").map(|(_, f)| f["nodes"].clone());
+        assert_eq!(nodes, Some(json!({ "0": "a" })));
     }
 }

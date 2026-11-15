@@ -47,6 +47,7 @@ fn replica(id: &str, workload: &str) -> Replica {
         placement: None,
         bound: None,
         node: None,
+        running: false,
     }
 }
 

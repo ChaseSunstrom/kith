@@ -1178,6 +1178,80 @@ fn workloads_move_off_a_lost_node() {
 }
 
 #[test]
+fn a_drain_moves_what_can_move_and_undrain_lets_a_replica_back() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "drain";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    // (Kept alive to the end: a Node stops its kithd when it is dropped.)
+    let _beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 2
+    });
+    let status = |key: &str| -> serde_json::Value {
+        let text = alpha.ok(&["get", key, "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()["status"].take()
+    };
+    let drained = |node: &str| alpha.ok(&["get", &format!("node/{node}"), "-o", "json"]);
+
+    // web (an exec Workload) runs on one node; a Volume made on that node, and db which mounts
+    // it, are pinned there.
+    let web = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: web }\nspec:\n  replicas: 1\n  template:\n    \
+        exec: [{ name: run, command: [sh, -c, 'echo up; exec sleep 300'] }]\n";
+    std::fs::write(alpha.dir.join("web.yaml"), web).unwrap();
+    alpha.ok(&["apply", "-f", "web.yaml"]);
+    wait_for("web to run", || status("workload/web")["ready"] == 1);
+    let home = status("workload/web")["nodes"]["0"].as_str().unwrap().to_string();
+    let away = if home == "alpha" { "beta" } else { "alpha" };
+    let volume = format!(
+        "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: {{ name: data }}\nspec: {{ node: {home}, path: d }}\n"
+    );
+    std::fs::write(alpha.dir.join("volume.yaml"), volume).unwrap();
+    alpha.ok(&["apply", "-f", "volume.yaml"]);
+    let db = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: db }\nspec:\n  replicas: 1\n  template:\n    \
+        containers: [{ name: run, image: img, volumeMounts: [{ volume: data, path: /data }] }]\n";
+    std::fs::write(alpha.dir.join("db.yaml"), db).unwrap();
+    alpha.ok(&["apply", "-f", "db.yaml"]);
+    wait_for("db to be placed where its Volume is", || {
+        status("workload/db")["nodes"]["0"] == home.as_str()
+    });
+
+    // The dry run says what would happen, and changes nothing.
+    let (code, said, _) = alpha.kith(&["node", "drain", home.as_str(), "--dry-run"]);
+    assert_eq!(code, 0, "{said}");
+    assert!(said.contains(&format!("web#0 moves to {away}")), "{said}");
+    assert!(said.contains(&format!("db#0 stays on {home}: pinned here")), "{said}");
+    assert_eq!(status("workload/web")["nodes"]["0"], home.as_str());
+    assert!(!drained(&home).contains("kith.dev/drain"));
+
+    // The drain: web moves to the other node, and db stays with its Volume.
+    alpha.ok(&["node", "drain", home.as_str()]);
+    assert!(drained(&home).contains("kith.dev/drain"));
+    wait_for("web to move off the drained node", || {
+        status("workload/web")["nodes"]["0"] == away
+    });
+    wait_for("web to run on the other node", || status("workload/web")["ready"] == 1);
+    assert_eq!(status("workload/db")["nodes"]["0"], home.as_str());
+
+    // Undrain takes the drain off, and a replica placed after that may go back there.
+    alpha.ok(&["node", "undrain", home.as_str()]);
+    assert!(!drained(&home).contains("kith.dev/drain"));
+    std::fs::write(alpha.dir.join("web.yaml"), web.replace("replicas: 1", "replicas: 2")).unwrap();
+    alpha.ok(&["apply", "-f", "web.yaml"]);
+    wait_for("a web replica placed on the node again", || {
+        status("workload/web")["nodes"]
+            .as_object()
+            .is_some_and(|nodes| nodes.values().any(|node| node.as_str() == Some(home.as_str())))
+    });
+}
+
+#[test]
 fn node_workload_runs_on_every_matching_node() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

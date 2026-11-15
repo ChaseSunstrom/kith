@@ -83,6 +83,8 @@ pub struct Replica {
     pub bound: Option<String>,
     /// The one node it may run on, where the hardware it claims is.
     pub node: Option<String>,
+    /// A Job that is running now: a drain leaves it where it runs.
+    pub running: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -91,7 +93,19 @@ pub struct Plan {
     pub bind: BTreeMap<String, String>,
     /// Replica id -> why no node would take it, in plain words.
     pub unschedulable: BTreeMap<String, String>,
+    /// Replica id -> why it stays on a drained node, in plain words: it runs, it is pinned
+    /// there, or no other node can take it.
+    pub stays: BTreeMap<String, String>,
 }
+
+/// The NoExecute taint `kith node drain` puts on a node. Unlike other taints it moves what
+/// can move and leaves a running Job and a replica pinned to the node where they are.
+pub const DRAIN: &str = "kith.dev/drain";
+
+/// Why a running Job stays on a drained node.
+const RUNS_HERE: &str = "running here: a drain leaves it to finish";
+/// Why a replica pinned by its hardware stays on a drained node.
+const PINNED_HERE: &str = "pinned here by a Volume or Device";
 
 /// Does every `require`-style label match? Keys may carry the `node.labels.` prefix.
 fn matches(have: &Labels, want: &Labels) -> bool {
@@ -160,13 +174,32 @@ fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
     })
 }
 
+/// A NoExecute taint other than the drain's: it leaves every replica.
+fn other_eviction(n: &Node) -> bool {
+    n.spec.taints.iter().any(|t| t.effect == TaintEffect::NoExecute && t.key != DRAIN)
+}
+
+/// Is `n` drained (its NoExecute drain taint is on)?
+fn drained(n: &Node) -> bool {
+    n.spec.taints.iter().any(|t| t.effect == TaintEffect::NoExecute && t.key == DRAIN)
+}
+
+/// Is `r` pinned to `n` by its hardware, or may it run on any node its placement allows?
+fn pin_and_placement_fit(n: &Node, r: &Replica) -> bool {
+    r.node.as_ref().is_none_or(|node| *node == n.name)
+        && r.placement.as_ref().is_none_or(|p| matches(&n.labels, &p.require))
+}
+
+/// Does a NoExecute taint of `n` make `r` leave it? The drain's does not touch a running
+/// Job or a replica pinned to `n`: those stay, and the plan says so.
+fn evicts(n: &Node, r: &Replica) -> bool {
+    other_eviction(n) || (drained(n) && !(r.running || r.node.as_deref() == Some(n.name.as_str())))
+}
+
 /// May a replica stay on `n`? Cordon, `NoSchedule` and capacity only stop new
 /// placements: a replica already running is not evicted for them.
 fn keeps(n: &Node, r: &Replica, grace: Duration) -> bool {
-    !gone(n, grace)
-        && tainted(n, &[TaintEffect::NoExecute]) == 0
-        && r.node.as_ref().is_none_or(|node| *node == n.name)
-        && r.placement.as_ref().is_none_or(|p| matches(&n.labels, &p.require))
+    !gone(n, grace) && !evicts(n, r) && pin_and_placement_fit(n, r)
 }
 
 /// One item per name, sorted by name. Of several with the same name the one
@@ -212,6 +245,10 @@ pub fn schedule(nodes: &[Node], replicas: &[Replica], grace: Duration) -> Plan {
         let home = r.bound.as_deref().and_then(|b| nodes.iter().find(|n| n.name == b));
         if let Some(n) = home.filter(|n| keeps(n, r, grace)) {
             state.put(&mut plan, n, r);
+            if drained(n) {
+                let why = if r.running { RUNS_HERE } else { PINNED_HERE };
+                plan.stays.insert(r.id.clone(), why.into());
+            }
         }
     }
     // Pass 2: the rest, filter then score.
@@ -241,8 +278,18 @@ pub fn schedule(nodes: &[Node], replicas: &[Replica], grace: Duration) -> Plan {
                 } else {
                     why.join(", ")
                 };
-                plan.unschedulable
-                    .insert(r.id.clone(), format!("0/{} nodes can take it: {why}", nodes.len()));
+                // Only a drain can leave it: its home stays when no other node can take it.
+                let home = r.bound.as_deref().and_then(|b| nodes.iter().find(|n| n.name == b));
+                match home {
+                    Some(n) if drained(n) && !other_eviction(n) && !gone(n, grace) && pin_and_placement_fit(n, r) => {
+                        state.put(&mut plan, n, r);
+                        plan.stays.insert(r.id.clone(), format!("no other node can take it: {why}"));
+                    }
+                    _ => {
+                        plan.unschedulable
+                            .insert(r.id.clone(), format!("0/{} nodes can take it: {why}", nodes.len()));
+                    }
+                }
             }
         }
     }
@@ -294,15 +341,18 @@ impl<'a> State<'a> {
 
 /// The nodes that run one copy of a NodeWorkload: every node whose labels match
 /// `selector`, minus cordoned nodes, `NoExecute`-tainted nodes and nodes lost
-/// past the grace period. Capacity is ignored. Names come back sorted.
+/// past the grace period. A drained node keeps its copy unless another
+/// `NoExecute` taint is on it. Capacity is ignored. Names come back sorted.
 pub fn node_workload(nodes: &[Node], selector: &Labels, grace: Duration) -> Vec<String> {
     let mut names: Vec<String> = nodes
         .iter()
         .filter(|n| {
-            matches(&n.labels, selector)
-                && !cordoned(n)
-                && tainted(n, &[TaintEffect::NoExecute]) == 0
-                && !gone(n, grace)
+            let copy_here = if drained(n) {
+                !other_eviction(n)
+            } else {
+                !cordoned(n) && tainted(n, &[TaintEffect::NoExecute]) == 0
+            };
+            matches(&n.labels, selector) && copy_here && !gone(n, grace)
         })
         .map(|n| n.name.clone())
         .collect();

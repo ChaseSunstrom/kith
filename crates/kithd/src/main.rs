@@ -197,6 +197,8 @@ pub struct Shared {
     /// On such a worker: where the control node it follows is, and the client that calls it
     /// and no other.
     pub upstream: Mutex<Option<(String, reqwest::Client)>>,
+    /// How long a node may be out of contact before its replicas move (`--lost-after`).
+    pub lost_after: std::time::Duration,
 }
 
 /// How many dry runs at once.
@@ -401,7 +403,11 @@ async fn membership(
 }
 
 /// Open this node's replica of the store and start Raft on it.
-async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> Result<Arc<Shared>, String> {
+async fn replica(
+    cluster: Option<cluster::Cluster>,
+    state: &std::path::Path,
+    lost_after: std::time::Duration,
+) -> Result<Arc<Shared>, String> {
     let changed = Arc::new(Notify::new());
     let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     let generation = watch::channel(clock.map_or(0, |d| d.as_millis() as u64)).0;
@@ -443,6 +449,7 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
+        lost_after,
     });
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
@@ -597,7 +604,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             None => Ok(None),
         }
     })?;
-    let shared = rt.block_on(replica(membership, &state))?;
+    let shared = rt.block_on(replica(membership, &state, std::time::Duration::from_secs(args.lost_after)))?;
     if args.ingress && shared.view.borrow().is_some() {
         return Err(
             "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \
