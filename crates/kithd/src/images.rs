@@ -388,7 +388,8 @@ impl Door {
 
 /// The registry's connections, shaken or not, at a time (a slot is taken before a connection
 /// is accepted and kept until it closes; kithd pulls a handful of layers at a time), and
-/// the time a connection may move no byte, from its handshake's end, before it is closed.
+/// the time a connection may move no byte, from its handshake's end, before it is closed
+/// (while it is answering a request, that time does not run).
 // ponytail: a process of the node can still take the registry's slots in turn, or keep one
 // with a byte now and then, and slow Image pulls: telling peers apart needs their identity,
 // which SO_PEERCRED does not give on TCP. A limit per user, or a Unix socket, if that is seen.
@@ -399,12 +400,53 @@ const HANDSHAKE: Duration = Duration::from_secs(2);
 
 type Secured = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
+/// The requests a connection is answering now. While one is, the connection's idle time does
+/// not run: an answer may wait on a copy from another node far longer than the idle time.
+#[derive(Clone, Default)]
+struct Busy(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Busy {
+    /// Counts a request as answered until the returned guard is dropped (a dropped handler too).
+    fn answering(&self) -> Answering {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Answering(self.clone())
+    }
+
+    fn is_answering(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+
+struct Answering(Busy);
+
+impl Drop for Answering {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Listener>> for Busy {
+    fn connect_info(stream: axum::serve::IncomingStream<'_, Listener>) -> Busy {
+        stream.io().busy.clone()
+    }
+}
+
 /// A connection the registry serves: its TLS stream, which closes once no byte moves for
 /// the idle time (`Idle`, counted from the handshake's end), and the slot it has held since
 /// before it was accepted, given back when it closes.
 struct Slotted {
     stream: crate::ingress::Idle<Secured>,
+    busy: Busy,
     _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Slotted {
+    /// While a request is answered, the idle time starts over at every poll of the stream.
+    fn renew_if_answering(&mut self) {
+        if self.busy.is_answering() {
+            self.stream.renew();
+        }
+    }
 }
 
 impl tokio::io::AsyncRead for Slotted {
@@ -413,6 +455,7 @@ impl tokio::io::AsyncRead for Slotted {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        self.renew_if_answering();
         std::pin::Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
@@ -423,6 +466,7 @@ impl tokio::io::AsyncWrite for Slotted {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        self.renew_if_answering();
         std::pin::Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
@@ -430,6 +474,7 @@ impl tokio::io::AsyncWrite for Slotted {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        self.renew_if_answering();
         std::pin::Pin::new(&mut self.stream).poll_flush(cx)
     }
 
@@ -437,6 +482,7 @@ impl tokio::io::AsyncWrite for Slotted {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        self.renew_if_answering();
         std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -474,11 +520,15 @@ fn listen(
     let slots = Arc::new(tokio::sync::Semaphore::new(bound));
     tokio::spawn(async move {
         loop {
-            let Ok(slot) = slots.clone().acquire_owned().await else {
+            // (Nobody serves any more: the port is given back, even with every slot taken.)
+            let slot = tokio::select! {
+                () = tx.closed() => return,
+                slot = slots.clone().acquire_owned() => slot,
+            };
+            let Ok(slot) = slot else {
                 return;
             };
             let accepted = tokio::select! {
-                // (Nobody serves any more: the port is given back.)
                 () = tx.closed() => return,
                 accepted = tcp.accept() => accepted,
             };
@@ -497,6 +547,7 @@ fn listen(
                 if let Ok(Ok(stream)) = shaken {
                     let stream = Slotted {
                         stream: crate::ingress::Idle::new(stream, idle, None),
+                        busy: Busy::default(),
                         _slot: slot,
                     };
                     let _ = tx.send((stream, from)).await;
@@ -523,11 +574,20 @@ async fn behind(
         async move {
             match door.refusal(request.headers()) {
                 Some(refused) => refused,
-                None => next.run(request).await,
+                None => {
+                    // (A refused request is not answered, so it does not hold the idle time off.)
+                    let _answering = request
+                        .extensions()
+                        .get::<axum::extract::connect_info::ConnectInfo<Busy>>()
+                        .map(|axum::extract::connect_info::ConnectInfo(busy)| busy.answering());
+                    next.run(request).await
+                }
             }
         }
     };
-    let app = app.layer(axum::middleware::from_fn(guard));
+    let app = app
+        .layer(axum::middleware::from_fn(guard))
+        .into_make_service_with_connect_info::<Busy>();
     let served = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = stopping.changed().await;
     });
@@ -597,14 +657,14 @@ mod tests {
         connector.connect(name, tcp).await.unwrap()
     }
 
-    /// Eight pieces of 1 KB, each 150 ms after the one before: the whole takes longer than the
-    /// tests' idle time, and no gap between bytes is as long as it.
+    /// Twenty-four pieces of 1 KB, each 200 ms after the one before: the whole takes longer than
+    /// the tests' idle time, and no gap between bytes is as long as it.
     fn trickled() -> axum::body::Body {
         let pieces = futures_util::stream::unfold(0u8, |n| async move {
-            if n == 8 {
+            if n == 24 {
                 return None;
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
             Some((Ok::<Vec<u8>, std::io::Error>(vec![b'#'; 1024]), n + 1))
         });
         axum::body::Body::from_stream(pieces)
@@ -774,7 +834,7 @@ mod tests {
     /// waits in the kernel's queue, and is served once the idle time has closed one of them.
     #[tokio::test]
     async fn registry_bounds_connections_shaken_or_not() {
-        let idle = Duration::from_secs(2);
+        let idle = Duration::from_secs(5);
         let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
         let (door, _stop) = bounded(app, 2, idle).await;
         let (port, certificate) = (door.local.port, (door.local.certificate)().unwrap());
@@ -824,11 +884,70 @@ mod tests {
         );
     }
 
+    /// A request the registry is answering is not cut by the idle time: a handler that takes
+    /// longer than the idle time answers on the same connection, and once it has answered,
+    /// the connection, idle again, is closed and gives its slot back (the bound is 1, so a
+    /// second connection is served only after the first has gone).
+    #[tokio::test]
+    async fn registry_bounds_a_request_being_answered_is_not_cut_by_the_idle_time() {
+        let idle = Duration::from_secs(2);
+        let app = axum::Router::new().fallback(axum::routing::get(|uri: axum::http::Uri| async move {
+            if uri.path().ends_with("/slow") {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            "inside"
+        }));
+        let (door, _stop) = bounded(app, 1, idle).await;
+        let (port, password) = (door.local.port, door.local.password.clone());
+        let certificate = (door.local.certificate)().unwrap();
+        use tokio::io::AsyncWriteExt;
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        let get =
+            |path: &str| format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {basic}\r\n\r\n");
+        let mut first = shaken(port, certificate.clone()).await;
+        first.write_all(get("/v2/team/slow").as_bytes()).await.unwrap();
+        let said = tokio::time::timeout(Duration::from_secs(20), read_inside(&mut first)).await;
+        assert!(
+            matches!(&said, Ok(said) if said.ends_with(b"inside")),
+            "an answer that took longer than the idle time was cut: {said:?}"
+        );
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(10), first.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "the answered connection was not closed once idle: {closed:?}"
+        );
+        let mut second = tokio::time::timeout(Duration::from_secs(20), shaken(port, certificate))
+            .await
+            .expect("the answered connection's slot was not given back");
+        second.write_all(get("/v2/team/quick").as_bytes()).await.unwrap();
+        let said = tokio::time::timeout(Duration::from_secs(20), read_inside(&mut second)).await;
+        assert!(
+            matches!(&said, Ok(said) if said.ends_with(b"inside")),
+            "the second connection was not answered: {said:?}"
+        );
+    }
+
+    /// Reads a kept-alive connection until the body `inside` of its answer has come.
+    async fn read_inside(tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut said = Vec::new();
+        let mut piece = [0u8; 1024];
+        while !said.ends_with(b"inside") {
+            match tls.read(&mut piece).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => said.extend_from_slice(&piece[..n]),
+            }
+        }
+        said
+    }
+
     /// Bytes that keep moving, each within the idle time, keep a connection: a request sent
     /// a piece at a time and a body that comes a piece at a time, both longer than the idle time.
     #[tokio::test]
     async fn registry_bounds_steady_bytes_keep_a_connection() {
-        let idle = Duration::from_millis(400);
+        let idle = Duration::from_secs(2);
         let app = axum::Router::new().fallback(axum::routing::get(|| async { trickled() }));
         let (door, _stop) = bounded(app, 2, idle).await;
         let (port, password) = (door.local.port, door.local.password.clone());
@@ -841,7 +960,7 @@ mod tests {
         for piece in request.as_bytes().chunks(8) {
             tls.write_all(piece).await.unwrap();
             tls.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
         let mut reply = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(20), tls.read_to_end(&mut reply)).await;
@@ -850,7 +969,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&reply)
         );
-        assert_eq!(reply.iter().filter(|&&b| b == b'#').count(), 8 * 1024);
+        assert_eq!(reply.iter().filter(|&&b| b == b'#').count(), 24 * 1024);
     }
 
     /// kithd's pull keeps a connection pooled between its requests: one that is answered,
@@ -858,7 +977,7 @@ mod tests {
     /// (a GET, so safe to send again) is still answered.
     #[tokio::test]
     async fn registry_bounds_a_pull_waits_past_the_idle_time_and_pulls_again() {
-        let idle = Duration::from_millis(300);
+        let idle = Duration::from_secs(2);
         let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
         let (door, _stop) = bounded(app, 2, idle).await;
         let (port, password) = (door.local.port, door.local.password.clone());
@@ -874,7 +993,7 @@ mod tests {
                 .unwrap();
             assert_eq!(said.status(), 200, "the pull {when}");
             assert_eq!(said.text().await.unwrap(), "inside", "the pull {when}");
-            tokio::time::sleep(idle * 4).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
 
