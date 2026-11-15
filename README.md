@@ -1330,6 +1330,8 @@ silence, and `kubectl get -o yaml` gives back what was sent.
 Not answered, each refused in words:
 
 - `exec`, `attach`, `port-forward`, `cp` and `kubectl run` (a pod alone); `kubectl top`.
+- A write to a resource's `/status` (a controller's, or `kubectl patch --subresource=status`):
+  `status is kithd's own`, written from what runs and not taken from a client. Reading it works.
 - CustomResourceDefinitions, and so other people's operators; admission
   webhooks; NetworkPolicy, HorizontalPodAutoscaler.
 - What it is not, and is not meant to become: kith is not a conformant Kubernetes
