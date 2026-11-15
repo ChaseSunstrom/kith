@@ -92,7 +92,7 @@ fn voter(shared: &Shared, id: NodeId) -> Found {
 /// and, for a voter with no Node in the store (a join, an empty store, a Node deleted), to a name
 /// that gives the id. With the name its Node has, for a log line; the error says who was called
 /// and who answered, or why no one is.
-fn to_voter(shared: &Shared, id: NodeId) -> Result<(reqwest::Client, Option<String>), String> {
+pub(crate) fn to_voter(shared: &Shared, id: NodeId) -> Result<(reqwest::Client, Option<String>), String> {
     let cluster = shared.cluster.as_ref().ok_or("this node is not in a cluster")?;
     match voter(shared, id) {
         Found::One(name, print) => Ok((cluster.to_name(&name, print)?, Some(name))),
