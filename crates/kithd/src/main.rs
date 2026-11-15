@@ -87,6 +87,10 @@ struct Args {
     /// is replaced, one each count. 0 for none [default: 5% of the disk, at most 1 GiB, as root; 0 otherwise]
     #[arg(long, env = "KITH_STORAGE_RESERVE", value_name = "BYTES")]
     storage_reserve: Option<u64>,
+    /// Seconds an image no unit on this node uses is kept before it is removed (sooner, oldest
+    /// first, while the state disk is under its reserve); pulled again when a unit needs it. 0 keeps every image
+    #[arg(long, env = "KITH_IMAGE_GRACE", value_name = "SECONDS", default_value_t = 86400)]
+    image_grace: u64,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -803,6 +807,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 runtime,
                 args.log_cap,
                 args.storage_reserve,
+                std::time::Duration::from_secs(args.image_grace),
                 stopping.clone(),
             );
             let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());

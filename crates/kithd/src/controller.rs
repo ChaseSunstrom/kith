@@ -10,6 +10,7 @@
 // of a replica cannot run side by side. Images are pulled one at a time.
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
+mod prune;
 mod storage;
 
 use crate::Shared;
@@ -26,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, watch};
 
@@ -196,6 +197,20 @@ struct Controller {
     missed: BTreeSet<String>,
     /// Set as kithd stops: a count or removal under way gives up, so the state disk can go.
     stop: std::sync::Arc<AtomicBool>,
+    /// How long an image no unit uses is kept (`--image-grace`); zero keeps every image.
+    image_grace: Duration,
+    /// The removal of unused images on its way, and what it will say; an error is the look at
+    /// them failing, which removes nothing.
+    pruning: Option<Job<Result<Vec<String>, String>>>,
+    /// When the last one ended.
+    pruned: Option<Instant>,
+    /// The boot and wall clocks as the last one began, to tell a clock set forward.
+    clocks: Option<(Duration, SystemTime)>,
+    /// No image is unused from before this: this kithd's start (what came before, and the time
+    /// it was down, is not known), moved to now by a clock set forward, or back past it.
+    floor: SystemTime,
+    /// What the last failed look said, said once until it changes.
+    look_failed: Option<String>,
 }
 
 /// Free bytes on the state disk, its reserve, and the pods as counted.
@@ -217,6 +232,7 @@ pub async fn run(
     runtime: kith_runtime::Result<Runtime>,
     log_cap: u64,
     reserve: Option<u64>,
+    image_grace: Duration,
     mut stopping: watch::Receiver<bool>,
 ) {
     let runtime = match runtime.and_then(|rt| rt.cleanup().map(|old| (rt, old))) {
@@ -282,6 +298,12 @@ pub async fn run(
         replacing: BTreeMap::new(),
         missed: BTreeSet::new(),
         stop: std::sync::Arc::new(AtomicBool::new(false)),
+        image_grace,
+        pruning: None,
+        pruned: None,
+        clocks: None,
+        floor: SystemTime::now(),
+        look_failed: None,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -305,10 +327,17 @@ pub async fn run(
             job?.waiting.map(drop).boxed(),
         ))
     });
-    let left = wait_for_storage(counts.chain(removals).collect(), Duration::from_secs(2)).await;
+    // An image's tree is one `remove_dir_all`, which the stop does not cut.
+    let pruning = controller.pruning.into_iter().map(|job| {
+        (
+            "the removal of unused images".to_string(),
+            job.waiting.map(drop).boxed(),
+        )
+    });
+    let left = wait_for_storage(counts.chain(removals).chain(pruning).collect(), Duration::from_secs(2)).await;
     if !left.is_empty() {
         eprintln!(
-            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone",
+            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone; an image half removed is out of the images already, and goes at the next look at them",
             left.join(", ")
         );
     }
@@ -1126,6 +1155,8 @@ impl Controller {
         // What pods wrote outside their volumes: one past its limit, or the biggest writer on a
         // disk under its reserve, is killed here and noticed as an exit below.
         self.tend_storage(shared, &state);
+        // Images no unit uses, once each unit there is has its slot and before any starts.
+        self.tend_images(shared, &state);
 
         // 3. Notice exits, then start whatever is due.
         // A Job's unit that ended is accounted for in step 1, and a unit that started may be
@@ -1659,6 +1690,83 @@ impl Controller {
         // Done, it wakes the loop to act on it; no thread for it, the next pass tries again.
     }
 
+    /// Removes the images no unit here uses (`prune`), at most every `prune::EVERY` after the
+    /// last removal ended, one at a time and off the async threads. In use is the image of
+    /// every unit with a slot, whatever it is doing, and every image a container is made from.
+    /// With no grace it only finishes what a removal cut short (a kithd that had one) left.
+    fn tend_images(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
+        if let Some(job) = self.pruning.as_mut() {
+            let hung = || "removing the images no unit uses has not ended in 60 s".to_string();
+            let Some(said) = job.done(hung) else { return };
+            match said {
+                Some(Ok(said)) => {
+                    self.look_failed = None;
+                    said.iter().for_each(|line| eprintln!("{line}"));
+                }
+                // Each pass fails alike until it is mended: said once, not each minute.
+                Some(Err(e)) if self.look_failed.as_ref() != Some(&e) => {
+                    eprintln!("{e}");
+                    self.look_failed = Some(e);
+                }
+                _ => {}
+            }
+            (self.pruning, self.pruned) = (None, Some(Instant::now()));
+        }
+        if self.pruned.is_some_and(|at| at.elapsed() < prune::EVERY) {
+            return;
+        }
+        // A wall clock set forward makes every image look unused for that much longer: the
+        // images are unused from now at the earliest (so this pass removes none).
+        let boot = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME).map(Duration::from);
+        let stepped = boot.ok().and_then(|boot| {
+            let now = (boot, SystemTime::now());
+            prune::stepped(self.clocks.replace(now), now)
+        });
+        if let Some(ahead) = stepped {
+            eprintln!(
+                "kithd: the clock moved {ahead} s further than time went: each image is kept for its grace from now"
+            );
+        }
+        self.floor = prune::floor(self.floor, stepped.is_some(), SystemTime::now());
+        let floor = self.floor;
+        let keep = images_in_use(&self.slots);
+        let (images, grace, stop, state) = (
+            self.runtime.images.clone(),
+            self.image_grace,
+            self.stop.clone(),
+            state.to_path_buf(),
+        );
+        let disk = nix::sys::statvfs::statvfs(&state).ok();
+        let total = disk.as_ref().map_or(0, |d| d.blocks() * d.fragment_size());
+        let root = nix::unistd::getuid().is_root();
+        let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total, root));
+        self.pruning = Job::start("images", &shared.changed, move || {
+            // A second back: an image a pull marks used as this begins stays, however coarse
+            // the disk's clock.
+            let began = SystemTime::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            // What a removal that stopped or failed left, and the layers no image names that
+            // are as old as an image must be to go (none with no grace). Said whatever follows.
+            let cut = Some(grace).filter(|grace| !grace.is_zero());
+            let tidied = images.tidy(cut.and_then(|grace| began.checked_sub(grace.max(prune::LEAST))));
+            if tidied > 0 {
+                eprintln!("kithd: removed what no image uses any more: {tidied} bytes freed");
+            }
+            if cut.is_none() {
+                return Ok(Vec::new());
+            }
+            let unused = images
+                .unused(&keep, floor)
+                .map_err(|e| format!("kithd: no image removed: {e}"))?;
+            // (A disk that cannot be asked is not under its reserve.)
+            let low =
+                || nix::sys::statvfs::statvfs(&state).is_ok_and(|d| d.blocks_available() * d.fragment_size() < reserve);
+            let remove = |digest: &str, before| images.remove_image(digest, before).map_err(|e| e.to_string());
+            Ok(prune::prune(&unused, began, grace, low, remove, &stop))
+        });
+    }
+
     /// Kills every running unit of the pod `pod`, saying `why`, and sets its disk scratch aside,
     /// to be removed once they are gone: each starts again as its restart policy says, from an
     /// empty root. A pod one of whose units started after the count `began` is left to the next
@@ -1733,6 +1841,15 @@ impl<T> Job<T> {
             done => Some(done.ok()),
         }
     }
+}
+
+/// The images of the units with a slot here: kept, whatever their units are doing.
+fn images_in_use(slots: &BTreeMap<String, Slot>) -> Vec<String> {
+    let images = slots.values().filter_map(|slot| match &slot.run {
+        Run::Container(c) => Some(c.image.clone()),
+        _ => None,
+    });
+    images.collect::<BTreeSet<_>>().into_iter().collect()
 }
 
 /// What the ConfigMap (or, `secret`, the Secret) `name` of `namespace` holds.
@@ -2355,6 +2472,24 @@ mod tests {
         assert!(!fits(&[key], &[key], &[]));
         assert!(!fits(&[card], &[card, pad], &[]));
         assert!(!fits(&[key], &[key, card], &[]));
+    }
+
+    /// Every unit with a slot keeps its image, leaving or not; an image named twice is one.
+    #[test]
+    fn image_removal_keeps_the_image_of_every_slot() {
+        let mut slots = BTreeMap::new();
+        slots.insert("a".to_string(), slot_of("Workload/x/a", &[], "a"));
+        let mut leaving = slot_of("Workload/x/b", &[], "b");
+        leaving.leaving = true;
+        slots.insert("b".to_string(), leaving);
+        let mut other = slot_of("Job/x/c", &[], "c");
+        let Run::Container(c) = &mut other.run else {
+            unreachable!()
+        };
+        c.image = "registry.example/c:1".into();
+        slots.insert("c".to_string(), other);
+        assert_eq!(images_in_use(&slots), ["img", "registry.example/c:1"]);
+        assert!(images_in_use(&BTreeMap::new()).is_empty());
     }
 
     /// A slot of `owner`, with the device nodes `devices`, that runs the container `name`.

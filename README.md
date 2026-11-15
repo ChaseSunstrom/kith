@@ -193,7 +193,28 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   no extended attribute) is one file on the node, hard-linked into each: three nginx
   images of one Alpine base took 44% less disk here, and unpacked 4 to 6% slower (each
   file is read once more to find its equals, on up to four threads; on one thread it
-  was a quarter slower).
+  was a quarter slower). An image no unit on the node uses goes once it has gone unused
+  for `--image-grace` seconds (a day by default; kithd looks once a minute, and counts
+  from the last look that found it in use, and never from before kithd's start: only
+  time kithd has been up counts, so a node down or restarted keeps its images longer),
+  and sooner, oldest first, while the state disk
+  is under its `--storage-reserve`, once unused for two minutes (so a unit started
+  again a moment later still has it; no grace is shorter): its unpacked tree, the
+  layers no image is made of any more, and the shared files nothing else links, each
+  said in kithd's log with the bytes it freed. An image a unit has a slot for, or a
+  container is made from, stays; while a pull is under way (one that hangs too) none
+  is removed. The time between a Job's or CronJob's runs counts as unused: an image
+  used less often than its grace is pulled again each time. A unit that needs a
+  removed image pulls it again, checked for its signature again; one with
+  `pullPolicy: never` fails until it is pulled, so a node off its network (a laptop)
+  wants `--image-grace 0`. That keeps every image and layer; kithd then only finishes
+  deleting what a removal it was stopped in left. A wall clock set forward between two
+  looks removes nothing that look, and counts every image from then; an image used
+  while the clock was far ahead is kept (under the reserve too) until the clock passes
+  that time again. A layer no image names goes once it is as old as an unused image
+  must be (a pull cut short is likely tried again), and none goes while an image
+  unpacked by a kithd from before this version is on the node: remove that image by
+  hand, or let it go past its grace, for layers to go.
   Memory and CPU limits, a limit on what a replica writes (`resources.storage`,
   [below](#a-replica-as-a-pod)), `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are

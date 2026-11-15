@@ -172,6 +172,32 @@ Only the newest version is fixed. There are no security releases of older ones.
   first unpacked) and its size, mode, owner and time: its bytes are not read again
   when a later image is linked to it, so one changed there since is what that image
   gets too.
+- **An image no unit uses is removed** (`--image-grace`, a day by default; sooner under
+  the state disk's reserve), as root, by kithd alone: taken out of `images/` by one
+  rename while no pull holds the store, then deleted following no link; only the layers
+  no image is made of any more (in the image store's `blobs/`, never the cluster's
+  Blobs the node's registry serves) and the `shared/` files nothing else links go with
+  it. One a unit has a slot for, or a container's bundle names, is kept; a bundle that
+  cannot be read keeps every image, said once in the log. A unit that needs it again
+  pulls it through the same path as the first time, so its template's `signedBy` and
+  the Cluster's `spec.images` are checked again: a signature found before does not
+  outlive the image, nor does the note of what its tag resolved to. Time is counted from
+  the image's last use, and never from before kithd's start, so an upgrade does not take
+  every old image at once and neither the time a node was down nor a clock set while it
+  was counts; a wall clock set forward by more than a minute beyond the boot clock
+  (which counts a suspend too) between two looks removes nothing that look and restarts
+  the count; one set back only keeps images longer. A layer no image names (one a pull
+  cut short fetched) goes only once as old as an image must be. Left: an image stays on
+  the disk for its grace after its last use, whoever may read the node's disk can read
+  it meanwhile; a cluster Image's archive (Blobs) is not removed with it; one image's
+  tree is one `remove_dir_all`,
+  which kithd's stop waits 2 s for and does not cut (what it leaves is out of `images/`
+  and goes at the next look); while an image unpacked by a kithd from before this is on
+  the node, no layer is removed (what it was made of is not known); and whoever may
+  apply in one namespace can fill the state disk under its reserve, so the node drops
+  other namespaces' images unused for two minutes: they are pulled and checked again
+  when next needed, so it costs availability (a pull, or a start that fails while the
+  registry cannot be reached), not integrity.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
