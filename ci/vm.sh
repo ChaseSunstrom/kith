@@ -109,6 +109,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    plugged in is given to the container holding the seat as it runs;
                    an app that is a client of the seat reaches the socket its session
                    listens on and cannot write beside it, and another user's cannot;
+                   the image of a Workload deleted goes once unused for --image-grace
+                   (two minutes here) and that of a running one stays;
                    needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
                    KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
@@ -228,7 +230,8 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
         # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
-        [ "$test" != pods ] || more='--mesh --storage-reserve 8388608'
+        # (And an image no unit has used for two minutes goes: README, --image-grace.)
+        [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
         # A container image the nodes have without asking anybody (they reach no registry
@@ -273,6 +276,18 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                     done <"$work/linked"
                     echo '{}' >"$image/config.json"
                     printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fsandbox:1"
+                    # And pod again under another name, for a Workload that is deleted: its
+                    # image goes once unused for --image-grace. (Each image here is marked
+                    # used a day ahead, so none goes before a unit has used it: no registry
+                    # would give it back. Its pod is the other's, linked: a copy would put
+                    # the state disk under its reserve, and every unused image would go.)
+                    digest=$(printf gone | sha256sum | cut -d ' ' -f 1)
+                    image=$work/seed/runtime/images/$digest
+                    mkdir -p "$image/rootfs/bin"
+                    ln "$work/seed/runtime/images/$(printf pod | sha256sum | cut -d ' ' -f 1)/rootfs/bin/pod" "$image/rootfs/bin/pod"
+                    echo '{}' >"$image/config.json"
+                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fgone:1"
+                    touch -d '+1 day' "$work"/seed/runtime/images/*/config.json
                 fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
@@ -630,6 +645,20 @@ EOF
             for heard in web-0 web-1 web-2 'HTTP/1.0 200 OK'; do
                 grep -q "$heard" "$work/ask.out" || fail "the pod that asked did not hear $heard: $(cat "$work/ask.out")"
             done
+            # A Workload of an image nothing else uses, deleted once it runs: its image is
+            # looked for again at the end.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"gone"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"web","image":"kith.test/gone:1","command":["/bin/pod","serve"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload gone was not applied"
+            waited=0
+            until line=$(units Workload gone) && [ "${line%% *}" = 1 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "waited for the pod of gone to be ready; the Workload says: $line"
+                sleep 1
+            done
+            api 1 DELETE /v1/resources/Workload/default/gone >/dev/null || fail "the Workload gone was not deleted"
             stock='no stock image was tried (KITH_E2E=1 pulls one)'
             if [ "${KITH_E2E:-}" = 1 ]; then
                 # An image as its makers ship it, with nothing said but its name: nginx starts
@@ -791,8 +820,26 @@ EOF
             # Past its limit with a file it removed and holds open: no name to walk to, still counted.
             fills unlinked ',"resources":{"storage":"1Mi"}' '2097152","unlinked' 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
 
+            # The deleted Workload's image went, from the node it ran on, once unused for its
+            # grace (looked at once a minute; the state disks here are under their reserve,
+            # where an image goes once unused for two minutes, as long as the grace here). That
+            # of web, running on the first node all along (it is never drained), stayed there,
+            # and web still answers.
+            gone=$(printf gone | sha256sum | cut -d ' ' -f 1)
+            waited=0
+            until grep -aq "kithd: removed image sha256:$gone, unused for [0-9]* s (past its grace)" "$work"/n?.log; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "the image of the deleted Workload gone was not removed past its grace: $(grep -ah 'kithd: .*image' "$work"/n?.log)"
+                sleep 1
+            done
+            pod=$(printf pod | sha256sum | cut -d ' ' -f 1)
+            ! grep -aq "kithd: removed image sha256:$pod" "$work/n1.log" || fail "the image of web was removed from the node it runs on: $(grep -a 'kithd: remov' "$work/n1.log")"
+            asks ask-after web 80
+            grep -q 'web-' "$work/ask-after.out" || fail "web did not answer after an image was removed: $(cat "$work/ask-after.out")"
+            grep -ah 'kithd: .*image' "$work"/n?.log | tr -d '\r' | sed 's/^/vm.sh: /' >&2
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
             exit 0
         fi
         if [ "$test" = kube ]; then

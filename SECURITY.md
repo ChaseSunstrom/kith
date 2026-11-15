@@ -172,6 +172,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   first unpacked) and its size, mode, owner and time: its bytes are not read again
   when a later image is linked to it, so one changed there since is what that image
   gets too.
+- **An image no unit uses is removed** (`--image-grace`, a day by default; sooner under
+  the state disk's reserve), as root, by kithd alone: taken out of `images/` by one
+  rename while no pull holds the store, then deleted following no link; only the layers
+  no other image was made of and the `shared/` files nothing else links go with it. One
+  a unit has a slot for, or a container's bundle names, is kept. A unit that needs it
+  again pulls it through the same path as the first time, so its template's `signedBy`
+  and the Cluster's `spec.images` are checked again: a signature found before does not
+  outlive the image. Left: an image stays on the disk for its grace after its last use,
+  whoever may read the node's disk can read it meanwhile; a cluster Image's archive
+  (Blobs) is not removed with it; and while an image unpacked by a kithd from before
+  this is on the node, no layer is removed (what it was made of is not known).
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A

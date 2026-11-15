@@ -188,7 +188,16 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   no extended attribute) is one file on the node, hard-linked into each: three nginx
   images of one Alpine base took 44% less disk here, and unpacked 4 to 6% slower (each
   file is read once more to find its equals, on up to four threads; on one thread it
-  was a quarter slower).
+  was a quarter slower). An image no unit on the node uses goes once it has gone unused
+  for `--image-grace` seconds (a day by default; `0` keeps every image; kithd looks
+  once a minute, and counts from the last look that found it in use), and sooner,
+  oldest first, while the state disk is under its `--storage-reserve`, once unused for
+  two minutes (so a unit started again a moment later still has it): its unpacked
+  tree, the layers no other image was made of, and the shared files nothing else links,
+  each said in kithd's log with the bytes it freed. An image a unit has a slot for, or a
+  container is made from, stays; one a pull is fetching keeps the pass waiting. A unit
+  that needs a removed image pulls it again, checked for its signature again; one with
+  `pullPolicy: never` fails until it is pulled.
   Memory and CPU limits, a limit on what a replica writes (`resources.storage`,
   [below](#a-replica-as-a-pod)), `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
