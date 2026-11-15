@@ -249,7 +249,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - Until its Node is deleted it can do everything: it can name the local socket as the
     one who asked on what nodes pass on to each other, and the node that leads writes to
     the store whatever a node of the cluster sends it to write, unasked.
-  - **A worker that is taken is, today, still the cluster taken.** A node whose Node
+  - **A worker that is taken reads the whole cluster, and writes only about itself.** A node whose Node
     says `spec.trust: worker` (said by whoever made its join token, `kith node token
     --worker`, or by whoever may apply a Node; the machine that joins does not say it)
     never votes on the store, is refused Raft's own messages by the other nodes (so it
@@ -265,14 +265,51 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     write is not held to it, and that the node has the key is its own word in its
     Node's status). `trust: control` on a Secret covers what a unit is given, not a
     Backup's S3 Secret, an ingress `tls-` Secret or the ACME account, which the node
-    doing that work reads. What a worker still has is the whole store with
-    every Secret in it (those that say `trust: control` too: the rule is its own
-    kithd's, and a taken node does not run its own kithd), and the write: the node
-    that leads writes what a worker sends it as it does a control node's, its own
-    Node's `trust` and a Workload for a control node included. So `trust: worker`
-    lowers what a worker is asked to run and what is taken from it on trust, and
-    stops no one who has taken it. A worker that keeps only what is placed on it and
-    writes only about itself is not built yet.
+    doing that work reads.
+
+    What a worker may write is a list the control node it writes to holds it to,
+    against that node's own store: what it says of the replicas the scheduler gave it
+    (how many are ready is counted again; a unit's address has to be in the worker's
+    own part of the mesh), `os` and `mesh` in its own Node's status (not a mesh key
+    another Node says, which would cut both off), its own NodeKey once, the Devices
+    and Seats whose `spec.node` is the worker (under a name that starts with the
+    worker's own, with the labels discovery writes and no other, the node and the
+    class among them its own), the status of an Image or a Backup of
+    a Volume that is on it, a Blob it made, its own name among a Blob's holders, and
+    when it synced as a Volume's replica. Everything else is refused and written to
+    the audit log under the worker's name: a template, a Secret, a Role, a Node's
+    spec (its own `trust` too), another node's status or Device, a report in another
+    node's name. So a change asked of a worker's own API is refused as well (`ask a
+    control node`); it still answers reads. The other things nodes do among themselves
+    are narrowed with it. A worker is sent a blob's bytes only where the status of an
+    Image or a Backup names it and that one's Volume is on the worker, or it is an
+    Image that a template placed on the worker runs; it is never one of the nodes
+    that should hold a blob, and no node lets go of its copy on a worker's word. A
+    Volume's whole copy is sent only to a node the store names among its replicas
+    (any node, not workers alone). The key of an encrypted Volume is given to control
+    nodes to keep and to no worker, and a node made a worker deletes the keys it
+    kept. Of a worker's word about which nodes are there, only what it says of itself
+    is taken. A worker's replica takes over a lost Volume only when no control node
+    has one, whatever time it says it synced.
+
+    What a taken worker still has: **the whole store with every Secret in it**
+    (those that say `trust: control` too: that rule is its own kithd's, and a taken
+    node does not run its own kithd), so change the Secrets; the files of every
+    Volume on it or that it is a replica of, and their backups and images. And within
+    its list it can lie: about its own units and its own Node; about its Devices, so
+    it can say it has a card a claim in any namespace selects and have that Workload
+    placed on it (a selector alone keeps nothing off a worker: `trust: control` on
+    the Secret or in the template's placement does), and a claim whose selector
+    names no node and came to one node's Devices then matches two nodes' and is
+    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it,
+    and name a Device as a node whose name starts with the worker's and a `-` would
+    name one of its own, which then is not listed. Nothing bounds how much or how
+    often it writes within its list: its reports can fill the store's log. For the round (3 seconds) in which another node still has the file
+    of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
+    for the bytes. A worker that still votes when it is taken (it was a control node
+    a moment ago) is still followed, and what it writes as the node that leads is
+    held to no list: delete its Node. A worker that is sent only what is placed on it
+    is not built yet (`docs/adr-workers.md`).
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.
@@ -305,7 +342,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - `kithd --admit-deleted-nodes` turns the check off on the node started with it, for
     a cluster that has locked itself out (a node from before this check that joined
     while another was away, and leads now); it says so at start. Leave it off. It
-    brings no deleted Node back: a node deleted by mistake joins again.
+    brings no deleted Node back: a node deleted by mistake joins again. A deleted
+    worker's certificate is taken there as a control node's (nothing says it was a
+    worker any more), but for a change to the store: that is taken from no node the
+    asked node has no Node for.
   Certificates still last ten years; nothing but the Node's deletion ends one.
 - **A Release is the right to apply whatever its packages render**, with the node's
   rights and not the writer's; the same for a Source. (T-0229, T-0227.)

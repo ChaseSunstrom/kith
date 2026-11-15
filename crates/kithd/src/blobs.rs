@@ -19,9 +19,10 @@
 use crate::Shared;
 use crate::access::Caller;
 use crate::api::{ApiError, permit};
+use crate::cluster::Peer;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Extension, Path as UrlPath, Query, State};
+use axum::extract::{ConnectInfo, Extension, Path as UrlPath, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
@@ -238,19 +239,29 @@ async fn fetch(client: &reqwest::Client, address: &str, name: &str, dir: &Path) 
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let (dir, me) = (dir(&shared), shared.members.me().to_string());
     let mut said = String::new();
+    // The blobs a Blob has named since this kithd started.
+    let mut named_once: BTreeSet<String> = BTreeSet::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(ROUND) => {}
             _ = stopping.changed() => return,
         }
-        let (wants, addresses) = {
+        let (wants, addresses, workers) = {
             let state = shared.store.lock().expect("a handler panicked holding the store");
             let address = |node: &kith_api::Resource| {
                 let address = node.status.as_ref()?["address"].as_str()?;
                 Some((node.metadata.name.clone(), address.to_string()))
             };
             let addresses: BTreeMap<String, String> = state.store.list(Some("Node")).filter_map(address).collect();
-            (wants(&state.store), addresses)
+            // A worker is never one that should hold a blob: no node lets go of its copy on
+            // a worker's word, and a worker keeps one only as long as it uses it.
+            let workers: BTreeSet<String> = addresses
+                .keys()
+                .chain([&me])
+                .filter(|node| crate::access::is_worker(&state.store, node))
+                .cloned()
+                .collect();
+            (wants(&state.store), addresses, workers)
         };
         let (have, others) = held(&dir);
         if wants.is_empty() && have.is_empty() && others.is_empty() {
@@ -262,6 +273,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         if !live.contains(&me.as_str()) {
             live.push(&me);
         }
+        live.retain(|node| !workers.contains(*node));
         let (fetches, removes) = plan(&wants, &have, &me, &live);
         // (Let go of at once: what the nodes said of themselves is as fresh as it gets.)
         for name in removes {
@@ -289,22 +301,25 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         // Read again, and nothing awaited from here to the removals: a Blob put while this
         // node was fetching is seen, and so is what the others said meanwhile.
         let wants = self::wants(&shared.store.lock().expect("a handler panicked holding the store").store);
-        let old = |path: &Path| {
+        let older = |path: &Path, than: Duration| {
             let age = std::fs::metadata(path).and_then(|file| file.modified()).ok();
             let age = age.and_then(|at| SystemTime::now().duration_since(at).ok());
-            age.is_some_and(|age| age > UNNAMED)
+            age.is_some_and(|age| age > than)
         };
         let (have, others) = held(&dir);
-        let unnamed = have
-            .iter()
-            .filter(|name| !wants.contains_key(*name))
-            .map(|name| dir.join(name));
-        for path in unnamed.chain(others.into_iter().map(|(path, _)| path)) {
-            if old(&path) {
+        // A file whose last Blob went is let go of now, and not kept for whoever still knows
+        // its name; one no Blob has named yet waits (its Blob may be on its way), and so
+        // does one written a moment ago (the same bytes put again).
+        let unnamed = have.iter().filter(|name| !wants.contains_key(*name));
+        let unnamed = unnamed.map(|name| (dir.join(name), if named_once.contains(name) { QUIET } else { UNNAMED }));
+        for (path, wait) in unnamed.chain(others.into_iter().map(|(path, _)| (path, UNNAMED))) {
+            if older(&path, wait) {
                 let _ = std::fs::remove_file(path);
             }
         }
         let (have, _) = held(&dir);
+        named_once.retain(|name| have.contains(name));
+        named_once.extend(wants.keys().cloned());
         // ponytail: each node writes the whole list with itself in or out; two that write
         // at once lose one of the two, which its node puts right the next round.
         let mut statuses = Vec::new();
@@ -487,8 +502,25 @@ pub async fn get(
     Err(io(failed))
 }
 
-/// `GET /v1/blob-copy/NAME` (members only): the bytes if they are here.
-pub async fn copy(State(shared): State<Arc<Shared>>, UrlPath(name): UrlPath<String>) -> Response {
+/// `GET /v1/blob-copy/NAME` (members only): the bytes if they are here. A control node may
+/// be a holder of any blob; a worker is sent one only where something on it names it.
+pub async fn copy(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    UrlPath(name): UrlPath<String>,
+) -> Response {
+    if let Some(crate::pki::Subject::Node(node, ..)) = &peer.subject {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        if crate::access::is_worker(&state.store, node) && !crate::worker::may_fetch(&state.store, node, &name) {
+            drop(state);
+            let why = format!("nothing on worker {node} names blob {name}");
+            let who = Caller::Node(node.clone());
+            shared
+                .audit
+                .record(&who, "GET", vec![format!("/v1/blob-copy/{name}")], Err(why.clone()));
+            return (StatusCode::FORBIDDEN, why).into_response();
+        }
+    }
     let found = named(&name).then(|| file_reply(&dir(&shared).join(&name)));
     match found {
         Some(Ok(reply)) => reply,

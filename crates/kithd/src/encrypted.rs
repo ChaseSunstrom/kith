@@ -148,6 +148,10 @@ fn theirs(shared: &Shared, peer: &Peer, namespace: &str, name: &str) -> Result<D
         return Err("this is for the cluster's nodes".into());
     };
     let state = shared.store.lock().expect("a handler panicked holding the store");
+    // (Refused, not "keeps none": a node that asks a worker has heard nothing of the key.)
+    if crate::access::is_worker(&state.store, shared.members.me()) {
+        return Err("this node is a worker: it keeps no volume's key".into());
+    }
     asked(&state.store, namespace, name, node)
 }
 
@@ -434,6 +438,16 @@ async fn tend(
     Err(format!("the key the cluster keeps does not open it: {failed}"))
 }
 
+/// The addresses of the nodes that keep the keys of `me`'s volumes: the other control nodes.
+/// A worker is given none and asked for none.
+fn keepers(store: &Store, me: &str) -> Vec<String> {
+    let address = |node: &kith_api::Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
+    let others = store
+        .list(Some("Node"))
+        .filter(|node| node.metadata.name != me && node.spec["trust"] != "worker");
+    others.filter_map(address).collect()
+}
+
 /// Keeps this node's encrypted volumes open.
 pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Receiver<bool>) {
     let me = shared.members.me().to_string();
@@ -448,13 +462,15 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
             _ = stopping.changed() => return,
         }
         let (mine, peers) = {
-            let state = shared.store.lock().expect("a handler panicked holding the store");
-            let address = |node: &kith_api::Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
-            let others = state.store.list(Some("Node")).filter(|node| node.metadata.name != me);
-            (
-                crate::volumes::encrypted(&state.store, &me),
-                others.filter_map(address).collect::<Vec<_>>(),
-            )
+            let held = shared.store.lock().expect("a handler panicked holding the store");
+            // A worker that was a control node before deletes what it kept then.
+            if crate::access::is_worker(&held.store, &me) {
+                let kept = state.join("volume-keys");
+                if kept.exists() && std::fs::remove_dir_all(&kept).is_ok() {
+                    eprintln!("kithd: this node is a worker: the volume keys it kept are deleted");
+                }
+            }
+            (crate::volumes::encrypted(&held.store, &me), keepers(&held.store, &me))
         };
         round += 1;
         let client = shared.cluster.as_ref().map(|cluster| &cluster.client);
@@ -527,6 +543,27 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
     }
 
     /// Another node keeps the key for the volume's node and nobody else, keeps the first
+    /// A worker is given no key to keep and asked for none.
+    #[test]
+    fn encrypted_volume_keys_are_kept_by_control_nodes() {
+        let node = |name: &str, trust: &str| {
+            format!("---\napiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ {trust} }}\n")
+        };
+        let mut store = store(&format!("{}{}", node("c", ""), node("w", "trust: worker")));
+        for (name, address) in [
+            ("a", "10.0.0.1:7443"),
+            ("b", "10.0.0.2:7443"),
+            ("c", "10.0.0.3:7443"),
+            ("w", "10.0.0.9:7443"),
+        ] {
+            let status = serde_json::json!({ "address": address });
+            store.set_status(&format!("Node/{name}"), Some(status)).unwrap();
+        }
+        assert_eq!(keepers(&store, "a"), ["10.0.0.2:7443", "10.0.0.3:7443"]);
+        // (A worker's own encrypted Volume is kept by the control nodes, all of them.)
+        assert_eq!(keepers(&store, "w").len(), 3);
+    }
+
     /// one it was given whatever comes later, and gives nothing to a node that is locked.
     #[test]
     fn encrypted_volume_keys_are_kept_for_its_node_alone_and_never_written_over() {

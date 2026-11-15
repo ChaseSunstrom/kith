@@ -18,6 +18,20 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const DISCOVERED: &str = "kith.dev/discovered";
+
+/// Every label discovery writes. A worker's Device may carry these and no other
+/// (`crate::worker`): one added here is one a control node takes from a worker.
+pub(crate) const LABELS: [&str; 9] = [
+    DISCOVERED,
+    "kith.dev/node",
+    "class",
+    "vendor",
+    "model",
+    "pci",
+    "driver",
+    "vram",
+    "function",
+];
 const EVERY: Duration = Duration::from_secs(30);
 
 /// The names in `dir`, sorted; none if it is not there.
@@ -236,6 +250,7 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         labels.insert("kith.dev/node".into(), node.into());
         labels.insert("class".into(), class.into());
         labels.insert(DISCOVERED.into(), "true".into());
+        debug_assert!(labels.keys().all(|label| LABELS.contains(&label.as_str())));
         let mut spec = json!({ "node": node, "class": class });
         if let Some(path) = path {
             spec["path"] = path.into();
@@ -291,11 +306,14 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
         Some(live) => ours(live, node) && (live.metadata.labels != new.metadata.labels || live.spec != new.spec),
     });
     let live = store.list(Some("Device")).chain(store.list(Some("Seat")));
-    // Gone from this machine, or of a node the cluster has no more (nobody else would).
+    // Gone from this machine, or of a node the cluster has no more (nobody else would; a
+    // worker leaves those to a control node: another node's Device is not its to delete).
+    let worker = crate::access::is_worker(store, node);
     let left = |live: &Resource| {
         let of = live.spec["node"].as_str().unwrap_or_default();
         live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true")
             && of != node
+            && !worker
             && store.get(&format!("Node/{of}")).is_none()
     };
     let gone = live.filter(|live| ours(live, node) && !found.iter().any(|new| new.key() == live.key()) || left(live));
@@ -652,6 +670,11 @@ mod tests {
         let theirs = scan(&root, "n2");
         store.apply(theirs[0].clone()).unwrap();
         assert_eq!(changes(&store, "n1", &found).1, [theirs[0].key()]);
+        // (Not by a worker: another node's Device is not its to delete.)
+        let mut as_worker = store.clone();
+        let worker = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n1 }\nspec: { trust: worker }";
+        as_worker.apply(written(worker)).unwrap();
+        assert_eq!(changes(&as_worker, "n1", &found), (vec![], vec![]));
         store
             .apply(written(
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n2 }\nspec: {}",

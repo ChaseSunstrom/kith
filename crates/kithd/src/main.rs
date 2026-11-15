@@ -54,6 +54,7 @@ mod vm;
 mod volume_files;
 mod volumes;
 mod wasm;
+mod worker;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

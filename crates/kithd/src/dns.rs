@@ -335,7 +335,10 @@ pub async fn run(
                         .collect::<Vec<_>>()
                 })
             };
-            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty())
+            // (Every node that answers says the same of the records: a worker leaves the
+            // saying to the control nodes, whose it is to write.)
+            let worker = crate::access::worker(&shared, shared.members.me());
+            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker)
                 && let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await
             {
                 eprintln!("kithd: reporting on DNS records: {e}");

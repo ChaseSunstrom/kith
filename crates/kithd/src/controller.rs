@@ -315,7 +315,7 @@ fn bound(resource: &Resource) -> Vec<u32> {
 }
 
 /// The template of a Workload, NodeWorkload or Job, and how many replicas (or runs) it has.
-fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
+pub(crate) fn template_of(resource: &Resource) -> Result<(Template, u32), String> {
     let spec = resource.spec.clone();
     match resource.kind.as_str() {
         "Workload" => serde_json::from_value::<WorkloadSpec>(spec).map(|s| (s.template, s.replicas.unwrap_or(1))),

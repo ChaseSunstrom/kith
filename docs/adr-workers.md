@@ -1,7 +1,9 @@
 # A worker keeps no Secret that nothing placed on it names
 
-Status: proposed (T-0184 step 4). Nothing here is built. It is the plan for step 5, written
-so it can be argued with before there is code. It was reviewed three times (the first
+Status: the first part is built (T-0184 step 5.1): the list a worker's writes are held to
+("Writes") and what the other node routes hand a worker. The view is not: a worker still
+keeps the whole store. The rest is the plan, written so it can be argued with before
+there is code. It was reviewed three times (the first
 draft was found not sound as written); what each pass found is decided below, and listed
 at the end.
 
@@ -39,9 +41,10 @@ worker. It needs most of them to do its work, and they are not where the Secrets
 ## Options
 
 **A. A view, sent by a control node (chosen).** The worker's kithd keeps the `Store` type
-it has and every loop that reads it. Raft on it is never started: a node that joined and
-was never sent the store is in that state already (`replica()` returns before Raft is
-started), every loop runs on it, and the leader-only ones skip with no leader. A client in
+it has and every loop that reads it. Raft on it is given nothing: a node that joined and
+has not been sent the store yet is in that state already (its Raft is there, with no
+members and an empty log), every loop runs on it, and the leader-only ones skip with no
+leader. A client in
 kithd holds one connection to a control node and applies what arrives into that store.
 
 **B. Keep the whole store everywhere, seal the Secrets.** Each Secret's values are
@@ -135,9 +138,12 @@ logged naming it, on both nodes):
 
 - **The barrier**: the empty write the controller makes before it starts a unit, one a
   second from each worker at most.
+- **A write from a node the asked node has no Node for** is not taken, and asked again:
+  what such a node may write is not known there.
 - **A unit's report**, in the worker's own name, for a template whose `status.nodes` names
   it. Of the report, only the replicas that `status.nodes` gives this node are taken, only
-  the fields a report has today, and `ready` is counted again by the control node. A
+  the fields a report has today, how many replicas there are is read from the spec by
+  the control node, and `ready` is counted again by it. A
   unit's `address` is taken only inside the worker's own part of the mesh. (Today a node
   may name any replica: one replica can say it is all of them and draw the Service's
   traffic.)
@@ -151,9 +157,11 @@ logged naming it, on both nodes):
 - **Its own NodeKey.**
 - **Devices and Seats** whose `spec.node` is the worker in what is sent, and in what is
   stored if there is one by that name: made, changed or deleted. A worker cannot write
-  over or delete another node's Device. (Not by the name: a Device's name is its node's
-  name, a class and an address cut at 63 characters, so a long name does not start with
-  its node's, and node `a` is the start of node `a-b`'s.)
+  over or delete another node's Device. (Not by the name alone: a Device's name is its
+  node's name, a class and an address cut at 63 characters, and node `a` is the start of
+  node `a-b`'s. The name still has to start as the worker's own do, so it is not one
+  another node's discovery would give.) Its labels are the ones discovery writes and no
+  other, the node and the class among them its own: a claim's selector reads labels.
 - **About a Volume the store says is on it**: its Image's and its Backup's status, and
   `Volume.synced` where it is a replica. Such a status may name only a Blob the worker
   made, or one that status named before.
@@ -198,8 +206,9 @@ today:
   unit on a worker would then be the backups of every Volume beside it. A worker writes
   the status of its own Volumes' Images and Backups, which is why what it may name there
   is held to what it made (under "Writes"). A node lets go of a blob's file in the round
-  its last Blob went; the ten minutes it waits today stay for a file no Blob has named
-  yet (an upload on its way). What is left: the node a worker writes to looks at its own
+  its last Blob went (half a minute after the file was written, at the earliest: the
+  same bytes may be on their way in again); the ten minutes it waits today stay for a
+  file no Blob has named yet (an upload on its way), and after kithd starts again. What is left: the node a worker writes to looks at its own
   files, so for the one round (3 seconds) in which another node still has the file of a
   Blob just deleted, a worker that knew the name can make a Blob of it and ask that node.
   A control node is answered as today: it may be a holder of any Blob.

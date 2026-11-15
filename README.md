@@ -634,12 +634,29 @@ kith node status                                   # who leads the store, who vo
   it right. With fewer than three control nodes one node votes, as in a cluster of
   fewer than three nodes.
 
-  What a worker is **not** yet: it still keeps the whole store, every Secret in it,
-  and the node that leads still writes what a worker sends it to write. So today
-  `trust: worker` narrows what a worker is asked to run and whose word is taken, not
-  what a worker that is taken can read or change; see SECURITY.md, "A node that is
-  taken". Say `trust` only once every node runs a kithd that knows it: an older kithd
-  does not read a Node or a Secret that has it.
+  A worker writes to the store only what it says of itself: its units' state, its
+  own Node's `os` and `mesh`, its Devices and Seats, and the backups and images of
+  the Volumes that are on it. The control node it writes to checks each write and
+  refuses the rest, in the audit log under the worker's name (`kith audit`). So run
+  `kith` on a control node, and point a kubeconfig, `curl` and the web UI at one: a
+  worker answers reads, and a change asked of it is refused (`ConfigMap/default/app:
+  it is not a worker's to apply: ask a control node: a worker writes only what it
+  says of itself`).
+
+  A worker holds no blob but one it is using, is given no encrypted Volume's key to
+  keep, and its copy of a replicated Volume takes over only when no control node has
+  one. Not on a worker yet: an ingress that gets its certificates by ACME (it would
+  have to write them), and being the only node that answers DNS if you read
+  `DNSRecord` or `DNSBlockList` status (a worker answers and leaves the status to
+  the control nodes).
+
+  What a worker is **not** yet: it still keeps the whole store, every Secret in it.
+  So today `trust: worker` narrows what a worker is asked to run, whose word is
+  taken and what a worker that is taken can change, not what it can read; see
+  SECURITY.md, "A node that is taken", and `docs/adr-workers.md` for the rest of the
+  design. Say `trust` only once every node runs a kithd that knows it: an older kithd
+  does not read a Node or a Secret that has it, and an older control node writes
+  whatever a worker sends it.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers

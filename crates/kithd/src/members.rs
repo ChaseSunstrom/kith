@@ -9,8 +9,9 @@
 // message authentication that the node API's mutual TLS gives here.
 
 use crate::Shared;
+use crate::cluster::Peer;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -125,9 +126,33 @@ impl Members {
     }
 }
 
+/// What is taken of the view the node `from` sent: all of a control node's, and of a
+/// worker's only its word about itself (it cannot keep a node that is gone looking there,
+/// or say what another has free).
+fn taken(shared: &Shared, from: Option<&str>, theirs: View) -> View {
+    match from.filter(|from| crate::access::worker(shared, from)) {
+        Some(worker) => own_word(worker, theirs),
+        None => theirs,
+    }
+}
+
+fn own_word(from: &str, mut theirs: View) -> View {
+    theirs.retain(|name, _| name == from);
+    theirs
+}
+
 /// `POST /v1/ping` (members only): take the caller's view, answer with ours.
-pub async fn ping(State(shared): State<Arc<Shared>>, Json(theirs): Json<View>) -> Json<View> {
+pub async fn ping(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(theirs): Json<View>,
+) -> Json<View> {
     let now = Instant::now();
+    let from = match &peer.subject {
+        Some(crate::pki::Subject::Node(name, ..)) => Some(name.as_str()),
+        _ => None,
+    };
+    let theirs = taken(&shared, from, theirs);
     merge(&mut shared.members.heard(), theirs, now);
     Json(shared.members.view(now))
 }
@@ -160,9 +185,10 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         }
         let view = shared.members.view(sent);
         let mut calls = tokio::task::JoinSet::new();
-        for (_, address) in peers.iter().filter(|(name, _)| **name != cluster.me.name) {
+        for (name, address) in peers.iter().filter(|(name, _)| **name != cluster.me.name) {
             let call = cluster.client.post(format!("https://{address}/v1/ping"));
             let call = call.timeout(Duration::from_secs(1)).json(&view);
+            let name = name.clone();
             calls.spawn(async move {
                 let mut answer = call.send().await.ok()?.error_for_status().ok()?;
                 let mut body = Vec::new();
@@ -172,12 +198,13 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                         return None;
                     }
                 }
-                serde_json::from_slice::<View>(&body).ok()
+                Some((name, serde_json::from_slice::<View>(&body).ok()?))
             });
         }
         while let Some(answer) = calls.join_next().await {
             // Ages count from when the call was made: time on the way is not news.
-            if let Ok(Some(theirs)) = answer {
+            if let Ok(Some((name, theirs))) = answer {
+                let theirs = taken(&shared, Some(&name), theirs);
                 merge(&mut shared.members.heard(), theirs, sent);
             }
         }
@@ -198,6 +225,10 @@ mod tests {
             memory: 8e9,
         };
         let told = |name: &str, ago| View::from([(name.to_string(), seen(ago))]);
+        // Of a worker's view only its word about itself is taken.
+        let mut both = told("w", 0);
+        both.extend(told("gone", 0));
+        assert_eq!(own_word("w", both).into_keys().collect::<Vec<_>>(), ["w"]);
         let lost = |name: &str, after: u64| {
             let gone = members.lost_for(name, start + Duration::from_secs(after));
             gone.map(|gone| gone.as_secs())

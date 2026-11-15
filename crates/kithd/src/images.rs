@@ -240,6 +240,11 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
             let statuses = vec![(job.key.clone(), fields.as_object().expect("an object").clone())];
             if let Err(e) = shared.submit(Command::Patch { statuses }).await {
                 eprintln!("kithd: image {}: its status was not written: {e}", job.key);
+                // (Refused whole, as a worker's that names a blob another node made is: said
+                // on it and tried again later, not made anew each round.)
+                let failed = json!({ "message": e.to_string(), "tried": now });
+                let statuses = vec![(job.key.clone(), failed.as_object().expect("an object").clone())];
+                drop(shared.submit(Command::Patch { statuses }).await);
             }
         }
     }

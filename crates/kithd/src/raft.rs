@@ -11,8 +11,9 @@
 // ponytail: Raft messages are JSON over the node API (a snapshot is an array of numbers).
 // Fine for stores of a few MB; a binary body is the upgrade if snapshots get slow.
 
-use crate::Shared;
-use axum::extract::{DefaultBodyLimit, State};
+use crate::cluster::Peer;
+use crate::{Shared, pki};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use kith_api::store::Error;
@@ -29,7 +30,7 @@ use kith_store::{Command, Done, NodeId, Reply, TypeConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -129,8 +130,78 @@ async fn snapshot(
     Json(shared.raft.install_snapshot(rpc).await)
 }
 
-/// A change another node passes to the leader: the reply and where in the log it is.
-async fn write(State(shared): State<Arc<Shared>>, Json(command): Json<Command>) -> Json<Option<(Reply, u64)>> {
+/// The empty writes (the controller's barrier before it starts a unit) each worker last sent.
+static BARRIERS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
+
+/// What a worker's write becomes, held to what a worker may write (`crate::worker`):
+/// `Ok(None)` for a barrier that comes too soon after its last (asked again in a moment).
+fn from_worker(shared: &Shared, name: &str, command: Command) -> Result<Option<Command>, String> {
+    if matches!(&command, Command::Patch { statuses } if statuses.is_empty()) {
+        let mut last = BARRIERS.lock().expect("nothing panics holding the barriers");
+        let now = Instant::now();
+        if last
+            .get(name)
+            .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(1))
+        {
+            return Ok(None);
+        }
+        last.insert(name.to_string(), now);
+        return Ok(Some(command));
+    }
+    let blobs = crate::blobs::dir(shared);
+    let held = |blob: &str| blobs.join(blob).exists();
+    let prefix = shared
+        .cluster
+        .as_ref()
+        .map(|cluster| crate::mesh::prefix(&cluster.me.ca));
+    let who = crate::worker::Worker {
+        name,
+        prefix,
+        held: &held,
+    };
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    crate::worker::checked(&state.store, &who, command).map(Some)
+}
+
+/// Is the node `name`, which sends a write, a worker? `None` where this node has no Node for it.
+fn sender(store: &kith_api::store::Store, name: &str) -> Option<bool> {
+    let node = store.get(&format!("Node/{name}"))?;
+    Some(node.spec["trust"] == "worker")
+}
+
+/// A change another node passes to the leader: the reply and where in the log it is. A
+/// control node's is given to Raft as it comes; a worker's is held to its list first.
+async fn write(
+    State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(command): Json<Command>,
+) -> Json<Option<(Reply, u64)>> {
+    let command = match &peer.subject {
+        Some(pki::Subject::Node(name, ..)) => {
+            let worker = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                sender(&state.store, name)
+            };
+            match worker {
+                // No Node for it here (this node is behind, or was started to admit deleted
+                // nodes): what it may write is not known, so it is asked again, not taken.
+                None => return Json(None),
+                Some(false) => command,
+                Some(true) => match from_worker(&shared, name, command) {
+                    Ok(Some(command)) => command,
+                    Ok(None) => return Json(None),
+                    Err(why) => {
+                        let who = crate::access::Caller::Node(name.clone());
+                        shared
+                            .audit
+                            .record(&who, "POST", vec!["/v1/raft/write".into()], Err(why.clone()));
+                        return Json(Some((Err(Error::Invalid(why)), 0)));
+                    }
+                },
+            }
+        }
+        _ => command,
+    };
     let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
     Json(match written {
         Ok(Ok(written)) => Some((written.data, written.log_id.index)),
@@ -453,6 +524,20 @@ mod tests {
         roaming: &BTreeSet<NodeId>,
     ) -> Option<ChangeMembers<NodeId, BasicNode>> {
         super::next_change(me, wanted, known, voters, current, lost, roaming, &BTreeSet::new())
+    }
+
+    #[test]
+    fn a_write_is_held_to_what_its_senders_node_says_and_one_with_no_node_is_not_taken() {
+        let mut store = kith_api::store::Store::default();
+        let nodes = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: a }\nspec: {}\n---\n\
+                     apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: w }\nspec: { trust: worker }\n";
+        for node in kith_api::Resource::from_source(nodes).unwrap() {
+            store.apply(node.unwrap()).unwrap();
+        }
+        assert_eq!(sender(&store, "a"), Some(false));
+        assert_eq!(sender(&store, "w"), Some(true));
+        // (Deleted and let in by `--admit-deleted-nodes`, or not heard of yet: asked again.)
+        assert_eq!(sender(&store, "gone"), None);
     }
 
     #[test]

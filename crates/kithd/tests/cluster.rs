@@ -785,6 +785,109 @@ fn ca_key_stays_with_the_control_nodes_and_a_worker_never_votes() {
     });
 }
 
+/// A raw HTTPS request with the node certificate kept in `dir`, and `body` as JSON if there
+/// is one; returns the status code and what was answered.
+fn ask_as_node(address: &str, dir: &Path, method: &str, path: &str, body: Option<&str>) -> (String, String) {
+    let mut curl = Command::new("curl");
+    curl.args(["-sk", "-w", "\n%{http_code}", "--max-time", "15", "-X", method]);
+    if let Some(body) = body {
+        curl.args(["-H", "content-type: application/json", "-d", body]);
+    }
+    curl.arg("--cert").arg(dir.join("node.crt"));
+    curl.arg("--key").arg(dir.join("node.key"));
+    let out = curl.arg(format!("https://{address}{path}")).output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (said, code) = out.rsplit_once('\n').unwrap_or(("", &out));
+    (code.to_string(), said.to_string())
+}
+
+/// A worker's own units are still said to run, and what is not a worker's to write is
+/// refused on the route nodes write by, whatever its certificate is admitted to; the other
+/// node routes hand it no blob nothing on it names and no Volume it is no replica of.
+#[test]
+fn a_worker_writes_only_what_it_says_of_itself() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    use serde_json::json;
+    let test = "wlist";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token", "--worker"]);
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 2
+    });
+    // What it says of itself goes through: its copy of a NodeWorkload runs and is said to.
+    let agent = "apiVersion: kith.dev/v1\nkind: NodeWorkload\nmetadata: { name: agent }\nspec:\n  \
+        template:\n    exec: [{ name: run, command: [sh, -c, 'echo up; exec sleep 300'] }]\n";
+    std::fs::write(alpha.dir.join("agent.yaml"), agent).unwrap();
+    alpha.ok(&["apply", "-f", "agent.yaml"]);
+    wait_for("the worker's copy to be said to run", || {
+        let agent = alpha.ok(&["get", "nodeworkload/agent", "-o", "json"]);
+        let agent: serde_json::Value = serde_json::from_str(&agent).unwrap();
+        let units = agent["status"]["containers"].as_array().cloned().unwrap_or_default();
+        units
+            .iter()
+            .any(|unit| unit["node"] == "beta" && unit["state"] == "running")
+    });
+    let (alphas, betas) = (alpha.dir.join("state/pki"), beta.dir.join("state/pki"));
+    // The route nodes write by, with the worker's certificate, for what is not its to write.
+    let write = |command: serde_json::Value| {
+        let body = command.to_string();
+        let (code, said) = ask_as_node(&alpha.address(), &betas, "POST", "/v1/raft/write", Some(&body));
+        format!("{code} {said}")
+    };
+    let forged = json!({ "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": "forged" },
+        "spec": { "data": { "a": "b" } } });
+    for forged in [
+        json!({ "Apply": { "resources": [forged], "at": 0 } }),
+        json!({ "Delete": { "key": "Node/alpha" } }),
+        json!({ "Patch": { "statuses": [["Node/alpha", { "address": "127.0.0.1:1" }]] } }),
+        json!({ "Patch": { "statuses": [["Node/beta", { "certificate": "x" }]] } }),
+        json!({ "Report": { "node": "alpha", "statuses": [["NodeWorkload/default/agent", null]] } }),
+    ] {
+        let said = write(forged.clone());
+        assert!(
+            said.contains("a worker writes only what it says of itself"),
+            "{forged}: {said}"
+        );
+    }
+    assert!(alpha.kith(&["get", "ConfigMap/forged"]).0 != 0);
+    assert_eq!(alpha.nodes().len(), 2);
+    // Through the worker's own API too: a change is asked of a control node.
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: here }\nspec: { data: { a: b } }\n";
+    std::fs::write(beta.dir.join("cm.yaml"), config).unwrap();
+    let (code, _, err) = beta.kith(&["apply", "-f", "cm.yaml"]);
+    let why = "ConfigMap/default/here: it is not a worker's to apply: ask a control node";
+    assert!(code != 0 && err.contains(why), "{err}");
+    // A blob nothing on the worker names is not sent to it, and it is never made a holder.
+    std::fs::write(alpha.dir.join("in"), b"bytes a worker has only heard the name of").unwrap();
+    let name = alpha.ok(&["blob", "put", "in"]).trim().to_string();
+    let copy = format!("/v1/blob-copy/{name}");
+    assert_eq!(ask_as_node(&alpha.address(), &alphas, "GET", &copy, None).0, "200");
+    let (code, said) = ask_as_node(&alpha.address(), &betas, "GET", &copy, None);
+    assert!(
+        code == "403" && said.contains("nothing on worker beta names"),
+        "{code} {said}"
+    );
+    // (Three rounds of the blobs' loop: a node that should hold it would have it by now.)
+    std::thread::sleep(Duration::from_secs(10));
+    assert!(!beta.dir.join("state/blobs").join(&name).exists());
+    // Nor a Volume it is no replica of.
+    let (code, said) = ask_as_node(&alpha.address(), &betas, "GET", "/v1/volume-copy/default/data", None);
+    assert!(code == "403" && said.contains("is no replica"), "{code} {said}");
+    // The worker's refused writes are in the control node's audit log, by its name.
+    let audit = alpha.ok(&["audit"]);
+    assert!(
+        audit.contains("beta") && audit.contains("a worker writes only"),
+        "{audit}"
+    );
+}
+
 #[test]
 fn a_node_that_is_down_is_not_made_a_voter() {
     if std::env::var_os("KITH_E2E").is_none() {

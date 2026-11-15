@@ -18,8 +18,9 @@
 
 use crate::Shared;
 use crate::blobs::Incoming;
+use crate::cluster::Peer;
 use crate::volumes::Dir;
-use axum::extract::{Path as UrlPath, Query, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use kith_api::store::Store;
@@ -74,7 +75,10 @@ pub fn writes(
                 .iter()
                 .filter(|node| there(node))
                 .filter(|node| synced(node).is_some());
-            if let Some(next) = ready.max_by_key(synced).cloned() {
+            // A worker's copy only when no control node has one, whatever time it says: when
+            // it synced is the worker's own word.
+            let trusted = |node: &&String| (!crate::access::is_worker(store, node), synced(node));
+            if let Some(next) = ready.max_by_key(trusted).cloned() {
                 replicas.retain(|node| *node != next);
                 primary = next;
             }
@@ -142,15 +146,35 @@ pub struct Have {
     have: Option<String>,
 }
 
+/// Does the store name `node` among the replicas of the Volume `key`?
+fn replica_of(store: &Store, key: &str, node: &str) -> bool {
+    let status = store.get(key).and_then(|volume| volume.status.as_ref());
+    status.is_some_and(|status| names(&status["replicas"]).iter().any(|replica| replica == node))
+}
+
 /// `GET /v1/volume-copy/NS/NAME` (members only): the volume as it is now, if this node has it.
 pub async fn copy(
     State(shared): State<Arc<Shared>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
     UrlPath((namespace, name)): UrlPath<(String, String)>,
     Query(have): Query<Have>,
 ) -> Response {
     let key = format!("Volume/{namespace}/{name}");
     let dir = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
+        // Only a node the store names among its replicas has a use for the whole of it.
+        let asks = match &peer.subject {
+            Some(crate::pki::Subject::Node(node, ..)) => node.as_str(),
+            _ => "",
+        };
+        if !replica_of(&state.store, &key, asks) {
+            drop(state);
+            let why = format!("node {asks} is no replica of {key}");
+            let who = crate::access::Caller::Node(asks.to_string());
+            let what = vec![format!("/v1/volume-copy/{namespace}/{name}")];
+            shared.audit.record(&who, "GET", what, Err(why.clone()));
+            return (StatusCode::FORBIDDEN, why).into_response();
+        }
         let mine = |(_, dir, _): &(String, Dir, u32)| dir.node == shared.members.me();
         crate::volumes::replicated(&state.store)
             .into_iter()
@@ -454,6 +478,28 @@ mod tests {
             ("c".to_string(), vec!["b".to_string()])
         );
         assert_eq!(decided(&two, &[("a", 60), ("c", 0)]).unwrap().0, "b");
+        // A worker's copy takes over only when no control node has one, whatever time it says.
+        let worker = json!({ "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "c" },
+            "spec": { "trust": "worker" } });
+        let resources = vec![serde_json::from_value(worker).unwrap()];
+        kith_store::run(&mut two, Command::Apply { resources, at: 2 }).unwrap();
+        assert_eq!(decided(&two, &[("a", 60)]).unwrap().0, "b");
+        assert_eq!(decided(&two, &[("a", 60), ("b", 0)]).unwrap().0, "c");
+    }
+
+    #[test]
+    fn a_volumes_copy_is_for_its_replicas() {
+        let said = store(json!({ "primary": "a", "replicas": ["b"], "synced": { "b": 100 } }));
+        assert!(replica_of(&said, KEY, "b"));
+        // Not a node that is none, not one with no name, not for a Volume with no replicas.
+        for (key, node) in [
+            (KEY, "c"),
+            (KEY, ""),
+            ("Volume/default/alone", "b"),
+            ("Volume/default/gone", "b"),
+        ] {
+            assert!(!replica_of(&said, key, node), "{key} {node}");
+        }
     }
 
     #[test]

@@ -393,7 +393,9 @@ pub async fn run(shared: Arc<Shared>, cache: Arc<Cache>, out: watch::Sender<Arc<
         if let Some(blocks) = round.blocks {
             out.send_replace(Arc::new(blocks));
         }
+        // (A worker answers by its lists and leaves saying how they are to the control nodes.)
         if !round.statuses.is_empty()
+            && !crate::access::worker(&shared, shared.members.me())
             && let Err(e) = shared
                 .submit(kith_store::Command::Status {
                     statuses: round.statuses,
