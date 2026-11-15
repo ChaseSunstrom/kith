@@ -142,7 +142,8 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 24] = [
+const FOR_IDENTITIES: [&str; 25] = [
+    "/v1/duress",
     "/v1/backups",
     "/v1/blobs",
     "/v1/volumes",
@@ -180,7 +181,7 @@ pub fn for_identities(path: &str) -> bool {
 }
 
 /// Is `path` a request one node passes on to another for whoever asked it (a unit's output,
-/// a Volume's files, a node's passphrase, a backup's restore: each is done by the node that
+/// a Volume's files, a node's passphrase or new recovery key, a backup's restore: each is done by the node that
 /// has the thing)? On these alone is a node's word for who asked ([`FOR`]) read.
 fn passed_on(path: &str) -> bool {
     let Some(rest) = path.strip_prefix("/v1/") else {
@@ -189,7 +190,10 @@ fn passed_on(path: &str) -> bool {
     let parts: Vec<&str> = rest.split('/').collect();
     matches!(
         parts[..],
-        ["logs", _, ..] | ["volumes", _, _, "files"] | ["lock", _, "passphrase"] | ["backups", _, _, "restore"]
+        ["logs", _, ..]
+            | ["volumes", _, _, "files"]
+            | ["lock", _, "passphrase" | "recovery"]
+            | ["backups", _, _, "restore"]
     )
 }
 

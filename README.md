@@ -3263,8 +3263,12 @@ kith node seal beta                    # beta's own TPM keeps the key too: it st
 kith node seal beta --off              # taken back: beta asks the cluster again
 kith node passphrase beta              # asks for one, twice, unseen: typed at beta's console, it opens beta's state away from home
 kith node passphrase beta --off        # taken away
+kith node recovery beta                # beta, running, makes a new recovery key and shows it, once: the old one opens no more
+kith node duress beta                  # a duress code for beta, shown once: typed at beta's waiting console, it erases beta's way in
+kith node duress --all                 # one code for the whole cluster (--off takes either away)
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
 sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
+sh ci/vm.sh --test duress              # the new recovery key and the duress code, the same way
 ```
 
 `lock` is for a machine that is lost or about to leave the house; a locked
@@ -3282,8 +3286,64 @@ machine's console, it opens the state where no cluster answers: a laptop away
 from home, or a cluster whose nodes were all off at once (each waits for
 another to hand it its key: open one by hand, and the others follow). It
 opens a locked node too, as whoever has it owns the machine; only `wipe`,
-reaching a running node, ends that. An install that nobody watched (from a
-URL, or from the network) has a recovery key that nobody saw.
+reaching a running node, or a duress code ends that. An install that nobody
+watched (from a URL, or from the network) has a recovery key that nobody saw:
+a cluster of such nodes that is all off at once opens for nobody. So
+`kith node recovery beta` has beta, while it runs, make a new one and shows it
+this once (it is kept nowhere: not in the store, not in the audit log); the key
+beta had before opens it no more. Beta writes the new key before it answers:
+if the command fails, run it again, since the old key may be gone and nobody
+has seen the new one. While the cluster holds nodes' keys and
+nobody was shown the recovery key of any of them, `kith get node` and the web
+UI say so. `kith get NodeKey beta` says `recoverySeen: true` once beta's was
+shown by that command, or typed at beta's console: shown, which is not the
+same as written down.
+
+**A duress code.** For whoever is made to open a node. `kith node duress beta`
+makes one and shows it this once: 32 digits in groups of four, as a recovery
+key looks. Typed at beta's console while beta waits for its key, it erases
+beta's lock record (the disk's own secret, and with it what the recovery key
+and a passphrase opened) and, when a node of the cluster answers, has the
+cluster forget beta's key, as `wipe` does. The console says of it what it says
+of a wrong key, two seconds after the line was entered, as it does for every
+line that opens nothing; from then on nothing typed opens beta, the recovery
+key included. There is no way back. Codes are made by kith, never chosen, and
+none exists until someone who may apply NodeKeys makes one; `--off` takes it
+away (the node drops it when it hears). A code works at a node once that node,
+running, has heard of it (`kith get nodekey beta` then says `duress: true` in
+its status): a node that was off when the code was made takes it for a wrong
+key until it has run with the cluster in reach.
+
+`kith node duress --all` makes one code for the whole cluster. Typed at the
+waiting console of any encrypted node, it does to that node what its own code
+does, and has the cluster forget the key of every other node that was under
+the code when it was made. Those nodes run on. They drop their TPM's seal and
+their passphrase when they hear of it, and from then on open with their own
+recovery keys alone, until `kith node unlock NAME` has the cluster hold NAME's
+key again. A node forgotten this way keeps its own code, which still erases
+it; the cluster's code is gone from all of them, and after `kith node unlock`
+a node has no code until one is made again. So the cluster makes no such code while one of its nodes has a
+recovery key nobody was shown (`kith node recovery` first), and a node that
+joins later is not under it: make the code again.
+
+What a duress code does not do. A disk copied beforehand, with its recovery
+key or a passphrase it had, still opens; and until a node of the cluster has
+heard the code (the machine was away, or its card was pulled), such a copy
+started on the cluster's network is still handed its key: `kith node wipe` it
+from a node you can reach as well. Flash may keep old blocks: the record is
+written over with zeros, and what a flash disk keeps of sectors it has
+replaced is not kith's to say. A disk that refuses the write keeps its record:
+the node tries again for as long as it waits and says nothing of it. The
+cluster stops handing the key out and a NodeKey cannot be rolled back, but a
+control node's disk and the cluster's backups still hold earlier versions with
+the wrapped key, which opens nothing without a copy of the erased disk. The record on the disk shows that a code
+exists (not what it is: it holds a public key made from the code). The answer
+at the console is the same; the request to the cluster, the write to the
+disk, and the record that is gone afterwards are there for whoever watches
+the network or reads the disk. It works at a waiting console only: a node
+that runs has its state open. And whoever has the code and can reach a node's
+port can have the cluster forget without being at any console: keep a code as
+you keep a recovery key.
 
 **The machine's own TPM.** `kith node seal beta` lets beta keep its key
 itself, sealed to its TPM and to the system it runs: from then on it opens
@@ -3348,19 +3408,22 @@ What is and is not protected:
 - Until another node holds the key it stays on the node's own disk, and the
   node says so at each start: a cluster's first node, until a second has
   joined, is not protected.
-- Whoever may apply NodeKeys can lock and wipe; a running node gives its
-  NodeKey again when it is deleted or written over, and one that was off
+- Whoever may apply NodeKeys can lock and wipe, have a node make a new
+  recovery key (and is shown it), and make duress codes; a running node gives
+  its NodeKey again when it is deleted or written over, and one that was off
   meanwhile needs its recovery key.
 - The config partition (the node's name, address, and the join token it was
   installed with, spent since) and the system itself are not encrypted.
 - Anyone who can reach a node's port can ask for a key by its id; what they
-  are sent opens nothing without the disk's secret.
+  are sent opens nothing without the disk's secret. They can ask it to forget
+  one too, which it does only for a number it gave within the last minute,
+  signed with the key of a duress code, once.
 - A stolen machine that is not locked, started on the cluster's own network,
   is handed its key: lock it when it goes missing.
 
 Not yet: a passphrase and the TPM both asked for (two locks, where these are
-two doors), a keyboard layout at the console, encrypting a node that was not installed that way, a new recovery key for a
-running node.
+two doors), a keyboard layout at the console, encrypting a node that was not installed that way, the disk's secret kept in
+the TPM (so that erasing it would not depend on what a flash disk keeps), a duress code that opens a decoy.
 
 ### Not in kith OS yet
 

@@ -69,6 +69,7 @@ ul { padding: 0; list-style: none; }
 a { color: inherit; }
 pre, textarea, .diff, .logs, td, .hint code { font-family: var(--mono); font-size: var(--small); }
 .dim { color: var(--dim); font-weight: 400; }
+.warning { color: var(--warn); font-size: var(--small); margin: 0 0 8px; }
 .bad { color: var(--bad); }
 .ok { color: var(--accent-text); }
 .grow { flex: 1; }
