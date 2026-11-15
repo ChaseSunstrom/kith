@@ -1223,6 +1223,17 @@ spec:
   and no `kith-values` ConfigMap; any of these (or a template that fails) is
   `state: error` with the reason in `message`, and what was installed before
   stays as it was.
+- A Release acts with the rights of whoever applied it (or rolled it back),
+  which kithd writes down on it as `kith.dev/written-by`; what a client says
+  there is not taken. Each time it renders, every resource is asked for as if
+  that writer applied it, and so is what it reaches (a Backup's Volume and
+  Secret, a Share's Volume, a CronJob's Jobs), and the deletion of each one no
+  longer rendered. One refusal and nothing is applied: `state: error`, with a
+  message such as `Secret/store/db: Release/store/shop was applied by alice,
+  and alice may not apply Secret in namespace store: no Role bound to it
+  allows that`. A writer who loses a right, or whose Identity is deleted,
+  stops the next render, not what is installed. A Release from before kithd
+  wrote this down makes nothing new until it is applied again.
 - `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
   any version that is not a pre-release. A Release goes on the newest
   package that fits and stays on it; with `autoUpgrade: true` it follows
@@ -1337,7 +1348,10 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   (5 at least) and applies its resources, marked `kith.dev/owned-by` like a
   Release's. A resource that names no namespace goes in the Source's. A
   Source applies only into its own namespace; one in `kith-system` applies
-  anywhere and any kind (it is the cluster's own). It does not take over what
+  anywhere and any kind. Either way it applies only what whoever applied it
+  may apply, as a Release does (above): so its repository's authors can make
+  whatever that writer can, and no more. A Release or a Source it makes acts
+  with the same writer's rights. It does not take over what
   is there and not its own; of two Sources that name one resource the one
   that has it keeps it (the first by name, if they come together) and the
   other says `error`. Sources are fetched several at
@@ -1806,8 +1820,9 @@ one that could give itself every right anyway.
   the old certificate's access; `kith delete identity/alice` ends it all.
 - Grant with care: `apply` on Role, RoleBinding or Identity is the power to
   grant oneself anything, and whoever may apply a Workload runs programs on
-  your nodes. A Release or Source acts for the cluster, not for whoever
-  applied it.
+  your nodes. A Release or a Source acts with the rights of whoever applied
+  it, and makes nothing they may not apply themselves (see Packages and
+  Sources); deleting one removes what it installed, whoever may delete it.
 
 Every change made through a node, and every refusal, is one line in that
 node's audit log (`audit.log` in its state directory, 4 MB and the four
@@ -2300,8 +2315,8 @@ spec:
   `samba-common-tools`, `nss_wrapper`).
 - The `status` of a Share says why it is given to nobody: no such Volume, an Identity in
   `users` that does not exist, or nobody named. Whoever applies a Share (or rolls one
-  back) must be allowed to apply the Volume it gives; a Release or a Source that renders
-  one gives a Volume of its own namespace, as it may run a workload that mounts it.
+  back) must be allowed to apply the Volume it gives; so must whoever applied a Release or a
+  Source that renders one.
 - `uid` is who writes: nobody (65534) unless you say, which is also who a container is
   with nothing said, so the two write each other's files. Where a container on the volume
   is another user (`runAsUser`, or its image's), name that user here.
