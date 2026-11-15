@@ -1963,6 +1963,7 @@ with open(sys.argv[1], "r+b") as disk:
         wait "$vm" || fail "the VM did not end within ${time} s of starting"
         said 'reboot: Restarting system' || fail "kithd did not restart the machine when told"
         ! said 'Kernel panic' || fail "the kernel panicked"
+        resident=$(grep -ao 'told to stop: [0-9]* kB resident, [0-9]* kB of it files' "$work/log" | tail -n 1)
     }
 
     if [ "$test" = update ]; then
@@ -2068,6 +2069,9 @@ with open(sys.argv[1], "r+b") as disk:
     ! said 'kithd: ' || fail "kithd ran from a root that was tampered with"
     said 'device-mapper: verity: .* is corrupted' || fail "the kernel did not say the root was corrupted"
     echo "vm.sh: the image served other nodes ${took} ms after QEMU started (firmware, boot loader and kernel included)"
+    # (Of the second start, from the image's own root: read from the disk, as a node's is.)
+    [ -n "$resident" ] || fail "kithd did not say what it held in memory when told to stop"
+    echo "vm.sh: kithd as the first process of kith OS, ${resident#told to stop: }"
     [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }
     echo "vm.sh: ok: UEFI boot from the image, a verity root, DHCP, TLS answered ($first), on a disk longer than the image a state partition that ends where the disk does from the first start and is left alone at the second, state kept across a restart, a tampered root refused"
     exit 0
@@ -2123,6 +2127,9 @@ if [ "$test" = init ]; then
     started 'sendkey ctrl-alt-delete' 'reboot: Restarting system' "$@"
     # The power button (a VPS panel's shutdown): kithd stops what it runs and powers off.
     started system_powerdown 'reboot: Power down' "$@"
+    resident=$(grep -ao 'told to stop: [0-9]* kB resident, [0-9]* kB of it files' "$work/log" | tail -n 1)
+    [ -n "$resident" ] || fail "kithd did not say what it held in memory when told to stop"
+    echo "vm.sh: kithd as the first process, from a memory disk, ${resident#told to stop: }"
     echo "vm.sh: kithd served ${took} ms after QEMU started (the firmware and kernel included)"
     [ "$took" -lt 10000 ] || { echo "vm.sh: FAIL: over 10 s" >&2; exit 1; }
     echo "vm.sh: ok: kithd is the first process, serves, restarts the machine when told, and powers it off at the power button"

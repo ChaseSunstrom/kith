@@ -681,6 +681,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 _ = int.recv() => {}
                 () = init::BUTTON.notified() => {}
             }
+            if first_process && let Some((all, files)) = init::resident() {
+                eprintln!("kithd: init: told to stop: {all} kB resident, {files} kB of it files");
+            }
             watched.stop.send_replace(true);
             // Told again while it stops: it ends now, as a kill would end it, and what still
             // runs is found by the next start. (Not the first process: its end unmounts the disks.)

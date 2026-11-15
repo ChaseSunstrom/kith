@@ -3729,6 +3729,25 @@ Rust 1.100.0 gave a tenth of these functions other names, and kithd built with i
 no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
 again (the check then fails, saying there is no lld).
 
+That number is of a kithd with nothing to do on the machine that built it. As the first
+process of kith OS it does more before it serves (its mounts, the state partition, DHCP,
+its node's TLS), and none of that code is in the order file, which is traced from a kithd
+that is not the first process. kithd as the first process says on its console what it
+holds when it is told to stop (`kithd: init: told to stop: 10248 kB resident, 8996 kB of
+it files`), and the VM tests print it: `sh ci/vm.sh --test image`, from the image's own
+root after one TLS request, 10.2 MB, 9.0 of them files, which is its own program (7.7 MB
+of its 9.8 MB of code); `sh ci/vm.sh --test init`, from a memory disk and told to stop as
+soon as it serves, 6.4 MB, 5.4 of them files. Tried in that VM, and not kept: telling the
+kernel the code is read at random (`MADV_RANDOM`) changed nothing (10.3 to 10.6 MB: the
+pages the kernel maps around a fault are not read-ahead); with the kernel mapping one
+page a fault where it maps 64 kB (a setting of the whole node, which kith OS leaves as it
+is) kithd held 7.7 MB, 5.4 of them code, so most of what it holds is code it ran, a page
+here and a page there, and not the pages around it. (Not tried: dropping the pages once
+it serves, which lowers the number until each is used again.) What would lower it is that code linked together
+too, which the order file does not do yet. These pages are the kernel's copy of a file:
+it takes them back when memory is short. No budget holds the VM's number (no VM runs in
+CI); the 9.00 MB budget is of the build machine's.
+
 ### Testing on several nodes
 
 ```sh

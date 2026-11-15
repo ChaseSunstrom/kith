@@ -650,6 +650,19 @@ fn counted(line: &str) -> bool {
     options.slot.is_some() && options.install.is_none()
 }
 
+/// What this kithd holds in memory, in kB as the kernel counts it: all of it, and the part
+/// that is files (its own program, mostly; a file of a memory disk is counted as shared
+/// memory, so that is added). Said on the console when the machine's first process is told
+/// to stop, so the number of a real node is there to read.
+pub fn resident() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kb = |name: &str| {
+        let line = status.lines().find_map(|line| line.strip_prefix(name))?;
+        line.split_whitespace().next()?.parse().ok()
+    };
+    Some((kb("VmRSS:")?, kb("RssFile:")? + kb("RssShmem:")?))
+}
+
 /// kithd is done (it has stopped what it ran): restart the machine or power it off.
 /// After a failure it restarts, once the reason has had time to be read on a console. A
 /// start that fails again waits longer, the count being on the ESP (see `os::wait`).
