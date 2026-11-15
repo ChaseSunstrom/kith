@@ -184,7 +184,10 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   how you follow a tag that moves. A cluster Image of this node's own registry is
   always asked, whatever its policy: one deleted, or made again under its name, is
   not started from the copy kept here (asking for an unchanged one takes about 22 ms
-  here). Memory and CPU limits, `command`/`args`, and `env`
+  here). A file that several unpacked images hold alike (bytes, mode, owner, time, and
+  no extended attribute) is one file on the node, hard-linked into each: three nginx
+  images of one Alpine base took 44% less disk here, and unpacked 8 to 10% slower.
+  Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
   had run for a minute), then after a wait that doubles from a second up to a

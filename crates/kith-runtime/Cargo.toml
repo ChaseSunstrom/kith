@@ -26,6 +26,9 @@ caps = "0.5"
 # Image signatures. (Both in the tree already: rustls verifies with ring.)
 ring = "0.17"
 base64 = "0.22"
+# Whether a file has extended attributes (one that has is never shared). In the tree already
+# through libcontainer's pathrs.
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 # The seccomp filter, written out in Rust: no C libseccomp (kithd is one static binary).
 seccompiler = "0.5"
 

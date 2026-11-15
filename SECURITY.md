@@ -142,6 +142,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
   signed only by keys it was checked against there.
+- **An image is checked when it is pulled, not again when it starts.** Its layers are
+  checked against their digests as they arrive and unpacked once; a start uses the files
+  on the node's disk as they are. A file that several images hold alike is one file,
+  hard-linked into each (and into `shared/`, beside `images/`): a file changed there by
+  root on the node changes in every image that shares it. Nothing kith runs writes there: a container
+  sees its image read-only, or through an overlay that takes its writes. A file with any
+  extended attribute (a file capability, a label) is never shared.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A

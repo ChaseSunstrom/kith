@@ -5,6 +5,9 @@
 //! <root>/images/<manifest hex>/      one unpacked image
 //!     rootfs/                        shared read-only by its containers
 //!     config.json                    written last: its presence means "complete"
+//! <root>/shared/<hex>-<mode>-<uid>-<gid>-<mtime>
+//!                                    a file equal in all of these in several images: one
+//!                                    inode, which each of them and this name link to
 //! ```
 
 use crate::{Context, Result, err};
@@ -14,7 +17,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use std::fs::{self, File};
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,6 +130,7 @@ impl ImageStore {
             ("blobs/sha256", ".partial-"),
             ("images", ".unpacking-"),
             ("refs", ".ref-"),
+            (SHARED, ".shared-"),
         ] {
             for entry in fs::read_dir(root.join(dir)).into_iter().flatten().flatten() {
                 let name = entry.file_name();
@@ -144,6 +148,12 @@ impl ImageStore {
             local: None,
             own_timeouts: (OWN_CONNECT, OWN_READ),
         })
+    }
+
+    /// Removes the shared files no image links any more, and says how many. Waits for an
+    /// unpack that is sharing. (For the removal of unused images, T-0414.)
+    pub fn sweep_shared(&self) -> Result<usize> {
+        sweep(&self.root.join(SHARED)).ctx("sweeping the shared files")
     }
 
     /// Where the store remembers what `reference` resolved to.
@@ -304,7 +314,10 @@ impl ImageStore {
         if !dir.join("config.json").exists() {
             let staging = dir.with_extension(scratch_name("unpacking"));
             let target = dir.clone();
-            let unpacked = tokio::task::spawn_blocking(move || unpack_image(&layers, &staging, &target, Budget::IMAGE));
+            let index = self.root.join(SHARED);
+            let unpacked = tokio::task::spawn_blocking(move || {
+                unpack_image(&layers, &staging, &target, Some(&index), Budget::IMAGE)
+            });
             unpacked.await.ctx("unpacking")??;
         }
 
@@ -467,13 +480,24 @@ fn because(what: &str, e: std::io::Error) -> crate::Error {
 }
 
 /// Unpack `layers` in order into `staging`, then publish it as `target`.
-/// However it fails, `staging` does not stay behind.
-fn unpack_image(layers: &[(PathBuf, String)], staging: &Path, target: &Path, mut budget: Budget) -> Result<()> {
+/// However it fails, `staging` does not stay behind. With an `index`, the finished tree's
+/// files that other images hold too become one with theirs before it is published.
+fn unpack_image(
+    layers: &[(PathBuf, String)],
+    staging: &Path,
+    target: &Path,
+    index: Option<&Path>,
+    mut budget: Budget,
+) -> Result<()> {
     let _ = fs::remove_dir_all(staging);
     let unpacked = (|| {
         fs::create_dir_all(staging.join("rootfs")).ctx("unpacking")?;
         for (blob, media_type) in layers {
             unpack_layer_capped(blob, media_type, &staging.join("rootfs"), &mut budget)?;
+        }
+        // Once, over the whole tree: a file a later layer replaces was never worth sharing.
+        if let Some(index) = index {
+            share(&staging.join("rootfs"), index, |from, to| fs::hard_link(from, to));
         }
         // The marker that the image is complete, so it is written last.
         fs::write(staging.join("config.json"), "{}").ctx("unpacking")?;
@@ -485,6 +509,143 @@ fn unpack_image(layers: &[(PathBuf, String)], staging: &Path, target: &Path, mut
     })();
     let _ = fs::remove_dir_all(staging); // already renamed away when all went well
     unpacked
+}
+
+/// The store's index of shared files (see the module's head).
+const SHARED: &str = "shared";
+
+/// What, beside their bytes, two files must have alike to be one: the whole mode (setuid,
+/// setgid and sticky with it), owner, group, last change to the second's billionth, length.
+type Same = (u32, u32, u32, i64, i64, u64);
+
+fn same(meta: &fs::Metadata) -> Same {
+    let mode = meta.mode() & 0o7777;
+    (
+        mode,
+        meta.uid(),
+        meta.gid(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.len(),
+    )
+}
+
+/// A file's name in the index: its SHA-256 and all of [`Same`] but the length, which the
+/// hash holds.
+fn shared_name(hex: &str, (mode, uid, gid, secs, nanos, _): Same) -> String {
+    format!("{hex}-{mode:o}-{uid}-{gid}-{secs}.{nanos:09}")
+}
+
+/// The index's lock, held by an unpack while it shares and by the sweep: no entry is
+/// swept between an unpack finding it and linking to it.
+fn lock(index: &Path) -> std::io::Result<File> {
+    fs::create_dir_all(index)?;
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(index.join(".lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// How a hard link is made: `fs::hard_link`, but for tests of a link that fails.
+type Link = fn(&Path, &Path) -> std::io::Result<()>;
+
+/// Makes each regular file of the finished tree `rootfs` one inode with the equal file of
+/// other images, through `index`. Best effort: a file that cannot be (a link fails, there
+/// are too many, the index is elsewhere) stays as it was. Nothing is written into a file:
+/// a shared one is replaced whole, by a rename. A hard link shares the inode, so what
+/// changes one image's copy on disk changes every image's; nothing does (containers see an
+/// image read-only, or through an overlay), and the store is root's alone.
+fn share(rootfs: &Path, index: &Path, link: Link) {
+    let Ok(_held) = lock(index) else { return };
+    let mut buf = vec![0; 64 << 10];
+    let mut todo = vec![rootfs.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        // Read whole before any rename in it, so a name is seen once.
+        let entries: Vec<_> = fs::read_dir(&dir).into_iter().flatten().flatten().collect();
+        for entry in entries {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => todo.push(entry.path()),
+                Ok(kind) if kind.is_file() => share_one(&entry.path(), index, link, &mut buf),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn share_one(path: &Path, index: &Path, link: Link, buf: &mut [u8]) {
+    let Ok((ours, hex)) = fingerprint(path, buf) else {
+        return;
+    };
+    let entry = index.join(shared_name(&hex, same(&ours)));
+    match link(path, &entry) {
+        Ok(()) => return, // the first of its kind
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return,
+    }
+    let Ok(held) = fs::symlink_metadata(&entry) else { return };
+    if (held.dev(), held.ino()) == (ours.dev(), ours.ino()) {
+        return; // one already
+    }
+    // Checked, not trusted. An entry is only ever made by linking a finished file, so one
+    // whose length, mode, owner or time are not what its name says (cut short, written
+    // since) is not used. Its bytes are not read again: that cost a tenth of the unpack.
+    let plain = || {
+        matches!(
+            rustix::fs::llistxattr_query(&entry),
+            Ok(0) | Err(rustix::io::Errno::OPNOTSUPP)
+        )
+    };
+    let scratch = |dir: &Path| dir.join(format!(".{}", scratch_name("shared")));
+    let (from, scratch, to): (&Path, _, &Path) = match held.is_file() && same(&held) == same(&ours) && plain() {
+        true => (&entry, scratch(path.parent().unwrap_or(path)), path),
+        // Ours takes its place, for the images that come after.
+        false => (path, scratch(index), &*entry),
+    };
+    if link(from, &scratch).is_ok() && fs::rename(&scratch, to).is_err() {
+        let _ = fs::remove_file(&scratch);
+    }
+}
+
+/// A regular file's metadata and the SHA-256 of its bytes. An error for anything else, and
+/// for a file with an extended attribute (a file capability, a label): never shared.
+fn fingerprint(path: &Path, buf: &mut [u8]) -> std::io::Result<(fs::Metadata, String)> {
+    let flags = nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK;
+    let mut file = File::options().read(true).custom_flags(flags).open(path)?;
+    let meta = file.metadata()?;
+    match rustix::fs::flistxattr_query(&file) {
+        Ok(0) | Err(rustix::io::Errno::OPNOTSUPP) if meta.is_file() => {}
+        _ => return Err(std::io::Error::other("not a plain file")),
+    }
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    loop {
+        match file.read(buf)? {
+            0 => break,
+            n => hash.update(&buf[..n]),
+        }
+    }
+    let mut hex = String::with_capacity(64);
+    for b in hash.finish().as_ref() {
+        hex.push(char::from_digit(u32::from(b >> 4), 16).unwrap_or('0'));
+        hex.push(char::from_digit(u32::from(b & 15), 16).unwrap_or('0'));
+    }
+    Ok((meta, hex))
+}
+
+/// Removes the index's entries no image links any more; how many.
+fn sweep(index: &Path) -> std::io::Result<usize> {
+    let _held = lock(index)?;
+    let mut swept = 0;
+    for entry in fs::read_dir(index)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') && entry.metadata()?.nlink() == 1 {
+            fs::remove_file(entry.path())?;
+            swept += 1;
+        }
+    }
+    Ok(swept)
 }
 
 #[cfg(test)]
@@ -739,7 +900,7 @@ mod tests {
             (2 * size, 3, "more files than kith unpacks"),
         ];
         for (bytes, entries, message) in refused {
-            let e = unpack_image(&layers, &staging, &target, Budget { bytes, entries }).unwrap_err();
+            let e = unpack_image(&layers, &staging, &target, None, Budget { bytes, entries }).unwrap_err();
             assert!(e.to_string().contains(message), "{e}");
             assert!(!staging.exists() && !target.exists());
         }
@@ -747,7 +908,7 @@ mod tests {
             bytes: 2 * size,
             entries: 4,
         };
-        unpack_image(&layers, &staging, &target, enough).unwrap();
+        unpack_image(&layers, &staging, &target, None, enough).unwrap();
         assert!(!staging.exists() && target.join("config.json").exists() && target.join("rootfs/two").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1414,6 +1575,450 @@ mod tests {
         );
         assert!(reason.to_string().contains(&reference), "{reason}");
         drop(silent);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file of a finished tree, as unpacking leaves one.
+    fn put(root: &Path, path: &str, bytes: &str, mode: u32, mtime: u64) -> PathBuf {
+        let file = root.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, bytes).unwrap();
+        let opened = File::options().write(true).open(&file).unwrap();
+        opened
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(mtime))
+            .unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        file
+    }
+
+    fn ino(path: &Path) -> u64 {
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    fn links(path: &Path) -> u64 {
+        fs::symlink_metadata(path).unwrap().nlink()
+    }
+
+    /// What the index holds, but for its lock.
+    fn entries(index: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(index)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::hard_link(from, to)
+    }
+
+    /// Sets `name` on `file` as this process can: directly, or as root of a user namespace
+    /// of its own (a capability may be set on a file only by someone who could hold it).
+    fn set_xattr(file: &Path, name: &str, value: &[u8]) -> bool {
+        if rustix::fs::setxattr(file, name, value, rustix::fs::XattrFlags::empty()).is_ok() {
+            return true;
+        }
+        let hex: String = value.iter().map(|b| format!("{b:02x}")).collect();
+        std::process::Command::new("unshare")
+            .args(["-Ur", "setfattr", "-n", name, "-v"])
+            .arg(format!("0x{hex}"))
+            .arg(file)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Equal files of two images are one inode; a file that differs in anything that
+    /// matters, or that has an extended attribute, is its own; nothing's bytes or mode change.
+    #[test]
+    fn shared_files_are_one_where_everything_matches() {
+        let (dir, _) = sandbox("shared-same");
+        let (a, b, index) = (dir.join("a"), dir.join("b"), dir.join("shared"));
+        let both = [
+            ("bin/tool", "tool", 0o755, 100),
+            ("etc/conf", "conf", 0o644, 100),
+            ("empty", "", 0o644, 100),
+            ("setuid", "s", 0o4755, 100),
+            ("all-bits", "s", 0o7755, 100),
+        ];
+        for (path, bytes, mode, mtime) in both {
+            put(&a, path, bytes, mode, mtime);
+            put(&b, path, bytes, mode, mtime);
+        }
+        // The same within one image too.
+        put(&a, "bin/tool-too", "tool", 0o755, 100);
+        // One thing apart, each.
+        let apart = [
+            ("bytes", ("one", 0o644, 100), ("two", 0o644, 100)),
+            ("mode", ("m", 0o644, 100), ("m", 0o640, 100)),
+            ("setuid-bit", ("s", 0o4755, 100), ("s", 0o755, 100)),
+            ("setgid-bit", ("s", 0o2755, 100), ("s", 0o755, 100)),
+            ("sticky-bit", ("s", 0o1755, 100), ("s", 0o755, 100)),
+            ("changed", ("t", 0o644, 100), ("t", 0o644, 200)),
+        ];
+        for (path, (x, xm, xt), (y, ym, yt)) in apart {
+            put(&a, path, x, xm, xt);
+            put(&b, path, y, ym, yt);
+        }
+        // Equal in all of it, but for an extended attribute: never shared, not even with each other.
+        let mut capable = true;
+        for root in [&a, &b] {
+            assert!(set_xattr(&put(root, "user-x", "x", 0o644, 100), "user.x", b"1"));
+            // VFS_CAP_REVISION_2, effective, CAP_NET_RAW permitted.
+            let cap = [1, 0, 0, 2, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            capable &= set_xattr(&put(root, "capable", "c", 0o755, 100), "security.capability", &cap);
+        }
+        if !capable {
+            eprintln!("could not set security.capability here; user.x was tried");
+        }
+        fs::create_dir_all(a.join("dir")).unwrap();
+        std::os::unix::fs::symlink("bin/tool", a.join("link")).unwrap();
+        std::os::unix::fs::symlink("bin/tool", b.join("link")).unwrap();
+        let look = |root: &Path| -> Vec<_> {
+            let mut all = Vec::new();
+            for path in ["bin/tool", "etc/conf", "empty", "setuid", "all-bits", "bytes", "mode"] {
+                let meta = fs::symlink_metadata(root.join(path)).unwrap();
+                all.push((path, fs::read(root.join(path)).unwrap(), meta.mode(), meta.mtime()));
+            }
+            all
+        };
+        let before = (look(&a), look(&b));
+
+        share(&a, &index, hard_link);
+        share(&b, &index, hard_link);
+
+        assert_eq!((look(&a), look(&b)), before, "a shared file changed");
+        for (path, ..) in both {
+            assert_eq!(ino(&a.join(path)), ino(&b.join(path)), "{path} is two files");
+        }
+        assert_eq!(ino(&a.join("bin/tool")), ino(&a.join("bin/tool-too")));
+        assert_eq!(links(&a.join("bin/tool")), 4, "two images, one index entry");
+        for (path, ..) in apart {
+            assert_ne!(ino(&a.join(path)), ino(&b.join(path)), "{path} is one file");
+        }
+        for path in ["user-x", "capable"] {
+            assert_ne!(ino(&a.join(path)), ino(&b.join(path)), "{path} is one file");
+            assert_eq!(links(&a.join(path)), 1, "{path} went into the index");
+        }
+        assert!(a.join("link").is_symlink() && a.join("dir").is_dir());
+        // Two files apart in owner are two names in the index: their own files.
+        let differ = |uid, gid| shared_name("ab", (0o644, uid, gid, 100, 0, 1));
+        assert!(differ(0, 0) != differ(1, 0) && differ(0, 0) != differ(0, 1));
+        if nix::unistd::getuid().is_root() {
+            let (x, y) = (put(&a, "owner", "o", 0o644, 100), put(&b, "owner", "o", 0o644, 100));
+            std::os::unix::fs::chown(&y, Some(1), None).unwrap();
+            let (u, v) = (put(&a, "group", "g", 0o644, 100), put(&b, "group", "g", 0o644, 100));
+            std::os::unix::fs::chown(&v, None, Some(1)).unwrap();
+            share(&a, &index, hard_link);
+            share(&b, &index, hard_link);
+            assert!(ino(&x) != ino(&y) && ino(&u) != ino(&v));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link that cannot be made (too many links already, another file system) leaves the
+    /// file as it was, and nothing of the attempt behind.
+    #[test]
+    fn shared_files_stay_plain_where_no_link_can_be_made() {
+        fn too_many(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(nix::libc::EMLINK))
+        }
+        fn elsewhere(_: &Path, _: &Path) -> std::io::Result<()> {
+            Err(std::io::Error::from_raw_os_error(nix::libc::EXDEV))
+        }
+        /// Into the index, yes; out of it, no.
+        fn not_out(from: &Path, to: &Path) -> std::io::Result<()> {
+            match to
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            {
+                true => too_many(from, to),
+                false => fs::hard_link(from, to),
+            }
+        }
+        let (dir, _) = sandbox("shared-plain");
+        for (n, link) in [too_many as fn(&Path, &Path) -> _, elsewhere, not_out]
+            .into_iter()
+            .enumerate()
+        {
+            let (a, b, index) = (
+                dir.join(format!("a{n}")),
+                dir.join(format!("b{n}")),
+                dir.join(format!("i{n}")),
+            );
+            let files = [put(&a, "f", "same", 0o755, 1), put(&b, "f", "same", 0o755, 1)];
+            share(&a, &index, link);
+            share(&b, &index, link);
+            assert_ne!(ino(&files[0]), ino(&files[1]), "{n}");
+            for file in &files {
+                assert_eq!(fs::read_to_string(file).unwrap(), "same", "{n}");
+                assert_eq!(fs::symlink_metadata(file).unwrap().mode() & 0o7777, 0o755);
+            }
+            assert_eq!(
+                fs::read_dir(&b).unwrap().count(),
+                1,
+                "{n}: a scratch name was left behind"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Sharing runs on the finished tree: what a lower layer had and a later one replaced
+    /// never reaches the index, and an image unpacked later shares what is left.
+    #[test]
+    fn shared_files_are_shared_once_the_tree_is_finished() {
+        let (dir, _) = sandbox("shared-finished");
+        let index = dir.join("shared");
+        let lower = layer(&dir, "1.tar", &[E::File("a", "first"), E::File("b", "kept")]);
+        let upper = layer(&dir, "2.tar", &[E::File("a", "second")]);
+        let one = [(lower, TAR.to_string()), (upper, TAR.to_string())];
+        unpack_image(&one, &dir.join("s1"), &dir.join("one"), Some(&index), Budget::IMAGE).unwrap();
+        assert_eq!(entries(&index).len(), 2, "{:?}", entries(&index));
+        for name in entries(&index) {
+            assert_ne!(fs::read_to_string(index.join(name)).unwrap(), "first");
+        }
+        let again = layer(&dir, "3.tar", &[E::File("a", "second"), E::File("b", "kept")]);
+        let two = [(again, TAR.to_string())];
+        unpack_image(&two, &dir.join("s2"), &dir.join("two"), Some(&index), Budget::IMAGE).unwrap();
+        for file in ["rootfs/a", "rootfs/b"] {
+            assert_eq!(ino(&dir.join("one").join(file)), ino(&dir.join("two").join(file)));
+        }
+        assert_eq!(fs::read_to_string(dir.join("two/rootfs/a")).unwrap(), "second");
+        assert_eq!(entries(&index).len(), 2);
+        // Unpacked with no index, nothing is shared.
+        unpack_image(&two, &dir.join("s3"), &dir.join("three"), None, Budget::IMAGE).unwrap();
+        assert_eq!(links(&dir.join("three/rootfs/a")), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Removing an image leaves the other's files whole; the sweep then removes what only the
+    /// index still holds, and waits for an unpack that is sharing.
+    #[test]
+    fn shared_files_outlive_an_image_and_the_sweep_takes_what_is_left() {
+        let (dir, _) = sandbox("shared-sweep");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let index = dir.join("store/shared");
+        let images = dir.join("store/images");
+        let common = layer(
+            &dir,
+            "common.tar",
+            &[E::File("lib", "library"), E::File("etc", "settings")],
+        );
+        let own = layer(&dir, "own.tar", &[E::File("only-a", "mine")]);
+        let a = [(common.clone(), TAR.to_string()), (own, TAR.to_string())];
+        let b = [(common, TAR.to_string())];
+        unpack_image(&a, &images.join("sa"), &images.join("a"), Some(&index), Budget::IMAGE).unwrap();
+        unpack_image(&b, &images.join("sb"), &images.join("b"), Some(&index), Budget::IMAGE).unwrap();
+        assert_eq!(entries(&index).len(), 3);
+        assert_eq!(store.sweep_shared().unwrap(), 0, "the sweep took what images still use");
+
+        fs::remove_dir_all(images.join("a")).unwrap();
+        assert_eq!(fs::read_to_string(images.join("b/rootfs/lib")).unwrap(), "library");
+        assert_eq!(fs::read_to_string(images.join("b/rootfs/etc")).unwrap(), "settings");
+        assert_eq!(links(&images.join("b/rootfs/lib")), 2);
+        assert_eq!(store.sweep_shared().unwrap(), 1, "only-a's entry was kept");
+        assert_eq!(entries(&index).len(), 2);
+        assert_eq!(fs::read_to_string(images.join("b/rootfs/lib")).unwrap(), "library");
+
+        // The sweep waits for the lock an unpack holds while it shares.
+        let held = lock(&index).unwrap();
+        let sweeping = std::thread::spawn({
+            let index = index.clone();
+            move || sweep(&index)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!sweeping.is_finished(), "the sweep ran while an unpack was sharing");
+        drop(held);
+        assert_eq!(sweeping.join().unwrap().unwrap(), 0);
+
+        fs::remove_dir_all(images.join("b")).unwrap();
+        assert_eq!(store.sweep_shared().unwrap(), 2);
+        assert!(entries(&index).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two unpacks at once into one index, which an earlier stop left an entry in that nothing
+    /// links and one that is not whole: every file is whole, and equal files are one.
+    #[test]
+    fn shared_files_two_unpacks_at_once_and_stray_entries() {
+        let (dir, _) = sandbox("shared-at-once");
+        let index = dir.join("shared");
+        // What a stop left: the entry for `f0`, nothing else linking it; and `f1`'s, cut short.
+        let seed = dir.join("seed");
+        unpack_image(
+            &[(
+                layer(&dir, "seed.tar", &[E::File("f0", "file 0"), E::File("f1", "file 1")]),
+                TAR.to_string(),
+            )],
+            &dir.join("seed-staging"),
+            &seed,
+            Some(&index),
+            Budget::IMAGE,
+        )
+        .unwrap();
+        let stray = ino(&seed.join("rootfs/f0"));
+        let cut = index.join(
+            entries(&index)
+                .into_iter()
+                .find(|name| ino(&index.join(name)) == ino(&seed.join("rootfs/f1")))
+                .unwrap(),
+        );
+        fs::remove_dir_all(&seed).unwrap();
+        File::options().write(true).open(&cut).unwrap().set_len(3).unwrap();
+        let short = ino(&cut);
+
+        let bodies: Vec<String> = (0..300).map(|n| format!("file {}", n % 150)).collect();
+        let files: Vec<(String, &str)> = bodies
+            .iter()
+            .enumerate()
+            .map(|(n, b)| (format!("f{n}"), b.as_str()))
+            .collect();
+        let tar: Vec<E> = files.iter().map(|(name, body)| E::File(name, body)).collect();
+        let blob = layer(&dir, "many.tar", &tar);
+        let unpacks: Vec<_> = ["x", "y"]
+            .map(|name| {
+                let (blob, dir, index) = (blob.clone(), dir.clone(), index.clone());
+                std::thread::spawn(move || {
+                    let layers = [(blob, TAR.to_string())];
+                    let staging = dir.join(format!("staging-{name}"));
+                    unpack_image(&layers, &staging, &dir.join(name), Some(&index), Budget::IMAGE)
+                })
+            })
+            .into();
+        for unpack in unpacks {
+            unpack.join().unwrap().unwrap();
+        }
+        let (x, y) = (dir.join("x/rootfs"), dir.join("y/rootfs"));
+        for (name, body) in &files {
+            for root in [&x, &y] {
+                assert_eq!(&fs::read_to_string(root.join(name)).unwrap(), body, "{name}");
+            }
+        }
+        assert_eq!(ino(&x.join("f0")), stray, "the stray entry was not used");
+        assert_eq!(ino(&y.join("f150")), stray);
+        for root in [&x, &y] {
+            assert_ne!(ino(&root.join("f1")), short, "linked to an entry cut short");
+        }
+        // The first unpack's whole file took its place, and the rest share it.
+        assert_eq!(fs::read_to_string(&cut).unwrap(), "file 1");
+        for n in 1..150 {
+            let one = ino(&x.join(format!("f{n}")));
+            for other in [
+                x.join(format!("f{}", n + 150)),
+                y.join(format!("f{n}")),
+                y.join(format!("f{}", n + 150)),
+            ] {
+                assert_eq!(ino(&other), one, "f{n}");
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// T-0175's trial, on this machine: three images of one base, unpacked as they would be
+    /// with and without sharing. Prints the disk they take (each inode counted once), the
+    /// middle of three unpack times, and the machine's load; fails if the disk falls by less
+    /// than a tenth. Pulls from mirror.gcr.io; nothing else is asked.
+    #[tokio::test]
+    async fn shared_files_measured() {
+        if std::env::var_os("KITH_E2E").is_none() {
+            eprintln!("skipped: set KITH_E2E=1 to run");
+            return;
+        }
+        let references = [
+            "mirror.gcr.io/library/nginx:1.27-alpine",
+            "mirror.gcr.io/library/nginx:1.27-alpine-perl",
+            "mirror.gcr.io/library/nginx:1.27-alpine-otel",
+        ];
+        let (dir, _) = sandbox("shared-measured");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let client = Client::try_from(ClientConfig::default()).unwrap();
+        let mut images = Vec::new();
+        for reference in references {
+            store.pull(reference, PullPolicy::Always).await.unwrap();
+            let (manifest, _) = client
+                .pull_image_manifest(&reference.parse().unwrap(), &RegistryAuth::Anonymous)
+                .await
+                .unwrap();
+            let layers: Vec<(PathBuf, String)> = manifest
+                .layers
+                .iter()
+                .map(|l| {
+                    (
+                        dir.join("store/blobs/sha256").join(sha256_hex(&l.digest).unwrap()),
+                        l.media_type.clone(),
+                    )
+                })
+                .collect();
+            images.push(layers);
+        }
+        let load = || {
+            fs::read_to_string("/proc/loadavg")
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        eprintln!(
+            "load before: {} ({} cores)",
+            load(),
+            std::thread::available_parallelism().map_or(0, |n| n.get())
+        );
+        let mut times: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+        let mut disk = [0u64; 2];
+        // Taken in turns, so a change in the machine's load falls on both alike.
+        for round in 0..3 {
+            for (shared, time) in times.iter_mut().enumerate() {
+                let at = dir.join(format!("run-{round}-{shared}"));
+                let index = at.join("shared");
+                let started = std::time::Instant::now();
+                for (n, layers) in images.iter().enumerate() {
+                    let target = at.join(format!("image-{n}"));
+                    let staging = at.join(format!("staging-{n}"));
+                    unpack_image(
+                        layers,
+                        &staging,
+                        &target,
+                        (shared == 1).then_some(&*index),
+                        Budget::IMAGE,
+                    )
+                    .unwrap();
+                }
+                time.push(started.elapsed());
+                let mut seen = std::collections::HashSet::new();
+                let mut bytes = 0;
+                let mut todo = vec![at.clone()];
+                while let Some(path) = todo.pop() {
+                    let meta = fs::symlink_metadata(&path).unwrap();
+                    if seen.insert((meta.dev(), meta.ino())) {
+                        bytes += meta.blocks() * 512;
+                    }
+                    if meta.is_dir() {
+                        todo.extend(fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                    }
+                }
+                disk[shared] = bytes;
+                fs::remove_dir_all(&at).unwrap();
+            }
+        }
+        eprintln!("load after: {}", load());
+        for time in &mut times {
+            time.sort();
+        }
+        let (before, after) = (times[0][1], times[1][1]);
+        let mb = |bytes: u64| bytes as f64 / 1e6;
+        eprintln!(
+            "disk: {:.1} MB -> {:.1} MB ({:+.1}%)",
+            mb(disk[0]),
+            mb(disk[1]),
+            100.0 * (disk[1] as f64 / disk[0] as f64 - 1.0)
+        );
+        eprintln!(
+            "unpack, middle of three: {before:?} -> {after:?} ({:+.1}%); all: {:?}",
+            100.0 * (after.as_secs_f64() / before.as_secs_f64() - 1.0),
+            times
+        );
+        assert!(disk[1] * 10 <= disk[0] * 9, "the disk fell by less than a tenth");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
