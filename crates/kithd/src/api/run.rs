@@ -8,7 +8,8 @@
 //! with those labels. The first node checks the caller (it may `exec` on `Node`, a
 //! rule for the whole cluster), writes the audit entry and, when the app is to run elsewhere, passes
 //! the tunnel to that node's `run-hop` over the cluster's mutual TLS: the hop is for
-//! members only, so a client token cannot call it and skip the check. The node that runs
+//! members only, so a client token cannot call it and skip the check, and the node it
+//! arrives at asks its own store whether the caller the first node names may. The node that runs
 //! the app starts `VIA --socket S server -- ARGV…` (VIA is `waypipe` unless said) with S
 //! in a private directory, and joins S to the tunnel; the `kith` command runs
 //! `VIA --socket L client` on its side. `argv` is an array end to end, never a shell line.
@@ -225,7 +226,7 @@ pub async fn hop(
     ConnectInfo(peer): ConnectInfo<Peer>,
     request: Request,
 ) -> Response {
-    let Some(Subject::Node(from)) = peer.subject else {
+    let Some(Subject::Node(from, ..)) = peer.subject else {
         return say(StatusCode::FORBIDDEN, "this is for the cluster's nodes");
     };
     let (spec, upgrade) = match take(request).await {
@@ -237,9 +238,16 @@ pub async fn hop(
         .as_ref()
         .map_or("local", |c| c.me.name.as_str())
         .to_string();
-    // The first node checked the caller; this one takes a member's word for who that was, and
-    // runs what it is asked: a node of the cluster can run anything on any other.
-    let who = format!("{} via node {from}", spec.caller);
+    // The first node checked the caller, and so does this one, in its own store: it takes a
+    // node's word for who asked, not for what they may do.
+    let Some(who) = Caller::named(&spec.caller) else {
+        let why = format!("caller: {:?} is no caller a node passes on", spec.caller);
+        return say(StatusCode::BAD_REQUEST, why);
+    };
+    let who = Caller::Via(from, Box::new(who));
+    if let Err(refused) = permit(&shared, &who, Verb::Exec, |_| vec![("Node".into(), None)]) {
+        return refused.into_response();
+    }
     start(&shared, &who, &me, spec, upgrade)
 }
 
@@ -428,7 +436,8 @@ sys.exit(subprocess.run(args[4:], stdin=s, stdout=s).returncode)
     }
 
     /// Two kithds in this process, `a` and `b`, each serving the node API on a loopback
-    /// port with its own certificate from one CA. Only `a` has Identities and Nodes.
+    /// port with its own certificate from one CA. Both have the Identities, Roles and Nodes,
+    /// as two nodes of one store do.
     struct World {
         a: Arc<Shared>,
         b: Arc<Shared>,
@@ -496,11 +505,12 @@ spec: {role: other-jobber, subjects: [carol]}
             };
             world.node("a", "", Some(a_port));
             world.node("b", "role: display", Some(b_port));
-            let mut state = world.a.store.lock().unwrap();
-            for resource in kith_api::Resource::from_source(ROLES).unwrap() {
-                state.store.apply(resource.unwrap()).unwrap();
+            for shared in [&world.a, &world.b] {
+                let mut state = shared.store.lock().unwrap();
+                for resource in kith_api::Resource::from_source(ROLES).unwrap() {
+                    state.store.apply(resource.unwrap()).unwrap();
+                }
             }
-            drop(state);
             world
         }
 
@@ -510,13 +520,20 @@ spec: {role: other-jobber, subjects: [carol]}
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}, labels: {{{labels}}}}}\nspec: {{}}\n"
             );
             let resource = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            // (With a `raftId`, as a node that joined has: one without is let in nowhere.)
             let status = match port {
-                Some(port) => json!({"address": format!("127.0.0.1:{port}"), "state": "ready"}),
-                None => json!({"address": "127.0.0.1:1", "state": "unreachable"}),
+                Some(port) => json!({"address": format!("127.0.0.1:{port}"), "state": "ready", "raftId": "1"}),
+                None => json!({"address": "127.0.0.1:1", "state": "unreachable", "raftId": "1"}),
             };
-            let mut state = self.a.store.lock().unwrap();
-            state.store.apply(resource).unwrap();
-            state.store.set_status(&format!("Node/{name}"), Some(status)).unwrap();
+            // Both nodes have the store: the one asked looks the asking node up in its own.
+            for shared in [&self.a, &self.b] {
+                let mut state = shared.store.lock().unwrap();
+                state.store.apply(resource.clone()).unwrap();
+                state
+                    .store
+                    .set_status(&format!("Node/{name}"), Some(status.clone()))
+                    .unwrap();
+            }
         }
 
         /// A client that shows the certificate of the Identity `name` (made now, on `a`).
@@ -526,8 +543,10 @@ spec: {role: other-jobber, subjects: [carol]}
                 "apiVersion": kith_api::API_VERSION, "kind": "Identity",
                 "metadata": {"name": name}, "spec": {"publicKey": public},
             });
-            let identity = serde_json::from_value(identity).unwrap();
-            self.a.store.lock().unwrap().store.apply(identity).unwrap();
+            let identity: kith_api::Resource = serde_json::from_value(identity).unwrap();
+            for shared in [&self.a, &self.b] {
+                shared.store.lock().unwrap().store.apply(identity.clone()).unwrap();
+            }
             let me = Identity {
                 name: name.into(),
                 ca: self.ca.cert.clone(),
@@ -700,6 +719,143 @@ spec: {role: other-jobber, subjects: [carol]}
         let spec = json!({"on": "a", "via": stand_in(), "argv": ["true"], "caller": "root"});
         let (status, _) = tunnel(&alice, world.a_port, "/v1/run-hop", spec).await.unwrap_err();
         assert_eq!(status, 403);
+    }
+
+    /// The node a hop arrives at asks its own store whether the one the first node names may:
+    /// a node's word is taken for who asked, not for what they may do.
+    #[tokio::test]
+    async fn hop_checks_the_named_caller_on_the_node_it_arrives_at() {
+        let world = World::new("hop-checks").await;
+        world.user("alice");
+        world.user("bob");
+        let a = world.a.cluster.as_ref().unwrap().client.clone();
+        let ask = |caller: &'static str| {
+            let spec = json!({"on": "b", "via": "/nonexistent/waypipe", "argv": ["true"], "caller": caller});
+            let (a, port) = (a.clone(), world.b_port);
+            async move { tunnel(&a, port, "/v1/run-hop", spec).await.unwrap_err() }
+        };
+        let (status, why) = ask("bob").await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.contains("bob via node a may not exec Node"), "{why}");
+        // No Identity of the store: no right either.
+        assert_eq!(ask("mallory").await.0, 403);
+        // A node, someone a node was itself passed, or nobody: not a caller a hop is for.
+        for caller in ["node a", "alice via node b", ""] {
+            assert_eq!(ask(caller).await.0, 400, "{caller:?}");
+        }
+        let ran = world.b.audit.tail(10).unwrap();
+        assert!(ran.iter().all(|entry| entry["ok"] == false), "{ran:?}");
+        assert_eq!(ran[0]["who"], "bob via node a");
+        // Who may: the hop goes on to the program (which is not there).
+        assert_eq!(ask("alice").await.0, 422);
+        assert_eq!(ask("local socket").await.0, 422);
+    }
+
+    /// A worker's word for who asked is not taken, on the hop or on what nodes pass on, and
+    /// its Raft messages are refused: whatever caller it names, the socket even.
+    #[tokio::test]
+    async fn hop_forged_by_a_worker_is_refused_whoever_it_names() {
+        let world = World::new("hop-forged").await;
+        let a = world.a.cluster.as_ref().unwrap().client.clone();
+        let hop = || {
+            let spec = json!({"on": "b", "via": "/nonexistent/waypipe", "argv": ["true"], "caller": "local socket"});
+            let (a, port) = (a.clone(), world.b_port);
+            async move { tunnel(&a, port, "/v1/run-hop", spec).await.unwrap_err() }
+        };
+        let ask = |method: reqwest::Method, path: &str| {
+            let url = format!("https://127.0.0.1:{}{path}", world.b_port);
+            let ask = a.request(method, url).header(crate::access::FOR, "local socket");
+            async move {
+                let reply = ask.send().await.unwrap();
+                let status = reply.status().as_u16();
+                let said: serde_json::Value = reply.json().await.unwrap_or_default();
+                (status, said["error"].as_str().unwrap_or_default().to_string())
+            }
+        };
+        let logs = "/v1/logs/Workload/default/web";
+        // A control node, as every node is unless said: the socket's rights where it arrives.
+        assert_eq!(hop().await.0, 422);
+        assert_eq!(ask(reqwest::Method::GET, logs).await.0, 404);
+        // b's store says a is a worker (a's own store does not count).
+        let trust = |trust: &str| {
+            let text =
+                format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: a}}\nspec: {{trust: {trust}}}\n");
+            let node = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            world.b.store.lock().unwrap().store.apply(node).unwrap();
+        };
+        trust("worker");
+        let (status, why) = hop().await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.contains("node a is a worker"), "{why}");
+        let (status, why) = ask(reqwest::Method::GET, logs).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(
+            why.contains("its word for who asked is not taken: ask a control node"),
+            "{why}"
+        );
+        // Raft's messages are taken from a worker only while it still votes in b's membership
+        // (it hands the vote over itself); the hop above is refused either way.
+        for message in ["append", "vote", "snapshot"] {
+            let (status, why) = ask(reqwest::Method::POST, &format!("/v1/raft/{message}")).await;
+            assert_eq!(status, 403, "{message}: {why}");
+            assert!(why.contains("only a control node sends this"), "{why}");
+        }
+        let ids = [world.b.raft.metrics().borrow().id, kith_store::node_id("a")];
+        let voters = ids.map(|id| (id, kith_store::openraft::BasicNode::new("")));
+        world
+            .b
+            .raft
+            .initialize(std::collections::BTreeMap::from(voters))
+            .await
+            .unwrap();
+        assert_ne!(ask(reqwest::Method::POST, "/v1/raft/vote").await.0, 403);
+        assert_eq!(hop().await.0, 403);
+        // What every node sends is still taken from it.
+        assert_ne!(ask(reqwest::Method::POST, "/v1/raft/write").await.0, 403);
+        // Nothing ran, and it is written down.
+        let entries = world.b.audit.tail(20).unwrap();
+        assert!(
+            entries.iter().any(|e| e["ok"] == false && e["who"] == "node a"),
+            "{entries:?}"
+        );
+        trust("control");
+        assert_eq!(hop().await.0, 422);
+    }
+
+    /// Who asked is a node's to say, on what nodes pass on: an Identity that names the local
+    /// socket is still itself, and a node that names nobody is given nothing.
+    #[tokio::test]
+    async fn who_asked_is_read_from_a_node_only_and_checked_where_it_arrives() {
+        let world = World::new("named").await;
+        let alice = world.user("alice");
+        let a = world.a.cluster.as_ref().unwrap().client.clone();
+        let ask = |client: &reqwest::Client, named: Option<&'static str>| {
+            let url = format!("https://127.0.0.1:{}/v1/logs/Workload/default/web", world.b_port);
+            let ask = client.get(url);
+            let ask = named
+                .into_iter()
+                .fold(ask, |ask, named| ask.header(crate::access::FOR, named));
+            async move {
+                let reply = ask.send().await.unwrap();
+                let status = reply.status().as_u16();
+                let said: serde_json::Value = reply.json().await.unwrap_or_default();
+                (status, said["error"].as_str().unwrap_or_default().to_string())
+            }
+        };
+        let (status, why) = ask(&alice, Some("local socket")).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.starts_with("alice may not get Workload"), "{why}");
+        // From a node: she is asked for by name, and has no more right for it.
+        let (status, why) = ask(&a, Some("alice")).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.starts_with("alice via node a may not get Workload"), "{why}");
+        // Nobody named: nothing on the node's own word.
+        let (status, why) = ask(&a, None).await;
+        assert_eq!(status, 400, "{why}");
+        assert!(why.contains("without saying who asked"), "{why}");
+        // The socket named: let through to the handler (there is no such Workload).
+        let (status, why) = ask(&a, Some("local socket")).await;
+        assert_eq!(status, 404, "{why}");
     }
 
     #[tokio::test]

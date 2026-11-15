@@ -478,7 +478,11 @@ kith node status                                   # who leads the store, who vo
   two nodes (also after one of three is deleted) only one votes, because two
   voters would stop when either one did; losing it stops changes until it is
   back. A node starts to vote only once it has received the store.
-- `kith delete node/NAME` takes a node out of the store's members.
+- `kith delete node/NAME` takes a node out of the store's members. From the next
+  request on, the other nodes refuse its certificate (`401`, on the API and between
+  nodes) and drop it from the mesh, with nothing restarted. To have the machine back,
+  join it again with a new token: it gets a new certificate, and the old one stays
+  refused. What that node already copied it still has: see SECURITY.md.
 - Every node tells every other one, every two seconds, which nodes it has
   heard from (none of this goes through the store). A node nobody has heard
   from for ten seconds shows as `unreachable` in `kith get node`, and as
@@ -568,6 +572,74 @@ kith node status                                   # who leads the store, who vo
   `unreachable`. The tunnels are WireGuard between the two nodes' own keys,
   which never leave them, and what goes through them between kithds is TLS
   with the cluster's certificates as well.
+- A node is a control node unless it is said to be a worker, and a worker is trusted
+  with less. Join one as a worker with a token that says so, or say it on a Node that
+  is there:
+
+  ```sh
+  kith node token --worker        # on alpha: the node this token lets in is a worker
+  ```
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Node
+  metadata: { name: gamma }
+  spec: { trust: worker }         # or `control`, which is what a Node without it is
+  ```
+
+  The token's maker says it, not the machine that joins. A worker never votes on the
+  store however much of it it has, and the other nodes take none of Raft's messages
+  from it. A node that votes or leads and is then made a worker hands its vote to a
+  control node by itself, and is followed until it has (seconds); to cut a node off
+  at once, delete its Node. The nodes do not take a worker's word for who asked:
+  `kith logs`, `kith volume put` and `get`, `kith node passphrase`, a backup's restore and `kith run`
+  asked of a worker for something on another node are refused (`node NAME is a
+  worker: its word for who asked is not taken: ask a control node`; for `kith run`,
+  `only a control node sends this`). Ask a control node, or the node that has the
+  thing. To keep something off workers:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Workload
+  metadata: { name: signer }
+  spec:
+    placement: { require: { kith.dev/trust: control } }   # `worker` is the other value
+    template:
+      containers:
+        - name: signer
+          image: registry.example.org/signer:1
+  ---
+  apiVersion: kith.dev/v1
+  kind: Secret
+  metadata: { name: signing-key }
+  spec:
+    trust: control                # given to units on control nodes only
+    data: { key: the-key-as-text }
+  ```
+
+  `kith.dev/trust` is a label every node has for the scheduler, made from its
+  `spec.trust` whatever its own labels say; a `NodeWorkload`'s `selector` takes it
+  too. A Workload, Job or NodeWorkload that names a Secret with `trust: control` is
+  placed on control nodes only (one that fits on none says `missing required
+  labels`), and a worker's kithd gives such a Secret to nothing, whoever placed it
+  there: `Secret/NAMESPACE/NAME is for control nodes (trust: control), and this node
+  is a worker`. That covers a Secret a unit is given in `env`, `envFrom` or as files,
+  and not what kithd reads for itself: a Backup's S3 Secret, an ingress host's
+  `tls-` Secret and the ACME account are read by whichever node does that work.
+  `kith apply`, `kith delete` and `kith rollback` refuse two changes: making the node
+  that holds the CA key (the one the cluster was started on) a worker, and one that
+  would leave only workers. A `Release`, a `Source` and a controller are not held to
+  that, nor are two changes made at once through two nodes; if only workers come
+  about, the nodes that vote go on voting, and making one a control node again puts
+  it right. With fewer than three control nodes one node votes, as in a cluster of
+  fewer than three nodes.
+
+  What a worker is **not** yet: it still keeps the whole store, every Secret in it,
+  and the node that leads still writes what a worker sends it to write. So today
+  `trust: worker` narrows what a worker is asked to run and whose word is taken, not
+  what a worker that is taken can read or change; see SECURITY.md, "A node that is
+  taken". Say `trust` only once every node runs a kithd that knows it: an older kithd
+  does not read a Node or a Secret that has it.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers
@@ -697,7 +769,8 @@ that moves to another address has to be deleted and joined again.
 Only the first node can admit others, tokens do not survive its restart (and
 `--token` shows in the process list until then: `KITH_TOKEN` does not), a join
 that dies halfway needs `kith delete node/NAME` and a new token,
-certificates last ten years and cannot be renewed or revoked, and `kith` itself
+certificates last ten years and cannot be renewed (a node's stops being taken when its Node is deleted,
+an Identity's when the Identity is), and `kith` itself
 only talks to the kithd on its own machine.
 
 ## DNS
@@ -1517,6 +1590,19 @@ spec:
   it holds together.
 - `kith get deviceclaim render -o yaml` shows `status.node`, `status.devices` and
   `status.holders`; a claim that comes to nothing has a `status.message` instead.
+- **A share of a GPU's vram.** A `shared` claim may say `share: { vram: 512Mi }`: what it
+  asks for of each Device it holds, counted against the Device's `vram` label (a node writes
+  it from the card's total vram). A workload's shares add up; a share that does not fit
+  waits, and its message gives the numbers (`has 0 of its 1073741824 vram bytes free, and
+  the share asks for 536870912`). `status.share` gives each Device's `asked` and `of`, and
+  `status.shareBytes` the share the claim was admitted with; a Device with no `vram` label
+  it can read admits the share and says `counted: false`. A holder keeps its share when the
+  label drops below what they ask, but a claim that asks for more than it held is fitted
+  again. **Nothing enforces a
+  share: it is cooperative.** kith counts it and does not stop an app that uses more vram
+  than it asked for. No driver is held to it by kith yet. Untried options: a driver's own
+  memory limit where the driver has one (the kernel's `dmem` cgroup controller), NVIDIA's
+  MPS limits, and MIG partitions, which would be Devices of their own.
 - A container is given the device nodes of its Devices in its own `/dev`, beside the few
   every container has (`null`, `zero`, `full`, `random`, `urandom`, `tty`). A GPU brings its render
   node (`/dev/dri/renderD*`) with its card, and a card on NVIDIA's driver its `nodes`; a
@@ -2194,8 +2280,10 @@ by name, that has them. `--via` names the program that carries the window (defau
   `kinds: [Node]` and no `namespaces` (`admin` has it). The app runs as kithd's user on
   the node, outside any container, so a right in one namespace is never enough. It is
   checked on the node you ask, before anything starts or is forwarded. The other node
-  accepts the hop only from a cluster node, never from a client token, and writes its own
-  audit entry (`GET /v1/audit`) with the name of the caller who asked.
+  accepts the hop only from a cluster node, never from a client token, asks its own
+  store whether the caller that node names may, and writes its own audit entry
+  (`GET /v1/audit`) with both names (`alice via node a`). It takes the first node's word
+  for who asked (see SECURITY.md).
 - **How:** the `kith` command asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app
   there with `waypipe --socket S server -- APP…`, S in a private (0700) directory with a name
   nobody can guess, and joins it to the tunnel; `kith` runs `waypipe --socket L client` and
@@ -2405,6 +2493,18 @@ A node's copy of the cluster's resources is two files in its state,
 Not numbered yet: what nodes say to each other (a snapshot one node sends
 another is written down by the node that takes it, in its own format), and
 the other files in a node's state (its keys, blobs and volumes).
+
+One thing nodes say to each other changed after 1.0: a node that passes a request on to
+the node that has the thing (`kith logs` of a replica elsewhere, `kith volume put` and
+`get`, `kith node passphrase`, a backup's restore) now says who asked, and a node that
+is told nothing refuses with `node NAME passed this on without saying who asked: its
+kithd is older than this node's`. So while a cluster is half way through such an
+update, ask the node that has the thing, or wait until both run the new kithd. Nothing
+else between nodes is affected: the store, the mesh, Services and `kith run` go on.
+
+A field a newer kithd takes is not known to an older one, which reads a resource that
+has it as one it cannot read: say `trust` on a Node or a Secret (and any field newer
+than the oldest kithd in the cluster) once every node runs the kithd that knows it.
 
 ### Rolling a release through the cluster
 

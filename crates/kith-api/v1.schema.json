@@ -1708,6 +1708,17 @@
             }
           ],
           "description": "`exclusive` where unsaid. `client` is of a seat: beside whoever holds it, with\nthe seat's directory (`/run/seat`, where its session puts its sockets) to read\nand its GPUs' render nodes, and none of its devices."
+        },
+        "share": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceShare"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "With `access: shared`: the vram the claim asks for on each Device it holds, which the\nscheduler counts against the Device's `vram` label. Nothing enforces it (see the README)."
         }
       },
       "description": "Exactly one of `seat` or `device`, or a `selector` over device labels."
@@ -1723,6 +1734,19 @@
         "camera",
         "other"
       ]
+    },
+    "DeviceShare": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "vram": {
+          "$ref": "#/$defs/Quantity"
+        }
+      },
+      "required": [
+        "vram"
+      ],
+      "description": "`{ vram: 512Mi }`: what a shared claim asks for of a Device's vram."
     },
     "DeviceSpec": {
       "type": "object",
@@ -2629,6 +2653,17 @@
           ],
           "description": "It comes and goes (a laptop): it does not start to vote, peers reach it wherever\nit last called from (they keep no address for it: it calls them), and what it runs\nis never started elsewhere, however long it is away. Take this off a node that is\ngone for good, or delete the node."
         },
+        "trust": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Trust"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How far the node is trusted: `control` (the default) may vote on the store and\nits word for who asked is taken by the others; a `worker` never votes, is not\nfollowed as a leader, and gets nothing that asks for control nodes."
+        },
         "mesh": {
           "anyOf": [
             {
@@ -3206,6 +3241,17 @@
           "additionalProperties": {
             "type": "string"
           }
+        },
+        "trust": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Trust"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "`control`: given to units on control nodes only, and what names it is placed\non those."
         }
       },
       "description": "Kept in the store as it is given: on a node's disk it is as safe as the node's state."
@@ -3551,6 +3597,13 @@
         }
       },
       "description": "The units one replica runs: containers, exec units and virtual machines."
+    },
+    "Trust": {
+      "type": "string",
+      "enum": [
+        "control",
+        "worker"
+      ]
     },
     "UpdatePlanSpec": {
       "type": "object",

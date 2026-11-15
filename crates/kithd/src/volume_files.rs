@@ -348,7 +348,7 @@ fn held(shared: &Shared, caller: &Caller, namespace: &str, name: &str) -> Result
     let dir = crate::volumes::dir(&state.store, namespace, name);
     let dir = dir.ok_or(ApiError::Store(Error::NotFound(key)))?;
     // (Asked by a node, it was sent here as the node that has it: never sent on again.)
-    if matches!(caller, Caller::Node(_)) && dir.node != shared.members.me() {
+    if caller.node().is_some() && dir.node != shared.members.me() {
         return Err(invalid(format!("node {} has that volume, not this node", dir.node)));
     }
     let bound = crate::volumes::size(&state.store, namespace, name).unwrap_or(u64::MAX);
@@ -361,6 +361,7 @@ fn held(shared: &Shared, caller: &Caller, namespace: &str, name: &str) -> Result
 /// the caller: its answer if it is a yes, why not otherwise.
 async fn elsewhere(
     shared: &Shared,
+    caller: &Caller,
     dir: &Dir,
     address: Option<String>,
     body: Option<Body>,
@@ -377,6 +378,8 @@ async fn elsewhere(
         None => cluster.client.get(url),
     };
     let failed = |e: reqwest::Error| format!("asking node {}: {e}", dir.node);
+    // (For whoever asked this node: the node that has the Volume asks what they may.)
+    let asked = asked.header(crate::access::FOR, caller.to_string());
     let answer = asked.send().await.map_err(failed)?;
     let status = answer.status();
     if status.is_success() {
@@ -399,7 +402,7 @@ pub async fn put(
     let done = if dir.node == shared.members.me() {
         here(&shared, dir, bound, body).await
     } else {
-        match elsewhere(&shared, &dir, address, Some(body)).await {
+        match elsewhere(&shared, &caller, &dir, address, Some(body)).await {
             Ok(answer) => answer.json().await.map_err(|e| e.to_string()),
             Err(why) => Err(why),
         }
@@ -464,7 +467,7 @@ pub async fn get(
     let started = if dir.node == shared.members.me() {
         out(&shared, &dir)
     } else {
-        elsewhere(&shared, &dir, address, None).await.map(|answer| {
+        elsewhere(&shared, &caller, &dir, address, None).await.map(|answer| {
             let chunks = futures_util::stream::unfold(answer, |mut answer| async move {
                 answer.chunk().await.transpose().map(|chunk| (chunk, answer))
             });

@@ -19,7 +19,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | Who | How kith knows them | What they can do |
 | --- | --- | --- |
 | The admin of a node | Whoever can open kithd's unix socket (mode 0600, kithd's user) | Everything in the cluster |
-| A node | A certificate of the cluster's CA for `NAME.node.kith` | Everything in the cluster: nodes replicate the whole store, Secrets included, and run what they are told. **Every node is trusted as much as the admin.** |
+| A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | Everything in the cluster: nodes replicate the whole store, Secrets included, and run what they are told. **Every node is trusted as much as the admin.** |
 | An Identity | A certificate for `NAME.user.kith` whose key is the one in its `Identity` | What its Roles say, by kind, verb and namespace |
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
@@ -37,8 +37,22 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
+- **A node's certificate has no right of its own on the API**: it reads nothing and
+  writes nothing there. What a node does there is pass on what someone asked it, to the
+  node that has the thing: a unit's output, a Volume's files, a node's passphrase, a
+  backup's restore. It names who asked (a header, `x-kith-for`), and the node that gets
+  the request asks its own store what that caller may do, and writes both in its audit
+  log (`alice via node a`). The header is read on those four requests and from a node
+  only: sent by an Identity, or anywhere else, it changes nothing. `kith run` is passed
+  to the node the app is for on the node-to-node routes, with who asked in the request,
+  and checked the same way there.
+  **A control node's word for who asked is taken**: one that is taken can name the local
+  socket, so this narrows nothing for it. A worker's word (`spec.trust: worker` on its
+  Node) is not taken: what it passes on is refused whoever it names (see "A node that
+  is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
-  command on another node) take a node's certificate only.
+  command on another node) take a node's certificate only, and, like the API, only
+  while that node's Node is in the store: each request is asked again.
 - **What a node fetches or sends for someone who is not the admin** (a Source's
   repository, a package pushed to a registry, a `DNSBlockList`'s `url`) goes only to
   addresses that are not this node's own or on its networks, each redirect and each place a registry sends an upload
@@ -210,9 +224,74 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   registry yet. A signature is checked against keys only: no certificate, no
   transparency log, so a signing key that leaks signs until it is taken out of every
   template.
-- **A node that is taken is the cluster taken.** It has the whole store. Certificates
-  last ten years and cannot be revoked: deleting a node does not make its certificate
-  stop working on the node-to-node routes. Take its disk, or make a new cluster.
+- **A node that is taken is the cluster taken, until its Node is deleted.** It has the
+  whole store, every Secret in it, and a node's rights. `kith delete node/NAME` ends
+  what it can ask for: each node looks a node certificate's name up in its own copy of
+  the store at every request, on the API and on the node-to-node routes, and refuses
+  one whose Node is gone, was only made by hand (it never joined), or names another
+  key (the name joined again); the mesh drops its key in the same moment. What that
+  does not undo:
+  - Until its Node is deleted it can do everything: it can name the local socket as the
+    one who asked on what nodes pass on to each other, and the node that leads writes to
+    the store whatever a node of the cluster sends it to write, unasked.
+  - **A worker that is taken is, today, still the cluster taken.** A node whose Node
+    says `spec.trust: worker` (said by whoever made its join token, `kith node token
+    --worker`, or by whoever may apply a Node; the machine that joins does not say it)
+    never votes on the store, is refused Raft's own messages by the other nodes (so it
+    cannot lead, or send them a store; a node that is behind, or has not heard of its
+    Node, still takes them, as from a deleted node, below; and one that voted when it
+    was made a worker is followed until it has handed its vote over, which a taken
+    one need not do: delete its Node), is refused `kith run`'s hop and what nodes pass
+    on to each other whoever it names, is given no Secret that says `trust: control`
+    by its own kithd, and has nothing placed on it that asks for control nodes. It was
+    never handed the CA key: only the node the cluster started on has it, and that
+    node is refused `trust: worker` by `kith apply`, `delete` and `rollback` (a
+    courtesy against a slip: a `Release`, a `Source`, a controller or a node's own
+    write is not held to it, and that the node has the key is its own word in its
+    Node's status). `trust: control` on a Secret covers what a unit is given, not a
+    Backup's S3 Secret, an ingress `tls-` Secret or the ACME account, which the node
+    doing that work reads. What a worker still has is the whole store with
+    every Secret in it (those that say `trust: control` too: the rule is its own
+    kithd's, and a taken node does not run its own kithd), and the write: the node
+    that leads writes what a worker sends it as it does a control node's, its own
+    Node's `trust` and a Workload for a control node included. So `trust: worker`
+    lowers what a worker is asked to run and what is taken from it on trust, and
+    stops no one who has taken it. A worker that keeps only what is placed on it and
+    writes only about itself is not built yet.
+  - What the node copied, it has: every Secret that was in the store, the keys of
+    encrypted volumes it was handed, the CA key if it was the node the cluster started
+    on (then make a new cluster). Change the Secrets.
+  - A request that was already running when the Node was deleted (a `kith run` in
+    progress, a copy of a blob or a volume) runs to its end. A watch is told no more.
+  - A node answers by the store it has: one that is cut off from the others, or
+    behind, still takes the deleted node's certificate until it has the delete.
+  - A node that has not heard of a node at all takes three things from it and nothing
+    else: what a leader sends to bring a store up to date (entries, a snapshot) and a
+    request for its vote. It has to: the node that leads may be one that joined while
+    it was away, and nobody else would send it the store. A certificate from a join
+    names an index of the store by which its Node was there, so a node whose store is
+    past that index knows the Node was deleted and refuses these too. One whose store
+    is not that far (a node that has just joined, one that has been away since before
+    the deleted node joined, one whose store was wiped while its certificate was kept)
+    cannot know, and whoever
+    holds a deleted node's key can send it a store of their making until it has caught
+    up with the real one. Do not start a node on a wiped store: join it again.
+  - A Node written by a kithd from before this check names no key and stands by its
+    name, and that node's certificate names no index: once its Node is deleted, only a
+    node that has not heard of itself takes those three things from it. The node the
+    cluster started on writes its key at its next start; the others get both when they
+    join again.
+  - A refused node certificate is written to the audit log once a minute at most, not
+    each time it asks, and it does not count against the connections a stranger may
+    hold open.
+  - A node that is still a member can write any Node's status, another's key
+    included: every node is trusted as the admin is (above) until a node's rights are
+    narrowed.
+  - `kithd --admit-deleted-nodes` turns the check off on the node started with it, for
+    a cluster that has locked itself out (a node from before this check that joined
+    while another was away, and leads now); it says so at start. Leave it off. It
+    brings no deleted Node back: a node deleted by mistake joins again.
+  Certificates still last ten years; nothing but the Node's deletion ends one.
 - **A Release is the right to apply whatever its packages render**, with the node's
   rights and not the writer's; the same for a Source. (T-0229, T-0227.)
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with

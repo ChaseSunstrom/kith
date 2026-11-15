@@ -23,6 +23,26 @@ use tokio::sync::watch;
 /// (node, key) pairs where a node that is gone left containers in a status.
 type Writes = (Vec<(String, Map<String, Value>)>, Vec<(String, String)>);
 
+/// The label every node has for the scheduler, made from its `spec.trust` (`control` or
+/// `worker`) whatever its own labels say: `placement.require` of it keeps a template off
+/// workers.
+pub const TRUST: &str = "kith.dev/trust";
+
+/// Whether `resource`'s template names one of `guarded`, the keys of the Secrets that are
+/// for control nodes only: it is then placed on those.
+fn control_only(guarded: &BTreeSet<String>, resource: &Resource) -> bool {
+    // (No such Secret, as in most clusters: no template is read a second time.)
+    if guarded.is_empty() {
+        return false;
+    }
+    let namespace = resource.metadata.namespace.as_deref().unwrap_or("default");
+    let template = serde_json::from_value::<kith_api::kinds::Template>(resource.spec["template"].clone());
+    template.is_ok_and(|template| {
+        let mut named = template.secrets();
+        named.any(|name| guarded.contains(&format!("Secret/{namespace}/{name}")))
+    })
+}
+
 /// The replicas `resource` wants placed: how many, what each asks for, where each may go.
 pub(crate) fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api::kinds::Placement>)> {
     let spec = resource.spec.clone();
@@ -49,8 +69,11 @@ pub(crate) fn wants(resource: &Resource) -> Option<(u32, Amount, Option<kith_api
 
 /// Where a NodeWorkload's copies are: replica number to node name, one for each node that
 /// matches. A node keeps its number while it matches; a new one takes the lowest free.
-fn every_node(resource: &Resource, nodes: &[Node], grace: Duration) -> Option<Map<String, Value>> {
-    let spec: NodeWorkloadSpec = serde_json::from_value(resource.spec.clone()).ok()?;
+fn every_node(resource: &Resource, nodes: &[Node], grace: Duration, control: bool) -> Option<Map<String, Value>> {
+    let mut spec: NodeWorkloadSpec = serde_json::from_value(resource.spec.clone()).ok()?;
+    if control {
+        spec.selector.insert(TRUST.into(), "control".into());
+    }
     let mut left = kith_sched::node_workload(nodes, &spec.selector, grace);
     let old = resource.status.as_ref().and_then(|s| s["nodes"].as_object());
     let mut bound: Map<String, Value> = old.into_iter().flatten().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -83,9 +106,15 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
                 lost
             }
         });
+        let mut labels = node.metadata.labels.clone();
+        let trust = match spec.trust {
+            Some(kith_api::kinds::Trust::Worker) => "worker",
+            _ => "control",
+        };
+        labels.insert(TRUST.into(), trust.into());
         Some(Node {
             name: node.metadata.name.clone(),
-            labels: node.metadata.labels.clone(),
+            labels,
             spec,
             capacity: Amount { cpu, memory },
             lost_for,
@@ -108,11 +137,22 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
     };
     let claims = crate::claims::resolve(store).owners;
     let mounts = crate::volumes::resolve(store).owners;
+    let guarded: BTreeSet<String> = {
+        let secrets = store
+            .list(Some("Secret"))
+            .filter(|secret| secret.spec["trust"] == "control");
+        secrets.map(Resource::key).collect()
+    };
     let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
     for resource in owners() {
-        let Some((count, requests, placement)) = wants(resource) else {
+        let Some((count, requests, mut placement)) = wants(resource) else {
             continue;
         };
+        if control_only(&guarded, resource) {
+            let (require, prefer) = Default::default();
+            let placement = placement.get_or_insert(kith_api::kinds::Placement { require, prefer });
+            placement.require.insert(TRUST.into(), "control".into());
+        }
         let key = resource.key();
         // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
         // to one node waits, with the reason.
@@ -162,7 +202,7 @@ fn plan(store: &Store, seen: Seen, grace: Duration) -> Writes {
         // A Job that is over keeps the node that ran it.
         let mut want = Vec::new();
         if resource.kind == "NodeWorkload" {
-            if let Some(bound) = every_node(resource, &nodes, grace) {
+            if let Some(bound) = every_node(resource, &nodes, grace, control_only(&guarded, resource)) {
                 want.push(("replicas", Value::from(bound.len())));
                 want.push(("nodes", Value::Object(bound)));
             }
@@ -308,6 +348,90 @@ spec:
   template:
     exec: [{ name: run, command: ['true'] }]
 ";
+
+    #[test]
+    fn trust_keeps_what_asks_for_control_nodes_off_a_worker() {
+        // b is a worker, whatever label it was given.
+        let cluster = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b, labels: { kith.dev/trust: control } }
+spec: { trust: worker }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: key }
+spec: { trust: control, data: { k: v } }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: any }
+spec: { data: { k: v } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: plain }
+spec:
+  replicas: 2
+  template:
+    exec: [{ name: run, command: [sleep, inf], env: [{ name: K, secret: { name: any, key: k } }] }]
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: asks }
+spec:
+  replicas: 2
+  placement: { require: { kith.dev/trust: control } }
+  template:
+    exec: [{ name: run, command: [sleep, inf] }]
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: named }
+spec:
+  replicas: 2
+  template:
+    exec: [{ name: run, command: [sleep, inf], env: [{ name: K, secret: { name: key, key: k } }] }]
+---
+apiVersion: kith.dev/v1
+kind: NodeWorkload
+metadata: { name: each }
+spec:
+  template:
+    exec: [{ name: run, command: [sleep, inf] }]
+---
+apiVersion: kith.dev/v1
+kind: NodeWorkload
+metadata: { name: each-named }
+spec:
+  template:
+    exec: [{ name: run, command: [sleep, inf], env: [{ name: K, secret: { name: key, key: k } }] }]
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(cluster).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let nodes = |key: &str| {
+            let of = fields
+                .iter()
+                .find(|(of, _)| of == key)
+                .unwrap_or_else(|| panic!("{key}: {fields:?}"));
+            of.1["nodes"].clone()
+        };
+        assert_eq!(nodes("Workload/default/plain"), json!({ "0": "a", "1": "b" }));
+        // Asked for in `placement`, or by a Secret it names that is for control nodes.
+        assert_eq!(nodes("Workload/default/asks"), json!({ "0": "a", "1": "a" }));
+        assert_eq!(nodes("Workload/default/named"), json!({ "0": "a", "1": "a" }));
+        assert_eq!(nodes("NodeWorkload/default/each"), json!({ "0": "a", "1": "b" }));
+        assert_eq!(nodes("NodeWorkload/default/each-named"), json!({ "0": "a" }));
+    }
 
     #[test]
     fn replicas_follow_the_nodes_and_stay_on_a_roaming_one() {

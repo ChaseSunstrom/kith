@@ -352,7 +352,11 @@ pub(crate) async fn applied(
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        crate::releases::claims(&state.store, &resources)
+        let nodes = resources.iter().filter(|resource| resource.kind == "Node");
+        let nodes: Vec<_> = nodes
+            .map(|node| (node.metadata.name.as_str(), Some(&node.spec)))
+            .collect();
+        access::control_stays(&state.store, &nodes).and_then(|()| crate::releases::claims(&state.store, &resources))
     };
     if let Err(why) = claimed {
         shared.audit.record(caller, "apply", keys, Err(why.clone()));
@@ -413,6 +417,11 @@ async fn watch(
     // The wait may have been long: an Identity deleted, or given another key, meanwhile is
     // told no more, and that is written down.
     // (An Identity with no certificate on record is not taken on trust.)
+    if let (Caller::Node(name), Some(Extension(Certificate(der)))) = (&caller, &certificate)
+        && !crate::cluster::admitted(&shared, name, der)
+    {
+        return Err(ApiError::Unauthorized(crate::cluster::EVICTED.into()));
+    }
     if let Caller::Identity(name) = &caller
         && !certificate.is_some_and(|Extension(Certificate(der))| access::stands(&shared, name, &der))
     {
@@ -451,6 +460,11 @@ async fn delete(
 /// Delete the resource at `key` as `caller`, if it may: what `DELETE /v1/resources` does.
 pub(crate) async fn deleted(shared: &Arc<Shared>, caller: &Caller, key: String) -> Result<Resource, ApiError> {
     permit(shared, caller, Verb::Delete, |_| vec![place_of(&key)])?;
+    if let Some(node) = key.strip_prefix("Node/") {
+        let Json(()) = read(shared, |store| {
+            access::control_stays(store, &[(node, None)]).map_err(Error::Invalid)
+        })?;
+    }
     match change(shared, caller, "delete", vec![key.clone()], Command::Delete { key }).await? {
         Done::Deleted(resource) => Ok(*resource),
         _ => Err(odd()),
@@ -480,6 +494,16 @@ async fn rollback(
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
+    if let Some(node) = key.strip_prefix("Node/") {
+        let Json(()) = read(&shared, |store| {
+            let was = store
+                .history(&key)?
+                .iter()
+                .find(|was| was.resource.metadata.revision == Some(to));
+            let after = was.map(|was| (node, Some(&was.resource.spec)));
+            access::control_stays(store, after.as_slice()).map_err(Error::Invalid)
+        })?;
+    }
     let what = vec![format!("{key} to revision {to}")];
     match change(&shared, &caller, "rollback", what, Command::Rollback { key, to, at }).await? {
         Done::Changes(mut changes) if changes.len() == 1 => Ok(Json(changes.remove(0))),
@@ -515,12 +539,17 @@ async fn logs(
 ) -> Reply<serde_json::Value> {
     // What a unit wrote is read by who may read the resource that runs it.
     permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
-    output(&shared, &key, &options).await
+    output(&shared, &caller, &key, &options).await
 }
 
 /// A chunk of what a unit of the resource at `key` wrote, from whichever node it runs on.
-/// (Whether the caller may read it is asked before.)
-pub(crate) async fn output(shared: &Arc<Shared>, key: &str, options: &LogOptions) -> Reply<serde_json::Value> {
+/// (Whether `caller` may read it is asked before, and by the other node of the one it is passed to.)
+pub(crate) async fn output(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    key: &str,
+    options: &LogOptions,
+) -> Reply<serde_json::Value> {
     // A replica that runs on another node: its output is there.
     let elsewhere = shared.cluster.as_ref().filter(|_| !options.here).and_then(|cluster| {
         let state = shared.store.lock().expect("a handler panicked holding the store");
@@ -549,6 +578,7 @@ pub(crate) async fn output(shared: &Arc<Shared>, key: &str, options: &LogOptions
         let asked = cluster
             .client
             .get(url)
+            .header(crate::access::FOR, caller.to_string())
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await;
@@ -914,7 +944,7 @@ async fn push(
     };
     let what = vec![format!("{name}:{version} to {}", asked.to)];
     // (As a pull: an Identity names only registries outside this node and its networks.)
-    let outward = matches!(caller, Caller::Identity(_));
+    let outward = !matches!(caller, Caller::Admin);
     let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature, outward).await;
     shared
         .audit
@@ -940,7 +970,7 @@ async fn pull(
 ) -> Reply<std::collections::BTreeMap<String, String>> {
     permit(&shared, &caller, Verb::Apply, |_| vec![("Package".into(), None)])?;
     // (An Identity names any registry it likes: only outside ones, as a namespace's Source.)
-    let outward = matches!(caller, Caller::Identity(_));
+    let outward = !matches!(caller, Caller::Admin);
     let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version, outward).await;
     let (blob, signature) = fetched.map_err(|e| ApiError::Store(Error::Io(e)))?;
     let package = crate::registry::checked(

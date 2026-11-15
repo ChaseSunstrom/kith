@@ -31,6 +31,9 @@ const ANY_NODE: &str = "kith";
 const NODE_SUFFIX: &str = ".node.kith";
 /// And an Identity's. A name is one label, so neither can be made to look like the other.
 const USER_SUFFIX: &str = ".user.kith";
+/// In the certificate a node is given as it joins: `INDEX.born.kith`, an index of the store
+/// by which its Node was there. A store that is past it and has no such Node had it deleted.
+const BORN_SUFFIX: &str = ".born.kith";
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
 
 type Fallible<T> = Result<T, String>;
@@ -92,7 +95,17 @@ impl Ca {
 
     /// A key pair and certificate for the node `name`, as (certificate, key).
     pub fn issue(&self, name: &str) -> Fallible<(String, String)> {
-        let names = vec![format!("{name}{NODE_SUFFIX}"), ANY_NODE.into()];
+        self.issue_node(name, None)
+    }
+
+    /// The same, for a node whose Node was in the store by its index `born`.
+    pub fn issue_born(&self, name: &str, born: u64) -> Fallible<(String, String)> {
+        self.issue_node(name, Some(born))
+    }
+
+    fn issue_node(&self, name: &str, born: Option<u64>) -> Fallible<(String, String)> {
+        let mut names = vec![format!("{name}{NODE_SUFFIX}"), ANY_NODE.into()];
+        names.extend(born.map(|born| format!("{born}{BORN_SUFFIX}")));
         let both = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
         let (cert, key) = self.sign(name, names, both)?;
         Ok((cert, key.serialize_pem()))
@@ -370,7 +383,10 @@ pub fn client_config(ca: &str, me: Option<&Identity>) -> Fallible<ClientConfig> 
 /// Whose a verified client certificate is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Subject {
-    Node(String),
+    /// A node, the public key (DER) the certificate is for, and the index of the store by
+    /// which its Node was there, if the certificate says: it stands for the node only
+    /// while that node's Node names the same key (`cluster::admitted`).
+    Node(String, Vec<u8>, Option<u64>),
     /// An Identity, and the public key (DER) the certificate is for: it stands for the
     /// Identity only while that names the same key.
     User(String, Vec<u8>),
@@ -380,10 +396,27 @@ pub fn subject_of(cert: &CertificateDer<'_>) -> Option<Subject> {
     let cert = webpki::EndEntityCert::try_from(cert).ok()?;
     let named = |suffix| cert.valid_dns_names().find_map(|name| name.strip_suffix(suffix));
     match (named(NODE_SUFFIX), named(USER_SUFFIX)) {
-        (Some(node), _) => Some(Subject::Node(node.into())),
+        (Some(node), _) => Some(Subject::Node(
+            node.into(),
+            cert.subject_public_key_info().to_vec(),
+            named(BORN_SUFFIX).and_then(|born| born.parse().ok()),
+        )),
         (None, Some(user)) => Some(Subject::User(user.into(), cert.subject_public_key_info().to_vec())),
         (None, None) => None,
     }
+}
+
+/// What a Node keeps of its node's certificate (`status.certificate`): SHA-256 of the
+/// public key (DER) it is for.
+pub fn key_print(der: &[u8]) -> String {
+    hex(ring::digest::digest(&ring::digest::SHA256, der).as_ref())
+}
+
+/// [`key_print`] of the certificate `pem`.
+pub fn print_of(pem: &str) -> Fallible<String> {
+    let der = ca_cert(pem)?;
+    let cert = tls("reading a certificate", webpki::EndEntityCert::try_from(&der))?;
+    Ok(key_print(&cert.subject_public_key_info()))
 }
 
 /// Is `pem` (an Identity's `publicKey`) the key `der`?
@@ -393,9 +426,10 @@ pub fn same_key(pem: &str, der: &[u8]) -> bool {
 
 /// Join tokens: `kith1.<secret>.<CA fingerprint>`. The secret is good once, for an hour,
 /// on the node that made it; the fingerprint lets the joiner check who it is talking to
-/// before it sends the secret.
+/// before it sends the secret. Whoever made it says whether the node it lets in is a worker
+/// (`spec.trust`): the node that joins does not.
 #[derive(Default)]
-pub struct Tokens(Mutex<Vec<([u8; 32], Instant)>>);
+pub struct Tokens(Mutex<Vec<([u8; 32], Instant, bool)>>);
 
 fn digest(secret: &str) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
@@ -412,31 +446,31 @@ pub fn token_parts(token: &str) -> Fallible<(&str, &str)> {
 }
 
 impl Tokens {
-    pub fn mint(&self, ca: &str) -> Fallible<String> {
+    pub fn mint(&self, ca: &str, worker: bool) -> Fallible<String> {
         let mut secret = [0u8; 32];
         let filled = ring::rand::SystemRandom::new().fill(&mut secret);
         filled.map_err(|_| "no random bytes from the system")?;
         let secret = hex(&secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
-        tokens.retain(|(_, made)| made.elapsed() < TOKEN_LIFE);
-        tokens.push((digest(&secret), Instant::now()));
+        tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
+        tokens.push((digest(&secret), Instant::now(), worker));
         Ok(format!("kith1.{secret}.{}", fingerprint(ca)?))
     }
 
-    /// Whether `token` is good; with `spend`, it is not good again.
+    /// Whether `token` is good, and then whether it is a worker's; with `spend`, it is not
+    /// good again.
     // Digests are compared, so how long the comparison takes says nothing about the secret.
-    pub fn good(&self, token: &str, spend: bool) -> bool {
-        let Ok((secret, _)) = token_parts(token) else {
-            return false;
-        };
+    pub fn good(&self, token: &str, spend: bool) -> Option<bool> {
+        let (secret, _) = token_parts(token).ok()?;
         let wanted = digest(secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
-        tokens.retain(|(_, made)| made.elapsed() < TOKEN_LIFE);
-        let found = tokens.iter().position(|(digest, _)| *digest == wanted);
-        if let (Some(at), true) = (found, spend) {
-            tokens.remove(at);
+        tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
+        let found = tokens.iter().position(|(digest, ..)| *digest == wanted)?;
+        let worker = tokens[found].2;
+        if spend {
+            tokens.remove(found);
         }
-        found.is_some()
+        Some(worker)
     }
 }
 
@@ -449,7 +483,13 @@ mod tests {
         let ca = Ca::create().unwrap();
         let (cert, key) = ca.issue("alpha").unwrap();
         let der = certs(&cert).unwrap().remove(0);
-        assert_eq!(subject_of(&der), Some(Subject::Node("alpha".into())));
+        let Some(Subject::Node(name, public, None)) = subject_of(&der) else {
+            panic!("a node's certificate");
+        };
+        assert_eq!((name.as_str(), key_print(&public)), ("alpha", print_of(&cert).unwrap()));
+        // One from a join says by which index of the store its Node was there.
+        let joined = certs(&ca.issue_born("beta", 41).unwrap().0).unwrap().remove(0);
+        assert!(matches!(subject_of(&joined), Some(Subject::Node(name, _, Some(41))) if name == "beta"));
 
         // An Identity's certificate names it and its key, and no server would be believed with it.
         let (user, _, public) = ca.issue_user("alice").unwrap();
@@ -527,13 +567,17 @@ mod tests {
     fn tokens_are_good_once() {
         let ca = Ca::create().unwrap();
         let tokens = Tokens::default();
-        let token = tokens.mint(&ca.cert).unwrap();
+        let token = tokens.mint(&ca.cert, false).unwrap();
         assert_eq!(token_parts(&token).unwrap().1, fingerprint(&ca.cert).unwrap());
-        assert!(!tokens.good("kith1.nope.nope", true));
-        assert!(!tokens.good(&tokens.mint(&ca.cert).unwrap().replace("kith1.", "kith1.0"), true));
-        assert!(tokens.good(&token, false));
-        assert!(tokens.good(&token, true));
-        assert!(!tokens.good(&token, true));
+        assert_eq!(tokens.good("kith1.nope.nope", true), None);
+        let other = tokens.mint(&ca.cert, false).unwrap().replace("kith1.", "kith1.0");
+        assert_eq!(tokens.good(&other, true), None);
+        assert_eq!(tokens.good(&token, false), Some(false));
+        assert_eq!(tokens.good(&token, true), Some(false));
+        assert_eq!(tokens.good(&token, true), None);
+        // Whether its node is a worker is what its maker said, kept here and not in the token.
+        let worker = tokens.mint(&ca.cert, true).unwrap();
+        assert_eq!(tokens.good(&worker, true), Some(true));
     }
 
     #[test]

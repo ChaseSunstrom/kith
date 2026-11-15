@@ -144,7 +144,7 @@ fn held(state: &Path, dir: &Dir) -> Option<Vec<u8>> {
 
 /// The node at the other end and the volume it names, if it may have that volume's key.
 fn theirs(shared: &Shared, peer: &Peer, namespace: &str, name: &str) -> Result<Dir, String> {
-    let Some(crate::pki::Subject::Node(node)) = &peer.subject else {
+    let Some(crate::pki::Subject::Node(node, ..)) = &peer.subject else {
         return Err("this is for the cluster's nodes".into());
     };
     let state = shared.store.lock().expect("a handler panicked holding the store");

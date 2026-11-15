@@ -44,6 +44,16 @@ impl TryFrom<String> for Quantity {
 }
 
 impl Quantity {
+    /// The amount in whole bytes, where it is some: `512Mi` is 536870912. `500m` is none, and so is
+    /// a number at 2^53 or more, where a float stops counting bytes.
+    pub fn bytes(&self) -> Option<u64> {
+        let value = self.value();
+        let whole = value.round();
+        // (The float's rounding is not a fraction of a byte: `1.1G` is 1100000000.)
+        let exact = (value - whole).abs() <= whole * 4.0 * f64::EPSILON;
+        (exact && whole > 0.0 && whole < 9007199254740992.0).then_some(whole as u64)
+    }
+
     /// The amount as a plain number: `500m` is 0.5, `2Gi` is 2147483648.
     pub fn value(&self) -> f64 {
         let number = self.0.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -179,11 +189,18 @@ spec! {
         /// gone for good, or delete the node.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub roaming: Option<bool>,
+        /// How far the node is trusted: `control` (the default) may vote on the store and
+        /// its word for who asked is taken by the others; a `worker` never votes, is not
+        /// followed as a leader, and gets nothing that asks for control nodes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trust: Option<Trust>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<NodeMesh>,
     }
 
     pub enum NodeRole { Voter, Worker, Edge }
+
+    pub enum Trust { Control, Worker }
 
     pub struct NodeMesh {
         /// `never`: this node's traffic goes straight to the other node or not at all,
@@ -869,6 +886,10 @@ spec! {
     pub struct SecretSpec {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub data: BTreeMap<String, String>,
+        /// `control`: given to units on control nodes only, and what names it is placed
+        /// on those.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trust: Option<Trust>,
     }
 
     // ---- Hardware (§4.6) ----
@@ -910,9 +931,18 @@ spec! {
         /// and its GPUs' render nodes, and none of its devices.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub access: Option<Access>,
+        /// With `access: shared`: the vram the claim asks for on each Device it holds, which the
+        /// scheduler counts against the Device's `vram` label. Nothing enforces it (see the README).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub share: Option<DeviceShare>,
     }
 
     pub enum Access { Exclusive, Shared, Client }
+
+    /// `{ vram: 512Mi }`: what a shared claim asks for of a Device's vram.
+    pub struct DeviceShare {
+        pub vram: Quantity,
+    }
 
     // ---- Packages and GitOps (§4.8, §4.9) ----
 
@@ -1568,6 +1598,19 @@ impl Template {
         self.init_containers.iter().chain(&self.containers)
     }
 
+    /// The names of the Secrets it names: in `env`, `envFrom` and mounts.
+    pub fn secrets(&self) -> impl Iterator<Item = &String> {
+        fn named(var: &EnvVar) -> Option<&String> {
+            var.secret.as_ref().map(|key| &key.name)
+        }
+        let containers = self.containers().flat_map(move |c| {
+            let from = c.env_from.iter().filter_map(|from| from.secret.as_ref());
+            let mounted = c.volume_mounts.iter().filter_map(|mount| mount.secret.as_ref());
+            c.env.iter().filter_map(named).chain(from).chain(mounted)
+        });
+        containers.chain(self.exec.iter().flat_map(|e| &e.env).filter_map(named))
+    }
+
     /// The names of its units, in the order they are numbered: containers, exec units, VMs.
     pub fn units(&self) -> impl Iterator<Item = &String> {
         let containers = self.containers.iter().map(|c| &c.name);
@@ -2076,6 +2119,14 @@ impl Spec for DeviceClaimSpec {
         )?;
         if self.access == Some(Access::Client) && self.seat.is_none() {
             return Err("spec.access: client is of a seat: name one with `seat`".into());
+        }
+        if let Some(share) = &self.share {
+            if self.access != Some(Access::Shared) {
+                return Err("spec.share: a share is of a shared claim: say `access: shared`".into());
+            }
+            if share.vram.bytes().is_none() {
+                return Err("spec.share.vram: a share is whole bytes, above 0 and below 8192Ti (such as 512Mi)".into());
+            }
         }
         Ok(())
     }

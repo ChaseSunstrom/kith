@@ -48,6 +48,26 @@ fn list(names: &BTreeSet<&str>) -> String {
     }
 }
 
+/// A `DeviceClaim` as it resolves: whether it is shared, the bytes of vram its share asks for, and
+/// the `Device`s it names (or why it names none).
+struct Known {
+    shared: bool,
+    share: Option<u64>,
+    found: Result<Held, String>,
+}
+
+/// The vram a `Device` counts its shares against: its `vram` label in bytes. None when it has no
+/// such label, or one that is not a number: then nothing is counted there.
+fn vram_of(store: &Store, device: &str) -> Option<u64> {
+    store
+        .get(&format!("Device/{device}"))?
+        .metadata
+        .labels
+        .get("vram")?
+        .parse()
+        .ok()
+}
+
 /// The `Device`s one claim names and the one node they are on, or why it names none.
 fn resolve_one(store: &Store, claim: &DeviceClaimSpec) -> Result<Held, String> {
     let (what, names): (&str, Vec<String>) = match (&claim.device, &claim.seat, claim.selector.is_empty()) {
@@ -122,29 +142,44 @@ fn claimants(store: &Store) -> Vec<(String, String, Vec<String>)> {
 /// first by key; a workload holds all its claims or none, so two that want each other's never
 /// wait for ever.
 pub fn resolve(store: &Store) -> Claims {
-    let known: BTreeMap<String, (bool, Result<Held, String>)> = store
+    let known: BTreeMap<String, Known> = store
         .list(Some("DeviceClaim"))
         .map(|claim| {
             let spec: Result<DeviceClaimSpec, _> = serde_json::from_value(claim.spec.clone());
             let shared = spec.as_ref().is_ok_and(|spec| spec.access == Some(Access::Shared));
+            let share = spec
+                .as_ref()
+                .ok()
+                .filter(|_| shared)
+                .and_then(|spec| spec.share.as_ref()?.vram.bytes());
             let found = spec
                 .map_err(|e| e.to_string())
                 .and_then(|spec| resolve_one(store, &spec));
-            (claim.key(), (shared, found))
+            (claim.key(), Known { shared, share, found })
         })
         .collect();
-    // Who each claim's status says holds it: they keep it.
-    let recorded: BTreeSet<&str> = store
-        .list(Some("DeviceClaim"))
-        .filter_map(|claim| claim.status.as_ref()?["holders"].as_array())
-        .flatten()
-        .filter_map(Value::as_str)
+    // Who each claim's status says holds it, and the share it was admitted with: a holder keeps its
+    // share while it asks for no more than that, even where the Device has less vram than it asks
+    // (a smaller label is not their turn lost). Asking for more is fitted again like a new claim.
+    let mut kept: BTreeMap<String, (BTreeSet<String>, Option<u64>)> = BTreeMap::new();
+    for claim in store.list(Some("DeviceClaim")) {
+        let Some(status) = claim.status.as_ref() else { continue };
+        let Some(holders) = status["holders"].as_array() else {
+            continue;
+        };
+        let holders = holders.iter().filter_map(Value::as_str).map(String::from).collect();
+        kept.insert(claim.key(), (holders, status["shareBytes"].as_u64()));
+    }
+    let recorded: BTreeSet<&str> = kept
+        .values()
+        .flat_map(|(holders, _)| holders)
+        .map(String::as_str)
         .collect();
     let mut wanting = claimants(store);
     // (Those with a client claim after the others: a client asks who holds its seat.)
     let client = |namespace: &str, names: &[String]| {
         let of = |name: &String| known.get(&format!("DeviceClaim/{namespace}/{name}"));
-        let is = |(_, found): &(bool, Result<Held, String>)| matches!(found, Ok(held) if matches!(held.seat, Some((_, true))));
+        let is = |known: &Known| matches!(&known.found, Ok(held) if matches!(held.seat, Some((_, true))));
         names.iter().filter_map(of).any(is)
     };
     wanting.sort_by_key(|(key, namespace, names)| {
@@ -155,15 +190,20 @@ pub fn resolve(store: &Store) -> Claims {
     // Per Device: (claim key, holder, exclusively) for each way it is held.
     let mut taken: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
     let mut holders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // Per Device: the vram bytes its admitted shares ask for.
+    let mut asked: BTreeMap<String, u64> = BTreeMap::new();
     let mut claims = Claims::default();
     for (key, namespace, names) in wanting {
+        // Per Device: the vram bytes this workload's own shares ask for, so far.
+        let mut own: BTreeMap<String, u64> = BTreeMap::new();
         let outcome = (|| {
             let mut node: Option<&str> = None;
             let mut devices = BTreeSet::new();
             let mut seat: Option<(String, bool)> = None;
             for name in &names {
                 let claim = format!("DeviceClaim/{namespace}/{name}");
-                let (shared, found) = known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
+                let Known { shared, share, found } =
+                    known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
                 let held = found.as_ref().map_err(|why| format!("DeviceClaim {name}: {why}"))?;
                 if let Some(other) = node.filter(|other| *other != held.node) {
                     return Err(format!(
@@ -207,6 +247,29 @@ pub fn resolve(store: &Store) -> Claims {
                         });
                     }
                 }
+                // A share is counted against each Device's vram, as far as the Device has room: a
+                // Device with no vram it can count admits it, and the status says it is not counted.
+                if let Some(amount) = *share {
+                    for device in &held.devices {
+                        let Some(of) = vram_of(store, device) else { continue };
+                        let used = asked
+                            .get(device)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(own.get(device).copied().unwrap_or(0));
+                        let free = of.saturating_sub(used);
+                        let exempt = kept.get(&claim).is_some_and(|(holders, was)| {
+                            holders.contains(&key) && was.is_some_and(|was| amount <= was)
+                        });
+                        if amount > free && !exempt {
+                            return Err(format!(
+                                "waiting for DeviceClaim {name}: Device {device} has {free} of its {of} vram bytes free, and the share asks for {amount}"
+                            ));
+                        }
+                        let sum = own.entry(device.clone()).or_default();
+                        *sum = sum.saturating_add(amount);
+                    }
+                }
                 devices.extend(held.devices.iter().cloned());
             }
             let node = node.expect("a workload names a claim").to_string();
@@ -217,11 +280,15 @@ pub fn resolve(store: &Store) -> Claims {
             })
         })();
         if outcome.is_ok() {
+            for (device, amount) in own {
+                let sum = asked.entry(device).or_default();
+                *sum = sum.saturating_add(amount);
+            }
             for name in &names {
                 let claim = format!("DeviceClaim/{namespace}/{name}");
-                let shared = known[&claim].0;
+                let shared = known[&claim].shared;
                 holders.entry(claim.clone()).or_default().insert(key.clone());
-                let found = known[&claim].1.as_ref().expect("it resolved");
+                let found = known[&claim].found.as_ref().expect("it resolved");
                 match &found.seat {
                     Some((_, true)) => continue,
                     Some((seat, false)) => drop(sessions.insert((seat.clone(), namespace.clone()))),
@@ -237,26 +304,48 @@ pub fn resolve(store: &Store) -> Claims {
         }
         claims.owners.insert(key, outcome);
     }
-    for (claim, (_, found)) in known {
+    for (claim, Known { share, found, .. }) in known {
         let status = match found {
             Ok(held) => {
                 let holding = holders.remove(&claim).unwrap_or_default();
+                // What each Device counts of a share: the sum of all the admitted ones, against its vram.
+                let counts = share.map(|_| {
+                    let counts = held.devices.iter().map(|device| {
+                        let counted = match vram_of(store, device) {
+                            Some(of) => {
+                                json!({ "counted": true, "asked": asked.get(device).copied().unwrap_or(0), "of": of })
+                            }
+                            None => json!({ "counted": false }),
+                        };
+                        (device.clone(), counted)
+                    });
+                    Value::Object(counts.collect())
+                });
                 // (A client holds no Device: its holders are the seat's apps.)
                 let devices = if matches!(held.seat, Some((_, true))) {
                     Vec::new()
                 } else {
                     held.devices
                 };
-                json!({ "node": held.node, "devices": devices, "holders": holding })
+                let mut status = json!({ "node": held.node, "devices": devices, "holders": holding });
+                if let (Some(amount), Some(counts)) = (share, counts) {
+                    status["share"] = counts;
+                    status["shareBytes"] = json!(amount);
+                }
+                status
             }
             // (Who held it still does when it is back: a Device gone for a moment, a USB
-            // one plugged in again, is not the holder's turn lost.)
+            // one plugged in again, is not the holder's turn lost. Nor its share's.)
             Err(message) => {
                 let live = store.get(&claim).and_then(|claim| claim.status.as_ref());
-                match live.map(|status| &status["holders"]).filter(|held| held.is_array()) {
-                    Some(held) => json!({ "message": message, "holders": held }),
-                    None => json!({ "message": message }),
+                let mut status = json!({ "message": message });
+                if let Some(held) = live.map(|status| &status["holders"]).filter(|held| held.is_array()) {
+                    status["holders"] = held.clone();
                 }
+                if let Some(was) = live.and_then(|status| status.get("shareBytes")) {
+                    status["shareBytes"] = was.clone();
+                }
+                status
             }
         };
         claims.status.insert(claim, status);
@@ -791,5 +880,192 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// A stand-in GPU on `a`, with no real card behind it: `extra` is more labels (`, vram: '1073741824'`).
+    fn card(name: &str, extra: &str) -> String {
+        format!(
+            "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: {name}, labels: {{ class: gpu, kith.dev/node: a{extra} }} }}\n\
+             spec: {{ node: a, class: gpu, path: /dev/dri/{name} }}\n"
+        )
+    }
+
+    #[test]
+    fn a_share_is_admitted_while_the_device_has_the_vram_and_waits_with_the_numbers() {
+        let source = [
+            card("a-vram", ", vram: '1073741824'"),
+            card("a-tiny", ", vram: '1073741824'"),
+            claim("half", "{ device: a-vram, access: shared, share: { vram: 512Mi } }"),
+            claim("look", "{ device: a-vram, access: shared }"),
+            claim("huge", "{ device: a-tiny, access: shared, share: { vram: 2Gi } }"),
+            workload("a1", "[half]"),
+            workload("a2", "[half]"),
+            workload("a3", "[half]"),
+            workload("f1", "[look]"),
+            workload("h", "[huge]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let claims = settle(&mut store);
+        // 1 GiB of vram: two halves fill it, and the third waits with the numbers. A shared claim
+        // with no share counts as nothing, so `f1` is admitted beside them.
+        assert!(claims.owners["Workload/default/a1"].is_ok() && claims.owners["Workload/default/a2"].is_ok());
+        assert!(claims.owners["Workload/default/f1"].is_ok());
+        assert_eq!(
+            claims.owners["Workload/default/a3"],
+            Err("waiting for DeviceClaim half: Device a-vram has 0 of its 1073741824 vram bytes free, and the share asks for 536870912".into())
+        );
+        // A share bigger than the whole card waits for ever, and says so.
+        assert_eq!(
+            claims.owners["Workload/default/h"],
+            Err("waiting for DeviceClaim huge: Device a-tiny has 1073741824 of its 1073741824 vram bytes free, and the share asks for 2147483648".into())
+        );
+        let status = store.get("DeviceClaim/default/half").unwrap().status.clone().unwrap();
+        assert_eq!(status["holders"], json!(["Workload/default/a1", "Workload/default/a2"]));
+        assert_eq!(
+            status["share"],
+            json!({ "a-vram": { "counted": true, "asked": 1073741824, "of": 1073741824 } })
+        );
+        // A holder that goes frees its share, and the one that waited has its turn.
+        store.delete("Workload/default/a1").unwrap();
+        assert!(settle(&mut store).owners["Workload/default/a3"].is_ok());
+    }
+
+    #[test]
+    fn who_holds_a_share_keeps_it_when_the_device_has_less_vram_than_they_ask() {
+        let source = [
+            card("a-vram", ", vram: '1073741824'"),
+            claim("half", "{ device: a-vram, access: shared, share: { vram: 512Mi } }"),
+            workload("a1", "[half]"),
+            workload("a2", "[half]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        settle(&mut store);
+        // The label is written smaller: both holders keep their share, and a new one waits.
+        store.delete("Device/a-vram").unwrap();
+        let smaller = Resource::from_source(&card("a-vram", ", vram: '536870912'"))
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        store.apply(smaller).unwrap();
+        store
+            .apply(
+                Resource::from_source(&workload("a3", "[half]"))
+                    .unwrap()
+                    .remove(0)
+                    .unwrap(),
+            )
+            .unwrap();
+        let after = settle(&mut store);
+        assert!(after.owners["Workload/default/a1"].is_ok() && after.owners["Workload/default/a2"].is_ok());
+        assert_eq!(
+            after.owners["Workload/default/a3"],
+            Err("waiting for DeviceClaim half: Device a-vram has 0 of its 536870912 vram bytes free, and the share asks for 536870912".into())
+        );
+    }
+
+    #[test]
+    fn a_holder_that_asks_for_more_than_it_held_is_fitted_again() {
+        let source = [
+            card("a-vram", ", vram: '1073741824'"),
+            claim("half", "{ device: a-vram, access: shared, share: { vram: 512Mi } }"),
+            workload("a1", "[half]"),
+            workload("a2", "[half]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        settle(&mut store);
+        // The claim now asks for all of the card: a1 has the room, and a2 (which held 512Mi) waits.
+        let bigger = claim("half", "{ device: a-vram, access: shared, share: { vram: 1Gi } }");
+        store
+            .apply(Resource::from_source(&bigger).unwrap().remove(0).unwrap())
+            .unwrap();
+        let after = settle(&mut store);
+        assert!(after.owners["Workload/default/a1"].is_ok());
+        assert_eq!(
+            after.owners["Workload/default/a2"],
+            Err("waiting for DeviceClaim half: Device a-vram has 0 of its 1073741824 vram bytes free, and the share asks for 1073741824".into())
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_vram_label_admits_its_shares_and_says_they_are_not_counted() {
+        let source = [
+            card("a-bare", ""),
+            card("a-odd", ", vram: lots"),
+            claim("bare", "{ device: a-bare, access: shared, share: { vram: 8Gi } }"),
+            claim("odd", "{ device: a-odd, access: shared, share: { vram: 8Gi } }"),
+            workload("b1", "[bare]"),
+            workload("b2", "[bare]"),
+            workload("b3", "[odd]"),
+            workload("b4", "[odd]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let claims = settle(&mut store);
+        assert!(claims.owners.values().all(Result::is_ok), "{:?}", claims.owners);
+        let status = |name: &str| {
+            store
+                .get(&format!("DeviceClaim/default/{name}"))
+                .unwrap()
+                .status
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(status("bare")["share"], json!({ "a-bare": { "counted": false } }));
+        assert_eq!(status("odd")["share"], json!({ "a-odd": { "counted": false } }));
+        assert_eq!(
+            status("odd")["holders"],
+            json!(["Workload/default/b3", "Workload/default/b4"])
+        );
+    }
+
+    #[test]
+    fn a_workload_asks_for_the_sum_of_its_shares_of_a_device_over_all_its_claims() {
+        let source = [
+            card("a-vram", ", vram: '1073741824'"),
+            claim("p1", "{ device: a-vram, access: shared, share: { vram: 768Mi } }"),
+            claim("p2", "{ device: a-vram, access: shared, share: { vram: 768Mi } }"),
+            claim("p3", "{ device: a-vram, access: shared, share: { vram: 512Mi } }"),
+            claim("p4", "{ device: a-vram, access: shared, share: { vram: 512Mi } }"),
+            workload("a-solo", "[p1, p2]"),
+            workload("pair", "[p3, p4]"),
+        ]
+        .concat();
+        let claims = resolve(&store(&source));
+        assert!(
+            claims.owners["Workload/default/a-solo"]
+                .clone()
+                .unwrap_err()
+                .starts_with(
+                    "waiting for DeviceClaim p2: Device a-vram has 268435456 of its 1073741824 vram bytes free"
+                ),
+        );
+        assert!(claims.owners["Workload/default/pair"].is_ok());
+    }
+
+    #[test]
+    fn a_share_is_of_a_shared_claim_and_is_a_whole_number_of_bytes_above_nothing() {
+        let valid = claim("ok", "{ device: a-vram, access: shared, share: { vram: 512Mi } }");
+        assert!(Resource::from_source(&valid).unwrap().remove(0).is_ok());
+        for (spec, names) in [
+            ("{ device: a-vram, share: { vram: 512Mi } }", "share"),
+            ("{ device: a-vram, access: exclusive, share: { vram: 512Mi } }", "share"),
+            ("{ device: a-vram, access: shared, share: { vram: 0 } }", "share"),
+            ("{ device: a-vram, access: shared, share: { vram: 0.5 } }", "share"),
+            (
+                "{ device: a-vram, access: shared, share: { vram: 512Mi, weight: 50 } }",
+                "weight",
+            ),
+            ("{ device: a-vram, access: shared, share: {} }", "vram"),
+        ] {
+            let refused = Resource::from_source(&claim("x", spec))
+                .unwrap()
+                .remove(0)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains(names), "{spec}: {refused}");
+        }
     }
 }
