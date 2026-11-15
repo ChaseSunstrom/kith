@@ -3499,6 +3499,23 @@ python3 ci/budgets.py            # binary-size and memory budgets, enforced in C
 python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
+Time budgets sit beside the size and memory ones. Three times are measured on one
+machine with no VM: `kith apply` until a container of a local image runs, a status
+change written on one of two kithds until the other has it, and one DNS answer from
+kithd. `python3 ci/budgets.py --times` prints the median of five runs of each; the
+build's `python3 ci/budgets.py` prints each once. The table's numbers were measured on
+a loaded 16-CPU machine, not the CI runner's, so they are not budgets: each budget is
+set from the CI runner's own medians (twice the slowest of three runs on main) and is a
+ceiling for a regression, not a claim of speed. Until then a time is printed and not
+enforced.
+
+| Time | Measured here: median of 5 (load 64 on 16 CPUs) | Printed as |
+|---|---|---|
+| apply to a running container | 74 ms | 74 ms (budget to be set from CI) |
+| a status change reaching a second kithd | 3.6 ms | 3.6 ms (budget to be set from CI) |
+| one DNS answer from kithd | 2.1 ms | 2.1 ms (budget to be set from CI) |
+| boot to ready | not measured here: no VM runs in CI | `python3 ci/budgets.py --boot LOG`, from the serial log of `ci/vm.sh`; not budgeted |
+
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
 has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on
 Debian/Ubuntu, or point `CC_x86_64_unknown_linux_musl` at a `zig cc -target

@@ -24,11 +24,13 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// How long a unit must have run for its next restart to be immediate again.
 const SETTLED: Duration = Duration::from_secs(60);
-/// With nothing else to wake it, the controller still looks around this often.
+/// With nothing else to wake it, the controller still looks around this often. A store change
+/// or a child exit wakes it sooner (`until_woken`). What this covers is a Job's next run and a
+/// failed status report, retried on the next pass. Neither is on the measured paths (T-0185).
 const TICK: Duration = Duration::from_secs(10);
 /// Failed runs a Job shrugs off when it does not say (`retries`).
 const JOB_RETRIES: u32 = 3;
@@ -214,15 +216,28 @@ pub async fn run(
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
-        tokio::select! {
-            _ = shared.changed.notified() => {}
-            _ = exited.recv() => {}
-            _ = tokio::time::sleep(wake) => {}
-            _ = stopping.changed() => break,
+        if until_woken(&shared.changed, &mut exited, wake, &mut stopping).await {
+            break;
         }
     }
     for (id, slot) in controller.slots {
         stop(&id, slot.handle);
+    }
+}
+
+/// Waits for the next pass: a store change or a child exit ends the wait at once, and `wake`
+/// is the longest it lasts. Returns true when the node is stopping.
+async fn until_woken(
+    changed: &Notify,
+    exited: &mut tokio::signal::unix::Signal,
+    wake: Duration,
+    stopping: &mut watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        _ = changed.notified() => false,
+        _ = exited.recv() => false,
+        _ = tokio::time::sleep(wake) => false,
+        _ = stopping.changed() => true,
     }
 }
 
@@ -1434,6 +1449,25 @@ fn not_its_image(local: Option<&kith_runtime::Local>, owner: &str, image: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store change wakes the controller's loop before its tick: a pass does not wait the
+    /// 10 s TICK for a change it is told of (the wait stops at the change, and not at the tick).
+    #[tokio::test]
+    async fn the_loop_wakes_on_a_change_before_its_tick() {
+        let changed = Notify::new();
+        let mut exited = signal(SignalKind::child()).expect("installing a signal handler");
+        // The sender stays alive: a dropped one would count as stopping.
+        let (_stop, mut stopping) = watch::channel(false);
+        let poke = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            changed.notify_one();
+        };
+        let (woken, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(5), until_woken(&changed, &mut exited, TICK, &mut stopping)),
+            poke
+        );
+        assert_eq!(woken.ok(), Some(false), "a change did not wake the loop before its {TICK:?} tick");
+    }
 
     /// A unit runs the cluster Images of its own namespace and no other's, by either name
     /// of the node's registry; what is not that registry's is nothing to this.
