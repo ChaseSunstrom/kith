@@ -148,8 +148,11 @@ logged naming it, on both nodes):
   unit's `address` is taken only inside the worker's own part of the mesh. (Today a node
   may name any replica: one replica can say it is all of them and draw the Service's
   traffic.)
-- **Its own Node's status**: `os` and `mesh` (its key, its port, whom it reaches), the two
-  fields a node writes of itself after it has joined. A mesh key another Node says is
+- **Its own Node's status**: `os`, `mesh` (its key, its port, whom it reaches) and `serves`
+  (the DNS port it answers, `ingress: true` if it answers ingress; null when it serves
+  neither), the fields a node writes of itself after it has joined. A worker that runs from
+  a view is refused `serves.ingress`, since the control node that let it join did not let it
+  serve ingress; the address and `view` are never its to write. A mesh key another Node says is
   refused: two nodes that say one key are both left out of the mesh today, so a worker
   could cut any node off by saying its key. Not `address`, `raftId` or
   `certificate`: the node that admitted it wrote those at the join, and `certificate` is

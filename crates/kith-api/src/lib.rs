@@ -273,6 +273,17 @@ fn check_name(name: &str) -> Result<(), String> {
 }
 
 impl Resource {
+    /// The address on the LAN that a Node's peers reach it at: the host of `status.address`, which the
+    /// control node that admitted it saw. None for a roaming Node (its address is on the mesh) and for
+    /// one not admitted yet.
+    pub fn lan_address(&self) -> Option<std::net::IpAddr> {
+        if self.spec["roaming"] == true {
+            return None;
+        }
+        let address = self.status.as_ref()?["address"].as_str()?;
+        address.parse::<std::net::SocketAddr>().ok().map(|at| at.ip())
+    }
+
     /// Validate one parsed YAML document. Errors point into the source.
     pub fn from_node(node: &Node) -> Result<Resource, kith_yaml::Error> {
         let fail = |at: &Node, msg: String| Err(kith_yaml::Error { msg, pos: Some(at.pos) });

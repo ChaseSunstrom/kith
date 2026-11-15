@@ -914,6 +914,13 @@ kith get dnsrecord                   # each one says `served`, or why not
   `<service>.<namespace>.kith` a Service's address on the mesh (where the
   node asked is on it). Names under `kith` are the cluster's own: a zone
   cannot take them.
+- `status.serves` on a Node says what the node answers: `dns` the port it serves
+  DNS on, and `ingress: true` if it serves ingress. A node says it from its own
+  `--dns` and `--ingress` flags, and a restart without them takes it off. That is
+  the node's word. A node's address on the LAN is `status.address`, the address
+  the control node that admitted it saw at join; a node behind NAT, or one that
+  moved to another address, is not covered (delete it and join it again). A
+  roaming node has its address on the mesh instead. `kith get node` shows both.
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
   zone itself. Names in values are full names (`nas.home.example`).

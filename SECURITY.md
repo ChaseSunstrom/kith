@@ -291,7 +291,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     nodes to keep and to no worker, and a node made a worker deletes the keys it
     kept. Of a worker's word about which nodes are there, only what it says of itself
     is taken. A worker's replica takes over a lost Volume only when no control node
-    has one, whatever time it says it synced.
+    has one, whatever time it says it synced. A worker's `status.serves` (the DNS port
+    it says it answers, and ingress) is its own word and nothing more: a control node
+    does not probe it, and nothing outside the cluster acts on it yet. A Node's address
+    on the LAN is the one the admitting control node saw at join, not the node's word.
 
     A worker keeps a view of the store, not the store (`docs/adr-workers.md`). A
     control node sends it, by the name in the worker's certificate: every Node,
