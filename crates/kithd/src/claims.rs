@@ -149,9 +149,10 @@ fn claimants(store: &Store) -> Vec<(String, String, Vec<String>)> {
 ///
 /// A claim is `Exclusive` unless it says `Shared`: one workload holds a Device at a time, whichever
 /// claim it comes through. The holder is the workload the claim's status already names, then the
-/// first by key; but a workload that a claim names as `holder` goes before them all, so it takes
-/// the claim from whoever holds it. A workload holds all its claims or none, so two that want each
-/// other's never wait for ever.
+/// first by key. A claim's `holder` is granted the claim's Devices ahead of those: it takes them
+/// from a recorded holder of its own namespace, and waits behind any other, and it gets nothing
+/// else for being named. A workload holds all its claims or none, so two that want each other's
+/// never wait for ever.
 pub fn resolve(store: &Store) -> Claims {
     let known: BTreeMap<String, Known> = store
         .list(Some("DeviceClaim"))
@@ -183,13 +184,6 @@ pub fn resolve(store: &Store) -> Claims {
             )
         })
         .collect();
-    // The workloads named as holder by a claim that resolves: they go before the others who want
-    // the claim, so one that is named takes it from whoever holds it now.
-    let switched: BTreeSet<String> = known
-        .values()
-        .filter(|known| known.found.is_ok())
-        .filter_map(|known| known.holder.clone())
-        .collect();
     // Who each claim's status says holds it, and the share it was admitted with: a holder keeps its
     // share while it asks for no more than that, even where the Device has less vram than it asks
     // (a smaller label is not their turn lost). Asking for more is fitted again like a new claim.
@@ -208,6 +202,48 @@ pub fn resolve(store: &Store) -> Claims {
         .map(String::as_str)
         .collect();
     let mut wanting = claimants(store);
+    // Per Device: the workloads the statuses of the claims that name it record as holding it.
+    let mut recorded_on: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (claim, (holders, _)) in &kept {
+        let Some(Ok(held)) = known.get(claim).map(|known| &known.found) else {
+            continue;
+        };
+        for device in &held.devices {
+            recorded_on
+                .entry(device.as_str())
+                .or_default()
+                .extend(holders.iter().map(String::as_str));
+        }
+    }
+    // The grants: a claim's holder takes the claim's Devices ahead of the others, and so holds them
+    // while it is admitted. It is not granted a Device a recorded holder of another namespace holds,
+    // nor one another grant has. Granted in key order, so that two of one Device are the same
+    // every time. ponytail: a grant its workload cannot be admitted with is dropped and the whole
+    // resolve run again: at most one round per grant, so a few. Upgrade if claims number in the hundreds.
+    let mut grants: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut ordered = wanting.clone();
+    ordered.sort();
+    for (key, namespace, names) in &ordered {
+        for name in names {
+            let claim = format!("DeviceClaim/{namespace}/{name}");
+            let Some(known) = known.get(&claim) else { continue };
+            let Ok(held) = &known.found else { continue };
+            if known.shared || known.holder.as_ref() != Some(key) || matches!(held.seat, Some((_, true))) {
+                continue;
+            }
+            let free = held.devices.iter().all(|device| {
+                !grants.contains_key(device)
+                    && recorded_on
+                        .get(device.as_str())
+                        .is_none_or(|who| who.iter().all(|who| who.split('/').nth(1) == Some(namespace.as_str())))
+            });
+            if free {
+                for device in &held.devices {
+                    grants.insert(device.clone(), (key.clone(), claim.clone()));
+                }
+            }
+        }
+    }
     // (Those with a client claim after the others: a client asks who holds its seat.)
     let client = |namespace: &str, names: &[String]| {
         let of = |name: &String| known.get(&format!("DeviceClaim/{namespace}/{name}"));
@@ -215,133 +251,142 @@ pub fn resolve(store: &Store) -> Claims {
         names.iter().filter_map(of).any(is)
     };
     wanting.sort_by_key(|(key, namespace, names)| {
-        (
-            !switched.contains(key),
-            !recorded.contains(key.as_str()),
-            client(namespace, names),
-            key.clone(),
-        )
+        (!recorded.contains(key.as_str()), client(namespace, names), key.clone())
     });
-    // The seats that are held, and the namespaces of who holds each: its sessions'.
-    let mut sessions: BTreeSet<(String, String)> = BTreeSet::new();
-    // Per Device: (claim key, holder, exclusively) for each way it is held.
-    let mut taken: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
-    let mut holders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    // Per Device: the vram bytes its admitted shares ask for.
-    let mut asked: BTreeMap<String, u64> = BTreeMap::new();
-    let mut claims = Claims::default();
-    for (key, namespace, names) in wanting {
-        // Per Device: the vram bytes this workload's own shares ask for, so far.
-        let mut own: BTreeMap<String, u64> = BTreeMap::new();
-        let outcome = (|| {
-            let mut node: Option<&str> = None;
-            let mut devices = BTreeSet::new();
-            let mut seat: Option<(String, bool)> = None;
-            for name in &names {
-                let claim = format!("DeviceClaim/{namespace}/{name}");
-                let Known {
-                    shared, share, found, ..
-                } = known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
-                let held = found.as_ref().map_err(|why| format!("DeviceClaim {name}: {why}"))?;
-                if let Some(other) = node.filter(|other| *other != held.node) {
-                    return Err(format!(
-                        "its DeviceClaims are on different nodes, {other} and {}",
-                        held.node
-                    ));
-                }
-                node = Some(&held.node);
-                // (One `/run/seat`: a client of one seat is not also of another, nor its holder.)
-                if let (Some(first), Some(this)) = (&seat, &held.seat)
-                    && first != this
-                    && (first.1 || this.1)
-                {
-                    return Err(format!(
-                        "DeviceClaim {name}: a client of a seat names no other seat, and does not hold its own"
-                    ));
-                }
-                seat = seat.or(held.seat.clone());
-                // A client takes no Device: it is beside whoever holds them. And it is an
-                // app of its own namespace's session, not of another's: whoever may write a
-                // claim in one namespace is not thereby let into a session of another.
-                if let Some((seat, true)) = &held.seat {
-                    if !sessions.contains(&(seat.clone(), namespace.clone())) {
+    let (mut claims, mut holders, asked) = 'rounds: loop {
+        // The seats that are held, and the namespaces of who holds each: its sessions'.
+        let mut sessions: BTreeSet<(String, String)> = BTreeSet::new();
+        // Per Device: (claim key, holder, exclusively) for each way it is held.
+        let mut taken: BTreeMap<String, Vec<(String, String, bool)>> = BTreeMap::new();
+        for (device, (workload, claim)) in &grants {
+            taken
+                .entry(device.clone())
+                .or_default()
+                .push((claim.clone(), workload.clone(), true));
+        }
+        let mut holders: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // Per Device: the vram bytes its admitted shares ask for.
+        let mut asked: BTreeMap<String, u64> = BTreeMap::new();
+        let mut claims = Claims::default();
+        for (key, namespace, names) in wanting.clone() {
+            // Per Device: the vram bytes this workload's own shares ask for, so far.
+            let mut own: BTreeMap<String, u64> = BTreeMap::new();
+            let outcome = (|| {
+                let mut node: Option<&str> = None;
+                let mut devices = BTreeSet::new();
+                let mut seat: Option<(String, bool)> = None;
+                for name in &names {
+                    let claim = format!("DeviceClaim/{namespace}/{name}");
+                    let Known {
+                        shared, share, found, ..
+                    } = known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
+                    let held = found.as_ref().map_err(|why| format!("DeviceClaim {name}: {why}"))?;
+                    if let Some(other) = node.filter(|other| *other != held.node) {
                         return Err(format!(
-                            "waiting for DeviceClaim {name}: no workload of this namespace holds Seat {seat}"
+                            "its DeviceClaims are on different nodes, {other} and {}",
+                            held.node
                         ));
                     }
-                    continue;
-                }
-                for device in &held.devices {
-                    let mut ways = taken.get(device).into_iter().flatten();
-                    let clash = ways.find(|(_, by, exclusive)| *by != key && (*exclusive || !shared));
-                    if let Some((via, by, _)) = clash {
-                        return Err(if *via == claim {
-                            format!("waiting for DeviceClaim {name}, held by {by}")
-                        } else {
-                            let via = via.strip_prefix("DeviceClaim/").unwrap_or(via);
-                            format!(
-                                "waiting for DeviceClaim {name}: Device {device} is held by {by} through DeviceClaim {via}"
-                            )
-                        });
+                    node = Some(&held.node);
+                    // (One `/run/seat`: a client of one seat is not also of another, nor its holder.)
+                    if let (Some(first), Some(this)) = (&seat, &held.seat)
+                        && first != this
+                        && (first.1 || this.1)
+                    {
+                        return Err(format!(
+                            "DeviceClaim {name}: a client of a seat names no other seat, and does not hold its own"
+                        ));
                     }
-                }
-                // A share is counted against each Device's vram, as far as the Device has room: a
-                // Device with no vram it can count admits it, and the status says it is not counted.
-                if let Some(amount) = *share {
-                    for device in &held.devices {
-                        let Some(of) = vram_of(store, device) else { continue };
-                        let used = asked
-                            .get(device)
-                            .copied()
-                            .unwrap_or(0)
-                            .saturating_add(own.get(device).copied().unwrap_or(0));
-                        let free = of.saturating_sub(used);
-                        let exempt = kept.get(&claim).is_some_and(|(holders, was)| {
-                            holders.contains(&key) && was.is_some_and(|was| amount <= was)
-                        });
-                        if amount > free && !exempt {
+                    seat = seat.or(held.seat.clone());
+                    // A client takes no Device: it is beside whoever holds them. And it is an
+                    // app of its own namespace's session, not of another's: whoever may write a
+                    // claim in one namespace is not thereby let into a session of another.
+                    if let Some((seat, true)) = &held.seat {
+                        if !sessions.contains(&(seat.clone(), namespace.clone())) {
                             return Err(format!(
-                                "waiting for DeviceClaim {name}: Device {device} has {free} of its {of} vram bytes free, and the share asks for {amount}"
+                                "waiting for DeviceClaim {name}: no workload of this namespace holds Seat {seat}"
                             ));
                         }
-                        let sum = own.entry(device.clone()).or_default();
-                        *sum = sum.saturating_add(amount);
+                        continue;
+                    }
+                    for device in &held.devices {
+                        let mut ways = taken.get(device).into_iter().flatten();
+                        let clash = ways.find(|(_, by, exclusive)| *by != key && (*exclusive || !shared));
+                        if let Some((via, by, _)) = clash {
+                            return Err(if *via == claim {
+                                format!("waiting for DeviceClaim {name}, held by {by}")
+                            } else {
+                                let via = via.strip_prefix("DeviceClaim/").unwrap_or(via);
+                                format!(
+                                    "waiting for DeviceClaim {name}: Device {device} is held by {by} through DeviceClaim {via}"
+                                )
+                            });
+                        }
+                    }
+                    // A share is counted against each Device's vram, as far as the Device has room: a
+                    // Device with no vram it can count admits it, and the status says it is not counted.
+                    if let Some(amount) = *share {
+                        for device in &held.devices {
+                            let Some(of) = vram_of(store, device) else { continue };
+                            let used = asked
+                                .get(device)
+                                .copied()
+                                .unwrap_or(0)
+                                .saturating_add(own.get(device).copied().unwrap_or(0));
+                            let free = of.saturating_sub(used);
+                            let exempt = kept.get(&claim).is_some_and(|(holders, was)| {
+                                holders.contains(&key) && was.is_some_and(|was| amount <= was)
+                            });
+                            if amount > free && !exempt {
+                                return Err(format!(
+                                    "waiting for DeviceClaim {name}: Device {device} has {free} of its {of} vram bytes free, and the share asks for {amount}"
+                                ));
+                            }
+                            let sum = own.entry(device.clone()).or_default();
+                            *sum = sum.saturating_add(amount);
+                        }
+                    }
+                    devices.extend(held.devices.iter().cloned());
+                }
+                let node = node.expect("a workload names a claim").to_string();
+                Ok(Held {
+                    node,
+                    devices: devices.into_iter().collect(),
+                    seat,
+                })
+            })();
+            // A granted workload that cannot be admitted gives its grant back, and the round is run again.
+            if outcome.is_err() && grants.values().any(|(granted, _)| *granted == key) {
+                grants.retain(|_, (granted, _)| *granted != key);
+                continue 'rounds;
+            }
+            if outcome.is_ok() {
+                for (device, amount) in own {
+                    let sum = asked.entry(device).or_default();
+                    *sum = sum.saturating_add(amount);
+                }
+                for name in &names {
+                    let claim = format!("DeviceClaim/{namespace}/{name}");
+                    let shared = known[&claim].shared;
+                    holders.entry(claim.clone()).or_default().insert(key.clone());
+                    let found = known[&claim].found.as_ref().expect("it resolved");
+                    match &found.seat {
+                        Some((_, true)) => continue,
+                        Some((seat, false)) => drop(sessions.insert((seat.clone(), namespace.clone()))),
+                        None => {}
+                    }
+                    for device in &found.devices {
+                        taken
+                            .entry(device.clone())
+                            .or_default()
+                            .push((claim.clone(), key.clone(), !shared));
                     }
                 }
-                devices.extend(held.devices.iter().cloned());
             }
-            let node = node.expect("a workload names a claim").to_string();
-            Ok(Held {
-                node,
-                devices: devices.into_iter().collect(),
-                seat,
-            })
-        })();
-        if outcome.is_ok() {
-            for (device, amount) in own {
-                let sum = asked.entry(device).or_default();
-                *sum = sum.saturating_add(amount);
-            }
-            for name in &names {
-                let claim = format!("DeviceClaim/{namespace}/{name}");
-                let shared = known[&claim].shared;
-                holders.entry(claim.clone()).or_default().insert(key.clone());
-                let found = known[&claim].found.as_ref().expect("it resolved");
-                match &found.seat {
-                    Some((_, true)) => continue,
-                    Some((seat, false)) => drop(sessions.insert((seat.clone(), namespace.clone()))),
-                    None => {}
-                }
-                for device in &found.devices {
-                    taken
-                        .entry(device.clone())
-                        .or_default()
-                        .push((claim.clone(), key.clone(), !shared));
-                }
-            }
+            claims.owners.insert(key, outcome);
         }
-        claims.owners.insert(key, outcome);
-    }
+        break 'rounds (claims, holders, asked);
+    };
     for (claim, Known { share, found, .. }) in known {
         let status = match found {
             Ok(held) => {
@@ -1180,5 +1225,119 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
                 .to_string();
             assert!(refused.contains("holder"), "{spec}: {refused}");
         }
+        let refused = Resource::from_source(&claim(
+            "x",
+            "{ device: a-gpu-card0, access: shared, holder: Workload/one }",
+        ))
+        .unwrap()
+        .remove(0)
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("for an exclusive claim"), "{refused}");
+    }
+
+    fn add(store: &mut Store, source: &str) {
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    /// What `claim` or `workload` writes, in another namespace.
+    fn within(namespace: &str, source: String) -> String {
+        source.replace(
+            "metadata: { name:",
+            &format!("metadata: {{ namespace: {namespace}, name:"),
+        )
+    }
+
+    /// Names `holder` on the claim already in the store, as `kith switch` does.
+    fn name_holder(store: &mut Store, claim: &str, holder: &str) {
+        let mut named = store.get(claim).unwrap().clone();
+        named.metadata.revision = None;
+        named.spec["holder"] = holder.into();
+        store.apply(named).unwrap();
+    }
+
+    #[test]
+    fn a_holder_takes_a_device_only_from_a_recorded_holder_of_its_own_namespace() {
+        let mut store = store(&within(
+            "other",
+            [claim("gpu", "{ device: a-gpu-card0 }"), workload("one", "[gpu]")].concat(),
+        ));
+        assert!(settle(&mut store).owners["Workload/other/one"].is_ok());
+        let source = within(
+            "default",
+            [
+                claim("gpu", "{ device: a-gpu-card0, holder: Workload/two }"),
+                workload("two", "[gpu]"),
+            ]
+            .concat(),
+        );
+        add(&mut store, &source);
+        let claims = settle(&mut store);
+        assert!(claims.owners["Workload/other/one"].is_ok());
+        assert!(
+            claims.owners["Workload/default/two"]
+                .as_ref()
+                .is_err_and(|why| why.contains("held by Workload/other/one"))
+        );
+    }
+
+    #[test]
+    fn a_workload_named_holder_by_a_claim_it_does_not_list_gains_nothing() {
+        let source = [
+            claim("gpu", "{ device: a-gpu-card0 }"),
+            claim("spare", "{ device: a-gpu-card0 }"),
+            workload("one", "[gpu]"),
+            workload("two", "[spare]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let claims = settle(&mut store);
+        assert!(claims.owners["Workload/default/one"].is_ok());
+        assert!(claims.owners["Workload/default/two"].is_err());
+        name_holder(&mut store, "DeviceClaim/default/gpu", "Workload/two");
+        let claims = settle(&mut store);
+        assert!(claims.owners["Workload/default/one"].is_ok());
+        assert!(claims.owners["Workload/default/two"].is_err());
+    }
+
+    #[test]
+    fn a_holder_gets_no_priority_on_the_devices_of_another_claim_it_lists() {
+        let mut store = store(&[claim("lens", "{ device: a-camera-video0 }"), workload("eye", "[lens]")].concat());
+        assert!(settle(&mut store).owners["Workload/default/eye"].is_ok());
+        let source = [
+            claim("gpu", "{ device: a-gpu-card0, holder: Workload/two }"),
+            claim("mon", "{ device: a-camera-video0 }"),
+            workload("two", "[gpu, mon]"),
+        ]
+        .concat();
+        add(&mut store, &source);
+        let claims = settle(&mut store);
+        assert!(claims.owners["Workload/default/eye"].is_ok());
+        assert!(
+            claims.owners["Workload/default/two"]
+                .as_ref()
+                .is_err_and(|why| why.contains("a-camera-video0"))
+        );
+    }
+
+    #[test]
+    fn two_claims_that_name_a_holder_each_for_one_device_settle_the_same_way_twice() {
+        let source = [
+            claim("gpu", "{ device: a-gpu-card0, holder: Workload/one }"),
+            claim("spare", "{ device: a-gpu-card0, holder: Workload/two }"),
+            workload("one", "[gpu]"),
+            workload("two", "[spare]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let first = settle(&mut store);
+        let second = settle(&mut store);
+        for key in ["Workload/default/one", "Workload/default/two"] {
+            assert_eq!(held(&first, key), held(&second, key), "{key}");
+        }
+        assert!(first.owners["Workload/default/one"].is_ok());
+        assert!(first.owners["Workload/default/two"].is_err());
     }
 }

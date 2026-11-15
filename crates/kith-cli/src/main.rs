@@ -1047,17 +1047,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let namespace = namespace.as_deref().unwrap_or(DEFAULT_NAMESPACE);
             let (kind, name) = workload.split_once('/').unwrap_or(("Workload", workload.as_str()));
             let holder = format!("{kind}/{name}");
-            let mut resource = backend.get(&format!("DeviceClaim/{namespace}/{claim}"))?;
+            // (The revision it came with stays: a change made meanwhile is refused, not overwritten.)
+            let key = format!("DeviceClaim/{namespace}/{claim}");
+            let mut resource = backend.get(&key)?;
             resource.spec["holder"] = serde_json::json!(holder);
-            (resource.metadata.revision, resource.status) = (None, None);
             let switched = resource.validated().or_else(fail)?;
             // (A holder that is not there would switch nothing: say so instead.)
             backend
                 .get(&format!("{kind}/{namespace}/{name}"))
                 .map_err(|e| format!("{holder}: {e}"))?;
-            for change in backend.apply(vec![switched], false)? {
+            let applied = backend.apply(vec![switched], false).map_err(|e| {
+                if e.contains("is at revision") {
+                    format!("{key}: the claim changed meanwhile: run it again")
+                } else {
+                    e
+                }
+            })?;
+            for change in applied {
                 let revision = change.after.metadata.revision.unwrap_or(0);
-                println!("{} held by {holder} (revision {revision})", change.after.key());
+                println!(
+                    "{} asks for {holder} (revision {revision}): `kith get deviceclaim {claim}` shows who holds it",
+                    change.after.key()
+                );
             }
         }
         Command::Backup {

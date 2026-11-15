@@ -1727,9 +1727,12 @@ kith switch gpu desktop   # the session takes it back
 ```
 
 - A claim's `holder` is the workload that takes the Device ahead of the others who want
-  it. The current holder is stopped, and only then is the new one started, in the same
-  pass of the controller. The holder stays until another `kith switch`. A holder with no
-  replicas takes nothing: the one holding the card keeps it.
+  it. That priority is for this claim's Devices only, and only if the workload lists the
+  claim in its template. It takes the Device from a holder of its own namespace; a holder
+  of another namespace keeps it, and the named workload waits behind it, as its claim's
+  status says. The current holder is stopped, and only then is the new one started, in the
+  same pass of the controller. The holder stays until another `kith switch`. A holder with
+  no replicas takes nothing: the one holding the card keeps it.
 - A card keeps its `pci` label (its place on the bus) under either driver, so a claim with
   `selector: { pci: "0000:01:00.0" }` names the same card as a `gpu` and as a passed-through
   Device. A `holder` is of an exclusive claim only.

@@ -623,11 +623,14 @@ spec:
     );
     assert_eq!(sb.kith(&["apply", "-f", "gpu.yaml"]).0, 0);
 
-    // One apply of the claim: revision 2, and the holder is named.
+    // One apply of the claim: revision 2. What came of it is the claim's status, not this line.
     let (code, out, err) = sb.kith(&["switch", "gpu", "game"]);
     assert_eq!(
         (code, out.as_str()),
-        (0, "DeviceClaim/default/gpu held by Workload/game (revision 2)\n"),
+        (
+            0,
+            "DeviceClaim/default/gpu asks for Workload/game (revision 2): `kith get deviceclaim gpu` shows who holds it\n"
+        ),
         "{err}"
     );
     let (_, yaml, _) = sb.kith(&["get", "DeviceClaim/gpu", "-o", "yaml"]);

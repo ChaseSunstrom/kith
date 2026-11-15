@@ -2103,7 +2103,7 @@ impl Spec for DeviceClaimSpec {
         }
         if let Some(holder) = &self.holder {
             if matches!(self.access, Some(Access::Shared | Access::Client)) {
-                return Err("spec.holder: a holder is of an exclusive claim: leave `access` unsaid".into());
+                return Err("spec.holder: a holder is for an exclusive claim, not one with `access: shared` or `access: client`".into());
             }
             let named = holder.split_once('/').is_some_and(|(kind, name)| {
                 matches!(kind, "Workload" | "Job") && !name.is_empty() && !name.contains('/')
