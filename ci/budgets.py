@@ -27,7 +27,6 @@ import sys
 import tempfile
 import time
 
-TARGET = "x86_64-unknown-linux-musl"  # static, as shipped
 MB = 1024 * 1024
 RUNS = 5  # each time is the median of this many runs
 
@@ -291,29 +290,16 @@ def idle_rss(kithd, tmp):
         daemon.wait()
 
 
-def musl_cc(env):
-    """kithd's TLS (ring) has C in it, so a static build needs a musl C compiler.
-
-    CI installs musl-tools. Where there is none but zig is installed, zig is one.
-    """
-    var = "CC_" + TARGET.replace("-", "_")
-    if var in env or shutil.which("musl-gcc") or shutil.which("x86_64-linux-musl-gcc") or not shutil.which("zig"):
-        return env
-    wrapper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "musl-cc.sh")
-    return {**env, var: wrapper}
-
-
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = "--self-test" in sys.argv
-    bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
+    # The binaries the image ships, built by the one command line that builds them for it: a
+    # package built alone gets other features of the crates both share, so it is another binary
+    # (and each order would build those crates again).
+    built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True)
+    bin_dir = built.stdout.strip()
     with tempfile.TemporaryDirectory() as tmp:
-        build_env = musl_cc(os.environ.copy())
-        for binary in SIZE_BUDGETS:
-            package = "kith-cli" if binary == "kith" else binary
-            build = ["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package]
-            subprocess.run(build, check=True, env=build_env)
         if "--times" in sys.argv:
             # The same three paths, unjudged: the numbers the budgets are set from.
             print(f"load {os.getloadavg()[0]:.1f} on {os.cpu_count()} CPUs")

@@ -3,7 +3,7 @@
 # are in (the one line this writes to its standard output).
 #
 # kithd's TLS (ring) has C in it, so linking it for musl needs a musl C compiler:
-# musl-gcc, or CC_x86_64_unknown_linux_musl, or else zig (as ci/budgets.py does).
+# musl-gcc, or CC_x86_64_unknown_linux_musl, or else zig. ci/budgets.py weighs what this builds.
 set -eu
 here=$(dirname "$0")
 root=$(cd "$here/.." && pwd)

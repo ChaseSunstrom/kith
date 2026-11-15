@@ -150,7 +150,7 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
-compiler when there is no musl-gcc, as ci/budgets.py does) and needs cpio and zstd.
+compiler when there is no musl-gcc: ci/musl.sh) and needs cpio and zstd.
 EOF
 }
 
