@@ -130,9 +130,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   at the registry's own port, so neither what is pulled nor the password is read off the
   loopback (by a container that is the node's root, say; that a pull happens, and how
   large, still shows) and a process that takes the port in kithd's place learns no
-  password. A process of the node that floods the port can hold Image pulls up. Every
-  start from one of the node's Images asks this registry for the manifest, whatever the
-  pull policy, so an Image deleted, or whose namespace was deleted and made again under
+  password. The bound is on kithd's file descriptors and memory: its connections, shaken or
+  not, are at most 64 at a time, and each is closed after 2 s without a handshake, after 5 s
+  without a whole request head, at a 401, or after 5 s with no byte between requests. The
+  head time runs from when the registry starts reading a head (the connection's start, or
+  the end of the last answer). A request being answered is not cut by the 5 s, because an
+  answer may wait on a copy from another node. What is left: a process on the node that
+  keeps connecting can fill the 64 slots and the kernel's queue behind them again and again,
+  and kithd's own pull then waits behind them or times out, for as long as that process
+  keeps at it. Kithd's other listeners and its open-file limit are not bounded by this.
+  Every start from one of the node's Images asks this registry for the manifest, whatever
+  the pull policy, so an Image deleted, or whose namespace was deleted and made again under
   the same name, is not started from the copy kept on the node; the old bytes stay on the
   node's disk until the Image is removed. And kithd pulls an Image only for what runs in
   the Image's own namespace: an Image is a packed Volume. Reading kithd's memory is being

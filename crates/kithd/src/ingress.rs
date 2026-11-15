@@ -459,6 +459,11 @@ impl<T> Idle<T> {
         }
     }
 
+    /// Starts the time over, as if a byte had moved now.
+    pub fn renew(&mut self) {
+        self.timer.as_mut().reset(Instant::now() + self.idle);
+    }
+
     /// Bytes moved start the time over; a poll that has to wait asks the time.
     fn watch<R>(&mut self, cx: &mut Context<'_>, polled: Poll<std::io::Result<R>>) -> Poll<std::io::Result<R>> {
         match polled {
@@ -487,11 +492,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Idle<T> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        self.watch(cx, polled)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let polled = Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.watch(cx, polled)
     }
 }
 
@@ -642,8 +649,8 @@ where
     });
     // ponytail: hyper's limits: 100 headers (431 past that), a request's head within about
     // 64 KiB (`max_buf_size`, looked at between reads; 431 past it) and within 30 seconds
-    // of its first byte; the connection's own idle time (`IDLE`, under TLS) ends one that
-    // says nothing between.
+    // of starting to read it (from the connection's start or the end of the last answer);
+    // the connection's own idle time (`IDLE`, under TLS) ends one that says nothing between.
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(30))
