@@ -1676,6 +1676,33 @@
             }
           ]
         },
+        "startingDeadlineSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "How late a minute the schedule named may still be run, where no node led in it\n(or kithd was down): the latest missed one only. Without it a missed minute is skipped."
+        },
+        "successfulJobsHistoryLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Finished Jobs that succeeded and are kept (3 unless said)."
+        },
+        "failedJobsHistoryLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "Finished Jobs that failed and are kept (3 unless said)."
+        },
         "job": {
           "$ref": "#/$defs/JobSpec"
         }

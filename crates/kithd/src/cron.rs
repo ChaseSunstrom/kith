@@ -1,15 +1,24 @@
 //! CronJobs: at each minute a CronJob's schedule names (in UTC), the node that leads the
 //! store makes a Job of it, named after the CronJob and the minute. A CronJob that says
 //! `concurrency: forbid` waits for its Job that has not finished, one that says `replace`
-//! has it removed first. The last [`KEPT`] finished Jobs of a CronJob are kept; each is
-//! marked as the CronJob's own ([`OWNER`]), so all of them go when it does.
+//! has it removed first. The last [`KEPT`] finished Jobs of a CronJob that succeeded and
+//! as many that failed are kept (`successfulJobsHistoryLimit`, `failedJobsHistoryLimit`
+//! say otherwise); each is marked as the CronJob's own ([`OWNER`]), so all of them go
+//! when it does.
+//!
+//! A minute in which no node led (or kithd was not running) is made up for when the
+//! CronJob says `startingDeadlineSeconds`: of the minutes its schedule named since
+//! `status.last` that are no older than that, the latest is run, once. One that has
+//! never run (no `status.last`) has nothing to catch up from.
 //!
 //! A CronJob whose schedule cannot be read, or that names a time zone other than UTC, is
 //! not run, and its status says why (`message`).
 //!
-//! ponytail: a minute in which no node led (or kithd was not running) is not made up for,
-//! and Kubernetes's `startingDeadlineSeconds` would say how late a run may still start:
-//! read `status.last` and catch up from it if a missed run comes to matter.
+//! ponytail: no table of time zones: measured, the zones' rules are 207 kB as compiled
+//! (`zic -b slim`, 345 distinct zones; 407 kB as the host keeps them, 105 kB as source
+//! with a parser to write), over the 150 kB this was given out of what kithd has left
+//! under its 13.00 MB, and kith OS ships none. Take a zone's name if that room is made. A catch-up looks back
+//! at most [`LOOKBACK`] minutes: one more `due` per minute per CronJob that is idle.
 
 use crate::Shared;
 use crate::releases::{OWNER, owner};
@@ -23,8 +32,50 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 
-/// Finished Jobs of a CronJob that are kept.
+/// Finished Jobs of a CronJob that are kept of each, unless it says.
 const KEPT: usize = 3;
+
+/// The most minutes a catch-up looks back, whatever the deadline (a week).
+const LOOKBACK: u64 = 7 * 24 * 60;
+
+/// Seconds since the epoch of `2026-11-12T09:30:00Z` (what [`rfc3339`] writes).
+fn unrfc3339(text: &str) -> Option<u64> {
+    let n = |from: usize, len: usize| text.get(from..from + len)?.parse::<i64>().ok();
+    if text.len() != 20 || !text.ends_with('Z') {
+        return None;
+    }
+    let (m, d) = (n(5, 2)?, n(8, 2)?);
+    let y = n(0, 4)? - i64::from(m <= 2);
+    let (era, yoe) = (y.div_euclid(400), y.rem_euclid(400));
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    u64::try_from(days * 86400 + n(11, 2)? * 3600 + n(14, 2)? * 60 + n(17, 2)?).ok()
+}
+
+/// The minute (since the epoch, in minutes) to make a Job for at `at`: the latest the
+/// schedule names, of this one and, where the CronJob has a deadline, the ones since its
+/// last run that the deadline allows.
+fn minute(cron: &Resource, schedule: &Schedule, at: u64) -> Option<u64> {
+    let this = at / 60;
+    let last = cron
+        .status
+        .as_ref()
+        .and_then(|status| status["last"].as_str())
+        .and_then(unrfc3339);
+    // (Never the minute of its last run again, nor one before it: a Job that ran and went,
+    // kept by no history limit, is not made a second time by a look in the same minute.)
+    let after = last.map_or(0, |last| last / 60 + 1);
+    let from = match (cron.spec["startingDeadlineSeconds"].as_u64(), last) {
+        (Some(deadline), Some(_)) => (at.saturating_sub(deadline))
+            .div_ceil(60)
+            .max(this.saturating_sub(LOOKBACK)),
+        _ => this,
+    };
+    // (This minute is run on time whatever the deadline.)
+    (from.min(this).max(after)..=this)
+        .rev()
+        .find(|minute| schedule.due(minute * 60))
+}
 
 /// What the minute `at` is in asks for.
 #[derive(Default)]
@@ -69,8 +120,16 @@ fn plan(store: &Store, at: u64) -> Step {
         let finished = |job: &&Resource| matches!(job.status.as_ref().map(|status| &status["state"]), Some(state) if state == "succeeded" || state == "failed");
         // (A Job's name ends in its minute: by name is by age.)
         let (done, running): (Vec<&Resource>, Vec<&Resource>) = mine.into_iter().partition(finished);
-        let old = done.len().saturating_sub(KEPT);
-        step.delete.extend(done[..old].iter().map(|job| job.key()));
+        let (good, bad): (Vec<&Resource>, Vec<&Resource>) = done
+            .iter()
+            .partition(|job| job.status.as_ref().is_some_and(|status| status["state"] == "succeeded"));
+        for (jobs, field) in [(good, "successfulJobsHistoryLimit"), (bad, "failedJobsHistoryLimit")] {
+            let kept = cron.spec[field]
+                .as_u64()
+                .map_or(KEPT, |kept| usize::try_from(kept).unwrap_or(KEPT));
+            step.delete
+                .extend(jobs[..jobs.len().saturating_sub(kept)].iter().map(|job| job.key()));
+        }
         let due = schedule(cron);
         // What it says of that, where it does not say it already (nothing, where it runs).
         let why = due.as_ref().err().map_or(Value::Null, |why| json!(why));
@@ -79,9 +138,11 @@ fn plan(store: &Store, at: u64) -> Step {
             step.last
                 .push((key.clone(), Map::from_iter([("message".to_string(), why)])));
         }
-        let name = format!("{}-{}", meta.name, at / 60);
-        let made = running.iter().chain(&done).any(|job| job.metadata.name == name);
-        if !due.is_ok_and(|schedule| schedule.due(at)) || made {
+        let Some(minute) = due.ok().and_then(|schedule| minute(cron, &schedule, at)) else {
+            continue;
+        };
+        let name = format!("{}-{minute}", meta.name);
+        if running.iter().chain(&done).any(|job| job.metadata.name == name) {
             continue;
         }
         match cron.spec["concurrency"].as_str() {
@@ -105,7 +166,7 @@ fn plan(store: &Store, at: u64) -> Step {
             spec: cron.spec["job"].clone(),
             status: None,
         });
-        let last = json!({ "last": rfc3339(at - at % 60) });
+        let last = json!({ "last": rfc3339(minute * 60) });
         step.last.extend(last.as_object().map(|last| (key, last.clone())));
     }
     step
@@ -236,7 +297,7 @@ mod tests {
         let made: Vec<&str> = step.make.iter().map(|job| job.metadata.name.as_str()).collect();
         assert_eq!(made, [format!("anew-{}", minute + 1), format!("later-{}", minute + 1)]);
         assert_eq!(step.delete, [format!("Job/default/{}", name("anew"))]);
-        // Of the finished ones the last three are kept.
+        // Of the finished ones the last three that succeeded and the last three that failed are kept.
         let mut store = Store::default();
         store.apply(cron("often", "30 9 * * *", "allow")).unwrap();
         for n in 1..=5 {
@@ -249,6 +310,80 @@ mod tests {
         }
         let key = |name: &str| format!("Job/default/{name}");
         let step = plan(&store, at + 3600);
-        assert_eq!(step.delete, [key("often-1"), key("often-2")]);
+        assert_eq!(step.delete, [key("often-1")]);
+        // A CronJob that says how many of each are kept keeps that many: one that succeeded,
+        // none that failed.
+        let mut few = cron("often", "30 9 * * *", "allow");
+        few.spec["successfulJobsHistoryLimit"] = 1.into();
+        few.spec["failedJobsHistoryLimit"] = 0.into();
+        store.apply(few).unwrap();
+        let mut deleted = plan(&store, at + 3600).delete;
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            [key("often-1"), key("often-2"), key("often-3"), key("often-4")]
+        );
+    }
+
+    #[test]
+    fn a_missed_minute_is_made_up_once_within_its_deadline() {
+        // Friday 2026-11-13 09:34:10; `*/10 * * * *` named 09:10, 09:20 and 09:30 since 09:00.
+        let (at, nine_thirty) = (1_794_562_450, 1_794_562_200);
+        let job = json!({ "template": { "exec": [{ "name": "tick", "command": ["true"] }] } });
+        let mut store = Store::default();
+        let nine = nine_thirty - 1800;
+        for (name, deadline, last) in [
+            ("late", Some(300), Some(nine)),
+            ("too-late", Some(200), Some(nine)),
+            ("unsaid", None, Some(nine)),
+            ("new", Some(3600), None),
+            ("zero", Some(0), Some(nine)),
+            ("done", Some(3600), Some(nine_thirty)),
+        ] {
+            let spec = json!({ "schedule": "*/10 * * * *", "job": job, "startingDeadlineSeconds": deadline });
+            let key = store.apply(resource("CronJob", name, spec)).unwrap().after.key();
+            if let Some(last) = last {
+                store.set_status(&key, Some(json!({ "last": rfc3339(last) }))).unwrap();
+            }
+        }
+        let minute = nine_thirty / 60;
+        let step = plan(&store, at);
+        let made: Vec<&str> = step.make.iter().map(|job| job.metadata.name.as_str()).collect();
+        assert_eq!(
+            made,
+            [format!("late-{minute}")],
+            "the latest missed one, once, in its deadline"
+        );
+        assert_eq!(step.last[0].1["last"], "2026-11-13T09:30:00Z");
+        // Made, it is not made again; a minute the schedule names is run on time as before.
+        let mut store = store;
+        for job in step.make {
+            store.apply(job).unwrap();
+        }
+        store
+            .set_status("CronJob/default/late", Some(json!({ "last": rfc3339(nine_thirty) })))
+            .unwrap();
+        assert!(plan(&store, at + 60).make.is_empty());
+        // Nor is the minute of a last run made again in that same minute, its Job gone
+        // already (a history limit of 0): `done` ran at 09:30 and has no Job. (The four that
+        // last ran at 09:00, or never, run at 09:30 on time.)
+        let again = plan(&store, nine_thirty + 5);
+        let again: Vec<&str> = again.make.iter().map(|job| job.metadata.name.as_str()).collect();
+        assert_eq!(again.len(), 4, "{again:?}");
+        assert!(!again.contains(&format!("done-{minute}").as_str()), "{again:?}");
+        let on_time = plan(&store, nine_thirty + 600 + 5);
+        assert_eq!(
+            on_time.make.len(),
+            6,
+            "09:40 is named by all six, and is run on time as before"
+        );
+    }
+
+    #[test]
+    fn a_status_time_is_read_back() {
+        for secs in [0, 951_782_400, 1_794_476_096] {
+            assert_eq!(unrfc3339(&rfc3339(secs)), Some(secs));
+        }
+        assert_eq!(unrfc3339("yesterday"), None);
     }
 }

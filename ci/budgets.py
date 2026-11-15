@@ -297,6 +297,73 @@ def idle_rss(kithd, tmp):
         daemon.wait()
 
 
+def relro_sealed(bin_dir, tmp, limit):
+    """Per shipped binary, whether the bytes of its PT_GNU_RELRO that the running process can
+    still write are at most `limit` (0: musl's static-pie start code leaves the part rw-p and
+    the program must shut it itself; -1 for the self-test). Fails with the count."""
+    runs = {
+        "kithd": [os.path.join(tmp, "relro-state"), os.path.join(tmp, "relro.sock")],
+        "kith": ["--store", os.path.join(tmp, "relro-store.json")],
+    }
+    results = []
+    for name, rest in runs.items():
+        binary = os.path.join(bin_dir, name)
+        # kithd serves its socket; kith waits for a document on a pipe that stays open.
+        argv = [binary, "--state", rest[0], "--socket", rest[1]] if name == "kithd" else [binary, "apply", "-f", "-", *rest]
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 10
+            while not (name == "kith" or os.path.exists(rest[1])) or os.path.realpath(f"/proc/{proc.pid}/exe") != os.path.realpath(binary):
+                if proc.poll() is not None or time.time() > deadline:
+                    sys.exit(f"{name} did not start for the RELRO check")
+                time.sleep(0.05)
+            time.sleep(0.5)  # past startup
+            try:
+                writable, size = relro_writable(binary, proc.pid)
+            except OSError as e:
+                sys.exit(f"{name} ended before its maps could be read for the RELRO check: {e}")
+        finally:
+            proc.kill()
+            proc.stdin.close()
+            proc.wait()
+        ok = size > 0 and writable <= limit
+        why = "" if size > 0 else " (no PT_GNU_RELRO: nothing to hold read-only)"
+        print(f"{'ok  ' if ok else 'FAIL'} {name}: {writable} of {size} bytes of its PT_GNU_RELRO writable while it runs (budget {max(limit, 0)}){why}")
+        results.append(ok)
+    return results
+
+
+def relro_writable(binary, pid):
+    """The bytes of `binary`'s PT_GNU_RELRO range that the running process `pid` can write,
+    and the size of the range: its program headers against the process's /proc/PID/maps."""
+    with open(binary, "rb") as elf:
+        head = elf.read(64)
+        (phoff,) = struct.unpack_from("<Q", head, 32)
+        entsize, count = struct.unpack_from("<HH", head, 54)
+        elf.seek(phoff)
+        table = elf.read(entsize * count)
+    parts = [struct.unpack_from("<IIQQQQQQ", table, at) for at in range(0, len(table), entsize)]
+    first = min(p[3] for p in parts if p[0] == 1) & ~0xFFF  # the lowest PT_LOAD's page
+    maps = []
+    with open(f"/proc/{pid}/maps") as lines:
+        for line in lines:
+            # address perms offset dev inode [path]: the path may hold spaces.
+            span, perms, *rest = line.rstrip("\n").split(None, 5)
+            start, end = (int(x, 16) for x in span.split("-"))
+            maps.append((start, end, perms, rest[-1] if len(rest) > 3 else ""))
+    mine = [start for start, _, _, path in maps if path == os.path.realpath(binary)]
+    if not mine:
+        sys.exit(f"no mapping of {binary} in /proc/{pid}/maps for the RELRO check")
+    base = min(mine) - first
+    writable = size = 0
+    for kind, _flags, _offset, vaddr, _paddr, _filesz, memsz, _align in parts:
+        if kind == 0x6474E552:  # PT_GNU_RELRO
+            size += memsz
+            lo, hi = base + vaddr, base + vaddr + memsz
+            writable += sum(max(0, min(hi, end) - max(lo, start)) for start, end, perms, _ in maps if "w" in perms)
+    return writable, size
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
@@ -324,6 +391,7 @@ def main():
             results.append(check(name, "peak RSS", rss, 1 if self_test else limit))
         rss = idle_rss(os.path.join(bin_dir, "kithd"), tmp)
         results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
+        results.extend(relro_sealed(bin_dir, tmp, -1 if self_test else 0))
         timed = medians(bin_dir, tmp, 1 if self_test else RUNS)
         for name in TIMED:
             budget = 0.001 if self_test else TIME_BUDGETS[name]
