@@ -32,9 +32,11 @@
 //!                              closed, reset by either end and kept for many small turns; say
 //!                              the address a connection there reached, each byte that did
 //!                              not come back in order, and how it went
-//!   pod fill FILE BYTES        say whether FILE was there (its root is empty if not), then
+//!   pod fill FILE BYTES [unlinked]
+//!                              say whether FILE was there (its root is empty if not), then
 //!                              write BYTES to it, 64 KiB each half second, saying if a write
-//!                              fails (the disk is full), and wait
+//!                              fails (the disk is full), and wait; unlinked: removes FILE
+//!                              first and writes to it held open, with no name
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -441,13 +443,17 @@ fn main() {
             println!("check: {connections} connections and one of 5000 turns ({:.0} a second), {} failed", rate.unwrap_or(0.0), failed.len());
             std::process::exit(if failed.is_empty() { 0 } else { 1 });
         }
-        ["fill", file, bytes] => {
+        ["fill", file, bytes, how @ ..] => {
             let bytes: u64 = bytes.parse().expect("how many bytes");
             match std::fs::metadata(file) {
                 Ok(was) => println!("fill: {file} was there: {} bytes", was.len()),
                 Err(_) => println!("fill: an empty root"),
             }
             let mut out = std::fs::File::create(file).expect("the file it fills");
+            if how == ["unlinked"] {
+                std::fs::remove_file(file).expect("the file it fills, removed");
+                println!("fill: {file} removed, held open");
+            }
             let chunk = vec![7u8; 64 << 10];
             let mut wrote = 0;
             while wrote < bytes {
@@ -463,6 +469,6 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked]"),
     }
 }

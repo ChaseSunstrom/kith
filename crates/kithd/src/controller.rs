@@ -131,6 +131,8 @@ struct Slot {
     started: Instant,
     /// When to (re)start it; `None` when it is running or done for good.
     start_at: Option<Instant>,
+    /// Its last run was ended for what its pod wrote (`replace`): its next run says so.
+    replaced: bool,
 }
 
 impl Slot {
@@ -181,10 +183,13 @@ struct Controller {
     reserve: Option<u64>,
     /// The count of what pods wrote outside their volumes, on its way, and when it began.
     count: Option<(Instant, tokio::task::JoinHandle<Counted>)>,
-    /// When the last count began.
+    /// When the last count ended.
     counted: Option<Instant>,
     /// The last count found the state disk under its reserve with no pod to replace for it.
     low: bool,
+    /// The pods replaced for what they wrote, when, and the removal of what they wrote once no run
+    /// from before is left: till it is done they are not counted and none is replaced for the reserve.
+    replacing: BTreeMap<String, (Instant, Option<tokio::task::JoinHandle<()>>)>,
 }
 
 /// What a count found: the state disk's free bytes, its reserve, and each pod counted.
@@ -213,6 +218,15 @@ pub async fn run(
     };
     if let Err(e) = std::fs::create_dir_all(&shared.logs) {
         eprintln!("kithd: creating {}: {e}", shared.logs.display());
+    }
+    let disk = nix::sys::statvfs::statvfs(shared.logs.parent().unwrap_or(&shared.logs));
+    if let (Some(reserve), Ok(disk)) = (reserve, disk)
+        && reserve > disk.blocks() * disk.fragment_size()
+    {
+        eprintln!(
+            "kithd: --storage-reserve {reserve} is more than the state disk holds, {} bytes: the disk is always under it, and the pod that wrote the most is replaced each count",
+            disk.blocks() * disk.fragment_size()
+        );
     }
     // After a restart this node's copy of the store is old news: a replica that was moved
     // off it while it was away is still written down as its own. So first catch up: a
@@ -248,6 +262,7 @@ pub async fn run(
         count: None,
         counted: None,
         low: false,
+        replacing: BTreeMap::new(),
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -764,6 +779,7 @@ impl Controller {
                             message: None,
                             started: Instant::now(),
                             start_at: Some(not_before),
+                            replaced: false,
                         })),
                     }
                 }
@@ -1119,8 +1135,12 @@ impl Controller {
                     Ok(handle) => {
                         slot.handle = Some(handle);
                         slot.tuned = None;
-                        // Why it was replaced for what it wrote stays said while it runs again.
-                        let replaced = slot.message.take().filter(|m| m.starts_with(storage::REPLACED));
+                        // Why it was replaced for what it wrote stays said while it runs again, once.
+                        let replaced = std::mem::take(&mut slot.replaced);
+                        let replaced = slot
+                            .message
+                            .take()
+                            .filter(|m| replaced && m.starts_with(storage::REPLACED));
                         (slot.state, slot.message, slot.start_at, slot.started) =
                             ("running", replaced, None, Instant::now());
                         if let Run::Container(c) = &slot.run {
@@ -1410,24 +1430,47 @@ impl Controller {
         self.owners = Some(owners);
     }
 
-    /// Counts what each pod wrote outside its volumes, at most every `TICK`, one count at a time
-    /// and off the async threads; replaces what the last count says must go (`storage::choose`).
+    /// Counts what each pod wrote outside its volumes, at most every `TICK` after the last count
+    /// ended, one count at a time and off the async threads; replaces what the last count says
+    /// must go (`storage::choose`).
     fn tend_storage(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
         use futures_util::FutureExt;
+        let replicas = state.join(crate::files::REPLICAS);
+        // A replaced pod's old runs gone, what they wrote outside the scratch made anew goes.
+        let slots = &self.slots;
+        self.replacing.retain(|pod, (at, removal)| {
+            let runs: Vec<(bool, Instant)> = slots
+                .values()
+                .filter(|slot| slot.handle.is_some() && pod_of(&slot.owner, slot.replica) == *pod)
+                .map(|slot| (slot.leaving, slot.started))
+                .collect();
+            if storage::replacing(&runs, *at) {
+                return true;
+            }
+            let removal = removal.get_or_insert_with(|| {
+                let replica = replicas.join(pod);
+                tokio::task::spawn_blocking(move || storage::sweep(&replica))
+            });
+            !removal.is_finished()
+        });
         if self.count.as_ref().is_some_and(|(_, job)| job.is_finished())
             && let Some((began, job)) = self.count.take()
-            && let Some(Ok(Ok((free, reserve, pods)))) = job.now_or_never()
         {
-            let chosen = storage::choose(&pods, free, reserve);
-            let low = free < reserve && chosen.is_empty();
-            if low && !self.low {
-                eprintln!(
-                    "kithd: the state disk has {free} bytes free, under its reserve of {reserve}, and no pod wrote enough outside its volumes to free it"
-                );
-            }
-            self.low = low;
-            for (i, why) in chosen {
-                self.replace(&pods[i].id, began, &why, state);
+            self.counted = Some(Instant::now());
+            if let Some(Ok(Ok((free, reserve, pods)))) = job.now_or_never() {
+                // While what a replaced pod wrote is not gone yet, none is replaced for the reserve.
+                let reserve = if self.replacing.is_empty() { reserve } else { 0 };
+                let chosen = storage::choose(&pods, free, reserve);
+                let low = free < reserve && chosen.is_empty();
+                if low && !self.low {
+                    eprintln!(
+                        "kithd: the state disk has {free} bytes free, under its reserve of {reserve}, and no pod wrote enough outside its volumes to free it"
+                    );
+                }
+                self.low = low;
+                for (i, why) in chosen {
+                    self.replace(&pods[i].id, began, &why, state);
+                }
             }
         }
         if self.count.is_some() || self.counted.is_some_and(|at| at.elapsed() < TICK) {
@@ -1439,38 +1482,64 @@ impl Controller {
             .as_ref()
             .map_or(u64::MAX, |d| d.blocks_available() * d.fragment_size());
         let total = disk.as_ref().map_or(0, |d| d.blocks() * d.fragment_size());
-        let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total));
-        // Per pod: its limit, the sum of its containers', and the roots of those running.
-        let mut pods: BTreeMap<String, (Option<u64>, Vec<PathBuf>)> = BTreeMap::new();
+        let root = nix::unistd::getuid().is_root();
+        let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total, root));
+        // Per pod: its limit, the sum of its containers', and the roots and cgroups of those running.
+        type Paths = Vec<PathBuf>;
+        let mut pods: BTreeMap<String, (Option<u64>, Paths, Paths)> = BTreeMap::new();
         for slot in self.slots.values() {
             let Run::Container(c) = &slot.run else { continue };
-            let (limit, roots) = pods.entry(pod_of(&slot.owner, slot.replica)).or_default();
+            let (limit, roots, cgroups) = pods.entry(pod_of(&slot.owner, slot.replica)).or_default();
             if let Some(bytes) = c.resources.as_ref().and_then(|r| r.storage.as_ref()?.bytes()) {
                 *limit = Some(limit.unwrap_or(0).saturating_add(bytes));
             }
-            roots.extend(slot.handle.as_ref().filter(|_| !slot.leaving).and_then(Handle::upper));
+            let running = slot.handle.as_ref().filter(|_| !slot.leaving);
+            roots.extend(running.and_then(Handle::upper));
+            cgroups.extend(running.map(|handle| handle.cgroup.clone()));
         }
-        let replicas = state.join(crate::files::REPLICAS);
-        let pods: Vec<(storage::Pod, Vec<PathBuf>)> = pods
+        let pods: Vec<(storage::Pod, Paths, Paths)> = pods
             .into_iter()
-            .filter(|(_, (limit, roots))| !roots.is_empty() && storage::walked(*limit, free, reserve))
-            .map(|(id, (limit, mut roots))| {
+            .filter(|(id, (limit, roots, _))| {
+                !roots.is_empty() && !self.replacing.contains_key(id) && storage::walked(*limit, free, reserve)
+            })
+            .map(|(id, (limit, mut roots, cgroups))| {
                 roots.push(replicas.join(&id).join("scratch"));
-                (storage::Pod { id, limit, bytes: 0 }, roots)
+                let pod = storage::Pod {
+                    id,
+                    limit,
+                    bytes: 0,
+                    finished: true,
+                };
+                (pod, roots, cgroups)
             })
             .collect();
         if pods.is_empty() {
             return;
         }
         let began = Instant::now();
-        self.counted = Some(began);
         let changed = shared.changed.clone();
+        let state = state.to_path_buf();
         let job = tokio::task::spawn_blocking(move || {
-            let pods = pods.into_iter().map(|(mut pod, roots)| {
-                pod.bytes = storage::count(&roots, pod.limit.unwrap_or(u64::MAX));
-                pod
-            });
-            (free, reserve, pods.collect())
+            let pods: Vec<storage::Pod> = pods
+                .into_iter()
+                .map(|(mut pod, roots, cgroups)| {
+                    // (A scratch set aside and not removed, by a kithd that stopped first, goes now.)
+                    storage::sweep(&replicas.join(&pod.id));
+                    let until = Instant::now() + storage::SPELL;
+                    let stop = pod.limit.unwrap_or(u64::MAX);
+                    (pod.bytes, pod.finished) = storage::count(&roots, stop, until);
+                    if pod.finished && pod.bytes <= stop {
+                        let pids: Vec<u32> = cgroups.iter().flat_map(|cgroup| storage::pids(cgroup)).collect();
+                        let (held, finished) = storage::unlinked(&pids, &roots, until);
+                        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), finished);
+                    }
+                    pod
+                })
+                .collect();
+            // Free once what was set aside is gone.
+            let disk = nix::sys::statvfs::statvfs(&state).ok();
+            let free = disk.map_or(free, |d| d.blocks_available() * d.fragment_size());
+            (free, reserve, pods)
         });
         // Done, it wakes the loop to act on it.
         let job = tokio::spawn(async move {
@@ -1481,30 +1550,31 @@ impl Controller {
         self.count = Some((began, job));
     }
 
-    /// Kills every running unit of the pod `pod`, saying `why`, and empties its disk scratch: each
-    /// starts again as its restart policy says, from an empty root. A pod one of whose units
-    /// started after the count `began` is left to the next count.
+    /// Kills every running unit of the pod `pod`, saying `why`, and sets its disk scratch aside,
+    /// to be removed once they are gone: each starts again as its restart policy says, from an
+    /// empty root. A pod one of whose units started after the count `began` is left to the next
+    /// count; one a unit of which could not be killed is tried again then, its scratch where it is.
     fn replace(&mut self, pod: &str, began: Instant, why: &str, state: &Path) {
         let mine =
             |slot: &&mut Slot| pod_of(&slot.owner, slot.replica) == pod && slot.handle.is_some() && !slot.leaving;
         let mut units: Vec<(&String, &mut Slot)> = self.slots.iter_mut().filter(|(_, slot)| mine(slot)).collect();
-        if units.is_empty() || units.iter().any(|(_, slot)| slot.started > began) {
+        let started: Vec<Instant> = units.iter().map(|(_, slot)| slot.started).collect();
+        if !storage::replaceable(&started, began) {
             return;
         }
         eprintln!("kithd: {pod}: {why}");
+        let mut killed = true;
         for (id, slot) in &mut units {
-            slot.message = Some(why.to_string());
+            (slot.message, slot.replaced) = (Some(why.to_string()), true);
             if let Some(Err(e)) = slot.handle.as_mut().map(Handle::kill) {
                 eprintln!("kithd: {id}: {e}");
+                killed = false;
             }
         }
-        // Moved aside at once, so what starts next makes a new one, and removed off the async threads.
-        if let Some(gone) = storage::aside(&state.join(crate::files::REPLICAS).join(pod).join("scratch")) {
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = std::fs::remove_dir_all(&gone) {
-                    eprintln!("kithd: removing {}: {e}", gone.display());
-                }
-            });
+        if killed {
+            // Moved aside at once, so what starts next makes a new one.
+            storage::aside(&state.join(crate::files::REPLICAS).join(pod).join("scratch"));
+            self.replacing.insert(pod.to_string(), (Instant::now(), None));
         }
     }
 }
@@ -2163,6 +2233,7 @@ mod tests {
             message: None,
             started: Instant::now(),
             start_at: None,
+            replaced: false,
         }
     }
 

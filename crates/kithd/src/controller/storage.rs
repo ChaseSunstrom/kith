@@ -1,9 +1,15 @@
-//! What a pod writes outside its Volumes: its containers' writable roots and its disk scratch,
-//! counted together, and which pod is replaced for it.
+//! What a pod writes outside its Volumes: its containers' writable roots, its disk scratch and
+//! the files its processes keep open after deleting them, counted together, and which pod is
+//! replaced for it.
 
+use nix::dir::{Dir, OwningIter};
+use nix::fcntl::{AtFlags, OFlag};
+use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat};
 use std::collections::BTreeSet;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// One pod as it was counted.
 pub struct Pod {
@@ -13,14 +19,30 @@ pub struct Pod {
     pub limit: Option<u64>,
     /// Bytes on disk under its roots; past its limit, where the count stopped.
     pub bytes: u64,
+    /// The count got to its end, or past the limit: not stopped by `SPELL` or `DEEP`.
+    pub finished: bool,
 }
 
 /// How the message of a unit replaced for what its pod wrote begins.
 pub const REPLACED: &str = "replaced: ";
 
-/// The reserve a node keeps when its flag does not say: 5% of its state disk, at most 1 GiB.
-pub fn default_reserve(total: u64) -> u64 {
-    (total / 20).min(1 << 30)
+/// The longest one pod is counted, each count.
+pub const SPELL: Duration = Duration::from_secs(5);
+
+/// How many directories deep a count goes (each holds a descriptor open while it is walked).
+pub const DEEP: usize = 128;
+
+/// Files with several links (or deleted, held open) remembered a count to be counted once; past
+/// that many each is counted at every link: more, never less.
+const LINKED: usize = 65536;
+
+/// The reserve a node keeps when its flag does not say: 5% of its state disk, at most 1 GiB; none
+/// for a kithd that is not root, which cannot read all a pod writes and shares its disk with a desk.
+pub fn default_reserve(total: u64, root: bool) -> u64 {
+    match root {
+        true => (total / 20).min(1 << 30),
+        false => 0,
+    }
 }
 
 /// Whether a pod is counted at all: one with a limit always, one without only while the state
@@ -29,70 +51,192 @@ pub fn walked(limit: Option<u64>, free: u64, reserve: u64) -> bool {
     limit.is_some() || free < reserve.saturating_mul(2)
 }
 
-/// Bytes on disk under `roots`. Follows no symlink, counts a file with several links once and
-/// leaves out what another filesystem holds. Stops as soon as it is past `stop`. What cannot be
-/// read is passed over.
+fn is_dir(meta: &FileStat) -> bool {
+    SFlag::from_bits_truncate(meta.st_mode) & SFlag::S_IFMT == SFlag::S_IFDIR
+}
+
+/// The directory `name` under `parent` (or the path `name`), opened without following a
+/// symlink, and what it is, if it is a directory on `device`.
+fn open_dir(parent: Option<&OwningIter>, name: &(impl nix::NixPath + ?Sized), device: u64) -> Option<OwningIter> {
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let dir = Dir::openat(parent.map(|p| p.as_raw_fd()), name, flags, Mode::empty()).ok()?;
+    // (What was looked at before it was opened may have been swapped since.)
+    let meta = fstat(dir.as_raw_fd()).ok()?;
+    (is_dir(&meta) && meta.st_dev == device).then(|| dir.into_iter())
+}
+
+/// Bytes on disk under `roots`, and whether the count got to its end. Opens each directory from
+/// the one above it and follows no symlink, counts a file with several links once and leaves out
+/// what another filesystem holds. Stops as soon as it is past `stop` (finished: it is known to be
+/// past), at `until`, and below `DEEP` directories (both unfinished). What cannot be read is
+/// passed over.
 //
 // ponytail: the files a pod made are walked one by one, so millions of small ones make a slow
 // count; an ext4 project quota on each root would hold the line at the write instead.
-pub fn count(roots: &[PathBuf], stop: u64) -> u64 {
+pub fn count(roots: &[PathBuf], stop: u64, until: Instant) -> (u64, bool) {
     let mut linked = BTreeSet::new();
-    let mut bytes = 0u64;
+    let (mut bytes, mut finished) = (0u64, true);
     for root in roots {
-        let Ok(top) = std::fs::symlink_metadata(root) else {
+        let Ok(top) = fstatat(None, root.as_path(), AtFlags::AT_SYMLINK_NOFOLLOW) else {
             continue;
         };
-        let device = top.dev();
-        bytes = bytes.saturating_add(top.blocks() * 512);
-        let mut dirs = match top.is_dir() {
-            true => vec![root.clone()],
+        let device = top.st_dev;
+        bytes = bytes.saturating_add(top.st_blocks as u64 * 512);
+        let mut open: Vec<OwningIter> = match is_dir(&top) {
+            true => open_dir(None, root.as_path(), device).into_iter().collect(),
             false => Vec::new(),
         };
-        while let Some(dir) = dirs.pop() {
+        while let Some(at) = open.last_mut() {
             if bytes > stop {
-                return bytes;
+                return (bytes, true);
             }
-            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-                // (Not followed: a symlink is the link itself.)
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.dev() != device || (meta.nlink() > 1 && !meta.is_dir() && !linked.insert((device, meta.ino())))
-                {
-                    continue;
-                }
-                bytes = bytes.saturating_add(meta.blocks() * 512);
-                if bytes > stop {
-                    return bytes;
-                }
-                if meta.is_dir() {
-                    dirs.push(entry.path());
+            if Instant::now() >= until {
+                return (bytes, false);
+            }
+            // (A directory that fails to read on is left where it failed.)
+            let Some(Ok(entry)) = at.next() else {
+                open.pop();
+                continue;
+            };
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            let Ok(meta) = fstatat(Some(at.as_raw_fd()), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+                continue;
+            };
+            let dir = is_dir(&meta);
+            if meta.st_dev != device || (!dir && meta.st_nlink > 1 && !first(&mut linked, &meta)) {
+                continue;
+            }
+            bytes = bytes.saturating_add(meta.st_blocks as u64 * 512);
+            if !dir {
+                continue;
+            }
+            if open.len() >= DEEP {
+                finished = false;
+                continue;
+            }
+            let below = open_dir(open.last(), name, device);
+            open.extend(below);
+        }
+    }
+    (bytes, finished)
+}
+
+/// Whether `meta`'s file is met for the first time (or too many were to remember).
+fn first(seen: &mut BTreeSet<(u64, u64)>, meta: &FileStat) -> bool {
+    seen.len() >= LINKED || seen.insert((meta.st_dev, meta.st_ino))
+}
+
+/// The processes in the cgroup `cgroup` and the cgroups under it.
+pub fn pids(cgroup: &Path) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut cgroups = vec![(cgroup.to_path_buf(), 0)];
+    while let Some((cgroup, depth)) = cgroups.pop() {
+        let procs = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap_or_default();
+        pids.extend(procs.lines().filter_map(|pid| pid.parse::<u32>().ok()));
+        if depth < 16 {
+            for entry in std::fs::read_dir(&cgroup).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    cgroups.push((entry.path(), depth + 1));
                 }
             }
         }
     }
-    bytes
+    pids
 }
 
-/// Moves the directory `scratch` aside, to a new name beside it, and returns that: what is
-/// made at `scratch` next is empty. `None` when there is none.
-pub fn aside(scratch: &Path) -> Option<PathBuf> {
+/// Bytes on disk of the files the processes `pids` keep open, or mapped, after they were deleted
+/// (they have no name left to walk to), on the filesystem of one of `roots` or the one each
+/// process sees as `/`; each file once. Whether it got to its end before `until`.
+pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Instant) -> (u64, bool) {
+    let devices: BTreeSet<u64> = roots
+        .iter()
+        .filter_map(|root| std::fs::symlink_metadata(root).ok())
+        .map(|meta| meta.dev())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut bytes = 0u64;
+    for pid in pids {
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let mut devices = devices.clone();
+        devices.extend(std::fs::metadata(process.join("root")).map(|m| m.dev()));
+        for held in ["fd", "map_files"] {
+            for entry in std::fs::read_dir(process.join(held)).into_iter().flatten().flatten() {
+                if Instant::now() >= until {
+                    return (bytes, false);
+                }
+                // (Followed: the link is the open file itself.)
+                let Ok(meta) = std::fs::metadata(entry.path()) else {
+                    continue;
+                };
+                if meta.is_file()
+                    && meta.nlink() == 0
+                    && devices.contains(&meta.dev())
+                    && (seen.len() >= LINKED || seen.insert((meta.dev(), meta.ino())))
+                {
+                    bytes = bytes.saturating_add(meta.blocks() * 512);
+                }
+            }
+        }
+    }
+    (bytes, true)
+}
+
+/// Moves the directory `scratch` aside, to a new name beside it (`scratch.N`): what is made at
+/// `scratch` next is empty. False when there is none.
+pub fn aside(scratch: &Path) -> bool {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     let gone = scratch.with_file_name(format!("scratch.{}", nanos.unwrap_or_default().as_nanos()));
-    std::fs::rename(scratch, &gone).ok().map(|()| gone)
+    std::fs::rename(scratch, gone).is_ok()
 }
 
-/// The pods to replace, by index into `pods`, and why. Every pod past its limit; while
-/// `free` is under `reserve` and none is, the one that wrote the most (one a count), if what it
-/// wrote is a tenth of the reserve or more: replacing a pod that wrote less frees nothing much.
+/// Removes every scratch moved aside in the replica directory `replica`.
+pub fn sweep(replica: &Path) {
+    for entry in std::fs::read_dir(replica).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().starts_with("scratch.")
+            && let Err(e) = std::fs::remove_dir_all(entry.path())
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("kithd: removing {}: {e}", entry.path().display());
+        }
+    }
+}
+
+/// Whether a pod whose running units (none stopping) started at `started` may be replaced for a
+/// count that began at `began`: one that started since was not counted.
+pub fn replaceable(started: &[Instant], began: Instant) -> bool {
+    !started.is_empty() && started.iter().all(|at| *at <= began)
+}
+
+/// Whether a run of a pod replaced at `at` is still there: of its units' runs, whether each is
+/// stopping and when it started.
+pub fn replacing(runs: &[(bool, Instant)], at: Instant) -> bool {
+    runs.iter().any(|(stopping, started)| *stopping || *started <= at)
+}
+
+/// The pods to replace, by index into `pods`, and why. Every pod past its limit, or with one whose
+/// count did not finish; while `free` is under `reserve` and none is, the one that wrote the most
+/// (one a count), if what it wrote is a tenth of the reserve or more: replacing a pod that wrote
+/// less frees nothing much.
 pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
     let over: Vec<(usize, String)> = pods
         .iter()
         .enumerate()
         .filter_map(|(i, pod)| {
-            let limit = pod.limit.filter(|limit| pod.bytes > *limit)?;
-            let why = format!(
-                "replaced: its pod wrote {} bytes outside its volumes, over its limit of {limit}",
-                pod.bytes
-            );
+            let limit = pod.limit?;
+            let why = match pod.finished {
+                true if pod.bytes > limit => format!(
+                    "replaced: its pod wrote {} bytes outside its volumes, over its limit of {limit}",
+                    pod.bytes
+                ),
+                true => return None,
+                false => format!(
+                    "replaced: its pod's files outside its volumes could not all be counted in {} s or {DEEP} directories deep, to hold its limit of {limit}",
+                    SPELL.as_secs()
+                ),
+            };
             Some((i, why))
         })
         .collect();
@@ -128,7 +272,12 @@ mod tests {
             id: id.into(),
             limit,
             bytes,
+            finished: true,
         }
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(600)
     }
 
     const MIB: u64 = 1 << 20;
@@ -139,20 +288,20 @@ mod tests {
         for n in 0..8 {
             std::fs::write(root.join(n.to_string()), vec![1u8; MIB as usize]).unwrap();
         }
-        let all = count(std::slice::from_ref(&root), u64::MAX);
-        assert!((8 * MIB..9 * MIB).contains(&all), "{all}");
+        let (all, finished) = count(std::slice::from_ref(&root), u64::MAX, later());
+        assert!((8 * MIB..9 * MIB).contains(&all) && finished, "{all}");
         // Past 2 MiB it stops: a file or two more at most, never the whole.
-        let stopped = count(std::slice::from_ref(&root), 2 * MIB);
-        assert!(stopped > 2 * MIB && stopped < 4 * MIB, "{stopped}");
+        let (stopped, finished) = count(std::slice::from_ref(&root), 2 * MIB, later());
+        assert!(stopped > 2 * MIB && stopped < 4 * MIB && finished, "{stopped}");
         // A sparse file is what it holds on disk, not its length.
         let sparse = dir("sparse");
         std::fs::File::create(sparse.join("hole"))
             .unwrap()
             .set_len(1 << 30)
             .unwrap();
-        assert!(count(std::slice::from_ref(&sparse), u64::MAX) < MIB);
+        assert!(count(std::slice::from_ref(&sparse), u64::MAX, later()).0 < MIB);
         // A root that is not there is nothing.
-        assert_eq!(count(&[root.join("gone")], u64::MAX), 0);
+        assert_eq!(count(&[root.join("gone")], u64::MAX, later()), (0, true));
         for d in [root, sparse] {
             std::fs::remove_dir_all(d).unwrap();
         }
@@ -165,21 +314,79 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         std::fs::write(a.join("file"), vec![1u8; 4 * MIB as usize]).unwrap();
-        let alone = count(&[a.clone(), b.clone()], u64::MAX);
+        let alone = count(&[a.clone(), b.clone()], u64::MAX, later()).0;
         // Linked again in the same root and in another root of the pod: no more bytes.
         std::fs::hard_link(a.join("file"), a.join("again")).unwrap();
         std::fs::hard_link(a.join("file"), b.join("again")).unwrap();
-        assert_eq!(count(&[a.clone(), b.clone()], u64::MAX), alone);
+        assert_eq!(count(&[a.clone(), b.clone()], u64::MAX, later()).0, alone);
         // A symlink to what is outside, a file or a directory, adds nothing of what it names.
         let outside = dir("outside");
         std::fs::write(outside.join("big"), vec![1u8; 4 * MIB as usize]).unwrap();
         std::os::unix::fs::symlink(&outside, b.join("dir")).unwrap();
         std::os::unix::fs::symlink(outside.join("big"), b.join("file")).unwrap();
         std::os::unix::fs::symlink(&b, b.join("loop")).unwrap();
-        assert!(count(&[a.clone(), b.clone()], u64::MAX) < alone + MIB);
+        assert!(count(&[a.clone(), b.clone()], u64::MAX, later()).0 < alone + MIB);
+        // A directory swapped for a symlink after it was looked at is not opened through it.
+        let parent = open_dir(None, b.as_path(), std::fs::metadata(&b).unwrap().dev()).unwrap();
+        assert!(open_dir(Some(&parent), c"dir", std::fs::metadata(&outside).unwrap().dev()).is_none());
         for d in [root, outside] {
             std::fs::remove_dir_all(d).unwrap();
         }
+    }
+
+    #[test]
+    fn storage_limit_a_count_too_deep_or_too_long_is_unfinished() {
+        let root = dir("deep");
+        let mut at = root.clone();
+        for _ in 0..DEEP + 2 {
+            at = at.join("d");
+        }
+        std::fs::create_dir_all(&at).unwrap();
+        std::fs::write(at.join("file"), vec![1u8; MIB as usize]).unwrap();
+        // What is below the deepest directory walked is not counted, and the count says so.
+        let (bytes, finished) = count(std::slice::from_ref(&root), u64::MAX, later());
+        assert!(!finished && bytes < MIB, "{bytes}");
+        // Out of time before it began: unfinished.
+        let shallow = dir("shallow");
+        std::fs::create_dir(shallow.join("d")).unwrap();
+        assert!(!count(std::slice::from_ref(&shallow), u64::MAX, Instant::now()).1);
+        for d in [root, shallow] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn storage_limit_another_filesystem_under_a_root_is_not_counted() {
+        // /dev/shm is a filesystem of its own under /dev, where there is one to write.
+        let shm = Path::new("/dev/shm").join(format!("kithd-storage-{}", std::process::id()));
+        let devices = (std::fs::metadata("/dev"), std::fs::metadata("/dev/shm"));
+        let (Ok(dev), Ok(shm_dev)) = devices else { return };
+        if dev.dev() == shm_dev.dev() || std::fs::write(&shm, vec![1u8; 4 * MIB as usize]).is_err() {
+            return;
+        }
+        let under_dev = count(&[PathBuf::from("/dev")], u64::MAX, later()).0;
+        let alone = count(&[PathBuf::from("/dev/shm")], u64::MAX, later()).0;
+        std::fs::remove_file(&shm).unwrap();
+        assert!(alone >= 4 * MIB && under_dev < 4 * MIB, "{alone} {under_dev}");
+    }
+
+    #[test]
+    fn storage_limit_a_deleted_file_held_open_is_counted() {
+        use std::io::Write;
+        let root = dir("unlinked");
+        let (me, roots) = ([std::process::id()], std::slice::from_ref(&root));
+        let before = unlinked(&me, roots, later()).0;
+        let mut file = std::fs::File::create(root.join("held")).unwrap();
+        file.write_all(&vec![1u8; 4 * MIB as usize]).unwrap();
+        file.sync_all().unwrap();
+        std::fs::remove_file(root.join("held")).unwrap();
+        // Gone from its directory: the walk finds nothing, the processes' open files do.
+        assert!(count(roots, u64::MAX, later()).0 < MIB);
+        let (held, finished) = unlinked(&me, roots, later());
+        assert!(held >= before + 4 * MIB && finished, "{held} {before}");
+        drop(file);
+        assert!(unlinked(&me, roots, later()).0 < held);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -204,20 +411,72 @@ mod tests {
         // Two past their limits: both go.
         let two = [pod("a", Some(MIB), 2 * MIB), pod("b", Some(MIB), 3 * MIB)];
         assert_eq!(choose(&two, u64::MAX, MIB).len(), 2);
+        // One whose count did not finish cannot be held to its limit: it goes, and says why.
+        // Without a limit, what was counted stands.
+        let unfinished = [
+            Pod {
+                finished: false,
+                ..pod("slow", Some(10 * MIB), MIB)
+            },
+            Pod {
+                finished: false,
+                ..pod("free", None, MIB)
+            },
+        ];
+        let chosen = choose(&unfinished, u64::MAX, MIB);
+        assert_eq!(chosen.len(), 1);
+        assert!(
+            chosen[0].0 == 0 && chosen[0].1.contains("could not all be counted"),
+            "{chosen:?}"
+        );
     }
 
     #[test]
-    fn storage_limit_a_replaced_pods_scratch_is_set_aside_whole() {
+    fn storage_limit_a_replaced_pods_scratch_is_set_aside_whole_and_swept() {
         let replica = dir("aside");
         let scratch = replica.join("scratch");
         std::fs::create_dir_all(scratch.join("cache")).unwrap();
         std::fs::write(scratch.join("cache").join("file"), "written").unwrap();
-        let gone = aside(&scratch).unwrap();
-        assert!(!scratch.exists() && gone.join("cache").join("file").exists());
-        assert_eq!(gone.parent(), Some(replica.as_path()));
+        assert!(aside(&scratch));
+        assert!(!scratch.exists());
+        let gone: Vec<_> = std::fs::read_dir(&replica)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            gone.len() == 1 && gone[0].join("cache").join("file").exists(),
+            "{gone:?}"
+        );
         // Nothing there: nothing to set aside.
-        assert_eq!(aside(&scratch), None);
+        assert!(!aside(&scratch));
+        // Swept: every scratch set aside goes, what is not one stays.
+        std::fs::create_dir_all(replica.join("scratch.1")).unwrap();
+        std::fs::create_dir_all(scratch.join("new")).unwrap();
+        sweep(&replica);
+        let left: Vec<_> = std::fs::read_dir(&replica)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, ["scratch"]);
         std::fs::remove_dir_all(replica).unwrap();
+    }
+
+    #[test]
+    fn storage_limit_a_pod_is_replaced_once_for_a_count_and_waits_for_its_old_runs() {
+        let began = Instant::now();
+        let before = began - Duration::from_secs(1);
+        let after = began + Duration::from_secs(1);
+        assert!(replaceable(&[before, began], began));
+        // One that started after the count began was not counted; none running, nothing to replace.
+        assert!(!replaceable(&[before, after], began));
+        assert!(!replaceable(&[], began));
+        // Replaced at `began`: still so while a run from before is there or one is stopping.
+        assert!(replacing(&[(false, before)], began));
+        assert!(replacing(&[(true, after)], began));
+        assert!(!replacing(&[(false, after)], began));
+        assert!(!replacing(&[], began));
     }
 
     #[test]
@@ -252,7 +511,9 @@ mod tests {
         assert!(!walked(None, 2 * reserve, reserve));
         assert!(walked(None, 2 * reserve - 1, reserve));
         assert!(!walked(None, 0, 0));
-        assert_eq!(default_reserve(10 * MIB * 20), 10 * MIB);
-        assert_eq!(default_reserve(1 << 40), 1 << 30);
+        assert_eq!(default_reserve(10 * MIB * 20, true), 10 * MIB);
+        assert_eq!(default_reserve(1 << 40, true), 1 << 30);
+        // A kithd that is not root keeps none unless told.
+        assert_eq!(default_reserve(1 << 40, false), 0);
     }
 }

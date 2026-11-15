@@ -133,7 +133,7 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("pod.volumes[].secret.optional", Hint, "true"),
     ("pod.volumes[].emptyDir", Carried, "{}"),
     ("pod.volumes[].emptyDir.medium", Carried, r#""Memory""#),
-    ("pod.volumes[].emptyDir.sizeLimit", Carried, r#""1Gi""#),
+    ("pod.volumes[].emptyDir.sizeLimit", Hint, r#""1Gi""#),
     ("pod.volumes[].projected", Refused, r#"{"sources":[]}"#),
     ("pod.volumes[].downwardAPI", Refused, r#"{"items":[]}"#),
     ("pod.securityContext.runAsUser", Carried, "1000"),
@@ -777,23 +777,22 @@ fn whole_bytes(q: &str) -> Option<u64> {
 }
 
 /// A disk emptyDir's `sizeLimit` added to what the first of `units` that mounts it may
-/// write (kith counts a pod's root and its scratch as one amount); whether one did.
+/// write (kith counts a pod's root and its scratch as one amount). `None` when none mounts it;
+/// else the container's name and whether it had no limit before (it has one now).
 // ponytail: a container that had no limit of its own gets one, its root counted in it too:
-// stricter than Kubernetes, which limits such an emptyDir alone.
-fn add_storage(units: &mut [Value], scratch: &str, size: &str) -> bool {
+// stricter than Kubernetes, which limits such an emptyDir alone (the import says so).
+fn add_storage(units: &mut [Value], scratch: &str, size: &str) -> Option<(String, bool)> {
     let mounts = |c: &&mut Value| {
         let mounts = c["volumeMounts"].as_array();
         mounts.is_some_and(|mounts| mounts.iter().any(|m| m["scratch"] == scratch))
     };
-    let Some(c) = units.iter_mut().find(mounts) else {
-        return false;
-    };
+    let c = units.iter_mut().find(mounts)?;
     let own = c["resources"]["storage"].as_str().and_then(whole_bytes);
     c["resources"]["storage"] = match (own, whole_bytes(size)) {
         (Some(own), Some(bytes)) => json!(own.saturating_add(bytes).to_string()),
         _ => json!(size),
     };
-    true
+    Some((c["name"].as_str().unwrap_or_default().to_string(), own.is_none()))
 }
 
 /// A `{name, key}` reference from `secretKeyRef` or `configMapKeyRef`.
@@ -1213,10 +1212,17 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
     };
     let (mut first, mut units) = (contained(cx, "initContainers"), contained(cx, "containers"));
     for (name, vol) in &vols {
-        if let Vol::Scratch(false, Some(size)) = vol
-            && !add_storage(&mut units, name, size)
-        {
-            add_storage(&mut first, name, size);
+        let Vol::Scratch(false, Some(size)) = vol else { continue };
+        let at = format!("{sp}.volumes[{name}].emptyDir.sizeLimit");
+        match add_storage(&mut units, name, size).or_else(|| add_storage(&mut first, name, size)) {
+            None => cx.hint(&at, "is not used: no container mounts the emptyDir"),
+            Some((container, true)) => cx.hint(
+                &at,
+                &format!(
+                    "limits all that `{container}` writes outside its volumes, its root too (resources.storage): stricter than Kubernetes, which limits the emptyDir alone"
+                ),
+            ),
+            Some(_) => {}
         }
     }
     // What Kubernetes assumes anyway, and tools write out.
@@ -2484,6 +2490,8 @@ spec:
           emptyDir: { medium: Memory, sizeLimit: 64Mi }
         - name: logs
           emptyDir: { sizeLimit: 100M }
+        - name: spare
+          emptyDir: { sizeLimit: 1Gi }
 "#;
         let (all, said) = run(chart);
         for r in &all {
@@ -2508,6 +2516,14 @@ spec:
             "{said:?}"
         );
         assert!(!said.iter().any(|line| line.contains("volumes[work]")), "{said:?}");
+        // `side` had no limit and has one now, its root counted in it too: said, as it is
+        // stricter than Kubernetes; and a sizeLimit no container mounts is said to be unused.
+        let hinted = |volume: &str, what: &str| {
+            said.iter()
+                .any(|line| line.contains(&format!("volumes[{volume}].emptyDir.sizeLimit")) && line.contains(what))
+        };
+        assert!(hinted("logs", "stricter than Kubernetes"), "{said:?}");
+        assert!(hinted("spare", "no container mounts"), "{said:?}");
         // What is not a whole number of bytes is refused by its place.
         let (_, said) = run(&chart.replace("ephemeral-storage: 2Gi", "ephemeral-storage: 500m"));
         assert!(

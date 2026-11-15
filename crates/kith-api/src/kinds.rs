@@ -1282,12 +1282,10 @@ impl Spec for ClusterSpec {
 
 no_checks!(
     BlobSpec,
-    NodeSpec,
     NetworkPolicySpec,
     VolumeClaimSpec,
     ConfigMapSpec,
     SecretSpec,
-    SeatSpec,
     DeviceSpec,
     PackageSpec,
     ReleaseSpec,
@@ -1298,6 +1296,29 @@ no_checks!(
     RoleBindingSpec,
     IdentitySpec,
 );
+
+/// `storage` limits a container's pod alone: in the Resources a node keeps back, a namespace's
+/// quota or a seat's reserve, `field`, it would look like a limit and limit nothing.
+fn storage_unread(field: &str, resources: &Option<Resources>) -> Result<(), String> {
+    match resources.as_ref().is_some_and(|r| r.storage.is_some()) {
+        true => Err(format!(
+            "{field}.storage: is not read here: it limits what a container's pod writes, in the container's resources"
+        )),
+        false => Ok(()),
+    }
+}
+
+impl Spec for NodeSpec {
+    fn check(&self) -> Result<(), String> {
+        storage_unread("reserved", &self.reserved)
+    }
+}
+
+impl Spec for SeatSpec {
+    fn check(&self) -> Result<(), String> {
+        storage_unread("reserve", &self.reserve)
+    }
+}
 
 /// A kind's name: letters and digits, a capital first (`GameServer`).
 pub(crate) fn kind_name(name: &str) -> Result<(), String> {
@@ -1825,7 +1846,7 @@ impl Template {
                 && storage.bytes().is_none()
             {
                 return Err(format!(
-                    "{at}: resources.storage: `{}` is not a whole number of bytes",
+                    "{at}: resources.storage: `{}` is not a whole number of bytes from 1 to 2^53 - 1",
                     String::from(storage.clone())
                 ));
             }
@@ -2024,6 +2045,7 @@ fn header_refused(name: &str, value: &str) -> Option<String> {
 
 impl Spec for NamespaceSpec {
     fn check(&self) -> Result<(), String> {
+        storage_unread("quota", &self.quota)?;
         for host in &self.hosts {
             let name = host.strip_prefix("*.").unwrap_or(host);
             if !dns_name(name) {

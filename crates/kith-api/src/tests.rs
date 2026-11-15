@@ -1448,7 +1448,11 @@ fn storage_limit_is_bytes_a_container_may_write() {
         ),
         (
             "{ containers: [{ name: c, image: i, resources: { storage: 0 } }] }",
-            "is not a whole number of bytes",
+            "`0` is not a whole number of bytes from 1 to 2^53 - 1",
+        ),
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: 9007199254740992 } }] }",
+            "from 1 to 2^53 - 1",
         ),
         (
             "{ containers: [{ name: c, image: i, resources: { storage: lots } }] }",
@@ -1465,5 +1469,25 @@ fn storage_limit_is_bytes_a_container_may_write() {
     ] {
         let refused = job(bad).unwrap_err();
         assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    // Resources is shared with what a node keeps back, a namespace's quota and a seat's
+    // reserve: none of them reads storage, so none takes it.
+    let read = |kind: &str, spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: n }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map_err(|e| e.msg)
+    };
+    for (kind, spec, field) in [
+        ("Node", "{ reserved: { storage: 1Gi } }", "reserved"),
+        ("Namespace", "{ quota: { storage: 1Gi } }", "quota"),
+        ("Seat", "{ node: a, reserve: { storage: 1Gi } }", "reserve"),
+    ] {
+        let refused = read(kind, spec).unwrap_err();
+        assert!(
+            refused.contains(&format!("{field}.storage: is not read here")),
+            "{kind}: {refused}"
+        );
+        let without = spec.replace("storage", "memory");
+        read(kind, &without).unwrap_or_else(|e| panic!("{kind} {without}: {e}"));
     }
 }
