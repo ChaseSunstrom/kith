@@ -194,10 +194,11 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
                 !text.is_empty() && text.chars().all(|c| c.is_ascii_alphanumeric() || more.contains(c))
             };
             let (address, token) = (join.address.trim(), join.token.trim());
-            if !plain(address, ".-:[]") || !address.contains(':') {
+            if !plain(address, ".-:[]") || !address.contains(':') || address.starts_with('-') {
                 return Err(format!("`{address}` is not a node's address: ADDRESS:PORT"));
             }
-            if !plain(token, ".") {
+            // A token ends in the name of the node that made it, which may hold `-`.
+            if !plain(token, ".-") || token.starts_with('-') {
                 return Err("the join token is not one: `kith node token` on the cluster makes them".into());
             }
             words.push(format!("--join {address} --token {token}"));
@@ -641,13 +642,13 @@ mod tests {
         let other = config("disk: sda\nsize: 256000000000\n", &two).unwrap_err();
         assert!(other.contains("is not the disk that was named"), "{other}");
         let (_, joined) = config(
-            "disk: /dev/sda\njoin: { address: 10.0.0.7:7443, token: kith1.ab.cd }\n",
+            "disk: /dev/sda\njoin: { address: 10.0.0.7:7443, token: kith1.ab.cd.ef.node-1 }\n", // pragma: allowlist secret
             &two,
         )
         .unwrap();
         assert_eq!(
             joined,
-            "-- --listen 0.0.0.0:7443 --join 10.0.0.7:7443 --token kith1.ab.cd"
+            "-- --listen 0.0.0.0:7443 --join 10.0.0.7:7443 --token kith1.ab.cd.ef.node-1" // pragma: allowlist secret
         );
 
         // `only` is for a machine with one disk; a name must be one that is there.
@@ -677,6 +678,8 @@ mod tests {
             "disk: sda\njoin: { address: 10.0.0.7, token: kith1.ab }\n",
             "disk: sda\njoin: { address: '10.0.0.7:7443 --claim', token: kith1.ab }\n",
             "disk: sda\njoin: { address: 10.0.0.7:7443, token: 'kith1.ab --state /tmp' }\n",
+            "disk: sda\njoin: { address: 10.0.0.7:7443, token: --claim }\n",
+            "disk: sda\njoin: { address: '--claim:7443', token: kith1.ab }\n",
         ] {
             assert!(config(bad, &two).is_err(), "{bad}");
         }

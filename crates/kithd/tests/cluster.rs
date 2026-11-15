@@ -172,8 +172,10 @@ fn nodes_join_over_mutual_tls() {
         kithd_fails(&scratch.join(dir), &args)
     };
     let zeros = "0".repeat(64);
+    // A token that names no node (as tokens from before did) is sent to whoever answers.
     let said = join("x1", "x1", &format!("kith1.{zeros}.{zeros}"));
     assert!(said.contains("its CA does not match the token"), "{said}");
+    assert!(said.contains("this token names no node"), "{said}");
 
     let token = alpha.ok(&["node", "token"]);
     let token = token.trim();
@@ -181,9 +183,10 @@ fn nodes_join_over_mutual_tls() {
     let said = join(
         "x2",
         "x2",
-        &format!("kith1.{zeros}.{}", token.rsplit('.').next().unwrap()),
+        &format!("kith1.{zeros}.{}", token.split('.').nth(2).unwrap()),
     );
     assert!(said.contains("the join token is wrong"), "{said}");
+    assert!(said.contains("this token names no node"), "{said}");
     // A name that is taken does not spend the token.
     let said = join("x3", "alpha", token);
     assert!(said.contains("already in the cluster"), "{said}");
@@ -205,6 +208,16 @@ fn nodes_join_over_mutual_tls() {
     // Only the node with the CA key admits nodes, and beta says so.
     let (code, _, err) = beta.kith(&["node", "token"]);
     assert!(code != 0 && err.contains("the one the cluster was started on"), "{err}");
+    // A token of alpha's taken to another node of the cluster: beta is sent nothing, and
+    // the joiner says who it called and who answered.
+    let elsewhere = alpha.ok(&["node", "token"]);
+    let args = ["--name", "x6", "--join", &beta.address(), "--token", elsewhere.trim()];
+    let _ = std::fs::remove_dir_all(scratch.join("x6"));
+    let said = kithd_fails(&scratch.join("x6"), &args);
+    assert!(
+        said.contains("node alpha was called, and a certificate naming beta answered"),
+        "{said}"
+    );
     // A state directory that holds a store is not thrown away by joining.
     std::fs::create_dir_all(scratch.join("x5/state/raft")).unwrap();
     let args = ["--name", "x5", "--join", &alpha.address(), "--token", token];

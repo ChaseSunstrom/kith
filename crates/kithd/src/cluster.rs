@@ -139,6 +139,25 @@ pub fn why(error: &dyn std::error::Error) -> String {
     text
 }
 
+/// Whether our certificate check refused what answered (a certificate that is not the one
+/// called): not a node that is not up yet, or a handshake cut short, which may be asked again.
+fn refused_tls(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(tls) = e.downcast_ref::<rustls::Error>() {
+            // (The pinned check refuses with General; the CA's check with InvalidCertificate.)
+            return matches!(tls, rustls::Error::InvalidCertificate(_) | rustls::Error::General(_));
+        }
+        // (An io::Error's source skips the error it wraps, and the handshake's error comes
+        // wrapped twice: step into each.)
+        cause = match e.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+            None => e.source(),
+        };
+    }
+    false
+}
+
 /// Who is on the other end of a TCP connection.
 #[derive(Clone, Debug)]
 pub struct Peer {
@@ -781,7 +800,7 @@ pub fn offer_claim(shared: &Shared) {
     if claimed(shared) {
         return;
     }
-    match claims.mint(&ca.cert, pki::Lets::Control) {
+    match claims.mint(&ca.cert, None, pki::Lets::Control) {
         Ok(token) => eprintln!(
             "kithd: nobody administers this cluster from outside yet. For an hour, whoever sends this token to /v1/claim does: {token}"
         ),
@@ -976,7 +995,7 @@ pub async fn netboot(
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
             netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
-                cluster.tokens.mint(&ca.cert, pki::Lets::Control)
+                cluster.tokens.mint(&ca.cert, Some(&cluster.me), pki::Lets::Control)
             })
             .await
         }
@@ -1000,7 +1019,7 @@ fn mint(shared: &Shared, lets: pki::Lets) -> Result<Json<serde_json::Value>, Ref
     let Some(ca) = &cluster.ca else {
         return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };
-    let token = cluster.tokens.mint(&ca.cert, lets);
+    let token = cluster.tokens.mint(&ca.cert, Some(&cluster.me), lets);
     let token = token.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "token": token, "expiresInSeconds": 3600 })))
 }
@@ -1300,11 +1319,21 @@ pub async fn request_join(
     view: bool,
 ) -> Fallible<Joined> {
     pki::valid_name(name)?;
-    let (_, pinned) = pki::token_parts(token)?;
-    let failed = |what: &str, e: reqwest::Error| format!("{what} {address}: {e}");
-    // Whoever answers is not trusted yet: the CA it hands over has to be the one the token names.
+    let (secret, pinned, maker) = pki::token_parts(token)?;
+    // (The whole cause: a refused certificate says who was called and who answered.)
+    let failed = |what: &str, e: reqwest::Error| format!("{what} {address}: {}", why(&e));
+    // The node that made the token is the one called, by its name and key: any other node of
+    // the cluster that answers at `address` is sent nothing. The CA it hands over has to be the
+    // one the token names. A token from before tokens named their maker is taken from whoever
+    // answers, as it was.
+    let held = maker.map(|(name, print)| (pki::Who::Name(name.into()), Some(print.to_string())));
+    if maker.is_none() {
+        eprintln!(
+            "kithd: this token names no node (it was made before tokens did): any node of its cluster that answers at {address} is sent it"
+        );
+    }
     let anyone = reqwest::Client::builder()
-        .tls_danger_accept_invalid_certs(true)
+        .use_preconfigured_tls(pki::maker_config(maker)?)
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .no_proxy();
@@ -1315,7 +1344,8 @@ pub async fn request_join(
     let reply = loop {
         let reply = anyone.get(format!("https://{address}/v1/ca")).send().await;
         match reply.and_then(reqwest::Response::error_for_status) {
-            Err(e) if e.is_connect() && tries < 60 => {
+            // (A refused certificate is not tried again: what answers there is not the maker.)
+            Err(e) if e.is_connect() && !refused_tls(&e) && tries < 60 => {
                 if tries == 0 {
                     eprintln!("kithd: {address} cannot be reached yet ({e}): trying for a minute");
                 }
@@ -1333,13 +1363,14 @@ pub async fn request_join(
         ));
     }
     let request = JoinRequest {
-        token: token.trim().into(),
+        // What a node that admits checks is the secret and the CA: the form every kithd reads.
+        token: format!("kith1.{secret}.{pinned}"),
         name: name.into(),
         port,
         mesh,
         view,
     };
-    let member = client(&ca, None)?
+    let member = client_for(&ca, None, held)?
         .post(format!("https://{address}/v1/join"))
         .json(&request);
     let reply = member.timeout(Duration::from_secs(15)).send().await;
@@ -1477,7 +1508,10 @@ pub(crate) mod pinned_peer {
         let ca = pki::Ca::create().unwrap();
         let a = node(&ca, "a");
         let cluster = Cluster::new(a, Some(ca)).unwrap();
-        let token = cluster.tokens.mint(&cluster.me.ca, pki::Lets::Control).unwrap();
+        let token = cluster
+            .tokens
+            .mint(&cluster.me.ca, Some(&cluster.me), pki::Lets::Control)
+            .unwrap();
         // Node/other has the id the name `joiner` gives (found by no search: it is set).
         let shared = shared_of("join-id", cluster, &[at("other", "127.0.0.1:1", None)]).await;
         let id = kith_store::node_id("joiner");
@@ -1540,7 +1574,10 @@ pub(crate) mod pinned_peer {
         let ca = pki::Ca::create().unwrap();
         let a = node(&ca, "a");
         let cluster = Cluster::new(a, Some(ca)).unwrap();
-        let token = cluster.tokens.mint(&cluster.me.ca, pki::Lets::Worker).unwrap();
+        let token = cluster
+            .tokens
+            .mint(&cluster.me.ca, Some(&cluster.me), pki::Lets::Worker)
+            .unwrap();
         let shared = shared_of("join-name", cluster, &[at("w", "127.0.0.1:1", None)]).await;
         let device: kith_api::Resource = serde_json::from_value(serde_json::json!({
             "apiVersion": "kith.dev/v1", "kind": "Device",
@@ -1575,6 +1612,106 @@ pub(crate) mod pinned_peer {
         );
         let store = shared.store.lock().unwrap();
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
+    }
+
+    /// Only our certificate check's refusal ends a join's asking; a handshake cut short (an alert)
+    /// or a node not up yet is asked again.
+    #[test]
+    fn only_a_refused_certificate_is_not_asked_again() {
+        use std::io::{Error, ErrorKind};
+        // (As hyper-rustls hands it on: an io::Error around an io::Error around the TLS error.)
+        let wrapped = |tls: rustls::Error| Error::other(Error::new(ErrorKind::InvalidData, tls));
+        assert!(refused_tls(&wrapped(rustls::Error::General(
+            "node a was called".into()
+        ))));
+        assert!(refused_tls(&wrapped(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer
+        ))));
+        assert!(!refused_tls(&wrapped(rustls::Error::AlertReceived(
+            rustls::AlertDescription::HandshakeFailure
+        ))));
+        assert!(!refused_tls(&Error::from(ErrorKind::ConnectionRefused)));
+    }
+
+    /// A join token names the node that made it, and a joiner talks to that node alone: another node
+    /// of the CA that answers at the --join address is refused in the handshake and asked nothing
+    /// (not even for the CA), and the error says who was called and who answered. A token from
+    /// before, which names no node, is still taken; what is sent is the token in its old form.
+    #[tokio::test]
+    async fn join_pinned_to_the_node_that_made_the_token() {
+        let ca = pki::Ca::create().unwrap();
+        let (a, x) = (node(&ca, "a"), node(&ca, "x"));
+        let cluster = Cluster::new(a.clone(), Some(ca)).unwrap();
+        let token = cluster
+            .tokens
+            .mint(&cluster.me.ca, Some(&cluster.me), pki::Lets::Control)
+            .unwrap();
+        let (secret, of_ca, maker) = pki::token_parts(&token).unwrap();
+        let print = pki::print_of(&a.cert).unwrap();
+        assert_eq!(maker, Some(("a", print.as_str())));
+        let old_form = format!("kith1.{secret}.{of_ca}");
+        let shared = shared_of("join-pinned", cluster, &[]).await;
+        let home = serving(shared.clone(), &a).await;
+        let (taken, to_x) = answering_as(&x).await;
+
+        // (Refused at once: a refused certificate is not asked again for a minute.)
+        let started = std::time::Instant::now();
+        let said = request_join(&taken, &token, "joiner", 7000, None, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            said.contains("node a was called, and a certificate naming x answered"),
+            "{said}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+        assert_eq!(
+            to_x.load(Ordering::SeqCst),
+            0,
+            "the node in the middle was asked something"
+        );
+
+        // Nor one outside the CA that names itself after the maker.
+        let (posing, to_posing) = answering_as(&node(&pki::Ca::create().unwrap(), "a")).await;
+        let said = request_join(&posing, &token, "joiner", 7000, None, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            said.contains("node a was called, and a certificate naming a answered, with another key"),
+            "{said}"
+        );
+        assert_eq!(to_posing.load(Ordering::SeqCst), 0, "the impostor was asked something");
+
+        // What is sent is the token as an admitting side from before reads one (`kith1.SECRET.CA`).
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let old_side = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&a).unwrap()).unwrap();
+        let (ca_pem, sent) = (a.ca.clone(), Arc::new(std::sync::Mutex::new(String::new())));
+        let kept = sent.clone();
+        let keep = move |Json(body): Json<serde_json::Value>| {
+            *kept.lock().unwrap() = body["token"].as_str().unwrap_or_default().to_string();
+            std::future::ready(StatusCode::FORBIDDEN)
+        };
+        let app = Router::new()
+            .route("/v1/ca", get(move || std::future::ready(ca_pem)))
+            .route("/v1/join", post(keep));
+        tokio::spawn(async move { drop(axum::serve(listener, app.into_make_service()).await) });
+        assert!(
+            request_join(&old_side, &token, "joiner", 7000, None, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(*sent.lock().unwrap(), old_form);
+
+        // At its maker the token is taken (nothing of it reached anyone else).
+        let joined = request_join(&home, &token, "joiner", 7000, None, false).await.unwrap();
+        assert!(joined.ca == a.ca && shared.store.lock().unwrap().store.get("Node/joiner").is_some());
+        // A token from before names no node, and is still taken.
+        let cluster = shared.cluster.as_ref().unwrap();
+        let old = cluster.tokens.mint(&cluster.me.ca, None, pki::Lets::Control).unwrap();
+        assert_eq!(pki::token_parts(&old).unwrap().2, None);
+        assert!(request_join(&home, &old, "other", 7000, None, false).await.is_ok());
     }
 
     /// Serves `node_router(shared)` on a loopback port, as the node `me`: the address.

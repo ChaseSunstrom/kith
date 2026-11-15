@@ -76,8 +76,19 @@ Only the newest version is fixed. There are no security releases of older ones.
   deleted node's own certificate (signed by the CA) still answers there until the
   membership change is through: seconds, longer with no leader or majority. A node's
   certificate outlives its Node, and nothing revokes it.
-  Not pinned: joining (the joining node has no store, and checks the CA by its hash
-  from the token); a blob fetched by its digest (what comes is checked against the
+  **A join with a token that names its maker talks only to that node.** A token holds
+  that node's name and key print beside the CA's fingerprint, and the joining node, which
+  has no store, talks only to the node that made the token: it takes no other
+  certificate at the `--join` address, and another node of the CA that
+  answers there (a taken worker on the address) is sent nothing, not the token's secret
+  and not the joiner's name, and the joiner says which node it called and which
+  answered. What is left: the node that made the token, which holds the CA's key, makes
+  the new node's key and sends it back (a node that holds the CA's key could sign any
+  node's certificate anyway); and a token made before tokens named their maker names no
+  node, so the joiner, which says so, sends it to any node of the CA that answers at the
+  address, as before. A claim token (`--claim`) names no node either: it is sent by
+  hand, and the README says how to check the CA it is sent to.
+  Not pinned: a blob fetched by its digest (what comes is checked against the
   digest); and a locked disk's key asked at boot, before there is a store (only a key
   wrapped under the disk's own secret is sent, but the disk's id is seen by whoever
   answers).
