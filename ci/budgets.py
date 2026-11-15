@@ -7,8 +7,8 @@ in agent mode sits far below that, and its budget is set near what it measures
 so that creep shows up long before the ceiling does.
 
 Time budgets are ceilings for a regression, not claims of speed. They are measured
-on the CI runner and set at twice the slowest median of its runs; until then a time
-is printed with no budget and does not fail.
+on the CI runner and set at twice the slowest of three of its runs on main; a path
+with no budget (None) would be printed and not fail.
 
     python3 ci/budgets.py            # sizes, RSS and times, each with its budget
     python3 ci/budgets.py --times    # the times only: medians of five runs each
@@ -49,11 +49,13 @@ SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 
-# Seconds, one per timed path. None: no budget yet (set from the CI runner's medians).
+# Seconds, one per timed path: twice the slowest of three runs (each a median of RUNS) on main on the CI runner
+# (apply 85.3, 88.1, 78.3 ms; status 4.7, 4.8, 4.8 ms; DNS 2.9, 3.1, 3.5 ms), rounded up.
+# A ceiling for a regression, not a claim of speed. None would mean no budget (printed only).
 TIME_BUDGETS = {
-    "apply to a running container": None,
-    "a status change reaching a second kithd": None,
-    "one DNS answer from kithd": None,
+    "apply to a running container": 0.180,
+    "a status change reaching a second kithd": 0.010,
+    "one DNS answer from kithd": 0.007,
 }
 # A local image (no registry): a rootfs holding the static kithd, which runs until stopped.
 IMAGE = "local.test/timing:1"

@@ -702,8 +702,10 @@ kith node status                                   # who leads the store, who vo
   `127.0.0.1` (or `::1`). A kithd that restarts drops the connections through
   it. A Service's connections are passed on by up to four threads of their
   own (one for each core, started with the first Service) and DNS answers on
-  one more, so a busy Service holds up neither the API nor a lookup. Only
-  TCP; a `targetPort` by name is a container port of that name.
+  one more, so a busy Service holds up neither the API nor a lookup. A node
+  over its limit for relaying says no to the others' asks, which try their
+  next replica (past 64 such connections from one node it hangs up instead,
+  and a client that had already spoken is then closed). Only TCP; a `targetPort` by name is a container port of that name.
 - A `NetworkPolicy` says who may connect to the Workloads it selects through
   a Service: the first ingress rule that fits decides, and when a policy
   selects a Workload and no rule fits, the connection is refused. A peer is
@@ -954,6 +956,9 @@ kith get dnsrecord                   # each one says `served`, or why not
   (`--dns-upstream 1.1.1.1,9.9.9.9` to say which), for clients on private
   networks only, so a kithd reachable from the internet is not an open
   resolver. Point your router's DHCP at a node and the whole house uses it.
+  The file is read again every few seconds while kithd runs (a kith OS node
+  gets its lease, and its resolvers with it, after kithd started), unless
+  `--dns-upstream` names them.
   A CNAME in a zone to a name outside it is answered with the target's
   addresses from those resolvers too, so stub resolvers get one reply to use
   (the CNAME alone when they do not answer).
@@ -1330,6 +1335,8 @@ silence, and `kubectl get -o yaml` gives back what was sent.
 Not answered, each refused in words:
 
 - `exec`, `attach`, `port-forward`, `cp` and `kubectl run` (a pod alone); `kubectl top`.
+- A write to a resource's `/status` (a controller's, or `kubectl patch --subresource=status`):
+  `status is kithd's own`, written from what runs and not taken from a client. Reading it works.
 - CustomResourceDefinitions, and so other people's operators; admission
   webhooks; NetworkPolicy, HorizontalPodAutoscaler.
 - What it is not, and is not meant to become: kith is not a conformant Kubernetes
@@ -3568,18 +3575,18 @@ python3 ci/bench.py              # the plan's numbers for one node: cached start
 Time budgets sit beside the size and memory ones. Three times are measured on one
 machine with no VM: `kith apply` until a container of a local image runs, a status
 change written on one of two kithds until the other has it, and one DNS answer from
-kithd. `python3 ci/budgets.py --times` prints the median of five runs of each; the
-build's `python3 ci/budgets.py` prints each once. The table's numbers were measured on
-a loaded 16-CPU machine, not the CI runner's, so they are not budgets: each budget is
-set from the CI runner's own medians (twice the slowest of three runs on main) and is a
-ceiling for a regression, not a claim of speed. Until then a time is printed and not
-enforced.
+kithd. Each time is the median of five runs: `python3 ci/budgets.py --times` prints
+them, and the build's `python3 ci/budgets.py` holds each to its budget. Each budget is
+twice the slowest of three such medians on main on the CI runner, rounded up: a ceiling for a
+regression, not a claim of speed. Each is printed as `ok   one DNS answer from kithd:
+2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1. A machine where a path cannot be run (no
+cgroup of its own for a container, say) fails that path, since it has a budget.
 
-| Time | Measured here: median of 5 (load 64 on 16 CPUs) | Printed as |
+| Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|
-| apply to a running container | 74 ms | 74 ms (budget to be set from CI) |
-| a status change reaching a second kithd | 3.6 ms | 3.6 ms (budget to be set from CI) |
-| one DNS answer from kithd | 2.1 ms | 2.1 ms (budget to be set from CI) |
+| apply to a running container | 85.3, 88.1, 78.3 ms | 180 ms |
+| a status change reaching a second kithd | 4.7, 4.8, 4.8 ms | 10 ms |
+| one DNS answer from kithd | 2.9, 3.1, 3.5 ms | 7 ms |
 | boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](ci/compare.txt)) | not budgeted: no VM runs in CI |
 
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which

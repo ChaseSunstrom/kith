@@ -1395,6 +1395,10 @@ async fn serve(
             let options = if body.is_empty() { Value::Null } else { sent()? };
             delete(&call, kind, namespace, name, &options).await?
         }
+        ("PUT" | "PATCH", Some(_), Some("status")) => {
+            let why = "status is kithd's own: it is written from what runs and is not taken from a client";
+            return Err(status(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", why.into()));
+        }
         (_, Some(_), Some("exec" | "attach" | "portforward")) => {
             let why = "exec, attach and port-forward are not answered here: `kith run` runs a command in a replica";
             return Err(status(StatusCode::NOT_IMPLEMENTED, "NotImplemented", why.into()));
@@ -2146,6 +2150,28 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A status is kithd's own word for what runs: a client's PUT or PATCH of it is refused
+    /// in those words, not with the bare 405 of a path nothing is done to.
+    #[tokio::test]
+    async fn status_is_kithds_own() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-status-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        for method in ["PUT", "PATCH"] {
+            let mut request = axum::http::Request::builder().method(method).body(()).unwrap();
+            request.extensions_mut().insert(Caller::Admin);
+            let (parts, ()) = request.into_parts();
+            let rest = "namespaces/default/deployments/web/status";
+            let no = serve(shared.clone(), parts, "apps", rest, Asked::new(), b"{}")
+                .await
+                .unwrap_err();
+            assert_eq!(no.code, StatusCode::METHOD_NOT_ALLOWED);
+            assert!(no.why.contains("status is kithd's own"), "{method}: {}", no.why);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// Who may write a kind and not read it is not answered with what is there by a
     /// change of it, and who may do neither is not told whether it is there.

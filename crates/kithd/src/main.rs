@@ -419,7 +419,8 @@ async fn replica(
         })
     };
     let name = cluster.as_ref().map_or("local", |cluster| &cluster.me.name);
-    let network = raft::Network(cluster.as_ref().map(|cluster| cluster.client.clone()));
+    let network = raft::Network::default();
+    let reach = network.0.clone();
     // A worker that runs from a view keeps no store: what Raft kept here before is erased
     // (a kithd that stopped between its first view and the erasing left it).
     let view = view::load(state)?;
@@ -451,6 +452,8 @@ async fn replica(
         upstream: Mutex::default(),
         lost_after,
     });
+    // (Raft's links look a voter's Node up in the store; the state holds Raft, so by a weak hold.)
+    let _ = reach.set(Arc::downgrade(&shared));
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
     if let Some((store, at, _)) = view {
@@ -598,10 +601,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             .or_else(bare)
             .ok_or(format!("--dns-upstream: `{address}` is not an address"))
     };
-    let mut upstreams = args.dns_upstream.iter().map(upstream).collect::<Result<Vec<_>, _>>()?;
-    if upstreams.is_empty() {
-        upstreams = dns::system_upstreams();
-    }
+    let upstreams = args.dns_upstream.iter().map(upstream).collect::<Result<Vec<_>, _>>()?;
     let (membership, tcp) = rt.block_on(membership(&args, &state))?;
     let names = rt.block_on(async {
         match args.dns {
@@ -749,6 +749,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
         };
         let names = async {
+            let upstreams = dns::upstreams(upstreams);
             let pods = pods::names(shared.clone(), upstreams.clone(), stopping.clone());
             let asked = async {
                 if let Some(sockets) = names {

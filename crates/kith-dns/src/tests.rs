@@ -776,8 +776,29 @@ async fn start_cached(
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (u, t) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
     let (tx, rx) = watch::channel(Arc::new(z));
-    tokio::spawn(serve(udp, tcp, rx, upstreams, forwarders, cache));
+    let (_, told) = watch::channel(upstreams.into());
+    tokio::spawn(serve(udp, tcp, rx, told, forwarders, cache));
     (u, t, tx)
+}
+
+/// A node's resolvers can come after its DNS started (a lease that arrives later): the one it
+/// is told of then is asked, with no restart.
+#[tokio::test]
+async fn upstreams_told_later_are_asked() {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (u, t) = (udp.local_addr().unwrap(), tcp.local_addr().unwrap());
+    let (_zones, rx) = watch::channel(Arc::new(zones()));
+    let (tell, told) = watch::channel(Arc::from(vec![]));
+    tokio::spawn(serve(udp, tcp, rx, told, vec![], Arc::default()));
+    let q = query(0x4321, "example.com", A, None);
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(r.rcode(), 2, "with no resolver to ask, the answer is a failure");
+    }
+    tell.send(vec![fake_upstream().await].into()).unwrap();
+    for r in [udp_ask(u, &q).await, tcp_ask(t, &q).await] {
+        assert_eq!(r.data(&r.an[0]), [1, 2, 3, 4]);
+    }
 }
 
 async fn udp_ask(to: SocketAddr, q: &[u8]) -> Reply {
