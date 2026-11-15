@@ -437,10 +437,26 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     off a worker: `trust: control` on
     the Secret or in the template's placement does), and a claim whose selector
     names no node and came to one node's Devices then matches two nodes' and is
-    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it,
-    and name a Device as a node whose name starts with the worker's and a `-` would
-    name one of its own, which then is not listed. Nothing bounds how much or how
-    often it writes within its list: its reports can fill the store's log. For the round (3 seconds) in which another node still has the file
+    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it.
+    A discovered Device's or Seat's name is the node's with the longest name that
+    starts it (`w-b-gpu-card0` is node `w-b`'s, not node `w`'s): a worker is refused
+    another node's; a node that finds a name of its own held says so in its log and
+    does not list that Device; and one made before the node with the longer name
+    joined is taken away at a control node's next look (half a minute), so that node
+    gets its name. A join is refused under a name that would take a discovered
+    Device or Seat from a node that has it (`w-gpu` while `w` lists `w-gpu-card0`):
+    whoever holds a join token chooses the new node's name, and would otherwise
+    choose whose card a claim by that name comes to. Where no such Device is listed
+    yet, a node named as another's name and a class (`w` and `w-gpu`) does take that
+    class's names, and the other's cards are then not listed: whoever names nodes
+    decides that. The same follows where a node lists a Device in the moment
+    between a join's check and the new Node being written. Any worker can make
+    Devices under names that start with its own, with no hardware behind them, and
+    so have a join under such a name refused until that Device is deleted or
+    another name is chosen. A control node's own writes
+    are not held to this (it can lead: the cluster is taken with it). Nothing bounds
+    how much or how often a worker writes within its list: its reports can fill the
+    store's log. For the round (3 seconds) in which another node still has the file
     of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
     a moment ago) is still followed, still has the store, and what it writes as the

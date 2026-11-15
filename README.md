@@ -1752,6 +1752,10 @@ within 30 seconds). `kith get device` lists them.
   is rewritten if you edit it and deleted when the hardware goes. A `Device` or `Seat`
   you wrote yourself is never changed or deleted. A machine without `/sys/class`
   (some containers) has no devices, and kithd says so once.
+- A name belongs to the node with the longest name that starts it, so do not name a
+  node as another node's name and a class (`alpha` and `alpha-gpu`): `alpha`'s GPUs
+  would then go unlisted, and kithd on `alpha` says so in its log. A join under a
+  name that would take a Device already listed is refused: pick another `--name`.
 
 ### Claiming hardware
 
