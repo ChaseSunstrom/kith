@@ -290,6 +290,10 @@ fn stop(id: &str, slot: &mut Slot) {
                 slot.message = Some(message);
             } else {
                 eprintln!("kithd: {id}: {}", undeleted.error);
+                // (Its processes are gone: only the cleanup failed, and nothing is held.)
+                if slot.message.as_deref().is_some_and(|m| m.starts_with("stopping: ")) {
+                    slot.message = None;
+                }
             }
         }
     }
@@ -330,13 +334,6 @@ fn devices_in_place(slot: &Slot, new: &Slot) -> bool {
         (slot.devices.iter().collect(), new.devices.iter().collect());
     let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
     in_place(&was, &now, &gone)
-}
-
-/// What a refused change of a running container's devices does to the unit. A refused removal
-/// replaces it: the container may still hold a node the kernel gives to another device. A refused
-/// plug alone keeps it running, and it is tried again at the next pass. (`plugged`: the plugs went in.)
-fn refusal_replaces(plugged: bool) -> bool {
-    plugged
 }
 
 /// Why a unit `id` of `owner`, with the device nodes `devices`, waits: a unit still stopping has its
@@ -878,17 +875,12 @@ impl Controller {
         for id in stale {
             stop_unit(&mut self.slots, &id, true);
         }
-        // The input devices of running units, given or taken as they run. After the stops above: a
-        // device a unit still stopping holds (one stopped this pass that did not go included) is not
-        // given to another, and what waits for it says so in its status.
-        let leaving_now: Vec<(String, String, Vec<PathBuf>)> = self
-            .slots
-            .iter()
-            .filter(|(_, s)| s.leaving)
-            .map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()))
-            .collect();
-        // Units whose removal was refused: replaced below, once the borrows of the loop are over.
+        // The input devices of running units, taken or given as they run. What was taken away
+        // first, from every unit: a refused removal replaces its unit (the container may still
+        // hold a node whose number the kernel gives to another device), and that unit is
+        // stopped before anything is given, so what it still holds is seen below.
         let mut replace: Vec<String> = Vec::new();
+        let mut changed: BTreeSet<String> = BTreeSet::new();
         for (id, slot) in &mut self.slots {
             let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
                 continue;
@@ -896,35 +888,68 @@ impl Controller {
             if !plugs_in_place(slot, new) {
                 continue;
             }
-            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
-                (slot.devices.iter().collect(), new.devices.iter().collect());
-            let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
-            if let Some(why) = held_by_leaving(id, &slot.owner, &added, &leaving_now) {
-                slot.message = Some(why);
-                continue;
-            }
-            let plugged = now.difference(&was).try_for_each(|path| handle.plug(path));
-            let plugged_ok = plugged.is_ok();
-            let taken = plugged.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
-            match taken {
-                Ok(()) => {
-                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
-                    slot.devices = new.devices.clone();
-                    slot.message = None;
-                }
-                // Still running: the comparison above does not replace it for this, so the change is
-                // tried again at the next pass. A refused removal replaces it (see refusal_replaces).
-                Err(e) => {
-                    eprintln!("kithd: {id}: {e}");
-                    slot.message = Some(format!("waiting: {e}"));
-                    if refusal_replaces(plugged_ok) {
+            let gone: Vec<PathBuf> = slot
+                .devices
+                .iter()
+                .filter(|path| !new.devices.contains(path))
+                .cloned()
+                .collect();
+            for path in gone {
+                match handle.unplug(&path) {
+                    // (The slot keeps the node until what came is plugged below: whether a unit
+                    // takes devices as it runs is asked of what it started with.)
+                    Ok(()) => drop(changed.insert(id.clone())),
+                    Err(e) => {
+                        eprintln!("kithd: {id}: {e}: it is replaced");
                         replace.push(id.clone());
+                        break;
                     }
                 }
             }
         }
-        for id in replace {
-            stop_unit(&mut self.slots, &id, true);
+        for id in &replace {
+            stop_unit(&mut self.slots, id, true);
+        }
+        // What a unit still stopping holds (one stopped this pass that did not go included) is
+        // not given to another, and what waits for it says so in its status.
+        let leaving_now: Vec<(String, String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()))
+            .collect();
+        for (id, slot) in &mut self.slots {
+            let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
+                continue;
+            };
+            if replace.contains(id) || !plugs_in_place(slot, new) {
+                continue;
+            }
+            let added: Vec<PathBuf> = new
+                .devices
+                .iter()
+                .filter(|path| !slot.devices.contains(path))
+                .cloned()
+                .collect();
+            if let Some(why) = held_by_leaving(id, &slot.owner, &added, &leaving_now) {
+                slot.message = Some(why);
+                continue;
+            }
+            match added.iter().try_for_each(|path| handle.plug(path)) {
+                Ok(()) => {
+                    if !added.is_empty() || changed.contains(id) {
+                        eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
+                    }
+                    slot.devices = new.devices.clone();
+                    slot.message = None;
+                }
+                // Still running: the comparison above does not replace it for this, so the plug
+                // is tried again at the next pass.
+                Err(e) => {
+                    eprintln!("kithd: {id}: {e}");
+                    slot.message = Some(format!("waiting: {e}"));
+                }
+            }
         }
         let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
@@ -1875,23 +1900,19 @@ mod tests {
         let plugged = slot_of("Workload/a/b", &["/dev/input/event0", "/dev/input/event1"], "app");
         let card = slot_of("Workload/a/b", &["/dev/dri/card0"], "app");
         assert!(devices_in_place(&slot, &plugged), "a plug is taken in place");
+        // One pulled and another plugged in one pass: in place while the slot still has the one it
+        // started with, which is why it is kept until the new one is in (a refused plug is tried
+        // again, the unit is not replaced).
+        let (lost, came) = ("/dev/input/event-no-such", "/dev/input/event1");
+        let swapped = slot_of("Workload/a/b", &[came], "app");
+        assert!(devices_in_place(&slot_of("Workload/a/b", &[lost], "app"), &swapped));
+        assert!(!devices_in_place(&slot_of("Workload/a/b", &[], "app"), &swapped));
         assert!(!devices_in_place(&slot, &card), "a DRI node is not");
         // Without a handle nothing runs: the unit is replaced, not plugged.
         assert!(
             !plugs_in_place(&slot, &plugged),
             "a unit that is not running is replaced"
         );
-    }
-
-    /// A refused removal replaces the unit, since the container may still hold the node it lost. A
-    /// refused plug alone keeps it running, and it is tried again at the next pass.
-    #[test]
-    fn refused_unplug_replaces_the_unit() {
-        assert!(
-            refusal_replaces(true),
-            "the plugs went in, so the refusal is the removal"
-        );
-        assert!(!refusal_replaces(false), "a refused plug alone is tried again");
     }
 
     #[test]
