@@ -585,6 +585,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     if let (Ok(runtime), Some(door)) = (&mut runtime, &door) {
         runtime.images.local = Some(door.local.clone());
     }
+    // Its port is taken now: the controller's first pass may ask it before it is served.
+    let door = door.map(|door| {
+        let tcp = images::bind(door.local.port);
+        (door, tcp)
+    });
 
     let upstream = |address: &String| {
         let with_port = address.parse().ok();

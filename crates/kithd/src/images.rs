@@ -613,10 +613,26 @@ async fn behind(
 
 /// Serves the cluster's Images on this node's loopback, to kithd's own pulls (no door:
 /// not at all).
-pub async fn serve(shared: Arc<Shared>, door: Option<Arc<Door>>, stopping: watch::Receiver<bool>) {
-    let Some(door) = door else { return };
+/// The registry's port, taken at kithd's start and before anything is started: a start from
+/// one of the node's own Images asks this registry whatever its pull policy, and one asked
+/// before [`serve`] runs waits in the kernel's queue where it would have been refused.
+pub fn bind(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))?;
+    tcp.set_nonblocking(true)?;
+    Ok(tcp)
+}
+
+/// Serve the node's Images behind `door` on the port [`bind`] took. Where it could not be
+/// taken, the door stays the runtime's (see main): a start from an own Image then fails
+/// rather than ask whatever else has the port.
+pub async fn serve(
+    shared: Arc<Shared>,
+    door: Option<(Arc<Door>, std::io::Result<std::net::TcpListener>)>,
+    stopping: watch::Receiver<bool>,
+) {
+    let Some((door, tcp)) = door else { return };
     let port = door.local.port;
-    let tcp = match tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await {
+    let tcp = match tcp.and_then(tokio::net::TcpListener::from_std) {
         Ok(tcp) => tcp,
         Err(e) => return eprintln!("kithd: registry: 127.0.0.1:{port}: {e}: Images are not served on this node"),
     };
@@ -1207,6 +1223,37 @@ mod tests {
         let mut reply = Vec::new();
         let ended = tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut reply)).await;
         assert!(ended.is_ok(), "the connection of a refused request was left open");
+        assert!(
+            reply.starts_with(b"HTTP/1.1 401"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// The port is taken before the registry is served (kithd's start takes it before the
+    /// controller's first pass): who asks in between waits and is answered, not refused.
+    #[tokio::test]
+    async fn asked_before_it_is_served_waits_and_is_answered() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tcp = bind(0).unwrap();
+        let door = Arc::new(Door::new(tcp.local_addr().unwrap().port()).unwrap());
+        let early = tokio::spawn(shaken(door.local.port, (door.local.certificate)().unwrap()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!early.is_finished(), "a handshake ended with nothing serving");
+        let (_stop, stopping) = watch::channel(false);
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let tcp = tokio::net::TcpListener::from_std(tcp).unwrap();
+        tokio::spawn(behind(tcp, door, app, stopping, 2, IDLE, HEAD));
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = tokio::time::timeout(Duration::from_secs(5), early)
+            .await
+            .unwrap()
+            .unwrap();
+        tls.write_all(b"GET /v2/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        tls.read_to_end(&mut reply).await.unwrap();
         assert!(
             reply.starts_with(b"HTTP/1.1 401"),
             "{}",
