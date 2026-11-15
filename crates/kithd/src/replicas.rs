@@ -244,6 +244,34 @@ fn place(
     placed.map(|()| hash)
 }
 
+/// Puts the unpacked copy `new` in place of `into`, unless this node was made the primary
+/// while it came: what is here is the volume itself then, in use, and stays, and `new` is
+/// given to `remove`. The store is held for the two renames only: that is decided under it,
+/// and the removal runs after it is let go. (Nothing leans on `new` being gone before the
+/// store is let go: syncs run one at a time from `run`, and this one does not return before
+/// the removal is done, so the next sync of the Volume finds the directory gone.)
+#[allow(clippy::too_many_arguments)]
+fn put_in(
+    store: &std::sync::Mutex<kith_store::State>,
+    dir: &Dir,
+    me: &str,
+    new: &Path,
+    into: &Path,
+    marker: &Path,
+    aside: Option<u64>,
+    remove: impl FnOnce(&Path),
+) -> Result<(), String> {
+    let held = store.lock().expect("a handler panicked holding the store");
+    if !replica(&held.store, dir, me) {
+        drop(held);
+        remove(new);
+        return Err("this node is not a replica of it any more".to_string());
+    }
+    // (No marker while the two are changing places: a crash there starts over.)
+    let _ = std::fs::remove_file(marker);
+    swap(new, into, aside).map_err(|e| format!("{}: {e}", into.display()))
+}
+
 /// Brings this node's copy of `dir` up to date from the node at `address`. The hash of what
 /// it has now.
 async fn sync(
@@ -283,16 +311,10 @@ async fn sync(
         let into = crate::volumes::host_dir(&state, &dir)?;
         let marker = self::marker(&state, &dir);
         let hash = place(incoming, &temp, &into, cap, |new| {
-            // This node may have been made the primary while that came: what is here is the
-            // volume itself then, in use, and stays. (The store is held for the two renames.)
-            let store = shared.store.lock().expect("a handler panicked holding the store");
-            if !replica(&store.store, &dir, shared.members.me()) {
-                crate::backups::remove_unpacked(&new);
-                return Err("this node is not a replica of it any more".to_string());
-            }
-            // (No marker while the two are changing places: a crash there starts over.)
-            let _ = std::fs::remove_file(&marker);
-            swap(&new, &into, aside).map_err(|e| format!("{}: {e}", into.display()))
+            let me = shared.members.me();
+            put_in(&shared.store, &dir, me, &new, &into, &marker, aside, |new| {
+                crate::backups::remove_unpacked(new);
+            })
         })?;
         let wrote =
             std::fs::create_dir_all(marker.parent().unwrap_or(&state)).and_then(|()| std::fs::write(&marker, &hash));
@@ -575,6 +597,46 @@ mod tests {
         header.set_mode(0o644);
         tar.append_data(&mut header, "big", &vec![5u8; size][..]).unwrap();
         tar.into_inner().unwrap()
+    }
+
+    #[test]
+    fn replica_put_in_removes_a_copy_it_was_not_to_keep_after_it_lets_go_of_the_store() {
+        let root = std::env::temp_dir().join(format!("kith-replica-putin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (into, new, marker) = (root.join("d"), root.join(".d.restoring"), root.join("marker"));
+        std::fs::create_dir_all(&new).unwrap();
+        let mut state = kith_store::State::default();
+        state.store = store(json!({}));
+        let state = std::sync::Mutex::new(state);
+        let dir = Dir {
+            namespace: "default".into(),
+            name: "data".into(),
+            path: String::new(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        // (This node, "a", has the Volume: it is no replica of it, and the copy goes.)
+        let (running, running_in) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (state, dir, new, into, marker) = (&state, &dir, &new, &into, &marker);
+        std::thread::scope(|scope| {
+            let put = scope.spawn(move || {
+                put_in(state, dir, "a", new, into, marker, None, |new| {
+                    running.send(()).unwrap();
+                    released.recv().unwrap();
+                    std::fs::remove_dir_all(new).unwrap();
+                })
+            });
+            // The removal is running and held: the store answers.
+            running_in.recv().unwrap();
+            assert!(state.try_lock().is_ok(), "the store is held while a copy is removed");
+            assert!(new.exists());
+            release.send(()).unwrap();
+            let refused = put.join().unwrap().unwrap_err();
+            assert!(refused.contains("not a replica"), "{refused}");
+        });
+        assert!(!new.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
