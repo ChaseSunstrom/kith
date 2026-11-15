@@ -291,9 +291,172 @@ pub fn netns_cookie() -> Result<u64> {
     }
 }
 
+/// Makes the part of this program that is written only while it starts (the addresses set
+/// right at its start: tables of functions, the table of its own addresses) read-only, as the
+/// loader of a program that is not static does. A static program of musl's sets those addresses
+/// right by itself and leaves the pages writable, so a write that goes astray in the process
+/// could change which function a call reaches. Called first in `main`, before any thread.
+///
+/// The program's headers say which part (`PT_GNU_RELRO`). Its start is rounded down to a page
+/// (a linker starts it on one). Its end is rounded up only where nothing else of the program
+/// is in the rest of that page (lld leaves it so; GNU ld ends it on a page), else down, so no
+/// page with something still written is shut. Returns how many bytes were made read-only.
+#[cfg(target_env = "musl")]
+pub fn seal_relro() -> Result<usize> {
+    use std::ffi::{c_int, c_void};
+    /// What is asked of each program header table: `data` is a `usize` that the bytes shut
+    /// are added to, or `usize::MAX` once a page could not be shut.
+    unsafe extern "C" fn each(info: *mut libc::dl_phdr_info, _size: usize, data: *mut c_void) -> c_int {
+        // SAFETY: musl calls this once, for the program itself, with a valid `info` whose
+        // `dlpi_phdr` is the table of `dlpi_phnum` headers the kernel mapped; `data` is the
+        // `usize` passed below.
+        let (base, headers) = unsafe {
+            let info = &*info;
+            (
+                info.dlpi_addr as usize,
+                std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)),
+            )
+        };
+        // SAFETY: sysconf has no precondition.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for (start, end) in relro_ranges(
+            headers
+                .iter()
+                .map(|h| (h.p_type, h.p_vaddr as usize, h.p_memsz as usize)),
+            page,
+        ) {
+            // SAFETY: the range is whole pages of this program's own mapping, which nothing
+            // writes after the start files have run (that is what the linker's header says).
+            let shut = unsafe { libc::mprotect((base + start) as *mut c_void, end - start, libc::PROT_READ) };
+            // SAFETY: `data` is the `usize` passed to dl_iterate_phdr below.
+            let total = unsafe { &mut *data.cast::<usize>() };
+            *total = if shut == 0 {
+                total.saturating_add(end - start)
+            } else {
+                usize::MAX
+            };
+        }
+        1
+    }
+    let mut total = 0usize;
+    // SAFETY: `each` matches the callback's type, and `total` outlives the call.
+    unsafe { libc::dl_iterate_phdr(Some(each), (&raw mut total).cast()) };
+    match total {
+        usize::MAX => Err(Error::last_os_error()),
+        total => Ok(total),
+    }
+}
+
+/// Elsewhere the loader has done it already.
+#[cfg(not(target_env = "musl"))]
+pub fn seal_relro() -> Result<usize> {
+    Ok(0)
+}
+
+const PT_LOAD: u32 = 1;
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+
+/// The page ranges to make read-only, from a program's headers as (type, address, size in
+/// memory): see [`seal_relro`].
+pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, page: usize) -> Vec<(usize, usize)> {
+    let down = |at: usize| at & !(page - 1);
+    headers
+        .clone()
+        .filter(|(kind, _, _)| *kind == PT_GNU_RELRO)
+        .filter_map(|(_, at, size)| {
+            // (Headers are the file's to say: a size of 0 or one that wraps is no range.)
+            let end = at.checked_add(size).filter(|_| size > 0)?;
+            let up = down(end.checked_add(page - 1)?);
+            // (The part's own PT_LOAD ends where it does or goes on past it: only what begins
+            // or goes on inside the rest of the page counts.)
+            let shared = headers
+                .clone()
+                .any(|(kind, from, len)| kind == PT_LOAD && from < up && from.saturating_add(len) > end);
+            let (start, end) = (down(at), if shared { down(end) } else { up });
+            (start < end).then_some((start, end))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PAGE: usize = 0x1000;
+    fn relro(at: usize, size: usize) -> (u32, usize, usize) {
+        (PT_GNU_RELRO, at, size)
+    }
+    fn load(at: usize, size: usize) -> (u32, usize, usize) {
+        (PT_LOAD, at, size)
+    }
+
+    #[test]
+    fn relro_ends_on_a_page() {
+        let headers = [
+            load(0, 0x1000),
+            load(0x1000, 0x3000),
+            relro(0x1000, 0x2000),
+            load(0x4000, 0x800),
+        ];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x3000)]);
+    }
+
+    /// lld: the part ends inside a page and its segment ends there too, with nothing in the rest.
+    #[test]
+    fn relro_ends_inside_a_page_with_nothing_else_in_it_rounds_up() {
+        let headers = [load(0x1000, 0x1800), relro(0x1000, 0x1800), load(0x4000, 0x100)];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x3000)]);
+    }
+
+    /// The segment goes on past the part (written data after it): that page stays writable.
+    #[test]
+    fn relro_ends_inside_a_page_a_load_goes_on_in_rounds_down() {
+        let headers = [load(0x1000, 0x3000), relro(0x1000, 0x1800)];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x2000)]);
+        // Another segment that begins in the rest of the page is the same.
+        let headers = [load(0x1000, 0x1800), load(0x2900, 0x100), relro(0x1000, 0x1800)];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x2000)]);
+    }
+
+    #[test]
+    fn a_range_that_rounds_to_nothing_is_not_asked_for() {
+        let headers = [load(0x1000, 0x3000), relro(0x1100, 0x200)];
+        assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+    }
+
+    #[test]
+    fn a_header_near_the_top_of_the_address_space_gives_no_range_and_no_panic() {
+        for headers in [
+            [relro(usize::MAX - 0x100, 0x80)],
+            [relro(usize::MAX - 0x100, 0x200)],
+            [relro(usize::MAX, usize::MAX)],
+        ] {
+            assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+        }
+        // A segment whose size wraps does not make the part shared, or panic.
+        let headers = [load(usize::MAX - 1, usize::MAX), relro(0x1000, 0x1000)];
+        assert_eq!(relro_ranges(headers.into_iter(), PAGE), [(0x1000, 0x2000)]);
+    }
+
+    #[test]
+    fn a_relro_header_of_size_zero_gives_no_range() {
+        let headers = [load(0x1000, 0x3000), relro(0x1000, 0)];
+        assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+    }
+
+    #[test]
+    fn no_relro_header_no_range() {
+        let headers = [load(0, 0x1000), load(0x1000, 0x1000), (7, 0x1000, 0x100)];
+        assert!(relro_ranges(headers.into_iter(), PAGE).is_empty());
+    }
+
+    /// Only that the stub answers: this test program is built for glibc, where `seal_relro`
+    /// does nothing (the loader did it). That the shipped musl programs are sealed is shown by
+    /// `python3 ci/budgets.py`, against their /proc/PID/maps.
+    #[test]
+    fn sealing_a_running_test_program_answers() {
+        assert!(seal_relro().is_ok());
+    }
 
     #[test]
     fn crypt_requests_are_laid_out_as_the_kernel_reads_them() {

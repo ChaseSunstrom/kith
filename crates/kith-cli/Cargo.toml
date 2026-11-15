@@ -15,6 +15,8 @@ kith-api.workspace = true
 kith-packages = { path = "../kith-packages" }
 kith-lang = { path = "../kith-lang" }
 kith-kube = { path = "../kith-kube" }
+# Makes its own tables of functions read-only at start (the workspace's one crate with unsafe).
+kith-dm-sys = { path = "../kith-dm-sys" }
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
