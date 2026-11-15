@@ -76,7 +76,7 @@ fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
 /// the public key the cluster is to know it by (hex). The cluster's addresses come from its
 /// CA, which the join `token` names.
 pub fn key_before_joining(options: &Options, token: &str, name: &str) -> Result<String, String> {
-    let (_, pinned) = crate::pki::token_parts(token)?;
+    let (_, pinned, _) = crate::pki::token_parts(token)?;
     let address = kith_mesh::node_address(kith_mesh::prefix(pinned.as_bytes()), name);
     let up = private_key(&options.key).and_then(|key| {
         let mut device = Device::ensure(&options.interface, &key, options.port, address)?;
