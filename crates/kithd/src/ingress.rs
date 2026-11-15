@@ -1104,10 +1104,11 @@ pub async fn run(
             }
         }
         // The leader keeps the thumbprint written whether or not anything is ordered now, so
-        // a worker has it before a renewal asks (one written only then reaches it a little late).
-        if let Some(account) = account.as_ref().filter(|_| leads && acme.is_some()) {
-            tell_thumbprint(&shared, account).await;
-        }
+        // a worker has it before a renewal asks; and whoever orders writes it first.
+        let told = match account.as_ref().filter(|_| acme.is_some() && (leads || orders)) {
+            Some(account) => tell_thumbprint(&shared, account).await,
+            None => false,
+        };
         if let Some(directory) = acme.as_deref().filter(|_| orders && !wanting.is_empty()) {
             let orders = async {
                 match account {
@@ -1126,7 +1127,7 @@ pub async fn run(
                     Some(account) => {
                         // A worker answers a challenge with the thumbprint its view holds: one
                         // written now has a few seconds to reach the views before it is asked.
-                        if tell_thumbprint(&shared, &account).await {
+                        if told {
                             tokio::time::sleep(Duration::from_secs(5)).await;
                         }
                         for (host, of) in &wanting {
@@ -2290,14 +2291,33 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
         // (Before the certificate: the worker's view, which has the host and no certificate.)
         let before = view_of(&shared);
         let deadline = Instant::now() + Duration::from_secs(60);
+        // (When the thumbprint was written, and when the authority was first asked.)
+        let (mut printed, mut first_asked) = (None, None);
         while shared.store.lock().unwrap().store.get(&key).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "no certificate was ordered: {:?}",
                 asked.lock().unwrap()
             );
+            let now = Instant::now();
+            if thumbprint_of(&shared.store.lock().unwrap().store).is_some() {
+                printed.get_or_insert(now);
+            }
+            if !asked.lock().unwrap().is_empty() {
+                first_asked.get_or_insert(now);
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // The worker's view is given time to have the thumbprint before the authority asks it
+        // (asked at once, a worker whose view is a moment behind answers 404 and the order fails).
+        // (Either not seen yet: it was in the last tenth of a second.)
+        let now = Instant::now();
+        let (printed, first_asked) = (printed.unwrap_or(now), first_asked.unwrap_or(now));
+        assert!(
+            first_asked >= printed + Duration::from_secs(4),
+            "the authority was asked {:?} after the thumbprint was written",
+            first_asked - printed
+        );
         let _ = stop.send(true);
         ordering.await.unwrap();
         let status = shared
