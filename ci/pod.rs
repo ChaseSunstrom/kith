@@ -40,8 +40,9 @@
 //!   pod ids|stays [PATH ...]   say its uid_map (whose ids it has on the node), then of each
 //!                              PATH its owner as seen here and whether it opens; `+PATH` is
 //!                              a file it writes first; `root-only` is a file of a PCI
-//!                              device's in /sys that only the node's root opens; stays: then
-//!                              wait
+//!                              device's in /sys that only the node's root opens; `=PATH`
+//!                              says what the file holds; `:80` says whether port 80 binds;
+//!                              stays: then wait
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -352,6 +353,15 @@ fn main() {
             let map = std::fs::read_to_string("/proc/self/uid_map").expect("its uid_map");
             println!("ids: map {}", map.split_whitespace().collect::<Vec<_>>().join(" "));
             for path in paths {
+                if let Some(read) = path.strip_prefix('=') {
+                    let holds = std::fs::read_to_string(read).map(|text| text.trim().to_string()).map_err(|e| e.kind());
+                    println!("ids: {path} holds {holds:?}");
+                    continue;
+                }
+                if *path == ":80" {
+                    println!("ids: :80 binds {:?}", TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).map(drop).map_err(|e| e.kind()));
+                    continue;
+                }
                 let found = if *path == "root-only" {
                     // (A BAR of a device: 0600 and the node's root's, as sysfs makes it.)
                     let devices = std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten();

@@ -699,12 +699,13 @@ EOF
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
                 printf '%s\n' "$line" | grep -Eq "$4" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
             }
-            # What holds a container to its devices: a pod that is root may make device nodes,
-            # and makes /dev/null again and reads it; its node's own disk it may neither make
-            # nor read. (NAME, block or character, and where /sys has the device's numbers.)
+            # What holds a container to its devices: a pod that is root is root of a user
+            # namespace of its own on kith OS, where the kernel makes no device node, not even
+            # /dev/null again; its node's own disk it may neither make nor read. (NAME, block
+            # or character, and where /sys has the device's numbers.)
             makes() { job "$1" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"node\",\"$2\",\"$3\",\"/dev/made\"]" '^[0-9]+ succeeded'; }
             makes null c /sys/class/mem/null/dev
-            grep -q 'node: made 0, read Ok(0)' "$work/null.out" || fail "a pod that is root could not make /dev/null again and read it: $(cat "$work/null.out" "$work/null.err")"
+            grep -q 'node: made -1, read Err' "$work/null.out" || fail "a pod that is root made a device node in a user namespace of its own: $(cat "$work/null.out" "$work/null.err")"
             makes disk b /sys/class/block/vda/dev
             grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
 
@@ -1146,9 +1147,24 @@ EOF
             user root 0
             until_job root succeeded
 
-            # A container's root is not the node's: its ids are a range of the node's of its
-            # own (two running at once never share one), the node's own files (its /sys) are
-            # nobody's to it, and a file there only the node's root opens does not open. Its
+            # A container on the node's network keeps the node's users (a port it serves is
+            # under 1024 as often as not, and no capability of a user namespace reaches that
+            # network), and the node's ports under 1024 stay its root's.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"node-ids"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","ids","=/proc/sys/net/ipv4/ip_unprivileged_port_start"],"runAsUser":0,
+   "volumeMounts":[{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job node-ids was not applied"
+            until_job node-ids succeeded
+            said=$(any GET /v1/logs/Job/default/node-ids | field data) || fail "what the Job node-ids said could not be read"
+            printf '%s\n' "$said" | grep -q '^ids: map 0 0 4294967295$' || fail "a container on the node's network did not keep the node's users: $said"
+            printf '%s\n' "$said" | grep -q '^ids: =/proc/sys/net/ipv4/ip_unprivileged_port_start holds Ok("1024")$' || fail "the node's ports under 1024 are not its root's alone: $said"
+
+            # A pod's root is not the node's: its ids are a range of the node's of its own (two
+            # running at once never share one), the node's own files (its /sys) are nobody's
+            # to it, a file there only the node's root opens does not open, and port 80 of its
+            # own network is still its to bind. Its
             # volume's files are owned on disk as before: read on the second node through NFS
             # (which takes no id-mapped mount: that container keeps the node's users, and says
             # so), what containers on the first made is root's, or nobody's, as they were. (Root
@@ -1164,13 +1180,14 @@ EOF
                 printf '%s\n' "$said"
             }
             cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ids"},"spec":{"replicas":2,"template":{"containers":[
-  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays","/sys","root-only","+/roots/by-root"],"runAsUser":0,
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ids"},"spec":{"replicas":2,"template":{"pod":true,"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays",":80","/sys","root-only","+/roots/by-root"],"runAsUser":0,
    "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots"},{"volume":"on1","path":"/here"}]}]}}}]
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload ids was not applied"
             range() { # REPLICA: the first id of its range
                 said=$(sees ids "$1" '^ids: +/roots/by-root /') || exit 1
+                printf '%s\n' "$said" | grep -q '^ids: :80 binds Ok(())$' || fail "a pod's root did not bind port 80 of its own network: $said"
                 printf '%s\n' "$said" | grep -q '^ids: /sys /sys owner 65534 opens Ok' || fail "the node's /sys is not nobody's to a container: $said"
                 printf '%s\n' "$said" | grep -q '^ids: root-only /sys/.* owner 65534 opens Err(PermissionDenied)' || fail "a container's root opened a file only the node's root does: $said"
                 printf '%s\n' "$said" | grep -q '^ids: +/roots/by-root /roots/by-root owner 0 opens Ok' || fail "a container's root did not make a file of its own in its volume: $said"
@@ -1181,7 +1198,7 @@ EOF
             [ "$first" -ge 65536 ] && [ "$second" -ge 65536 ] && [ "$first" != "$second" ] || fail "two containers have the ranges $first and $second"
             echo "vm.sh: two containers' ids start at $first and $second of the node's" >&2
             cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"owners"},"spec":{"replicas":1,"template":{"containers":[
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"owners"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
   {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays","/roots/by-root","/data/from-n1","/data/from-n2"],
    "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots","readOnly":true},{"volume":"on2","path":"/here"}]}]}}}]
 EOF
@@ -1301,7 +1318,7 @@ EOF
             ! dd if="$work/n2.raw" bs=512 skip="$state_start" count="$state_sectors" status=none | grep -aq kith-volume || fail "the encrypted volume's file system is in the clear on its node's disk"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there; a container's root was not the node's (two at once had ranges of ids of their own, the node's /sys was nobody's to them and a file only the node's root opens did not open), and what containers made in a volume was owned on disk as before"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there; a pod's root was not the node's (two at once had ranges of ids of their own, the node's /sys was nobody's to them, a file only the node's root opens did not open, and each bound port 80 of its own network) while a container on the node's network kept the node's users and the node's ports under 1024 stayed its root's, and what containers made in a volume was owned on disk as before"
             exit 0
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "

@@ -159,11 +159,13 @@ fn take_range(bundles: &Path) -> Result<Range> {
     Ok(Range(base))
 }
 
-/// Whether a container gets a user namespace of its own where kithd is root. Not one that keeps
-/// the node's users; not one given device nodes (the node's, whose owners are the node's users);
-/// not one in a network namespace (a pod's: its network is made by the node's root); and not one
-/// with its image or a volume on a file system that takes no id-mapped mount (NFS: a volume of
-/// another node). Those are what they were before: their users are the node's.
+/// Whether a container gets a user namespace of its own where kithd is root: one with a network
+/// of its own (a pod's), where a port under 1024 is anyone's. Not one on the node's network: a
+/// port it serves is under 1024 as often as not, and no capability of a user namespace reaches
+/// the node's network, so it would need the node's ports to be anyone's. Not one that keeps the
+/// node's users; not one given device nodes (the node's, whose owners are the node's users); and
+/// not one with its image or a volume on a file system that takes no id-mapped mount (NFS: a
+/// volume of another node). Those are what they were before: their users are the node's.
 fn shifts(image: &Image, unit: &Unit) -> bool {
     use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, FsType, TMPFS_MAGIC, statfs};
     // XFS's number, which nix leaves out where libc is musl.
@@ -171,7 +173,7 @@ fn shifts(image: &Image, unit: &Unit) -> bool {
     let kinds = [EXT4_SUPER_MAGIC, TMPFS_MAGIC, xfs, BTRFS_SUPER_MAGIC];
     let mappable = |path: &Path| statfs(path).is_ok_and(|fs| kinds.contains(&fs.filesystem_type()));
     unit.devices.is_empty()
-        && unit.netns.is_none()
+        && unit.netns.is_some()
         && !unit.host_users
         && mappable(&image.rootfs)
         && unit.mounts.iter().all(|volume| mappable(&volume.host))
@@ -223,6 +225,11 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
         }
         let only = if volume.read_only { RDONLY } else { 0 };
         mount_mapped(&volume.host, &at, users.as_fd(), NOSUID | NODEV | only)?;
+    }
+    // Its network is joined here, by the thread it is made from: from inside its own user
+    // namespace it may not join one the node's root made.
+    if let Some(netns) = &unit.netns {
+        nix::sched::setns(File::open(netns)?, nix::sched::CloneFlags::CLONE_NEWNET)?;
     }
     Ok(())
 }
@@ -1244,12 +1251,13 @@ fn spec_shifted(
         notes.insert(BECOMES.to_string(), format!("{user}:{group}"));
     }
     spec.set_annotations(Some(notes));
-    // No network namespace of its own: the host's network, or the one it is given.
+    // No network namespace of its own: the host's network, or the one it is given (which one
+    // with a range of ids has from the thread that makes it: see `stage`).
     let network = oci_spec::runtime::LinuxNamespaceType::Network;
     let mut linux = spec.linux().clone().unwrap_or_default();
     let mut namespaces = linux.namespaces().clone().unwrap_or_default();
     namespaces.retain(|ns| ns.typ() != network);
-    if let Some(netns) = &unit.netns {
+    if let Some(netns) = unit.netns.as_ref().filter(|_| shift.is_none()) {
         let given = oci_spec::runtime::LinuxNamespaceBuilder::default().typ(network);
         namespaces.push(given.path(netns).build()?);
     }
@@ -2340,14 +2348,17 @@ mod tests {
         let _ = fs::remove_dir_all(&bundles);
     }
 
-    /// What keeps a container's users the node's: devices, a pod's network, a NodeWorkload, or
-    /// a file system that takes no id-mapped mount. Otherwise it gets a range.
+    /// What keeps a container's users the node's: the node's network (its ports under 1024 are
+    /// the node's root's), devices, a NodeWorkload, or a file system that takes no id-mapped
+    /// mount. A pod, with a network of its own, otherwise gets a range, and joins its network
+    /// from the thread it is made from rather than by the spec.
     #[test]
     fn idmapped_only_where_every_file_system_takes_it() {
         let here = std::env::temp_dir().join(format!("kith-shifts-{}", std::process::id()));
         fs::create_dir_all(&here).unwrap();
         let image = Image {
             rootfs: here.clone(),
+            entrypoint: vec!["/bin/true".into()],
             ..Image::default()
         };
         let mapped = nix::sys::statfs::statfs(&here).unwrap().filesystem_type();
@@ -2357,26 +2368,35 @@ mod tests {
             nix::sys::statfs::XFS_SUPER_MAGIC,
             nix::sys::statfs::BTRFS_SUPER_MAGIC,
         ];
-        assert_eq!(shifts(&image, &Unit::default()), takes.contains(&mapped));
+        let pod = || Unit {
+            netns: Some("/proc/1/ns/net".into()),
+            ..Unit::default()
+        };
+        assert_eq!(shifts(&image, &pod()), takes.contains(&mapped));
         let kept = [
+            Unit::default(),
             Unit {
                 devices: vec!["/dev/dri/card0".into()],
-                ..Unit::default()
-            },
-            Unit {
-                netns: Some("/proc/1/ns/net".into()),
-                ..Unit::default()
+                ..pod()
             },
             Unit {
                 host_users: true,
-                ..Unit::default()
+                ..pod()
             },
             // (/proc is no file system an id-mapped mount takes, as NFS is not.)
             Unit {
                 mounts: vec![bind("/proc", "/x", true)],
-                ..Unit::default()
+                ..pod()
             },
         ];
+        let root = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        let network = oci_spec::runtime::LinuxNamespaceType::Network;
+        let joins = |shift: Option<u32>| {
+            let spec = spec_shifted("a", &image, &pod(), "/kith/a", Path::new("/b"), root, shift).unwrap();
+            let namespaces = spec.linux().clone().unwrap().namespaces().clone().unwrap();
+            namespaces.iter().any(|ns| ns.typ() == network)
+        };
+        assert!(joins(None) && !joins(Some(RANGE)));
         for unit in kept {
             assert!(!shifts(&image, &unit), "{unit:?}");
         }

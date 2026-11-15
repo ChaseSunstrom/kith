@@ -615,11 +615,6 @@ pub fn early() -> Boot {
     if let Err(e) = nix::unistd::sethostname(&name) {
         eprintln!("kithd: init: naming the machine {name}: {e}");
     }
-    // A container's root is root of its own range of ids, not the node's: in the node's network
-    // it could bind no port under 1024. Any port is anyone's here, as it was a container root's.
-    if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_unprivileged_port_start", "0") {
-        eprintln!("kithd: init: letting containers have ports under 1024: {e}");
-    }
     // A panic would end process 1, and with it the kernel: say it and restart instead.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("kithd: {info}");
