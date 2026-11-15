@@ -8,8 +8,37 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How many times its base a deadline is given: the 1-minute load average over the CPU count,
+/// at least 1 and at most 4 (a host loaded past that is not waited on for ever).
+fn patience(load: f64, cpus: usize) -> f64 {
+    // (clamp passes a NaN through.)
+    if load.is_nan() {
+        return 1.0;
+    }
+    (load / cpus.max(1) as f64).clamp(1.0, 4.0)
+}
+
+#[test]
+fn deadlines_grow_with_the_load_within_bounds() {
+    assert_eq!(patience(0.5, 16), 1.0);
+    assert_eq!(patience(32.0, 16), 2.0);
+    assert_eq!(patience(105.0, 16), 4.0);
+    assert_eq!(patience(f64::NAN, 16), 1.0);
+    assert_eq!(patience(1000.0, 0), 4.0);
+}
+
+/// The base deadline of a wait, grown by the load the host has now.
+fn deadline_for(base: Duration) -> Duration {
+    let load = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|text| text.split(' ').next()?.parse().ok())
+        .unwrap_or(0.0);
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    base.mul_f64(patience(load, cpus))
+}
+
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + deadline_for(Duration::from_secs(30));
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
@@ -320,7 +349,17 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     alpha.stop();
     alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &["--admit-deleted-nodes"]);
     wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
-    wait_for("the old certificate to be taken", || api() == "403");
+    // The switch is set before the node port is served: the first answer on it is the answer.
+    // (curl says 000 while the port does not answer; a loaded host takes long to get there.)
+    let mut said = String::new();
+    wait_for("alpha's node port to answer", || {
+        said = api();
+        said != "000"
+    });
+    assert_eq!(
+        said, "403",
+        "the old certificate, at the first answer of a node started with --admit-deleted-nodes"
+    );
 }
 
 /// The node the cluster started on, deleted and started again, does not put its Node back.
