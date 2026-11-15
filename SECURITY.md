@@ -209,22 +209,25 @@ Only the newest version is fixed. There are no security releases of older ones.
   replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
   downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
   it is unpacked. An unpack holds only the directories the archive is inside of, a path,
-  a mode and a time each, and refuses a directory more than 128 directories down; an
+  a mode and a time each, and refuses an entry more than 128 directories down; an
   entry's headers (its name, and a long name, PAX header or sparse map the tar crate
-  reads whole) are refused past 256 KiB: its memory does not grow with the archive. A
-  restore that fails opens what it unpacked to its owner and removes it, and one that
-  finds such a leftover beside the Volume does the same first. Each directory is made when it comes, stays open
-  to its owner while the archive is inside it, and is given its mode and time when the
-  archive leaves it, through no link: one whose path leads elsewhere by then is left as
-  it is. An archive in depth-first order (kith's own, GNU tar's) unpacks with every
-  directory's mode, owner and time; one that is not leaves its directories' times as the
-  unpack left them, and where kithd is not root, an entry that comes after the archive
-  left a directory that shuts its owner out is refused. A restore unpacks into a
-  directory beside the Volume and renames it over the Volume's empty one: a move that
-  fails leaves the Volume's directory as it was, mode and owner too. There is no quota on
-  the directory and no count of inodes. A restore from S3 unpacks from its download, which
-  is removed once the unpack is done or refused. A sync of a Volume that is gone from the store
-  (or whose spec does not parse) takes nothing and says so.
+  reads whole) are refused past 256 KiB, and an archive that ends inside an entry is
+  refused: its memory does not grow with the archive. An unpack that fails opens what
+  it unpacked to its owner and removes it, holding open only the directories it is
+  inside of, through no link, and one that finds such a leftover beside the Volume does
+  the same first. Each directory is made when it comes, stays open to its owner while
+  the archive is inside it, and is given its mode and time when the archive leaves it,
+  through no link: one whose path leads elsewhere by then is left as it is. An archive
+  in depth-first order (kith's own, GNU tar's) unpacks with every directory's mode,
+  owner and time; one that is not leaves its directories' times as the unpack left
+  them, and where kithd is not root, an entry that comes after the archive left a
+  directory that shuts its owner out is refused. A restore unpacks into a directory
+  beside the Volume, `.NAME.restoring` (a dot no Volume's name starts with), and renames
+  it over the Volume's empty one: a move that fails leaves the Volume's directory as it
+  was, mode and owner too. There is no quota on the directory and no count of inodes. A
+  restore from S3 unpacks from its download, which is removed once the unpack is done or
+  refused. A sync of a Volume that is gone from the store (or whose spec does not parse)
+  takes nothing and says so.
 - **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
   apply a Volume and a Workload in its namespace, checked on the node that is asked; the
   node that has the Volume takes the request from that node as it takes any other node's.
