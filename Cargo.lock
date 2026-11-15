@@ -1381,6 +1381,7 @@ dependencies = [
  "oci-client",
  "oci-spec",
  "ring",
+ "rustix 1.1.6",
  "rustls",
  "seccompiler",
  "serde_json",

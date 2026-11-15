@@ -150,6 +150,17 @@ Only the newest version is fixed. There are no security releases of older ones.
   may write a Source in `kith-system` (its files are applied as the node): they can add
   a rule with a longer prefix and a key of their own. A node on a build from before
   rules reads none.
+- **An image is checked when it is pulled, not again when it starts.** Its layers are
+  checked against their digests as they arrive and unpacked once; a start uses the files
+  on the node's disk as they are. A file that several images hold alike is one file,
+  hard-linked into each (and into `shared/`, beside `images/`): a file changed there by
+  root on the node changes in every image that shares it. Nothing kith runs writes
+  there: a container sees its image read-only, or through an overlay that takes its
+  writes. A file with any extended attribute (a file capability, a label) is never
+  shared. A file in `shared/` is taken by its name (the SHA-256 it had when it was
+  first unpacked) and its size, mode, owner and time: its bytes are not read again
+  when a later image is linked to it, so one changed there since is what that image
+  gets too.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
