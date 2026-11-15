@@ -214,6 +214,12 @@ pub struct Shared {
 const DRY_RUNS: usize = 4;
 
 fn main() -> ExitCode {
+    // First of all, before a thread or an argument (and before the shim below, which is
+    // this same program started again): what musl's start code left writable is shut. A node
+    // that cannot shut it still has to boot, so a failure is only said.
+    if let Err(e) = kith_dm_sys::seal_relro() {
+        eprintln!("kithd: could not make its tables of functions read-only: {e}");
+    }
     // Started again by the runtime as an exec unit's helper? Then this never returns.
     kith_runtime::exec_shim();
     let first = init::is_init();

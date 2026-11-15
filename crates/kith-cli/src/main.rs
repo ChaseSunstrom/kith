@@ -490,6 +490,10 @@ macro_rules! println {
 }
 
 fn main() -> ExitCode {
+    // First, before the arguments are read: what musl's start code left writable is shut.
+    if let Err(e) = kith_dm_sys::seal_relro() {
+        eprintln!("kith: could not make its tables of functions read-only: {e}");
+    }
     let code = match run(Cli::parse()) {
         Ok(code) => code,
         Err(msg) => {
