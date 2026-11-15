@@ -62,16 +62,19 @@ fn minute(cron: &Resource, schedule: &Schedule, at: u64) -> Option<u64> {
         .as_ref()
         .and_then(|status| status["last"].as_str())
         .and_then(unrfc3339);
+    // (Never the minute of its last run again, nor one before it: a Job that ran and went,
+    // kept by no history limit, is not made a second time by a look in the same minute.)
+    let after = last.map_or(0, |last| last / 60 + 1);
     let from = match (cron.spec["startingDeadlineSeconds"].as_u64(), last) {
-        (Some(deadline), Some(last)) => {
-            let oldest = (at.saturating_sub(deadline))
-                .div_ceil(60)
-                .max(this.saturating_sub(LOOKBACK));
-            oldest.max(last / 60 + 1).min(this)
-        }
+        (Some(deadline), Some(_)) => (at.saturating_sub(deadline))
+            .div_ceil(60)
+            .max(this.saturating_sub(LOOKBACK)),
         _ => this,
     };
-    (from..=this).rev().find(|minute| schedule.due(minute * 60))
+    // (This minute is run on time whatever the deadline.)
+    (from.min(this).max(after)..=this)
+        .rev()
+        .find(|minute| schedule.due(minute * 60))
 }
 
 /// What the minute `at` is in asks for.
@@ -361,6 +364,13 @@ mod tests {
             .set_status("CronJob/default/late", Some(json!({ "last": rfc3339(nine_thirty) })))
             .unwrap();
         assert!(plan(&store, at + 60).make.is_empty());
+        // Nor is the minute of a last run made again in that same minute, its Job gone
+        // already (a history limit of 0): `done` ran at 09:30 and has no Job. (The four that
+        // last ran at 09:00, or never, run at 09:30 on time.)
+        let again = plan(&store, nine_thirty + 5);
+        let again: Vec<&str> = again.make.iter().map(|job| job.metadata.name.as_str()).collect();
+        assert_eq!(again.len(), 4, "{again:?}");
+        assert!(!again.contains(&format!("done-{minute}").as_str()), "{again:?}");
         let on_time = plan(&store, nine_thirty + 600 + 5);
         assert_eq!(
             on_time.make.len(),
