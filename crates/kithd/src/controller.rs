@@ -206,6 +206,9 @@ struct Controller {
     pruned: Option<Instant>,
     /// The boot and wall clocks as the last one began, to tell a clock set forward.
     clocks: Option<(Duration, SystemTime)>,
+    /// No image is unused from before this: this kithd's start (what came before, and the time
+    /// it was down, is not known), moved to now by a clock set forward, or back past it.
+    floor: SystemTime,
     /// What the last failed look said, said once until it changes.
     look_failed: Option<String>,
 }
@@ -299,6 +302,7 @@ pub async fn run(
         pruning: None,
         pruned: None,
         clocks: None,
+        floor: SystemTime::now(),
         look_failed: None,
     };
     loop {
@@ -1689,10 +1693,8 @@ impl Controller {
     /// Removes the images no unit here uses (`prune`), at most every `prune::EVERY` after the
     /// last removal ended, one at a time and off the async threads. In use is the image of
     /// every unit with a slot, whatever it is doing, and every image a container is made from.
+    /// With no grace it only finishes what a removal cut short (a kithd that had one) left.
     fn tend_images(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
-        if self.image_grace.is_zero() {
-            return;
-        }
         if let Some(job) = self.pruning.as_mut() {
             let hung = || "removing the images no unit uses has not ended in 60 s".to_string();
             let Some(said) = job.done(hung) else { return };
@@ -1713,13 +1715,20 @@ impl Controller {
         if self.pruned.is_some_and(|at| at.elapsed() < prune::EVERY) {
             return;
         }
-        // A wall clock set forward makes every image look unused for that much longer: this
-        // pass removes nothing, and the images are unused from now at the earliest.
+        // A wall clock set forward makes every image look unused for that much longer: the
+        // images are unused from now at the earliest (so this pass removes none).
         let boot = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME).map(Duration::from);
         let stepped = boot.ok().and_then(|boot| {
             let now = (boot, SystemTime::now());
             prune::stepped(self.clocks.replace(now), now)
         });
+        if let Some(ahead) = stepped {
+            eprintln!(
+                "kithd: the clock moved {ahead} s further than time went: each image is kept for its grace from now"
+            );
+        }
+        self.floor = prune::floor(self.floor, stepped.is_some(), SystemTime::now());
+        let floor = self.floor;
         let keep = images_in_use(&self.slots);
         let (images, grace, stop, state) = (
             self.runtime.images.clone(),
@@ -1732,39 +1741,29 @@ impl Controller {
         let root = nix::unistd::getuid().is_root();
         let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total, root));
         self.pruning = Job::start("images", &shared.changed, move || {
-            let mut said = Vec::new();
-            // What a removal that stopped or failed left, and the layers no image names.
-            let tidied = images.tidy();
-            if tidied > 0 {
-                said.push(format!(
-                    "kithd: removed what no image uses any more: {tidied} bytes freed"
-                ));
-            }
-            if let Some(ahead) = stepped {
-                return match images.restamp() {
-                    Ok(_) => {
-                        said.push(format!("kithd: the clock moved {ahead} s further than time went: no image removed this pass, and each is kept for its grace from now"));
-                        Ok(said)
-                    }
-                    Err(e) => Err(format!(
-                        "kithd: no image removed: the clock moved {ahead} s further than time went, and marking the images unused from now failed: {e}"
-                    )),
-                };
-            }
             // A second back: an image a pull marks used as this begins stays, however coarse
             // the disk's clock.
             let began = SystemTime::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            // What a removal that stopped or failed left, and the layers no image names that
+            // are as old as an image must be to go (none with no grace). Said whatever follows.
+            let cut = Some(grace).filter(|grace| !grace.is_zero());
+            let tidied = images.tidy(cut.and_then(|grace| began.checked_sub(grace.max(prune::LEAST))));
+            if tidied > 0 {
+                eprintln!("kithd: removed what no image uses any more: {tidied} bytes freed");
+            }
+            if cut.is_none() {
+                return Ok(Vec::new());
+            }
             let unused = images
-                .unused(&keep)
+                .unused(&keep, floor)
                 .map_err(|e| format!("kithd: no image removed: {e}"))?;
             // (A disk that cannot be asked is not under its reserve.)
             let low =
                 || nix::sys::statvfs::statvfs(&state).is_ok_and(|d| d.blocks_available() * d.fragment_size() < reserve);
             let remove = |digest: &str, before| images.remove_image(digest, before).map_err(|e| e.to_string());
-            said.extend(prune::prune(&unused, began, grace, low, remove, &stop));
-            Ok(said)
+            Ok(prune::prune(&unused, began, grace, low, remove, &stop))
         });
     }
 

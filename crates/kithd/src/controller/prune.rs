@@ -66,6 +66,13 @@ pub fn stepped(last: Option<(Duration, SystemTime)>, now: (Duration, SystemTime)
     (ahead > EVERY).then_some(ahead.as_secs())
 }
 
+/// The time no image is unused from before, at a pass `now`, from the last (`floor`, at first
+/// kithd's start): now after a clock set forward (`stepped`), or set back before it (from a time
+/// still to come, nothing would go until the clock got there).
+pub fn floor(floor: SystemTime, stepped: bool, now: SystemTime) -> SystemTime {
+    if stepped { now } else { floor.min(now) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +224,28 @@ mod tests {
         assert_eq!(stepped(last, (boot + EVERY, wall - day)), None);
         // The first pass has nothing to compare with.
         assert_eq!(stepped(None, (boot, wall)), None);
+    }
+
+    /// The floor is kithd's start, so an image unused while kithd was down is not unused for
+    /// that time; a clock set forward moves it to now, and one set back before it, back to now.
+    #[test]
+    fn image_removal_counts_from_the_start_and_the_floor_follows_a_clock_that_jumps() {
+        let start = SystemTime::now();
+        let later = start + HOUR;
+        assert_eq!(floor(start, false, later), start, "a pass moved the floor");
+        assert_eq!(floor(start, true, later + 24 * HOUR), later + 24 * HOUR);
+        assert_eq!(
+            floor(later, false, start),
+            start,
+            "set back, a floor still to come stayed"
+        );
+        // Images a month unused before this start (the node was down): kept the grace from it.
+        let down = images(start, &[24 * 30]);
+        let since: Vec<_> = down
+            .iter()
+            .map(|(digest, used)| (digest.clone(), (*used).max(start)))
+            .collect();
+        let (removed, _) = run(&since, later, 2 * HOUR, || false);
+        assert!(removed.is_empty(), "went for the time kithd was down");
     }
 }
