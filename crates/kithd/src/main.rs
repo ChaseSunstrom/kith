@@ -658,6 +658,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 () = init::BUTTON.notified() => {}
             }
             watched.stop.send_replace(true);
+            // Told again while it stops: it ends now, as a kill would end it, and what still
+            // runs is found by the next start. (Not the first process: its end unmounts the disks.)
+            if !first_process {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                eprintln!("kithd: told to stop twice: ending now, with what it had not stopped left to the next start");
+                std::process::exit(1);
+            }
         });
         let mut server_stop = stopping.clone();
         // Whoever can open the socket is the machine's admin.

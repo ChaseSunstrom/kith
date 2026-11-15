@@ -230,7 +230,9 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   its first replica and the status says where. `strategy: recreate` replaces
   everything at once. A container or exec unit is replaced the same way when a
   `ConfigMap` or `Secret` value in its `env` changes.
-- On SIGTERM it stops everything it started.
+- On SIGTERM it stops everything it started. Told a second time while it
+  stops, it ends at once and its next start stops what was left (on kith OS
+  the second signal changes nothing: the node still unmounts its disks).
 
 Not yet: `exec` probes are accepted but do nothing (the status says so), a
 container's `ports` only name them for probes and Services (nothing is opened or
