@@ -360,10 +360,10 @@ async fn membership(
     let listen = args.listen.unwrap_or((anywhere, 7443).into());
     // As the first process the address is waited for from the network, and said below.
     let holds_ca = known.as_ref().map_or(args.join.is_none(), |(_, ca)| ca.is_some());
-    if !init::is_init() {
-        if let Some(why) = unreachable_listen(listen, args.advertise.is_some(), holds_ca) {
-            return Err(why);
-        }
+    if !init::is_init()
+        && let Some(why) = unreachable_listen(listen, args.advertise.is_some(), holds_ca)
+    {
+        return Err(why);
     }
     let tcp = tokio::net::TcpListener::bind(listen).await;
     let tcp = tcp.map_err(|e| format!("listening on {listen}: {e}"))?;
