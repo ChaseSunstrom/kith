@@ -13,7 +13,10 @@
 
 use crate::cluster::Peer;
 use crate::{Shared, pki};
+use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use kith_api::store::Error;
@@ -220,16 +223,174 @@ async fn snapshot(
 /// The empty writes (the controller's barrier before it starts a unit) each worker last sent.
 static BARRIERS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 
-/// Whether worker `name` may send a barrier at `now`: one a second, `last` being when each last did.
-fn barrier_due(last: &mut BTreeMap<String, Instant>, name: &str, now: Instant) -> bool {
-    let soon = |at: &Instant| now.duration_since(*at) < Duration::from_secs(1);
+/// Whether worker `name` may do a thing at `now` that it may do once `every`, `last` being
+/// when each last did it.
+fn due(last: &mut BTreeMap<String, Instant>, name: &str, now: Instant, every: Duration) -> bool {
+    let soon = |at: &Instant| now.duration_since(*at) < every;
     if last.get(name).is_some_and(soon) {
         return false;
     }
-    // (What is older holds nobody back: the map is as long as the workers of the last second.)
+    // (What is older holds nobody back: the map is as long as the workers of the last `every`.)
     last.retain(|_, at| soon(at));
     last.insert(name.to_string(), now);
     true
+}
+
+/// The most a worker's write may be. A report of 300 units, each with a long message and
+/// notes, is 131 KiB (`worker_bound_is_several_times_an_honest_report`).
+const WORKER_WRITE: usize = 1 << 20;
+/// Writes a second a worker may send a control node, and how many at once after a rest. A
+/// write counts one, and one more for each whole 64 KiB: so 640 KiB a second at the most.
+const WORKER_RATE: f64 = 10.0;
+const WORKER_BURST: f64 = 50.0;
+
+/// How long a worker's write may take to send (its buffer is held meanwhile); a moment in
+/// tests, which send one that never ends.
+const BODY_PATIENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 15 });
+
+/// What a worker's write of `bytes` counts for against [`WORKER_RATE`].
+fn cost(bytes: usize) -> f64 {
+    1.0 + (bytes >> 16) as f64
+}
+
+/// `node`'s report of `statuses` as writes a worker may make: whole statuses, as many as fit
+/// in half of [`WORKER_WRITE`] each. (One status larger than that is a write of its own, and
+/// is refused for its size: the rest of the report still lands.)
+pub(crate) fn in_parts(node: &str, statuses: Vec<(String, Option<serde_json::Value>)>) -> Vec<Command> {
+    let mut parts: Vec<Vec<_>> = Vec::new();
+    let mut size = 0;
+    for status in statuses {
+        let more = serde_json::to_vec(&status).map_or(0, |bytes| bytes.len());
+        match parts.last_mut() {
+            Some(part) if size + more <= WORKER_WRITE / 2 => part.push(status),
+            _ => {
+                parts.push(vec![status]);
+                size = 0;
+            }
+        }
+        size += more;
+    }
+    let report = |statuses| Command::Report {
+        node: node.to_string(),
+        statuses,
+    };
+    parts.into_iter().map(report).collect()
+}
+
+/// What each worker that wrote lately may still write: how much, and when that was counted;
+/// and when the workers that may write their whole burst again were last let go.
+#[derive(Default)]
+struct Spent {
+    buckets: BTreeMap<String, (f64, Instant)>,
+    pruned: Option<Instant>,
+}
+
+static SPENT: Mutex<Spent> = Mutex::new(Spent {
+    buckets: BTreeMap::new(),
+    pruned: None,
+});
+
+/// Take `cost` from what worker `name` may write at `now`; or, taking nothing, how long until it may.
+fn spend(spent: &mut Spent, name: &str, cost: f64, now: Instant) -> Result<(), Duration> {
+    let has =
+        |(left, at): &(f64, Instant)| (left + now.duration_since(*at).as_secs_f64() * WORKER_RATE).min(WORKER_BURST);
+    let had = spent.buckets.get(name).map_or(WORKER_BURST, has);
+    if had < cost {
+        return Err(Duration::from_secs_f64((cost - had) / WORKER_RATE));
+    }
+    // (A worker that may write its whole burst again is as one that never wrote: the map is as
+    // long as the workers of the last few seconds. Looked over every few seconds, not each write.)
+    if spent
+        .pruned
+        .is_none_or(|at| now.duration_since(at) >= Duration::from_secs(5))
+    {
+        spent.buckets.retain(|_, bucket| has(bucket) < WORKER_BURST);
+        spent.pruned = Some(now);
+    }
+    spent.buckets.insert(name.to_string(), (had - cost, now));
+    Ok(())
+}
+
+/// Take `cost` from what worker `name` may write; past its rate, the answer that says how long to wait.
+fn over_rate(shared: &Shared, name: &str, cost: f64) -> Option<Response> {
+    let mut spent = SPENT.lock().expect("nothing panics holding what workers spent");
+    let wait = spend(&mut spent, name, cost, Instant::now()).err()?;
+    drop(spent);
+    let why = format!(
+        "a worker writes at most {WORKER_RATE} times a second (a write counts once more for each 64 KiB), \
+         and {name} wrote more: asked again in {} ms",
+        wait.as_millis()
+    );
+    audit_throttled(shared, name, "rate", &why);
+    Some(too_many(wait, why))
+}
+
+/// The refusals of a worker, of a kind, held to a line a minute in the audit log: when the
+/// last was written, and how many have not been since.
+type Said = BTreeMap<(String, &'static str), (Instant, u64)>;
+static SAID: Mutex<Said> = Mutex::new(BTreeMap::new());
+
+/// Does worker `name`'s refusal of `kind` at `now` open a minute in the audit log? If so, how
+/// many of that kind were not written since the last that was.
+fn throttled(said: &mut Said, name: &str, kind: &'static str, now: Instant) -> Option<u64> {
+    let minute = Duration::from_secs(60);
+    let key = (name.to_string(), kind);
+    match said.get_mut(&key) {
+        Some((at, unwritten)) if now.duration_since(*at) < minute => {
+            *unwritten += 1;
+            return None;
+        }
+        _ => {}
+    }
+    // (A minute with nothing unwritten has nothing left to say: the map is as long as the
+    // workers refused in the last minute, and those with a count still to give.)
+    said.retain(|_, (at, unwritten)| *unwritten > 0 || now.duration_since(*at) < minute);
+    Some(said.insert(key, (now, 0)).map_or(0, |(_, unwritten)| unwritten))
+}
+
+/// Put worker `name`'s refused write in the audit log.
+fn audit(shared: &Shared, name: &str, why: String) {
+    let who = crate::access::Caller::Node(name.to_string());
+    shared
+        .audit
+        .record(&who, "POST", vec!["/v1/raft/write".into()], Err(why));
+}
+
+/// [`audit`] a refusal for the size or the rate of worker `name`'s write: a line a minute of
+/// each kind, which says how many were not written since the last.
+fn audit_throttled(shared: &Shared, name: &str, kind: &'static str, why: &str) {
+    let unwritten = throttled(
+        &mut SAID.lock().expect("nothing panics holding the refusals said"),
+        name,
+        kind,
+        Instant::now(),
+    );
+    match unwritten {
+        None => {}
+        Some(0) => audit(shared, name, why.to_string()),
+        // (First: the audit log cuts a long error short.)
+        Some(n) => audit(shared, name, format!("{n} more not written since the last: {why}")),
+    }
+}
+
+/// A worker's write past its rate: 429, and when to send it again (whole seconds, at least one).
+fn too_many(wait: Duration, why: String) -> Response {
+    let seconds = (wait.as_secs_f64().ceil() as u64).max(1);
+    let wait = [(header::RETRY_AFTER, seconds.to_string())];
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        wait,
+        Json(serde_json::json!({ "error": why })),
+    )
+        .into_response()
+}
+
+/// How long a control node that answered 429 asks a write to wait (`Retry-After`): a second at least
+/// (one that says none would be asked again at once, and again), a minute at most.
+pub(crate) fn wait_of(reply: &reqwest::Response) -> Duration {
+    let said = reply.headers().get(reqwest::header::RETRY_AFTER);
+    let seconds = said.and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    Duration::from_secs(seconds.unwrap_or(1).clamp(1, 60))
 }
 
 /// What a worker's write becomes, held to what a worker may write (`crate::worker`):
@@ -237,7 +398,7 @@ fn barrier_due(last: &mut BTreeMap<String, Instant>, name: &str, now: Instant) -
 fn from_worker(shared: &Shared, name: &str, command: Command) -> Result<Option<Command>, String> {
     if matches!(&command, Command::Patch { statuses } if statuses.is_empty()) {
         let mut last = BARRIERS.lock().expect("nothing panics holding the barriers");
-        return Ok(barrier_due(&mut last, name, Instant::now()).then_some(command));
+        return Ok(due(&mut last, name, Instant::now(), Duration::from_secs(1)).then_some(command));
     }
     let blobs = crate::blobs::dir(shared);
     let held = |blob: &str| blobs.join(blob).exists();
@@ -261,44 +422,100 @@ fn sender(store: &kith_api::store::Store, name: &str) -> Option<bool> {
 }
 
 /// A change another node passes to the leader: the reply and where in the log it is. A
-/// control node's is given to Raft as it comes; a worker's is held to its list first.
+/// control node's is given to Raft as it comes; a worker's is held to its size, its rate
+/// and its list first.
 async fn write(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
-    Json(command): Json<Command>,
-) -> Json<Option<(Reply, u64)>> {
-    let command = match &peer.subject {
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Response {
+    let worker = match &peer.subject {
         Some(pki::Subject::Node(name, ..)) => {
-            let worker = {
-                let state = shared.store.lock().expect("a handler panicked holding the store");
-                sender(&state.store, name)
-            };
-            match worker {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            match sender(&state.store, name) {
                 // No Node for it here (this node is behind, or was started to admit deleted
                 // nodes): what it may write is not known, so it is asked again, not taken.
-                None => return Json(None),
-                Some(false) => command,
-                Some(true) => match from_worker(&shared, name, command) {
-                    // (Through this node to whichever leads: a worker asks one control node.)
-                    Ok(Some(command)) => return Json(passed(&shared, command).await),
-                    Ok(None) => return Json(None),
-                    Err(why) => {
-                        let who = crate::access::Caller::Node(name.clone());
-                        shared
-                            .audit
-                            .record(&who, "POST", vec!["/v1/raft/write".into()], Err(why.clone()));
-                        return Json(Some((Err(Error::Invalid(why)), 0)));
-                    }
-                },
+                None => return Json(None::<(Reply, u64)>).into_response(),
+                Some(worker) => worker.then(|| name.clone()),
             }
         }
-        _ => command,
-    };
-    let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
-    Json(match written {
-        Ok(Ok(written)) => Some((written.data, written.log_id.index)),
         _ => None,
-    })
+    };
+    let Some(name) = worker else {
+        let Ok(bytes) = axum::body::to_bytes(body, 64 << 20).await else {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        };
+        let command: Command = match serde_json::from_slice(&bytes) {
+            Ok(command) => command,
+            Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
+        };
+        let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
+        return Json(match written {
+            Ok(Ok(written)) => Some((written.data, written.log_id.index)),
+            _ => None,
+        })
+        .into_response();
+    };
+    let refused = |why: String| Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
+    let too_large = |why: String| {
+        audit_throttled(&shared, &name, "size", &why);
+        refused(why)
+    };
+    let audited = |why: String| {
+        audit(&shared, &name, why.clone());
+        refused(why)
+    };
+    // Every write of a worker counts, refused or not, for the size it says it is (once, where
+    // it says none), and past its rate it is not read.
+    let most = WORKER_WRITE >> 10;
+    let declared = headers.get(header::CONTENT_LENGTH);
+    let declared = declared.and_then(|length| length.to_str().ok()?.parse::<u64>().ok());
+    let charged = declared.map_or(1.0, |bytes| cost(bytes.min(WORKER_WRITE as u64) as usize));
+    if let Some(wait) = over_rate(&shared, &name, charged) {
+        return wait;
+    }
+    if let Some(bytes) = declared.filter(|bytes| *bytes > WORKER_WRITE as u64) {
+        let said = bytes >> 10;
+        return too_large(format!(
+            "a worker's write is at most {most} KiB, and this one says it is {said} KiB"
+        ));
+    }
+    // (Its buffer is held while it comes: a write that stalls is let go.)
+    let read = tokio::time::timeout(BODY_PATIENCE, axum::body::to_bytes(body, WORKER_WRITE)).await;
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            return too_large(format!(
+                "a worker's write is at most {most} KiB, and this one was not read whole ({e})"
+            ));
+        }
+        Err(_) => {
+            let why = format!(
+                "a worker's write was not sent in {} s, and is let go",
+                BODY_PATIENCE.as_secs()
+            );
+            audit_throttled(&shared, &name, "slow", &why);
+            return refused(why);
+        }
+    };
+    // (What else it counts for, now that its size is known: one that did not say.)
+    let more = cost(bytes.len()) - charged;
+    if more > 0.0
+        && let Some(wait) = over_rate(&shared, &name, more)
+    {
+        return wait;
+    }
+    let command: Command = match serde_json::from_slice(&bytes) {
+        Ok(command) => command,
+        Err(e) => return audited(format!("not a change: {e}")),
+    };
+    match from_worker(&shared, &name, command) {
+        // (Through this node to whichever leads: a worker asks one control node.)
+        Ok(Some(command)) => Json(passed(&shared, command).await).into_response(),
+        Ok(None) => Json(None::<(Reply, u64)>).into_response(),
+        Err(why) => audited(why),
+    }
 }
 
 /// A worker's change that was held to its list, made as this node's own: asked again
@@ -373,6 +590,12 @@ impl Shared {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
+                    Forward::Wait(wait, why) if Instant::now() + wait > deadline => return Err(rate_wait(&why)),
+                    // (Waited already: asked again at once, and the deadline still ahead.)
+                    Forward::Wait(wait, _) => {
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
                 }
             }
             if Instant::now() > deadline {
@@ -407,6 +630,12 @@ impl Shared {
         };
         let call = client.post(format!("https://{at}/v1/raft/write"));
         match call.timeout(PATIENCE).json(command).send().await {
+            // Only a worker is held to a rate (this one keeps the log, as a learner): it sends
+            // the change again once the leader says it may, if that is before its deadline.
+            Ok(reply) if reply.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let wait = wait_of(&reply);
+                Forward::Wait(wait, format!("the leader at {at} asked to wait {} s", wait.as_secs()))
+            }
             Ok(reply) => {
                 if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
                     // What a client writes through this node, it can read from this node.
@@ -439,6 +668,8 @@ enum Forward {
     Failed(Error),
     /// Not sent, or not reached: ask again, and say why if it is still so at the deadline.
     Again(Option<String>),
+    /// Refused for now (a worker that wrote too much): ask again after this long.
+    Wait(Duration, String),
 }
 
 /// The change was not taken in time; `refused` is why the last leader called was not reached.
@@ -447,6 +678,15 @@ fn no_majority(refused: Option<String>) -> Error {
         Some(why) => unavailable(format!("{NO_MAJORITY} (the last try: {why})")),
         None => unavailable(NO_MAJORITY),
     }
+}
+
+/// The change was not taken in time because this worker writes past its rate, not for want
+/// of a leader: `why` is what the control node said.
+fn rate_wait(why: &str) -> Error {
+    unavailable(format!(
+        "the control node asked this worker to wait: it wrote more than {WORKER_RATE} writes a second \
+         (or more than its burst of {WORKER_BURST}) ({why})"
+    ))
 }
 
 const NO_MAJORITY: &str = "no leader, or it did not hear from more than half of the voting nodes in time \
@@ -675,15 +915,381 @@ mod tests {
     #[test]
     fn barrier_map_is_bounded() {
         let (mut last, begun) = (BTreeMap::new(), Instant::now());
+        let second = Duration::from_secs(1);
         for worker in 0..100 {
-            assert!(barrier_due(&mut last, &format!("w{worker}"), begun));
+            assert!(due(&mut last, &format!("w{worker}"), begun, second));
         }
         assert!(
-            !barrier_due(&mut last, "w0", begun + Duration::from_millis(999)),
+            !due(&mut last, "w0", begun + Duration::from_millis(999), second),
             "one a second"
         );
-        assert!(barrier_due(&mut last, "w0", begun + Duration::from_secs(1)));
+        assert!(due(&mut last, "w0", begun + second, second));
         assert_eq!(last.len(), 1, "the others' second is over");
+    }
+
+    /// The report a worker running 300 units sends (100 Workloads of 3, each unit with a long
+    /// message and an address, each Workload with notes; `controller.rs` "4. Report") is far
+    /// below what a worker may write at once, and counts for little of its burst.
+    //
+    // How often: one report is in flight at a time (the next waits for it), a Node's own status
+    // is patched when its serving or mesh changes, devices every 30 s, and barriers one a second
+    // at most (each counted one). A worker held to the rate only sends fewer, larger reports.
+    #[test]
+    fn worker_bound_is_several_times_an_honest_report() {
+        let report = Command::Report {
+            node: "a-worker-with-a-long-name".into(),
+            statuses: honest(100),
+        };
+        let bytes = serde_json::to_vec(&report).unwrap().len();
+        eprintln!("an honest report of 300 units: {bytes} bytes, counted {}", cost(bytes));
+        assert!(
+            bytes * 4 <= WORKER_WRITE,
+            "{bytes} bytes: the bound is not several times it"
+        );
+        assert!(cost(bytes) * 5.0 <= WORKER_BURST, "it alone takes most of the burst");
+    }
+
+    /// A report too large for one write goes in parts, each a write a worker may make, every
+    /// status whole and in its order; a small one is one write.
+    #[test]
+    fn worker_report_goes_in_parts_under_the_bound() {
+        let statuses = honest(1000);
+        let keys: Vec<_> = statuses.iter().map(|(key, _)| key.clone()).collect();
+        let parts = in_parts("w", statuses);
+        assert!(parts.len() > 1, "{} parts", parts.len());
+        let mut kept = Vec::new();
+        for part in &parts {
+            let bytes = serde_json::to_vec(part).unwrap().len();
+            assert!(bytes <= WORKER_WRITE, "a part of {bytes} bytes");
+            let Command::Report { node, statuses } = part else {
+                panic!("{part:?}")
+            };
+            assert_eq!(node, "w");
+            kept.extend(statuses.iter().map(|(key, _)| key.clone()));
+        }
+        assert_eq!(kept, keys);
+        assert_eq!(in_parts("w", honest(100)).len(), 1);
+        assert!(in_parts("w", Vec::new()).is_empty(), "nothing to report is no write");
+    }
+
+    /// The statuses of `workloads` Workloads of 3 units, each with a long message and notes.
+    fn honest(workloads: usize) -> Vec<(String, Option<serde_json::Value>)> {
+        let message = "stopping: the unit did not stop in its grace period and was killed; its devices and \
+                       its name are held until it is gone, and it is started again once they are free (try 4)";
+        (0..workloads)
+            .map(|n| {
+                let units: Vec<_> = (0..3)
+                    .map(|replica| {
+                        serde_json::json!({
+                            "name": format!("workload-number-{n:03}-{replica}"), "replica": replica,
+                            "state": "restarting", "ready": false, "restarts": 12345, "revision": 1_000_000 + n,
+                            "exitCode": 137, "message": message, "address": "fd6b:6974:6800:1234:5678:9abc:def0:1234",
+                        })
+                    })
+                    .collect();
+                let notes = ["the image could not be pulled: the registry answered 503 Service Unavailable"; 2];
+                let status = serde_json::json!({ "replicas": 3, "containers": units, "notes": notes });
+                (format!("Workload/default/workload-number-{n:03}"), Some(status))
+            })
+            .collect()
+    }
+
+    /// A worker that wrote its burst waits, and how long is what refills what it asks; a write
+    /// it may not make is not counted, a worker's rest gives it no more than its burst, and the
+    /// map keeps no worker that may write its whole burst again.
+    #[test]
+    fn worker_bound_spends_a_bucket_per_worker() {
+        let (mut spent, begun) = (Spent::default(), Instant::now());
+        for _ in 0..WORKER_BURST as usize {
+            assert!(spend(&mut spent, "w", 1.0, begun).is_ok());
+        }
+        let wait = spend(&mut spent, "w", 2.0, begun).unwrap_err();
+        assert_eq!(wait, Duration::from_millis(200));
+        assert!(
+            spend(&mut spent, "v", 1.0, begun).is_ok(),
+            "another worker is held by w"
+        );
+        let later = begun + Duration::from_millis(200);
+        assert!(
+            spend(&mut spent, "w", 2.0, later).is_ok(),
+            "the refused write was counted"
+        );
+        // A long rest: the burst, no more.
+        let rested = begun + Duration::from_secs(3600);
+        for _ in 0..WORKER_BURST as usize {
+            assert!(spend(&mut spent, "w", 1.0, rested).is_ok());
+        }
+        assert!(spend(&mut spent, "w", 1.0, rested).is_err());
+        assert_eq!(spent.buckets.keys().collect::<Vec<_>>(), ["w"], "v has its burst again");
+        assert_eq!(
+            (cost(0), cost(65535), cost(65536), cost(WORKER_WRITE)),
+            (1.0, 1.0, 2.0, 17.0)
+        );
+    }
+
+    /// A worker's refusals of a kind open a minute in the audit log, and the next minute's first
+    /// says how many were not written; another kind, or another worker, has its own minute.
+    #[test]
+    fn worker_refusals_are_a_line_a_minute_of_each_kind() {
+        let (mut said, begun) = (Said::new(), Instant::now());
+        assert_eq!(throttled(&mut said, "w", "size", begun), Some(0));
+        for _ in 0..5 {
+            assert_eq!(throttled(&mut said, "w", "size", begun + Duration::from_secs(30)), None);
+        }
+        assert_eq!(
+            throttled(&mut said, "w", "rate", begun),
+            Some(0),
+            "rate has its own minute"
+        );
+        assert_eq!(
+            throttled(&mut said, "v", "size", begun),
+            Some(0),
+            "v has its own minute"
+        );
+        let later = begun + Duration::from_secs(61);
+        assert_eq!(throttled(&mut said, "w", "size", later), Some(5));
+        assert_eq!(throttled(&mut said, "w", "size", later), None);
+        assert_eq!(
+            said.len(),
+            1,
+            "the minutes over with nothing unwritten are let go: {said:?}"
+        );
+    }
+
+    /// A control node that says to wait no time, or an hour, is waited a second, or a minute.
+    #[test]
+    fn wait_of_is_a_second_to_a_minute() {
+        let reply = |after: &str| {
+            let said = axum::http::Response::builder()
+                .header("retry-after", after)
+                .body("")
+                .unwrap();
+            reqwest::Response::from(said)
+        };
+        let seconds = |after| wait_of(&reply(after)).as_secs();
+        assert_eq!(
+            (seconds("0"), seconds("5"), seconds("3600"), seconds("soon")),
+            (1, 5, 60, 1)
+        );
+    }
+
+    /// A worker's write over the size is refused unread, one off its list refused, and one past
+    /// its rate answered 429 with the wait; none reaches the log, and each kind is in the audit
+    /// log (the rate's once that minute). Another worker and a control node are not held by it,
+    /// and a worker's own write, refused for its rate, is sent again once it may, whether it
+    /// runs from a view or keeps the log.
+    #[tokio::test]
+    async fn worker_bound_holds_a_worker_to_its_size_and_rate_and_no_one_else() {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        use crate::cluster::{Cluster, listen, node_router};
+        let ca = pki::Ca::create().unwrap();
+        let (c, w, v, k) = (
+            node(&ca, "bound-c"),
+            node(&ca, "bound-w"),
+            node(&ca, "bound-v"),
+            node(&ca, "bound-k"),
+        );
+        let shared = shared_with("bound", c.clone(), &[]).await;
+        for (name, spec) in [
+            ("bound-w", "{trust: worker}"),
+            ("bound-v", "{trust: worker}"),
+            ("bound-k", "{}"),
+        ] {
+            let text = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}}}\nspec: {spec}\n");
+            let node = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            // Joined: a Node made by hand is not let in.
+            let joined = serde_json::json!({ "raftId": kith_store::node_id(name).to_string() });
+            store.set_status(&format!("Node/{name}"), Some(joined)).unwrap();
+        }
+        let id = shared.raft.metrics().borrow().id;
+        shared
+            .raft
+            .initialize(BTreeMap::from([(id, BasicNode::new(""))]))
+            .await
+            .unwrap();
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&c).unwrap()).unwrap();
+        let app = node_router(shared.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let client = |who: &pki::Identity| {
+            let cluster = Cluster::new(who.clone(), None).unwrap();
+            cluster.to(&at("bound-c", &address, None)).unwrap()
+        };
+        let (to_w, to_v, to_k) = (client(&w), client(&v), client(&k));
+        let url = format!("https://{address}/v1/raft/write");
+        let os = |name: &str, bytes: usize| {
+            let fields = serde_json::json!({ "os": "x".repeat(bytes) });
+            let fields = fields.as_object().unwrap().clone();
+            Command::Patch {
+                statuses: vec![(format!("Node/{name}"), fields)],
+            }
+        };
+        let logged = || shared.raft.metrics().borrow().last_log_index.unwrap_or(0);
+
+        // Over the size: refused by what it says it is, before a byte of it is read (none is
+        // ever sent here), and never in the log.
+        let before = logged();
+        let never = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+        let big = to_w
+            .post(&url)
+            .header(reqwest::header::CONTENT_LENGTH, WORKER_WRITE + 1)
+            .body(reqwest::Body::wrap_stream(never))
+            .send();
+        let big = tokio::time::timeout(Duration::from_secs(30), big).await;
+        let said = big.expect("answered before the body").unwrap().text().await.unwrap();
+        assert!(said.contains("at most 1024 KiB"), "{said}");
+        // Not on its list: refused, and written in the audit log each time.
+        let theirs = Command::Rollback {
+            key: "Node/bound-c".into(),
+            to: 1,
+            at: 0,
+        };
+        let said = to_w
+            .post(&url)
+            .json(&theirs)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(said.contains("Err"), "{said}");
+        // Past the rate: all at once, so the bucket is not refilled between them.
+        let mut sent = tokio::task::JoinSet::new();
+        let begun = Instant::now();
+        for _ in 0..(WORKER_BURST as usize * 2) {
+            let call = to_w.post(&url).json(&os("bound-w", 10));
+            sent.spawn(async move {
+                let reply = call.send().await.unwrap();
+                let wait = reply.headers().get(reqwest::header::RETRY_AFTER).cloned();
+                (reply.status().as_u16(), wait, reply.text().await.unwrap())
+            });
+        }
+        let (mut taken, mut waited) = (0, 0);
+        while let Some(done) = sent.join_next().await {
+            let (status, wait, said) = done.unwrap();
+            match status {
+                200 => {
+                    assert!(said.contains("Ok"), "{said}");
+                    taken += 1;
+                }
+                429 => {
+                    let wait: u64 = wait.expect("the wait is said").to_str().unwrap().parse().unwrap();
+                    assert!(wait >= 1 && said.contains("asked again in"), "{wait} {said}");
+                    waited += 1;
+                }
+                _ => panic!("{status} {said}"),
+            }
+        }
+        let refilled = (begun.elapsed().as_secs_f64() * WORKER_RATE).ceil() as usize;
+        assert!(waited > 0, "a burst twice the bound was all taken");
+        assert!(taken <= WORKER_BURST as usize + refilled, "{taken} taken");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(logged(), before + taken as u64, "a refused write is in the log");
+        let refusals = shared.audit.tail(200).unwrap();
+        let of_w: Vec<_> = refusals.iter().filter(|e| e["who"] == "node bound-w").collect();
+        // Its size, its list and its rate: a line each, the rate's once that minute.
+        assert_eq!(of_w.len(), 3, "{of_w:?}");
+        assert!(of_w.iter().all(|e| e["ok"] == false), "{of_w:?}");
+
+        // Another worker, and a control node (its writes as fast and as large as it likes).
+        let reply = to_v.post(&url).json(&os("bound-v", 10)).send().await.unwrap();
+        assert!(reply.text().await.unwrap().contains("Ok"), "v was held by w");
+        let mut sent = tokio::task::JoinSet::new();
+        for _ in 0..(WORKER_BURST as usize * 2) {
+            let call = to_k.post(&url).json(&os("bound-k", 10));
+            sent.spawn(async move { call.send().await.unwrap().status().as_u16() });
+        }
+        while let Some(status) = sent.join_next().await {
+            assert_eq!(status.unwrap(), 200, "a control node was held");
+        }
+        let large = to_k
+            .post(&url)
+            .json(&os("bound-k", WORKER_WRITE * 2))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            large.text().await.unwrap().contains("Ok"),
+            "a control node's large write was refused"
+        );
+        assert!(
+            shared
+                .audit
+                .tail(200)
+                .unwrap()
+                .iter()
+                .all(|e| e["who"] != "node bound-k")
+        );
+
+        // What a worker may still write, set here.
+        let left = |writes: f64| {
+            let bucket = (writes, Instant::now());
+            SPENT.lock().unwrap().buckets.insert("bound-w".into(), bucket);
+        };
+        // A body that never ends: none of these is sent a byte of it.
+        let unsent = |length: Option<usize>| {
+            let never = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+            let call = to_w.post(&url).body(reqwest::Body::wrap_stream(never));
+            let call = match length {
+                Some(length) => call.header(reqwest::header::CONTENT_LENGTH, length),
+                None => call,
+            };
+            tokio::time::timeout(Duration::from_secs(30), call.send())
+        };
+        // One that says it is 1 MiB, with a write left: it counts for 17, so it is answered
+        // 429 at once, unread.
+        left(1.0);
+        let reply = unsent(Some(WORKER_WRITE)).await.expect("answered unread").unwrap();
+        assert_eq!(reply.status().as_u16(), 429, "{:?}", reply.text().await);
+        // One that does not say, and stalls: refused once its time is up, and in the audit log.
+        left(WORKER_BURST);
+        let begun = Instant::now();
+        let reply = unsent(None).await.expect("answered when its time was up").unwrap();
+        let said = reply.text().await.unwrap();
+        assert!(said.contains("was not sent in"), "{said}");
+        assert!(begun.elapsed() >= BODY_PATIENCE, "{:?}", begun.elapsed());
+        let audited = shared.audit.tail(200).unwrap();
+        assert!(
+            audited
+                .iter()
+                .any(|e| e["who"] == "node bound-w" && e.to_string().contains("was not sent in")),
+            "{audited:?}"
+        );
+
+        // The worker's own kithd (from a view, through c) sends a write c asks it to wait for
+        // again once it may: here, after 3 s (its bucket 20 writes short).
+        let worker = shared_with("bound-worker", w.clone(), &[]).await;
+        worker.view.send_replace(Some(u64::MAX));
+        *worker.upstream.lock().unwrap() = Some((address.clone(), to_w.clone()));
+        let short = |by: f64| left(-by);
+        short(20.0);
+        let begun = Instant::now();
+        let done = worker.write(os("bound-w", 10)).await;
+        assert!(done.is_ok(), "{done:?}");
+        assert!(begun.elapsed() >= Duration::from_secs(2), "it was not asked to wait");
+
+        // A worker's kithd that keeps the log (a learner) sends it to the leader, and is told
+        // to wait as well.
+        let learner = shared_with("bound-learner", w.clone(), &[at("bound-c", &address, None)]).await;
+        short(20.0);
+        match learner.forward(1, &BasicNode::new(&address), &os("bound-w", 10)).await {
+            Forward::Wait(wait, why) => {
+                assert!(wait >= Duration::from_secs(1), "{why}");
+                // Past its deadline, its log says why: not that there is no leader.
+                let said = rate_wait(&why).to_string();
+                assert!(
+                    said.contains("asked this worker to wait") && !said.contains("no leader"),
+                    "{said}"
+                );
+            }
+            _ => panic!("not asked to wait"),
+        }
     }
 
     /// [`super::next_change`] of a cluster with no worker.
