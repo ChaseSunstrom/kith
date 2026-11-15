@@ -234,20 +234,111 @@ pub fn aside(scratch: &Path) -> bool {
 
 /// Removes every scratch moved aside in the replica directory `replica`, till `stop` is set.
 //
-// ponytail: each scratch goes in one `remove_dir_all`, which a stop does not cut short; one of
-// millions of files can outlast kithd's stop. A walk of its own that checks `stop` if it does.
+/// A scratch the stop cut short is left as it is, and the next sweep takes the rest.
 pub fn sweep(replica: &Path, stop: &AtomicBool) {
     for entry in std::fs::read_dir(replica).into_iter().flatten().flatten() {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        if entry.file_name().to_string_lossy().starts_with("scratch.")
-            && let Err(e) = std::fs::remove_dir_all(entry.path())
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("kithd: removing {}: {e}", entry.path().display());
+        if entry.file_name().to_string_lossy().starts_with("scratch.") {
+            match remove_tree(&entry.path(), &|| stop.load(Ordering::Relaxed)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "kithd: stopped removing {}: the rest goes at the next sweep",
+                        entry.path().display()
+                    );
+                    return;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("kithd: removing {}: {e}", entry.path().display()),
+            }
         }
     }
+}
+
+/// How many steps of a removal (an entry removed, a directory entered) pass between two looks
+/// at the stop.
+const BATCH: usize = 1024;
+
+/// Removes the directory `root` and all in it, asking `halted` first and then every [`BATCH`]
+/// steps: true once it is done, false when it was halted (what is left stays, the rest of a
+/// directory included). A pod wrote what is in it and kithd is root here, so each directory
+/// is opened through its parent's handle and never through a link, one that shuts its owner
+/// out is opened up first, and a link is unlinked, never followed. The first error is returned
+/// once the rest is done.
+fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
+    use crate::backups::{DEEPEST, open_dir, within};
+    use nix::sys::stat::{FchmodatFlags, fchmodat};
+    use std::os::unix::fs::PermissionsExt;
+    type Held = (std::fs::File, std::fs::ReadDir, std::ffi::OsString);
+    let open = |parent: Option<&std::fs::File>, name: &std::ffi::OsStr| -> std::io::Result<Held> {
+        let path = parent.map_or_else(|| PathBuf::from(name), |dir| within(dir, name));
+        let dir = match (open_dir(&path), parent) {
+            (Err(e), Some(parent)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                let open = Mode::from_bits_truncate(0o700);
+                fchmodat(Some(parent.as_raw_fd()), name, open, FchmodatFlags::NoFollowSymlink)?;
+                open_dir(&path)?
+            }
+            (opened, _) => opened?,
+        };
+        let mode = dir.metadata()?.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            dir.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777 | 0o700))?;
+        }
+        let listing = std::fs::read_dir(within(&dir, ".".as_ref()))?;
+        Ok((dir, listing, name.to_owned()))
+    };
+    let mut first: Option<std::io::Error> = None;
+    let mut note = |done: std::io::Result<()>| {
+        if let Err(e) = done
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            first.get_or_insert(e);
+        }
+    };
+    let mut inside = vec![open(None, root.as_os_str())?];
+    let mut steps = 0usize;
+    loop {
+        steps += 1;
+        if steps % BATCH == 1 && halted() {
+            return Ok(false);
+        }
+        let held = inside.len();
+        let Some((dir, listing, _)) = inside.last_mut() else {
+            break;
+        };
+        let Some(entry) = listing.next() else {
+            let Some((_, _, name)) = inside.pop() else { break };
+            note(match inside.last() {
+                Some((parent, ..)) => std::fs::remove_dir(within(parent, &name)),
+                None => std::fs::remove_dir(root),
+            });
+            continue;
+        };
+        let Ok(entry) = entry else {
+            note(Err(std::io::Error::other("a directory listing failed")));
+            continue;
+        };
+        let name = entry.file_name();
+        let path = within(dir, &name);
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            // ponytail: deeper than a pod's own directories go is one `remove_dir_all` that a
+            // stop does not cut; a held directory is an open file, so the walk holds only so many.
+            if held > DEEPEST {
+                note(std::fs::remove_dir_all(&path));
+            } else {
+                match open(Some(dir), &name) {
+                    Ok(under) => inside.push(under),
+                    // (A link put there since the listing is unlinked, not followed.)
+                    Err(e) => note(std::fs::remove_file(&path).or(Err(e))),
+                }
+            }
+        } else {
+            note(std::fs::remove_file(&path));
+        }
+    }
+    first.map_or(Ok(true), Err)
 }
 
 /// Whether a pod whose running units (none stopping) started at `started` may be replaced for a
@@ -680,5 +771,44 @@ mod tests {
         assert_eq!(default_reserve(1 << 40, true), 1 << 30);
         // A kithd that is not root keeps none unless told.
         assert_eq!(default_reserve(1 << 40, false), 0);
+    }
+
+    #[test]
+    fn storage_stop_ends_a_removal_between_entries_and_follows_no_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let top = dir("walk");
+        let (root, outside) = (top.join("scratch.1"), top.join("outside"));
+        std::fs::create_dir_all(outside.join("shut")).unwrap();
+        std::fs::write(outside.join("shut/kept"), "x").unwrap();
+        std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        for n in 0..2500 {
+            std::fs::write(root.join(format!("a/f{n}")), "x").unwrap();
+        }
+        // A directory the pod shut, with a file in it, and a link to a directory outside.
+        std::fs::create_dir_all(root.join("a/b/closed")).unwrap();
+        std::fs::write(root.join("a/b/closed/f"), "x").unwrap();
+        std::fs::set_permissions(root.join("a/b/closed"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a/out")).unwrap();
+        // Asked to stop at its second look: the walk ends, with the rest left where it is.
+        let looks = std::cell::Cell::new(0);
+        let stopped = remove_tree(&root, &|| {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        });
+        assert!(!stopped.unwrap(), "stopped");
+        assert!(root.exists());
+        let left = std::fs::read_dir(root.join("a")).unwrap().count();
+        assert!(0 < left && left < 2500, "{left}");
+        // Let alone, it takes all of it, and no more.
+        assert!(remove_tree(&root, &|| false).unwrap());
+        assert!(!root.exists());
+        assert_eq!(
+            std::fs::metadata(outside.join("shut")).unwrap().permissions().mode() & 0o777,
+            0
+        );
+        std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(outside.join("shut/kept").exists());
+        std::fs::remove_dir_all(top).unwrap();
     }
 }
