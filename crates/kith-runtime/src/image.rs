@@ -584,19 +584,49 @@ type Link = fn(&Path, &Path) -> std::io::Result<()>;
 /// image read-only, or through an overlay), and the store is root's alone.
 fn share(rootfs: &Path, index: &Path, link: Link) {
     let Ok(_held) = lock(index) else { return };
-    let mut buf = vec![0; 64 << 10];
-    let mut todo = vec![rootfs.to_path_buf()];
+    let (mut files, mut todo) = (Vec::new(), vec![rootfs.to_path_buf()]);
     while let Some(dir) = todo.pop() {
-        // Read whole before any rename in it, so a name is seen once.
-        let entries: Vec<_> = fs::read_dir(&dir).into_iter().flatten().flatten().collect();
-        for entry in entries {
+        let within: std::sync::Arc<Path> = dir.into();
+        for entry in fs::read_dir(&within).into_iter().flatten().flatten() {
             match entry.file_type() {
                 Ok(kind) if kind.is_dir() => todo.push(entry.path()),
-                Ok(kind) if kind.is_file() => share_one(&entry.path(), index, link, &mut buf),
+                Ok(kind) if kind.is_file() => files.push((within.clone(), entry.file_name())),
                 _ => {}
             }
         }
+        // A few thousand at a time, and a name with its directory said once: the list stays
+        // small whatever the image is. Only once a directory is read to its end, so a name
+        // is seen once (a file is replaced by a rename within its own directory).
+        if files.len() >= 4096 {
+            share_all(&files, index, link);
+            files.clear();
+        }
     }
+    share_all(&files, index, link);
+}
+
+/// [`share_one`] for each of `files` (a directory and a name in it), on a few threads: every
+/// file is read again and hashed, which on one thread made the unpack a quarter longer. Two
+/// that reach one entry at once: one makes the link and the other is linked to it. Where
+/// both find an entry they cannot use, the later one's file is the entry and the two stay
+/// two files, each whole.
+fn share_all(files: &[(std::sync::Arc<Path>, std::ffi::OsString)], index: &Path, link: Link) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let work = || {
+        let mut buf = vec![0; 64 << 10];
+        while let Some((dir, name)) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+            share_one(&dir.join(name), index, link, &mut buf);
+        }
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    std::thread::scope(|scope| {
+        for _ in 1..threads.min(files.len()) {
+            // (A thread the node has none left for costs time and nothing else.)
+            let _ = std::thread::Builder::new().spawn_scoped(scope, work);
+        }
+        work();
+    });
 }
 
 fn share_one(path: &Path, index: &Path, link: Link, buf: &mut [u8]) {
@@ -1785,6 +1815,32 @@ mod tests {
                 1,
                 "{n}: a scratch name was left behind"
             );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Many files alike in one tree, shared on several threads at once and in more than one
+    /// round: each is whole and all are one, with one entry (whichever thread made it, the
+    /// others were linked to it), and nothing else is left in the tree or the index.
+    #[test]
+    fn shared_files_alike_in_one_tree_are_one() {
+        let (dir, _) = sandbox("shared-alike");
+        let (tree, index) = (dir.join("tree"), dir.join("shared"));
+        let files: Vec<PathBuf> = (0..5000)
+            .map(|n| put(&tree, &format!("d{}/f{n}", n % 7), "alike", 0o644, 100))
+            .collect();
+        share(&tree, &index, hard_link);
+        assert_eq!(entries(&index).len(), 1, "{:?}", entries(&index));
+        for file in &files {
+            assert_eq!(ino(file), ino(&files[0]));
+            assert_eq!(fs::read_to_string(file).unwrap(), "alike");
+        }
+        assert_eq!(links(&files[0]), 5001);
+        let names = |dir: &Path| fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name());
+        assert_eq!(names(&index).count(), 2, "the lock and the entry");
+        for n in 0..7 {
+            let within = tree.join(format!("d{n}"));
+            assert!(names(&within).all(|name| name.to_string_lossy().starts_with('f')));
         }
         fs::remove_dir_all(&dir).unwrap();
     }

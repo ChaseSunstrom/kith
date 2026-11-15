@@ -186,7 +186,9 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   not started from the copy kept here (asking for an unchanged one takes about 22 ms
   here). A file that several unpacked images hold alike (bytes, mode, owner, time, and
   no extended attribute) is one file on the node, hard-linked into each: three nginx
-  images of one Alpine base took 44% less disk here, and unpacked 8 to 10% slower.
+  images of one Alpine base took 44% less disk here, and unpacked 4 to 6% slower (each
+  file is read once more to find its equals, on up to four threads; on one thread it
+  was a quarter slower).
   Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
