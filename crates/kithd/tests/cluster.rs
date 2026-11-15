@@ -332,7 +332,7 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
         alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
     });
     let token = alpha.ok(&["node", "token"]);
-    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
     wait_for("beta to have the store", || beta.nodes().len() == 2);
     let taken = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join("taken");
     let _ = std::fs::remove_dir_all(&taken);
@@ -344,14 +344,18 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
     wait_for("alpha to be refused", || {
         status_as_node(&beta.address(), &taken, "GET", "/v1/resources") == "401"
     });
+    // beta takes a deleted node's certificate again (as for a cluster that locked itself out), so that
+    // what alpha writes at its start could commit: only alpha's own guard keeps its Node out.
+    beta.stop();
+    beta.child = Node::spawn(&beta.dir, "beta", beta.port, &["--admit-deleted-nodes"]);
+    wait_for("beta to answer again", || beta.kith(&["get", "node"]).0 == 0);
     alpha.stop();
     alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
     wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
     // (Its registration ran at the start: given time, it would have put the Node back.)
-    std::thread::sleep(Duration::from_secs(5));
+    std::thread::sleep(Duration::from_secs(8));
     let names: Vec<_> = beta.nodes().into_iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["beta"]);
-    assert_eq!(status_as_node(&beta.address(), &taken, "GET", "/v1/resources"), "401");
 }
 
 #[test]

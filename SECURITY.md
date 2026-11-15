@@ -591,9 +591,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     on (then make a new cluster). Change the Secrets.
   - A deleted node does not put itself back, the one the cluster started on included: that one
     makes its own Node only while the store holds no Node at all, so on a restart with its
-    Node gone it writes nothing and says so (a cluster of that one node, deleted, is the
-    exception: no Node is left to tell it apart from a start that ended too early). It joins
-    again with a token.
+    Node gone it writes nothing and says so. It joins again with a token. Two edges: when
+    every Node of the store is deleted, the node makes its own again (no Node is left to
+    tell that from a first start that ended too early); and a first start that ended before
+    its Node was written, after a joiner's went in, is told "deleted, or never registered"
+    at the next start and joins again. A Node of its name holding another certificate (a
+    joiner's) is not written over. It waits up to 30 s for a leader and for the store to be
+    caught up: with none, nothing is written in that run and the next start tries again.
   - A request that was already running when the Node was deleted (a `kith run` in
     progress, a copy of a blob or a volume) runs to its end. A watch is told no more.
   - A node answers by the store it has: one that is cut off from the others, or

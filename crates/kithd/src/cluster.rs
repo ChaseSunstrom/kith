@@ -1064,9 +1064,10 @@ fn node_key(name: &str) -> String {
     format!("Node/{name}")
 }
 
-/// [`register`] for the node the cluster started on, at each start: it makes its Node only while the
-/// store holds no Node at all (the start that made the cluster, or one that ended before its Node was in),
-/// so a node deleted stays deleted across its restart. False: its Node is gone and nothing was written.
+/// [`register`] for the node the cluster started on, at each start, and the only way it is called for it:
+/// it makes its Node only while the store holds no Node at all (the start that made the cluster, or one
+/// that ended before its Node was in), so a node deleted stays deleted across its restart. False: its Node
+/// is gone, or is a joiner's under the name (another certificate), and nothing was written.
 /// It waits for the store to have all the log of the term it is in applied first: until then a Node
 /// that is there may not show.
 pub async fn register_first(
@@ -1084,12 +1085,23 @@ pub async fn register_first(
     wait.metrics(caught_up, "the log of this term applied")
         .await
         .map_err(|e| kith_api::store::Error::Io(format!("no leader to say what the store holds: {e}")))?;
-    let (has_none, has_own) = {
+    let (has_none, own) = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        (state.store.list(Some("Node")).next().is_none(), state.store.get(&node_key(name)).is_some())
+        let own = state.store.get(&node_key(name)).map(|node| {
+            let said = node.status.as_ref().and_then(|status| status["certificate"].as_str());
+            said.is_some_and(|said| said != print)
+        });
+        (state.store.list(Some("Node")).next().is_none(), own)
     };
-    if !has_none && !has_own {
-        eprintln!("kithd: node {name} was deleted: it does not put itself back; join again with a token to be a node");
+    if !has_none && own.is_none() {
+        eprintln!(
+            "kithd: node {name} was deleted, or never registered: it does not put itself back; join again with a token to be a node"
+        );
+        return Ok(false);
+    }
+    // A Node of the name that holds another certificate is a joiner's, made after the delete: not written over.
+    if own == Some(true) {
+        eprintln!("kithd: node {name}: the Node of that name holds another node's certificate: not written over");
         return Ok(false);
     }
     register(shared, name, address, id, print, more).await.map(|()| true)
@@ -1101,7 +1113,7 @@ pub async fn register_first(
 /// in one entry: no entry makes it half a node. The leader then starts sending it the store.
 /// `more` is what else its status says from the start: `ca` (it is the node that holds the CA
 /// key, which no change may make a worker), `view` (a worker that is sent a view instead).
-pub async fn register(
+async fn register(
     shared: &Shared,
     name: &str,
     address: &str,
@@ -1545,9 +1557,17 @@ pub(crate) mod pinned_peer {
             let node = state.store.get("Node/a").map(|node| node.status.clone().unwrap());
             node.map(|status| status["address"].as_str().unwrap().to_string())
         };
-        assert!(register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null).await.unwrap());
+        assert!(
+            register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null)
+                .await
+                .unwrap()
+        );
         assert_eq!(address(&shared).as_deref(), Some("127.0.0.1:1"));
-        assert!(register_first(&shared, "a", "127.0.0.1:2", 1, "p", serde_json::Value::Null).await.unwrap());
+        assert!(
+            register_first(&shared, "a", "127.0.0.1:2", 1, "p", serde_json::Value::Null)
+                .await
+                .unwrap()
+        );
         assert_eq!(address(&shared).as_deref(), Some("127.0.0.1:2"));
     }
 
@@ -1557,9 +1577,29 @@ pub(crate) mod pinned_peer {
         let ca = pki::Ca::create().unwrap();
         let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
         let shared = shared_of("first-node-deleted", cluster, &[at("b", "127.0.0.1:3", None)]).await;
+        for _ in 0..2 {
+            let put = register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null);
+            assert!(!put.await.unwrap());
+            assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
+        }
+    }
+
+    /// A Node of its name that holds another certificate is a joiner's, made after the delete: its
+    /// status is not written over.
+    #[tokio::test]
+    async fn first_node_leaves_a_node_that_holds_another_certificate_alone() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let others = [at("a", "127.0.0.1:9", Some("joiner".into()))];
+        let shared = shared_of("first-node-joiner", cluster, &others).await;
         let put = register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null);
         assert!(!put.await.unwrap());
-        assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
+        let state = shared.store.lock().unwrap();
+        let status = state.store.get("Node/a").unwrap().status.clone().unwrap();
+        assert_eq!(
+            (status["address"].as_str(), status["certificate"].as_str()),
+            (Some("127.0.0.1:9"), Some("joiner"))
+        );
     }
 
     /// A name whose Raft id a Node has is refused at the join (it would be taken for that Node's
