@@ -120,10 +120,14 @@ struct Args {
     /// registry to pull from (0: not served)
     #[arg(long, env = "KITH_REGISTRY_PORT", value_name = "PORT", default_value_t = 5000)]
     registry_port: u16,
-    /// A key (hex) this node takes kith OS releases from; repeat for more. Without one,
-    /// the key of the first release it updates to is kept, and only that one is taken after
+    /// A key (hex) this node takes kith OS releases from; repeat for more. Without one, those
+    /// it keeps, or else those its system was built with (/etc/kith/release-keys); with none
+    /// of those, the key of the first release it updates to is kept (said at every start)
     #[arg(long, env = "KITH_RELEASE_KEY", value_name = "KEY", value_delimiter = ',', value_parser = release_key)]
     release_key: Vec<String>,
+    /// Fetch kith OS updates from this node's own networks too (a release server on the LAN)
+    #[arg(long, env = "KITH_LAN_RELEASES")]
+    lan_releases: bool,
     /// Let a Source name a git repository on this machine (`file://`): for tests
     #[arg(long, hide = true)]
     local_sources: bool,
@@ -726,6 +730,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 shared.clone(),
                 state.clone(),
                 args.release_key.clone(),
+                args.lan_releases,
                 stopping.clone(),
             );
             let key = async {

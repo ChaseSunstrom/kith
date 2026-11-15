@@ -102,6 +102,13 @@ pub struct Answers {
     /// Keep the node's state encrypted, its key held by its cluster (see crypt.rs).
     #[serde(default)]
     pub encrypt: bool,
+    /// The keys (hex, with commas between) the node takes kith OS releases from: over the
+    /// ones its image was built with, and without either it takes the first release's.
+    #[serde(default, rename = "releaseKey")]
+    pub release_key: Option<String>,
+    /// Fetch kith OS updates from the node's own networks too (a release server on the LAN).
+    #[serde(default, rename = "lanReleases")]
+    pub lan_releases: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -169,6 +176,17 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     if let Some(address) = address {
         words.push(format!("--advertise {address}:{PORT}"));
     }
+    if let Some(keys) = &answers.release_key {
+        let keys: Vec<&str> = keys.split(',').map(str::trim).collect();
+        let key = |key: &&str| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit());
+        if keys.len() > 8 || !keys.iter().all(key) {
+            return Err("`releaseKey` is 1 to 8 keys of 64 hex digits, with commas between".into());
+        }
+        words.push(format!("--release-key {}", keys.join(",")));
+    }
+    if answers.lan_releases {
+        words.push("--lan-releases".into());
+    }
     match &answers.join {
         Some(join) => {
             let plain = |text: &str, more: &str| {
@@ -232,6 +250,7 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
         size: None,
         join,
         encrypt,
+        ..Answers::default()
     })
 }
 
@@ -667,6 +686,40 @@ mod tests {
                 .unwrap_err()
                 .contains("longer than")
         );
+    }
+
+    #[test]
+    fn release_key_given_at_install_is_the_nodes() {
+        let two = [disk("sda", 8)];
+        let (a, b) = ("a".repeat(64), "0B".repeat(32));
+        let yaml = format!("disk: sda\nip: 10.0.0.5/24\nreleaseKey: '{a}, {b}'\nlanReleases: true\n");
+        let (_, config) = plan(&answers(&yaml).unwrap(), &two, 300 << 20, 1 << 20).unwrap();
+        let (_, args) = crate::init::configured(&config);
+        assert_eq!(
+            args,
+            [
+                "--listen",
+                "0.0.0.0:7443",
+                "--advertise",
+                "10.0.0.5:7443",
+                "--release-key",
+                &format!("{a},{b}"),
+                "--lan-releases",
+                "--claim"
+            ]
+        );
+        // Only keys: nothing that would say more on the node's command line.
+        for bad in [
+            "''".to_string(),
+            "abc".into(),
+            format!("'{a} --claim'"),
+            format!("'{a},'"),
+            format!("'{}'", "g".repeat(64)),
+            format!("'{}'", [a.as_str(); 9].join(",")),
+        ] {
+            let told = answers(&format!("disk: sda\nreleaseKey: {bad}\n")).unwrap();
+            assert!(plan(&told, &two, 300 << 20, 1 << 20).is_err(), "{bad}");
+        }
     }
 
     #[test]

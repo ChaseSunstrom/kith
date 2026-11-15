@@ -42,7 +42,8 @@ DIR/kith-install.cpio.zst and DIR/vps.sh (see os/vps.sh). For machines started f
 the network by a node (`kith node netboot`): DIR/kith-netboot.efi.
 Beside them, DIR/kith-os.update: what a running node is given to become this version
 (it writes it into its other slot). KITH_OS_VERSION names the version built (default:
-the workspace's).
+the workspace's). KITH_RELEASE_KEY (hex keys, commas between) are the keys its nodes take
+releases from (/etc/kith/release-keys); without, a node takes the first release's key.
 
   --out DIR   where the image and the pieces it is made of go: a directory this
               made before, or an empty one (it is emptied first)
@@ -81,6 +82,17 @@ efi=/usr/lib/systemd/boot/efi
 die() { echo "build.sh: $1" >&2; exit 1; }
 # (3: this machine cannot build it, which is not the image being wrong; ci/vm.sh skips.)
 lacks() { echo "build.sh: needs $1" >&2; exit 3; }
+# (KITH_RELEASE_KEY: the keys a node of this image takes releases from, in its signed
+# root. Without, a node takes the key of the first release it is given.)
+keys=''
+set -f
+for k in $(printf '%s' "${KITH_RELEASE_KEY:-}" | tr ',' ' '); do
+    case $k in *[!0-9a-fA-F]*) die "KITH_RELEASE_KEY: '$k' is not a key (64 hex digits)" ;; esac
+    [ ${#k} -eq 64 ] || die "KITH_RELEASE_KEY: '$k' is not a key (64 hex digits)"
+    keys="$keys$k
+"
+done
+set +f
 
 # bc (the kernel's build) and mcopy (files into the ESP) are the two tools a machine
 # with the rest often lacks.
@@ -164,6 +176,10 @@ assemble() { # DIR
     cp "$cache/cacert-$ca_date.pem" "$r/etc/ssl/certs/ca-certificates.crt"
     ln -s /run/resolv.conf "$r/etc/resolv.conf"
     printf 'NAME="kith OS"\nID=kith\nVERSION_ID=%s\nPRETTY_NAME="kith OS %s"\n' "$version" "$version" >"$r/etc/os-release"
+    if [ -n "$keys" ]; then
+        mkdir -p "$r/etc/kith"
+        printf '%s' "$keys" >"$r/etc/kith/release-keys"
+    fi
     # The file system an encrypted Volume starts as: a node has no mkfs, so kithd writes
     # this one under the volume's key and grows it (crates/kithd/src/encrypted.rs). 4 KiB
     # blocks and an inode for 32 KiB once it has grown; the same bytes at every build.
