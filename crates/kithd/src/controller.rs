@@ -1121,6 +1121,10 @@ fn map_of(shared: &Shared, namespace: &str, secret: bool, name: &str) -> Result<
     let file_store = shared.store.lock().expect("a handler panicked holding the store");
     let found = file_store.store.get(&key).map(|r| r.spec.clone());
     let spec = found.ok_or(format!("{key} does not exist"))?;
+    let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+    if let Some(why) = crate::access::withheld(&file_store.store, me, &key, &spec).filter(|_| secret) {
+        return Err(why);
+    }
     // Both kinds are `data: {key: value}`.
     let data = match secret {
         true => serde_json::from_value::<SecretSpec>(spec).map(|s| s.data),

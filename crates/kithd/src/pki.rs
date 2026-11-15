@@ -426,9 +426,10 @@ pub fn same_key(pem: &str, der: &[u8]) -> bool {
 
 /// Join tokens: `kith1.<secret>.<CA fingerprint>`. The secret is good once, for an hour,
 /// on the node that made it; the fingerprint lets the joiner check who it is talking to
-/// before it sends the secret.
+/// before it sends the secret. Whoever made it says whether the node it lets in is a worker
+/// (`spec.trust`): the node that joins does not.
 #[derive(Default)]
-pub struct Tokens(Mutex<Vec<([u8; 32], Instant)>>);
+pub struct Tokens(Mutex<Vec<([u8; 32], Instant, bool)>>);
 
 fn digest(secret: &str) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
@@ -445,31 +446,31 @@ pub fn token_parts(token: &str) -> Fallible<(&str, &str)> {
 }
 
 impl Tokens {
-    pub fn mint(&self, ca: &str) -> Fallible<String> {
+    pub fn mint(&self, ca: &str, worker: bool) -> Fallible<String> {
         let mut secret = [0u8; 32];
         let filled = ring::rand::SystemRandom::new().fill(&mut secret);
         filled.map_err(|_| "no random bytes from the system")?;
         let secret = hex(&secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
-        tokens.retain(|(_, made)| made.elapsed() < TOKEN_LIFE);
-        tokens.push((digest(&secret), Instant::now()));
+        tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
+        tokens.push((digest(&secret), Instant::now(), worker));
         Ok(format!("kith1.{secret}.{}", fingerprint(ca)?))
     }
 
-    /// Whether `token` is good; with `spend`, it is not good again.
+    /// Whether `token` is good, and then whether it is a worker's; with `spend`, it is not
+    /// good again.
     // Digests are compared, so how long the comparison takes says nothing about the secret.
-    pub fn good(&self, token: &str, spend: bool) -> bool {
-        let Ok((secret, _)) = token_parts(token) else {
-            return false;
-        };
+    pub fn good(&self, token: &str, spend: bool) -> Option<bool> {
+        let (secret, _) = token_parts(token).ok()?;
         let wanted = digest(secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
-        tokens.retain(|(_, made)| made.elapsed() < TOKEN_LIFE);
-        let found = tokens.iter().position(|(digest, _)| *digest == wanted);
-        if let (Some(at), true) = (found, spend) {
-            tokens.remove(at);
+        tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
+        let found = tokens.iter().position(|(digest, ..)| *digest == wanted)?;
+        let worker = tokens[found].2;
+        if spend {
+            tokens.remove(found);
         }
-        found.is_some()
+        Some(worker)
     }
 }
 
@@ -566,13 +567,17 @@ mod tests {
     fn tokens_are_good_once() {
         let ca = Ca::create().unwrap();
         let tokens = Tokens::default();
-        let token = tokens.mint(&ca.cert).unwrap();
+        let token = tokens.mint(&ca.cert, false).unwrap();
         assert_eq!(token_parts(&token).unwrap().1, fingerprint(&ca.cert).unwrap());
-        assert!(!tokens.good("kith1.nope.nope", true));
-        assert!(!tokens.good(&tokens.mint(&ca.cert).unwrap().replace("kith1.", "kith1.0"), true));
-        assert!(tokens.good(&token, false));
-        assert!(tokens.good(&token, true));
-        assert!(!tokens.good(&token, true));
+        assert_eq!(tokens.good("kith1.nope.nope", true), None);
+        let other = tokens.mint(&ca.cert, false).unwrap().replace("kith1.", "kith1.0");
+        assert_eq!(tokens.good(&other, true), None);
+        assert_eq!(tokens.good(&token, false), Some(false));
+        assert_eq!(tokens.good(&token, true), Some(false));
+        assert_eq!(tokens.good(&token, true), None);
+        // Whether its node is a worker is what its maker said, kept here and not in the token.
+        let worker = tokens.mint(&ca.cert, true).unwrap();
+        assert_eq!(tokens.good(&worker, true), Some(true));
     }
 
     #[test]

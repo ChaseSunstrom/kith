@@ -572,6 +572,74 @@ kith node status                                   # who leads the store, who vo
   `unreachable`. The tunnels are WireGuard between the two nodes' own keys,
   which never leave them, and what goes through them between kithds is TLS
   with the cluster's certificates as well.
+- A node is a control node unless it is said to be a worker, and a worker is trusted
+  with less. Join one as a worker with a token that says so, or say it on a Node that
+  is there:
+
+  ```sh
+  kith node token --worker        # on alpha: the node this token lets in is a worker
+  ```
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Node
+  metadata: { name: gamma }
+  spec: { trust: worker }         # or `control`, which is what a Node without it is
+  ```
+
+  The token's maker says it, not the machine that joins. A worker never votes on the
+  store however much of it it has, and the other nodes take none of Raft's messages
+  from it. A node that votes or leads and is then made a worker hands its vote to a
+  control node by itself, and is followed until it has (seconds); to cut a node off
+  at once, delete its Node. The nodes do not take a worker's word for who asked:
+  `kith logs`, `kith volume put` and `get`, `kith node passphrase`, a backup's restore and `kith run`
+  asked of a worker for something on another node are refused (`node NAME is a
+  worker: its word for who asked is not taken: ask a control node`; for `kith run`,
+  `only a control node sends this`). Ask a control node, or the node that has the
+  thing. To keep something off workers:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Workload
+  metadata: { name: signer }
+  spec:
+    placement: { require: { kith.dev/trust: control } }   # `worker` is the other value
+    template:
+      containers:
+        - name: signer
+          image: registry.example.org/signer:1
+  ---
+  apiVersion: kith.dev/v1
+  kind: Secret
+  metadata: { name: signing-key }
+  spec:
+    trust: control                # given to units on control nodes only
+    data: { key: the-key-as-text }
+  ```
+
+  `kith.dev/trust` is a label every node has for the scheduler, made from its
+  `spec.trust` whatever its own labels say; a `NodeWorkload`'s `selector` takes it
+  too. A Workload, Job or NodeWorkload that names a Secret with `trust: control` is
+  placed on control nodes only (one that fits on none says `missing required
+  labels`), and a worker's kithd gives such a Secret to nothing, whoever placed it
+  there: `Secret/NAMESPACE/NAME is for control nodes (trust: control), and this node
+  is a worker`. That covers a Secret a unit is given in `env`, `envFrom` or as files,
+  and not what kithd reads for itself: a Backup's S3 Secret, an ingress host's
+  `tls-` Secret and the ACME account are read by whichever node does that work.
+  `kith apply`, `kith delete` and `kith rollback` refuse two changes: making the node
+  that holds the CA key (the one the cluster was started on) a worker, and one that
+  would leave only workers. A `Release`, a `Source` and a controller are not held to
+  that, nor are two changes made at once through two nodes; if only workers come
+  about, the nodes that vote go on voting, and making one a control node again puts
+  it right. With fewer than three control nodes one node votes, as in a cluster of
+  fewer than three nodes.
+
+  What a worker is **not** yet: it still keeps the whole store, every Secret in it,
+  and the node that leads still writes what a worker sends it to write. So today
+  `trust: worker` narrows what a worker is asked to run and whose word is taken, not
+  what a worker that is taken can read or change; see SECURITY.md, "A node that is
+  taken". Say `trust` only once every node runs a kithd that knows it: an older kithd
+  does not read a Node or a Secret that has it.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers
@@ -2433,6 +2501,10 @@ is told nothing refuses with `node NAME passed this on without saying who asked:
 kithd is older than this node's`. So while a cluster is half way through such an
 update, ask the node that has the thing, or wait until both run the new kithd. Nothing
 else between nodes is affected: the store, the mesh, Services and `kith run` go on.
+
+A field a newer kithd takes is not known to an older one, which reads a resource that
+has it as one it cannot read: say `trust` on a Node or a Secret (and any field newer
+than the oldest kithd in the cluster) once every node runs the kithd that knows it.
 
 ### Rolling a release through the cluster
 

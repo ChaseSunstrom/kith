@@ -46,8 +46,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   only: sent by an Identity, or anywhere else, it changes nothing. `kith run` is passed
   to the node the app is for on the node-to-node routes, with who asked in the request,
   and checked the same way there.
-  **The node's word for who asked is taken**: a node that is taken can name the local
-  socket, so this narrows nothing for it yet (see "A node that is taken").
+  **A control node's word for who asked is taken**: one that is taken can name the local
+  socket, so this narrows nothing for it. A worker's word (`spec.trust: worker` on its
+  Node) is not taken: what it passes on is refused whoever it names (see "A node that
+  is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
   command on another node) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
@@ -231,8 +233,31 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   does not undo:
   - Until its Node is deleted it can do everything: it can name the local socket as the
     one who asked on what nodes pass on to each other, and the node that leads writes to
-    the store whatever a node of the cluster sends it to write, unasked. (Nodes with
-    less trust than that, whose word is not taken, are not built yet.)
+    the store whatever a node of the cluster sends it to write, unasked.
+  - **A worker that is taken is, today, still the cluster taken.** A node whose Node
+    says `spec.trust: worker` (said by whoever made its join token, `kith node token
+    --worker`, or by whoever may apply a Node; the machine that joins does not say it)
+    never votes on the store, is refused Raft's own messages by the other nodes (so it
+    cannot lead, or send them a store; a node that is behind, or has not heard of its
+    Node, still takes them, as from a deleted node, below; and one that voted when it
+    was made a worker is followed until it has handed its vote over, which a taken
+    one need not do: delete its Node), is refused `kith run`'s hop and what nodes pass
+    on to each other whoever it names, is given no Secret that says `trust: control`
+    by its own kithd, and has nothing placed on it that asks for control nodes. It was
+    never handed the CA key: only the node the cluster started on has it, and that
+    node is refused `trust: worker` by `kith apply`, `delete` and `rollback` (a
+    courtesy against a slip: a `Release`, a `Source`, a controller or a node's own
+    write is not held to it, and that the node has the key is its own word in its
+    Node's status). `trust: control` on a Secret covers what a unit is given, not a
+    Backup's S3 Secret, an ingress `tls-` Secret or the ACME account, which the node
+    doing that work reads. What a worker still has is the whole store with
+    every Secret in it (those that say `trust: control` too: the rule is its own
+    kithd's, and a taken node does not run its own kithd), and the write: the node
+    that leads writes what a worker sends it as it does a control node's, its own
+    Node's `trust` and a Workload for a control node included. So `trust: worker`
+    lowers what a worker is asked to run and what is taken from it on trust, and
+    stops no one who has taken it. A worker that keeps only what is placed on it and
+    writes only about itself is not built yet.
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.

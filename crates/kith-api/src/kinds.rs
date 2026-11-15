@@ -189,11 +189,18 @@ spec! {
         /// gone for good, or delete the node.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub roaming: Option<bool>,
+        /// How far the node is trusted: `control` (the default) may vote on the store and
+        /// its word for who asked is taken by the others; a `worker` never votes, is not
+        /// followed as a leader, and gets nothing that asks for control nodes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trust: Option<Trust>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<NodeMesh>,
     }
 
     pub enum NodeRole { Voter, Worker, Edge }
+
+    pub enum Trust { Control, Worker }
 
     pub struct NodeMesh {
         /// `never`: this node's traffic goes straight to the other node or not at all,
@@ -879,6 +886,10 @@ spec! {
     pub struct SecretSpec {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub data: BTreeMap<String, String>,
+        /// `control`: given to units on control nodes only, and what names it is placed
+        /// on those.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub trust: Option<Trust>,
     }
 
     // ---- Hardware (§4.6) ----
@@ -1585,6 +1596,19 @@ impl Template {
     /// Its containers, those that run first among them.
     pub fn containers(&self) -> impl Iterator<Item = &Container> {
         self.init_containers.iter().chain(&self.containers)
+    }
+
+    /// The names of the Secrets it names: in `env`, `envFrom` and mounts.
+    pub fn secrets(&self) -> impl Iterator<Item = &String> {
+        fn named(var: &EnvVar) -> Option<&String> {
+            var.secret.as_ref().map(|key| &key.name)
+        }
+        let containers = self.containers().flat_map(move |c| {
+            let from = c.env_from.iter().filter_map(|from| from.secret.as_ref());
+            let mounted = c.volume_mounts.iter().filter_map(|mount| mount.secret.as_ref());
+            c.env.iter().filter_map(named).chain(from).chain(mounted)
+        });
+        containers.chain(self.exec.iter().flat_map(|e| &e.env).filter_map(named))
     }
 
     /// The names of its units, in the order they are numbered: containers, exec units, VMs.

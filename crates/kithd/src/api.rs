@@ -352,7 +352,11 @@ pub(crate) async fn applied(
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        crate::releases::claims(&state.store, &resources)
+        let nodes = resources.iter().filter(|resource| resource.kind == "Node");
+        let nodes: Vec<_> = nodes
+            .map(|node| (node.metadata.name.as_str(), Some(&node.spec)))
+            .collect();
+        access::control_stays(&state.store, &nodes).and_then(|()| crate::releases::claims(&state.store, &resources))
     };
     if let Err(why) = claimed {
         shared.audit.record(caller, "apply", keys, Err(why.clone()));
@@ -456,6 +460,11 @@ async fn delete(
 /// Delete the resource at `key` as `caller`, if it may: what `DELETE /v1/resources` does.
 pub(crate) async fn deleted(shared: &Arc<Shared>, caller: &Caller, key: String) -> Result<Resource, ApiError> {
     permit(shared, caller, Verb::Delete, |_| vec![place_of(&key)])?;
+    if let Some(node) = key.strip_prefix("Node/") {
+        let Json(()) = read(shared, |store| {
+            access::control_stays(store, &[(node, None)]).map_err(Error::Invalid)
+        })?;
+    }
     match change(shared, caller, "delete", vec![key.clone()], Command::Delete { key }).await? {
         Done::Deleted(resource) => Ok(*resource),
         _ => Err(odd()),
@@ -485,6 +494,16 @@ async fn rollback(
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
+    if let Some(node) = key.strip_prefix("Node/") {
+        let Json(()) = read(&shared, |store| {
+            let was = store
+                .history(&key)?
+                .iter()
+                .find(|was| was.resource.metadata.revision == Some(to));
+            let after = was.map(|was| (node, Some(&was.resource.spec)));
+            access::control_stays(store, after.as_slice()).map_err(Error::Invalid)
+        })?;
+    }
     let what = vec![format!("{key} to revision {to}")];
     match change(&shared, &caller, "rollback", what, Command::Rollback { key, to, at }).await? {
         Done::Changes(mut changes) if changes.len() == 1 => Ok(Json(changes.remove(0))),

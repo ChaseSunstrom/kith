@@ -372,7 +372,12 @@ fn set_value(assignment: &str) -> Result<serde_json::Value, String> {
 #[derive(Subcommand)]
 enum NodeCommand {
     /// Print a token that lets one more node join, within the hour: `kithd --join ADDR:PORT --token TOKEN`
-    Token,
+    Token {
+        /// The node it lets in is a worker (`spec.trust: worker`): it never votes on the
+        /// store, and nothing that asks for control nodes is placed on it
+        #[arg(long)]
+        worker: bool,
+    },
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
     /// Have this node install machines that start from the network (PXE): each erases its disk and joins
@@ -1148,12 +1153,17 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Command::Node {
-            command: NodeCommand::Token,
+            command: NodeCommand::Token { worker },
         } => {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("tokens are made by kithd: leave out --store");
             };
-            let reply: serde_json::Value = request(&kithd, "POST", "/v1/tokens", b"")?;
+            let route = if worker {
+                "/v1/tokens?trust=worker"
+            } else {
+                "/v1/tokens"
+            };
+            let reply: serde_json::Value = request(&kithd, "POST", route, b"")?;
             println!("{}", reply["token"].as_str().unwrap_or_default());
         }
         Command::Node {

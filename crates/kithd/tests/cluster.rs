@@ -676,6 +676,115 @@ fn a_volumes_replica_has_its_files_and_takes_over_when_its_node_is_lost() {
     wait_for("the third node to have the file", || has(other, "second"));
 }
 
+/// A worker (`spec.trust`, said by whoever made its join token) never votes however much of
+/// the store it has, a control node made one stops, the CA key stays where the cluster was
+/// started, and the last control node is not made a worker.
+#[test]
+fn ca_key_stays_with_the_control_nodes_and_a_worker_never_votes() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "trust";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let address = alpha.address();
+    let join = |alpha: &Node, name: &str, token: &[&str]| {
+        let token = alpha.ok(&[&["node", "token"], token].concat());
+        Node::start(test, name, &["--join", &address, "--token", token.trim()])
+    };
+    let beta = join(&alpha, "beta", &["--worker"]);
+    let gamma = join(&alpha, "gamma", &["--worker"]);
+    wait_for("the workers to have the store", || {
+        beta.nodes().len() == 3 && gamma.nodes().len() == 3
+    });
+    let listed: serde_json::Value = serde_json::from_str(&alpha.ok(&["get", "node", "-o", "json"])).unwrap();
+    let trusts: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["spec"]["trust"].clone())
+        .collect();
+    assert_eq!(
+        serde_json::json!(trusts),
+        serde_json::json!([null, "worker", "worker"]),
+        "{listed}"
+    );
+    // Three nodes that have the store, and one voter: the workers only receive it.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(alpha.ok(&["node", "status"]).contains("voters:    alpha\n"));
+    // Neither was handed the CA key, and neither can let a node in.
+    for worker in [&beta, &gamma] {
+        let mut kept = Vec::new();
+        let mut dirs = vec![worker.dir.clone()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                match entry.file_type().unwrap().is_dir() {
+                    true => dirs.push(entry.path()),
+                    false => kept.push(entry.file_name().to_string_lossy().into_owned()),
+                }
+            }
+        }
+        assert!(
+            kept.contains(&"ca.crt".to_string()) && !kept.contains(&"ca.key".to_string()),
+            "{kept:?}"
+        );
+        let (code, _, err) = worker.kith(&["node", "token"]);
+        assert!(code != 0 && err.contains("the one the cluster was started on"), "{err}");
+    }
+    // The node that holds the CA key is not made a worker: it lets every other node in.
+    let trust = |alpha: &Node, name: &str, trust: &str| {
+        let node =
+            format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{ trust: {trust} }}\n");
+        std::fs::write(alpha.dir.join("node.yaml"), node).unwrap();
+        alpha.kith(&["apply", "-f", "node.yaml"])
+    };
+    let (code, _, err) = trust(&alpha, "alpha", "worker");
+    assert!(code != 0 && err.contains("holds the cluster's CA key"), "{err}");
+    // Two more control nodes: three voters, the workers left out.
+    let delta = join(&alpha, "delta", &[]);
+    let epsilon = join(&alpha, "epsilon", &[]);
+    wait_for("three control nodes to vote", || {
+        alpha
+            .ok(&["node", "status"])
+            .contains("voters:    alpha, delta, epsilon")
+    });
+    // Another node leads (alpha is gone for a moment), and is then made a worker: the others
+    // stop following it at once, one of them leads, and it no longer votes.
+    let said = |node: &Node, what: &str| {
+        let (code, status, _) = node.kith(&["node", "status"]);
+        let line = status.lines().find(|line| line.starts_with(what));
+        line.filter(|_| code == 0)
+            .map(|line| line[what.len()..].trim().to_string())
+    };
+    alpha.stop();
+    wait_for("delta or epsilon to lead", || {
+        said(&delta, "leader:").is_some_and(|leader| leader == "delta" || leader == "epsilon")
+    });
+    let leader = said(&delta, "leader:").unwrap();
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
+    wait_for("the leader to be made a worker", || {
+        trust(&alpha, &leader, "worker").0 == 0
+    });
+    wait_for("a control node to lead and the worker to stop voting", || {
+        let leads = said(&alpha, "leader:").is_some_and(|now| now != leader && now != "none");
+        leads && said(&alpha, "voters:").is_some_and(|voters| !voters.contains(&leader))
+    });
+    // A change still goes through, and the worker still has it.
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: after }\nspec: { data: { a: b } }\n";
+    std::fs::write(alpha.dir.join("cm.yaml"), config).unwrap();
+    wait_for("a change to go through", || {
+        alpha.kith(&["apply", "-f", "cm.yaml"]).0 == 0
+    });
+    let demoted = if leader == "delta" { &delta } else { &epsilon };
+    wait_for("the worker to have the change", || {
+        demoted.kith(&["get", "ConfigMap/after"]).0 == 0
+    });
+}
+
 #[test]
 fn a_node_that_is_down_is_not_made_a_voter() {
     if std::env::var_os("KITH_E2E").is_none() {

@@ -751,6 +751,77 @@ spec: {role: other-jobber, subjects: [carol]}
         assert_eq!(ask("local socket").await.0, 422);
     }
 
+    /// A worker's word for who asked is not taken, on the hop or on what nodes pass on, and
+    /// its Raft messages are refused: whatever caller it names, the socket even.
+    #[tokio::test]
+    async fn hop_forged_by_a_worker_is_refused_whoever_it_names() {
+        let world = World::new("hop-forged").await;
+        let a = world.a.cluster.as_ref().unwrap().client.clone();
+        let hop = || {
+            let spec = json!({"on": "b", "via": "/nonexistent/waypipe", "argv": ["true"], "caller": "local socket"});
+            let (a, port) = (a.clone(), world.b_port);
+            async move { tunnel(&a, port, "/v1/run-hop", spec).await.unwrap_err() }
+        };
+        let ask = |method: reqwest::Method, path: &str| {
+            let url = format!("https://127.0.0.1:{}{path}", world.b_port);
+            let ask = a.request(method, url).header(crate::access::FOR, "local socket");
+            async move {
+                let reply = ask.send().await.unwrap();
+                let status = reply.status().as_u16();
+                let said: serde_json::Value = reply.json().await.unwrap_or_default();
+                (status, said["error"].as_str().unwrap_or_default().to_string())
+            }
+        };
+        let logs = "/v1/logs/Workload/default/web";
+        // A control node, as every node is unless said: the socket's rights where it arrives.
+        assert_eq!(hop().await.0, 422);
+        assert_eq!(ask(reqwest::Method::GET, logs).await.0, 404);
+        // b's store says a is a worker (a's own store does not count).
+        let trust = |trust: &str| {
+            let text =
+                format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: a}}\nspec: {{trust: {trust}}}\n");
+            let node = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            world.b.store.lock().unwrap().store.apply(node).unwrap();
+        };
+        trust("worker");
+        let (status, why) = hop().await;
+        assert_eq!(status, 403, "{why}");
+        assert!(why.contains("node a is a worker"), "{why}");
+        let (status, why) = ask(reqwest::Method::GET, logs).await;
+        assert_eq!(status, 403, "{why}");
+        assert!(
+            why.contains("its word for who asked is not taken: ask a control node"),
+            "{why}"
+        );
+        // Raft's messages are taken from a worker only while it still votes in b's membership
+        // (it hands the vote over itself); the hop above is refused either way.
+        for message in ["append", "vote", "snapshot"] {
+            let (status, why) = ask(reqwest::Method::POST, &format!("/v1/raft/{message}")).await;
+            assert_eq!(status, 403, "{message}: {why}");
+            assert!(why.contains("only a control node sends this"), "{why}");
+        }
+        let ids = [world.b.raft.metrics().borrow().id, kith_store::node_id("a")];
+        let voters = ids.map(|id| (id, kith_store::openraft::BasicNode::new("")));
+        world
+            .b
+            .raft
+            .initialize(std::collections::BTreeMap::from(voters))
+            .await
+            .unwrap();
+        assert_ne!(ask(reqwest::Method::POST, "/v1/raft/vote").await.0, 403);
+        assert_eq!(hop().await.0, 403);
+        // What every node sends is still taken from it.
+        assert_ne!(ask(reqwest::Method::POST, "/v1/raft/write").await.0, 403);
+        // Nothing ran, and it is written down.
+        let entries = world.b.audit.tail(20).unwrap();
+        assert!(
+            entries.iter().any(|e| e["ok"] == false && e["who"] == "node a"),
+            "{entries:?}"
+        );
+        trust("control");
+        assert_eq!(hop().await.0, 422);
+    }
+
     /// Who asked is a node's to say, on what nodes pass on: an Identity that names the local
     /// socket is still itself, and a node that names nobody is given nothing.
     #[tokio::test]

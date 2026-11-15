@@ -338,6 +338,26 @@ fn catching_up(shared: &Shared, path: &str, name: &str, born: Option<u64>) -> bo
     unheard(&state.store, &cluster.me.name, applied, path, name, born)
 }
 
+/// What a worker (`spec.trust`) is refused among the nodes' routes: the second hop of
+/// `kith run`, and Raft's own messages, which only one that votes or leads sends.
+const CONTROL_ONLY: [&str; 4] = ["/v1/raft/append", "/v1/raft/vote", "/v1/raft/snapshot", RUN_HOP];
+const RUN_HOP: &str = "/v1/run-hop";
+
+/// Whether the Node `name` votes in the membership this node has. Raft's messages are taken
+/// from a worker for as long as it does (it hands its vote over itself, `raft::next_change`):
+/// refusing them the moment a voter is made a worker would cut a store's only voter off from
+/// the others, with nothing left that could agree on putting it right.
+fn votes(shared: &Shared, name: &str) -> bool {
+    // (Its id in Raft is made from the name its certificate has: nothing a node can write.)
+    let id = kith_store::node_id(name);
+    let metrics = shared.raft.metrics().borrow().clone();
+    metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .any(|voter| voter == id)
+}
+
 async fn members_only(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
@@ -349,6 +369,19 @@ async fn members_only(
         Some(pki::Subject::Node(name, key, born))
             if admitted(&shared, name, key) || catching_up(&shared, path, name, *born) =>
         {
+            // A worker does not vote, is not followed, and its word for who asked is not taken.
+            let worker = CONTROL_ONLY.contains(&path) && crate::access::worker(&shared, name);
+            if worker && (path == RUN_HOP || !votes(&shared, name)) {
+                let why = format!("node {name} is a worker: only a control node sends this");
+                if shared.audit.stranger() {
+                    let who = crate::access::Caller::Node(name.clone());
+                    let refused = Err(why.clone());
+                    shared
+                        .audit
+                        .record(&who, request.method().as_str(), vec![path.to_string()], refused);
+                }
+                return refuse(StatusCode::FORBIDDEN, why).into_response();
+            }
             return next.run(request).await;
         }
         Some(pki::Subject::Node(name, ..)) => {
@@ -435,7 +468,7 @@ async fn claim(State(shared): State<Arc<Shared>>, Json(request): Json<ClaimReque
     let cluster = cluster(&shared)?;
     // The token first: someone without one learns nothing about the cluster.
     let refused = "the claim token is wrong, already used, or older than an hour";
-    if !cluster.claims.good(&request.token, false) {
+    if cluster.claims.good(&request.token, false).is_none() {
         return Err(refuse(StatusCode::FORBIDDEN, refused));
     }
     pki::valid_name(&request.name).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
@@ -446,7 +479,7 @@ async fn claim(State(shared): State<Arc<Shared>>, Json(request): Json<ClaimReque
         return Err(refuse(StatusCode::CONFLICT, why));
     }
     // (Spent here, and once: of two who send it together, one is refused.)
-    if !cluster.claims.good(&request.token, true) {
+    if cluster.claims.good(&request.token, true).is_none() {
         return Err(refuse(StatusCode::FORBIDDEN, refused));
     }
     let grant = serde_json::json!([
@@ -481,7 +514,7 @@ pub fn offer_claim(shared: &Shared) {
     if claimed(shared) {
         return;
     }
-    match claims.mint(&ca.cert) {
+    match claims.mint(&ca.cert, false) {
         Ok(token) => eprintln!(
             "kithd: nobody administers this cluster from outside yet. For an hour, whoever sends this token to /v1/claim does: {token}"
         ),
@@ -581,6 +614,7 @@ async fn ca(State(shared): State<Arc<Shared>>) -> Result<String, Refusal> {
 pub async fn token(
     State(shared): State<Arc<Shared>>,
     axum::Extension(caller): axum::Extension<crate::access::Caller>,
+    axum::extract::Query(asked): axum::extract::Query<std::collections::BTreeMap<String, String>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     if caller.node().is_some() {
@@ -594,7 +628,16 @@ pub async fn token(
     if let Err(refused) = api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, node) {
         return refused.into_response();
     }
-    let minted = mint(&shared);
+    // `?trust=worker`: the node it lets in is one (`spec.trust`), from its first moment.
+    let worker = match asked.get("trust").map(String::as_str) {
+        None | Some("control") => false,
+        Some("worker") => true,
+        Some(other) => {
+            let why = format!("trust is `control` or `worker`, not `{other}`");
+            return refuse(StatusCode::UNPROCESSABLE_ENTITY, why).into_response();
+        }
+    };
+    let minted = mint(&shared, worker);
     let said = minted.as_ref().map(drop).map_err(|_| "no token".to_string());
     shared.audit.record(&caller, "token", vec!["Node".into()], said);
     minted.into_response()
@@ -650,7 +693,7 @@ pub async fn netboot(
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
             netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
-                cluster.tokens.mint(&ca.cert)
+                cluster.tokens.mint(&ca.cert, false)
             })
             .await
         }
@@ -669,12 +712,12 @@ pub async fn netboot(
     }
 }
 
-fn mint(shared: &Shared) -> Result<Json<serde_json::Value>, Refusal> {
+fn mint(shared: &Shared, worker: bool) -> Result<Json<serde_json::Value>, Refusal> {
     let cluster = cluster(shared)?;
     let Some(ca) = &cluster.ca else {
         return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };
-    let token = cluster.tokens.mint(&ca.cert);
+    let token = cluster.tokens.mint(&ca.cert, worker);
     let token = token.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "token": token, "expiresInSeconds": 3600 })))
 }
@@ -716,6 +759,7 @@ fn node_key(name: &str) -> String {
 /// every JSON reader keeps 64 bits), and holding the certificate whose key's print is
 /// `print` ([`admitted`]), with what it says of itself on the mesh if it joined there, all
 /// in one entry: no entry makes it half a node. The leader then starts sending it the store.
+/// `ca`: it is the node that holds the CA key, which no change may make a worker.
 pub async fn register(
     shared: &Shared,
     name: &str,
@@ -723,6 +767,7 @@ pub async fn register(
     id: u64,
     print: &str,
     mesh: Option<serde_json::Value>,
+    ca: bool,
 ) -> Result<(), kith_api::store::Error> {
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": {},
@@ -741,6 +786,7 @@ pub async fn register(
         unreachable!("an object")
     };
     status.extend(mesh.map(|mesh| ("mesh".to_string(), mesh)));
+    status.extend(ca.then(|| ("ca".to_string(), true.into())));
     let statuses = vec![(node_key(name), status)];
     shared.submit(Command::Patch { statuses }).await.map(drop)
 }
@@ -760,12 +806,12 @@ async fn join(
     // One join at a time: a token is checked here and spent at the end, and is good once.
     let _one = cluster.joining.lock().await;
     // The token first: someone without one learns nothing about the cluster.
-    if !cluster.tokens.good(&request.token, false) {
+    let Some(worker) = cluster.tokens.good(&request.token, false) else {
         return Err(refuse(
             StatusCode::FORBIDDEN,
             "the join token is wrong, already used, or older than an hour",
         ));
-    }
+    };
     pki::valid_name(&request.name).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let taken = {
         let store = shared.store.lock().expect("a handler panicked holding the store");
@@ -834,10 +880,14 @@ async fn join(
     // was there (`unheard`). The Node admits nobody until `register` gives it a status.
     let unavailable = |e| refuse(StatusCode::SERVICE_UNAVAILABLE, e);
     let failed = |e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e);
-    let spec = match request.mesh {
+    let mut spec = match request.mesh {
         Some(_) => serde_json::json!({ "roaming": true }),
         None => serde_json::json!({}),
     };
+    // (Its token's maker says so, not the node.)
+    if worker {
+        spec["trust"] = "worker".into();
+    }
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node",
         "metadata": { "name": request.name }, "spec": spec,
@@ -861,7 +911,7 @@ async fn join(
     };
     let address = address.to_string();
     let id = kith_store::node_id(&request.name);
-    register(&shared, &request.name, &address, id, &print, mesh)
+    register(&shared, &request.name, &address, id, &print, mesh, false)
         .await
         .map_err(unavailable)?;
     cluster.tokens.good(&request.token, true);

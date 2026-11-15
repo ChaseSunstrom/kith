@@ -281,6 +281,7 @@ fn states_of(shared: &Shared) -> Vec<(String, String, Option<String>, Option<Nod
 
 /// The next change to make, if any: one at a time, each seen in the metrics before the next.
 /// `current` are the nodes that have (nearly) all of the log: only those may start to vote.
+#[allow(clippy::too_many_arguments)]
 fn next_change(
     me: NodeId,
     wanted: &BTreeMap<NodeId, BasicNode>,
@@ -289,6 +290,7 @@ fn next_change(
     current: &BTreeSet<NodeId>,
     lost: &BTreeSet<NodeId>,
     roaming: &BTreeSet<NodeId>,
+    workers: &BTreeSet<NodeId>,
 ) -> Option<ChangeMembers<NodeId, BasicNode>> {
     let differ = |(id, node): &(&NodeId, &BasicNode)| known.get(id) != Some(node);
     let (changed, new): (BTreeMap<_, _>, BTreeMap<_, _>) = wanted
@@ -308,10 +310,17 @@ fn next_change(
     // become a voter: with two such voters of three, nothing could be agreed again.
     // A node that roams (a laptop) is as good as lost for this: it votes only if it leads
     // or nobody else can, and the cluster is as large as the nodes that stay.
-    let staying = wanted.keys().filter(|id| !roaming.contains(id)).count();
+    // A worker (`spec.trust`) never votes, whoever else there is: it is not counted, and one
+    // that votes (it was a control node until now, the leader even) stops.
+    let may = |id: &&NodeId| !workers.contains(id);
+    let staying = wanted.keys().filter(may).filter(|id| !roaming.contains(id)).count();
     // (Never fewer voters because a node was said to roam: those that vote go on, last in line.)
-    let enough = staying >= VOTERS || voters.len() >= VOTERS;
-    let target = if wanted.len() >= VOTERS && enough { VOTERS } else { 1 };
+    let enough = staying >= VOTERS || voters.iter().filter(may).count() >= VOTERS;
+    let target = if wanted.keys().filter(may).count() >= VOTERS && enough {
+        VOTERS
+    } else {
+        1
+    };
     let there = |id: &&NodeId| !lost.contains(id) && !roaming.contains(id);
     let by_preference = [me]
         .into_iter()
@@ -319,13 +328,15 @@ fn next_change(
         .chain(current.iter().filter(there).copied())
         .chain(voters.iter().copied());
     let mut next = BTreeSet::new();
-    for id in by_preference.filter(|id| *id == me || wanted.contains_key(id)) {
+    for id in by_preference.filter(|id| (*id == me || wanted.contains_key(id)) && may(&id)) {
         if next.len() < target {
             next.insert(id);
         }
     }
     // Not from one voter to two while the third is not ready: two stop when either does.
-    let waiting = voters.len() == 1 && next.len() == 2;
+    // (And never to no voter: a cluster of workers alone goes on as it is. The API refuses to
+    // make the last control node one.)
+    let waiting = voters.len() == 1 && next.len() == 2 || next.is_empty();
     if next != *voters && !waiting {
         return Some(ChangeMembers::ReplaceAllVoters(next));
     }
@@ -384,7 +395,18 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         let id = |node: &kith_api::Resource| node.status.as_ref()?["raftId"].as_str()?.parse().ok();
         store.store.list(Some("Node")).filter(roams).filter_map(id).collect()
     };
-    let Some(mut change) = next_change(metrics.id, &wanted, &known, &voters, &current, &lost, &roaming) else {
+    let workers: BTreeSet<NodeId> = {
+        let store = shared.store.lock().expect("nothing panics holding the store");
+        let id = |node: &kith_api::Resource| node.status.as_ref()?["raftId"].as_str()?.parse().ok();
+        let nodes = store.store.list(Some("Node"));
+        nodes
+            .filter(|node| node.spec["trust"] == "worker")
+            .filter_map(id)
+            .collect()
+    };
+    let Some(mut change) = next_change(
+        metrics.id, &wanted, &known, &voters, &current, &lost, &roaming, &workers,
+    ) else {
         return Ok(());
     };
     // Having the log says a node was there, not that it is: ask the ones about to vote.
@@ -402,7 +424,7 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
                 there.remove(id);
             }
         }
-        match next_change(metrics.id, &wanted, &known, &voters, &there, &lost, &roaming) {
+        match next_change(metrics.id, &wanted, &known, &voters, &there, &lost, &roaming, &workers) {
             Some(with_those_there) => change = with_those_there,
             None => return Ok(()),
         }
@@ -419,6 +441,48 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::next_change`] of a cluster with no worker.
+    fn next_change(
+        me: NodeId,
+        wanted: &BTreeMap<NodeId, BasicNode>,
+        known: &BTreeMap<NodeId, BasicNode>,
+        voters: &BTreeSet<NodeId>,
+        current: &BTreeSet<NodeId>,
+        lost: &BTreeSet<NodeId>,
+        roaming: &BTreeSet<NodeId>,
+    ) -> Option<ChangeMembers<NodeId, BasicNode>> {
+        super::next_change(me, wanted, known, voters, current, lost, roaming, &BTreeSet::new())
+    }
+
+    #[test]
+    fn a_worker_never_votes_and_one_that_votes_or_leads_stops() {
+        let nodes = |ids: &[u64]| {
+            let node = |n: &u64| (*n, BasicNode::new(format!("10.0.0.{n}:7443")));
+            ids.iter().map(node).collect::<BTreeMap<_, _>>()
+        };
+        let set = |ids: &[u64]| ids.iter().copied().collect::<BTreeSet<_>>();
+        let next = |me: u64, all: &[u64], voters: &[u64], workers: &[u64]| {
+            let (all, none) = (nodes(all), set(&[]));
+            let current = all.keys().copied().collect();
+            super::next_change(me, &all, &all, &set(voters), &current, &none, &none, &set(workers))
+        };
+        let voters = |ids: &[u64]| Some(ChangeMembers::ReplaceAllVoters(set(ids)));
+        // Three control nodes of five vote; the workers only receive, though they have the log.
+        assert_eq!(next(1, &[1, 2, 3, 4, 5], &[1], &[2, 3]), voters(&[1, 4, 5]));
+        // One control node and two workers: one voter, as with fewer than three nodes.
+        assert_eq!(next(1, &[1, 2, 3], &[1], &[2, 3]), None);
+        // A voter made a worker stops, and another control node takes its place.
+        assert_eq!(next(1, &[1, 2, 3, 4], &[1, 2, 3], &[2]), voters(&[1, 3, 4]));
+        // With no one to take its place the cluster is back to one voter, not two.
+        assert_eq!(next(1, &[1, 2, 3], &[1, 2, 3], &[2]), voters(&[1]));
+        // The leader made a worker hands the vote to those that are not, itself left out.
+        assert_eq!(next(1, &[1, 2, 3, 4], &[1, 2, 3], &[1]), voters(&[2, 3, 4]));
+        // The only voter made a worker hands over too (the others take its messages till then).
+        assert_eq!(next(1, &[1, 2], &[1], &[1]), voters(&[2]));
+        // Every node a worker (the API refuses it): nothing is changed, the voters go on.
+        assert_eq!(next(1, &[1, 2, 3], &[1, 2, 3], &[1, 2, 3]), None);
+    }
 
     #[test]
     fn members_follow_the_nodes_and_a_roaming_one_never_starts_to_vote() {

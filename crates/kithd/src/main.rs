@@ -631,7 +631,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     let id = shared.raft.metrics().borrow().id;
                     // Not fatal: the address the cluster has for this node is the one from last time.
                     let registered = match pki::print_of(&cluster.me.cert) {
-                        Ok(print) => cluster::register(&shared, &cluster.me.name, &reachable, id, &print, None)
+                        Ok(print) => cluster::register(&shared, &cluster.me.name, &reachable, id, &print, None, true)
                             .await
                             .map_err(|e| e.to_string()),
                         Err(e) => Err(e),

@@ -203,6 +203,65 @@ pub fn stands(shared: &Shared, name: &str, der: &[u8]) -> bool {
     pinned.is_some_and(|pem| pki::same_key(pem, der))
 }
 
+/// Whether the Node `name` is there and a worker (`spec.trust`): one that is not there yet
+/// (this node is still being sent the store) is not said to be one.
+pub fn worker(shared: &Shared, name: &str) -> bool {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    is_worker(&state.store, name)
+}
+
+pub fn is_worker(store: &Store, name: &str) -> bool {
+    let node = store.get(&format!("Node/{name}"));
+    node.is_some_and(|node| node.spec["trust"] == "worker")
+}
+
+/// Refuses a change that leaves nodes and no control node among them: the workers would
+/// follow nobody and nothing could be agreed on again. `after` is what the change makes of
+/// each Node it touches: its spec, or `None` where it deletes it.
+pub fn control_stays(store: &Store, after: &[(&str, Option<&serde_json::Value>)]) -> Result<(), String> {
+    // Two documents for one Node in one change: the last is what the Node becomes.
+    let last = |(at, (name, _)): &(usize, &(&str, Option<&serde_json::Value>))| {
+        !after[at + 1..].iter().any(|(later, _)| later == name)
+    };
+    let after: Vec<_> = after.iter().enumerate().filter(last).map(|(_, node)| *node).collect();
+    // The node that holds the CA key (it says so as it starts) admits every other: a worker
+    // with it would be a worker in name.
+    let holds = |name: &str| {
+        let status = store.get(&format!("Node/{name}")).and_then(|node| node.status.as_ref());
+        status.is_some_and(|status| status["ca"] == true)
+    };
+    let made_worker = |(name, spec): &&(&str, Option<&serde_json::Value>)| {
+        spec.is_some_and(|spec| spec["trust"] == "worker") && holds(name)
+    };
+    if let Some((name, _)) = after.iter().find(made_worker) {
+        return Err(format!(
+            "node {name} holds the cluster's CA key: it stays a control node"
+        ));
+    }
+    let touched = |name: &str| after.iter().any(|(node, _)| *node == name);
+    let rest = store.list(Some("Node")).filter(|node| !touched(&node.metadata.name));
+    let specs = rest
+        .map(|node| &node.spec)
+        .chain(after.iter().filter_map(|(_, spec)| *spec));
+    let workers: Vec<bool> = specs.map(|spec| spec["trust"] == "worker").collect();
+    if after.is_empty() || workers.is_empty() || workers.contains(&false) {
+        return Ok(());
+    }
+    Err("a cluster needs a control node (`spec.trust: control`, or none said): this would leave only workers".into())
+}
+
+/// Why the Secret at `key` (`spec`) is given to nothing on the node `me`, if so: one for
+/// control nodes only (`trust: control`) on a worker, whoever placed what names it there.
+pub fn withheld(store: &Store, me: Option<&str>, key: &str, spec: &serde_json::Value) -> Option<String> {
+    let kept = spec["trust"] == "control" && me.is_some_and(|me| is_worker(store, me));
+    kept.then(|| format!("{key} is for control nodes (`trust: control`), and this node is a worker"))
+}
+
+/// Why a worker's word for who asked does nothing.
+pub fn not_taken(node: &str) -> String {
+    format!("node {node} is a worker: its word for who asked is not taken")
+}
+
 /// Who a request on the TLS port is from, or why it is refused (and with what status). A
 /// certificate that does not stand for an Identity, or none, is refused and written down.
 pub fn who(
@@ -220,6 +279,11 @@ pub fn who(
             } else if !passed_on(path) {
                 // Where nodes pass nothing on it is the node, with no right, whatever it names.
                 return Ok(caller);
+            } else if worker(shared, node) {
+                (
+                    StatusCode::FORBIDDEN,
+                    format!("{}: ask a control node", not_taken(node)),
+                )
             } else {
                 // Whoever the node says asked it: the handler asks what that caller may do.
                 let why = match named.map(|named| (named, Caller::named(named))) {
@@ -304,6 +368,57 @@ pub async fn caller(
 mod tests {
     use super::*;
     use kith_api::Resource;
+
+    #[test]
+    fn a_worker_is_what_its_node_says_and_a_cluster_keeps_a_control_node() {
+        let mut store = Store::default();
+        let node = |name: &str, spec: &str| {
+            let text = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}}}\nspec: {spec}\n");
+            Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        for (name, spec) in [("a", "{}"), ("b", "{trust: control}"), ("w", "{trust: worker}")] {
+            store.apply(node(name, spec)).unwrap();
+        }
+        // A node that is not there (yet: this one is being sent the store) is not said to be one.
+        let workers = ["a", "b", "w", "nobody"].map(|name| is_worker(&store, name));
+        assert_eq!(workers, [false, false, true, false]);
+        // A Secret for control nodes is given to nothing on a worker; any other is.
+        let (guarded, plain) = (serde_json::json!({"trust": "control"}), serde_json::json!({}));
+        let why = withheld(&store, Some("w"), "Secret/default/key", &guarded).unwrap();
+        assert!(why.starts_with("Secret/default/key is for control nodes"), "{why}");
+        assert_eq!(withheld(&store, Some("w"), "Secret/default/any", &plain), None);
+        assert_eq!(withheld(&store, Some("a"), "Secret/default/key", &guarded), None);
+        assert_eq!(withheld(&store, None, "Secret/default/key", &guarded), None);
+        // The last control node is not made a worker, deleted or rolled back to one.
+        let (worker, control) = (serde_json::json!({"trust": "worker"}), serde_json::json!({}));
+        assert_eq!(control_stays(&store, &[("a", Some(&worker))]), Ok(()));
+        assert_eq!(control_stays(&store, &[("a", None)]), Ok(()));
+        let both = control_stays(&store, &[("a", Some(&worker)), ("b", None)]).unwrap_err();
+        assert!(both.contains("would leave only workers"), "{both}");
+        // (Two documents for one Node: the last is what it becomes.)
+        let twice = [("b", None), ("a", Some(&control)), ("a", Some(&worker))];
+        assert!(control_stays(&store, &twice).is_err());
+        let twice = [("b", None), ("a", Some(&worker)), ("a", Some(&control))];
+        assert_eq!(control_stays(&store, &twice), Ok(()));
+        // (A new control node in the same change counts, and a cluster of no node is no cluster.)
+        assert_eq!(
+            control_stays(&store, &[("a", None), ("b", None), ("c", Some(&control))]),
+            Ok(())
+        );
+        assert_eq!(control_stays(&store, &[("a", None), ("b", None), ("w", None)]), Ok(()));
+        // Nor is the node that holds the CA key, while others are control nodes too.
+        store
+            .set_status("Node/b", Some(serde_json::json!({"ca": true})))
+            .unwrap();
+        let holder = control_stays(&store, &[("b", Some(&worker))]).unwrap_err();
+        assert!(holder.contains("node b holds the cluster's CA key"), "{holder}");
+        assert_eq!(control_stays(&store, &[("b", Some(&control))]), Ok(()));
+        // What touches no Node is never refused for it.
+        store.apply(node("a", "{trust: worker}")).unwrap();
+        store.apply(node("b", "{trust: worker}")).unwrap();
+        assert_eq!(control_stays(&store, &[]), Ok(()));
+        assert_eq!(control_stays(&store, &[("a", Some(&control))]), Ok(()));
+    }
 
     /// A refused certificate is written down, with who showed it and what for: a 401 is no
     /// less a refusal than a 403.
