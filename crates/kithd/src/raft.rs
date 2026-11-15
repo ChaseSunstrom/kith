@@ -61,8 +61,17 @@ impl RaftNetworkFactory<TypeConfig> for Network {
     }
 }
 
-/// The Node whose Raft id is `id`, if the store has it: its name, and the print of its key.
-fn voter(shared: &Shared, id: NodeId) -> (Option<String>, Option<String>) {
+/// What the store says of the voter whose Raft id is `id`.
+enum Found {
+    /// No Node carries the id.
+    No,
+    /// The Node that does: its name, and the print of its key where it names one.
+    One(String, Option<String>),
+    /// Two or more Nodes carry it: none of them is known to be the voter.
+    Many,
+}
+
+fn voter(shared: &Shared, id: NodeId) -> Found {
     let state = shared.store.lock().expect("nothing panics holding the store");
     let id = id.to_string();
     let named = |node: &&kith_api::Resource| {
@@ -70,21 +79,48 @@ fn voter(shared: &Shared, id: NodeId) -> (Option<String>, Option<String>) {
             .as_ref()
             .is_some_and(|status| status["raftId"].as_str() == Some(&id))
     };
-    let node = state.store.list(Some("Node")).find(named);
+    let mut nodes = state.store.list(Some("Node")).filter(named);
     let print = |node: &kith_api::Resource| node.status.as_ref()?["certificate"].as_str().map(str::to_string);
-    (node.map(|node| node.metadata.name.clone()), node.and_then(print))
+    match (nodes.next(), nodes.next()) {
+        (None, _) => Found::No,
+        (Some(node), None) => Found::One(node.metadata.name.clone(), print(node)),
+        (Some(_), Some(_)) => Found::Many,
+    }
 }
 
-/// The client for the voter `id`, held to it: its certificate's name gives `id`, and its key is
-/// the one its Node names once that Node is in the store (a join, an empty store: by name alone).
-/// With the name its Node has, for a log line; the error says who was called and who answered.
+/// The client for the voter `id`, held to it: to the name and key of the Node that has that id,
+/// and, for a voter with no Node in the store (a join, an empty store, a Node deleted), to a name
+/// that gives the id. With the name its Node has, for a log line; the error says who was called
+/// and who answered, or why no one is.
 fn to_voter(shared: &Shared, id: NodeId) -> Result<(reqwest::Client, Option<String>), String> {
     let cluster = shared.cluster.as_ref().ok_or("this node is not in a cluster")?;
-    let (name, print) = voter(shared, id);
-    Ok((cluster.to_voter(id, print)?, name))
+    match voter(shared, id) {
+        Found::One(name, print) => Ok((cluster.to_name(&name, print)?, Some(name))),
+        Found::No => Ok((cluster.to_voter(id)?, None)),
+        Found::Many => Err(format!(
+            "two Nodes of the store have the raft id {id}, so none is known to be the voter: nothing is sent"
+        )),
+    }
+}
+
+/// Whether the candidate voter `id`, at `address`, is there: it answers for the CA, as itself.
+async fn answers(shared: &Shared, id: NodeId, address: &str) -> bool {
+    let Ok((client, _)) = to_voter(shared, id) else {
+        return false;
+    };
+    let asked = client.get(format!("https://{address}/v1/ca"));
+    asked.timeout(Duration::from_secs(2)).send().await.is_ok()
 }
 
 impl Link {
+    /// Put in the log what a link cannot do, once for each text.
+    fn say(&mut self, said: String) {
+        if self.said.as_ref() != Some(&said) {
+            eprintln!("kithd: {said}");
+            self.said = Some(said);
+        }
+    }
+
     // The error type is openraft's.
     #[allow(clippy::result_large_err)]
     async fn call<Q, A, E>(
@@ -101,17 +137,23 @@ impl Link {
         let unreachable = |why: &str| Unreachable::new(&std::io::Error::other(why.to_string()));
         let shared = self.shared.get().and_then(Weak::upgrade);
         let shared = shared.ok_or_else(|| unreachable("this node is not in a cluster"))?;
-        let (client, name) = to_voter(&shared, self.target).map_err(|why| unreachable(&why))?;
+        let (client, name) = match to_voter(&shared, self.target) {
+            Ok(held) => held,
+            Err(why) => {
+                self.say(format!("raft link at {}: {why}", self.address));
+                return Err(unreachable(&why).into());
+            }
+        };
         let call = client.post(format!("https://{}/v1/raft/{what}", self.address));
         let reply = call.timeout(option.hard_ttl()).json(rpc).send().await;
         let reply = reply.and_then(reqwest::Response::error_for_status);
         let reply = reply.map_err(|e| {
             let to = name.map_or(String::new(), |name| format!(" to node {name}"));
-            let said = format!("raft link{to} at {}: {}", self.address, crate::cluster::why(&e));
-            if self.said.as_ref() != Some(&said) {
-                eprintln!("kithd: {said}");
-                self.said = Some(said);
-            }
+            self.say(format!(
+                "raft link{to} at {}: {}",
+                self.address,
+                crate::cluster::why(&e)
+            ));
             Unreachable::new(&e)
         })?;
         self.said = None;
@@ -602,12 +644,7 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         for id in next.difference(&voters) {
             // (The candidate and no other: the Node it is in the store, or its name alone.)
             let address = wanted.get(id).map_or("", |node| node.addr.as_str());
-            let asked = to_voter(&shared, *id).map(|(client, _)| client.get(format!("https://{address}/v1/ca")));
-            let answered = match asked {
-                Ok(asked) => asked.timeout(Duration::from_secs(2)).send().await.is_ok(),
-                Err(_) => false,
-            };
-            if !answered {
+            if !answers(shared, *id, address).await {
                 there.remove(id);
             }
         }
@@ -717,6 +754,73 @@ mod tests {
         let (done, why) = vote_at(right, taken).await;
         assert!(!done && said(why).contains("was called, and node x answered"));
         assert_eq!(to_x.load(Ordering::SeqCst), 0);
+    }
+
+    /// Two Nodes with one Raft id: neither is known to be the voter, so the vote is sent to neither.
+    #[tokio::test]
+    async fn raft_link_two_nodes_one_id_is_sent_nothing() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use kith_store::openraft::Vote;
+        use std::sync::atomic::Ordering;
+        let ca = pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (home, to_b) = answering_as(&b).await;
+        let (there, to_x) = answering_as(&x).await;
+        let id = kith_store::node_id("b");
+        let nodes = [at("b", &home, None), at("x", &there, None)];
+        let shared = shared_with("link-two", a, &nodes).await;
+        for name in ["b", "x"] {
+            let status = serde_json::json!({ "address": home, "state": "ready", "raftId": id.to_string() });
+            let set = shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .set_status(&format!("Node/{name}"), Some(status));
+            set.unwrap();
+        }
+        let mut network = Network::default();
+        let _ = network.0.set(Arc::downgrade(&shared));
+        let mut link = network.new_client(id, &BasicNode::new(&home)).await;
+        let vote = VoteRequest::new(Vote::new(1, kith_store::node_id("a")), None);
+        assert!(link.vote(vote, RPCOption::new(Duration::from_secs(5))).await.is_err());
+        let said = link.said.expect("the refusal is in the log");
+        assert!(said.contains("two Nodes") && said.contains("nothing is sent"), "{said}");
+        assert_eq!((to_b.load(Ordering::SeqCst), to_x.load(Ordering::SeqCst)), (0, 0));
+        // And the probe of that candidate finds no one there either.
+        assert!(!answers(&shared, id, &home).await);
+        assert_eq!(to_b.load(Ordering::SeqCst), 0);
+    }
+
+    /// The candidate voter is asked as itself: another node of the CA at its address is not taken for it.
+    #[tokio::test]
+    async fn raft_probe_of_a_candidate_is_not_answered_by_another_node() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use std::sync::atomic::Ordering;
+        let ca = pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (taken, to_x) = answering_as(&x).await;
+        let (home, to_b) = answering_as(&b).await;
+        let id = kith_store::node_id("b");
+        // Not yet a Node: held to a name that gives b's id.
+        let empty = shared_with("probe-empty", a.clone(), &[]).await;
+        assert!(!answers(&empty, id, &taken).await, "x was taken for b");
+        assert!(answers(&empty, id, &home).await, "b was not taken for b");
+        // With its Node: held to the name and key it has.
+        let shared = shared_with("probe-known", a, &[at("b", &home, None)]).await;
+        let status = serde_json::json!({ "address": home, "state": "ready", "raftId": id.to_string() });
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Node/b", Some(status))
+            .unwrap();
+        assert!(!answers(&shared, id, &taken).await, "x was taken for b");
+        assert!(answers(&shared, id, &home).await, "b was not taken for b");
+        // (/v1/ca is asked of each, and the handshake is what refuses: x is sent nothing.)
+        assert_eq!(to_x.load(Ordering::SeqCst), 0);
+        assert_eq!(to_b.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

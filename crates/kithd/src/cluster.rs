@@ -84,15 +84,21 @@ impl Cluster {
     /// name, and by the key its Node names where it names one. One per node (a new one when
     /// the key changes), so a connection kept open is not made again for each call.
     pub fn to(&self, to: &crate::view::Upstream) -> Fallible<reqwest::Client> {
-        self.pin_to(to.name.clone(), pki::Who::Name(to.name.clone()), to.certificate.clone())
+        self.to_name(&to.name, to.certificate.clone())
     }
 
-    /// A client that calls the voter whose id in Raft is `id` and no other: its certificate must
-    /// be for a node name that gives that id, and carry the key `print` where its Node names one.
-    /// For a link used before its Node is in the store, which then has the name alone to go by.
-    pub fn to_voter(&self, id: kith_store::NodeId, print: Option<String>) -> Fallible<reqwest::Client> {
+    /// [`Cluster::to`] of the node called `name` whose Node names the key `print`, if it does.
+    pub fn to_name(&self, name: &str, print: Option<String>) -> Fallible<reqwest::Client> {
+        self.pin_to(name.to_string(), pki::Who::Name(name.to_string()), print)
+    }
+
+    /// A client that calls the voter whose id in Raft is `id`, for a voter that has no Node in
+    /// the store: its certificate must be for a node name that gives that id. That is weaker than
+    /// [`Cluster::to`]: any name the CA issued whose id it is will do, and a Node of a name
+    /// that is not the voter's cannot have it, as `join` refuses an id that is taken.
+    pub fn to_voter(&self, id: kith_store::NodeId) -> Fallible<reqwest::Client> {
         // (Not a node name, so `forget_but` knows these apart.)
-        self.pin_to(format!("#{id}"), pki::Who::Id(id), print)
+        self.pin_to(format!("#{id}"), pki::Who::Id(id), None)
     }
 
     fn pin_to(&self, key: String, who: pki::Who, print: Option<String>) -> Fallible<reqwest::Client> {
@@ -878,6 +884,44 @@ pub async fn register(
     shared.submit(Command::Patch { statuses }).await.map(drop)
 }
 
+/// Why `name` may not be a node: its Raft id ([`kith_store::node_id`]) is the one a Node of the
+/// store says it has, or one of the members of the cluster.
+fn taken_raft_id(shared: &Shared, name: &str) -> Option<String> {
+    let id = kith_store::node_id(name);
+    let text = id.to_string();
+    let has = |node: &&kith_api::Resource| {
+        node.status
+            .as_ref()
+            .is_some_and(|status| status["raftId"].as_str() == Some(&text))
+    };
+    let other = {
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        store
+            .store
+            .list(Some("Node"))
+            .find(has)
+            .map(|node| node.metadata.name.clone())
+    };
+    let by = match other {
+        Some(other) => format!("node `{other}`"),
+        None if shared
+            .raft
+            .metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .any(|(member, _)| *member == id) =>
+        {
+            "a member of the cluster".into()
+        }
+        None => return None,
+    };
+    Some(format!(
+        "the name `{name}` gives the Raft id {id}, which {by} has: pick another --name"
+    ))
+}
+
 async fn join(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
@@ -919,6 +963,11 @@ async fn join(
             "a node named `{0}` is already in the cluster: pick another --name, or `kith delete node/{0}` first",
             request.name
         );
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
+    // A Raft id comes from a name too: a name whose id a Node or a member already has would be
+    // taken for that voter by a link that knows its voter by the id.
+    if let Some(why) = taken_raft_id(&shared, &request.name) {
         return Err(refuse(StatusCode::CONFLICT, why));
     }
     // Mesh addresses come from names: two names with the same ones cannot both be nodes.
@@ -1144,9 +1193,13 @@ pub(crate) mod pinned_peer {
 
     /// The state of the node `me`, whose store has a Node for each of `nodes`, called where they say.
     pub async fn shared_with(tag: &str, me: Identity, nodes: &[Upstream]) -> Arc<Shared> {
+        shared_of(tag, Cluster::new(me, None).unwrap(), nodes).await
+    }
+
+    /// [`shared_with`] of a cluster already made.
+    pub async fn shared_of(tag: &str, cluster: Cluster, nodes: &[Upstream]) -> Arc<Shared> {
         let dir = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let cluster = Cluster::new(me, None).unwrap();
         let shared = crate::replica(Some(cluster), &dir, Duration::from_secs(300)).await;
         let shared = shared.unwrap();
         for node in nodes {
@@ -1207,6 +1260,61 @@ pub(crate) mod pinned_peer {
         // The plain client takes any node of the cluster: it is not for what is meant for one.
         let any = cluster.client.post(format!("https://{taken}/v1/secret")).send().await;
         assert!(any.unwrap().status().is_success() && to_x.load(Ordering::SeqCst) == 1);
+    }
+
+    /// A name whose Raft id a Node has is refused at the join (it would be taken for that Node's
+    /// voter), the token is not spent, and a name with a free id is not refused for it.
+    #[tokio::test]
+    async fn join_refuses_a_taken_raft_id() {
+        let ca = pki::Ca::create().unwrap();
+        let a = node(&ca, "a");
+        let cluster = Cluster::new(a, Some(ca)).unwrap();
+        let token = cluster.tokens.mint(&cluster.me.ca, pki::Lets::Control).unwrap();
+        // Node/other has the id the name `joiner` gives (found by no search: it is set).
+        let shared = shared_of("join-id", cluster, &[at("other", "127.0.0.1:1", None)]).await;
+        let id = kith_store::node_id("joiner");
+        let status = serde_json::json!({ "address": "127.0.0.1:1", "state": "ready", "raftId": id.to_string() });
+        let set = shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .set_status("Node/other", Some(status));
+        set.unwrap();
+        let peer = Peer {
+            addr: "127.0.0.1:2".parse().unwrap(),
+            subject: None,
+        };
+        let join = |name: &str| {
+            let request = JoinRequest {
+                token: token.clone(),
+                name: name.into(),
+                port: 7000,
+                mesh: None,
+                view: false,
+            };
+            join(State(shared.clone()), ConnectInfo(peer.clone()), Json(request))
+        };
+        let (status, Json(said)) = join("joiner").await.err().expect("a taken id is refused");
+        assert_eq!(status, StatusCode::CONFLICT);
+        let said = said["error"].as_str().unwrap();
+        assert!(
+            said.contains("gives the Raft id") && said.contains("node `other`"),
+            "{said}"
+        );
+        assert!(said.contains("pick another --name"), "{said}");
+        let cluster = shared.cluster.as_ref().unwrap();
+        assert!(
+            cluster.tokens.good(&token, false).is_some(),
+            "the refusal spent the token"
+        );
+        assert!(shared.store.lock().unwrap().store.get("Node/joiner").is_none());
+        // A free id passes this check (it goes on, and fails later on what the test does not have).
+        let other = join("someone-else").await.err().map(|(_, Json(said))| said.to_string());
+        assert!(
+            other.as_ref().is_none_or(|said| !said.contains("gives the Raft id")),
+            "{other:?}"
+        );
     }
 
     fn sources(dir: &std::path::Path, into: &mut Vec<(String, String)>) {

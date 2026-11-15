@@ -63,11 +63,15 @@ Only the newest version is fixed. There are no security releases of older ones.
   names a key (`status.certificate`), is that key. So another node of the CA that
   answers at a moved or reused address is sent nothing and what it says is not taken
   for the named node's word, and the error says who was called and who answered. A
-  Node that names no key is held to its name alone. A Raft link knows its voter by
-  its raft id, so its certificate's name must give that id, and the key too once that
-  voter's Node is in the store; a store with no Node for it yet (a node just joined)
-  holds the link to the name alone, as does a voter whose Node was deleted and that
-  still gets the store until it is taken out of the voters.
+  Node that names no key is held to its name alone.
+  A Raft link goes to the voter's address in the membership. It is held to the name
+  and key of the Node that has that voter's raft id; if two Nodes have it, nothing is
+  sent. Where the store has no Node for the voter (a node just joined, or a voter whose
+  Node was deleted and that still gets the store until it is taken out of the voters),
+  it is held to a certificate whose name gives that id, which is weaker: any name of the
+  CA that hashes to the id is taken for the voter. A join is refused a name whose id
+  another Node or a member of the cluster has, so a joining node cannot be taken for a
+  voter by choosing its name.
   Not pinned: joining (the joining node has no store, and checks the CA by its hash
   from the token); a blob fetched by its digest (what comes is checked against the
   digest); and a locked disk's key asked at boot, before there is a store (only a key

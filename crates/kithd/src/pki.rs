@@ -333,11 +333,14 @@ pub type Pin = (String, Option<String>);
 /// The one node a client will talk to: who it is, and the print of its key.
 pub type Held = (Who, Option<String>);
 
-/// A node by its name, or by its id in Raft (which its name gives, `kith_store::node_id`): a
-/// Raft link knows the id of the voter it is for before it knows any Node.
+/// A node by its name, or by its id in Raft (which its name gives, `kith_store::node_id`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Who {
     Name(String),
+    /// For a voter that has no Node in the store, which is all a Raft link has then. Weaker than
+    /// a name: the id is a 64-bit hash, so any name of the CA's that hashes to it is taken for the
+    /// voter. (Only a Node's name and key pin a voter that has a Node; `join` refuses a name
+    /// whose id a Node already has.)
     Id(kith_store::NodeId),
 }
 
