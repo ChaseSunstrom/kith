@@ -515,7 +515,8 @@ async fn replica(
 }
 
 fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
-    // One thread: kithd forks containers, and a small idle footprint is the point (§3.2).
+    // One thread for everything that is awaited: kithd forks containers, and a small idle
+    // footprint is the point (§3.2). (What blocks goes to a thread of its own for as long as it does.)
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

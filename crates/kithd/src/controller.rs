@@ -237,7 +237,7 @@ pub async fn run(
         }
     }
     for (id, mut slot) in controller.slots {
-        stop(&id, &mut slot);
+        stop(&id, &mut slot).await;
     }
 }
 
@@ -259,13 +259,42 @@ async fn until_woken(
 
 /// Deletes a unit's handle. One whose processes remain keeps it: the slot is `leaving` (its id
 /// and devices held back) until a later pass finds it gone. A cleanup-only failure holds nothing.
-fn stop(id: &str, slot: &mut Slot) {
+async fn stop(id: &str, slot: &mut Slot) {
     let Some(handle) = slot.handle.take() else {
         slot.leaving = false;
         return;
     };
     slot.tried = Some(Instant::now());
-    match handle.delete() {
+    let deleted = delete(handle).await;
+    stopped(id, slot, deleted);
+}
+
+/// `handle.delete()` on a thread of its own: a delete kills the unit and then waits, asleep
+/// between tries, for its cgroup to empty, and on kithd's thread the API, the proxy and DNS
+/// would wait with it. Where the node has no thread to give, it runs here after all.
+async fn delete(handle: Handle) -> Result<(), kith_runtime::Undeleted> {
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(Some(handle)));
+    let (theirs, (done, said)) = (cell.clone(), tokio::sync::oneshot::channel());
+    let spawned = std::thread::Builder::new().name("stop".into()).spawn(move || {
+        let handle = theirs.lock().expect("nothing panics holding it").take();
+        if let Some(handle) = handle {
+            let _ = done.send(handle.delete());
+        }
+    });
+    if spawned.is_ok()
+        && let Ok(deleted) = said.await
+    {
+        return deleted;
+    }
+    let handle = cell.lock().expect("nothing panics holding it").take();
+    handle
+        .expect("the stop's thread took the handle and answered nothing: it panicked")
+        .delete()
+}
+
+/// What a stop leaves in its slot once the delete was tried with `deleted`.
+fn stopped(id: &str, slot: &mut Slot, deleted: Result<(), kith_runtime::Undeleted>) {
+    match deleted {
         Ok(()) => {
             // Gone: the "stopping" message of an earlier pass is over.
             if slot.message.as_deref().is_some_and(|m| m.starts_with("stopping: ")) {
@@ -302,10 +331,10 @@ fn stop(id: &str, slot: &mut Slot) {
 
 /// Stops the unit `id` if it has one. Its slot is kept while it is `leaving`, and once it is gone
 /// unless it is dropped: `drop` marks one stopped to be replaced or dropped (see `kept_once_gone`).
-fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str, drop: bool) {
+async fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str, drop: bool) {
     if let Some(mut slot) = slots.remove(id) {
         slot.drop |= drop;
-        stop(id, &mut slot);
+        stop(id, &mut slot).await;
         if slot.leaving || kept_once_gone(slot.drop) {
             slots.insert(id.to_string(), slot);
         }
@@ -624,7 +653,7 @@ impl Controller {
                     let first = template.init_containers.iter().map(|c| &c.name);
                     let names: BTreeSet<_> = template.units().chain(first).collect();
                     let units = names.iter().filter(|name| unit_id(&prefix, 0, name).is_ok()).count();
-                    let (runs, not_before) = self.job_runs(&key, resource, replicas, units);
+                    let (runs, not_before) = self.job_runs(&key, resource, replicas, units).await;
                     // A Job retries whole runs, so a unit that exits stays exited.
                     (runs, not_before, RestartPolicy::Never)
                 }
@@ -788,7 +817,7 @@ impl Controller {
                 continue;
             }
             // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
-            stop_unit(&mut self.slots, id, !wanted.contains_key(id));
+            stop_unit(&mut self.slots, id, !wanted.contains_key(id)).await;
         }
         let mut stale: Vec<String> = Vec::new();
         fn of(slot: &Slot) -> (&str, u32) {
@@ -873,7 +902,7 @@ impl Controller {
             .collect();
         stale.extend(first);
         for id in stale {
-            stop_unit(&mut self.slots, &id, true);
+            stop_unit(&mut self.slots, &id, true).await;
         }
         // The input devices of running units, taken or given as they run. What was taken away
         // first, from every unit: a refused removal replaces its unit (the container may still
@@ -908,7 +937,7 @@ impl Controller {
             }
         }
         for id in &replace {
-            stop_unit(&mut self.slots, id, true);
+            stop_unit(&mut self.slots, id, true).await;
         }
         // What a unit still stopping holds (one stopped this pass that did not go included) is
         // not given to another, and what waits for it says so in its status.
@@ -1048,7 +1077,7 @@ impl Controller {
                         -1
                     }
                 };
-                stop(id, slot);
+                stop(id, slot).await;
                 slot.probes = None;
                 slot.exit_code = Some(code);
                 slot.failures = if slot.started.elapsed() >= SETTLED {
@@ -1245,7 +1274,13 @@ impl Controller {
     /// say which runs should exist now and from when. A run is one replica of the
     /// template; it succeeds when every unit exits 0 and fails as soon as one does not
     /// (or cannot start). `retries` failed runs are forgiven; one more fails the Job.
-    fn job_runs(&mut self, key: &str, resource: &Resource, completions: u32, units: usize) -> (Vec<u32>, Instant) {
+    async fn job_runs(
+        &mut self,
+        key: &str,
+        resource: &Resource,
+        completions: u32,
+        units: usize,
+    ) -> (Vec<u32>, Instant) {
         let spec: JobSpec = serde_json::from_value(resource.spec.clone()).expect("read once already");
         let revision = resource.metadata.revision;
         let job = self.jobs.entry(key.into()).or_insert_with(|| {
@@ -1279,7 +1314,7 @@ impl Controller {
         if job.revision != revision {
             // Applied again with changes: it runs again.
             for id in mine(&self.slots, None) {
-                stop_unit(&mut self.slots, &id, true);
+                stop_unit(&mut self.slots, &id, true).await;
             }
             *job = Progress {
                 revision,
@@ -1328,7 +1363,7 @@ impl Controller {
                 }
             }
             for id in ids {
-                stop_unit(&mut self.slots, &id, true);
+                stop_unit(&mut self.slots, &id, true).await;
             }
         }
         let timeout = spec.timeout_seconds.map(|s| Duration::from_secs(s.into()));
@@ -1342,7 +1377,7 @@ impl Controller {
         }
         if job.outcome.is_some() {
             for id in mine(&self.slots, None) {
-                stop_unit(&mut self.slots, &id, true);
+                stop_unit(&mut self.slots, &id, true).await;
             }
             return (Vec::new(), Instant::now());
         }
@@ -1690,8 +1725,10 @@ async fn start(
         Ok(()) => Ok(handle),
         Err(e) => {
             // It never ran; what processes it left are the slot's to hold until they are gone.
-            slot.handle = Some(handle);
-            stop(id, slot);
+            // (Deleted here, not on a thread: this start is given up when kithd ends, and a
+            // delete nobody waits for any more would be cut short by the exit.)
+            slot.tried = Some(Instant::now());
+            stopped(id, slot, handle.delete());
             Err(e.to_string())
         }
     }
@@ -2076,20 +2113,20 @@ mod tests {
 
     /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit
     /// code and restarts stay, and it is not run again. One stopped to be replaced is removed.
-    #[test]
-    fn leaving_exit_is_not_run_again() {
+    #[tokio::test]
+    async fn leaving_exit_is_not_run_again() {
         let id = "w_a_b_0_app";
         let mut ended = slot_of("Workload/a/b", &[], "app");
         (ended.leaving, ended.state, ended.exit_code) = (true, "exited", Some(0));
         let mut slots = BTreeMap::from([(id.to_string(), ended)]);
-        stop_unit(&mut slots, id, false);
+        stop_unit(&mut slots, id, false).await;
         let kept = slots.get(id).expect("an exit is kept");
         assert_eq!(
             (kept.state, kept.exit_code, kept.leaving, kept.start_at.is_none()),
             ("exited", Some(0), false, true),
             "kept as it ended, with nothing to start"
         );
-        stop_unit(&mut slots, id, true);
+        stop_unit(&mut slots, id, true).await;
         assert!(
             !slots.contains_key(id),
             "a replaced unit goes, and what is wanted starts afresh"
