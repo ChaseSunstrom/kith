@@ -2829,9 +2829,12 @@ none, 443 for `https://`). One on the node itself or on its own networks
 (loopback, private, shared, link-local, multicast) is refused. With
 `--lan-releases` (`lanReleases: true` at install) the private ranges (10/8,
 172.16/12, 192.168/16, 100.64/10, fc00::/7) may be, for a release server on the
-LAN; the node's own addresses, loopback and link-local stay refused, and the
-address is still checked and held. Even so, give OSRelease and UpdatePlan to nobody who is not the
-cluster's admin: they still decide when nodes restart.
+LAN; the node's own addresses, the cluster's mesh (its nodes' and pods' addresses
+there), loopback and link-local stay refused, and the address is still checked
+and held. With the flag, whoever may write an OSRelease can have every node ask
+any host on those ranges, at any port and path, and read in the plan's status
+whether it answered. Even so, give OSRelease and UpdatePlan to nobody who is not
+the cluster's admin: they still decide when nodes restart.
 
 **A key hands over to others in a release.** `handover` names the keys that count
 once a node runs that release (the release's own among them, if it is to go on

@@ -532,7 +532,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one whose keys cannot be read says so and takes no release. An OSRelease's image is
   fetched only from an address that is not the node's own or on its networks, checked
   and then held for the connection (no proxy, no redirect); `--lan-releases` lets the
-  networks' private ranges through, never the node itself, loopback or link-local.
+  networks' private ranges through, never the node itself, the cluster's mesh, loopback
+  or link-local. With that flag, whoever may write an OSRelease has each node send one
+  request to any host of those ranges, at any port and path, and sees in the plan's
+  status whether it answered and with what code. Over `http://` someone on the path
+  can spoil the download: nothing unsigned is written to be started, but the slot
+  being written has lost its system by then, so the node has only the one it runs
+  until a download goes through (as when a download breaks off): serve releases
+  over `https://`.
   The image's keys are only where a fresh node starts: once it updates, its keys move
   by a signed handover or `--release-key`, not by a new image. (T-0231.) What a taken admin credential can
   still do with OSRelease and UpdatePlan is restart nodes into releases their keys
@@ -601,7 +608,7 @@ Severity:
 | 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Fixed: each is capped by the Volume's `size` (files, directories and links counted in 4 KiB blocks, a sparse entry at its whole length; the download at twice the size and 1 MiB). Stays: a Volume with no `size` is not capped, and there is no quota on the directory. |
-| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through, never the node itself, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
+| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through (any port and path there), never the node itself, the cluster's mesh, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
 | 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host, or is not good now (run out, or not yet started), is refused and the stored certificate stays in use; an order has ten minutes in all. Not checked: that the URLs a directory gives are on the directory's own host (the operator names the authority, and ACME does not oblige one host). (T-0232.) |
 
 The T- numbers are the maintainer's task numbers, the same ones commits carry.
