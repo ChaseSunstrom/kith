@@ -366,7 +366,7 @@ pub(crate) fn remove_unpacked(beside: &Path) -> usize {
 }
 
 /// The directory at `path` open, not through a link in its place.
-fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_DIRECTORY;
     std::fs::OpenOptions::new()
