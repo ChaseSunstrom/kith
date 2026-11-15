@@ -175,14 +175,27 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **An image no unit uses is removed** (`--image-grace`, a day by default; sooner under
   the state disk's reserve), as root, by kithd alone: taken out of `images/` by one
   rename while no pull holds the store, then deleted following no link; only the layers
-  no other image was made of and the `shared/` files nothing else links go with it. One
-  a unit has a slot for, or a container's bundle names, is kept. A unit that needs it
-  again pulls it through the same path as the first time, so its template's `signedBy`
-  and the Cluster's `spec.images` are checked again: a signature found before does not
-  outlive the image. Left: an image stays on the disk for its grace after its last use,
-  whoever may read the node's disk can read it meanwhile; a cluster Image's archive
-  (Blobs) is not removed with it; and while an image unpacked by a kithd from before
-  this is on the node, no layer is removed (what it was made of is not known).
+  no image is made of any more (in the image store's `blobs/`, never the cluster's
+  Blobs the node's registry serves) and the `shared/` files nothing else links go with
+  it. One a unit has a slot for, or a container's bundle names, is kept; a bundle that
+  cannot be read keeps every image, said once in the log. A unit that needs it again
+  pulls it through the same path as the first time, so its template's `signedBy` and
+  the Cluster's `spec.images` are checked again: a signature found before does not
+  outlive the image. Time is counted from the image's last use, and never from before
+  the store's first look (`images/.pruning`), so an upgrade does not take every old
+  image at once; a wall clock set forward by more than a minute beyond the boot clock
+  (which counts a suspend too) between two looks removes nothing that look and restarts
+  the count; one set back only keeps images longer. Left: an image stays on the disk
+  for its grace after its last use, whoever may read the node's disk can read it
+  meanwhile; a cluster Image's archive (Blobs) is not removed with it; a clock set
+  forward while kithd is down is not seen; one image's tree is one `remove_dir_all`,
+  which kithd's stop waits 2 s for and does not cut (what it leaves is out of `images/`
+  and goes at the next look); while an image unpacked by a kithd from before this is on
+  the node, no layer is removed (what it was made of is not known); and whoever may
+  apply in one namespace can fill the state disk under its reserve, so the node drops
+  other namespaces' images unused for two minutes: they are pulled and checked again
+  when next needed, so it costs availability (a pull, or a start that fails while the
+  registry cannot be reached), not integrity.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A

@@ -199,10 +199,15 @@ struct Controller {
     stop: std::sync::Arc<AtomicBool>,
     /// How long an image no unit uses is kept (`--image-grace`); zero keeps every image.
     image_grace: Duration,
-    /// The removal of unused images on its way, and what it will say.
-    pruning: Option<Job<Vec<String>>>,
+    /// The removal of unused images on its way, and what it will say; an error is the look at
+    /// them failing, which removes nothing.
+    pruning: Option<Job<Result<Vec<String>, String>>>,
     /// When the last one ended.
     pruned: Option<Instant>,
+    /// The boot and wall clocks as the last one began, to tell a clock set forward.
+    clocks: Option<(Duration, SystemTime)>,
+    /// What the last failed look said, said once until it changes.
+    look_failed: Option<String>,
 }
 
 /// Free bytes on the state disk, its reserve, and the pods as counted.
@@ -293,6 +298,8 @@ pub async fn run(
         image_grace,
         pruning: None,
         pruned: None,
+        clocks: None,
+        look_failed: None,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -316,10 +323,17 @@ pub async fn run(
             job?.waiting.map(drop).boxed(),
         ))
     });
-    let left = wait_for_storage(counts.chain(removals).collect(), Duration::from_secs(2)).await;
+    // An image's tree is one `remove_dir_all`, which the stop does not cut.
+    let pruning = controller.pruning.into_iter().map(|job| {
+        (
+            "the removal of unused images".to_string(),
+            job.waiting.map(drop).boxed(),
+        )
+    });
+    let left = wait_for_storage(counts.chain(removals).chain(pruning).collect(), Duration::from_secs(2)).await;
     if !left.is_empty() {
         eprintln!(
-            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone",
+            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone; an image half removed is out of the images already, and goes at the next look at them",
             left.join(", ")
         );
     }
@@ -1682,14 +1696,30 @@ impl Controller {
         if let Some(job) = self.pruning.as_mut() {
             let hung = || "removing the images no unit uses has not ended in 60 s".to_string();
             let Some(said) = job.done(hung) else { return };
-            for line in said.into_iter().flatten() {
-                eprintln!("{line}");
+            match said {
+                Some(Ok(said)) => {
+                    self.look_failed = None;
+                    said.iter().for_each(|line| eprintln!("{line}"));
+                }
+                // Each pass fails alike until it is mended: said once, not each minute.
+                Some(Err(e)) if self.look_failed.as_ref() != Some(&e) => {
+                    eprintln!("{e}");
+                    self.look_failed = Some(e);
+                }
+                _ => {}
             }
             (self.pruning, self.pruned) = (None, Some(Instant::now()));
         }
         if self.pruned.is_some_and(|at| at.elapsed() < prune::EVERY) {
             return;
         }
+        // A wall clock set forward makes every image look unused for that much longer: this
+        // pass removes nothing, and the images are unused from now at the earliest.
+        let boot = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME).map(Duration::from);
+        let stepped = boot.ok().and_then(|boot| {
+            let now = (boot, SystemTime::now());
+            prune::stepped(self.clocks.replace(now), now)
+        });
         let keep = images_in_use(&self.slots);
         let (images, grace, stop, state) = (
             self.runtime.images.clone(),
@@ -1702,20 +1732,39 @@ impl Controller {
         let root = nix::unistd::getuid().is_root();
         let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total, root));
         self.pruning = Job::start("images", &shared.changed, move || {
+            let mut said = Vec::new();
+            // What a removal that stopped or failed left, and the layers no image names.
+            let tidied = images.tidy();
+            if tidied > 0 {
+                said.push(format!(
+                    "kithd: removed what no image uses any more: {tidied} bytes freed"
+                ));
+            }
+            if let Some(ahead) = stepped {
+                return match images.restamp() {
+                    Ok(_) => {
+                        said.push(format!("kithd: the clock moved {ahead} s further than time went: no image removed this pass, and each is kept for its grace from now"));
+                        Ok(said)
+                    }
+                    Err(e) => Err(format!(
+                        "kithd: no image removed: the clock moved {ahead} s further than time went, and marking the images unused from now failed: {e}"
+                    )),
+                };
+            }
             // A second back: an image a pull marks used as this begins stays, however coarse
             // the disk's clock.
             let began = SystemTime::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            let unused = match images.unused(&keep) {
-                Ok(unused) => unused,
-                Err(e) => return vec![format!("kithd: no image removed: {e}")],
-            };
+            let unused = images
+                .unused(&keep)
+                .map_err(|e| format!("kithd: no image removed: {e}"))?;
             // (A disk that cannot be asked is not under its reserve.)
             let low =
                 || nix::sys::statvfs::statvfs(&state).is_ok_and(|d| d.blocks_available() * d.fragment_size() < reserve);
             let remove = |digest: &str, before| images.remove_image(digest, before).map_err(|e| e.to_string());
-            prune::prune(&unused, began, grace, low, remove, &stop)
+            said.extend(prune::prune(&unused, began, grace, low, remove, &stop));
+            Ok(said)
         });
     }
 

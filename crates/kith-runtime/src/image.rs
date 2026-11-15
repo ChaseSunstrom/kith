@@ -7,6 +7,7 @@
 //!     config.json                    written last: its presence means "complete"; it names
 //!                                    the layers, and its time is when the image was last used
 //! <root>/images/.lock                held shared by each pull, and by a removal alone
+//! <root>/images/.pruning             its time: no image is unused from before it
 //! <root>/shared/<hex>-<mode>-<uid>-<gid>-<mtime>
 //!                                    a file equal in all of these in several images: one
 //!                                    inode, which each of them and this name link to
@@ -153,10 +154,11 @@ impl ImageStore {
         fs::create_dir_all(root.join("refs")).ctx(format!("creating {}", root.display()))?;
         // What a crashed pull left half-done. One owner per store (kithd holds the
         // state lock), so nothing here is still being written.
+        // (What a removal cut short left, `.removing-`, is the next look's: `tidy`. It may be
+        // a whole image, and a start does not wait for it.)
         for (dir, marker) in [
             ("blobs/sha256", ".partial-"),
             ("images", ".unpacking-"),
-            ("images", ".removing-"),
             ("refs", ".ref-"),
             (SHARED, ".shared-"),
         ] {
@@ -198,13 +200,19 @@ impl ImageStore {
     }
 
     /// The images unpacked here that nothing uses, oldest first, each with when it was last
-    /// used: pulled, or found in use. In use is the image one of the references `keep`
+    /// used: pulled, or found in use, and never before the first look (`images/.pruning`, made
+    /// by the first call: an image of a kithd from before was never marked used, and is not
+    /// unused since it was unpacked). In use is the image one of the references `keep`
     /// resolved to when last pulled here, and one a container's bundle names (the bundles a
     /// [`crate::Runtime`] keeps under this same root, `containers/<id>/config.json`); those are
     /// marked used now, so an image's time to go counts from when the last unit using it went.
     /// A bundle that cannot be read is an error: nothing is unused that might be in use.
     pub fn unused(&self, keep: &[String]) -> Result<Vec<(String, SystemTime)>> {
         let images = self.root.join("images");
+        let floor = match fs::symlink_metadata(images.join(STAMP)).and_then(|m| m.modified()) {
+            Ok(at) => at,
+            Err(_) => self.restamp().ctx("stamping the first look at the images")?,
+        };
         let mut found = Vec::new();
         for entry in fs::read_dir(&images).ctx("listing the images")? {
             let entry = entry.ctx("listing the images")?;
@@ -217,7 +225,7 @@ impl ImageStore {
             }
             // (No marker: not an image a start would take.)
             if let Ok(used) = fs::symlink_metadata(entry.path().join("config.json")).and_then(|m| m.modified()) {
-                found.push((hex.to_string(), used));
+                found.push((hex.to_string(), used.max(floor)));
             }
         }
         let mut kept: std::collections::BTreeSet<String> = keep
@@ -263,10 +271,11 @@ impl ImageStore {
 
     /// Removes the unpacked image `digest` if it was last used no later than `before`, and no
     /// pull holds the store: taken out of `images/` by one rename, so whatever stops the
-    /// removal, no start finds half of it; then the layers only it named (where every other
-    /// image says what it was made of), its tree, and the shared files nothing links any more.
-    /// The bytes that freed, or `None` when it stays (used since, a pull under way, not here).
-    /// What a removal that stopped leaves (`<hex>.removing-…`) goes as the store is next opened.
+    /// removal, no start finds half of it; then the layers no image names any more (where every
+    /// image says what it was made of), its tree (one `remove_dir_all`, which a stop does not
+    /// cut), and the shared files nothing links any more. The bytes that freed, or `None` when
+    /// it stays (used since, a pull under way, not here). What a removal that stopped or failed
+    /// leaves (`<hex>.removing-…`) goes at the next look, [`tidy`](Self::tidy).
     pub fn remove_image(&self, digest: &str, before: SystemTime) -> Result<Option<u64>> {
         let hex = sha256_hex(digest)?;
         let images = self.root.join("images");
@@ -282,46 +291,91 @@ impl ImageStore {
             Ok(used) if used <= before && fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) => {}
             _ => return Ok(None),
         }
-        let layers = layers_of(&marker);
         let aside = dir.with_extension(scratch_name("removing"));
         fs::rename(&dir, &aside).ctx(format!("removing image {digest}"))?;
-        let mut freed = 0;
-        if let Some(layers) = layers {
-            let (mut named, mut known) = (std::collections::BTreeSet::new(), true);
-            for entry in fs::read_dir(&images).ctx("listing the images")? {
-                let entry = entry.ctx("listing the images")?;
-                let name = entry.file_name();
-                if name
-                    .to_str()
-                    .is_some_and(|hex| sha256_hex(&format!("sha256:{hex}")).is_ok())
-                {
-                    match layers_of(&entry.path().join("config.json")) {
-                        Some(theirs) => named.extend(theirs),
-                        None => known = false,
-                    }
-                }
-            }
-            let blobs = self.root.join("blobs/sha256");
-            for layer in layers.iter().filter(|layer| known && !named.contains(*layer)) {
-                if sha256_hex(&format!("sha256:{layer}")).is_err() {
-                    continue;
-                }
-                let blob = blobs.join(layer);
-                if let Ok(meta) = fs::symlink_metadata(&blob)
-                    && meta.is_file()
-                    && fs::remove_file(&blob).is_ok()
-                {
-                    freed += meta.blocks() * 512;
-                }
-            }
-        }
+        let mut freed = self.unnamed_layers();
         // Out of `images/`: no pull looks at it any more.
         drop(held);
         freed += unlinked(&aside);
+        // (A failure leaves it for the next look, `tidy`.)
         fs::remove_dir_all(&aside).ctx(format!("removing image {digest}"))?;
         // (Left for the next removal if it fails: an entry nothing links is no harm meanwhile.)
         freed += sweep(&self.root.join(SHARED)).map_or(0, |(_, bytes)| bytes);
         Ok(Some(freed))
+    }
+
+    /// What each look at the images does first: removes what a removal cut short left
+    /// (`<hex>.removing-…`, by a stop or a failed delete), and, if no pull holds the store,
+    /// the layers no image names. The bytes that freed; what fails is tried at the next look.
+    pub fn tidy(&self) -> u64 {
+        let images = self.root.join("images");
+        let mut freed = 0;
+        for entry in fs::read_dir(&images).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().contains(".removing-") {
+                let left = unlinked(&entry.path());
+                if remove(&entry.path()).is_ok() {
+                    freed += left;
+                }
+            }
+        }
+        let Ok(held) = self.images_lock() else { return freed };
+        if held.try_lock().is_ok() {
+            freed += self.unnamed_layers();
+        }
+        freed + sweep(&self.root.join(SHARED)).map_or(0, |(_, bytes)| bytes)
+    }
+
+    /// Makes the first look's stamp (`images/.pruning`) now, or moves it to now: no image is
+    /// unused from before it. When it is.
+    pub fn restamp(&self) -> std::io::Result<SystemTime> {
+        let stamp = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(self.root.join("images").join(STAMP))?;
+        let now = SystemTime::now();
+        stamp.set_modified(now)?;
+        Ok(now)
+    }
+
+    /// Removes the layers (`blobs/sha256/<hex>`) no image in `images/` names, the bytes that
+    /// freed: none while an image is here that does not say what it was made of (unpacked by
+    /// a kithd from before, or half made), so nothing goes that one may need. The images lock
+    /// is held alone, so no pull is fetching a layer it has not unpacked yet. (The cluster's
+    /// Images are served from its Blobs, `<state>/blobs`, not from these.)
+    fn unnamed_layers(&self) -> u64 {
+        let mut named = std::collections::BTreeSet::new();
+        let is_hex = |name: &str| sha256_hex(&format!("sha256:{name}")).is_ok();
+        let Ok(listed) = fs::read_dir(self.root.join("images")) else {
+            return 0;
+        };
+        for entry in listed {
+            let Ok(entry) = entry else { return 0 };
+            if entry.file_name().to_str().is_some_and(is_hex) {
+                match layers_of(&entry.path().join("config.json")) {
+                    Some(layers) => named.extend(layers),
+                    None => return 0,
+                }
+            }
+        }
+        let blobs = self.root.join("blobs/sha256");
+        let Ok(listed) = fs::read_dir(&blobs) else { return 0 };
+        let mut freed = 0;
+        for entry in listed.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str().filter(|name| is_hex(name) && !named.contains(*name)) else {
+                continue; // a pull's `.partial-`, or a layer an image names
+            };
+            let blob = blobs.join(name);
+            if let Ok(meta) = fs::symlink_metadata(&blob)
+                && meta.is_file()
+                && fs::remove_file(&blob).is_ok()
+            {
+                freed += meta.blocks() * 512;
+            }
+        }
+        freed
     }
 
     /// Where the store remembers what `reference` resolved to.
@@ -696,6 +750,9 @@ fn unpack_image(
 
 /// The store's index of shared files (see the module's head).
 const SHARED: &str = "shared";
+
+/// In `images/`: made at the first look at the images, its time the earliest any is unused.
+const STAMP: &str = ".pruning";
 
 /// What, beside their bytes, two files must have alike to be one: the whole mode (setuid,
 /// setgid and sticky with it), owner, group, last change to the second's billionth, length.
@@ -2387,12 +2444,13 @@ mod tests {
         let later = SystemTime::now() + Duration::from_secs(60);
         assert!(store.remove_image(&b, later).unwrap().is_some());
         assert!(!blob('1').exists() && entries(&index).is_empty());
-        let left: Vec<_> = fs::read_dir(&images)
+        let mut left: Vec<_> = fs::read_dir(&images)
             .unwrap()
             .flatten()
             .map(|e| e.file_name())
             .collect();
-        assert_eq!(left, [".lock"], "the removal left something in images/");
+        left.sort();
+        assert_eq!(left, [".lock", ".pruning"], "the removal left something in images/");
         assert_eq!(
             store.remove_image(&b, later).unwrap(),
             None,
@@ -2451,13 +2509,14 @@ mod tests {
             "a layer went that an image of unknown layers may name"
         );
         assert!(store.remove_image(&format!("sha256:{old}"), now).unwrap().is_some());
-        assert!(blob('1').exists() && blob('2').exists());
+        // Every image left says its layers: the one none of them names goes with it.
+        assert!(!blob('1').exists() && blob('2').exists() && blob('3').exists());
         assert!(store.remove_image("sha256:../../etc", now).is_err());
         fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A removal that stops halfway has taken the image out of `images/` first: no start takes
-    /// what is left of it, and a kithd starting again removes the rest.
+    /// what is left of it, and the next look (`tidy`) removes the rest, not the store's opening.
     #[test]
     fn image_removal_cut_halfway_leaves_no_half_image() {
         let (dir, _) = sandbox("image-cut");
@@ -2491,11 +2550,84 @@ mod tests {
             fs::set_permissions(left.join("rootfs/stuck"), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let store = ImageStore::new(&store.root).unwrap();
+        assert!(aside.iter().all(|left| left.exists()), "the start was held removing it");
+        store.tidy();
+        assert!(aside.iter().all(|left| !left.exists()), "the next look left it");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A store from before this kithd looked at its images: none of them is unused from before
+    /// the first look (its stamp), whenever it was last used, and a stamp made again (the clock
+    /// moved) is the new floor.
+    #[test]
+    fn image_removal_a_store_from_before_keeps_its_images_for_the_grace_from_the_first_look() {
+        let (dir, _) = sandbox("image-first-look");
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let a = stored(&store, "a:1", 'a', &[('1', &[E::File("f", "file")])]);
+        aged(&store, &a, 30 * 86400);
+        let stamp = store.root.join("images/.pruning");
+        assert!(!stamp.exists());
+        let first = SystemTime::now() - Duration::from_secs(1);
+        let unused = store.unused(&[]).unwrap();
+        assert_eq!(digests(&unused), [a.as_str()]);
+        assert!(unused[0].1 >= first, "unused since it was unpacked, a month ago");
+        let floor = fs::metadata(&stamp).unwrap().modified().unwrap();
+        // The stamp stays put, and the image is taken only past its grace from it.
+        let file = File::options().write(true).open(&stamp).unwrap();
+        file.set_modified(floor - Duration::from_secs(3600)).unwrap();
+        let unused = store.unused(&[]).unwrap();
+        assert_eq!(unused[0].1, floor - Duration::from_secs(3600));
+        store.restamp().unwrap();
         assert!(
-            aside.iter().all(|left| !left.exists()),
-            "a kithd starting again left it"
+            store.unused(&[]).unwrap()[0].1 >= first,
+            "the floor did not move with the clock"
         );
-        drop(store);
+        assert!(since(&store, &a) < first, "a look marked it used");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The layers no image names go at each look (an image from before layers were noted, a
+    /// removal cut between its rename and its layers), but not while an image of unknown layers
+    /// is here, nor under a pull; nor what is not a layer, nor the cluster's own blobs beside
+    /// the store, which the node's registry serves its Images from.
+    #[test]
+    fn image_removal_takes_the_layers_no_image_names() {
+        let (dir, _) = sandbox("image-unnamed");
+        let store = ImageStore::new(dir.join("state/runtime")).unwrap();
+        let a = stored(&store, "a:1", 'a', &[('1', &[E::File("f", "file")])]);
+        let blobs = store.root.join("blobs/sha256");
+        let blob = |c: char| blobs.join(c.to_string().repeat(64));
+        fs::write(blob('9'), "a layer of a removal cut short").unwrap();
+        let partial = blobs.join(format!("{}.partial-1", "8".repeat(64)));
+        fs::write(&partial, "a pull's").unwrap();
+        // `<state>/blobs`: the Blobs the node's registry serves.
+        let cluster = dir.join("state/blobs");
+        fs::create_dir_all(&cluster).unwrap();
+        fs::write(cluster.join("9".repeat(62)), "an Image's layer").unwrap();
+        fs::write(dir.join("state/blobs").join("9".repeat(64)), "named like a layer").unwrap();
+
+        let old = store.root.join("images").join("d".repeat(64));
+        fs::create_dir_all(old.join("rootfs")).unwrap();
+        fs::write(old.join("config.json"), "{}").unwrap();
+        assert_eq!(store.tidy(), 0);
+        assert!(blob('9').exists(), "went while an image of unknown layers is here");
+        fs::remove_dir_all(&old).unwrap();
+
+        let pulling = store.images_lock().unwrap();
+        pulling.lock_shared().unwrap();
+        assert_eq!(store.tidy(), 0);
+        assert!(blob('9').exists(), "went under a pull");
+        drop(pulling);
+
+        assert!(store.tidy() > 0);
+        assert!(!blob('9').exists(), "a layer no image names stayed");
+        assert!(blob('1').exists() && marker(&store, &a).exists());
+        assert!(partial.exists());
+        assert_eq!(
+            fs::read_dir(&cluster).unwrap().count(),
+            2,
+            "the cluster's blobs were touched"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -14,10 +14,10 @@ pub const EVERY: Duration = Duration::from_secs(60);
 pub const LEAST: Duration = Duration::from_secs(2 * EVERY.as_secs());
 
 /// Removes, of the `unused` images (oldest first, each with when it was last used), those
-/// unused for `grace` by `began`, and while `low` says the state disk is under its reserve
-/// the others unused for `LEAST`, oldest first; `remove(digest, before)` removes one unless
-/// it was used after `before`. Gives up as `stop` is set. A grace of 0 removes nothing.
-/// What is said of each, a line for the log.
+/// unused for `grace` (and never less than `LEAST`) by `began`, and while `low` says the state
+/// disk is under its reserve the others unused for `LEAST`, oldest first; `remove(digest,
+/// before)` removes one unless it was used after `before`. Gives up as `stop` is set. A grace
+/// of 0 removes nothing. What is said of each, a line for the log.
 pub fn prune(
     unused: &[(String, SystemTime)],
     began: SystemTime,
@@ -30,7 +30,8 @@ pub fn prune(
     if grace.is_zero() {
         return said;
     }
-    let (cut, least) = (began.checked_sub(grace), began.checked_sub(LEAST));
+    // However short the grace, one used within `LEAST` of the pass stays.
+    let (cut, least) = (began.checked_sub(grace.max(LEAST)), began.checked_sub(LEAST));
     for (digest, since) in unused {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -52,6 +53,17 @@ pub fn prune(
         }
     }
     said
+}
+
+/// How far the wall clock moved beyond the boot clock (which counts suspend too, and is never
+/// stepped) since the last pass, in seconds, when that is more than a minute: a clock set
+/// forward, which would make every image look unused for that much longer. A clock set back
+/// only keeps images longer, so it is not a step here. `None` at the first pass.
+pub fn stepped(last: Option<(Duration, SystemTime)>, now: (Duration, SystemTime)) -> Option<u64> {
+    let (boot, wall) = last?;
+    let moved = now.1.duration_since(wall).ok()?;
+    let ahead = moved.checked_sub(now.0.saturating_sub(boot))?;
+    (ahead > EVERY).then_some(ahead.as_secs())
 }
 
 #[cfg(test)]
@@ -173,5 +185,37 @@ mod tests {
             &AtomicBool::new(true),
         );
         assert!(said.is_empty());
+    }
+
+    #[test]
+    fn image_removal_a_grace_under_two_minutes_still_keeps_one_used_within_them() {
+        let began = SystemTime::now();
+        let unused = [
+            ("sha256:old".to_string(), began - LEAST),
+            ("sha256:new".to_string(), began - EVERY),
+        ];
+        let (removed, _) = run(&unused, began, Duration::from_secs(1), || false);
+        assert_eq!(removed, [("sha256:old".to_string(), began - LEAST)]);
+    }
+
+    #[test]
+    fn image_removal_a_clock_set_forward_is_a_step_and_one_set_back_is_not() {
+        let wall = SystemTime::now();
+        let boot = Duration::from_secs(1000);
+        let last = Some((boot, wall));
+        // A pass a minute on, both clocks agreeing (a few seconds of drift aside).
+        assert_eq!(
+            stepped(last, (boot + EVERY, wall + EVERY + Duration::from_secs(5))),
+            None
+        );
+        // A suspend of a day moves both: not a step.
+        let day = 24 * HOUR;
+        assert_eq!(stepped(last, (boot + day, wall + day)), None);
+        // The wall clock set a day forward between two passes a minute apart.
+        assert_eq!(stepped(last, (boot + EVERY, wall + EVERY + day)), Some(86400));
+        // Set back: images only look used later, so they stay; not a step.
+        assert_eq!(stepped(last, (boot + EVERY, wall - day)), None);
+        // The first pass has nothing to compare with.
+        assert_eq!(stepped(None, (boot, wall)), None);
     }
 }
