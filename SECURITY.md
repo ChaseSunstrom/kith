@@ -142,13 +142,25 @@ Only the newest version is fixed. There are no security releases of older ones.
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
   signed only by keys it was checked against there.
+- **An image under a rule of the cluster's** (a `Cluster`'s `spec.images`: a registry or
+  a path of one, and its keys) is run only if one of the rule's keys signed it, whether
+  or not its template names keys; a template's keys narrow the rule's and never replace
+  them. Each node reads the rule at every start, a worker that runs from a view too (it
+  is sent every `Cluster`). Rights over the whole cluster write one, and so does whoever
+  may write a Source in `kith-system` (its files are applied as the node): they can add
+  a rule with a longer prefix and a key of their own. A node on a build from before
+  rules reads none.
 - **An image is checked when it is pulled, not again when it starts.** Its layers are
   checked against their digests as they arrive and unpacked once; a start uses the files
   on the node's disk as they are. A file that several images hold alike is one file,
   hard-linked into each (and into `shared/`, beside `images/`): a file changed there by
-  root on the node changes in every image that shares it. Nothing kith runs writes there: a container
-  sees its image read-only, or through an overlay that takes its writes. A file with any
-  extended attribute (a file capability, a label) is never shared.
+  root on the node changes in every image that shares it. Nothing kith runs writes
+  there: a container sees its image read-only, or through an overlay that takes its
+  writes. A file with any extended attribute (a file capability, a label) is never
+  shared. A file in `shared/` is taken by its name (the SHA-256 it had when it was
+  first unpacked) and its size, mode, owner and time: its bytes are not read again
+  when a later image is linked to it, so one changed there since is what that image
+  gets too.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
@@ -311,10 +323,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   device (a GPU's render node is a kernel driver's whole interface). There is no AppArmor
   or SELinux profile. Run such a program in a VM (`vms`).
 - **An image is whoever's its registry says**, unless its template names keys
-  (`signedBy`). Nothing makes a template name them: there is no rule for a cluster or a
-  registry yet. A signature is checked against keys only: no certificate, no
-  transparency log, so a signing key that leaks signs until it is taken out of every
-  template.
+  (`signedBy`) or a rule of the cluster's has it (`spec.images`). A rule for a prefix
+  holds that name only: whoever may apply a workload can name an image under no rule
+  (another registry, or the same one by a name kithd does not know to be it: a
+  registry's usual port and Docker Hub's own names are read as one, an address or an
+  alias in DNS is not), so only a rule with no prefix makes every pulled image a signed
+  one. A cluster Image is under no rule and signed by no one: whoever may apply an
+  Image and write a Volume in a namespace runs what they packed. Containers already
+  running when a rule is applied are not stopped. A signature is checked against keys
+  only: no certificate, no transparency log, so a signing key that leaks signs until
+  it is taken out of every rule and template.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of
@@ -444,10 +462,26 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     off a worker: `trust: control` on
     the Secret or in the template's placement does), and a claim whose selector
     names no node and came to one node's Devices then matches two nodes' and is
-    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it,
-    and name a Device as a node whose name starts with the worker's and a `-` would
-    name one of its own, which then is not listed. Nothing bounds how much or how
-    often it writes within its list: its reports can fill the store's log. For the round (3 seconds) in which another node still has the file
+    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it.
+    A discovered Device's or Seat's name is the node's with the longest name that
+    starts it (`w-b-gpu-card0` is node `w-b`'s, not node `w`'s): a worker is refused
+    another node's; a node that finds a name of its own held says so in its log and
+    does not list that Device; and one made before the node with the longer name
+    joined is taken away at a control node's next look (half a minute), so that node
+    gets its name. A join is refused under a name that would take a discovered
+    Device or Seat from a node that has it (`w-gpu` while `w` lists `w-gpu-card0`):
+    whoever holds a join token chooses the new node's name, and would otherwise
+    choose whose card a claim by that name comes to. Where no such Device is listed
+    yet, a node named as another's name and a class (`w` and `w-gpu`) does take that
+    class's names, and the other's cards are then not listed: whoever names nodes
+    decides that. The same follows where a node lists a Device in the moment
+    between a join's check and the new Node being written. Any worker can make
+    Devices under names that start with its own, with no hardware behind them, and
+    so have a join under such a name refused until that Device is deleted or
+    another name is chosen. A control node's own writes
+    are not held to this (it can lead: the cluster is taken with it). Nothing bounds
+    how much or how often a worker writes within its list: its reports can fill the
+    store's log. For the round (3 seconds) in which another node still has the file
     of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
     a moment ago) is still followed, still has the store, and what it writes as the
@@ -539,7 +573,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one whose keys cannot be read says so and takes no release. An OSRelease's image is
   fetched only from an address that is not the node's own or on its networks, checked
   and then held for the connection (no proxy, no redirect); `--lan-releases` lets the
-  networks' private ranges through, never the node itself, loopback or link-local.
+  networks' private ranges through, never the node itself, the cluster's mesh, loopback
+  or link-local. With that flag, whoever may write an OSRelease has each node send one
+  request to any host of those ranges, at any port and path, and sees in the plan's
+  status whether it answered and with what code. Over `http://` someone on the path
+  can spoil the download: nothing unsigned is written to be started, but the slot
+  being written has lost its system by then, so the node has only the one it runs
+  until a download goes through (as when a download breaks off): serve releases
+  over `https://`.
   The image's keys are only where a fresh node starts: once it updates, its keys move
   by a signed handover or `--release-key`, not by a new image. (T-0231.) What a taken admin credential can
   still do with OSRelease and UpdatePlan is restart nodes into releases their keys
@@ -608,7 +649,7 @@ Severity:
 | 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Fixed: each is capped by the Volume's `size` (files, directories and links counted in 4 KiB blocks, a sparse entry at its whole length; the download at twice the size and 1 MiB). Stays: a Volume with no `size` is not capped, and there is no quota on the directory. |
-| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through, never the node itself, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
+| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through (any port and path there), never the node itself, the cluster's mesh, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
 | 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host, or is not good now (run out, or not yet started), is refused and the stored certificate stays in use; an order has ten minutes in all. Not checked: that the URLs a directory gives are on the directory's own host (the operator names the authority, and ACME does not oblige one host). (T-0232.) |
 
 The T- numbers are the maintainer's task numbers, the same ones commits carry.

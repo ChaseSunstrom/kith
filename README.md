@@ -332,8 +332,40 @@ spec:
   or Ed25519: the text of the `.pub` file, or the base64 in it. An image already on the
   node counts as signed only by the keys a signature of it was found by; `pullPolicy:
   never` with a key the node has not checked it against does not start. With no
-  `signedBy`, an image is run whoever made it. Whatever its `pullPolicy`, a cluster
-  Image of this node's own registry is asked for again before it starts (see above).
+  `signedBy` and no rule of the cluster's (next), an image is run whoever made it.
+  Whatever its `pullPolicy`, a cluster Image of this node's own registry is asked for
+  again before it starts (see above).
+- **Keys named once, for the cluster.** A `Cluster`'s `spec.images` says which keys
+  sign the images under a registry or a path of one, whatever a template says:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Cluster
+  metadata: { name: home }
+  spec:
+    images:
+      - prefix: ghcr.io/acme        # ghcr.io/acme/tool, not ghcr.io/acmex
+        signedBy: [MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=]
+      - signedBy:                   # no prefix: every other image a node pulls
+          - MCowBQYDK2VwAyEAPN3lqZV4Lw1d2sZ0c3gW5vQy8Tn6uJ7kR9xB1mD4hFA=
+  ```
+
+  An image is held to the rule with the longest prefix it is under, read as a pull
+  reads it (`nginx` is `docker.io/library/nginx`, so Docker Hub's official images are
+  under `docker.io/library`; `ghcr.io:443` is `ghcr.io`), and is run only if one of
+  that rule's keys signed it. A template's own `signedBy` can then only narrow: the image
+  must be signed by a key both name, and where they name none in common it is not
+  run. An image under no rule runs as before, so a rule for a prefix holds that name
+  and not what a workload's writer may choose to run instead: for that, give a rule
+  with no prefix. Only someone with rights over the whole cluster can apply a
+  `Cluster` (a Role that names namespaces gives none), or who may write a Source in
+  `kith-system`, whose files are applied cluster-wide. Every node must run a build
+  that reads rules: an older one runs an image as before. Up to 32 rules, 16 keys each;
+  a rule by mistake stops new containers under it from starting (the refusal names
+  the rule), and taking it out of the `Cluster` is the way back. Not under any rule:
+  a cluster Image (packed from a Volume on a node, signed by no one). Not read: cosign's
+  keyless signatures (certificates), a transparency log, and signatures kept as OCI
+  referrers; `spec.images` is all kithd reads of a `Cluster` today.
 - **What it still reaches.** The node's network (and so every port on its loopback, and
   the sockets programs of the node listen on by name alone, without a file), the
   kernel through every call the filter lets by, and the devices it claims: a GPU's render
@@ -1755,6 +1787,10 @@ within 30 seconds). `kith get device` lists them.
   is rewritten if you edit it and deleted when the hardware goes. A `Device` or `Seat`
   you wrote yourself is never changed or deleted. A machine without `/sys/class`
   (some containers) has no devices, and kithd says so once.
+- A name belongs to the node with the longest name that starts it, so do not name a
+  node as another node's name and a class (`alpha` and `alpha-gpu`): `alpha`'s GPUs
+  would then go unlisted, and kithd on `alpha` says so in its log. A join under a
+  name that would take a Device already listed is refused: pick another `--name`.
 
 ### Claiming hardware
 
@@ -2832,9 +2868,12 @@ none, 443 for `https://`). One on the node itself or on its own networks
 (loopback, private, shared, link-local, multicast) is refused. With
 `--lan-releases` (`lanReleases: true` at install) the private ranges (10/8,
 172.16/12, 192.168/16, 100.64/10, fc00::/7) may be, for a release server on the
-LAN; the node's own addresses, loopback and link-local stay refused, and the
-address is still checked and held. Even so, give OSRelease and UpdatePlan to nobody who is not the
-cluster's admin: they still decide when nodes restart.
+LAN; the node's own addresses, the cluster's mesh (its nodes' and pods' addresses
+there), loopback and link-local stay refused, and the address is still checked
+and held. With the flag, whoever may write an OSRelease can have every node ask
+any host on those ranges, at any port and path, and read in the plan's status
+whether it answered. Even so, give OSRelease and UpdatePlan to nobody who is not
+the cluster's admin: they still decide when nodes restart.
 
 **A key hands over to others in a release.** `handover` names the keys that count
 once a node runs that release (the release's own among them, if it is to go on

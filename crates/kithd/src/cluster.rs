@@ -962,6 +962,20 @@ async fn join(
         );
         return Err(refuse(StatusCode::CONFLICT, why));
     }
+    // A discovered Device's name is the node's with the longest name that starts it: a name
+    // that would take one from the node that has it is not the joiner's to choose.
+    let takes = {
+        let store = shared.store.lock().expect("a handler panicked holding the store");
+        crate::devices::taken_by(&store.store, &request.name)
+    };
+    if let Some((key, of)) = takes {
+        let why = format!(
+            "the name `{}` would take {key} from node `{of}` (a discovered Device's name is the node's with the \
+             longest name that starts it): pick another --name",
+            request.name
+        );
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
     // A Raft id comes from a name too: a name whose id a Node or a member already has would be
     // taken for that voter by a link that knows its voter by the id.
     if let Some(why) = taken_raft_id(&shared, &request.name) {
@@ -1320,6 +1334,50 @@ pub(crate) mod pinned_peer {
             other.map_err(|(status, Json(said))| format!("{status}: {said}")),
             Ok(())
         );
+    }
+
+    /// A name that would take a discovered Device from the node that has it is refused at the
+    /// join, the token is not spent, and the Device stays that node's.
+    #[tokio::test]
+    async fn join_refuses_a_longest_name_that_takes_a_nodes_device() {
+        let ca = pki::Ca::create().unwrap();
+        let a = node(&ca, "a");
+        let cluster = Cluster::new(a, Some(ca)).unwrap();
+        let token = cluster.tokens.mint(&cluster.me.ca, pki::Lets::Worker).unwrap();
+        let shared = shared_of("join-name", cluster, &[at("w", "127.0.0.1:1", None)]).await;
+        let device: kith_api::Resource = serde_json::from_value(serde_json::json!({
+            "apiVersion": "kith.dev/v1", "kind": "Device",
+            "metadata": { "name": "w-gpu-card0", "labels": { "kith.dev/discovered": "true", "kith.dev/node": "w" } },
+            "spec": { "node": "w", "class": "gpu", "path": "/dev/dri/card0" },
+        }))
+        .unwrap();
+        shared.store.lock().unwrap().store.apply(device).unwrap();
+        let peer = Peer {
+            addr: "127.0.0.1:2".parse().unwrap(),
+            subject: None,
+        };
+        let request = JoinRequest {
+            token: token.clone(),
+            name: "w-gpu".into(),
+            port: 7000,
+            mesh: None,
+            view: true,
+        };
+        let refused = join(State(shared.clone()), ConnectInfo(peer), Json(request)).await;
+        let (status, Json(said)) = refused.err().expect("a name that takes a Device is refused");
+        let said = said["error"].as_str().unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{said}");
+        assert!(
+            said.contains("would take Device/w-gpu-card0 from node `w`") && said.contains("pick another --name"),
+            "{said}"
+        );
+        let cluster = shared.cluster.as_ref().unwrap();
+        assert!(
+            cluster.tokens.good(&token, false).is_some(),
+            "the refusal spent the token"
+        );
+        let store = shared.store.lock().unwrap();
+        assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
     }
 
     fn sources(dir: &std::path::Path, into: &mut Vec<(String, String)>) {

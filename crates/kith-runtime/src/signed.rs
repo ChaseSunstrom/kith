@@ -136,7 +136,7 @@ pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], ke
         }
     }
     err(format!(
-        "image `{reference}` ({}) is not signed by a key its template names: {}",
+        "image `{reference}` ({}) is not signed by a key its template or the Cluster's rule for it names: {}",
         digests.last().copied().unwrap_or_default(),
         found.join("; ")
     ))
@@ -369,7 +369,7 @@ mod tests {
         let said = refused(store.pull_signed(&name("plain"), PullPolicy::IfNotPresent, &keys).await);
         assert!(
             said.contains(&format!(
-                "image `{}` ({plain}) is not signed by a key its template names",
+                "image `{}` ({plain}) is not signed by a key its template or the Cluster's rule for it names",
                 name("plain")
             )),
             "{said}"

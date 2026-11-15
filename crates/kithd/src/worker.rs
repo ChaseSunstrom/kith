@@ -372,8 +372,9 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
             };
             // The labels discovery writes and no other, a claim's selector reads them: with
             // one of its own choosing, this node's Device would be one more that a claim made
-            // for another node's comes to. And a name that starts as its own do (cut where
-            // the node's name is long), not one another node's discovery would give.
+            // for another node's comes to. And a name that is its own (`devices::whose`): one
+            // that starts as its own do, and as no other node's with a longer name does (`w`
+            // does not make `w-b-gpu-card0`: node `w-b` would then leave its own out).
             let class = resource.spec["class"].as_str();
             let plain = resource
                 .metadata
@@ -384,12 +385,17 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
                     "class" => Some(value.as_str()) == class,
                     other => crate::devices::LABELS.contains(&other),
                 });
-            let stem = node.get(..57).unwrap_or(node).trim_end_matches(['-', '.']);
-            let name = &resource.metadata.name;
-            let named = name.starts_with(&format!("{node}-")) || (node.len() >= 57 && name.starts_with(stem));
-            match own(resource) && live.is_none_or(own) && plain && named {
-                true => Ok(()),
-                false => Err(refused(&key, "it is not one this node's hardware made")),
+            if !(own(resource) && live.is_none_or(own) && plain) {
+                return Err(refused(&key, "it is not one this node's hardware made"));
+            }
+            match crate::devices::whose(store, &resource.metadata.name) {
+                theirs if theirs.contains(&node) => Ok(()),
+                theirs if theirs.is_empty() => Err(refused(&key, "it is not one this node's hardware made")),
+                theirs => {
+                    let theirs = theirs.join(", ");
+                    let why = format!("its name is node {theirs}'s (the longest name that starts it), not {node}'s");
+                    Err(refused(&key, why))
+                }
             }
         }
         "Blob" => {
@@ -906,6 +912,57 @@ spec: { volume: there, every: 1d }
             )
             .is_ok()
         );
+    }
+
+    /// A discovered name is the node's with the longest name that starts it: `w` cannot make
+    /// `w-b`'s Device or Seat before `w-b` does (it would then skip its own).
+    #[test]
+    fn longest_name_has_a_discovered_name_and_a_shorter_one_is_refused() {
+        let mut store = store();
+        let node = |name: &str| -> Resource {
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": name }, "spec": { "trust": "worker" },
+            }))
+            .unwrap()
+        };
+        let made = |kind: &str, name: &str, by: &str| -> Command {
+            let spec = match kind {
+                "Seat" => json!({ "node": by, "devices": [] }),
+                _ => json!({ "node": by, "class": "gpu", "path": "/dev/dri/card0" }),
+            };
+            let resource = json!({
+                "apiVersion": "kith.dev/v1", "kind": kind,
+                "metadata": { "name": name, "labels": { DISCOVERED: "true", "kith.dev/node": by } },
+                "spec": spec,
+            });
+            Command::Apply {
+                resources: vec![serde_json::from_value(resource).unwrap()],
+                at: 0,
+            }
+        };
+        let (long_a, long_b) = (format!("{}aaa", "n".repeat(57)), format!("{}bbb", "n".repeat(57)));
+        for name in ["w-b", "w-b-x", "w-b-x-y", &long_a, &long_b] {
+            store.apply(node(name)).unwrap();
+        }
+        // Its own, as before.
+        assert!(try_as(&store, "w", made("Device", "w-gpu-card0", "w")).is_ok());
+        assert!(try_as(&store, "w-b", made("Device", "w-b-gpu-card0", "w-b")).is_ok());
+        // Another node's, though it starts as this node's do: refused, naming both.
+        for (kind, name) in [("Device", "w-b-gpu-card0"), ("Seat", "w-b-seat0")] {
+            let why = try_as(&store, "w", made(kind, name, "w")).unwrap_err();
+            assert!(why.contains("w-b") && why.contains("longest name"), "{why}");
+        }
+        assert!(try_as(&store, "w-b-x", made("Device", "w-b-x-y-gpu-card0", "w-b-x")).is_err());
+        assert!(try_as(&store, "w-b-x-y", made("Device", "w-b-x-y-gpu-card0", "w-b-x-y")).is_ok());
+        assert!(try_as(&store, "w-b", made("Seat", "w-b-x-seat0", "w-b")).is_err());
+        // Two long names cut to one stem: the name is both's (the first to make it keeps it).
+        let seat = format!("{}-seat0", "n".repeat(57));
+        assert!(try_as(&store, &long_a, made("Seat", &seat, &long_a)).is_ok());
+        assert!(try_as(&store, &long_b, made("Seat", &seat, &long_b)).is_ok());
+        // (Not where the whole of one's name starts it.)
+        let cut = format!("{long_a}-gp");
+        assert!(try_as(&store, &long_a, made("Device", &cut, &long_a)).is_ok());
+        assert!(try_as(&store, &long_b, made("Device", &cut, &long_b)).is_err());
     }
 
     #[test]

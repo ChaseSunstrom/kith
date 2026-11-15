@@ -279,7 +279,7 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         made(
             "Seat",
             // (Cut like the Devices' names: a node's name may be 63 long by itself.)
-            format!("{}-seat0", node.get(..57).unwrap_or(node).trim_end_matches(['-', '.'])),
+            format!("{}-seat0", stem(node)),
             labels,
             json!({ "node": node, "devices": seated }),
         )
@@ -287,37 +287,138 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
     devices.into_values().chain(seat).collect()
 }
 
-/// Is `resource` one this node's discovery made?
-fn ours(resource: &Resource, node: &str) -> bool {
+/// What a long node name is cut to where its discovered names start (57 of a name's 63).
+fn stem(node: &str) -> &str {
+    node.get(..57).unwrap_or(node).trim_end_matches(['-', '.'])
+}
+
+/// Whose a discovered name is: of the cluster's Nodes whose name and a dash start `name` (or,
+/// for a node name of 57 or more, whose cut stem does), those that account for the most of it.
+/// So `w-b-gpu-card0` is node `w-b`'s and not node `w`'s, and two long names with one stem both
+/// have what starts with it. None where no Node's name starts it.
+pub(crate) fn whose<'a>(store: &'a Store, name: &str) -> Vec<&'a str> {
+    whose_of(&nodes(store), name)
+}
+
+/// The names of the cluster's Nodes.
+fn nodes(store: &Store) -> Vec<&str> {
+    let nodes = store.list(Some("Node"));
+    nodes.map(|node| node.metadata.name.as_str()).collect()
+}
+
+/// How much of the discovered name `name` node `node`'s name accounts for; 0 where it does not
+/// start it. (A node name of 62 or 63 leaves no room: its Devices' names are its own name.)
+fn starts(name: &str, node: &str) -> usize {
+    match name.strip_prefix(node) {
+        Some(rest) if rest.starts_with('-') || (rest.is_empty() && node.len() >= 62) => node.len() + 1,
+        _ if node.len() >= 57 && name.starts_with(stem(node)) => stem(node).len(),
+        _ => 0,
+    }
+}
+
+/// [`whose`], of the Nodes named `nodes`.
+fn whose_of<'a>(nodes: &[&'a str], name: &str) -> Vec<&'a str> {
+    let most = nodes.iter().map(|node| starts(name, node)).max().unwrap_or(0);
+    let has = |node: &&'a str| (most > 0 && starts(name, node) == most).then_some(*node);
+    nodes.iter().filter_map(has).collect()
+}
+
+/// What a node that joined as `joining` would take from a node that has it: a discovered Device
+/// or Seat whose name would then be the new node's alone ([`whose`]), and the node it is of.
+/// A join under such a name is refused: whoever holds a join token chooses the node's name, and
+/// would choose whose hardware a claim by that name comes to.
+pub(crate) fn taken_by(store: &Store, joining: &str) -> Option<(String, String)> {
+    let nodes = nodes(store);
+    let live = store.list(Some("Device")).chain(store.list(Some("Seat")));
+    // (Of a node that is there: what a node that is gone left is taken away by itself.)
+    let of = |live: &Resource| live.spec["node"].as_str().unwrap_or_default().to_string();
+    live.filter(|live| discovered(live) && of(live) != joining && nodes.contains(&of(live).as_str()))
+        .find(|live| {
+            let name = &live.metadata.name;
+            let most = nodes.iter().map(|node| starts(name, node)).max().unwrap_or(0);
+            starts(name, joining) > most
+        })
+        .map(|live| (live.key(), live.spec["node"].as_str().unwrap_or_default().to_string()))
+}
+
+/// Is `resource` one a node's discovery made?
+fn discovered(resource: &Resource) -> bool {
     resource
         .metadata
         .labels
         .get(DISCOVERED)
         .is_some_and(|made| made == "true")
-        && resource.spec["node"] == node
 }
 
+/// Is `resource` one this node's discovery made?
+fn ours(resource: &Resource, node: &str) -> bool {
+    discovered(resource) && resource.spec["node"] == node
+}
+
+/// A name of this node's it does not list, and the node that has it.
+type Held = (String, String);
+
 /// What to do to the store to make this node's discovered `Device`s and `Seat` what was `found`:
-/// what to apply (new or changed), and the keys to delete (gone).
-fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec<String>) {
-    let apply = found.iter().filter(|new| match store.get(&new.key()) {
-        None => true,
-        // (One someone wrote under the same name is theirs.)
-        Some(live) => ours(live, node) && (live.metadata.labels != new.metadata.labels || live.spec != new.spec),
-    });
+/// what to apply (new or changed), the keys to delete (gone), and what of its own it does not
+/// list because another node has the name: the name is that node's ([`whose`]), or that node's
+/// discovery made one under it.
+fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec<String>, Vec<Held>) {
+    let (mut apply, mut held) = (Vec::new(), Vec::new());
+    let nodes = nodes(store);
+    for new in found {
+        let theirs = whose_of(&nodes, &new.metadata.name);
+        if !theirs.is_empty() && !theirs.contains(&node) {
+            held.push((new.key(), theirs.join(", ")));
+            continue;
+        }
+        match store.get(&new.key()) {
+            None => apply.push(new.clone()),
+            Some(live) if ours(live, node) => {
+                if live.metadata.labels != new.metadata.labels || live.spec != new.spec {
+                    apply.push(new.clone());
+                }
+            }
+            Some(live) if discovered(live) => {
+                held.push((new.key(), live.spec["node"].as_str().unwrap_or_default().to_string()));
+            }
+            // (One someone wrote under the same name is theirs.)
+            Some(_) => {}
+        }
+    }
     let live = store.list(Some("Device")).chain(store.list(Some("Seat")));
-    // Gone from this machine, or of a node the cluster has no more (nobody else would; a
-    // worker leaves those to a control node: another node's Device is not its to delete).
+    // Gone from this machine. And, by a control node (a worker leaves those to one: another
+    // node's Device is not its to delete): of a node the cluster has no more, or under a name
+    // that is another node's (made before that node joined), so that node gets its name.
     let worker = crate::access::is_worker(store, node);
     let left = |live: &Resource| {
         let of = live.spec["node"].as_str().unwrap_or_default();
-        live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true")
-            && of != node
-            && !worker
-            && store.get(&format!("Node/{of}")).is_none()
+        let misnamed = || {
+            let theirs = whose_of(&nodes, &live.metadata.name);
+            !theirs.is_empty() && !theirs.contains(&of)
+        };
+        let no_more = of != node && !nodes.contains(&of);
+        discovered(live) && !worker && (no_more || misnamed())
     };
     let gone = live.filter(|live| ours(live, node) && !found.iter().any(|new| new.key() == live.key()) || left(live));
-    (apply.cloned().collect(), gone.map(Resource::key).collect())
+    let gone: Vec<String> = gone.map(Resource::key).collect();
+    // (What this pass takes away holds nothing: the name is listed at the next.)
+    held.retain(|(key, _)| !gone.contains(key));
+    (apply, gone, held)
+}
+
+/// What to say of the names held: each once, and again only when what is held changes.
+fn held_lines(said: &mut Vec<Held>, held: Vec<Held>) -> Vec<String> {
+    if *said == held {
+        return Vec::new();
+    }
+    *said = held;
+    let line = |(key, node): &Held| {
+        format!(
+            "kithd: devices: this node's {key} is not listed: node {node} has that name (give one of the \
+             two nodes another name; or, if {node} should not have it, delete that {key})"
+        )
+    };
+    said.iter().map(line).collect()
 }
 
 /// Keep the store's `Device`s and `Seat` of this node as `/sys` says, until stopped.
@@ -331,6 +432,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
     // The first look soon after start, the rest every half minute.
     let mut wait = Duration::from_secs(5);
+    let mut said = Vec::new();
     loop {
         tokio::select! {
             () = tokio::time::sleep(wait) => {}
@@ -338,11 +440,14 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         }
         wait = EVERY;
         let found = scan(sys, me);
-        let (resources, gone) = {
+        let (resources, gone, held) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             changes(&state.store, me, &found)
         };
         drop(found);
+        for line in held_lines(&mut said, held) {
+            eprintln!("{line}");
+        }
         if !resources.is_empty() {
             let at = kith_api::store::now();
             if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
@@ -355,6 +460,9 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 eprintln!("kithd: devices: taking {key} away: {e}");
                 break;
             }
+            // (So that one that went can be traced: the hardware is gone, its node is, or the
+            // name is another node's.)
+            eprintln!("kithd: devices: {key} is no longer listed");
         }
     }
 }
@@ -664,7 +772,7 @@ mod tests {
             store.apply(resource.clone()).unwrap();
         }
         // Nothing changed: nothing to do.
-        assert_eq!(changes(&store, "n1", &found), (vec![], vec![]));
+        assert_eq!(changes(&store, "n1", &found), (vec![], vec![], vec![]));
         // Another node's discovered one, one written by hand (with a name discovery would use, too).
         // (While the cluster has no Node n2 it is taken away; with one, it is n2's to keep.)
         let theirs = scan(&root, "n2");
@@ -674,13 +782,13 @@ mod tests {
         let mut as_worker = store.clone();
         let worker = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n1 }\nspec: { trust: worker }";
         as_worker.apply(written(worker)).unwrap();
-        assert_eq!(changes(&as_worker, "n1", &found), (vec![], vec![]));
+        assert_eq!(changes(&as_worker, "n1", &found), (vec![], vec![], vec![]));
         store
             .apply(written(
                 "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n2 }\nspec: {}",
             ))
             .unwrap();
-        assert_eq!(changes(&store, "n1", &found), (vec![], vec![]));
+        assert_eq!(changes(&store, "n1", &found), (vec![], vec![], vec![]));
         let hand = "apiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: HAND }\nspec: { node: n1, class: gpu }";
         store.apply(written(&hand.replace("HAND", "n1-gpu-card7"))).unwrap();
         store.apply(written(&hand.replace("HAND", "n1-camera-video0"))).unwrap();
@@ -697,19 +805,153 @@ mod tests {
         now.retain(|r| r.metadata.name != "n1-camera-video0" && r.metadata.name != "n1-usb-1-2");
         let gpu = now.iter_mut().find(|r| r.metadata.name == "n1-gpu-card0").unwrap();
         gpu.metadata.labels.insert("driver".into(), "radeon".into());
-        let (apply, delete) = changes(&store, "n1", &now);
+        let (apply, delete, _) = changes(&store, "n1", &now);
         let applied: Vec<&str> = apply.iter().map(|r| r.metadata.name.as_str()).collect();
         // (The hand-written n1-camera-video0 is not ours: not deleted, and not found either.)
         assert_eq!(applied, ["n1-gpu-card0"]);
         assert_eq!(delete, ["Device/n1-usb-1-2"]);
         // A hand-written one under a name discovery would make is not overwritten.
-        let (apply, _) = changes(&store, "n1", &found);
+        let (apply, _, _) = changes(&store, "n1", &found);
         assert!(apply.iter().all(|r| r.metadata.name != "n1-camera-video0"));
         // A machine without hardware loses all its own, and only its own.
-        let (_, delete) = changes(&store, "n1", &[]);
+        let (_, delete, _) = changes(&store, "n1", &[]);
         assert_eq!(delete.len(), found.len() - 1, "all but the camera someone wrote over");
         assert!(!delete.contains(&"Device/n1-gpu-card7".to_string()));
         assert!(!delete.contains(&"Seat/n1-seat1".to_string()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn node(name: &str, trust: &str) -> Resource {
+        let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: NAME }\nspec: { trust: TRUST }";
+        written(&node.replace("NAME", name).replace("TRUST", trust))
+    }
+
+    #[test]
+    fn longest_name_has_a_discovered_name() {
+        let mut store = Store::default();
+        let (long_a, long_b) = (format!("{}aaa", "n".repeat(57)), format!("{}bbb", "n".repeat(57)));
+        for name in ["w", "w-b", "w-b-x", &long_a, &long_b] {
+            store.apply(node(name, "worker")).unwrap();
+        }
+        assert_eq!(whose(&store, "w-gpu-card0"), ["w"]);
+        assert_eq!(whose(&store, "w-b-gpu-card0"), ["w-b"]);
+        assert_eq!(whose(&store, "w-b-seat0"), ["w-b"]);
+        assert_eq!(whose(&store, "w-b-x-seat0"), ["w-b-x"]);
+        assert_eq!(whose(&store, &format!("{}-seat0", "n".repeat(57))), [&long_a, &long_b]);
+        assert_eq!(whose(&store, &format!("{long_a}-gp")), [&long_a]);
+        // (Not a name that only begins like a node's: `wb-…` is not `w`'s.)
+        assert!(whose(&store, "wb-gpu-card0").is_empty() && whose(&store, "x-gpu-card0").is_empty());
+        // A node name of 63 is its Devices' name whole: its own, not a shorter node's that starts it.
+        let short = "z".repeat(58);
+        let full = format!("{short}-abcd");
+        for name in [&short, &full] {
+            store.apply(node(name, "worker")).unwrap();
+        }
+        assert_eq!(whose(&store, &full), [&full]);
+        assert_eq!(whose(&store, &format!("{short}-gpu")), [&short]);
+    }
+
+    /// A node is not let in under a name that would take a discovered Device's name from the
+    /// node that has it; its own from before (it joins again) and a tie are no hindrance.
+    #[test]
+    fn longest_name_is_not_taken_by_a_node_that_joins() {
+        let root = tree("join");
+        laptop(&root);
+        let mut store = Store::default();
+        store.apply(node("w", "worker")).unwrap();
+        let found = scan(&root, "w");
+        for resource in &found {
+            store.apply(resource.clone()).unwrap();
+        }
+        let gpu = found.iter().find(|r| r.metadata.name.starts_with("w-gpu-")).unwrap();
+        assert_eq!(taken_by(&store, "w-gpu"), Some((gpu.key(), "w".to_string())));
+        assert_eq!(taken_by(&store, "w-b"), None);
+        assert_eq!(taken_by(&store, "x"), None);
+        // A long name's Devices (named by its cut stem) are not taken by a name that is the stem
+        // and more, which ties; the stem itself as a name would take them.
+        let long = format!("{}-abcd", "z".repeat(58));
+        store.apply(node(&long, "worker")).unwrap();
+        for resource in scan(&root, &long) {
+            store.apply(resource).unwrap();
+        }
+        assert_eq!(taken_by(&store, &format!("{}-abce", "z".repeat(58))), None);
+        assert!(taken_by(&store, &"z".repeat(57)).is_some_and(|(_, of)| of == long));
+        // (Its own, left from before it was deleted: it joins again.)
+        store.delete("Node/w").unwrap();
+        assert_eq!(taken_by(&store, "w"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name of this node's that another node's discovery made a Device under is not listed, and
+    /// said once: again only when what is held changes. One a person wrote is theirs, silently.
+    #[test]
+    fn held_name_is_said_once_and_a_persons_is_not() {
+        let root = tree("held");
+        laptop(&root);
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        store.apply(node("n1", "worker")).unwrap();
+        store.apply(node("n", "worker")).unwrap();
+        let mut theirs = found[0].clone();
+        theirs.spec["node"] = "n".into();
+        theirs.metadata.labels.insert("kith.dev/node".into(), "n".into());
+        store.apply(theirs.clone()).unwrap();
+        let hand = "apiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: HAND }\nspec: { node: n, class: gpu }";
+        store
+            .apply(written(&hand.replace("HAND", &found[1].metadata.name)))
+            .unwrap();
+        let (apply, gone, held) = changes(&store, "n1", &found);
+        assert_eq!(held, [(found[0].key(), "n".to_string())]);
+        assert_eq!(apply.len(), found.len() - 2, "neither is written over");
+        assert!(gone.is_empty(), "a worker takes nothing of another node's away");
+        let mut said = Vec::new();
+        let lines = held_lines(&mut said, held.clone());
+        assert!(
+            lines.len() == 1 && lines[0].contains(&found[0].key()) && lines[0].contains("node n "),
+            "{lines:?}"
+        );
+        assert!(held_lines(&mut said, held).is_empty(), "said once");
+        assert_eq!(
+            held_lines(&mut said, Vec::new()),
+            Vec::<String>::new(),
+            "and nothing when it is free again"
+        );
+        // A name that is another node's (this node is named as that one and a class): not listed.
+        store.apply(node("n1-gpu", "worker")).unwrap();
+        let (apply, _, held) = changes(&store, "n1", &found);
+        let gpu = found.iter().find(|r| r.metadata.name.starts_with("n1-gpu-")).unwrap();
+        assert!(held.contains(&(gpu.key(), "n1-gpu".to_string())), "{held:?}");
+        assert!(apply.iter().all(|r| r.key() != gpu.key()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A discovered Device under a name that is another node's, made before that node joined, is
+    /// taken away by a control node's pass (not by a worker's), so that node gets its name.
+    #[test]
+    fn taken_back_is_a_name_made_before_its_node_joined() {
+        let root = tree("back");
+        laptop(&root);
+        let mut store = Store::default();
+        store.apply(node("c", "control")).unwrap();
+        store.apply(node("w", "worker")).unwrap();
+        // `w` made what `w-b`'s discovery would, while there was no `w-b`.
+        let mut early = scan(&root, "w-b").remove(0);
+        early.spec["node"] = "w".into();
+        early.metadata.labels.insert("kith.dev/node".into(), "w".into());
+        store.apply(early.clone()).unwrap();
+        assert!(
+            changes(&store, "c", &[]).1.is_empty(),
+            "w's, while no node has a longer name"
+        );
+        store.apply(node("w-b", "worker")).unwrap();
+        assert_eq!(changes(&store, "c", &[]).1, [early.key()]);
+        assert!(changes(&store, "w-b", &[]).1.is_empty(), "not by a worker");
+        // Once it is gone, the node that joined lists its own under the name.
+        let mut after = store.clone();
+        after.delete(&early.key()).unwrap();
+        let found = scan(&root, "w-b");
+        let (apply, _, held) = changes(&after, "w-b", &found);
+        assert!(apply.iter().any(|r| r.key() == early.key()) && held.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

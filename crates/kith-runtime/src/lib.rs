@@ -19,7 +19,7 @@ pub mod signed;
 pub use container::{
     Awaited, Handle, Mount, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans, spawn_awaited, tune,
 };
-pub use image::{Image, ImageStore, Local, PullPolicy};
+pub use image::{Image, ImageStore, Local, PullPolicy, registry, repository};
 pub use seccomp::REFUSED;
 
 #[derive(Debug)]

@@ -356,6 +356,40 @@ spec:
     assert_eq!(count(""), 0, "no container outlives kithd");
 }
 
+/// Under a Cluster's rule (`spec.images`) an image that no key of the rule signed is not
+/// run, though its template names no key; with the rule gone it runs.
+#[test]
+fn image_rules_refuse_an_image_no_rule_key_signed() {
+    if !e2e() {
+        return;
+    }
+    let image = std::env::var("KITH_E2E_IMAGE").unwrap_or("mirror.gcr.io/library/busybox:1.36".into());
+    let daemon = Daemon::start("imagerules");
+    // (A key's shape, and no one's key: nothing is signed by it.)
+    let key = format!("MCowBQYDK2VwAyEA{}=", "A".repeat(43));
+    let cluster = |images: &str| {
+        format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  images: {images}\n")
+    };
+    daemon.apply(&cluster(&format!("[{{ signedBy: [{key}] }}]")));
+    let workload = format!(
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: plain }}\nspec:\n  template:\n    containers:\n      \
+         - {{ name: main, image: '{image}', command: [sleep, '300'], resources: {{ memory: 32Mi, cpu: 250m }} }}\n"
+    );
+    daemon.apply(&workload);
+    let container = || daemon.status("Workload/plain")["containers"][0].clone();
+    wait_for("the unsigned image to be refused", || container()["state"] == "failed");
+    let message = container()["message"].as_str().unwrap_or_default().to_string();
+    assert!(
+        message.contains("is not signed by a key its template or the Cluster's rule for it names"),
+        "{message}"
+    );
+    // The rule gone: the same Workload runs.
+    daemon.apply(&cluster("[]"));
+    wait_for("the image to run with no rule", || {
+        daemon.status("Workload/plain")["ready"] == 1
+    });
+}
+
 /// README.md's first run, as it is written: every `kithd` and `kith` line of its steps
 /// is run, in a directory with nothing in it and as whoever runs the tests, and what a
 /// step says you should see is looked for in what came out (`…` stands for anything).

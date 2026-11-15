@@ -82,9 +82,10 @@ fn host(url: &str) -> &str {
 /// Is this an address of this node or of the networks around it (loopback, private,
 /// link-local, shared, unspecified, broadcast, multicast), in whatever form it is
 /// written? With `lan`, the private and shared ranges (10/8, 172.16/12, 192.168/16,
-/// 100.64/10, fc00::/7) are not: a server on the LAN may be asked; the rest still are.
+/// 100.64/10, fc00::/7) are not: a server on the LAN may be asked; the rest still are, and
+/// so is a private address carried inside a 6to4 or NAT64 one (that goes off the LAN).
 fn inward(ip: std::net::IpAddr, lan: bool) -> bool {
-    let v4 = |ip: std::net::Ipv4Addr| {
+    let v4 = |ip: std::net::Ipv4Addr, lan: bool| {
         let shared = ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64;
         let private = (ip.is_private() || shared) && !lan;
         ip.is_loopback()
@@ -95,7 +96,7 @@ fn inward(ip: std::net::IpAddr, lan: bool) -> bool {
             || ip.is_multicast()
     };
     match ip {
-        std::net::IpAddr::V4(ip) => v4(ip),
+        std::net::IpAddr::V4(ip) => v4(ip, lan),
         std::net::IpAddr::V6(ip) => {
             let first = ip.segments()[0];
             // (Unique-local, link-local, the old site-local, multicast; and the forms that
@@ -103,11 +104,12 @@ fn inward(ip: std::net::IpAddr, lan: bool) -> bool {
             let unique = (first & 0xfe00) == 0xfc00 && !lan;
             let local = unique || (first & 0xffc0) == 0xfe80 || (first & 0xffc0) == 0xfec0 || ip.is_multicast();
             let [a, b, c, d] = [ip.octets()[2], ip.octets()[3], ip.octets()[4], ip.octets()[5]];
-            let sixtofour = first == 0x2002 && v4(std::net::Ipv4Addr::new(a, b, c, d));
+            let sixtofour = first == 0x2002 && v4(std::net::Ipv4Addr::new(a, b, c, d), false);
             let [a, b, c, d] = [ip.octets()[12], ip.octets()[13], ip.octets()[14], ip.octets()[15]];
-            let nat64 = ip.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && v4(std::net::Ipv4Addr::new(a, b, c, d));
+            let nat64 =
+                ip.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0] && v4(std::net::Ipv4Addr::new(a, b, c, d), false);
             let ours = ip.is_loopback() || local || sixtofour || nat64;
-            ours || ip.to_ipv4_mapped().or(ip.to_ipv4()).is_some_and(v4)
+            ours || ip.to_ipv4_mapped().or(ip.to_ipv4()).is_some_and(|ip| v4(ip, lan))
         }
     }
 }
@@ -966,6 +968,9 @@ mod tests {
             "ff02::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            // (A private address inside a 6to4 or NAT64 one is reached through a relay.)
+            "2002:0a01:0203::1",
+            "64:ff9b::10.1.2.3",
         ] {
             assert!(inward(ip.parse().unwrap(), true), "{ip}");
         }

@@ -444,3 +444,20 @@ fn the_keys_commands_changed_are_kept_for_a_reader_that_is_behind() {
     assert_eq!((state.index(), state.touched(5990)), (5999, None));
     assert_eq!(state.touched(5999).map(|keys| keys.len()), Some(0));
 }
+
+/// kith says each of Raft's settings itself (openraft's `Default` runs a command line parser):
+/// what it does not choose is still what openraft would have.
+#[test]
+fn settings_are_openrafts_but_for_ours() {
+    let ours = crate::settings();
+    let theirs = openraft::Config {
+        cluster_name: ours.cluster_name.clone(),
+        heartbeat_interval: ours.heartbeat_interval,
+        election_timeout_min: ours.election_timeout_min,
+        election_timeout_max: ours.election_timeout_max,
+        snapshot_policy: ours.snapshot_policy.clone(),
+        max_in_snapshot_log_to_keep: ours.max_in_snapshot_log_to_keep,
+        ..Default::default()
+    };
+    assert_eq!(format!("{ours:?}"), format!("{theirs:?}"));
+}

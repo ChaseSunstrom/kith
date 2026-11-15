@@ -693,13 +693,30 @@ fn client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Cli
         .map_err(|e| e.to_string())
 }
 
+/// The cluster's own /48 on the mesh (`crate::mesh::prefix`), once [`node`] knows it: the
+/// nodes' and the pods' addresses, which `--lan-releases` does not open.
+static MESH: std::sync::OnceLock<std::net::Ipv6Addr> = std::sync::OnceLock::new();
+
+/// Is one of `addresses` in the cluster's /48 `mesh`?
+fn on_the_mesh(mesh: Option<&std::net::Ipv6Addr>, addresses: &[std::net::SocketAddr]) -> bool {
+    let within = |mesh: &std::net::Ipv6Addr, ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(ip) => ip.octets()[..6] == mesh.octets()[..6],
+        std::net::IpAddr::V4(_) => false,
+    };
+    mesh.is_some_and(|mesh| addresses.iter().any(|at| within(mesh, at.ip())))
+}
+
 /// The host of a release's image and the addresses it may be fetched from: outside this
-/// node and its networks, or with `lan` (`--lan-releases`) in their private ranges too.
+/// node and its networks, or with `lan` (`--lan-releases`) in their private ranges too,
+/// but for the cluster's own mesh.
 async fn pinned(url: &reqwest::Url, lan: bool) -> Result<(String, Vec<std::net::SocketAddr>), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("the release's image, {url}: it is fetched over http or https"));
     }
     match crate::sources::vetted(&url.origin().ascii_serialization(), lan).await {
+        Ok((_, _, addresses)) if on_the_mesh(MESH.get(), &addresses) => Err(format!(
+            "the release's image, {url}: an update is not fetched from the cluster's own mesh"
+        )),
         Ok((host, _, addresses)) => Ok((host, addresses)),
         Err(crate::sources::Refused::Inward(_)) if lan => Err(format!(
             "the release's image, {url}: an update is not fetched from this node, nor from its \
@@ -832,6 +849,9 @@ pub async fn node(
         image: Some(PathBuf::from("/etc/kith/release-keys")),
         ..Keys::new(keys, &state)
     };
+    if let Some(cluster) = &shared.cluster {
+        let _ = MESH.set(crate::mesh::prefix(&cluster.me.ca));
+    }
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let version = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -1090,6 +1110,21 @@ mod tests {
         // No system file (off kith OS): the first release's key, as before.
         let first = Keys::new(Vec::new(), &dir.join("elsewhere"));
         assert_eq!(first.first_kept("aa11"), "aa11\n");
+    }
+
+    /// The cluster's own /48 (its nodes and pods on the mesh) is not fetched from, though
+    /// `--lan-releases` lets the unique-local range through.
+    #[test]
+    fn os_image_vetted_refuses_the_clusters_mesh() {
+        let mesh = kith_mesh::prefix(b"a cluster");
+        let pod = kith_mesh::node_net(mesh, "n2");
+        let at = |ip: &str| vec![std::net::SocketAddr::new(ip.parse().unwrap(), 7443)];
+        assert!(on_the_mesh(Some(&mesh), &at(&pod.to_string())));
+        let both = [at("192.168.1.9"), at(&pod.to_string())].concat();
+        assert!(on_the_mesh(Some(&mesh), &both), "one address there refuses the host");
+        // Another unique-local network, the LAN's, and a node with no cluster.
+        assert!(!on_the_mesh(Some(&mesh), &at("fd00::1")) && !on_the_mesh(Some(&mesh), &at("192.168.1.9")));
+        assert!(!on_the_mesh(None, &at(&pod.to_string())));
     }
 
     #[tokio::test]
