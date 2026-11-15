@@ -3687,11 +3687,15 @@ kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it h
 3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
 was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
 builds: a breakpoint on every function, taken off the first time it is hit, so each one
-that runs is seen once and in order (x86_64 Linux). A name is matched whatever a
-`cargo update` or a new compiler makes of the letters Rust writes before each crate's
-name, so the file outlives most of those; code written since is not in it, and
-`python3 ci/order.py --check`, which CI runs, fails once under four fifths of its
-names are still in kithd, or are not together where its code starts. A toolchain with
+that runs is seen once and in order (x86_64 Linux). The file holds each name as a
+pattern, without what an ordinary change gives another value: the letters Rust writes
+before each crate's name (a `cargo update` or a new compiler changes them), the number
+of an `impl` in its module (one more for every `impl` written above it) and the number
+the compiler ends a copy of a function with. So the file outlives most changes; code
+written since is not in it, and each function kithd runs at start that is left where
+the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
+--check`, which CI runs, fails once under 95 in 100 of its names are still in kithd,
+or under four fifths of those are together where its code starts. A toolchain with
 no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
 again (the check then fails, saying there is no lld).
 
