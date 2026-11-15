@@ -11,19 +11,23 @@
 //!
 //! `resourceVersion`: of a list, the store's generation; of an object, its kith revision
 //! and what its status hashes to. A watch starts from a list's version or is told `410`
-//! (the client lists again): the store keeps no log of what changed between two generations.
-//
-// ponytail: one field manager. A server-side apply replaces what was sent before, whoever
-// sent it; managedFields, and a conflict between two managers, would be a table of who
-// set which field.
-// ponytail: a watch keeps the name and version of every object it has told of, and looks
-// at them all on each change of the store. A log of changes per kind would make that one read.
+//! (the client lists again): a generation is a time, not a place in what the store kept of changes.
+//!
+//! `metadata.managedFields`: who set which field, kept in the object as it was sent, for
+//! server-side apply (a second manager's different value is a 409 unless forced). Only
+//! `Apply` writes make a manager; a replace or a patch takes a field from whoever had it.
+//!
+//! A watch reads what changed: the store keeps the keys each command changed (kith-store's
+//! `touched`), so on a change the watch reads those and no other. It reads everything again
+//! when it cannot know what changed: a worker that runs from a view (kept apart from Raft's
+//! log), a change of who may see what (an Identity, a Role or its binding), more changes
+//! than are kept, a store that was replaced, and the Namespaces (made up from every resource).
 
 use crate::Shared;
 use crate::access::{self, Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -193,16 +197,38 @@ const DEFAULTS: &[(&str, &str, &str)] = &[
 ];
 
 /// The lists a strategic merge patch merges item by item, and the field that names an
-/// item (Kubernetes's types say which; `ports` is by `containerPort` in a container and by
-/// `port` in a Service). Any other list is replaced whole.
+/// item: every field Kubernetes's types tag `patchMergeKey`, by its JSON name, in the
+/// order `python3 ci/kube_proto.py --merge-keys` gives (a test says when they differ).
+/// `ports` is by `containerPort` in a container and by `port` in a Service: [`merge_key`]
+/// takes the one an item has. Any other list is replaced whole.
 const MERGED: &[(&str, &str)] = &[
+    ("addresses", "type"),
+    ("allocatedResourcesStatus", "name"),
+    ("conditions", "type"),
     ("containers", "name"),
-    ("initContainers", "name"),
     ("env", "name"),
-    ("volumes", "name"),
-    ("volumeMounts", "mountPath"),
-    ("imagePullSecrets", "name"),
+    ("ephemeralContainers", "name"),
+    ("evictionResponders", "name"),
+    ("healthConditions", "status"),
     ("hostAliases", "ip"),
+    ("hostIPs", "ip"),
+    ("imagePullSecrets", "name"),
+    ("initContainers", "name"),
+    ("mapping", "name"),
+    ("nodeAllocatableResourceClaimStatuses", "resourceClaimName"),
+    ("overhead", "name"),
+    ("ownerReferences", "uid"),
+    ("podIPs", "ip"),
+    ("ports", "containerPort"),
+    ("ports", "port"),
+    ("resourceClaimStatuses", "name"),
+    ("resourceClaims", "name"),
+    ("schedulingGates", "name"),
+    ("secrets", "name"),
+    ("topologySpreadConstraints", "topologyKey"),
+    ("volumeDevices", "devicePath"),
+    ("volumeMounts", "mountPath"),
+    ("volumes", "name"),
 ];
 
 pub fn router() -> Router<Arc<Shared>> {
@@ -218,7 +244,7 @@ pub fn router() -> Router<Arc<Shared>> {
         .route("/api/v1", get(|| async { resources("") }))
         .route(
             "/apis/{group}/v1",
-            get(|Path(group): Path<String>| async move { resources(&group) }),
+            get(|Route(group): Route<String>| async move { resources(&group) }),
         )
         .route("/openapi/v3", get(openapi))
         // (What kubectl checks a kind against that the server does not check for it: of a
@@ -316,7 +342,7 @@ async fn openapi() -> Json<Value> {
 /// What kubectl and helm ask before they send an object: whether the server checks the
 /// fields itself (`fieldValidation`). It does (what is not carried over is said, or refused),
 /// so they need no schema of every kind to check them against: none is served.
-async fn checked(Path(of): Path<String>) -> Response {
+async fn checked(Route(of): Route<String>) -> Response {
     let group = match of.split('/').collect::<Vec<_>>()[..] {
         ["api", "v1"] => "",
         ["apis", group, "v1"] => group,
@@ -337,6 +363,7 @@ async fn checked(Path(of): Path<String>) -> Response {
 }
 
 /// A refusal, as Kubernetes says one: kubectl prints `why`, and reads `reason`.
+#[derive(Debug)]
 struct No {
     code: StatusCode,
     reason: &'static str,
@@ -419,6 +446,15 @@ fn version(resource: &Resource) -> u64 {
 fn made_at(resource: &Resource) -> u64 {
     let made = resource.metadata.annotations.get(MADE);
     made.and_then(|made| made.parse().ok()).unwrap_or(0)
+}
+
+/// The time (as [`rfc3339`] writes it) of the oldest revision the store kept of `resource`:
+/// when a thing that no client made here (a namespace, a node) was first seen. That is not
+/// always when it was made: a worker that runs from a view has only the revisions the view
+/// carried, and a history that was trimmed starts later.
+fn oldest(store: &Store, resource: &Resource) -> String {
+    let first = store.history(&resource.key()).ok().and_then(|history| history.first());
+    rfc3339(first.map_or(0, |first| first.at))
 }
 
 /// Sets what is at `path` (`/a/b`) of `at`, making the mappings on the way; nothing where
@@ -870,15 +906,41 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
     replicas.into_iter().map(pod).collect()
 }
 
+/// What a read of the store looks at, and what it did.
+#[derive(Default)]
+struct Look<'a> {
+    /// Only the resources of these keys (none: every one).
+    only: Option<&'a BTreeSet<&'a str>>,
+    /// How many resources were made into objects.
+    translated: usize,
+}
+
+/// The resources that are `holder`s: of those the store has, or of those `only` names that it has.
+fn held<'a>(
+    store: &'a Store,
+    holder: &'a str,
+    only: Option<&'a BTreeSet<&'a str>>,
+) -> Box<dyn Iterator<Item = &'a Resource> + 'a> {
+    match only {
+        None => Box::new(store.list(Some(holder))),
+        Some(keys) => Box::new(
+            keys.iter()
+                .filter_map(|key| store.get(key))
+                .filter(move |r| r.kind == holder),
+        ),
+    }
+}
+
 /// The objects of a kind that is not held, made up from what the store says: `caller` sees
-/// those of the resources it may see.
+/// those of the resources it may see. Each comes with the key of the resource it is made of.
 fn made(
     store: &Store,
     kind: &Kind,
     namespace: Option<&str>,
     name: Option<&str>,
     may: &dyn Fn(&&Resource) -> bool,
-) -> Vec<Value> {
+    look: &mut Look,
+) -> Vec<(String, Value)> {
     let within = |resource: &&Resource| namespace.is_none_or(|ns| resource.metadata.namespace.as_deref() == Some(ns));
     let mut found = Vec::new();
     let owners: &[&str] = match kind.kind {
@@ -888,7 +950,7 @@ fn made(
     };
     for resource in owners
         .iter()
-        .flat_map(|owner| store.list(Some(*owner)))
+        .flat_map(|owner| held(store, owner, look.only))
         .filter(within)
         .filter(may)
     {
@@ -896,33 +958,39 @@ fn made(
         if name.is_some_and(|name| !name.starts_with(&resource.metadata.name)) {
             continue;
         }
+        look.translated += 1;
+        let of = resource.key();
         if kind.kind == "Node" {
             let said = |field: &str| resource.status.as_ref().and_then(|status| status[field].as_str());
             let address = said("address").and_then(|address| address.rsplit_once(':'));
             let address = address.map(|(host, _)| host.trim_matches(['[', ']']));
-            found.push(json!({
-                "apiVersion": "v1", "kind": "Node",
-                "metadata": {
-                    "name": resource.metadata.name, "labels": resource.metadata.labels,
-                    "uid": uid(&resource.key()), "resourceVersion": version(resource).to_string(),
-                },
-                "spec": {},
-                "status": {
-                    "conditions": [condition("Ready", said("state") != Some("unreachable"), "KithdReady")],
-                    "addresses": [{ "type": "InternalIP", "address": address }],
-                    "nodeInfo": { "kubeletVersion": concat!("kith-", env!("CARGO_PKG_VERSION")) },
-                },
-            }));
+            found.push((
+                of,
+                json!({
+                    "apiVersion": "v1", "kind": "Node",
+                    "metadata": {
+                        "name": resource.metadata.name, "labels": resource.metadata.labels,
+                        "uid": uid(&resource.key()), "resourceVersion": version(resource).to_string(),
+                        "creationTimestamp": oldest(store, resource),
+                    },
+                    "spec": {},
+                    "status": {
+                        "conditions": [condition("Ready", said("state") != Some("unreachable"), "KithdReady")],
+                        "addresses": [{ "type": "InternalIP", "address": address }],
+                        "nodeInfo": { "kubeletVersion": concat!("kith-", env!("CARGO_PKG_VERSION")) },
+                    },
+                }),
+            ));
             continue;
         }
         let Some((_, owner)) = served(resource) else { continue };
         match kind.kind {
-            "Pod" => found.extend(pods(&owner, resource)),
-            _ if owner["kind"] == "Deployment" => found.push(replica_set(&owner, resource)),
+            "Pod" => found.extend(pods(&owner, resource).into_iter().map(|pod| (of.clone(), pod))),
+            _ if owner["kind"] == "Deployment" => found.push((of, replica_set(&owner, resource))),
             _ => {}
         }
     }
-    found.retain(|object| name.is_none_or(|name| object["metadata"]["name"] == name));
+    found.retain(|(_, object)| name.is_none_or(|name| object["metadata"]["name"] == name));
     found
 }
 
@@ -935,10 +1003,25 @@ fn objects(
     grants: &Grants,
     verb: &Verb,
 ) -> Vec<Value> {
+    let found = read(store, kind, namespace, name, grants, verb, &mut Look::default());
+    found.into_iter().map(|(_, object)| object).collect()
+}
+
+/// [`objects`], each with the key of the resource it is made of, and as `look` says: of the
+/// resources it names only (not for a namespace, which is made of all of them).
+fn read(
+    store: &Store,
+    kind: &'static Kind,
+    namespace: Option<&str>,
+    name: Option<&str>,
+    grants: &Grants,
+    verb: &Verb,
+    look: &mut Look,
+) -> Vec<(String, Value)> {
     let may = |resource: &&Resource| grants.may(verb, &resource.kind, resource.metadata.namespace.as_deref());
     let of_kind = |(of, object): (&'static Kind, Value)| std::ptr::eq(of, kind).then_some(object);
     match (kind.held, name) {
-        (Held::Made, _) => made(store, kind, namespace, name, &may),
+        (Held::Made, _) => made(store, kind, namespace, name, &may, look),
         // A namespace is there when it is said to be, and when anything is in it.
         (Held::As("Namespace"), _) => {
             if !grants.may(verb, "Namespace", None) {
@@ -951,8 +1034,15 @@ fn objects(
             names.insert(kith_api::DEFAULT_NAMESPACE);
             names.extend(store.list(Some("Namespace")).map(|r| r.metadata.name.as_str()));
             let object = |name: &str| {
-                let said = store.get(&format!("Namespace/{name}")).and_then(served);
-                said.map(|(_, object)| object).unwrap_or_else(|| {
+                let said = store.get(&format!("Namespace/{name}")).and_then(|r| {
+                    let (_, mut object) = served(r)?;
+                    // (One made through these paths has been given the time it was made.)
+                    if object.pointer("/metadata/creationTimestamp").is_none() {
+                        set(&mut object, "/metadata/creationTimestamp", oldest(store, r).into());
+                    }
+                    Some(object)
+                });
+                said.unwrap_or_else(|| {
                     json!({
                         "apiVersion": "v1", "kind": "Namespace",
                         "metadata": { "name": name, "uid": uid(name), "resourceVersion": "1" },
@@ -961,18 +1051,33 @@ fn objects(
                 })
             };
             let asked = names.into_iter().filter(|found| name.is_none_or(|name| name == *found));
-            asked.map(object).collect()
+            let found: Vec<_> = asked.map(|name| (format!("Namespace/{name}"), object(name))).collect();
+            look.translated += found.len();
+            found
         }
         (_, Some(name)) => {
             let found = store.get(&key(kind, namespace, name)).filter(may);
-            found.and_then(served).and_then(of_kind).into_iter().collect()
+            look.translated += usize::from(found.is_some());
+            let found = found.and_then(|r| Some((r.key(), served(r)?)));
+            found
+                .and_then(|(at, served)| Some((at, of_kind(served)?)))
+                .into_iter()
+                .collect()
         }
         (_, None) => {
             let within = |r: &&Resource| namespace.is_none_or(|ns| r.metadata.namespace.as_deref() == Some(ns));
             // (Of what is kept, only this kind's are read.)
             let this = |r: &&Resource| r.kind != "KubeObject" || r.spec["object"]["kind"] == kind.kind;
-            let held = store.list(Some(holder(kind))).filter(within).filter(may).filter(this);
-            held.filter_map(served).filter_map(of_kind).collect()
+            let kept = held(store, holder(kind), look.only)
+                .filter(within)
+                .filter(may)
+                .filter(this);
+            let found: Vec<_> = kept
+                .filter_map(|r| Some((r.key(), served(r)?)))
+                .filter_map(|(at, served)| Some((at, of_kind(served)?)))
+                .collect();
+            look.translated += found.len();
+            found
         }
     }
 }
@@ -1177,11 +1282,9 @@ fn table(kind: &Kind, objects: &[Value], at: u64) -> Value {
 
 /// The field that names an item of the list `list`, where a strategic patch merges it.
 fn merge_key(list: &str, item: &Value) -> Option<&'static str> {
-    match list {
-        "ports" if item.get("containerPort").is_some() => Some("containerPort"),
-        "ports" => Some("port"),
-        list => MERGED.iter().find(|(of, _)| *of == list).map(|(_, by)| *by),
-    }
+    // (Of a list that two keys name, the item's own; an item with neither is by the last.)
+    let keys: Vec<&str> = MERGED.iter().filter(|(of, _)| *of == list).map(|(_, by)| *by).collect();
+    keys.iter().find(|by| item.get(**by).is_some()).or(keys.last()).copied()
 }
 
 /// `patch` laid over `live`: a JSON merge patch, or with `strategic` Kubernetes's own (the
@@ -1258,6 +1361,323 @@ fn merged(have: &mut Value, items: Vec<Value>, by: &str) {
     }
 }
 
+// ---- Who set which field: server-side apply ----
+
+/// A field's place in an object, a step at a time as Kubernetes's `fieldsV1` spells it:
+/// `f:name` for a field of a mapping, `k:{"name":"web"}` for the item of a list a merge key names.
+type Path = Vec<String>;
+
+/// The most field managers one object has, and the longest a manager's name is (Kubernetes's).
+const MANAGERS: usize = 64;
+const MANAGER_NAME: usize = 128;
+
+/// One entry of `metadata.managedFields`: a manager, and the fields its last apply set.
+struct Manager {
+    name: String,
+    version: String,
+    time: String,
+    fields: BTreeSet<Path>,
+}
+
+/// The merge key that names the items of `list`, if every item has one and no two share it:
+/// a list of any other kind is one field, set whole.
+fn keyed(list: &str, items: &[Value]) -> Option<&'static str> {
+    let by = merge_key(list, items.first()?)?;
+    let mut seen = BTreeSet::new();
+    let unique = items
+        .iter()
+        .all(|item| !item[by].is_null() && seen.insert(item[by].to_string()));
+    unique.then_some(by)
+}
+
+fn item_key(by: &str, item: &Value) -> String {
+    Value::Object([(by.to_string(), item[by].clone())].into_iter().collect()).to_string()
+}
+
+/// The fields `value` sets, each by its path: a field with a value of its own (a scalar, an
+/// empty mapping, a list no key names) is one, and a mapping or a keyed list is its parts.
+fn leaves(at: &mut Path, list: &str, value: &Value, out: &mut BTreeMap<Path, Value>) {
+    let items = value.as_array().and_then(|items| Some((items, keyed(list, items)?)));
+    if let Some((items, by)) = items {
+        for item in items {
+            at.push(format!("k:{}", item_key(by, item)));
+            leaves(at, "", item, out);
+            at.pop();
+        }
+    } else if let Some(map) = value.as_object().filter(|map| !map.is_empty()) {
+        for (field, value) in map {
+            at.push(format!("f:{field}"));
+            leaves(at, field, value, out);
+            at.pop();
+        }
+    } else if !value.is_null() {
+        out.insert(at.clone(), value.clone());
+    }
+}
+
+/// What nobody manages: who the object is, what it is, and what kithd says of it.
+const UNMANAGED: [&[&str]; 6] = [
+    &["f:apiVersion"],
+    &["f:kind"],
+    &["f:status"],
+    &["f:metadata", "f:name"],
+    &["f:metadata", "f:namespace"],
+    &["f:metadata", "f:managedFields"],
+];
+
+/// Every field of `object` that can be managed, by its path, with its value.
+fn fields_of(object: &Value) -> BTreeMap<Path, Value> {
+    let mut out = BTreeMap::new();
+    leaves(&mut Vec::new(), "", object, &mut out);
+    let under =
+        |at: &Path, skip: &[&str]| at.len() >= skip.len() && at.iter().zip(skip.iter().copied()).all(|(a, b)| a == b);
+    out.retain(|at, _| !UNMANAGED.iter().any(|skip| under(at, skip)));
+    out
+}
+
+/// A set of paths as `fieldsV1` has it: a mapping of mappings, an empty one at each field.
+fn fields_v1(fields: &BTreeSet<Path>) -> Value {
+    let mut root = json!({});
+    for path in fields {
+        let mut at = &mut root;
+        for step in path {
+            let Some(map) = at.as_object_mut() else { break };
+            at = map.entry(step.clone()).or_insert_with(|| json!({}));
+        }
+    }
+    root
+}
+
+fn owned(tree: &Value, at: &mut Path, out: &mut BTreeSet<Path>) {
+    match tree.as_object().filter(|map| !map.is_empty()) {
+        Some(map) => {
+            // (`.` says the mapping itself is managed too: no field of ours is that.)
+            for (step, below) in map.iter().filter(|(step, _)| *step != ".") {
+                at.push(step.clone());
+                owned(below, at, out);
+                at.pop();
+            }
+        }
+        None if !at.is_empty() => drop(out.insert(at.clone())),
+        None => {}
+    }
+}
+
+/// The managers an object names.
+fn managers(object: &Value) -> Vec<Manager> {
+    let entries = object.pointer("/metadata/managedFields").and_then(Value::as_array);
+    let entry = |entry: &Value| {
+        let text = |field: &str| entry[field].as_str().unwrap_or_default().to_string();
+        let mut fields = BTreeSet::new();
+        owned(&entry["fieldsV1"], &mut Vec::new(), &mut fields);
+        let (name, version, time) = (entry["manager"].as_str()?.to_string(), text("apiVersion"), text("time"));
+        Some(Manager {
+            name,
+            version,
+            time,
+            fields,
+        })
+    };
+    entries.into_iter().flatten().filter_map(entry).collect()
+}
+
+/// `object` told to be managed by these (it names none when none manages a field).
+fn managed(object: &mut Value, managers: Vec<Manager>) {
+    let entries: Vec<Value> = managers
+        .into_iter()
+        .filter(|manager| !manager.fields.is_empty())
+        .map(|manager| {
+            json!({
+                "manager": manager.name, "operation": "Apply", "apiVersion": manager.version,
+                "time": manager.time, "fieldsType": "FieldsV1", "fieldsV1": fields_v1(&manager.fields),
+            })
+        })
+        .collect();
+    if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+        match entries.is_empty() {
+            true => drop(meta.remove("managedFields")),
+            false => drop(meta.insert("managedFields".into(), entries.into())),
+        }
+    }
+}
+
+/// A path as Kubernetes says it in a conflict: `.spec.template.spec.containers[name="web"].image`.
+fn shown(path: &Path) -> String {
+    let step = |step: &String| match step.split_once(':') {
+        Some(("f", field)) => format!(".{field}"),
+        Some(("k", key)) => {
+            let key: Value = serde_json::from_str(key).unwrap_or_default();
+            let parts: Vec<String> = key
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(by, is)| format!("{by}={is}"))
+                .collect();
+            format!("[{}]", parts.join(","))
+        }
+        _ => step.clone(),
+    };
+    path.iter().map(step).collect()
+}
+
+/// Kubernetes's words for fields another manager has and the apply would change.
+fn conflicts(found: &[(String, String, Path)]) -> No {
+    let mut by_manager: Vec<(&str, &str, Vec<String>)> = Vec::new();
+    for (name, version, path) in found {
+        match by_manager.iter_mut().find(|(has, ..)| has == name) {
+            Some((.., paths)) => paths.push(shown(path)),
+            None => by_manager.push((name, version, vec![shown(path)])),
+        }
+    }
+    let mut why = match (found.len(), &by_manager[..]) {
+        (1, [(name, version, paths)]) => {
+            format!(
+                "Apply failed with 1 conflict: conflict with \"{name}\" using {version}: {}",
+                paths[0]
+            )
+        }
+        (many, _) => format!("Apply failed with {many} conflicts:"),
+    };
+    if found.len() > 1 {
+        for (name, version, paths) in &by_manager {
+            why.push_str(&format!("\nconflicts with \"{name}\" using {version}:"));
+            for path in paths {
+                why.push_str(&format!("\n- {path}"));
+            }
+        }
+    }
+    status(StatusCode::CONFLICT, "Conflict", why)
+}
+
+/// Takes the field at `path` out of `value`, and what it leaves empty with it; whether `value`
+/// is itself empty then.
+fn unset(value: &mut Value, path: &[String]) -> bool {
+    let Some((step, rest)) = path.split_first() else {
+        return true;
+    };
+    match (value, step.split_once(':')) {
+        (Value::Object(map), Some(("f", field))) => {
+            if let Some(child) = map.get_mut(field)
+                && unset(child, rest)
+            {
+                map.remove(field);
+            }
+            map.is_empty()
+        }
+        (Value::Array(items), Some(("k", key))) => {
+            let key: Value = serde_json::from_str(key).unwrap_or_default();
+            let named = |item: &Value| {
+                key.as_object()
+                    .is_some_and(|key| key.iter().all(|(by, is)| item.get(by) == Some(is)))
+            };
+            if let Some(at) = items.iter().position(named)
+                && unset(&mut items[at], rest)
+            {
+                items.remove(at);
+            }
+            items.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `at` is the key of an item that other managers still have fields of: the item
+/// is theirs, and without its key they could not find it.
+fn shielded(at: &Path, others: &[&Manager]) -> bool {
+    let [parent @ .., last] = at.as_slice() else {
+        return false;
+    };
+    let key = parent.last().and_then(|step| step.strip_prefix("k:"));
+    let key: Value = key.and_then(|key| serde_json::from_str(key).ok()).unwrap_or_default();
+    let is_key = last.strip_prefix("f:").is_some_and(|field| key.get(field).is_some());
+    is_key
+        && others
+            .iter()
+            .any(|other| other.fields.iter().any(|theirs| theirs.starts_with(parent)))
+}
+
+/// What `live` (none: not there) comes to when `who` applies `config` to it: the fields `who`
+/// sets, over what is there; the fields `who` set before and leaves out of it taken out, where
+/// no other manager has them. Another manager's field `who` would change is a conflict, but
+/// with `force`, when it is `who`'s.
+fn apply(live: Option<Value>, config: Value, who: &str, version: &str, force: bool) -> Result<Value, No> {
+    let mut live = live.unwrap_or_else(|| json!({}));
+    let mut all = managers(&live);
+    if let Some(meta) = live.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.remove("managedFields");
+    }
+    let (held, sets) = (fields_of(&live), fields_of(&config));
+    let mut found = Vec::new();
+    for (at, value) in &sets {
+        for other in all.iter().filter(|other| other.name != who) {
+            if other.fields.contains(at) && held.get(at) != Some(value) {
+                found.push((other.name.clone(), other.version.clone(), at.clone()));
+            }
+        }
+    }
+    if !found.is_empty() && !force {
+        return Err(conflicts(&found));
+    }
+    for (name, _, at) in &found {
+        for other in all.iter_mut().filter(|other| other.name == *name) {
+            other.fields.remove(at);
+        }
+    }
+    let before = all.iter().position(|manager| manager.name == who);
+    let mine = before.map(|at| all[at].fields.clone()).unwrap_or_default();
+    let others: Vec<&Manager> = all.iter().filter(|other| other.name != who).collect();
+    let mut gone: Vec<&Path> = mine
+        .iter()
+        .filter(|at| !sets.contains_key(*at) && !others.iter().any(|other| other.fields.contains(*at)))
+        .filter(|at| !shielded(at, &others))
+        .collect();
+    gone.sort_by_key(|at| std::cmp::Reverse(at.len()));
+    let mut object = live.clone();
+    patched(&mut object, config, true);
+    for at in gone {
+        unset(&mut object, at);
+    }
+    let fields: BTreeSet<Path> = sets.into_keys().collect();
+    // (Kubernetes dates a manager by its last change: a repeat of an apply is not one.)
+    let time = match before {
+        Some(at) if object == live && fields == mine => all[at].time.clone(),
+        _ => rfc3339(now()),
+    };
+    let (name, version) = (who.to_string(), version.to_string());
+    let me = Manager {
+        name,
+        version,
+        time,
+        fields,
+    };
+    match before {
+        Some(at) => all[at] = me,
+        None => all.push(me),
+    }
+    all.retain(|manager| !manager.fields.is_empty());
+    if all.len() > MANAGERS {
+        return Err(invalid(format!(
+            "metadata.managedFields: more than {MANAGERS} managers have fields of this object"
+        )));
+    }
+    managed(&mut object, all);
+    Ok(object)
+}
+
+/// `after`, an object changed by something other than an apply, told what is managed: a field
+/// it changed is no apply manager's any more, and the others are as they were.
+fn updated(live: &Value, after: &mut Value) {
+    let mut all = managers(live);
+    if all.is_empty() {
+        return;
+    }
+    let (before, now) = (fields_of(live), fields_of(after));
+    for manager in &mut all {
+        manager.fields.retain(|at| before.get(at) == now.get(at));
+    }
+    managed(after, all);
+}
+
 type Asked = HashMap<String, String>;
 
 /// One request: who asks, and what its query says.
@@ -1286,7 +1706,7 @@ enum How {
 async fn core(
     State(shared): State<Arc<Shared>>,
     parts: Parts,
-    Path(rest): Path<String>,
+    Route(rest): Route<String>,
     Query(asked): Query<Asked>,
     body: Bytes,
 ) -> Response {
@@ -1297,7 +1717,7 @@ async fn core(
 async fn grouped(
     State(shared): State<Arc<Shared>>,
     parts: Parts,
-    Path((group, rest)): Path<(String, String)>,
+    Route((group, rest)): Route<(String, String)>,
     Query(asked): Query<Asked>,
     body: Bytes,
 ) -> Response {
@@ -1753,6 +2173,37 @@ async fn write(
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
+    // An apply says who applies, as Kubernetes asks; and one to what is there is answered with
+    // all of it (merged, and a conflict names whose field it is): for who may read it. Whether
+    // it is there is told to who may write (a create says), so asking after that is no leak.
+    let manager = call.asked.get("fieldManager").map(String::as_str).unwrap_or_default();
+    let mut there = false;
+    if how == How::Apply {
+        if manager.is_empty() {
+            let why =
+                "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: is required for apply patch";
+            return Err(invalid(why.into()));
+        }
+        if manager.len() > MANAGER_NAME {
+            return Err(invalid(format!(
+                "fieldManager: must be no more than {MANAGER_NAME} characters"
+            )));
+        }
+    }
+    // (A replace is answered with the managers' fields too: it needs `get` of what is there.)
+    if matches!(how, How::Apply | How::Replace) {
+        there = call
+            .shared
+            .store
+            .lock()
+            .expect("a handler panicked holding the store")
+            .store
+            .get(&primary)
+            .is_some();
+        if there {
+            call.allowed(kind, namespace, Verb::Get)?;
+        }
+    }
     let exists = || {
         status(
             StatusCode::CONFLICT,
@@ -1764,6 +2215,11 @@ async fn write(
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
         let before = live.and_then(raw).filter(|(of, _)| std::ptr::eq(*of, kind));
+        if live.is_some() && !there && how == How::Apply {
+            let why = format!("{primary} was made since: apply it again");
+            return Err(status(StatusCode::CONFLICT, "Conflict", why));
+        }
+        let was = before.as_ref().map(|(_, object)| object.clone());
         // What is there and was not made here, or not as this kind, is not written over.
         if live.is_some() && before.is_none() {
             let why = format!(
@@ -1826,14 +2282,25 @@ async fn write(
                 None => meta.remove(field),
             };
         }
+        // Who set which field: an apply is laid over what is there, a change by anything else
+        // takes the fields it changes from the managers.
+        match (how, was) {
+            (How::Apply, was) => {
+                let force = call.asked.get("force").is_some_and(|force| force == "true");
+                sent = apply(was, sent, manager, &version_of(kind.group), force)?;
+            }
+            (How::Replace | How::Patch { .. }, Some(was)) => updated(&was, &mut sent),
+            _ => {}
+        }
         held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision))
     };
     let ((mut resources, hints), revision) = read.map_err(|refused| invalid(refused.join("; ")))?;
-    // Made only if it is not there, changed only as it was read: the store holds to that.
+    // Made only if it is not there, changed only as it was read: the store holds to that
+    // (an apply is laid over what is there, so it is read from that revision too).
     for resource in resources.iter_mut().filter(|resource| resource.key() == primary) {
         resource.metadata.revision = match how {
             How::Create => Some(0),
-            How::Apply => None,
+            How::Apply if !there => Some(0),
             _ => revision,
         };
     }
@@ -1954,15 +2421,96 @@ struct Watch {
     kind: &'static Kind,
     namespace: Option<String>,
     generation: tokio::sync::watch::Receiver<u64>,
-    /// Each object told of: its version, and enough of it to say it is gone.
-    known: BTreeMap<String, (Value, Value)>,
+    /// Each object told of, by the key of the resource it is made of and its own: its version,
+    /// and enough of it to say it is gone.
+    known: BTreeMap<(String, String), (Value, Value)>,
+    /// How far into the store's log the last reading was (none before the first).
+    after: Option<u64>,
+    /// What the readings did: resources made into objects, and objects compared with known ones.
+    translated: usize,
+    compared: usize,
     /// Events not sent yet, a line each.
     due: Vec<u8>,
     until: tokio::time::Instant,
     over: bool,
 }
 
+/// A reading of the store for a watch: the objects, the generation it was at, and the keys
+/// of the resources they were made from (none: all of them were read).
+struct Seen {
+    found: Vec<(String, Value)>,
+    at: u64,
+    changed: Option<BTreeSet<String>>,
+}
+
 impl Watch {
+    fn start(call: Call, kind: &'static Kind, namespace: Option<String>, seconds: u64) -> Watch {
+        // (Marked as seen before the store is read: a change after the reading wakes the watch.)
+        let mut generation = call.shared.generation.subscribe();
+        drop(generation.borrow_and_update());
+        Watch {
+            generation,
+            call,
+            kind,
+            namespace,
+            known: BTreeMap::new(),
+            after: None,
+            translated: 0,
+            compared: 0,
+            due: Vec::new(),
+            until: tokio::time::Instant::now() + Duration::from_secs(seconds),
+            over: false,
+        }
+    }
+
+    /// What `Verb::Watch` lets the caller see of what changed since the last reading, or of
+    /// everything when that is not known (see the top of this file). What it shows is what a
+    /// list shows: the same grants, and the same selectors, are asked of each resource read.
+    fn read(&mut self) -> Seen {
+        let call = &self.call;
+        let state = call.shared.store.lock().expect("a handler panicked holding the store");
+        let grants = Grants::of(&call.caller, &state.store);
+        // (A worker that runs from a view has its store put there without a log.)
+        let kept = call.shared.view.borrow().is_none();
+        let access = |key: &&str| {
+            ["Identity/", "RoleBinding/", "Role/"]
+                .iter()
+                .any(|held| key.starts_with(held))
+        };
+        let names = !matches!(self.kind.held, Held::As("Namespace"));
+        let only = self
+            .after
+            .filter(|_| kept && names)
+            .and_then(|after| state.touched(after));
+        let only = only.filter(|keys| !keys.iter().any(access));
+        let mut look = Look {
+            only: only.as_ref(),
+            translated: 0,
+        };
+        let namespace = self.namespace.as_deref();
+        let mut found = read(
+            &state.store,
+            self.kind,
+            namespace,
+            None,
+            &grants,
+            &Verb::Watch,
+            &mut look,
+        );
+        found.retain(|(_, object)| selected(object, &call.asked));
+        let changed = only
+            .as_ref()
+            .map(|keys| keys.iter().map(|key| key.to_string()).collect());
+        self.translated += look.translated;
+        self.after = Some(state.index());
+        // (Read under the store's lock: a change and its generation come together.)
+        Seen {
+            found,
+            at: *call.shared.generation.borrow(),
+            changed,
+        }
+    }
+
     fn event(&mut self, event: &str, object: &Value, at: u64) {
         let line = match self.call.table && event != "BOOKMARK" {
             true => json!({ "type": event, "object": table(self.kind, std::slice::from_ref(object), at) }),
@@ -1975,12 +2523,25 @@ impl Watch {
     /// Lines up an event for each object of `found` that is new or changed since the last
     /// look, and for each that is gone (none with `quiet`: the client has them from its
     /// list). Then a bookmark, where the client takes them: the generation it is told up to.
-    fn tell(&mut self, found: Vec<Value>, at: u64, quiet: bool, first: bool) {
-        let mut gone: BTreeSet<String> = self.known.keys().cloned().collect();
+    fn tell(&mut self, seen: Seen, quiet: bool, first: bool) {
+        let Seen { found, at, changed } = seen;
+        // What may be gone: of what was read only the objects of the resources read, else all.
+        let mut gone: BTreeSet<(String, String)> = match &changed {
+            None => self.known.keys().cloned().collect(),
+            Some(keys) => keys
+                .iter()
+                .flat_map(|key| {
+                    let from = (key.clone(), String::new());
+                    let told = self.known.range(from..).take_while(move |(of, _)| of.0 == *key);
+                    told.map(|(of, _)| of.clone())
+                })
+                .collect(),
+        };
+        self.compared += found.len();
         let mut told = false;
-        for object in found {
+        for (of, object) in found {
             let meta = &object["metadata"];
-            let id = format!("{}/{}", meta["namespace"], meta["name"]);
+            let id = (of, format!("{}/{}", meta["namespace"], meta["name"]));
             gone.remove(&id);
             let event = match self.known.get(&id) {
                 None => "ADDED",
@@ -2000,6 +2561,7 @@ impl Watch {
                 told = true;
             }
         }
+        self.compared += gone.len();
         for id in gone {
             if let Some((_, last)) = self.known.remove(&id) {
                 self.event("DELETED", &last, at);
@@ -2043,27 +2605,15 @@ fn watch(call: Call, kind: &'static Kind, namespace: Option<String>) -> Result<R
     let from = asked("resourceVersion").filter(|from| !from.is_empty() && *from != "0");
     let from = from.map(str::to_string);
     let events = asked("sendInitialEvents") == Some("true");
-    // (Marked as seen before the store is read: a change after the reading wakes the watch.)
-    let mut generation = call.shared.generation.subscribe();
-    drop(generation.borrow_and_update());
-    let (found, at) = call.seen(kind, namespace.as_deref(), None, Verb::Watch);
+    let mut watch = Watch::start(call, kind, namespace, seconds);
+    let seen = watch.read();
     // From a list's version, only what changes after it is told; and only from the newest:
-    // what changed between an older one and now is not kept anywhere.
-    if let Some(from) = from.as_ref().filter(|from| **from != at.to_string() && !events) {
-        let why = format!("too old resource version: {from} ({at})");
+    // a generation is a time, not a place in the log, so what changed since an older one is not told.
+    if let Some(from) = from.as_ref().filter(|from| **from != seen.at.to_string() && !events) {
+        let why = format!("too old resource version: {from} ({})", seen.at);
         return Err(status(StatusCode::GONE, "Expired", why));
     }
-    let mut watch = Watch {
-        generation,
-        call,
-        kind,
-        namespace,
-        known: BTreeMap::new(),
-        due: Vec::new(),
-        until: tokio::time::Instant::now() + Duration::from_secs(seconds),
-        over: false,
-    };
-    watch.tell(found, at, from.is_some() && !events, true);
+    watch.tell(seen, from.is_some() && !events, true);
     let events = futures_util::stream::unfold(watch, |mut watch| async move {
         loop {
             if !watch.due.is_empty() {
@@ -2083,9 +2633,8 @@ fn watch(call: Call, kind: &'static Kind, namespace: Option<String>) -> Result<R
                 return None;
             }
             drop(watch.generation.borrow_and_update());
-            let namespace = watch.namespace.clone();
-            let (found, at) = watch.call.seen(watch.kind, namespace.as_deref(), None, Verb::Watch);
-            watch.tell(found, at, false, false);
+            let seen = watch.read();
+            watch.tell(seen, false, false);
         }
     });
     Ok(([(header::CONTENT_TYPE, "application/json")], Body::from_stream(events)).into_response())
@@ -2217,6 +2766,11 @@ mod tests {
             .unwrap();
         let held = "
 apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: carol}
+spec: {}
+---
+apiVersion: kith.dev/v1
 kind: Role
 metadata: {name: writer}
 spec:
@@ -2258,6 +2812,25 @@ spec: {role: writer, subjects: [carol]}
             code(done),
             Some(StatusCode::FORBIDDEN),
             "a patch is answered with all of it"
+        );
+        // A replace of what is there is answered with all of it, managers' fields too: the same.
+        let sent = json!({ "metadata": { "name": "kept" }, "stringData": { "password": "other" } }); // pragma: allowlist secret
+        let done = write(
+            &carol,
+            secrets,
+            Some("default"),
+            Some("kept"),
+            How::Replace,
+            sent.clone(),
+        )
+        .await;
+        assert_eq!(code(done), Some(StatusCode::FORBIDDEN), "a replace of what is there");
+        let sent = json!({ "metadata": { "name": "fresh" }, "stringData": { "password": "x" } }); // pragma: allowlist secret
+        let done = write(&carol, secrets, Some("default"), Some("fresh"), How::Replace, sent).await;
+        assert_eq!(
+            code(done),
+            Some(StatusCode::NOT_FOUND),
+            "a replace of what is not there answers 404, as to any writer"
         );
         // What is there and what is not are the same to who may not ask.
         let eve = call("eve");
@@ -2564,6 +3137,88 @@ spec: {role: writer, subjects: [carol]}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The lists a strategic patch merges by a key are the ones Kubernetes's types tag with
+    /// `patchMergeKey`: what ci/kube_proto.py reads of them is the table in this file. It
+    /// fails, and does not skip, where that source is not there (run ci/kube_proto.py once to
+    /// have it); nothing is fetched here. Ignored in a plain `cargo test`, which touches no
+    /// outside host and holds no cache: `ci/kube.sh` fetches the files and runs it with `--ignored`.
+    #[test]
+    #[ignore = "needs the Kubernetes type files ci/kube.sh fetches (cargo test -- --ignored merge_keys)"]
+    fn merge_keys_are_those_of_the_kubernetes_types() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/kube_proto.py");
+        let read = std::process::Command::new("python3")
+            .arg(script)
+            .arg("--merge-keys")
+            .output()
+            .expect("python3 is there to read the Kubernetes types");
+        let err = String::from_utf8_lossy(&read.stderr);
+        assert!(read.status.success(), "ci/kube_proto.py --merge-keys: {err}");
+        let read = String::from_utf8(read.stdout).unwrap();
+        let ours: Vec<String> = MERGED.iter().map(|(list, by)| format!("{list} {by}")).collect();
+        assert_eq!(
+            ours,
+            read.lines().collect::<Vec<_>>(),
+            "the table is not what the types say"
+        );
+        // What each does with an item: a list of two keys goes by the one the item has.
+        let by = |list, item: Value| merge_key(list, &item);
+        assert_eq!(by("ports", json!({ "containerPort": 80 })), Some("containerPort"));
+        assert_eq!(by("ports", json!({ "port": 80 })), Some("port"));
+        assert_eq!(by("conditions", json!({ "type": "Ready" })), Some("type"));
+        assert_eq!(by("args", json!("x")), None);
+    }
+
+    /// `kubectl get namespaces` and `get nodes` print an AGE: the object's creationTimestamp
+    /// is the time of the oldest revision the store kept of what holds it.
+    #[test]
+    fn age_of_a_namespace_and_a_node_is_its_oldest_revision() {
+        let mut store = Store::default();
+        let held = |kind: &str, name: &str| -> Resource {
+            let meta = json!({ "name": name });
+            let status = json!({ "address": "10.0.0.2:7000", "state": "reachable" });
+            let spec = if kind == "Node" {
+                json!({ "address": "10.0.0.2:7000" })
+            } else {
+                json!({})
+            };
+            let mut held: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": kind, "metadata": meta, "spec": spec,
+            }))
+            .unwrap();
+            if kind == "Node" {
+                held.status = Some(status);
+            }
+            held
+        };
+        store.at(Some(1_700_000_000));
+        store.apply(held("Namespace", "shop")).unwrap();
+        store.put(held("Node", "n2"));
+        // A later change of the namespace keeps the age of its first revision.
+        store.at(Some(1_700_000_500));
+        let mut again = held("Namespace", "shop");
+        again.metadata.labels.insert("a".into(), "b".into());
+        store.apply(again).unwrap();
+        let grants = Grants::of(&Caller::Admin, &store);
+        let kind = |of: &str| KINDS.iter().find(|kind| kind.kind == of).unwrap();
+        for (of, name) in [("Namespace", "shop"), ("Node", "n2")] {
+            let found = objects(&store, kind(of), None, Some(name), &grants, &Verb::Get);
+            assert_eq!(found.len(), 1, "{of}");
+            assert_eq!(
+                found[0]["metadata"]["creationTimestamp"],
+                rfc3339(1_700_000_000),
+                "{of}: {found:?}"
+            );
+            let cells: Vec<_> = row(of, &found[0])
+                .into_iter()
+                .filter(|(name, _)| *name == "Age")
+                .collect();
+            assert!(
+                cells[0].1.as_str().is_some_and(|age| age.ends_with('d')),
+                "{of}: {cells:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_time_is_read_back_and_a_name_kith_cannot_hold_is_hashed() {
         for at in [0, 951_782_400, 1_709_251_199, 1_794_614_400] {
@@ -2575,5 +3230,309 @@ spec: {role: writer, subjects: [carol]}
         let hashed = kept_name(roles, "system:reader");
         assert!(hashed.len() == 45 && !hashed.contains(':'), "{hashed}");
         assert_ne!(hashed, kept_name(roles, "system:writer"));
+    }
+
+    /// What `api` gave, or why not (`ApiError` has no `Debug`).
+    fn must<T>(result: Result<T, api::ApiError>) -> T {
+        result.unwrap_or_else(|e| match e {
+            api::ApiError::Refused(why) | api::ApiError::Unauthorized(why) => panic!("{why}"),
+            api::ApiError::Store(e) => panic!("{e}"),
+        })
+    }
+
+    /// ConfigMaps `from..to` of `namespace`, each holding `value`, as if made through this API.
+    fn maps(namespace: &str, from: usize, to: usize, value: &str) -> Vec<kith_api::Resource> {
+        let source: String = (from..to)
+            .map(|n| {
+                let sent = json!({
+                    "apiVersion": "v1", "kind": "ConfigMap",
+                    "metadata": { "name": format!("c{n}"), "namespace": namespace }, "data": { "k": value },
+                });
+                let sent = serde_json::to_string(&sent.to_string()).unwrap();
+                format!(
+                    "---\napiVersion: kith.dev/v1\nkind: ConfigMap\n\
+                     metadata: {{ name: c{n}, namespace: {namespace}, annotations: {{ {SENT}: {sent} }} }}\n\
+                     spec: {{ data: {{ k: {value} }} }}\n"
+                )
+            })
+            .collect();
+        let resources = kith_api::Resource::from_source(&source).unwrap();
+        resources.into_iter().map(Result::unwrap).collect()
+    }
+
+    /// What a watch of ConfigMaps does for one change among 2000 of them: it makes one object
+    /// and compares one key, where reading everything makes and compares 2000. (The times are
+    /// for the reader to see; what is asserted is the work.) It reads everything again where
+    /// it cannot know what changed, and what it reads it shows no more of than a list does.
+    #[tokio::test]
+    async fn watch_work_is_what_changed() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-watch-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let configmaps = KINDS.iter().find(|kind| kind.plural == "configmaps").unwrap();
+        let admin = |shared: &Arc<Shared>| Call {
+            shared: shared.clone(),
+            caller: Caller::Admin,
+            certificate: None,
+            asked: Asked::new(),
+            table: false,
+        };
+        let put = |resources| {
+            let shared = shared.clone();
+            async move { must(api::applied(&shared, &Caller::Admin, resources).await) }
+        };
+        put(maps("default", 0, 2000, "1")).await;
+        let mut watch = Watch::start(admin(&shared), configmaps, None, 60);
+        let seen = watch.read();
+        watch.tell(seen, true, true);
+        assert_eq!(
+            (watch.translated, watch.compared, watch.known.len()),
+            (2000, 2000, 2000)
+        );
+        // One change: one object made, one key compared, one event.
+        let events = |watch: &mut Watch| String::from_utf8(std::mem::take(&mut watch.due)).unwrap();
+        let mut times = Vec::new();
+        for (n, partial) in [(7, true), (8, false), (9, true)] {
+            put(maps("default", n, n + 1, "2")).await;
+            watch.after = watch.after.filter(|_| partial);
+            (watch.translated, watch.compared) = (0, 0);
+            let began = std::time::Instant::now();
+            let seen = watch.read();
+            watch.tell(seen, false, false);
+            times.push((began.elapsed(), watch.translated, watch.compared));
+            let told = events(&mut watch);
+            assert_eq!(told.lines().count(), 1, "{told}");
+            assert!(
+                told.contains(&format!("\"name\":\"c{n}\"")) && told.contains("MODIFIED"),
+                "{told}"
+            );
+        }
+        eprintln!(
+            "watch of 2000 ConfigMaps, one changed: reading what changed {:?}, reading all {:?}",
+            times[0].0, times[1].0
+        );
+        assert_eq!((times[0].1, times[0].2), (1, 1), "what changed");
+        assert_eq!((times[1].1, times[1].2), (2000, 2000), "everything");
+        assert_eq!((times[2].1, times[2].2), (1, 1), "what changed, again");
+        // A deleted one is told gone, from its key alone.
+        must(api::deleted(&shared, &Caller::Admin, "ConfigMap/default/c3".into()).await);
+        (watch.translated, watch.compared) = (0, 0);
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        let told = events(&mut watch);
+        assert!(told.contains("DELETED") && told.contains("\"name\":\"c3\""), "{told}");
+        assert_eq!((watch.translated, watch.compared), (0, 1));
+        assert_eq!(watch.known.len(), 1999);
+        // Where it cannot know what changed it reads all: who may see what changed, ...
+        let access = "---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: eve}\nspec: {}\n";
+        let access = kith_api::Resource::from_source(access).unwrap().pop().unwrap().unwrap();
+        put(vec![access]).await;
+        // ... a worker's view of the store, which has no log, ...
+        (watch.translated, watch.compared) = (0, 0);
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        assert_eq!(watch.translated, 1999, "an Identity changed");
+        put(maps("default", 10, 11, "2")).await;
+        shared.view.send_replace(Some(0));
+        (watch.translated, watch.compared) = (0, 0);
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        assert_eq!(watch.translated, 1999, "a view");
+        shared.view.send_replace(None);
+        // ... and more changes than are kept.
+        put(maps("other", 0, 4100, "1")).await;
+        (watch.translated, watch.compared) = (0, 0);
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        assert_eq!(watch.translated, 1999 + 4100, "more changes than are kept");
+        drop(events(&mut watch));
+        let seen = watch.read();
+        assert_eq!(watch.translated, 1999 + 4100, "nothing changed since");
+        assert!(seen.found.is_empty() && seen.changed.is_some_and(|changed| changed.is_empty()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A watch shows what a list shows: a change to what the caller may not see is not read
+    /// into an object, and a change of what the caller may see (a Role) is read at once.
+    #[tokio::test]
+    async fn watch_work_shows_what_a_list_shows() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-watch-grants-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let configmaps = KINDS.iter().find(|kind| kind.plural == "configmaps").unwrap();
+        let source = |namespaces: &str| {
+            format!(
+                "---\napiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{name: eve}}\nspec: {{}}\n\
+                 ---\napiVersion: kith.dev/v1\nkind: Role\nmetadata: {{name: seer}}\n\
+                 spec: {{ rules: [{{kinds: [ConfigMap], verbs: [watch, list], namespaces: [{namespaces}]}}] }}\n\
+                 ---\napiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: eve-seer}}\n\
+                 spec: {{role: seer, subjects: [eve]}}\n"
+            )
+        };
+        let sources = |text: String| -> Vec<kith_api::Resource> {
+            kith_api::Resource::from_source(&text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let put = |resources| {
+            let shared = shared.clone();
+            async move { must(api::applied(&shared, &Caller::Admin, resources).await) }
+        };
+        put(sources(source("a"))).await;
+        let mut resources = maps("a", 0, 3, "1");
+        resources.extend(maps("b", 0, 3, "1"));
+        put(resources).await;
+        let call = Call {
+            shared: shared.clone(),
+            caller: Caller::Identity("eve".into()),
+            certificate: None,
+            asked: Asked::new(),
+            table: false,
+        };
+        let mut watch = Watch::start(call, configmaps, None, 60);
+        let seen = watch.read();
+        watch.tell(seen, true, true);
+        assert_eq!(watch.known.len(), 3, "only a's");
+        // A change in b: nothing is made of it, nothing is told.
+        put(maps("b", 0, 1, "2")).await;
+        (watch.translated, watch.compared) = (0, 0);
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        assert_eq!((watch.translated, watch.compared, watch.due.len()), (0, 0, 0));
+        // A change in a is told; and a Role that lets eve see b makes b's told as new.
+        put(maps("a", 1, 2, "2")).await;
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        assert_eq!(
+            String::from_utf8(std::mem::take(&mut watch.due))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        put(sources(source("a, b"))).await;
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        let told = String::from_utf8(std::mem::take(&mut watch.due)).unwrap();
+        assert_eq!(told.matches("ADDED").count(), 3, "{told}");
+        assert_eq!(watch.known.len(), 6);
+        // And one that takes a away: a's are told gone.
+        put(sources(source("b"))).await;
+        let seen = watch.read();
+        watch.tell(seen, false, false);
+        let told = String::from_utf8(std::mem::take(&mut watch.due)).unwrap();
+        assert_eq!(told.matches("DELETED").count(), 3, "{told}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn map(data: Value) -> Value {
+        json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": { "name": "m" }, "data": data })
+    }
+
+    fn who(object: &Value) -> Vec<(String, Vec<String>)> {
+        managers(object)
+            .into_iter()
+            .map(|m| (m.name, m.fields.iter().map(|at| at.join("/")).collect()))
+            .collect()
+    }
+
+    /// Two managers keep their own fields; a different value for one of another's is a 409 in
+    /// Kubernetes's words, and with force it is the forcer's; what a manager leaves out of its
+    /// next apply goes when no one else has it.
+    #[test]
+    fn apply_keeps_each_managers_fields_and_conflicts_on_the_others() {
+        let a = apply(None, map(json!({ "x": "1", "gone": "g" })), "a", "v1", false).unwrap();
+        let ab = apply(Some(a), map(json!({ "w": "2" })), "b", "v1", false).unwrap();
+        assert_eq!(ab["data"], json!({ "x": "1", "gone": "g", "w": "2" }));
+        let no = apply(Some(ab.clone()), map(json!({ "x": "9" })), "b", "v1", false).unwrap_err();
+        assert_eq!(no.code, StatusCode::CONFLICT);
+        assert_eq!(
+            no.why,
+            "Apply failed with 1 conflict: conflict with \"a\" using v1: .data.x"
+        );
+        // The same value is no conflict; both then have it.
+        let same = apply(Some(ab.clone()), map(json!({ "x": "1" })), "b", "v1", false).unwrap();
+        assert!(
+            who(&same)
+                .iter()
+                .all(|(_, fields)| fields.contains(&"f:data/f:x".to_string()))
+        );
+        // With force the field is b's, and a is now the one in conflict.
+        let forced = apply(Some(ab), map(json!({ "x": "9", "w": "2" })), "b", "v1", true).unwrap();
+        assert_eq!(forced["data"]["x"], "9");
+        let no = apply(
+            Some(forced.clone()),
+            map(json!({ "x": "1", "gone": "g" })),
+            "a",
+            "v1",
+            false,
+        )
+        .unwrap_err();
+        assert!(no.why.contains("conflict with \"b\" using v1: .data.x"), "{}", no.why);
+        // a leaves out what it set, and no other has: gone. What b has stays.
+        let a2 = apply(Some(forced), map(json!({ "keep": "k" })), "a", "v1", false).unwrap();
+        assert_eq!(a2["data"], json!({ "x": "9", "w": "2", "keep": "k" }));
+        assert_eq!(who(&a2).len(), 2);
+    }
+
+    /// An apply that changes nothing is not a change: not of the object, and not of the time
+    /// the manager is dated by. Many managers are refused past the cap.
+    #[test]
+    fn a_repeat_of_an_apply_changes_nothing() {
+        let mut once = apply(None, map(json!({ "x": "1" })), "a", "v1", false).unwrap();
+        // (A manager's time is a second's; make it one a second can differ from.)
+        once["metadata"]["managedFields"][0]["time"] = json!("2001-01-01T00:00:00Z");
+        let twice = apply(Some(once.clone()), map(json!({ "x": "1" })), "a", "v1", false).unwrap();
+        assert_eq!(once, twice);
+        let mut object = once;
+        let mut taken = 1; // (a is one)
+        loop {
+            let (key, name) = (format!("k{taken}"), format!("m{taken}"));
+            match apply(Some(object.clone()), map(json!({ key: "v" })), &name, "v1", false) {
+                Ok(next) => object = next,
+                Err(no) => {
+                    assert_eq!(no.code, StatusCode::UNPROCESSABLE_ENTITY);
+                    break;
+                }
+            }
+            taken += 1;
+        }
+        assert_eq!(taken, MANAGERS, "one manager more than {MANAGERS} is refused");
+    }
+
+    /// What is managed survives what is stored (FieldsV1, in the object as it was sent) and
+    /// keyed list items are told apart by their key, not by their place.
+    #[test]
+    fn managed_fields_round_trip_and_list_items_are_named_by_key() {
+        let deployment = |names: &[&str]| {
+            let containers: Vec<Value> = names.iter().map(|name| json!({ "name": name, "image": "i" })).collect();
+            json!({
+                "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web" },
+                "spec": { "replicas": 1, "template": { "spec": { "containers": containers } } },
+            })
+        };
+        let applied = apply(None, deployment(&["a", "b"]), "m", "apps/v1", false).unwrap();
+        let fields = who(&applied).remove(0).1;
+        assert!(
+            fields.contains(&r#"f:spec/f:template/f:spec/f:containers/k:{"name":"b"}/f:image"#.to_string()),
+            "{fields:?}"
+        );
+        let again = managers(&applied);
+        assert_eq!(again.len(), 1);
+        // An update of a field takes it from its manager; the rest stays.
+        let mut changed = applied.clone();
+        changed["spec"]["replicas"] = json!(3);
+        updated(&applied, &mut changed);
+        let left = who(&changed).remove(0).1;
+        assert!(
+            !left.contains(&"f:spec/f:replicas".to_string()) && left.len() == fields.len() - 1,
+            "{left:?}"
+        );
+        // What it costs: the managedFields of one Deployment, against the object.
+        let (with, without) = (
+            serde_json::to_vec(&applied).unwrap().len(),
+            serde_json::to_vec(&deployment(&["a", "b"])).unwrap().len(),
+        );
+        eprintln!("managedFields: {} bytes on {} of the object", with - without, without);
     }
 }

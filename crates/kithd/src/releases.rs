@@ -27,6 +27,10 @@ use tokio::sync::watch;
 
 /// The annotation on what a release applied: the Release's key.
 pub const OWNER: &str = "kith.dev/owned-by";
+/// The annotation on a Release or a Source: who applied it, as the audit log names them,
+/// written by the API server (a client's word for it is replaced) and, on what a Source
+/// makes, the Source's own. What it renders is made with that one's rights.
+pub const WRITER: &str = "kith.dev/written-by";
 /// What no package gets to make, besides anything that is in no namespace (nodes,
 /// packages, repositories): what installs things.
 const KEPT: [&str; 2] = ["Release", "Source"];
@@ -403,6 +407,8 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
         let live = release.status.as_ref();
         let done = output.and_then(|output| {
             let done = reconcile(store, &key, &recorded(release), &output.resources, true)?;
+            // (Asked on every pass: a writer that loses a right is told at once.)
+            writer_may(store, release, &output.resources, &done.delete)?;
             Ok((output, done))
         });
         let mut step = Step {
@@ -441,6 +447,52 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
         .filter(|resource| owner(resource).is_some_and(|owner| store.get(owner).is_none()));
     plan.orphans.extend(orphans.map(Resource::key));
     plan
+}
+
+/// Why `owner` (a Release or a Source) may not make `resources` and delete `gone`, if so:
+/// each is asked of whoever applied it ([`WRITER`]), as the API asks it of whoever applies
+/// a resource directly. One with nobody written down, or one kithd does not act as, makes
+/// nothing: never more than the cluster's least.
+pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone: &[String]) -> Result<(), String> {
+    use crate::access::{Caller, Grants};
+    use kith_api::kinds::Verb;
+    let key = owner.key();
+    let Some(writer) = owner.metadata.annotations.get(WRITER) else {
+        return Err(format!(
+            "nobody is written down as having applied {key} (it was applied before kithd wrote that down), \
+             so it makes nothing new: apply it again"
+        ));
+    };
+    let Some(caller) = Caller::named(writer) else {
+        return Err(format!(
+            "{key} was applied by {writer}, as whom kithd makes nothing: apply it again"
+        ));
+    };
+    let grants = Grants::of(&caller, store);
+    let short = |(at, (verb, kind, namespace)): (String, crate::api::Right)| {
+        let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
+        let why = match &caller {
+            Caller::Identity(name) if store.get(&format!("Identity/{name}")).is_none() => {
+                format!("there is no Identity {name}")
+            }
+            _ => "no Role bound to it allows that".to_string(),
+        };
+        let verb = crate::api::word(&verb);
+        format!("{at}: {key} was applied by {writer}, and {writer} may not {verb} {kind}{place}: {why}")
+    };
+    let made = resources.iter().flat_map(|resource| {
+        let rights = crate::api::takes(store, std::slice::from_ref(resource));
+        rights.into_iter().map(|right| (resource.key(), right))
+    });
+    let taken = gone.iter().map(|at| {
+        let (kind, namespace) = crate::api::place_of(at);
+        (at.clone(), (Verb::Delete, kind, namespace))
+    });
+    let mut asked = made.chain(taken);
+    match asked.find(|(_, (verb, kind, namespace))| !grants.may(verb, kind, namespace.as_deref())) {
+        Some(refused) => Err(short(refused)),
+        None => Ok(()),
+    }
 }
 
 fn failed(why: &str, revision: Option<u64>) -> Value {
@@ -565,7 +617,9 @@ mod tests {
                        spec: { data: { colour: {{ values.colour }} } }\n\
                        {% if values.extra %}---\napiVersion: kith.dev/v1\nkind: ConfigMap\n\
                        metadata: { name: {{ name }}-extra }\nspec: { data: { a: b } }\n{% endif %}";
-    const RELEASE: &str = "apiVersion: kith.dev/v1\nkind: Release\nmetadata: { name: mine, namespace: shop }\n\
+    /// (Applied through the local socket: the API server writes down who applies one.)
+    const RELEASE: &str = "apiVersion: kith.dev/v1\nkind: Release\n\
+                           metadata: { name: mine, namespace: shop, annotations: { 'kith.dev/written-by': 'local socket' } }\n\
                            spec: { package: { name: maps }, autoUpgrade: true, values: { extra: true } }\n";
 
     /// Render what is pending and carry the plan out, until there is nothing to do.
@@ -583,11 +637,10 @@ mod tests {
                 for key in step.delete.into_iter() {
                     store.delete(&key).unwrap();
                 }
+                // (As `carry_out` writes it.)
                 if let Some(fields) = step.status {
-                    let live = store.get(&step.release).and_then(|r| r.status.clone());
-                    let mut status = live.unwrap_or(json!({}));
-                    status.as_object_mut().unwrap().extend(fields);
-                    store.set_status(&step.release, Some(status)).unwrap();
+                    let statuses = vec![(step.release, fields)];
+                    kith_store::run(store, kith_store::Command::Patch { statuses }).unwrap();
                 }
             }
             for key in plan.orphans {
@@ -913,5 +966,150 @@ mod tests {
             (&status["state"], &status["message"]),
             (&json!("error"), &json!("there is no Repository/ours"))
         );
+    }
+
+    /// The Identity bob, who may apply and delete `kinds` (a YAML list's insides) in shop.
+    fn bob(store: &mut Store, kinds: &str) {
+        apply(
+            store,
+            &format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
+                 spec: {{ rules: [{{ kinds: [{kinds}], verbs: [apply, delete], namespaces: [shop] }}] }}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-shop }}\nspec: {{ role: shop, subjects: [bob] }}\n"
+            ),
+        );
+    }
+
+    fn said(store: &Store) -> (Value, String) {
+        let status = store.get("Release/shop/mine").unwrap().status.clone().unwrap();
+        let message = status["message"].as_str().unwrap_or_default().to_string();
+        (status["state"].clone(), message)
+    }
+
+    /// A Release makes what whoever applied it may make, and nothing more: one who may
+    /// write Releases and no Secret gets no Secret by way of a package.
+    #[test]
+    fn release_rights_a_release_makes_nothing_its_writer_may_not() {
+        let as_bob = RELEASE.replace("local socket", "bob");
+        let kinds = [
+            ("Secret", "spec: { data: { k: v } }"),
+            ("Backup", "spec: { volume: v, every: 1d }"),
+            ("Share", "spec: { volume: v, users: [bob] }"),
+            (
+                "Workload",
+                "spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }",
+            ),
+        ];
+        for (kind, spec) in kinds {
+            let (mut store, mut renders) = (Store::default(), Renders::new());
+            bob(&mut store, "Release, ConfigMap");
+            let template = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: x }}\n{spec}\n");
+            store
+                .apply(package("1.0.0", &[("map.yaml", MAP), ("x.yaml", &template)]))
+                .unwrap();
+            apply(&mut store, &as_bob);
+            settle(&mut store, &mut renders);
+            let (state, message) = said(&store);
+            assert_eq!(state, "error", "{message}");
+            assert!(
+                message.contains(&format!("{kind}/shop/x: "))
+                    && message.contains(&format!("bob may not apply {kind} in namespace shop")),
+                "{message}"
+            );
+            let owned = store.list(None).filter(|resource| owner(resource).is_some());
+            assert_eq!(owned.count(), 0, "all of a release or none of it");
+        }
+        // What a resource reaches into is the writer's to reach too: a Share is a Volume's files.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "Release, ConfigMap, Share");
+        let share = "apiVersion: kith.dev/v1\nkind: Share\nmetadata: { name: x }\nspec: { volume: v, users: [bob] }\n";
+        store
+            .apply(package("1.0.0", &[("map.yaml", MAP), ("x.yaml", share)]))
+            .unwrap();
+        apply(&mut store, &as_bob);
+        settle(&mut store, &mut renders);
+        let (_, message) = said(&store);
+        assert!(
+            message.contains("Share/shop/x: ") && message.contains("bob may not apply Volume in namespace shop"),
+            "{message}"
+        );
+        // Who may make all of it: installed. So is what the local socket applied.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "Release, ConfigMap");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &as_bob);
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, "installed", "{}", said(&store).1);
+        let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: x }\nspec: { data: { k: v } }\n";
+        store
+            .apply(package("2.0.0", &[("map.yaml", MAP), ("x.yaml", secret)]))
+            .unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, "installed", "{}", said(&store).1);
+        assert!(store.get("Secret/shop/x").is_some());
+    }
+
+    /// A writer that loses its rights, or is gone: what was installed stays, nothing new is
+    /// made or taken away, and the Release says whose rights fell short. One with no writer
+    /// written down acts as nobody, not as the cluster.
+    #[test]
+    fn rights_later_a_release_whose_writer_may_no_longer_installs_nothing_new() {
+        let as_bob = RELEASE.replace("local socket", "bob");
+        let keys = |store: &Store| -> Vec<String> {
+            let owned = store.list(None).filter(|resource| owner(resource).is_some());
+            owned.map(Resource::key).collect()
+        };
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "Release, ConfigMap");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &as_bob);
+        settle(&mut store, &mut renders);
+        assert_eq!(keys(&store).len(), 2);
+        // The status written does not touch who wrote it.
+        let writer = |store: &Store| {
+            let release = store.get("Release/shop/mine").unwrap();
+            release.metadata.annotations.get("kith.dev/written-by").cloned()
+        };
+        assert_eq!(writer(&store).as_deref(), Some("bob"));
+
+        // bob may write ConfigMaps no more; the release asks for one map fewer.
+        store.delete("RoleBinding/bob-shop").unwrap();
+        apply(&mut store, &as_bob.replace("extra: true", "extra: false"));
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error");
+        assert!(
+            message.contains("ConfigMap/shop/mine-maps: ")
+                && message.contains("bob may not apply ConfigMap in namespace shop"),
+            "{message}"
+        );
+        assert_eq!(keys(&store).len(), 2, "a refused render takes nothing away");
+        assert_eq!(writer(&store).as_deref(), Some("bob"));
+
+        // The rights back, and the Identity gone: the same, said so.
+        bob(&mut store, "Release, ConfigMap");
+        store.delete("Identity/bob").unwrap();
+        settle(&mut store, &mut renders);
+        let (_, message) = said(&store);
+        assert!(message.contains("there is no Identity bob"), "{message}");
+        assert_eq!(keys(&store).len(), 2);
+        // Back: the extra map goes, as asked.
+        bob(&mut store, "Release, ConfigMap");
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, keys(&store).len()), (json!("installed"), 1));
+
+        // Applied before anyone wrote the writer down, or by one kithd does not act as:
+        // nothing new, and how to mend it.
+        for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
+            let release = as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written);
+            apply(&mut store, &release.replace("extra: false", "extra: true"));
+            settle(&mut store, &mut renders);
+            let (state, message) = said(&store);
+            assert_eq!(state, "error");
+            assert!(message.contains("apply it again"), "{message}");
+            assert_eq!(keys(&store).len(), 1);
+        }
     }
 }

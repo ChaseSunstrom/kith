@@ -698,6 +698,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
         .route("/v1/join", post(join))
         .route("/v1/claim", post(claim))
         .route("/v1/unlock", post(crate::crypt::unlock))
+        .route("/v1/forget", post(crate::crypt::forget))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(shared.clone());
     let ping = Router::new().route("/v1/ping", post(crate::members::ping));

@@ -12,7 +12,7 @@
 // is followed and no hook runs. No signed-commit check yet.
 
 use crate::Shared;
-use crate::releases::{OWNER, Step, carry_out, owner, reconcile, recorded};
+use crate::releases::{OWNER, Step, WRITER, carry_out, owner, reconcile, recorded, writer_may};
 use kith_api::Resource;
 use kith_api::kinds::{Approval, SourceSpec};
 use kith_api::store::Store;
@@ -707,7 +707,19 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
         // (Worked out once for each fetch, not each time the store changes.)
         let done = fetched.as_ref().map_err(String::clone).and_then(|fetched| {
             let resources = fetched.resources.get_or_init(|| desired(&key, fetched));
-            let resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
+            let mut resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
+            // What a Source makes that makes more is the Source writer's too, whatever the
+            // repository says of it.
+            let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source");
+            if resources.iter().any(makes) {
+                for resource in resources.to_mut().iter_mut().filter(|resource| makes(resource)) {
+                    let annotations = &mut resource.metadata.annotations;
+                    match source.metadata.annotations.get(WRITER) {
+                        Some(writer) => annotations.insert(WRITER.into(), writer.clone()),
+                        None => annotations.remove(WRITER),
+                    };
+                }
+            }
             // (What another owns now is no longer ours, whatever we recorded: else two
             // Sources that named one resource take it back from each other for ever.)
             let ours = |at: &&str| {
@@ -721,6 +733,8 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
             if let Some(at) = done.kept.iter().find(|at| claimed.contains(at.as_str())) {
                 return Err(format!("{at} is there already and is not {key}'s"));
             }
+            // (Asked on every pass: a writer that loses a right is told at once.)
+            writer_may(store, source, &resources, &done.delete)?;
             Ok((fetched, done))
         });
         let status = match done {
@@ -1100,10 +1114,8 @@ mod tests {
                     store.delete(&key).unwrap();
                 }
                 if let Some(fields) = step.status {
-                    let live = store.get(&step.release).and_then(|r| r.status.clone());
-                    let mut status = live.unwrap_or(json!({}));
-                    status.as_object_mut().unwrap().extend(fields);
-                    store.set_status(&step.release, Some(status)).unwrap();
+                    let statuses = vec![(step.release, fields)];
+                    kith_store::run(store, kith_store::Command::Patch { statuses }).unwrap();
                 }
             }
             for key in orphans {
@@ -1133,7 +1145,9 @@ mod tests {
         Fetches::from([("Source/shop/repo".to_string(), Ok(fetched))])
     }
 
-    const SOURCE: &str = "apiVersion: kith.dev/v1\nkind: Source\nmetadata: { name: repo, namespace: shop }\n\
+    /// (Applied through the local socket: the API server writes down who applies one.)
+    const SOURCE: &str = "apiVersion: kith.dev/v1\nkind: Source\n\
+                          metadata: { name: repo, namespace: shop, annotations: { 'kith.dev/written-by': 'local socket' } }\n\
                           spec: { git: { url: 'https://example.org/a.git' }, prune: true }\n";
 
     #[test]
@@ -1433,6 +1447,113 @@ mod tests {
             assert_eq!(first.as_deref(), Some("Source/shop/one"));
             assert_eq!(status(&store, "Source/shop/one")["state"], "synced");
             assert_eq!(status(&store, "Source/shop/two")["state"], "error");
+        }
+    }
+
+    /// The Identity bob, who may apply and delete `kinds` (a YAML list's insides) in shop.
+    fn bob(store: &mut Store, kinds: &str) {
+        apply(
+            store,
+            &format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
+                 spec: {{ rules: [{{ kinds: [{kinds}], verbs: [apply, delete], namespaces: [shop] }}] }}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-shop }}\nspec: {{ role: shop, subjects: [bob] }}\n"
+            ),
+        );
+    }
+
+    fn writer(store: &Store, key: &str) -> Option<String> {
+        let annotations = &store.get(key).unwrap().metadata.annotations;
+        annotations.get("kith.dev/written-by").cloned()
+    }
+
+    /// A Source makes what whoever applied it may make, and nothing more; what it makes
+    /// that makes more (a Release) acts as that writer too, whatever the repository says.
+    #[test]
+    fn source_rights_a_source_makes_nothing_its_writer_may_not() {
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
+        bob(&mut store, "Source, ConfigMap, Release");
+        apply(&mut store, &SOURCE.replace("local socket", "bob"));
+        let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: s }\nspec: { data: { k: v } }\n";
+        settle(
+            &mut store,
+            &at("r1", &[("a.yaml", map("a", "red")), ("s.yaml", secret.to_string())]),
+        );
+        let message = status(&store)["message"].to_string();
+        assert_eq!(status(&store)["state"], "error", "{message}");
+        assert!(
+            message.contains("Secret/shop/s: ") && message.contains("bob may not apply Secret in namespace shop"),
+            "{message}"
+        );
+        assert!(store.get("ConfigMap/shop/a").is_none() && store.get("Secret/shop/s").is_none());
+
+        let release = "apiVersion: kith.dev/v1\nkind: Release\n\
+                       metadata: { name: mine, annotations: { 'kith.dev/written-by': 'local socket' } }\n\
+                       spec: { package: { name: maps } }\n";
+        settle(
+            &mut store,
+            &at("r2", &[("a.yaml", map("a", "red")), ("r.yaml", release.to_string())]),
+        );
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        assert!(store.get("ConfigMap/shop/a").is_some());
+        assert_eq!(writer(&store, "Release/shop/mine").as_deref(), Some("bob"));
+        // (Its own status written: who wrote it stays.)
+        assert_eq!(writer(&store, "Source/shop/repo").as_deref(), Some("bob"));
+    }
+
+    /// A Source whose writer may no longer, or is gone, or was never written down: what
+    /// it applied stays, and nothing new is made or taken away.
+    #[test]
+    fn source_rights_later_a_source_whose_writer_may_no_longer_applies_nothing_new() {
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
+        bob(&mut store, "Source, ConfigMap");
+        let as_bob = SOURCE.replace("local socket", "bob");
+        apply(&mut store, &as_bob);
+        settle(
+            &mut store,
+            &at("r1", &[("a.yaml", map("a", "red")), ("b.yaml", map("b", "red"))]),
+        );
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+
+        store.delete("RoleBinding/bob-shop").unwrap();
+        settle(&mut store, &at("r2", &[("a.yaml", map("a", "blue"))]));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            message.contains("ConfigMap/shop/a: ") && message.contains("bob may not apply ConfigMap in namespace shop"),
+            "{message}"
+        );
+        assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "red");
+        assert!(
+            store.get("ConfigMap/shop/b").is_some(),
+            "a refused render takes nothing away"
+        );
+
+        // Allowed to make, and not to take away: the same.
+        bob(&mut store, "Source");
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: shop }\n\
+             spec: { rules: [{ kinds: [ConfigMap], verbs: [apply], namespaces: [shop] }] }\n",
+        );
+        settle(&mut store, &at("r2", &[("a.yaml", map("a", "blue"))]));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            message.contains("ConfigMap/shop/b: ")
+                && message.contains("bob may not delete ConfigMap in namespace shop"),
+            "{message}"
+        );
+        assert!(store.get("ConfigMap/shop/b").is_some());
+
+        for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
+            let source = as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written);
+            apply(&mut store, &source);
+            settle(&mut store, &at("r2", &[("a.yaml", map("a", "blue"))]));
+            let message = status(&store)["message"].to_string();
+            assert!(message.contains("apply it again"), "{message}");
+            assert!(store.get("ConfigMap/shop/b").is_some());
         }
     }
 

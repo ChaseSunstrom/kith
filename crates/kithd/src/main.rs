@@ -207,6 +207,9 @@ pub struct Shared {
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
+    /// The order access is decided in, where a change is put in the log: a change to access
+    /// holds it alone until applied, an Identity's write shared once decided again (`raft.rs`).
+    pub order: tokio::sync::RwLock<()>,
     /// On a worker that runs from a view (`view`): the index of the store its view is at.
     /// `None` on every other node, which keeps the store.
     pub view: watch::Sender<Option<u64>>,
@@ -526,6 +529,7 @@ async fn replica(
         stop: watch::channel(false).0,
         pods: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
+        order: tokio::sync::RwLock::default(),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
@@ -614,8 +618,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     // ponytail: past this, a stop waits for the serving below (the membership and the replica
     // open in moments, not as long as a key); it is kept until then.
     let mut opened = None;
-    if let Some((record, _)) = &sealed {
-        let key = crypt::open(record, args.join.as_ref());
+    if let Some((record, config)) = &sealed {
+        let key = crypt::open(record, config, args.join.as_ref());
         opened = Some(match &mut early {
             Some((term, int)) => rt.block_on(async {
                 tokio::select! {

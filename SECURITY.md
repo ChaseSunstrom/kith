@@ -37,13 +37,49 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
+- **An Identity's write is decided again where the log is kept.** An apply, a delete or
+  a rollback by an Identity, of any kind (a Role, a RoleBinding and an Identity
+  included), is asked about on the node it reaches, and then decided again on the
+  leader as it is put in the log: the leader first applies every entry it holds, and
+  asks its own store what the Identity may do now; a node that no longer leads sends the
+  write back, to be passed to whichever does. A write that changes a Role, a
+  RoleBinding, an Identity or a KindDefinition (which says whether a kind is namespaced,
+  so which rule matches it), or an import, goes into the log alone: the Identities'
+  writes wait for it to be applied, and it waits for those already on their way. So
+  access is decided in the log's order: a RoleBinding deleted before a write is put in
+  the log stops that write, even one that a node which had not heard of the deletion
+  yet let through, and the refusal says so ("decided again as the write was put in the
+  log"). One whose right to change access went cannot bind itself again through such a
+  node either. A node passes on the Identity's name with the write (`x-kith-for`); the
+  leader takes it from a control node only, and a worker's writes are held to a
+  worker's list whatever it names. A write waits at most 10 seconds for what comes
+  before it, and is then refused with "try again". So whoever may change a Role, a
+  RoleBinding, an Identity or a KindDefinition can, by changing access over and over,
+  slow the Identities' writes by up to those 10 seconds each, and past them make the
+  writes fail (they are refused, to be tried again): there is no rate on it.
+  What is decided once, where it arrives, and not again: an import or a restore of a
+  whole store; what the controllers write for themselves (a backup made, a status); a
+  blob put; a Volume's files; a package pushed; `kith run`; a seat's activity (a
+  Seat's status, `/v1/seats/NAME/activity`); a node's lock, its codes and keys
+  (`/v1/lock/NAME` and its lock, unlock, wipe, seal, unseal and duress,
+  `/v1/lock/NAME/recovery`, `/v1/lock/NAME/passphrase` and `/v1/duress`); and a
+  worker's write from its view. What it does not stop: a write put in the log before the change, which is
+  the log's order and not the clock's (a deletion still on its way when the write
+  reached the leader comes after it); a node of an older kith, in a cluster that is
+  half updated, which passes on no name, so its writes are decided where they arrived
+  (and a leader of an older kith decides nothing again); a taken control node, which
+  can name anyone or write as itself; and a certificate that stops standing for its
+  Identity (one made again, or the Identity deleted) while the write is on its way: the
+  leader is given the name, not the key, and asks what the Roles bound to that name
+  allow.
 - **A node's certificate has no right of its own on the API**: it reads nothing and
   writes nothing there. What a node does there is pass on what someone asked it, to the
   node that has the thing: a unit's output, a Volume's files, a node's passphrase, a
   backup's restore. It names who asked (a header, `x-kith-for`), and the node that gets
   the request asks its own store what that caller may do, and writes both in its audit
-  log (`alice via node a`). The header is read on those four requests and from a node
-  only: sent by an Identity, or anywhere else, it changes nothing. `kith run` is passed
+  log (`alice via node a`). The header is read on those four requests and on a write
+  passed on to the leader (above), and from a node only: sent by an Identity, or
+  anywhere else, it changes nothing. `kith run` is passed
   to the node the app is for on the node-to-node routes, with who asked in the request,
   and checked the same way there.
   **A control node's word for who asked is taken**: one that is taken can name the local
@@ -149,6 +185,18 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **What a resource makes for itself is asked for with it.** Whoever writes a CronJob
   must be allowed to write a Job, and whoever writes a claim that says `provision`
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
+- **A Release or a Source makes only what its writer may make.** The API writes down
+  who applied it (`kith.dev/written-by`, whatever the body said; through another node,
+  whom that node passed on), and a rollback to an older revision is written down as
+  whoever rolls back. Each time the controller renders, every resource is asked for as
+  that writer would be asked if they applied it themselves, with what it reaches (a
+  Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs); each one the render
+  drops, for leave to delete it. One refusal and nothing of the render is applied: the
+  status names the resource, the right and the writer. A Release or a Source a Source
+  makes is written down as the Source's writer. Rights lost later stop the next render,
+  not what is installed; a writer whose Identity is gone, or a Release or Source with no
+  writer written down (one from before this check), makes nothing until it is applied
+  again.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -158,8 +206,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   or not its template names keys; a template's keys narrow the rule's and never replace
   them. Each node reads the rule at every start, a worker that runs from a view too (it
   is sent every `Cluster`). Rights over the whole cluster write one, and so does whoever
-  may write a Source in `kith-system` (its files are applied as the node): they can add
-  a rule with a longer prefix and a key of their own. A node on a build from before
+  may write a Source in `kith-system` and a `Cluster` (its files are applied with its
+  writer's rights): they can add a rule with a longer prefix and a key of their own. A node on a build from before
   rules reads none.
 - **An image is checked when it is pulled, not again when it starts.** Its layers are
   checked against their digests as they arrive and unpacked once; a start uses the files
@@ -700,8 +748,19 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     with the flag, that includes the deleted node's word for who asked: do not
     start a worker with it.
   Certificates still last ten years; nothing but the Node's deletion ends one.
-- **A Release is the right to apply whatever its packages render**, with the node's
-  rights and not the writer's; the same for a Source. (T-0229, T-0227.)
+- **A Release and a Source act with their writer's rights, as far as these go:**
+  - Deleting one removes what it installed as the node does: leave to delete the
+    Release or Source is enough, not leave to delete each thing.
+  - What a Release reads to render is not asked for: a Package of a Repository that is
+    there, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - A Source's writer is trusted for whatever its repository's authors push, up to the
+    writer's own rights.
+  - An Identity deleted and made again under the same name is the same writer: what
+    the old one applied renders with the new one's rights.
+  - During an upgrade, a node from before this check neither writes the writer down nor
+    checks it; and each Release and Source from before it makes nothing new until it is
+    applied again.
+  - A WebAssembly controller still applies what it returns with the node's rights.
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
   Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
@@ -796,6 +855,72 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is kept by neither, nor by the store or the audit log; it is in kithd's memory on
   both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
   disk keeps of sectors it has replaced is not kith's to say.
+- **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
+  node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
+  makes one), it writes zeros over the node's lock record (the disk's secret, and what
+  the recovery key, a passphrase and the TPM's seal opened) and has the cluster forget
+  the node's key. What it does not do: a disk copied beforehand, with its recovery key
+  or a passphrase it had, still opens, and until a node of the cluster has heard the
+  code such a copy started on the cluster's network is still handed its key; flash
+  may keep the record's old blocks (the secret is not in a TPM); the record shows that
+  a code exists, though not what it is (a public key made from 128 random bits). The
+  console answers every line that opens nothing with the same words two seconds after
+  it was entered, the duress code among them, by a clock a test owns; that is all that
+  is the same. A write to the disk, a request to the cluster, the cluster's own log
+  and audit log (which say that a duress code was typed), and the missing record are
+  there for whoever watches the network or reads the disk or the cluster, and a disk
+  that takes longer than those two seconds to write would answer late. A node the
+  cluster would have opened by itself says after the code what a locked node says,
+  and does not open; it says so when it next asks the cluster, which is not held to
+  the two seconds. A code is known at a node only once that node, running, has heard
+  of it (the NodeKey's status says `duress` or `duressAll`): one that was off since
+  before the code was made takes it for a wrong key. The zeros are read back, and a disk that did not take them is
+  written again ten times a second for as long as the node waits, with nothing said:
+  **a disk that takes no write keeps its record**, and the cluster forgetting is then
+  all that was done. A code typed at a console does nothing to a node that runs (its
+  console takes no key then); sent to a node's port by whoever has it, it is a wipe
+  of a running node as well: the node erases its record and powers off.
+  **Forgotten is not gone from every disk.** The cluster stops handing the key out
+  and drops it from the NodeKey, which can no longer be rolled back; the store still
+  keeps the NodeKey's earlier versions (up to 100), and the cluster's log and its
+  backups keep what was written: whoever reads a control node's state or a backup
+  finds the node's key there, wrapped under the secret that was on the erased disk,
+  which opens nothing without a copy of that disk. A change to a NodeKey made in the
+  same moment (`kith node lock`, a new code) can write the key back for the length
+  of one write: it is forgotten again and the change refused, and a waiting node that
+  is handed its key after a code tells the cluster again.
+  **The cluster forgets for whoever has the code**, at any node's port and with no
+  certificate (a waiting node cannot read its own): `POST /v1/forget` gives a number
+  and takes it back signed with the code's key, within a minute, once; a copy of the
+  disk without the code, a second sending and an old number are refused, all with one
+  answer. So a code that leaks is a wipe for whoever reaches the port, and the
+  cluster's code (`kith node duress --all`) is that for every node under it: keep a
+  code as a recovery key is kept. Whoever reaches the port can also ask for numbers
+  until a waiting node's own is pushed out of the 64 that are kept: the node asks
+  again every few seconds, and is not told while they keep at it. Only a control
+  node forgets: a worker that is asked refuses, and the waiting node asks the next.
+  A node the cluster's code forgot (not the one it was typed at) keeps its own code
+  and loses the cluster's; unlocked again, it has neither until they are made anew.
+  One that was off when the cluster's code was used still knows that code: typed at
+  it later, it erases itself, and the cluster, which had forgotten its key already,
+  goes on saying forgotten and not wiped.
+  **A new recovery key (`kith node recovery`) is written before it is shown**: an
+  answer lost on its way leaves a key nobody saw, the old one opening no more and
+  `recoverySeen` saying yes (the command says so when it fails: run it again). Where
+  the node sees that whoever asked is gone, it puts the old key back; if that write
+  fails, the new one stays, seen by nobody. It
+  goes from the node that made it to the node that was asked over the cluster's TLS
+  and is kept by neither; a control node that is taken can ask any node for one in
+  an admin's name, as it can set a passphrase.
+  **The cluster's code forgets; it does not erase the others.** Typed at one node, it
+  erases that node, and every other node under it loses the cluster's copy of its key:
+  it runs on with its state open, drops its seal and its passphrase when it hears, and
+  opens from then on with its own recovery key alone until `kith node unlock`. A node
+  that was off did not hear and still opens by its seal or passphrase; a node on a
+  kithd from before this gives its key to the cluster again; and the cluster makes no
+  such code while a node under it has a recovery key nobody was shown, where "shown"
+  (`recoverySeen`: by `kith node recovery`, or typed at its console) is not "kept": a
+  key shown and lost opens nothing either. It has run in VMs on disk files only.
 - **Confidential machines (SEV-SNP, TDX) and device passthrough** have never been run on
   real hardware.
 - **Most of kithd's and kith's memory is writable for as long as they run.** Both are
@@ -838,7 +963,7 @@ Severity:
 | 3 | High | An exposed host went to whichever Service asked first, in any namespace; with `--acme` anyone who may write a Service had certificates ordered for names of their choosing. | Fixed in part: a Namespace keeps hosts (`hosts`), and exposes no others once it names any. Open where none is kept: T-0233. |
 | 4 | Medium | An Identity allowed to push a package could have the node send it to an address only the node reaches (its loopback, its networks), by naming such a registry or one that sends the upload on to there. | Fixed: when an Identity asks, every request of the push goes only to an address that was checked, as a Source's fetch does. |
 | 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
-| 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
+| 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Fixed: each render is applied only as far as the Release's or Source's writer may apply it, the writer being whoever applied it, written down by the API. Stays: what is said above under "A Release and a Source act with their writer's rights". (T-0229.) |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Fixed: each is capped by the Volume's `size` (files, directories and links counted in 4 KiB blocks, a sparse entry at its whole length; the download at twice the size and 1 MiB). Stays: a Volume with no `size` is not capped, and there is no quota on the directory. |
 | 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through (any port and path there), never the node itself, the cluster's mesh, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
 | 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host, or is not good now (run out, or not yet started), is refused and the stored certificate stays in use; an order has ten minutes in all. Not checked: that the URLs a directory gives are on the directory's own host (the operator names the authority, and ACME does not oblige one host). (T-0232.) |

@@ -5,6 +5,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Make `path` an executable holding `text`, without this process ever opening it for
+/// writing: while it does, another test thread that forks keeps a copy of the descriptor
+/// until its exec, and running the file meanwhile fails with ETXTBSY. The text goes to a
+/// draft that is never run, `cp` (the only writer, which forks nothing) copies it, and
+/// chmod opens nothing.
+fn write_executable(path: &Path, text: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut draft = path.to_path_buf().into_os_string();
+    draft.push(".draft");
+    std::fs::write(&draft, text).unwrap();
+    let copied = Command::new("cp").arg(&draft).arg(path).status().unwrap();
+    assert!(copied.success(), "cp of {}: {copied}", path.display());
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 struct Sandbox(PathBuf);
 
 impl Sandbox {
@@ -379,9 +394,7 @@ fn the_nas_package_renders_a_share_and_its_smb_server() {
     let bin = sandbox.0.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let stand_in = |name: &str, does: &str| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(bin.join(name), format!("#!/bin/sh\n{does}\n")).unwrap();
-        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_executable(&bin.join(name), &format!("#!/bin/sh\n{does}\n"));
     };
     stand_in(
         "smbpasswd",
@@ -546,7 +559,6 @@ fn kith_with_path(sb: &Sandbox, path: &Path, args: &[&str]) -> (i32, String, Str
 
 #[test]
 fn import_helm_runs_helm_template_and_translates() {
-    use std::os::unix::fs::PermissionsExt;
     let sb = Sandbox::new("import-helm");
     // A stand-in `helm`: it records its arguments and prints a rendered chart.
     let bin = sb.0.join("bin");
@@ -556,8 +568,7 @@ fn import_helm_runs_helm_template_and_translates() {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}/args.txt'\nexec /bin/cat '{0}/rendered.yaml'\n",
         sb.0.display()
     );
-    std::fs::write(bin.join("helm"), script).unwrap();
-    std::fs::set_permissions(bin.join("helm"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&bin.join("helm"), &script);
 
     let (code, out, err) = kith_with_path(
         &sb,

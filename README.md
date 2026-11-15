@@ -1238,6 +1238,17 @@ spec:
   and no `kith-values` ConfigMap; any of these (or a template that fails) is
   `state: error` with the reason in `message`, and what was installed before
   stays as it was.
+- A Release acts with the rights of whoever applied it (or rolled it back),
+  which kithd writes down on it as `kith.dev/written-by`; what a client says
+  there is not taken. Each time it renders, every resource is asked for as if
+  that writer applied it, and so is what it reaches (a Backup's Volume and
+  Secret, a Share's Volume, a CronJob's Jobs), and the deletion of each one no
+  longer rendered. One refusal and nothing is applied: `state: error`, with a
+  message such as `Secret/store/db: Release/store/shop was applied by alice,
+  and alice may not apply Secret in namespace store: no Role bound to it
+  allows that`. A writer who loses a right, or whose Identity is deleted,
+  stops the next render, not what is installed. A Release from before kithd
+  wrote this down makes nothing new until it is applied again.
 - `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
   any version that is not a pre-release. A Release goes on the newest
   package that fits and stays on it; with `autoUpgrade: true` it follows
@@ -1352,7 +1363,10 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   (5 at least) and applies its resources, marked `kith.dev/owned-by` like a
   Release's. A resource that names no namespace goes in the Source's. A
   Source applies only into its own namespace; one in `kith-system` applies
-  anywhere and any kind (it is the cluster's own). It does not take over what
+  anywhere and any kind. Either way it applies only what whoever applied it
+  may apply, as a Release does (above): so its repository's authors can make
+  whatever that writer can, and no more. A Release or a Source it makes acts
+  with the same writer's rights. It does not take over what
   is there and not its own; of two Sources that name one resource the one
   that has it keeps it (the first by name, if they come together) and the
   other says `error`. Sources are fetched several at
@@ -1451,6 +1465,25 @@ What works, by the real clients in the tests (`sh ci/kube.sh`, and
 - **helm**: `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`,
   `history`, `get manifest`, each with and without `--wait`, into a namespace it
   creates.
+- **Field managers**: `kubectl apply --server-side` keeps who set which field (in
+  `metadata.managedFields`, up to 64 managers an object). Two managers that apply
+  one object each keep their own fields; a second manager's different value for a
+  field the first set is a `409 Conflict` in Kubernetes's words, unless it says
+  `--force-conflicts` (it then takes the field). A field a manager leaves out of its
+  next apply goes, when no other manager has it. Fields are owned by their exact
+  path, a list that has no one key to merge by is owned whole, and only an apply makes
+  a manager (a `replace` or a `patch` takes a field from whoever had it). Applying
+  onto an object that exists, or replacing one, needs `get` as well as `apply`, as a
+  patch does. `kubectl get namespaces` and `get nodes` show an AGE: the time of the
+  oldest revision the store kept, which is when it was made unless the history was
+  trimmed or the node is a worker that runs from a view and holds only what the view
+  carried (an implicit namespace, one that only holds objects, has none).
+- **Watches**: `kubectl get --watch` reads what the store says changed, so one
+  change among 2000 objects makes and compares one object, not 2000 (what it shows
+  is what a list shows: the same Roles apply to every read). It reads the kind again
+  when it cannot know what changed: on a worker node that runs from a view, after a
+  change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys,
+  after the store was replaced, and for Namespaces.
 - **GitOps**: a [Source](#sources-gitops) follows a repository of Kubernetes
   manifests as they are; a file's objects are read exactly as the API reads them.
 
@@ -1821,8 +1854,9 @@ one that could give itself every right anyway.
   the old certificate's access; `kith delete identity/alice` ends it all.
 - Grant with care: `apply` on Role, RoleBinding or Identity is the power to
   grant oneself anything, and whoever may apply a Workload runs programs on
-  your nodes. A Release or Source acts for the cluster, not for whoever
-  applied it.
+  your nodes. A Release or a Source acts with the rights of whoever applied
+  it, and makes nothing they may not apply themselves (see Packages and
+  Sources); deleting one removes what it installed, whoever may delete it.
 
 Every change made through a node, and every refusal, is one line in that
 node's audit log (`audit.log` in its state directory, 4 MB and the four
@@ -1831,9 +1865,12 @@ went. A certificate that no longer stands for its Identity is a refusal too,
 and so is no certificate at all (one line a minute of those). Refusals past
 sixty a minute are counted rather than written. A watch ends when its
 Identity is deleted or given another certificate. `Audit` is not a name a
-custom kind may take. Permission is asked when a request arrives, not again
-when its write is committed: a Role removed in between does not stop a write
-already under way. `kith audit` shows the last of it,
+custom kind may take. Permission is asked when a request arrives, and an
+Identity's apply, delete or rollback is asked again on the leader as it is put
+in the log: a RoleBinding deleted before then stops it, even when the node it
+reached had not heard of the deletion yet. A write already in the log before
+the deletion stays (SECURITY.md says what else is decided once, where it
+arrives). `kith audit` shows the last of it,
 as does `GET /v1/audit` for an Identity with `get` on `Audit`.
 
 ```
@@ -2315,8 +2352,8 @@ spec:
   `samba-common-tools`, `nss_wrapper`).
 - The `status` of a Share says why it is given to nobody: no such Volume, an Identity in
   `users` that does not exist, or nobody named. Whoever applies a Share (or rolls one
-  back) must be allowed to apply the Volume it gives; a Release or a Source that renders
-  one gives a Volume of its own namespace, as it may run a workload that mounts it.
+  back) must be allowed to apply the Volume it gives; so must whoever applied a Release or a
+  Source that renders one.
 - `uid` is who writes: nobody (65534) unless you say, which is also who a container is
   with nothing said, so the two write each other's files. Where a container on the volume
   is another user (`runAsUser`, or its image's), name that user here.
@@ -3263,8 +3300,12 @@ kith node seal beta                    # beta's own TPM keeps the key too: it st
 kith node seal beta --off              # taken back: beta asks the cluster again
 kith node passphrase beta              # asks for one, twice, unseen: typed at beta's console, it opens beta's state away from home
 kith node passphrase beta --off        # taken away
+kith node recovery beta                # beta, running, makes a new recovery key and shows it, once: the old one opens no more
+kith node duress beta                  # a duress code for beta, shown once: typed at beta's waiting console, it erases beta's way in
+kith node duress --all                 # one code for the whole cluster (--off takes either away)
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
 sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
+sh ci/vm.sh --test duress              # the new recovery key and the duress code, the same way
 ```
 
 `lock` is for a machine that is lost or about to leave the house; a locked
@@ -3282,8 +3323,64 @@ machine's console, it opens the state where no cluster answers: a laptop away
 from home, or a cluster whose nodes were all off at once (each waits for
 another to hand it its key: open one by hand, and the others follow). It
 opens a locked node too, as whoever has it owns the machine; only `wipe`,
-reaching a running node, ends that. An install that nobody watched (from a
-URL, or from the network) has a recovery key that nobody saw.
+reaching a running node, or a duress code ends that. An install that nobody
+watched (from a URL, or from the network) has a recovery key that nobody saw:
+a cluster of such nodes that is all off at once opens for nobody. So
+`kith node recovery beta` has beta, while it runs, make a new one and shows it
+this once (it is kept nowhere: not in the store, not in the audit log); the key
+beta had before opens it no more. Beta writes the new key before it answers:
+if the command fails, run it again, since the old key may be gone and nobody
+has seen the new one. While the cluster holds nodes' keys and
+nobody was shown the recovery key of any of them, `kith get node` and the web
+UI say so. `kith get NodeKey beta` says `recoverySeen: true` once beta's was
+shown by that command, or typed at beta's console: shown, which is not the
+same as written down.
+
+**A duress code.** For whoever is made to open a node. `kith node duress beta`
+makes one and shows it this once: 32 digits in groups of four, as a recovery
+key looks. Typed at beta's console while beta waits for its key, it erases
+beta's lock record (the disk's own secret, and with it what the recovery key
+and a passphrase opened) and, when a node of the cluster answers, has the
+cluster forget beta's key, as `wipe` does. The console says of it what it says
+of a wrong key, two seconds after the line was entered, as it does for every
+line that opens nothing; from then on nothing typed opens beta, the recovery
+key included. There is no way back. Codes are made by kith, never chosen, and
+none exists until someone who may apply NodeKeys makes one; `--off` takes it
+away (the node drops it when it hears). A code works at a node once that node,
+running, has heard of it (`kith get nodekey beta` then says `duress: true` in
+its status): a node that was off when the code was made takes it for a wrong
+key until it has run with the cluster in reach.
+
+`kith node duress --all` makes one code for the whole cluster. Typed at the
+waiting console of any encrypted node, it does to that node what its own code
+does, and has the cluster forget the key of every other node that was under
+the code when it was made. Those nodes run on. They drop their TPM's seal and
+their passphrase when they hear of it, and from then on open with their own
+recovery keys alone, until `kith node unlock NAME` has the cluster hold NAME's
+key again. A node forgotten this way keeps its own code, which still erases
+it; the cluster's code is gone from all of them, and after `kith node unlock`
+a node has no code until one is made again. So the cluster makes no such code while one of its nodes has a
+recovery key nobody was shown (`kith node recovery` first), and a node that
+joins later is not under it: make the code again.
+
+What a duress code does not do. A disk copied beforehand, with its recovery
+key or a passphrase it had, still opens; and until a node of the cluster has
+heard the code (the machine was away, or its card was pulled), such a copy
+started on the cluster's network is still handed its key: `kith node wipe` it
+from a node you can reach as well. Flash may keep old blocks: the record is
+written over with zeros, and what a flash disk keeps of sectors it has
+replaced is not kith's to say. A disk that refuses the write keeps its record:
+the node tries again for as long as it waits and says nothing of it. The
+cluster stops handing the key out and a NodeKey cannot be rolled back, but a
+control node's disk and the cluster's backups still hold earlier versions with
+the wrapped key, which opens nothing without a copy of the erased disk. The record on the disk shows that a code
+exists (not what it is: it holds a public key made from the code). The answer
+at the console is the same; the request to the cluster, the write to the
+disk, and the record that is gone afterwards are there for whoever watches
+the network or reads the disk. It works at a waiting console only: a node
+that runs has its state open. And whoever has the code and can reach a node's
+port can have the cluster forget without being at any console: keep a code as
+you keep a recovery key.
 
 **The machine's own TPM.** `kith node seal beta` lets beta keep its key
 itself, sealed to its TPM and to the system it runs: from then on it opens
@@ -3348,19 +3445,22 @@ What is and is not protected:
 - Until another node holds the key it stays on the node's own disk, and the
   node says so at each start: a cluster's first node, until a second has
   joined, is not protected.
-- Whoever may apply NodeKeys can lock and wipe; a running node gives its
-  NodeKey again when it is deleted or written over, and one that was off
+- Whoever may apply NodeKeys can lock and wipe, have a node make a new
+  recovery key (and is shown it), and make duress codes; a running node gives
+  its NodeKey again when it is deleted or written over, and one that was off
   meanwhile needs its recovery key.
 - The config partition (the node's name, address, and the join token it was
   installed with, spent since) and the system itself are not encrypted.
 - Anyone who can reach a node's port can ask for a key by its id; what they
-  are sent opens nothing without the disk's secret.
+  are sent opens nothing without the disk's secret. They can ask it to forget
+  one too, which it does only for a number it gave within the last minute,
+  signed with the key of a duress code, once.
 - A stolen machine that is not locked, started on the cluster's own network,
   is handed its key: lock it when it goes missing.
 
 Not yet: a passphrase and the TPM both asked for (two locks, where these are
-two doors), a keyboard layout at the console, encrypting a node that was not installed that way, a new recovery key for a
-running node.
+two doors), a keyboard layout at the console, encrypting a node that was not installed that way, the disk's secret kept in
+the TPM (so that erasing it would not depend on what a flash disk keeps), a duress code that opens a decoy.
 
 ### Not in kith OS yet
 
@@ -3764,9 +3864,15 @@ kithd is linked by the Rust toolchain's own lld, with the functions it runs from
 start until it has idled a while first in its code, in the order
 `crates/kithd/kithd.order` lists them. The kernel keeps in memory the pages around each
 one a process touches: with that code where the compiler put it, all over the binary,
-kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it holds
-3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
-was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
+kithd with nothing to do held 10.50 MB without the order and 4.62 MB with it
+(`python3 ci/budgets.py`; the budget stays 9.00 MB). Those are of the binary read from
+disk, as a node has it: `ci/budgets.py` drops the file's cache and reads it back before it
+starts kithd, so the number is the same right after a build and an hour later. Right
+after a build, with the file in the page cache as the linker wrote it, the kernel maps
+fewer pages around each one touched, and kithd held 8.75 MB without the order and 3.75 MB
+with it (an earlier version of this paragraph told those: 8.91 and 3.81). On tmpfs the
+cache cannot be dropped and the number is that of the file as it is there. The binary is
+11.35 MB, as it was without the order. `python3 ci/order.py` writes the file again from a run of the kithd it
 builds: a breakpoint on every function, taken off the first time it is hit, so each one
 that runs is seen once and in order (x86_64 Linux). The file holds each name as a
 pattern, without what an ordinary change gives another value: the letters Rust writes
@@ -3779,9 +3885,9 @@ the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
 or under four fifths of those are together where its code starts. The order is of
 one compiler, the one `rust-toolchain.toml` names (rustup installs it by itself):
 Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held
-5.96 MB. After naming another there, run `python3 ci/order.py` again. A toolchain with
-no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
-again (the check then fails, saying there is no lld).
+5.96 MB (measured right after the build). After naming another there, run `python3
+ci/order.py` again. A toolchain with no lld links kithd in the compiler's order, with a
+warning, and it holds the 10.50 MB again (the check then fails, saying there is no lld).
 
 That number is of a kithd with nothing to do on the machine that built it. As the first
 process of kith OS it does more before it serves (its mounts, the state partition, DHCP,
@@ -3811,6 +3917,7 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
 sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)

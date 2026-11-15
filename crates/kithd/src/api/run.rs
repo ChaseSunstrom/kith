@@ -439,7 +439,18 @@ sys.exit(subprocess.run(args[4:], stdin=s, stdout=s).returncode)
         static PATH: OnceLock<String> = OnceLock::new();
         PATH.get_or_init(|| {
             let path = std::env::temp_dir().join(format!("kith-run-on-stand-in-{}", std::process::id()));
-            std::fs::write(&path, STAND_IN).unwrap();
+            // Not `fs::write` on `path`: while this process holds it open for writing, another
+            // test thread that forks keeps a copy of the descriptor until its exec, and running
+            // the file meanwhile fails with ETXTBSY. `cp` is the only writer, and forks nothing.
+            let mut draft = path.clone().into_os_string();
+            draft.push(".draft");
+            std::fs::write(&draft, STAND_IN).unwrap();
+            let copied = std::process::Command::new("cp")
+                .arg(&draft)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(copied.success(), "cp of the stand-in: {copied}");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path.display().to_string()
         })

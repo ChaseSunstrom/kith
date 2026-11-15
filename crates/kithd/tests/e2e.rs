@@ -2184,17 +2184,57 @@ fn wasm_controller_makes_what_its_resource_needs() {
     wait_for("the server's settings to go", || data("one-config").is_none());
 }
 
-/// curl, for the web UI's tests: (status, headers in lower case, body).
+/// curl, for the web UI's tests: (status, headers in lower case, body). Asked again while curl
+/// got no answer (a host too loaded to answer in its 10 s), up to the suite's deadline.
 fn fetch(args: &[&str]) -> (u16, String, String) {
-    let out = Command::new("curl")
-        .args(["-s", "-i", "--max-time", "10"])
-        .args(args)
-        .output()
-        .unwrap();
-    let out = String::from_utf8(out.stdout).unwrap();
-    let (head, body) = out.split_once("\r\n\r\n").unwrap_or_default();
-    let status = head.split(' ').nth(1).and_then(|status| status.parse().ok());
-    (status.unwrap_or(0), head.to_lowercase(), body.to_string())
+    fetch_within(Duration::from_secs(90), args)
+}
+
+/// [`fetch`] with a deadline of `within`; an answer of any status ends it.
+/// (ponytail: a POST whose answer was lost is sent again: the tests' posts are applies, which are idempotent.)
+fn fetch_within(within: Duration, args: &[&str]) -> (u16, String, String) {
+    let deadline = Instant::now() + within;
+    loop {
+        let out = Command::new("curl")
+            .args(["-s", "-i", "--max-time", "10"])
+            .args(args)
+            .output()
+            .unwrap();
+        let out = String::from_utf8(out.stdout).unwrap();
+        let (head, body) = out.split_once("\r\n\r\n").unwrap_or_default();
+        let status = head.split(' ').nth(1).and_then(|status| status.parse().ok());
+        if let Some(status) = status {
+            return (status, head.to_lowercase(), body.to_string());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for an answer from curl {}",
+            args.join(" ")
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A server that drops the first connection with no answer is asked again, and the second answer is the one returned.
+#[test]
+fn fetch_asks_again_while_curl_got_no_answer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        drop(listener.accept().unwrap());
+        let (mut second, _) = listener.accept().unwrap();
+        std::io::Write::write_all(&mut second, b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi").unwrap();
+    });
+    let (status, _, body) = fetch_within(Duration::from_secs(30), &[&url]);
+    assert_eq!((status, body.as_str()), (200, "hi"));
+    server.join().unwrap();
+}
+
+/// Past its deadline with no answer, fetch says what it asked.
+#[test]
+#[should_panic(expected = "timed out waiting for an answer from curl http://127.0.0.1:1/")]
+fn fetch_says_what_it_waited_for() {
+    fetch_within(Duration::from_millis(300), &["http://127.0.0.1:1/"]);
 }
 
 #[test]
