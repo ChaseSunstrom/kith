@@ -209,8 +209,8 @@ Only the newest version is fixed. There are no security releases of older ones.
   replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
   downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
   it is unpacked. An unpack holds only the directories the archive is inside of, a path,
-  a mode and a time each, and refuses an entry more than 128 directories down; an
-  entry's headers (its name, and a long name, PAX header or sparse map the tar crate
+  a mode and a time each, and refuses an entry more than 128 directories down (as deep
+  as a Backup packs, so what a restore takes is backed up again); an entry's headers (its name, and a long name, PAX header or sparse map the tar crate
   reads whole) are refused past 256 KiB, and an archive that ends inside an entry is
   refused: its memory does not grow with the archive. An unpack that fails opens what
   it unpacked to its owner and removes it, holding open only the directories it is
