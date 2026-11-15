@@ -230,6 +230,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   kith checks no DNSSEC signature, so an answer forged on the way from them lasts that
   long, and answers given from what is kept do not count toward a client's limit on
   forwarded questions.
+- **A host a Service exposes is answered at the ingress nodes' LAN addresses, to the clients of its zone.**
+  Each host a Service exposes under a zone's domain (and its Namespace keeps for it) is given the LAN
+  address of every node serving ingress, unless a DNSRecord has the name. Whoever may write a Service
+  or a Namespace decides which names those are, and the answer is only as private as the zone's `clients`.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can
