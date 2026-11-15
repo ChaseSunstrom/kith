@@ -562,6 +562,11 @@ async fn behind(
                     // (A refused request is not answered, so it does not hold the idle time off.)
                     let busy = request.extensions().get::<Busy>();
                     debug_assert!(busy.is_some(), "a connection of the registry carries its Busy");
+                    // ponytail: the answering mark ends when the handler returns, before a body
+                    // has gone out. That holds while a body's bytes come without waiting (a blob
+                    // is a file of this node by then, see `blobs::chunks`): the idle time then
+                    // starts over as bytes move and runs out only on a client that stops reading.
+                    // A body that waits on something else would need the mark carried in it.
                     let _answering = busy.map(|busy| busy.answering());
                     next.run(request).await
                 }
