@@ -215,6 +215,11 @@ spec! {
         /// followed as a leader, and gets nothing that asks for control nodes.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub trust: Option<Trust>,
+        /// A worker that serves ingress: its view holds the certificates of the hosts the
+        /// cluster exposes (and so their keys), and it may say it serves ingress. Written by
+        /// the node that admitted it, from its token; a control node orders its certificates.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub ingress: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<NodeMesh>,
     }

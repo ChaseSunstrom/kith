@@ -253,7 +253,7 @@ pub async fn order(directory: &str, account: &Account, host: &str) -> Fallible<(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
     use std::sync::{Arc, Mutex};
@@ -261,7 +261,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     /// What a test authority sends back: a status, its headers, its body.
-    type Answer = (u16, Vec<String>, Vec<u8>);
+    pub(crate) type Answer = (u16, Vec<String>, Vec<u8>);
 
     /// A request's head and body, the body read as far as its Content-Length says.
     async fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
@@ -346,7 +346,7 @@ mod tests {
     /// A certificate authority on 127.0.0.1 (the only address these tests reach), whose
     /// certificates are for `names`. `change` sees each answer with its path and sends
     /// what it says instead. Gives the authority's address and the paths asked of it.
-    async fn authority(
+    pub(crate) async fn authority(
         names: &'static str,
         change: impl Fn(&str, &Answer) -> Answer + Send + Sync + 'static,
     ) -> (String, Arc<Mutex<Vec<String>>>) {

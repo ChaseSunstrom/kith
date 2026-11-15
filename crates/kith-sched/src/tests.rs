@@ -17,6 +17,7 @@ fn node(name: &str, cpu: f64, mem_gi: f64) -> Node {
         unschedulable: None,
         roaming: None,
         trust: None,
+        ingress: None,
         mesh: None,
     };
     Node {

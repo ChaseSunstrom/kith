@@ -167,10 +167,14 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
             only(key, fields, &["os", "mesh", "serves"])?;
             if let Some(serves) = fields.get("serves") {
                 serving_shape(key, serves)?;
-                // A worker that joined to run from a view was let in to read the store, not to answer ingress.
+                // A worker that joined to run from a view answers ingress only when its token let
+                // it: the node that admitted it wrote `spec.ingress` (its view holds the certificates).
                 let viewed = live.status.as_ref().is_some_and(|status| status["view"] == true);
-                if viewed && serves.get("ingress").is_some() {
-                    return Err(refused(key, "ingress is not served by a worker that runs from a view"));
+                if viewed && serves.get("ingress").is_some() && live.spec["ingress"] != true {
+                    return Err(refused(
+                        key,
+                        "ingress is served by a worker that joined with a token from `kith node token --worker --ingress`",
+                    ));
                 }
             }
             // Two nodes that say one key are both left out of the mesh: saying another's cuts it off.
@@ -703,12 +707,112 @@ spec: { volume: there, every: 1d }
             )
             .unwrap();
         let ingress = patch_of("Node/w-b", json!({ "serves": { "ingress": true } }));
-        assert!(try_as(&store, "w-b", ingress).unwrap_err().contains("ingress"));
+        assert!(try_as(&store, "w-b", ingress.clone()).unwrap_err().contains("ingress"));
         let dns = patch_of("Node/w-b", json!({ "serves": { "dns": 53 } }));
         assert!(try_as(&store, "w-b", dns).is_ok());
+        // Unless it joined with a token for an ingress worker: its Node says so.
+        ingress_worker(&mut store, "w-b");
+        assert!(try_as(&store, "w-b", ingress).is_ok());
         // `view` is a control node's to write, as its address is.
         let view = patch_of("Node/w", json!({ "view": true }));
         assert!(try_as(&store, "w", view).unwrap_err().contains("view"));
+    }
+
+    /// Make `node` a worker that joined to serve ingress from a view, as its join writes it.
+    fn ingress_worker(store: &mut Store, node: &str) {
+        let mut live = store.get(&format!("Node/{node}")).unwrap().clone();
+        live.spec["ingress"] = true.into();
+        store.put(live);
+    }
+
+    fn resource(of: Value) -> Resource {
+        serde_json::from_value(of).unwrap()
+    }
+
+    /// Every write the ingress loop makes (`crate::ingress`): an ACME account key, a host's
+    /// certificate, the thumbprint a worker answers challenges with, and a Service's `tls` status.
+    /// Each is a control node's: a worker, even one that serves ingress, makes none of them. It
+    /// says of its own Node that it serves ingress, and that alone.
+    #[test]
+    fn ingress_writes_are_a_control_nodes_and_an_ingress_worker_says_only_that_it_serves() {
+        let mut store = store();
+        let service = resource(json!({
+            "apiVersion": "kith.dev/v1", "kind": "Service", "metadata": { "name": "web" },
+            "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }], "expose": { "host": "web.example.test", "via": "edge" } },
+        }));
+        store.apply(service).unwrap();
+        ingress_worker(&mut store, "w");
+        store
+            .set_status(
+                "Node/w",
+                Some(json!({ "address": "10.0.0.2:7443", "raftId": "2", "view": true })),
+            )
+            .unwrap();
+        let secret = |name: &str, namespace: &str, data: Value| {
+            resource(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Secret",
+                "metadata": { "name": name, "namespace": namespace }, "spec": { "data": data },
+            }))
+        };
+        // A certificate already ordered, which the control node renews or replaces.
+        let ordered = secret(
+            "tls-web.example.test",
+            "default",
+            json!({ "tls.crt": "c", "tls.key": "k" }),
+        );
+        store.apply(ordered).unwrap();
+        let apply = |resource: Resource| Command::Apply {
+            resources: vec![resource],
+            at: 0,
+        };
+        let writes = [
+            (
+                "the ACME account key",
+                apply(secret("acme-account", "kith-system", json!({ "key": "k" }))),
+            ),
+            (
+                "a host's certificate",
+                apply(secret(
+                    "tls-web.example.test",
+                    "default",
+                    json!({ "tls.crt": "c", "tls.key": "k" }),
+                )),
+            ),
+            (
+                "the thumbprint",
+                apply(resource(json!({
+                    "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+                    "metadata": { "name": "acme", "namespace": "kith-system" }, "spec": { "data": { "thumbprint": "t" } },
+                }))),
+            ),
+            (
+                "a Service's tls status",
+                patch_of(
+                    "Service/default/web",
+                    json!({ "tls": { "state": "ordering", "by": "w" } }),
+                ),
+            ),
+            (
+                "a certificate's deletion",
+                Command::Delete {
+                    key: "Secret/default/tls-web.example.test".into(),
+                },
+            ),
+        ];
+        for (what, write) in writes {
+            assert!(
+                try_as(&store, "w", write).is_err(),
+                "{what} is a control node's to write"
+            );
+        }
+        // What it serves, on its own Node; not on another worker's that joined without ingress.
+        let serves = |node: &str| patch_of(&format!("Node/{node}"), json!({ "serves": { "ingress": true } }));
+        assert!(try_as(&store, "w", serves("w")).is_ok());
+        store
+            .set_status("Node/w-b", Some(json!({ "address": "10.0.0.3:7443", "view": true })))
+            .unwrap();
+        assert!(try_as(&store, "w-b", serves("w-b")).is_err());
+        assert!(try_as(&store, "w", serves("w-b")).is_err());
     }
 
     fn unit(replica: u64, more: Value) -> Value {

@@ -698,7 +698,7 @@ kith node status                                   # who leads the store, who vo
 
   ```sh
   kith node token --worker             # on alpha: the node this token lets in is a worker
-  kith node token --worker --ingress   # a worker that serves ingress: it is sent the whole store
+  kith node token --worker --ingress   # a worker that serves ingress: it is sent the hosts' certificates too
   ```
 
   ```yaml
@@ -769,8 +769,8 @@ kith node status                                   # who leads the store, who vo
 
   A worker holds no blob but one it is using, is given no encrypted Volume's key to
   keep, and its copy of a replicated Volume takes over only when no control node has
-  one. Not on a worker yet: an ingress that gets its certificates by ACME (it would
-  have to write them), and being the only node that answers DNS if you read
+  one. Not on a worker yet: ordering certificates by ACME (an ingress worker serves
+  the ones a control node orders, below), and being the only node that answers DNS if you read
   `DNSRecord` or `DNSBlockList` status (a worker answers and leaves the status to
   the control nodes).
 
@@ -794,11 +794,35 @@ kith node status                                   # who leads the store, who vo
   worker`). A
   control node, or a worker from before views, that is made a worker erases its
   copy of the store once its first view is written down; to make it a control node
-  again, delete its Node and join it again. A worker that serves ingress is still
-  sent the whole store (it reads the hosts' certificates), so the node the internet
-  reaches holds no less as a worker yet; it is let in only by a token that says so,
-  `kith node token --worker --ingress`, and a plain worker's token refuses a kithd
-  started with `--ingress`. What a worker that is taken still
+  again, delete its Node and join it again.
+
+  A worker that serves ingress (the node the internet reaches) runs from a view too,
+  which also holds the `tls-` Secret of every host a Service exposes and the ACME
+  account's thumbprint (the ConfigMap `kith-system/acme`), never the account's key.
+  It is let in only by a token that says so, and a plain worker's token refuses a
+  kithd started with `--ingress`. Its certificates are ordered by a control node:
+  start the control nodes with `--acme` (with or without `--ingress`); the one that
+  leads orders for the workers' hosts, and the worker answers the authority's
+  challenges on port 80:
+
+  ```sh
+  kithd --acme ...                         # on each control node
+  kith node token --worker --ingress       # on a control node
+  kithd --join ADDRESS --token TOKEN --ingress --mesh   # on the edge machine
+  ```
+
+  If that worker is taken, it has every exposed host's key: delete its Node, then
+  delete each `tls-` Secret (`kith get secret`) and the control node orders new ones
+  with new keys. To move an ingress worker to another machine: join the new one as
+  above, point the hosts' DNS at it, then delete the old one's Node. A worker that
+  served ingress before this (sent the whole store to do it) goes on being sent the
+  store, and its kithd and every control node that sends it the store say so, with
+  what to do: delete its Node and join it again with an ingress worker's token, or
+  set `ingress: true` in its Node's spec (it then asks for a view and erases its
+  copy). In a cluster half updated, an older control node writes no `ingress` into a
+  Node it admits (that worker is sent the whole store, as before, and is warned
+  about) and sends a worker it serves no certificate: update every control node
+  before an ingress worker joins. What a worker that is taken still
   has is in SECURITY.md, "A node that is taken"; the design is `docs/adr-workers.md`.
   Say `trust` only once every node runs a kithd that knows it: an older kithd
   does not read a Node or a Secret that has it, an older control node writes
@@ -838,7 +862,8 @@ kith node status                                   # who leads the store, who vo
   another ACME directory; giving the flag agrees to that authority's terms)
   and another before it runs out. The host's DNS has to point at the ingress
   nodes first: the authority checks by asking port 80 there, and any node
-  with `--ingress` can answer. `kith get service/NAME -o yaml` shows how it
+  with `--ingress` can answer (an ingress worker's are ordered by a control
+  node with `--acme`, above). `kith get service/NAME -o yaml` shows how it
   went (`tls`: its `secret` names the Secret whose certificate serves the
   host, one applied by hand included); after a failure kithd tries again an
   hour later, not sooner.

@@ -926,12 +926,14 @@ pub async fn token(
         return refused.into_response();
     }
     // `?trust=worker`: the node it lets in is one (`spec.trust`), from its first moment, and
-    // is sent a view of the store; `&store=whole`: the store all the same (it serves ingress).
+    // is sent a view of the store; `&store=whole`: it serves ingress (`spec.ingress`), and its
+    // view holds the certificates of the exposed hosts too. (The words are from when such a
+    // worker was sent the whole store: a control node from then still makes that token of them.)
     let said = |field: &str| asked.get(field).map(String::as_str);
     let lets = match (said("trust"), said("store")) {
         (None | Some("control"), None) => pki::Lets::Control,
         (Some("worker"), None) => pki::Lets::Worker,
-        (Some("worker"), Some("whole")) => pki::Lets::WorkerWhole,
+        (Some("worker"), Some("whole")) => pki::Lets::WorkerIngress,
         (trust, store) => {
             let (trust, store) = (trust.unwrap_or("control"), store.unwrap_or_default());
             let why = format!(
@@ -1035,9 +1037,13 @@ struct JoinRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mesh: Option<OnMesh>,
     /// It can run from a view if it is let in as a worker (a kithd from before views says
-    /// nothing; one that serves ingress says no). What it is sent is its token's to say.
+    /// nothing, and one from before ingress workers said no if it served ingress). What it is
+    /// sent is its token's to say.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     view: bool,
+    /// It serves ingress (`--ingress`): a worker token has to say so too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ingress: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1200,14 +1206,25 @@ async fn join(
             "the join token is wrong, already used, or older than an hour",
         ));
     };
-    // Whether a worker is sent the store is its token's maker's to say: a node that cannot run
-    // from a view (it serves ingress, or its kithd is from before views) is not let in by a
-    // token that does not say so.
-    let (worker, view) = (lets != pki::Lets::Control, lets == pki::Lets::Worker);
-    if view && !request.view {
-        let why = "this token lets in a worker that runs from a view of the store, and this node cannot \
-                   (it serves ingress, or its kithd is older): ask for a token with `kith node token --worker --ingress` \
-                   (the node is then sent the whole store), or join it without --ingress";
+    // A worker runs from a view, and whether it serves ingress (and is sent the certificates
+    // of the exposed hosts) is its token's maker's to say: the joiner has to say the same.
+    let (worker, ingress) = (lets != pki::Lets::Control, lets == pki::Lets::WorkerIngress);
+    let mismatch = match (worker, ingress, request.view, request.ingress) {
+        (true, _, false, _) => Some(
+            "this token lets in a worker, which runs from a view of the store, and this node's kithd is older \
+             than views: update it, or ask for a token without --worker",
+        ),
+        (true, false, _, true) => Some(
+            "this token lets in a worker that serves no ingress: ask for a token with \
+             `kith node token --worker --ingress`, or join it without --ingress",
+        ),
+        (true, true, _, false) => Some(
+            "this token lets in a worker that serves ingress: join it with --ingress, or ask for a token \
+             with `kith node token --worker`",
+        ),
+        _ => None,
+    };
+    if let Some(why) = mismatch {
         return Err(refuse(StatusCode::CONFLICT, why));
     }
     pki::valid_name(&request.name).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
@@ -1305,6 +1322,9 @@ async fn join(
     if worker {
         spec["trust"] = "worker".into();
     }
+    if ingress {
+        spec["ingress"] = true.into();
+    }
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node",
         "metadata": { "name": request.name }, "spec": spec,
@@ -1328,8 +1348,8 @@ async fn join(
             SocketAddr::new(mesh_address.into(), request.port)
         }
     };
-    // A worker that runs from a view is never sent the store: its Node says so from the start.
-    if view {
+    // A worker runs from a view and is never sent the store: its Node says so from the start.
+    if worker {
         more.insert("view".into(), true.into());
     }
     let address = address.to_string();
@@ -1348,19 +1368,19 @@ async fn join(
         cert,
         key,
         peers,
-        view: view.then(|| (cluster.me.name.clone(), pki::print_of(&cluster.me.cert).ok())),
+        view: worker.then(|| (cluster.me.name.clone(), pki::print_of(&cluster.me.cert).ok())),
     }))
 }
 
-/// Trade a join token for an identity, at the node `address`.
-/// `view`: let in as a worker, it will run from a view.
+/// Trade a join token for an identity, at the node `address`. Let in as a worker, it runs
+/// from a view; `ingress`: it serves ingress (`--ingress`).
 pub async fn request_join(
     address: &str,
     token: &str,
     name: &str,
     port: u16,
     mesh: Option<OnMesh>,
-    view: bool,
+    ingress: bool,
 ) -> Fallible<Joined> {
     pki::valid_name(name)?;
     let (secret, pinned, maker) = pki::token_parts(token)?;
@@ -1412,7 +1432,8 @@ pub async fn request_join(
         name: name.into(),
         port,
         mesh,
-        view,
+        view: true,
+        ingress,
     };
     let member = client_for(&ca, None, held)?
         .post(format!("https://{address}/v1/join"))
@@ -1636,6 +1657,7 @@ pub(crate) mod pinned_peer {
                 port: 7000,
                 mesh: None,
                 view: false,
+                ingress: false,
             };
             join(State(shared.clone()), ConnectInfo(peer.clone()), Json(request))
         };
@@ -1698,6 +1720,7 @@ pub(crate) mod pinned_peer {
             port: 7000,
             mesh: None,
             view: true,
+            ingress: false,
         };
         let refused = join(State(shared.clone()), ConnectInfo(peer), Json(request)).await;
         let (status, Json(said)) = refused.err().expect("a name that takes a Device is refused");
@@ -1714,6 +1737,67 @@ pub(crate) mod pinned_peer {
         );
         let store = shared.store.lock().unwrap();
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
+    }
+
+    /// A token for an ingress worker lets in a worker that runs from a view, and the node that
+    /// admits it writes `spec.ingress` on its Node (the joiner never does). The joiner has to say
+    /// what its token says; a refusal does not spend the token.
+    #[tokio::test]
+    async fn join_lets_in_an_ingress_worker_to_a_view_its_node_saying_ingress() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let mint = |lets| cluster.tokens.mint(&cluster.me.ca, Some(&cluster.me), lets).unwrap();
+        let (edge, plain) = (mint(pki::Lets::WorkerIngress), mint(pki::Lets::Worker));
+        let shared = shared_of("join-ingress", cluster, &[]).await;
+        let peer = Peer {
+            addr: "127.0.0.1:2".parse().unwrap(),
+            subject: None,
+        };
+        let join = |token: &str, name: &str, view: bool, ingress: bool| {
+            let request = JoinRequest {
+                token: token.into(),
+                name: name.into(),
+                port: 7000,
+                mesh: None,
+                view,
+                ingress,
+            };
+            join(State(shared.clone()), ConnectInfo(peer.clone()), Json(request))
+        };
+        let refusal = |said: Result<Json<Joined>, Refusal>| {
+            let (status, Json(said)) = said.err().expect("refused");
+            assert_eq!(status, StatusCode::CONFLICT);
+            said["error"].as_str().unwrap().to_string()
+        };
+        // An ingress joiner with a token that does not say ingress, and the other way round.
+        let said = refusal(join(&plain, "w", true, true).await);
+        assert!(said.contains("kith node token --worker --ingress"), "{said}");
+        let said = refusal(join(&edge, "w", true, false).await);
+        assert!(said.contains("join it with --ingress"), "{said}");
+        // A kithd from before views cannot run from one.
+        let said = refusal(join(&edge, "w", false, true).await);
+        assert!(said.contains("update it"), "{said}");
+        let cluster = shared.cluster.as_ref().unwrap();
+        assert!(cluster.tokens.good(&edge, false).is_some() && cluster.tokens.good(&plain, false).is_some());
+
+        let joined = join(&edge, "edge", true, true)
+            .await
+            .map_err(|(_, Json(said))| said)
+            .unwrap();
+        assert_eq!(joined.0.view.as_ref().map(|(name, _)| name.as_str()), Some("a"));
+        let edge = shared.store.lock().unwrap().store.get("Node/edge").cloned().unwrap();
+        assert_eq!(
+            (&edge.spec["trust"], &edge.spec["ingress"]),
+            (&"worker".into(), &true.into())
+        );
+        assert_eq!(edge.status.as_ref().unwrap()["view"], true);
+        // A worker without it: no `ingress` on its Node.
+        let _ = join(&plain, "w", true, false)
+            .await
+            .map_err(|(_, Json(said))| said)
+            .unwrap();
+        let store = shared.store.lock().unwrap();
+        assert!(store.store.get("Node/w").unwrap().spec.get("ingress").is_none());
     }
 
     /// Only our certificate check's refusal ends a join's asking; a handshake cut short (an alert)
