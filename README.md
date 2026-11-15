@@ -178,9 +178,13 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   daemon: for trying things out, not for looking into a kithd's state.
 - Runs each `Workload` container in its own cgroup with youki's `libcontainer`
   linked in: no containerd, no shim, no root. Images are pulled into a
-  content-addressed store; one pulled before starts without asking the registry
-  (about 25 ms from `kith apply` to first output here), so `pullPolicy: always` is
-  how you follow a tag that moves. Memory and CPU limits, `command`/`args`, and `env`
+  content-addressed store; one pulled before starts without asking the registry (but
+  one of this node's own registry, below; about 25 ms from `kith apply` to first output
+  here), so `pullPolicy: always` is
+  how you follow a tag that moves. A cluster Image of this node's own registry is
+  always asked, whatever its policy: one deleted, or made again under its name, is
+  not started from the copy kept here (asking for an unchanged one takes about 22 ms
+  here). Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
   had run for a minute), then after a wait that doubles from a second up to a
@@ -325,7 +329,8 @@ spec:
   or Ed25519: the text of the `.pub` file, or the base64 in it. An image already on the
   node counts as signed only by the keys a signature of it was found by; `pullPolicy:
   never` with a key the node has not checked it against does not start. With no
-  `signedBy`, an image is run whoever made it.
+  `signedBy`, an image is run whoever made it. Whatever its `pullPolicy`, a cluster
+  Image of this node's own registry is asked for again before it starts (see above).
 - **What it still reaches.** The node's network (and so every port on its loopback, and
   the sockets programs of the node listen on by name alone, without a file), the
   kernel through every call the filter lets by, and the devices it claims: a GPU's render

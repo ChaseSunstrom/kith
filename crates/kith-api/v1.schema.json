@@ -3028,7 +3028,7 @@
         "always",
         "never"
       ],
-      "description": "`ifNotPresent` never notices a tag that moved at the registry."
+      "description": "`ifNotPresent` never notices a tag that moved at the registry. A reference of this\nnode's own registry is always asked, whatever the policy."
     },
     "Quantity": {
       "type": "string",

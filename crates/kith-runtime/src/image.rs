@@ -17,12 +17,24 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub struct ImageStore {
     root: PathBuf,
     /// This node's own registry, where it serves one.
     pub local: Option<Local>,
+    /// How long the own registry may take to accept a connection, and to answer one read
+    /// ([`OWN_CONNECT`], [`OWN_READ`]). Tests shorten them.
+    pub own_timeouts: (Duration, Duration),
 }
+
+/// Waiting for the node's own registry to accept a connection. It is on this machine: a
+/// connection that takes longer than this is a registry that is not there.
+const OWN_CONNECT: Duration = Duration::from_secs(10);
+/// Waiting for the node's own registry to answer a read. A start awaits its pull inside the
+/// controller's pass, so a registry that accepts and then stalls would hold every unit's start
+/// with it; past this, the start fails with its reason instead.
+const OWN_READ: Duration = Duration::from_secs(30);
 
 /// This node's own registry of the cluster's Images, as its kithd made it at this start.
 /// It is asked over TLS, trusting the one certificate it was started with and no other,
@@ -76,7 +88,8 @@ pub struct Image {
     pub from_cache: bool,
 }
 
-/// When to ask the registry what a reference points at.
+/// When to ask the registry what a reference points at. A reference of this node's own
+/// registry is always asked, whatever the policy.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum PullPolicy {
     /// Only if this reference was never pulled here. A tag that moved at the
@@ -84,7 +97,8 @@ pub enum PullPolicy {
     #[default]
     IfNotPresent,
     Always,
-    /// Use what is here or fail: no network at all.
+    /// Use what is here or fail: no network at all (but for this node's own registry,
+    /// which is asked).
     Never,
 }
 
@@ -125,7 +139,11 @@ impl ImageStore {
         }
         // Images keep their setuid bits; nobody else on this machine gets to run them.
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).ctx(format!("securing {}", root.display()))?;
-        Ok(ImageStore { root, local: None })
+        Ok(ImageStore {
+            root,
+            local: None,
+            own_timeouts: (OWN_CONNECT, OWN_READ),
+        })
     }
 
     /// Where the store remembers what `reference` resolved to.
@@ -191,14 +209,18 @@ impl ImageStore {
             .iter()
             .map(|key| crate::signed::key(key))
             .collect::<Result<_>>()?;
+        // The node's own registry is always asked, whatever the policy: an Image of it that is
+        // here may have been deleted with its namespace, or made again under the same name, since.
+        let own = self.local.as_ref().filter(|local| local.is(reference.registry()));
         let here = self.cached(&reference);
         let signed = |image: &Image| keys.is_empty() || keys.iter().any(|key| image.signed_by.contains(&key.id));
-        if policy != PullPolicy::Always
+        if own.is_none()
+            && policy != PullPolicy::Always
             && let Some(image) = here.clone().filter(signed)
         {
             return Ok(image);
         }
-        if policy == PullPolicy::Never {
+        if own.is_none() && policy == PullPolicy::Never {
             return err(match here {
                 None => format!("image `{reference}` is not here and its pull policy is `never`"),
                 Some(_) => format!(
@@ -208,7 +230,6 @@ impl ImageStore {
         }
         // The node's own registry is shown its password only once it has shown the
         // certificate it was started with: whatever else listens on that port is not it.
-        let own = self.local.as_ref().filter(|local| local.is(reference.registry()));
         let (config, auth) = match own {
             Some(local) => (
                 ClientConfig {
@@ -217,6 +238,8 @@ impl ImageStore {
                         encoding: oci_client::client::CertificateEncoding::Der,
                         data: (local.certificate)().ctx("the node's registry")?,
                     }],
+                    connect_timeout: Some(self.own_timeouts.0),
+                    read_timeout: Some(self.own_timeouts.1),
                     ..ClientConfig::default()
                 },
                 RegistryAuth::Basic("kithd".into(), local.password.clone()),
@@ -561,6 +584,7 @@ fn unpack_layer_capped(blob: &Path, media_type: &str, rootfs: &Path, budget: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use tar::{Builder, EntryType, Header};
 
     enum E<'a> {
@@ -981,5 +1005,415 @@ mod tests {
         ] {
             assert!(sha256_hex(bad).is_err(), "{bad}");
         }
+    }
+
+    type Files = Arc<std::sync::Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>>;
+
+    // (A test-only certificate for `localhost` and 127.0.0.1, valid for a hundred years and not
+    // a CA, with its key below, made with openssl: nothing trusts it but these tests' clients,
+    // which are told it by hand.)
+    const REGISTRY_CERTIFICATE: &str = "MIIBhDCCASqgAwIBAgIUQSHn5qa3SOvSNwHc/zDY+GlIP7MwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExNTA2MzI0M1oYDzIxMjYxMDIyMDYzMjQzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATpxnpqkmfgCLaqxTLOdv1xxDiweTwOFG3jF2FaCkR4hVGagoDe3hu/JTJD806s3Y9/9PDt6EiF7SrPOnBnNFjAo1gwVjAdBgNVHQ4EFgQUQpZJwqh1DYSEgKBb1HmdJg9Lg1YwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwCwYDVR0PBAQDAgeAMAoGCCqGSM49BAMCA0gAMEUCIEPXA9/RZwGM8VCZN/nY7RqxkR7HEDQUvV//jVG/rfSVAiEAwx4OjM7eaEMMDJmppsbKbm+yo1pXs9+RNuTT7RbpMfU="; // pragma: allowlist secret
+    const REGISTRY_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgpDvOyGoDPU2RfuNInjEEFAnwdX1/8mIVbtEL4zcvi2WhRANCAATpxnpqkmfgCLaqxTLOdv1xxDiweTwOFG3jF2FaCkR4hVGagoDe3hu/JTJD806s3Y9/9PDt6EiF7SrPOnBnNFjA"; // pragma: allowlist secret
+
+    /// A registry for these tests, over TLS with the certificate above (as the node's own
+    /// registry has one) or over plain HTTP. It serves `/v2/` and whatever `files` holds; any
+    /// other path is a 404, as an Image deleted with its namespace is. `asked` counts the
+    /// requests it answered (a handshake that fails answers none).
+    struct Registry {
+        port: u16,
+        certificate: Vec<u8>,
+        files: Files,
+        asked: Arc<std::sync::atomic::AtomicUsize>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Registry {
+        fn start(tls: bool) -> Registry {
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let decode = |text: &str| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text).unwrap();
+            let certificate = decode(REGISTRY_CERTIFICATE);
+            let config = tls.then(|| {
+                let key = rustls::pki_types::PrivatePkcs8KeyDer::from(decode(REGISTRY_KEY));
+                let config =
+                    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                        .with_safe_default_protocol_versions()
+                        .unwrap()
+                        .with_no_client_auth()
+                        .with_single_cert(
+                            vec![rustls::pki_types::CertificateDer::from(decode(REGISTRY_CERTIFICATE))],
+                            key.into(),
+                        )
+                        .unwrap();
+                Arc::new(config)
+            });
+            let files: Files = Arc::default();
+            let asked = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (serve_files, serve_asked, serve_stop) = (files.clone(), asked.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                while !serve_stop.load(Ordering::SeqCst) {
+                    let Ok((mut tcp, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    let _ = tcp.set_nonblocking(false);
+                    let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    match &config {
+                        Some(config) => {
+                            if let Ok(conn) = rustls::ServerConnection::new(config.clone()) {
+                                let mut tls = rustls::StreamOwned::new(conn, tcp);
+                                serve_one(&mut tls, &serve_files, &serve_asked);
+                            }
+                        }
+                        None => serve_one(&mut tcp, &serve_files, &serve_asked),
+                    }
+                }
+            });
+            Registry {
+                port,
+                certificate,
+                files,
+                asked,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// The node's own registry as its kithd would have made it: this certificate, this password.
+        fn local(&self) -> Local {
+            let certificate = self.certificate.clone();
+            Local {
+                port: self.port,
+                password: "open-sesame".into(), // pragma: allowlist secret
+                certificate: Arc::new(move || Ok(certificate.clone())),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Publishes `team/hello` at `tag` with this entrypoint, and returns its manifest digest.
+        /// Its one layer holds `bin/hello`, so an Image pulled again unchanged has a layer to not fetch.
+        fn publish(&self, tag: &str, entrypoint: &str) -> String {
+            let mut tar = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_size(5);
+            h.set_mode(0o755);
+            tar.append_data(&mut h, "bin/hello", &b"hello"[..]).unwrap();
+            let layer = tar.into_inner().unwrap();
+            let layer_digest = sha(&layer);
+            let config = serde_json::json!({
+                "architecture": "amd64", "os": "linux",
+                "config": { "Entrypoint": [entrypoint] },
+                "rootfs": { "type": "layers", "diff_ids": [] },
+            })
+            .to_string()
+            .into_bytes();
+            let config_digest = sha(&config);
+            let manifest = serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": config_digest, "size": config.len(),
+                },
+                "layers": [{ "mediaType": TAR, "digest": layer_digest, "size": layer.len() }],
+            })
+            .to_string()
+            .into_bytes();
+            let digest = sha(&manifest);
+            let json = "application/vnd.oci.image.manifest.v1+json";
+            let mut files = self.files.lock().unwrap();
+            files.insert(
+                format!("/v2/team/hello/blobs/{config_digest}"),
+                ("application/octet-stream".into(), config),
+            );
+            files.insert(
+                format!("/v2/team/hello/blobs/{layer_digest}"),
+                ("application/octet-stream".into(), layer),
+            );
+            files.insert(
+                format!("/v2/team/hello/manifests/{tag}"),
+                (json.into(), manifest.clone()),
+            );
+            files.insert(format!("/v2/team/hello/manifests/{digest}"), (json.into(), manifest));
+            digest
+        }
+
+        /// The namespace `team` is deleted: nothing under it is served any more.
+        fn delete_namespace(&self) {
+            self.files
+                .lock()
+                .unwrap()
+                .retain(|path, _| !path.starts_with("/v2/team/"));
+        }
+
+        /// The registry is down: it answers nothing, and its port refuses.
+        fn stop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    impl Drop for Registry {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+        let hex: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        format!("sha256:{hex}")
+    }
+
+    /// Answers one request on `conn`, then closes it.
+    fn serve_one<S: Read + Write>(conn: &mut S, files: &Files, asked: &std::sync::atomic::AtomicUsize) {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+            match conn.read(&mut byte) {
+                Ok(1) => head.push(byte[0]),
+                _ => return,
+            }
+        }
+        asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let head = String::from_utf8_lossy(&head).into_owned();
+        let target = head.split_whitespace().nth(1).unwrap_or("");
+        let path = target.split('?').next().unwrap_or("").to_string();
+        let found = files.lock().unwrap().get(&path).cloned();
+        let (status, kind, body, digest) = if path == "/v2/" {
+            ("200 OK", "application/json".to_string(), b"{}".to_vec(), None)
+        } else if let Some((kind, body)) = found {
+            let digest = sha(&body);
+            ("200 OK", kind, body, Some(digest))
+        } else {
+            let body = br#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"gone"}]}"#.to_vec();
+            ("404 Not Found", "application/json".to_string(), body, None)
+        };
+        let mut reply = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(digest) = digest {
+            reply.push_str(&format!("Docker-Content-Digest: {digest}\r\n"));
+        }
+        reply.push_str("\r\n");
+        let _ = conn.write_all(reply.as_bytes());
+        let _ = conn.write_all(&body);
+        let _ = conn.flush();
+    }
+
+    const POLICIES: [PullPolicy; 3] = [PullPolicy::IfNotPresent, PullPolicy::Always, PullPolicy::Never];
+
+    /// A cached reference of the node's own registry is asked for its manifest on every
+    /// pull, whatever the policy, and an unchanged Image is not unpacked again.
+    #[tokio::test]
+    async fn own_registry_is_asked_on_every_pull_and_an_unchanged_image_is_not_unpacked_again() {
+        use std::os::unix::fs::MetadataExt;
+        let (dir, _) = sandbox("own-registry-unchanged");
+        let registry = Registry::start(true);
+        let digest = registry.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(registry.local());
+        let reference = format!("localhost:{}/team/hello:1", registry.port);
+        let first = store.pull(&reference, PullPolicy::IfNotPresent).await.unwrap();
+        assert_eq!(first.digest, digest);
+        assert_eq!(first.downloaded, 1, "the first pull did not fetch its layer");
+        let unpacked = fs::metadata(&first.rootfs).unwrap().ino();
+        for policy in POLICIES {
+            let before = registry.asked();
+            let again = store
+                .pull(&reference, policy)
+                .await
+                .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+            assert!(
+                !again.from_cache,
+                "{policy:?}: answered from the store, not the registry"
+            );
+            assert_eq!(again.digest, digest, "{policy:?}");
+            assert_eq!(again.downloaded, 0, "{policy:?}: a layer was downloaded again");
+            assert!(registry.asked() > before, "{policy:?}: the registry was not asked");
+            assert_eq!(
+                fs::metadata(&again.rootfs).unwrap().ino(),
+                unpacked,
+                "{policy:?}: unpacked again"
+            );
+        }
+        drop(registry);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An Image deleted with its namespace, and made again, is not started from the store's copy.
+    #[tokio::test]
+    async fn own_registry_fails_a_start_whose_image_it_no_longer_has() {
+        let (dir, _) = sandbox("own-registry-deleted");
+        let registry = Registry::start(true);
+        registry.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(registry.local());
+        let reference = format!("localhost:{}/team/hello:1", registry.port);
+        store.pull(&reference, PullPolicy::IfNotPresent).await.unwrap();
+        registry.delete_namespace();
+        for policy in POLICIES {
+            let before = registry.asked();
+            let failed = store.pull(&reference, policy).await;
+            let Err(reason) = failed else {
+                panic!("{policy:?}: started a deleted Image from the store");
+            };
+            assert!(registry.asked() > before, "{policy:?}: the registry was not asked");
+            assert!(reason.to_string().contains("team/hello:1"), "{policy:?}: {reason}");
+            // The registry's refusal, in the words its 404 gave (the envelope is read, not a bare status).
+            assert!(
+                reason.to_string().contains("OCI API error: gone"),
+                "{policy:?}: {reason}"
+            );
+        }
+        drop(registry);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tag that moved under the node's own registry starts as the new Image, whatever the policy.
+    #[tokio::test]
+    async fn own_registry_starts_a_changed_tag_as_the_new_image() {
+        let (dir, _) = sandbox("own-registry-changed");
+        let registry = Registry::start(true);
+        let old = registry.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(registry.local());
+        let reference = format!("localhost:{}/team/hello:1", registry.port);
+        store.pull(&reference, PullPolicy::IfNotPresent).await.unwrap();
+        let new = registry.publish("1", "/bin/two");
+        assert_ne!(old, new);
+        for policy in POLICIES {
+            let image = store
+                .pull(&reference, policy)
+                .await
+                .unwrap_or_else(|e| panic!("{policy:?}: {e}"));
+            assert_eq!(image.digest, new, "{policy:?}");
+            assert_eq!(image.entrypoint, ["/bin/two"], "{policy:?}");
+        }
+        drop(registry);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The node's own registry being down fails the start with the reason, not with the cached copy.
+    #[tokio::test]
+    async fn own_registry_being_down_fails_the_start_with_its_reason() {
+        let (dir, _) = sandbox("own-registry-down");
+        let mut registry = Registry::start(true);
+        registry.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(registry.local());
+        let reference = format!("localhost:{}/team/hello:1", registry.port);
+        store.pull(&reference, PullPolicy::IfNotPresent).await.unwrap();
+        registry.stop();
+        for policy in POLICIES {
+            let failed = store.pull(&reference, policy).await;
+            let Err(reason) = failed else {
+                panic!("{policy:?}: started with the registry down");
+            };
+            assert!(reason.to_string().contains(&reference), "{policy:?}: {reason}");
+            assert!(
+                reason.to_string().contains("error sending request"),
+                "{policy:?}: {reason}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Another registry's reference keeps its policy: IfNotPresent answers from the store
+    /// without asking, and only Always asks.
+    #[tokio::test]
+    async fn own_registry_leaves_another_registrys_policy_as_it_was() {
+        let (dir, _) = sandbox("own-registry-other");
+        let own = Registry::start(true);
+        let other = Registry::start(false);
+        other.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(own.local());
+        let reference = format!("127.0.0.1:{}/team/hello:1", other.port);
+        store.pull(&reference, PullPolicy::Always).await.unwrap();
+        let before = other.asked();
+        let cached = store.pull(&reference, PullPolicy::IfNotPresent).await.unwrap();
+        assert!(cached.from_cache, "another registry was asked under IfNotPresent");
+        assert_eq!(other.asked(), before, "another registry was asked under IfNotPresent");
+        store.pull(&reference, PullPolicy::Always).await.unwrap();
+        assert!(other.asked() > before, "Always did not ask");
+        drop((own, other));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Other names for the node's registry's port are not it: they are sent no request at all
+    /// (no password either), and leave nothing in the store.
+    #[tokio::test]
+    async fn own_registry_names_at_its_port_that_are_not_its_own_pull_nothing() {
+        let (dir, _) = sandbox("own-registry-names");
+        let registry = Registry::start(true);
+        registry.publish("1", "/bin/one");
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(registry.local());
+        for name in ["[::1]", "LOCALHOST", "localhost.", "127.1"] {
+            let reference = format!("{name}:{}/team/hello:1", registry.port);
+            for policy in POLICIES {
+                assert!(store.pull(&reference, policy).await.is_err(), "{reference} {policy:?}");
+            }
+        }
+        assert_eq!(
+            registry.asked(),
+            0,
+            "a name that is not the node's own was sent a request"
+        );
+        assert_eq!(
+            fs::read_dir(dir.join("store/refs")).unwrap().count(),
+            0,
+            "a ref file was left"
+        );
+        drop(registry);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A registry that accepts a connection and never answers fails the start with its reason
+    /// within the own registry's timeouts, rather than holding the start for as long as it stalls.
+    #[tokio::test]
+    async fn own_registry_that_accepts_and_never_answers_fails_the_start_in_time() {
+        let (dir, _) = sandbox("own-registry-stalls");
+        // The kernel accepts a connection to it; nothing ever reads it or answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let certificate =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, REGISTRY_CERTIFICATE).unwrap();
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.local = Some(Local {
+            port,
+            password: "open-sesame".into(), // pragma: allowlist secret
+            certificate: Arc::new(move || Ok(certificate.clone())),
+        });
+        store.own_timeouts = (Duration::from_millis(200), Duration::from_millis(200));
+        let reference = format!("localhost:{port}/team/hello:1");
+        let started = std::time::Instant::now();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the start was still waiting on a registry that never answers after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("started from a registry that never answered");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(reason.to_string().contains(&reference), "{reason}");
+        drop(silent);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

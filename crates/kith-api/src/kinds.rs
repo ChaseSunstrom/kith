@@ -369,7 +369,8 @@ spec! {
         pub readiness: Option<Probe>,
     }
 
-    /// `ifNotPresent` never notices a tag that moved at the registry.
+    /// `ifNotPresent` never notices a tag that moved at the registry. A reference of this
+    /// node's own registry is always asked, whatever the policy.
     pub enum PullPolicy { IfNotPresent, Always, Never }
 
     pub struct ExecUnit {

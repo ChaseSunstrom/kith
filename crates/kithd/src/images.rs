@@ -686,6 +686,84 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The node's own registry is asked for an Image on every pull, as kithd's own store
+    /// answers it: one deleted from the store is not started from the copy the node kept,
+    /// and the pull says which Image it was. (The ask of an unchanged one is timed.)
+    #[tokio::test]
+    async fn cached_image_is_asked_for_again_after_it_is_deleted() {
+        let root = std::env::temp_dir().join(format!("kith-cached-image-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, blobs) = (root.join("volume"), root.join("blobs"));
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/hello"), "#!/bin/sh\necho hello\n").unwrap();
+        let spec: ImageSpec = serde_json::from_value(json!({ "volume": "out", "entrypoint": ["/bin/hello"] })).unwrap();
+        let [layer, config, manifest] = pack(&dir, &blobs, &spec).unwrap();
+        let mut kept = store(json!([
+            { "apiVersion": "kith.dev/v1", "kind": "Volume", "metadata": { "name": "out" }, "spec": { "node": "n1", "path": "out" } },
+            { "apiVersion": "kith.dev/v1", "kind": "Image", "metadata": { "name": "hello" },
+              "spec": { "volume": "out", "tag": "1", "entrypoint": ["/bin/hello"] } },
+        ]));
+        // (What `make` records for a made Image: its manifest's digest, and the blob each piece is.)
+        let names: serde_json::Map<String, Value> = [&layer, &config, &manifest]
+            .into_iter()
+            .map(|(sha, name, _)| (sha.clone(), json!(name)))
+            .collect();
+        let digest = format!("sha256:{}", manifest.0);
+        kept.set_status("Image/default/hello", Some(json!({ "digest": digest, "blobs": names })))
+            .unwrap();
+        let state = Arc::new(std::sync::Mutex::new(kept));
+        let serve = {
+            let state = state.clone();
+            move |uri: Uri| {
+                let (state, blobs) = (state.clone(), blobs.clone());
+                async move {
+                    let known = found(&state.lock().unwrap(), uri.path());
+                    match known {
+                        Some((key, sha)) => {
+                            let name = key.rsplit('/').next().unwrap_or_default();
+                            piece(uri.path(), &sha, std::fs::File::open(blobs.join(name)))
+                        }
+                        None if uri.path() == "/v2/" => "{}".into_response(),
+                        None => StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }
+        };
+        let (door, _stop) = opened(axum::Router::new().fallback(axum::routing::get(serve))).await;
+        let mut own = kith_runtime::ImageStore::new(root.join("own")).unwrap();
+        own.local = Some(door.local.clone());
+        let reference = format!("localhost:{}/default/hello:1", door.local.port);
+        let always = kith_runtime::PullPolicy::Always;
+        let first = own
+            .pull(&reference, kith_runtime::PullPolicy::IfNotPresent)
+            .await
+            .unwrap();
+        assert_eq!(first.downloaded, 1, "the first pull did not fetch the Image's layer");
+        let asking = std::time::Instant::now();
+        let again = own.pull(&reference, always).await.unwrap();
+        eprintln!(
+            "kithd cached_image: an unchanged Image asked for in {} ms",
+            asking.elapsed().as_millis()
+        );
+        assert_eq!(again.digest, digest);
+        assert_eq!(again.downloaded, 0, "an unchanged Image's layer was downloaded again");
+        state.lock().unwrap().delete("Image/default/hello").unwrap();
+        for policy in [
+            kith_runtime::PullPolicy::IfNotPresent,
+            always,
+            kith_runtime::PullPolicy::Never,
+        ] {
+            let reason = own.pull(&reference, policy).await.unwrap_err().to_string();
+            assert!(reason.contains("default/hello:1"), "{policy:?}: {reason}");
+            // The registry's refusal of the manifest it was asked for, not the store's copy.
+            assert!(
+                reason.contains("manifests/1"),
+                "{policy:?}: the registry was not asked: {reason}"
+            );
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn an_image_packed_from_a_directory_is_a_whole_oci_image() {
         let root = std::env::temp_dir().join(format!("kith-image-{}", std::process::id()));
