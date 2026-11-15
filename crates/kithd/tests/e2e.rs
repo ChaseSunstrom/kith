@@ -176,6 +176,42 @@ fn a_second_signal_ends_a_stopping_kithd() {
     assert!(said.contains("told to stop twice"), "{said}");
 }
 
+/// A request left half sent on kithd's socket does not hold its stop, and one it is answering
+/// when it is told to stop is answered whole.
+#[test]
+fn a_held_request_does_not_hold_a_stop() {
+    use std::io::Write;
+    let mut daemon = Daemon::start("held-request");
+    let g = watch_request(&daemon, "")["generation"].as_u64().unwrap();
+    let mut held = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
+    held.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: x\r\n").unwrap();
+    let (answered, told) = std::thread::scope(|scope| {
+        let watch = scope.spawn(|| watch_request(&daemon, &format!("?after={g}&wait=20")));
+        std::thread::sleep(Duration::from_millis(500));
+        Command::new("kill")
+            .arg(daemon.child.id().to_string())
+            .status()
+            .unwrap();
+        (watch.join().unwrap(), Instant::now())
+    });
+    assert_eq!(answered["generation"], g, "{answered}");
+    // (Three seconds is what it waits; a loaded machine is given eight.)
+    let ended = loop {
+        match daemon.child.try_wait().unwrap() {
+            Some(ended) => break Some(ended),
+            None if told.elapsed() > Duration::from_secs(8) => break None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    if ended.is_none() {
+        let _ = daemon.child.kill();
+    }
+    assert!(
+        ended.is_some_and(|ended| ended.success()),
+        "kithd waited for a request that was never finished: {ended:?}"
+    );
+}
+
 #[test]
 fn api_through_the_cli() {
     let mut daemon = Daemon::start("api");

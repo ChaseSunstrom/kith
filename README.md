@@ -230,7 +230,9 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   its first replica and the status says where. `strategy: recreate` replaces
   everything at once. A container or exec unit is replaced the same way when a
   `ConfigMap` or `Secret` value in its `env` changes.
-- On SIGTERM it stops everything it started. Told a second time while it
+- On SIGTERM it stops everything it started, and goes on answering the
+  requests it has for 3 seconds at most: a longer one (a large `kith volume
+  put`, a followed log) is cut there. Told a second time while it
   stops, it ends at once and its next start stops what was left (on kith OS
   the second signal changes nothing: the node still unmounts its disks).
 

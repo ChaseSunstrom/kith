@@ -286,6 +286,26 @@ fn installer(boot: init::Boot, source: String) -> ! {
     }
 }
 
+/// How long a server goes on with what it is answering, once kithd is stopping.
+const LAST_ANSWERS: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `served` until it ends, or [`LAST_ANSWERS`] after the stop. It ends by itself once every
+/// connection has, and a request left half sent, or an answer nobody reads, would hold it
+/// (and the stop, and a node's power-off) for as long as its client stays.
+async fn within(
+    served: impl IntoFuture<Output = std::io::Result<()>>,
+    mut stop: watch::Receiver<bool>,
+) -> std::io::Result<()> {
+    let late = async {
+        let _ = stop.wait_for(|stopping| *stopping).await;
+        tokio::time::sleep(LAST_ANSWERS).await;
+    };
+    tokio::select! {
+        ended = served.into_future() => ended,
+        () = late => Ok(()),
+    }
+}
+
 /// SIGTERM and SIGINT, heard from here on (one that comes before it is read is kept).
 /// Call inside the runtime.
 fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
@@ -677,6 +697,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             .merge(ui::pages());
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
+        let server = within(server, stopping.clone());
         // The same API for other nodes, over TLS.
         let nodes = async {
             let (Some(cluster), Some(tcp)) = (&shared.cluster, tcp) else {
@@ -712,6 +733,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let app = cluster::node_router(shared.clone()).into_make_service_with_connect_info::<cluster::Peer>();
             let mut stop = stopping.clone();
             let served = axum::serve(listener, app).with_graceful_shutdown(async move { drop(stop.changed().await) });
+            let served = within(served, stopping.clone());
             let members = raft::tend_members(shared.clone(), stopping.clone());
             // The node the cluster started on says where it is; one that joined was written down as it did.
             // ponytail: so a joined node that moves has to be deleted and joined again.
