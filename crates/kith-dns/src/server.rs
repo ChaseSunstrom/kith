@@ -94,7 +94,7 @@ pub(crate) fn may_forward(ip: IpAddr, allowed: &[Cidr]) -> bool {
 #[derive(Clone)]
 struct Shared {
     zones: ZonesRx,
-    upstreams: Arc<[SocketAddr]>,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
     forwarders: Arc<[Cidr]>,
     forwards: PerIp,
     slot_log: Arc<Throttle>,
@@ -108,6 +108,11 @@ struct Cached {
 }
 
 impl Shared {
+    /// The resolvers to ask now.
+    fn upstreams(&self) -> Arc<[SocketAddr]> {
+        self.upstreams.borrow().clone()
+    }
+
     /// Looks `query` up in the cache.
     fn cached(&self, query: &[u8]) -> Cached {
         // A question with options of its own goes to the upstreams with them, and what comes
@@ -128,18 +133,19 @@ impl Shared {
 
 /// Serves DNS on `udp` and `tcp` until the task is dropped. Names outside `zones` go to each of
 /// `upstreams` in turn, for clients in `forwarders` (or, when empty, on local networks), and what
-/// they answer is kept in `cache`; the zones in the watch channel can be replaced while it runs.
+/// they answer is kept in `cache`; the zones and the upstreams in their watch channels can be
+/// replaced while it runs.
 pub async fn serve(
     udp: UdpSocket,
     tcp: TcpListener,
     zones: ZonesRx,
-    upstreams: Vec<SocketAddr>,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
     forwarders: Vec<Cidr>,
     cache: Arc<Cache>,
 ) {
     let shared = Shared {
         zones,
-        upstreams: upstreams.into(),
+        upstreams,
         forwarders: forwarders.into(),
         forwards: PerIp::default(),
         slot_log: Arc::default(),
@@ -186,7 +192,7 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
                     let _ = sock.send_to(&c.plain(), from).await;
                     continue;
                 };
-                let (sock, upstreams) = (sock.clone(), sh.upstreams.clone());
+                let (sock, upstreams) = (sock.clone(), sh.upstreams());
                 tokio::spawn(async move {
                     let _ = sock.send_to(&chase(&c, &upstreams, false).await, from).await;
                     drop(held);
@@ -206,7 +212,7 @@ async fn serve_udp(sock: UdpSocket, sh: Shared) {
                 ) else {
                     continue;
                 };
-                let (query, sock, upstreams, sh) = (buf[..n].to_vec(), sock.clone(), sh.upstreams.clone(), sh.clone());
+                let (query, sock, upstreams, sh) = (buf[..n].to_vec(), sock.clone(), sh.upstreams(), sh.clone());
                 tokio::spawn(async move {
                     let reply = forward(&query, &upstreams, false).await;
                     sh.keep(key, &reply);
@@ -255,7 +261,7 @@ async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::R
             Answer::Chase(c) => {
                 let allowed = may_forward(from.ip(), &sh.forwarders);
                 match allowed.then(|| sh.forwards.take(from.ip(), FORWARDS_PER_IP)).flatten() {
-                    Some(_held) => chase(&c, &sh.upstreams, true).await,
+                    Some(_held) => chase(&c, &sh.upstreams(), true).await,
                     None => {
                         if allowed {
                             sh.slot_log.no_slot(from.ip());
@@ -269,7 +275,7 @@ async fn tcp_connection(mut s: TcpStream, from: SocketAddr, sh: Shared) -> io::R
                 Cached { hit: Some(hit), .. } => hit,
                 Cached { key, .. } => match sh.forwards.take(from.ip(), FORWARDS_PER_IP) {
                     Some(_held) => {
-                        let reply = forward(&query, &sh.upstreams, true).await;
+                        let reply = forward(&query, &sh.upstreams(), true).await;
                         sh.keep(key, &reply);
                         reply
                     }

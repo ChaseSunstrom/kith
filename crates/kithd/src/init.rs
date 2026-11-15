@@ -237,7 +237,10 @@ fn resolvers(servers: &[IpAddr]) {
         let _ = std::fs::remove_file("/etc/resolv.conf");
         std::os::unix::fs::symlink("/run/resolv.conf", "/etc/resolv.conf")
     });
-    if let Err(e) = std::fs::write("/run/resolv.conf", lines) {
+    // (Written whole: kithd reads it again while it runs, and half a file is other resolvers.)
+    let whole = std::fs::write("/run/resolv.conf.new", lines)
+        .and_then(|()| std::fs::rename("/run/resolv.conf.new", "/run/resolv.conf"));
+    if let Err(e) = whole {
         eprintln!("kithd: init: writing /run/resolv.conf: {e}");
     }
 }

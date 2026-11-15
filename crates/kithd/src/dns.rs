@@ -302,9 +302,8 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
     )
 }
 
-/// The resolvers in `/etc/resolv.conf`, for names that are not ours.
-pub fn system_upstreams() -> Vec<SocketAddr> {
-    let conf = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+/// The resolvers a resolv.conf names (`conf`, its text).
+fn resolvers_in(conf: &str) -> Vec<SocketAddr> {
     let server = |line: &str| {
         let mut words = line.split_ascii_whitespace();
         (words.next() == Some("nameserver")).then(|| words.next()?.parse::<IpAddr>().ok())?
@@ -313,6 +312,44 @@ pub fn system_upstreams() -> Vec<SocketAddr> {
         .filter_map(server)
         .map(|ip| SocketAddr::new(ip, 53))
         .collect()
+}
+
+/// The resolvers for names that are not ours: those `told` (`--dns-upstream`), or else the
+/// system's, in `/etc/resolv.conf`. Call inside the runtime.
+pub fn upstreams(told: Vec<SocketAddr>) -> watch::Receiver<Vec<SocketAddr>> {
+    follow(told, "/etc/resolv.conf".into(), std::time::Duration::from_secs(5))
+}
+
+/// `told`, or else what the file `conf` names, read again `every` so often for as long as
+/// someone listens: a node's lease, and with it its resolvers, can come after kithd started
+/// (kith OS asks for one while kithd serves) and change with the network.
+fn follow(
+    told: Vec<SocketAddr>,
+    conf: std::path::PathBuf,
+    every: std::time::Duration,
+) -> watch::Receiver<Vec<SocketAddr>> {
+    let read = move || resolvers_in(&std::fs::read_to_string(&conf).unwrap_or_default());
+    let (say, said) = watch::channel(if told.is_empty() { read() } else { told.clone() });
+    if told.is_empty() {
+        // ponytail: a few bytes read every few seconds; a watch on the file if that ever shows.
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = say.closed() => return,
+                    () = tokio::time::sleep(every) => {}
+                }
+                // (None named any more is none to ask: a network left is not asked from the
+                // next one. kith OS writes the file whole, so it is never read half made.)
+                let now = read();
+                say.send_if_modified(|was| {
+                    let changed = *was != now;
+                    *was = now;
+                    changed
+                });
+            }
+        });
+    }
+    said
 }
 
 /// Would asking `upstream` be asking ourselves, listening on `listen`?
@@ -343,7 +380,7 @@ pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String
 pub async fn run(
     shared: Arc<Shared>,
     (udp, tcp): (UdpSocket, TcpListener),
-    mut upstreams: Vec<SocketAddr>,
+    mut upstreams: watch::Receiver<Vec<SocketAddr>>,
     mut stopping: watch::Receiver<bool>,
 ) {
     // This node's pods are its own to ask for any name, whatever their addresses are. (A list
@@ -353,11 +390,29 @@ pub async fn run(
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
-    upstreams.retain(|upstream| !is_self(*upstream, listen));
-    eprintln!("kithd: serving DNS on {listen}; other names go to {upstreams:?}");
-    if upstreams.is_empty() {
-        eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
-    }
+    let ours = move |all: &[SocketAddr]| -> Arc<[SocketAddr]> {
+        all.iter()
+            .copied()
+            .filter(|upstream| !is_self(*upstream, listen))
+            .collect()
+    };
+    let said = move |now: &[SocketAddr]| {
+        eprintln!("kithd: serving DNS on {listen}; other names go to {now:?}");
+        if now.is_empty() {
+            eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
+        }
+    };
+    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update()));
+    said(&asked.borrow());
+    let told = async {
+        while upstreams.changed().await.is_ok() {
+            let now = ours(&upstreams.borrow_and_update());
+            said(&now);
+            ask.send_replace(now);
+        }
+        // (Resolvers named on the command line: nothing more is told.)
+        std::future::pending::<()>().await;
+    };
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
     // The lists of names to answer as not there, and the answers kept from the upstreams.
     let cache = Arc::new(kith_dns::Cache::default());
@@ -426,7 +481,7 @@ pub async fn run(
     let answering = thread.spawn(async move {
         let (udp, tcp) = sockets?;
         let (udp, tcp) = (UdpSocket::from_std(udp)?, TcpListener::from_std(tcp)?);
-        kith_dns::serve(udp, tcp, served, upstreams, forwarders, cache).await;
+        kith_dns::serve(udp, tcp, served, asked, forwarders, cache).await;
         Ok::<_, std::io::Error>(())
     });
     let stop = answering.abort_handle();
@@ -439,6 +494,7 @@ pub async fn run(
         () = feed => {}
         () = relist => {}
         () = blocks => {}
+        () = told => {}
         _ = stopping.changed() => {}
     }
     stop.abort();
@@ -447,6 +503,31 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A node's resolvers can be written after kithd started (its lease comes while it serves).
+    #[tokio::test]
+    async fn resolvers_written_later_are_followed() {
+        let conf = std::env::temp_dir().join(format!("kith-resolvers-{}", std::process::id()));
+        let _ = std::fs::remove_file(&conf);
+        let every = std::time::Duration::from_millis(10);
+        let mut said = follow(vec![], conf.clone(), every);
+        assert!(said.borrow_and_update().is_empty());
+        std::fs::write(&conf, "# from a lease\nnameserver 10.0.2.3\n").unwrap();
+        said.changed().await.unwrap();
+        assert_eq!(*said.borrow_and_update(), ["10.0.2.3:53".parse().unwrap()]);
+        // A lease that names none (another network): the old ones are not asked from there.
+        std::fs::write(&conf, "").unwrap();
+        said.changed().await.unwrap();
+        assert!(said.borrow_and_update().is_empty());
+        // Told on the command line: the file is not read.
+        let told: Vec<SocketAddr> = vec!["9.9.9.9:53".parse().unwrap()];
+        let mut fixed = follow(told.clone(), conf.clone(), every);
+        std::fs::write(&conf, "nameserver 10.0.2.4\n").unwrap();
+        said.changed().await.unwrap();
+        assert_eq!(*fixed.borrow_and_update(), told);
+        assert!(fixed.has_changed().is_err(), "nothing follows the file for it");
+        let _ = std::fs::remove_file(&conf);
+    }
 
     fn store(yaml: &str) -> Store {
         let mut store = Store::default();

@@ -161,7 +161,11 @@ pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result
 }
 
 /// This node's DNS for its pods, from the first pod on: at the address every pod is told.
-pub async fn names(shared: Arc<Shared>, upstreams: Vec<std::net::SocketAddr>, mut stopping: watch::Receiver<bool>) {
+pub async fn names(
+    shared: Arc<Shared>,
+    upstreams: watch::Receiver<Vec<std::net::SocketAddr>>,
+    mut stopping: watch::Receiver<bool>,
+) {
     let up = shared.pods.lock().expect("nothing panics holding the pods").up.clone();
     tokio::select! {
         () = up.notified() => {}

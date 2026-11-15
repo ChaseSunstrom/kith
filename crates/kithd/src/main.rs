@@ -598,10 +598,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             .or_else(bare)
             .ok_or(format!("--dns-upstream: `{address}` is not an address"))
     };
-    let mut upstreams = args.dns_upstream.iter().map(upstream).collect::<Result<Vec<_>, _>>()?;
-    if upstreams.is_empty() {
-        upstreams = dns::system_upstreams();
-    }
+    let upstreams = args.dns_upstream.iter().map(upstream).collect::<Result<Vec<_>, _>>()?;
     let (membership, tcp) = rt.block_on(membership(&args, &state))?;
     let names = rt.block_on(async {
         match args.dns {
@@ -749,6 +746,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             );
         };
         let names = async {
+            let upstreams = dns::upstreams(upstreams);
             let pods = pods::names(shared.clone(), upstreams.clone(), stopping.clone());
             let asked = async {
                 if let Some(sockets) = names {
