@@ -1450,6 +1450,25 @@ What works, by the real clients in the tests (`sh ci/kube.sh`, and
 - **helm**: `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`,
   `history`, `get manifest`, each with and without `--wait`, into a namespace it
   creates.
+- **Field managers**: `kubectl apply --server-side` keeps who set which field (in
+  `metadata.managedFields`, up to 64 managers an object). Two managers that apply
+  one object each keep their own fields; a second manager's different value for a
+  field the first set is a `409 Conflict` in Kubernetes's words, unless it says
+  `--force-conflicts` (it then takes the field). A field a manager leaves out of its
+  next apply goes, when no other manager has it. Fields are owned by their exact
+  path, a list that has no one key to merge by is owned whole, and only an apply makes
+  a manager (a `replace` or a `patch` takes a field from whoever had it). Applying
+  onto an object that exists, or replacing one, needs `get` as well as `apply`, as a
+  patch does. `kubectl get namespaces` and `get nodes` show an AGE: the time of the
+  oldest revision the store kept, which is when it was made unless the history was
+  trimmed or the node is a worker that runs from a view and holds only what the view
+  carried (an implicit namespace, one that only holds objects, has none).
+- **Watches**: `kubectl get --watch` reads what the store says changed, so one
+  change among 2000 objects makes and compares one object, not 2000 (what it shows
+  is what a list shows: the same Roles apply to every read). It reads the kind again
+  when it cannot know what changed: on a worker node that runs from a view, after a
+  change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys,
+  after the store was replaced, and for Namespaces.
 - **GitOps**: a [Source](#sources-gitops) follows a repository of Kubernetes
   manifests as they are; a file's objects are read exactly as the API reads them.
 
