@@ -649,8 +649,8 @@ where
     });
     // ponytail: hyper's limits: 100 headers (431 past that), a request's head within about
     // 64 KiB (`max_buf_size`, looked at between reads; 431 past it) and within 30 seconds
-    // of its first byte; the connection's own idle time (`IDLE`, under TLS) ends one that
-    // says nothing between.
+    // of starting to read it (from the connection's start or the end of the last answer);
+    // the connection's own idle time (`IDLE`, under TLS) ends one that says nothing between.
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(TokioTimer::new())
         .header_read_timeout(Duration::from_secs(30))

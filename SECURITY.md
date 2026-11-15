@@ -113,16 +113,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   at the registry's own port, so neither what is pulled nor the password is read off the
   loopback (by a container that is the node's root, say; that a pull happens, and how
   large, still shows) and a process that takes the port in kithd's place learns no
-  password. Its connections, shaken or not, are at most 64 at a time. One on which no byte
-  moves for 5 s after its handshake is closed, unless a request on it is being answered: an
-  answer may wait on a copy from another node, so the time does not run then. A request's
-  head must arrive whole within 5 s of its first byte, and a refused request closes its
-  connection after its 401. What is left: a process of the node can take the registry's
-  slots in turn, each for a few seconds at most, which holds a pull up but does not stop it;
-  and a request it is answering holds its slot until the answer ends, however long that
-  takes. Kithd's other listeners and its open-file limit are not bounded by this. And kithd pulls an Image only for what runs in the Image's
-  own namespace: an Image is a packed Volume. Reading kithd's memory is being root on the
-  node outside any container, which nothing here defends against.
+  password. The bound is on kithd's file descriptors and memory: its connections, shaken or
+  not, are at most 64 at a time, and each is closed after 2 s without a handshake, after 5 s
+  without a whole request head, at a 401, or after 5 s with no byte between requests. The
+  head time runs from when the registry starts reading a head (the connection's start, or
+  the end of the last answer). A request being answered is not cut by the 5 s, because an
+  answer may wait on a copy from another node. What is left: a process on the node that
+  keeps connecting can fill the 64 slots and the kernel's queue behind them again and again,
+  and kithd's own pull then waits behind them or times out, for as long as that process
+  keeps at it. Kithd's other listeners and its open-file limit are not bounded by this. And
+  kithd pulls an Image only for what runs in the Image's own namespace: an Image is a packed
+  Volume. Reading kithd's memory is being root on the node outside any container, which
+  nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the

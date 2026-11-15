@@ -404,6 +404,9 @@ const IDLE: Duration = Duration::from_secs(5);
 /// refused by hyper, too).
 const HANDSHAKE: Duration = Duration::from_secs(2);
 const HEAD: Duration = Duration::from_secs(5);
+/// How long a stopping registry waits for its open connections to finish their answers before
+/// they are dropped.
+const DRAIN: Duration = Duration::from_secs(3);
 
 type Secured = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
@@ -539,7 +542,7 @@ fn listen(
 
 /// `app` on `tcp` behind the door: TLS, and the password before anything of a request
 /// (its path, too) is looked at, whatever it asks for. Each connection is served by hyper
-/// itself, so a request's head must arrive whole within `HEAD`.
+/// itself, so a request's head must arrive whole within `head`.
 async fn behind(
     tcp: tokio::net::TcpListener,
     door: Arc<Door>,
@@ -547,6 +550,7 @@ async fn behind(
     mut stopping: watch::Receiver<bool>,
     bound: usize,
     idle: Duration,
+    head: Duration,
 ) {
     let mut accepted = listen(tcp, door.tls.clone(), bound, idle);
     let guard = move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -565,11 +569,11 @@ async fn behind(
         }
     };
     let app = app.layer(axum::middleware::from_fn(guard));
-    // ponytail: hyper's limits, a head within 64 KiB and within HEAD of its first byte; no
-    // other request limit. A slow answer is not bounded here (the copy of a blob may take as long).
+    // ponytail: hyper's limits, a head within 64 KiB and within `head` of starting to read it;
+    // no other request limit. A slow answer is not bounded here (the copy of a blob may take as long).
     let mut http = hyper::server::conn::http1::Builder::new();
     http.timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(HEAD)
+        .header_read_timeout(head)
         .max_buf_size(64 * 1024);
     let mut open = tokio::task::JoinSet::new();
     loop {
@@ -581,17 +585,30 @@ async fn behind(
                     app.clone().layer(axum::Extension(stream.busy.clone())),
                 );
                 let http = http.clone();
+                let mut stopped = stopping.clone();
                 open.spawn(async move {
-                    let _ = http.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                    let connection = http.serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+                    let mut connection = std::pin::pin!(connection);
+                    tokio::select! {
+                        _ = connection.as_mut() => {}
+                        // (Told to close once its answer, if any, is out: an idle one closes now.)
+                        _ = async { let _ = stopped.wait_for(|stopped| *stopped).await; } => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                    }
                 });
             }
             // (Finished connections are let go as they finish, not kept until the end.)
             Some(_) = open.join_next(), if !open.is_empty() => {}
         }
     }
-    // (Nothing more is accepted; what is open is answered out, as before.)
+    // (Nothing more is accepted; what is open is answered out, for `DRAIN` at most.)
     drop(accepted);
-    while open.join_next().await.is_some() {}
+    let drained = tokio::time::timeout(DRAIN, async { while open.join_next().await.is_some() {} }).await;
+    if drained.is_err() {
+        open.shutdown().await;
+    }
 }
 
 /// Serves the cluster's Images on this node's loopback, to kithd's own pulls (no door:
@@ -605,7 +622,7 @@ pub async fn serve(shared: Arc<Shared>, door: Option<Arc<Door>>, stopping: watch
     };
     // (`get` answers HEAD too, without the body.)
     let app = axum::Router::new().fallback(axum::routing::get(move |uri: Uri| answer(shared.clone(), uri)));
-    behind(tcp, door, app, stopping, CONNECTIONS, IDLE).await;
+    behind(tcp, door, app, stopping, CONNECTIONS, IDLE, HEAD).await;
 }
 
 #[cfg(test)]
@@ -634,11 +651,21 @@ mod tests {
 
     /// `opened`, with the test's own bound and idle time.
     async fn bounded(app: axum::Router, bound: usize, idle: Duration) -> (Arc<Door>, watch::Sender<bool>) {
+        bounded_head(app, bound, idle, HEAD).await
+    }
+
+    /// `bounded`, with the test's own head time too.
+    async fn bounded_head(
+        app: axum::Router,
+        bound: usize,
+        idle: Duration,
+        head: Duration,
+    ) -> (Arc<Door>, watch::Sender<bool>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let door = Arc::new(Door::new(tcp.local_addr().unwrap().port()).unwrap());
         let (stop, stopping) = watch::channel(false);
-        tokio::spawn(behind(tcp, door.clone(), app, stopping, bound, idle));
+        tokio::spawn(behind(tcp, door.clone(), app, stopping, bound, idle, head));
         (door, stop)
     }
 
@@ -947,7 +974,7 @@ mod tests {
     async fn registry_bounds_steady_bytes_keep_a_connection() {
         let idle = Duration::from_secs(2);
         let app = axum::Router::new().fallback(axum::routing::get(|| async { trickled() }));
-        let (door, _stop) = bounded(app, 2, idle).await;
+        let (door, _stop) = bounded_head(app, 2, idle, Duration::from_secs(30)).await;
         let (port, password) = (door.local.port, door.local.password.clone());
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut tls = shaken(port, (door.local.certificate)().unwrap()).await;
@@ -1013,7 +1040,12 @@ mod tests {
             assert_eq!(said.text().await.unwrap(), "inside");
         };
         pull().await;
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        let began = std::time::Instant::now();
+        while closed_by_registry.load(std::sync::atomic::Ordering::SeqCst) < 1
+            && began.elapsed() < Duration::from_secs(10)
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         assert_eq!(
             closed_by_registry.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1034,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn registry_bounds_a_head_dripped_past_the_head_time_is_closed() {
         let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
-        let (door, _stop) = bounded(app, 1, Duration::from_secs(60)).await;
+        let (door, _stop) = bounded_head(app, 1, Duration::from_secs(60), Duration::from_secs(2)).await;
         let (port, password) = (door.local.port, door.local.password.clone());
         let certificate = (door.local.certificate)().unwrap();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1060,7 +1092,7 @@ mod tests {
             "a head dripped past the head time was not closed: {closed:?}"
         );
         assert!(
-            (Duration::from_secs(4)..Duration::from_secs(10)).contains(&began.elapsed()),
+            (Duration::from_secs(1)..Duration::from_secs(5)).contains(&began.elapsed()),
             "the head was closed after {:?}, not about the head time",
             began.elapsed()
         );
@@ -1095,12 +1127,50 @@ mod tests {
             .await
             .unwrap();
         let mut reply = Vec::new();
-        let ended = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut reply)).await;
+        let ended = tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut reply)).await;
         assert!(ended.is_ok(), "the connection of a refused request was left open");
         assert!(
             reply.starts_with(b"HTTP/1.1 401"),
             "{}",
             String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// Stopping does not wait for an idle kept-alive connection: it is told to close (its answer
+    /// is out already), so the registry stops in well under the idle time, which is a minute here.
+    #[tokio::test]
+    async fn registry_bounds_stopping_does_not_wait_for_an_idle_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let door = Arc::new(Door::new(tcp.local_addr().unwrap().port()).unwrap());
+        let (port, password) = (door.local.port, door.local.password.clone());
+        let certificate = (door.local.certificate)().unwrap();
+        let (stop, stopping) = watch::channel(false);
+        let serving = tokio::spawn(behind(tcp, door, app, stopping, 2, Duration::from_secs(60), HEAD));
+        use tokio::io::AsyncWriteExt;
+        let mut kept = shaken(port, certificate).await;
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        kept.write_all(
+            format!("GET /v2/team/quick HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {basic}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let said = tokio::time::timeout(Duration::from_secs(10), read_inside(&mut kept)).await;
+        assert!(
+            matches!(&said, Ok(said) if said.ends_with(b"inside")),
+            "the kept-alive connection was not answered: {said:?}"
+        );
+        let began = std::time::Instant::now();
+        stop.send(true).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(10), serving).await;
+        assert!(matches!(stopped, Ok(Ok(()))), "stopping waited for the idle connection");
+        // (Without the close, the drain would run to `DRAIN`, which is over this.)
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "stopping took {:?} with one idle connection",
+            began.elapsed()
         );
     }
 
