@@ -106,7 +106,8 @@ pub struct Answers {
     /// ones its image was built with, and without either it takes the first release's.
     #[serde(default, rename = "releaseKey")]
     pub release_key: Option<String>,
-    /// Fetch kith OS updates from the node's own networks too (a release server on the LAN).
+    /// Fetch kith OS updates from the private ranges of the node's networks too (a release
+    /// server on the LAN).
     #[serde(default, rename = "lanReleases")]
     pub lan_releases: bool,
 }

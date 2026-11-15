@@ -1294,6 +1294,15 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
             exit 0
         fi
 
+        # Before any release, each node says it takes releases from its image's keys.
+        whose=$(any GET /v1/resources | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+nodes = (r for r in found if r["kind"] == "Node")
+print(",".join(sorted(((n.get("status") or {}).get("os") or {}).get("releaseKeys", "?") for n in nodes)))
+') || fail "the nodes could not be listed"
+        [ "$whose" = image,image,image ] || fail "the nodes do not take releases from the image's keys alone: $whose"
         # The first release applied, signed by a key the image was not built with: refused,
         # where a node with no key would have taken that key for its own.
         by=$public2

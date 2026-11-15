@@ -125,7 +125,8 @@ struct Args {
     /// of those, the key of the first release it updates to is kept (said at every start)
     #[arg(long, env = "KITH_RELEASE_KEY", value_name = "KEY", value_delimiter = ',', value_parser = release_key)]
     release_key: Vec<String>,
-    /// Fetch kith OS updates from this node's own networks too (a release server on the LAN)
+    /// Fetch kith OS updates from the private ranges of this node's networks too (a release
+    /// server on the LAN); never from this node, its loopback or link-local addresses
     #[arg(long, env = "KITH_LAN_RELEASES")]
     lan_releases: bool,
     /// Let a Source name a git repository on this machine (`file://`): for tests

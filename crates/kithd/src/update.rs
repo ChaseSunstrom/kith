@@ -445,14 +445,21 @@ impl Keys {
         self.mine().map_or("unread", |(_, whose)| whose)
     }
 
-    /// What a node that takes releases from no key says at its start, every start.
+    /// What a node that takes releases from no key (or from keys it cannot read) says at
+    /// its start, every start.
     fn unkeyed(&self) -> Option<String> {
-        (self.whose() == "none").then(|| {
-            "kithd: this node has no release key: the first kith OS release it takes sets it, \
-             whoever applies that one (give it with --release-key, or KITH_RELEASE_KEY when \
-             building the image, or `releaseKey` when installing)"
-                .to_string()
-        })
+        match self.mine() {
+            Ok((_, "none")) => Some(
+                "kithd: this node has no release key: the first kith OS release it takes sets it, \
+                 whoever applies that one (give it with --release-key, or KITH_RELEASE_KEY when \
+                 building the image, or `releaseKey` when installing)"
+                    .to_string(),
+            ),
+            Err(e) => Some(format!(
+                "kithd: this node's release keys could not be read ({e}): it takes no release"
+            )),
+            Ok(_) => None,
+        }
     }
 
     /// What the first update this node takes keeps in its state: the keys of its system if
@@ -670,26 +677,46 @@ fn raise(file: &Path, version: &str) -> Result<(), String> {
     }
 }
 
-/// The client an update is fetched with: no redirect is followed (the address is the
-/// release's, and the release is what was applied: nowhere else). Given a host and its
-/// vetted addresses, those are the ones connected to, and no proxy (which would look the
-/// name up again itself).
-fn client(pinned: Option<(&str, &[std::net::SocketAddr])>) -> Result<reqwest::Client, String> {
-    let mut client = reqwest::Client::builder()
+/// The client an update is fetched with: `host`'s vetted addresses are the ones connected
+/// to, through no proxy (which would look the name up again itself), and no redirect is
+/// followed (the address is the release's, and the release is what was applied: nowhere
+/// else).
+fn client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .resolve_to_addrs(host, addresses)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(30))
         // (A server that goes quiet is a download that broke, not one to wait out.)
-        .read_timeout(Duration::from_secs(60));
-    if let Some((host, addresses)) = pinned {
-        client = client.resolve_to_addrs(host, addresses).no_proxy();
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// The host of a release's image and the addresses it may be fetched from: outside this
+/// node and its networks, or with `lan` (`--lan-releases`) in their private ranges too.
+async fn pinned(url: &reqwest::Url, lan: bool) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("the release's image, {url}: it is fetched over http or https"));
     }
-    client.build().map_err(|e| e.to_string())
+    match crate::sources::vetted(&url.origin().ascii_serialization(), lan).await {
+        Ok((host, _, addresses)) => Ok((host, addresses)),
+        Err(crate::sources::Refused::Inward(_)) if lan => Err(format!(
+            "the release's image, {url}: an update is not fetched from this node, nor from its \
+             networks but for their private ranges"
+        )),
+        Err(crate::sources::Refused::Inward(_)) => Err(format!(
+            "the release's image, {url}: an update is not fetched from this node or its own \
+             networks (start kithd with --lan-releases for a release server on their private ranges)"
+        )),
+        Err(crate::sources::Refused::Address(why)) => Err(format!("the release's image: {why}")),
+    }
 }
 
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
-/// by its key, and the version it says. Not from this node or its own networks unless
-/// `lan` (`--lan-releases`): an OSRelease is written by whoever may write one, and kithd
-/// fetches as root.
+/// by its key, and the version it says. Not from this node or its own networks (their
+/// private ranges only with `lan`, `--lan-releases`): an OSRelease is written by whoever
+/// may write one, and kithd fetches as root.
 #[allow(clippy::too_many_arguments)]
 async fn fetch(
     url: &str,
@@ -707,21 +734,8 @@ async fn fetch(
     let first = keys.refused(public.as_deref())?;
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
-    let client = match lan {
-        true => client(None)?,
-        false => {
-            let (host, _, addresses) = crate::sources::vetted(&parsed.origin().ascii_serialization())
-                .await
-                .map_err(|e| match e.contains("its own networks") {
-                    true => format!(
-                        "the release's image, {url}: an update is not fetched from this node or its own \
-                         networks (start kithd with --lan-releases for a release server on them)"
-                    ),
-                    false => format!("the release's image: {e}"),
-                })?;
-            client(Some((&host, &addresses)))?
-        }
-    };
+    let (host, addresses) = pinned(&parsed, lan).await?;
+    let client = client(&host, &addresses)?;
     let failed = |e: reqwest::Error| format!("fetching {url}: {e}");
     let mut response = client
         .get(parsed)
@@ -1019,10 +1033,16 @@ mod tests {
         assert_eq!((given.whose(), given.unkeyed()), ("given", None));
         crate::pki::write_whole(&keys.kept, b"bb22\n").unwrap();
         assert_eq!((keys.whose(), keys.unkeyed()), ("kept", None));
-        // Keys that cannot be read are not none: such a node takes no release at all.
+        // Keys that cannot be read are not none: such a node takes no release at all, and
+        // says so at every start too.
         std::fs::remove_file(&keys.kept).unwrap();
         std::fs::create_dir(&keys.kept).unwrap();
-        assert_eq!((keys.whose(), keys.unkeyed()), ("unread", None));
+        assert_eq!(keys.whose(), "unread");
+        let said = keys.unkeyed().expect("a node whose keys cannot be read says so");
+        assert!(
+            said.contains("could not be read") && said.contains("takes no release"),
+            "{said}"
+        );
         assert!(keys.refused(Some("aa11")).is_err());
     }
 
@@ -1087,16 +1107,65 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(said.contains("--lan-releases"), "{said}");
-        }
-        // What a lookup may take another way than the fetch is refused too.
-        let url = format!("http://{at}/kith-os.update?x=1");
-        assert!(
-            fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false)
+            // Allowing the LAN does not allow this node itself.
+            let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, true)
                 .await
-                .is_err()
-        );
+                .unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+        }
+        // Nor what a cloud answers on at its link-local address (looked at, never asked).
+        for lan in [false, true] {
+            let url = "http://169.254.169.254/kith-os.update";
+            let said = fetch(url, "2".into(), &release, 'a', &keys, "1", true, lan)
+                .await
+                .unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+            assert!(!said.contains("Source"), "an OS update's words: {said}");
+        }
         let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(asked.is_err(), "nothing was to be fetched");
+    }
+
+    /// `--lan-releases` lets the private ranges of the node's networks through: a release
+    /// server on the LAN. (Looked up, not asked: an address literal needs no lookup.)
+    #[tokio::test]
+    async fn os_image_vetted_lan_lets_private_ranges_through() {
+        for url in [
+            "http://10.254.253.252/kith-os.update",
+            "http://[fd12:3456:789a::1]/kith-os.update",
+        ] {
+            let url = reqwest::Url::parse(url).unwrap();
+            let said = pinned(&url, false).await.unwrap_err();
+            assert!(said.contains("--lan-releases"), "{said}");
+            let (_, addresses) = pinned(&url, true).await.unwrap();
+            assert_eq!(addresses.len(), 1, "{url}");
+        }
+    }
+
+    /// A URL with no port is fetched from its scheme's: the addresses held carry it, and
+    /// what is connected to is one of them, at that port (port 80 cannot be listened on
+    /// here, so this is the address the fetch is given, through the name it looks up).
+    #[tokio::test]
+    async fn os_image_vetted_portless_url_holds_its_schemes_port() {
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let mut ports = Vec::new();
+        for url in ["http://localhost/kith-os.update", "https://localhost/kith-os.update"] {
+            let (host, addresses) = pinned(&reqwest::Url::parse(url).unwrap(), false).await.unwrap();
+            assert_eq!(host, "localhost");
+            ports.push(
+                addresses
+                    .iter()
+                    .map(|at| at.port())
+                    .collect::<std::collections::BTreeSet<_>>(),
+            );
+        }
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+        assert_eq!(ports, [[80].into(), [443].into()]);
+        // Neither ssh nor anything else but HTTP.
+        let said = pinned(&reqwest::Url::parse("ssh://8.8.8.8/x").unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(said.contains("http") && !said.contains("Source"), "{said}");
     }
 
     #[tokio::test]
@@ -1114,14 +1183,15 @@ mod tests {
             }
         });
         // A name nobody can look up reaches the address it was vetted at, and only that.
-        let pinned = client(Some(("releases.example", &[at]))).unwrap();
+        let held = client("releases.example", &[at]).unwrap();
         let url = format!("http://releases.example:{}/kith-os.update", at.port());
-        assert_eq!(pinned.get(url).send().await.unwrap().status(), 404);
-        // And the fetch goes on to the address that was vetted (loopback taken for outside).
+        assert_eq!(held.get(url).send().await.unwrap().status(), 404);
+        // And the fetch, by a name it looks up, goes on to the address that was vetted.
+        // (This thread takes loopback for outside: it stands for a server elsewhere.)
         crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
         let keys = Keys::new(vec!["aa11".into()], &scratch("vetted-out"));
         let release = json!({ "publicKey": "aa11", "signature": "00" });
-        let url = format!("http://{at}/kith-os.update");
+        let url = format!("http://localhost:{}/kith-os.update", at.port());
         let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
         crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
         let said = said.unwrap_err();
@@ -1403,10 +1473,11 @@ mod tests {
         });
         let release = json!({ "publicKey": "aa11", "signature": "00" });
         let keys = Keys::new(Vec::new(), &dir);
-        // (A release server on this node's own networks: `--lan-releases`.)
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, true)
-            .await
-            .unwrap_err();
+        // (This thread takes loopback for outside: it stands for a release server elsewhere.)
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+        let said = said.unwrap_err();
         assert!(said.contains("302") && said.contains("redirect"), "{said}");
         answering.await.unwrap();
         let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;

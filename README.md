@@ -2797,7 +2797,7 @@ names. Give them before the first release, so that nobody else's can be it:
 
 - **in the image**: `KITH_RELEASE_KEY=KEY sh os/build.sh` (commas between
   several) writes them to `/etc/kith/release-keys`, in the signed root, so every
-  node made from the image has them and they change with the image only;
+  node made from the image starts with them;
 - **at install**: `releaseKey: KEY` in the installer's answers (commas between
   several), for one installer image that serves owners with different keys; it
   goes on kithd's line in the config partition as `--release-key`;
@@ -2812,14 +2812,25 @@ every start, and its Node's `status.os.releaseKeys` is `none` (else `given`,
 `kept` or `image`). A node with no state partition keeps nothing, so give it its
 key in the image or to kithd. A release signed by any other key is refused. A
 release older than what a node runs is refused too, unless the plan says
-`allowDowngrade: true`.
+`allowDowngrade: true`. A node whose keys cannot be read takes no release, and
+says that at every start too.
+
+The image's keys are where a fresh node starts, not what it holds to: its first
+update keeps them in its state, and from then on its keys change only by a
+handover (below) signed by a key it has, or by `--release-key`. A new image
+built with another key does not move nodes that already run: to rotate, sign a
+release with the old key whose `handover` names the new one, roll it out, then
+build later images with the new key alone.
 
 The file is fetched from the address the release names and nowhere else: a
-redirect is not followed, and the address is looked up once, checked and then
-connected to, as for a Source. One on the node itself or on its own networks
-(loopback, private and link-local ranges) is refused unless kithd is started
-with `--lan-releases` (`lanReleases: true` at install), for a release server on
-the LAN. Even so, give OSRelease and UpdatePlan to nobody who is not the
+redirect is not followed, no proxy is used, and the address is looked up once,
+checked and then connected to, at the port the URL names (80 for `http://` with
+none, 443 for `https://`). One on the node itself or on its own networks
+(loopback, private, shared, link-local, multicast) is refused. With
+`--lan-releases` (`lanReleases: true` at install) the private ranges (10/8,
+172.16/12, 192.168/16, 100.64/10, fc00::/7) may be, for a release server on the
+LAN; the node's own addresses, loopback and link-local stay refused, and the
+address is still checked and held. Even so, give OSRelease and UpdatePlan to nobody who is not the
 cluster's admin: they still decide when nodes restart.
 
 **A key hands over to others in a release.** `handover` names the keys that count
@@ -2974,7 +2985,7 @@ join:                         # without it the node starts a new cluster
   token: $TOKEN
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
-lanReleases: true             # releases may come from a server on the node's own networks
+lanReleases: true             # releases may come from a server on the node's private ranges
 ```
 
 Then nothing is asked, and nothing confirmed: a stick with answers on it

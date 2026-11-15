@@ -115,7 +115,7 @@ struct Web {
 /// and its networks. It follows nothing.
 async fn held(url: &reqwest::Url) -> Fallible<reqwest::Client> {
     // (Its origin only: what follows, a query too, is not what is connected to.)
-    let (host, _, addresses) = crate::sources::vetted(&url.origin().ascii_serialization()).await?;
+    let (host, _, addresses) = crate::sources::vetted(&url.origin().ascii_serialization(), false).await?;
     let client = reqwest::Client::builder()
         .resolve_to_addrs(&host, &addresses)
         // (Nor a proxy, which would look the name up again itself.)
