@@ -300,7 +300,8 @@ pub fn remove(number: u16, address: Option<Ipv4Addr>) -> Result<()> {
         NLM_F_ACK,
     );
     match gone {
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        // (A link not there by its name: ENODEV, not ENOENT.)
+        Err(e) if e.kind() == ErrorKind::NotFound || e.raw_os_error() == Some(nix::libc::ENODEV) => Ok(()),
         gone => gone.map(drop),
     }
 }
@@ -374,5 +375,35 @@ mod tests {
             .collect();
         assert_eq!(tables.len(), 1);
         assert!(tables[0].contains(&RuleAttribute::Table(table(8))));
+        // A tunnel that is not there is taken away all the same (the kernel says ENODEV of a
+        // link it does not know by name: the first `ensure` of each tunnel removes one).
+        remove(8, Some("10.2.0.2".parse().unwrap())).unwrap();
+    }
+
+    /// A tunnel is made, made again, and taken away (`KITH_E2E=1 unshare -Urn cargo test
+    /// -p kith-mesh tunnel`; skipped where the kernel has no WireGuard).
+    #[test]
+    fn a_tunnel_is_made_again_and_taken_away() {
+        if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh tunnel");
+        }
+        let tunnel = Tunnel {
+            key: [1; 32],
+            address: "10.2.0.2".parse().unwrap(),
+            peer: [2; 32],
+            shared: None,
+            endpoint: "192.0.2.7:51820".parse().unwrap(),
+            keepalive: 25,
+        };
+        match ensure(7, &tunnel) {
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                return eprintln!("skipped: {e} (this namespace may not write its sysctls)");
+            }
+            made => made.unwrap(),
+        }
+        ensure(7, &tunnel).unwrap();
+        forget().unwrap();
+        remove(7, Some(tunnel.address)).unwrap();
+        remove(7, Some(tunnel.address)).unwrap();
     }
 }
