@@ -272,7 +272,8 @@ const BATCH: usize = 1024;
 /// held, never through a link, one that shuts its owner out is opened up first, and a link is
 /// unlinked, never followed. An entry that is a directory is tried with `rmdir` first and
 /// opened only if it is not empty; once a directory is empty the walk opens `..` of it and
-/// lists that again (never above `root`). The first error that leaves an entry in place ends
+/// lists that again, unless it is `root` itself (told by device and inode): `..` of `root` is
+/// never taken, so the walk cannot climb above `root` whatever is moved under it. The first error that leaves an entry in place ends
 /// the removal with it, as `remove_dir_all` does, so what cannot be removed cannot be walked
 /// round for ever; a directory on another file system than `root`'s ends it so too. A `root`
 /// that is a link or a file is unlinked.
@@ -293,7 +294,8 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
         }
         opened => Dir::from_fd(opened?.into_raw_fd())?,
     };
-    let device = fstat(top.as_raw_fd())?.st_dev;
+    let top_meta = fstat(top.as_raw_fd())?;
+    let (device, top_ino) = (top_meta.st_dev, top_meta.st_ino);
     // `name` in the directory `fd`, held to the root's file system and opened up if it shuts out.
     let open = |fd: i32, name: &std::ffi::CStr| -> std::io::Result<Dir> {
         let dir = match Dir::openat(Some(fd), name, flags, Mode::empty()) {
@@ -318,7 +320,7 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
         }
         Ok(dir)
     };
-    let (mut here, mut depth, mut steps) = (top, 0usize, 0usize);
+    let (mut here, mut steps) = (top, 0usize);
     loop {
         let fd = here.as_raw_fd();
         let mut down = None;
@@ -356,9 +358,15 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
             }
         }
         match down {
-            Some(name) => (here, depth) = (open(fd, &name)?, depth + 1),
-            None if depth > 0 => (here, depth) = (open(fd, c"..")?, depth - 1),
-            None => break,
+            Some(name) => here = open(fd, &name)?,
+            None => {
+                // Told by what the directory is, not by a count a move under the walk could falsify.
+                let meta = fstat(fd)?;
+                if meta.st_dev == device && meta.st_ino == top_ino {
+                    break;
+                }
+                here = open(fd, c"..")?;
+            }
         }
     }
     drop(here);
@@ -876,6 +884,30 @@ mod tests {
         // Let alone, all of it goes.
         assert!(remove_tree(&root, &|| false).unwrap());
         assert!(!root.exists());
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn storage_stop_a_directory_moved_up_under_the_walk_does_not_take_it_above_the_root() {
+        let top = dir("moved");
+        let (root, beside) = (top.join("scratch.1"), top.join("beside"));
+        std::fs::create_dir_all(root.join("a/b/c/d")).unwrap();
+        std::fs::create_dir_all(&beside).unwrap();
+        std::fs::write(beside.join("kept"), "x").unwrap();
+        for n in 0..2000 {
+            std::fs::write(root.join(format!("a/b/c/d/f{n}")), "x").unwrap();
+        }
+        // On its second look, inside `d`, a writer that is still alive moves `d` up to the root.
+        let looks = std::cell::Cell::new(0);
+        let _ = remove_tree(&root, &|| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 2 {
+                std::fs::rename(root.join("a/b/c/d"), root.join("d")).unwrap();
+            }
+            false
+        });
+        assert!(looks.get() >= 2);
+        assert_eq!(std::fs::read_to_string(beside.join("kept")).unwrap(), "x");
         std::fs::remove_dir_all(top).unwrap();
     }
 
