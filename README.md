@@ -3674,6 +3674,22 @@ has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on
 Debian/Ubuntu, or point `CC_x86_64_unknown_linux_musl` at a `zig cc -target
 x86_64-linux-musl` wrapper.
 
+kithd is linked by the Rust toolchain's own lld, with the functions it runs from its
+start until it has idled a while first in its code, in the order
+`crates/kithd/kithd.order` lists them. The kernel keeps in memory the pages around each
+one a process touches: with that code where the compiler put it, all over the binary,
+kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it holds
+3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
+was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
+builds: a breakpoint on every function, taken off the first time it is hit, so each one
+that runs is seen once and in order (x86_64 Linux). A name is matched whatever a
+`cargo update` or a new compiler makes of the letters Rust writes before each crate's
+name, so the file outlives most of those; code written since is not in it, and
+`python3 ci/order.py --check`, which CI runs, fails once under four fifths of its
+names are still in kithd, or are not together where its code starts. A toolchain with
+no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
+again (the check then fails, saying there is no lld).
+
 ### Testing on several nodes
 
 ```sh
