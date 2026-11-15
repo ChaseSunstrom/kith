@@ -318,6 +318,20 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   at once, and eight connections from one address keep out whoever shares that address
   with them (a node behind the same NAT, or in the same IPv6 /64): the count is taken
   before a certificate is shown. A firewall in front of the port is the answer to that.
+- **A Service connection the kernel passes on** (kith OS: a container on the node's own
+  network connecting to a Service with a replica on the same node and no NetworkPolicy)
+  is not seen by kithd: it is not counted against the node's limit of Service
+  connections, not ended when it is silent, and not written anywhere. What the kernel
+  passes to is made again when replicas change, so for a moment it can be behind: a
+  replica that has gone is passed to until the round that the change wakes has taken it
+  out, and the address of a pod that was let go may by then be the next pod's, of any
+  namespace, for at most the rest of the round in progress (its probes, 3 seconds
+  together, and on the node that leads its status write) and one load of the program.
+  A NetworkPolicy does not come into it: a Service a policy names is never the
+  kernel's. Units run with `exec` and containers on the node's network share the one
+  cgroup the program is on. A kithd that is killed leaves its program where it is
+  until kithd starts again, passing to what was there when it stopped; one kithd
+  cannot empty is tried again each round and said.
 - **Backup buckets and S3 endpoints may be on the node's own network** on purpose, and a
   restore, a replica's copy and its sync take no more than the Volume's `size` says
   (above), but a Volume with no `size` is not capped: a bucket someone else writes can

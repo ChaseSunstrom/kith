@@ -744,6 +744,20 @@ kith node status                                   # who leads the store, who vo
   closed, so that what it said reaches no second replica; one that had said
   nothing yet is tried at the next replica.
 
+Where kithd is root (kith OS), a connection that a container on the node's own
+network makes to a Service with a replica on that node does not pass through kithd
+at all: the kernel writes the replica's address in place of the Service's as the
+container connects (a program kithd puts on the containers' cgroup, and makes again
+when replicas change). Replicas on other nodes keep their share of such
+connections, through kithd as before. This is only for a Service whose Workloads
+no NetworkPolicy is for: one a policy names goes through kithd, which asks at each
+connection, and a policy applied later takes the Service off the kernel's path for
+the next connection (those already made stay). A connection the kernel passes is
+not one of the 4096, is not closed for being silent, and the replica sees the
+client's own address. Only a replica that answers on an IPv6 address is passed to
+this way. Where the kernel refuses the program, or kithd is not root, kithd says
+so once and passes every connection itself.
+
 What a cluster of three does when a node is cut off or loses power is tested
 in VMs (`sh ci/vm.sh --test chaos`): three kith OS nodes, and a writer on the
 host through each of them. Each node in turn has its card on the cluster's
