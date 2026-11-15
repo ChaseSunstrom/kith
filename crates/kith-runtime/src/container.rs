@@ -107,7 +107,7 @@ pub struct Unit {
     /// What it is called (a pod's containers are all called as the pod is). Without it: its id.
     pub hostname: Option<String>,
     /// It is the node's own users where kithd is root, as a NodeWorkload is: no user namespace
-    /// of its own (see [`shifts`]).
+    /// of its own (see `shifts`).
     pub host_users: bool,
 }
 
@@ -140,14 +140,23 @@ impl Drop for Range {
 
 /// The lowest range of ids no container has: not one that a bundle under `bundles` maps, nor
 /// one being taken. What is taken is what the bundles say, so it holds over a restart of
-/// kithd, and a range is free once its container's bundle is removed.
+/// kithd, and a range is free once its container's bundle is removed. A bundle whose
+/// config.json is there and does not load may name any: none is given while it is.
 fn take_range(bundles: &Path) -> Result<Range> {
     let mut taken = taking();
     let mut used = taken.clone();
     for entry in fs::read_dir(bundles).ctx("listing containers")?.flatten() {
-        // (An exec unit's marker has no config.json.)
-        let Ok(spec) = Spec::load(entry.path().join("config.json")) else {
+        // (One being made has none yet: its range, if it has one, is being taken. Its file
+        // comes whole, by a rename: see `create`.)
+        let config = entry.path().join("config.json");
+        if !config.exists() {
             continue;
+        }
+        let Ok(spec) = Spec::load(&config) else {
+            return err(format!(
+                "{} does not load, and may name a range of ids: no container is given one until it is removed",
+                config.display()
+            ));
         };
         let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().clone());
         used.extend(maps.iter().flatten().map(|map| map.host_id()));
@@ -166,17 +175,27 @@ fn take_range(bundles: &Path) -> Result<Range> {
 /// node's users; not one given device nodes (the node's, whose owners are the node's users); and
 /// not one with its image or a volume on a file system that takes no id-mapped mount (NFS: a
 /// volume of another node). Those are what they were before: their users are the node's.
+/// (`create` asks it in its two parts, to say which path keeps a pod so.)
+#[cfg(test)]
 fn shifts(image: &Image, unit: &Unit) -> bool {
+    may_shift(unit) && unmappable(image, unit).is_none()
+}
+
+/// What of `shifts` its unit says: a network of its own, no devices, not the node's users.
+fn may_shift(unit: &Unit) -> bool {
+    unit.devices.is_empty() && unit.netns.is_some() && !unit.host_users
+}
+
+/// The first of a container's image root and volumes on a file system that takes no id-mapped
+/// mount, if one is.
+fn unmappable<'a>(image: &'a Image, unit: &'a Unit) -> Option<&'a Path> {
     use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, FsType, TMPFS_MAGIC, statfs};
     // XFS's number, which nix leaves out where libc is musl.
     let xfs = FsType(0x5846_5342 as _);
     let kinds = [EXT4_SUPER_MAGIC, TMPFS_MAGIC, xfs, BTRFS_SUPER_MAGIC];
     let mappable = |path: &Path| statfs(path).is_ok_and(|fs| kinds.contains(&fs.filesystem_type()));
-    unit.devices.is_empty()
-        && unit.netns.is_some()
-        && !unit.host_users
-        && mappable(&image.rootfs)
-        && unit.mounts.iter().all(|volume| mappable(&volume.host))
+    let paths = std::iter::once(&image.rootfs).chain(unit.mounts.iter().map(|volume| &volume.host));
+    paths.map(PathBuf::as_path).find(|path| !mappable(path))
 }
 
 /// Mounts, in the calling thread's own mount namespace, what a container whose ids start at
@@ -321,15 +340,22 @@ impl Runtime {
             .flatten()
         {
             found += 1;
-            // State we cannot load is removed below along with the bundle.
-            if let Ok(mut container) = Container::load(entry.path()) {
-                let _ = container.delete(true);
-            }
-            // An exec unit has no container state, only its cgroup.
             let name = entry.file_name();
-            let _ = manager(&format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy())).remove();
-            let _ = fs::remove_dir_all(entry.path());
-            let _ = fs::remove_dir_all(self.root.join("containers").join(name));
+            let cgroup = format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy());
+            let path = Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
+            sweep(&entry.path(), &self.root.join("containers").join(&name), &path, || {
+                // State we cannot load is removed along with the bundle.
+                if let Ok(mut container) = Container::load(entry.path())
+                    && let Err(e) = container.delete(true)
+                {
+                    eprintln!(
+                        "kith: deleting the container {} left behind: {e}",
+                        name.to_string_lossy()
+                    );
+                }
+                // An exec unit has no container state, only its cgroup.
+                let _ = manager(&cgroup).remove();
+            });
         }
         Ok(found)
     }
@@ -360,9 +386,17 @@ impl Runtime {
         )
         .ctx(&what)?;
         let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
-        let range = match uid.is_root() && shifts(image, unit) {
-            true => Some(take_range(&self.root.join("containers")).ctx(&what)?),
-            false => None,
+        let range = match (uid.is_root() && may_shift(unit)).then(|| unmappable(image, unit)) {
+            Some(None) => Some(take_range(&self.root.join("containers")).ctx(&what)?),
+            // (Not its Workload's choice, and its status says only `hostUsers`: said here too.)
+            Some(Some(path)) => {
+                eprintln!(
+                    "kith: container `{id}` keeps the node's users, not a range of its own: {} is on a file system that takes no id-mapped mount",
+                    path.display()
+                );
+                None
+            }
+            None => None,
         };
         let shift = range.as_ref().map(|range| range.0);
         let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
@@ -395,8 +429,10 @@ impl Runtime {
                     std::os::unix::fs::chown(bundle.join(layer), shift, shift).ctx(&what)?;
                 }
             }
-            // (From here the bundle names its range: no other container takes it.)
-            spec.save(bundle.join("config.json")).ctx(&what)?;
+            // (From here the bundle names its range: no other container takes it. Written beside
+            // it and renamed, so `take_range` never reads half of one.)
+            spec.save(bundle.join("config.json.new")).ctx(&what)?;
+            fs::rename(bundle.join("config.json.new"), bundle.join("config.json")).ctx(&what)?;
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
             }
@@ -773,7 +809,7 @@ impl Handle {
     }
 
     /// The first of the node's ids its user namespace maps 0 to: `None` where its users are
-    /// the node's (an exec unit, a container where kithd is not root, or one [`shifts`] keeps so).
+    /// the node's (an exec unit, a container where kithd is not root, or one `shifts` keeps so).
     pub fn range(&self) -> Option<u32> {
         self.range
     }
@@ -911,6 +947,24 @@ fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl Fn
     let _ = fs::remove_dir_all(state);
     let _ = fs::remove_dir_all(bundle);
     Ok(())
+}
+
+/// What [`Runtime::cleanup`] does with a unit left behind: `kill` it, then remove its `state` and
+/// `bundle`, unless its `cgroup` still has processes. Then both stay, as [`Handle::delete`] keeps
+/// them, and so its id and its range of ids (named by its bundle) stay taken until they are gone;
+/// it is said, and `false` returned.
+fn sweep(state: &Path, bundle: &Path, cgroup: &Path, kill: impl FnOnce()) -> bool {
+    kill();
+    if has_processes(cgroup) {
+        eprintln!(
+            "kith: {} still has processes after it was killed: kept, with its range of ids, until they are gone",
+            state.display()
+        );
+        return false;
+    }
+    let _ = fs::remove_dir_all(state);
+    let _ = fs::remove_dir_all(bundle);
+    true
 }
 
 /// Whether a cgroup still has processes, its child cgroups' included (`populated` in `cgroup.events`,
@@ -1190,7 +1244,7 @@ fn spec_of(
 }
 
 /// The container's spec, for a kithd that is the user `kithd`, where `shift` is the first id
-/// of the range its user namespace maps (where kithd is root, and [`shifts`] says so).
+/// of the range its user namespace maps (where kithd is root, and `shifts` says so).
 fn spec_shifted(
     id: &str,
     image: &Image,
@@ -2348,6 +2402,73 @@ mod tests {
         let _ = fs::remove_dir_all(&bundles);
     }
 
+    /// A container left behind whose processes outlive its kill (`cleanup`'s `sweep`) keeps its
+    /// state and bundle, so its range is not given again while its user namespace has processes;
+    /// once they are gone, both go and the range is free.
+    #[test]
+    fn idmapped_a_bundle_kept_by_a_failed_delete_holds_its_range() {
+        let root = std::env::temp_dir().join(format!("kith-swept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (state, bundles, cgroup) = (root.join("state/a"), root.join("containers"), root.join("cgroup"));
+        for dir in [&state, &bundles.join("a"), &cgroup] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let held = take_range(&bundles).unwrap();
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let root_ids = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        let spec = spec_shifted(
+            "a",
+            &image,
+            &Unit::default(),
+            "/kith/a",
+            Path::new("/b"),
+            root_ids,
+            Some(held.0),
+        );
+        spec.unwrap().save(bundles.join("a/config.json")).unwrap();
+        let named = held.0;
+        drop(held);
+        fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let mut killed = false;
+        assert!(!sweep(&state, &bundles.join("a"), &cgroup, || killed = true));
+        assert!(
+            killed && state.exists() && bundles.join("a").exists(),
+            "a unit that still runs is kept"
+        );
+        let taken: Vec<Range> = (0..3).map(|_| take_range(&bundles).unwrap()).collect();
+        assert!(
+            taken.iter().all(|range| range.0 != named),
+            "its range is not given again"
+        );
+        fs::write(cgroup.join("cgroup.events"), "populated 0\n").unwrap();
+        assert!(sweep(&state, &bundles.join("a"), &cgroup, || {}));
+        assert!(
+            !state.exists() && !bundles.join("a").exists(),
+            "gone once nothing of it runs"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A bundle whose config.json does not load may name a range: no range is given while it is
+    /// there, and the refusal names it. One with no config.json (being made) names none.
+    #[test]
+    fn idmapped_an_unreadable_bundle_takes_no_range_from_anyone() {
+        let bundles = std::env::temp_dir().join(format!("kith-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bundles);
+        fs::create_dir_all(bundles.join("making")).unwrap();
+        assert!(take_range(&bundles).is_ok());
+        fs::create_dir_all(bundles.join("torn")).unwrap();
+        fs::write(bundles.join("torn/config.json"), "{\"ociVersion\":").unwrap();
+        let refused = take_range(&bundles)
+            .err()
+            .expect("no range while a bundle cannot be read");
+        assert!(refused.to_string().contains("torn"), "{refused}");
+        let _ = fs::remove_dir_all(&bundles);
+    }
+
     /// What keeps a container's users the node's: the node's network (its ports under 1024 are
     /// the node's root's), devices, a NodeWorkload, or a file system that takes no id-mapped
     /// mount. A pod, with a network of its own, otherwise gets a range, and joins its network
@@ -2400,6 +2521,18 @@ mod tests {
         for unit in kept {
             assert!(!shifts(&image, &unit), "{unit:?}");
         }
+        // A pod kept so by a file system, not by its own unit, is told which path it was.
+        let on_proc = Unit {
+            mounts: vec![bind("/proc", "/x", true)],
+            ..pod()
+        };
+        assert!(may_shift(&on_proc) && !may_shift(&Unit::default()));
+        assert_eq!(unmappable(&image, &on_proc), Some(Path::new("/proc")));
+        let elsewhere = Image {
+            rootfs: "/proc".into(),
+            ..image.clone()
+        };
+        assert_eq!(unmappable(&elsewhere, &pod()), Some(Path::new("/proc")));
         let _ = fs::remove_dir_all(&here);
     }
 }

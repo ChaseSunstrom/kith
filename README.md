@@ -323,11 +323,14 @@ spec:
   are its image, its volumes and the devices it claims. On kith OS, where kithd is root,
   a pod's container (one with a network of its own: [a pod](#a-replica-as-a-pod)) is a
   user namespace of its own too: its users 0 to 65535 are 65536 users of the node that no
-  other container has (taken as it starts, given back once it is gone, and found again
-  from what still runs when kithd starts over), so `runAsUser: 0` is root of that
+  other container has (taken as it starts, given back once it is gone; which are taken is
+  read from the containers' bundles on the disk, and one left behind whose processes
+  outlive its kill keeps its range until they are gone), so `runAsUser: 0` is root of that
   namespace alone, and a `runAsUser` of 65536 or more is refused. Its image and its
   volumes are mounted id-mapped: a file its user 1000 makes is user 1000's on the disk, as
-  before, and no owner on the disk is changed to fit its range. Any port of the pod's own
+  before, and no owner on the disk is changed to fit its range. Id-mapped mounts are
+  Linux 5.12's (btrfs's 5.15, tmpfs's 6.3; kith OS's own kernel, 6.18, has them all); a kernel or file system that refuses one
+  fails the container's start rather than run it as the node's users. Any port of the pod's own
   network is anyone's in it, so its root still serves port 80. The rest keep the node's
   users, so that `runAsUser: 0` is the node's root with three capabilities (to send
   signals, to take a port below 1024, to write the audit log): a container on the node's
@@ -336,7 +339,8 @@ spec:
   whose image or a volume is on a file system that takes no id-mapped mount (ext4, xfs,
   btrfs and tmpfs take one; a volume of another node is NFS, which does not), one given
   devices (theirs are the node's users) and a NodeWorkload's (the node's own). A
-  container's status says which it is: `hostUsers: false` for a namespace of its own.
+  container's status says which it is: `hostUsers: false` for a namespace of its own; a
+  pod's container kept so by a file system also says which path on kithd's log.
 - **Nothing more than that user.** No capabilities (on kith OS the one for ports below
   1024 is kept), and no way to any: `no_new_privs` is set, so a setuid program in the
   image is an ordinary program.
