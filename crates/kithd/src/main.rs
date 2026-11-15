@@ -23,6 +23,7 @@ mod devices;
 mod dhcp;
 mod dns;
 mod encrypted;
+mod exits;
 mod files;
 mod gpt;
 mod images;
@@ -201,6 +202,8 @@ pub struct Shared {
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
     pub pods: Mutex<pods::Pods>,
+    /// The tunnels of the Exits this node holds.
+    pub exits: Mutex<exits::Exits>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
@@ -514,6 +517,7 @@ async fn replica(
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
+        exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
@@ -685,6 +689,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         &state,
         std::time::Duration::from_secs(args.lost_after),
     ))?;
+    // (An exit's pods pass on to the mesh by its link alone.)
+    shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
     if args.ingress && shared.view.borrow().is_some() {
         return Err(
             "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \
@@ -837,7 +843,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             };
             let hardware = devices::run(shared.clone(), stopping.clone());
             let crons = cron::run(shared.clone(), stopping.clone());
+            let exits = exits::run(shared.clone(), stopping.clone());
+            let published = pods::publish(shared.clone(), stopping.clone());
             tokio::join!(
+                apart(exits),
+                apart(published),
                 apart(units),
                 apart(releases),
                 apart(repositories),

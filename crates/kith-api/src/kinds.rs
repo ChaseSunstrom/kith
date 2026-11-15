@@ -305,6 +305,11 @@ spec! {
         /// root the replica shares the node's network.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pod: Option<bool>,
+        /// Name of the `Exit` a `pod` leaves by: what it sends beyond the cluster goes
+        /// through that tunnel or nowhere. Its replicas run on the exit's node, and only
+        /// containers (an exec unit or a VM has the node's network).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub exit: Option<String>,
         /// Notes on each replica, which nothing in kith reads. A replica is made anew
         /// when they change (`kubectl rollout restart` changes one to restart them all).
         #[serde(default, skip_serializing_if = "Labels::is_empty")]
@@ -483,6 +488,11 @@ spec! {
         pub port: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub protocol: Option<Protocol>,
+        /// Reached at the same port of its node's own addresses too: kithd listens there
+        /// and passes each connection (or each datagram) on to the pod. Only in a `pod`,
+        /// and only ports from 1024.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub publish: Option<bool>,
     }
 
     pub enum Protocol { Tcp, Udp }
@@ -719,6 +729,25 @@ spec! {
 
     /// `nxdomain`: no such name. `unspecified`: `0.0.0.0` for A and `::` for AAAA.
     pub enum DnsBlockAnswer { Nxdomain, Unspecified }
+
+    /// A WireGuard tunnel one node holds, which the pods there that name it (a template's
+    /// `exit`) leave by and by nothing else: no container is given a capability, a sysctl or
+    /// a tun device for it. While the tunnel is down what they send to the world is
+    /// dropped, IPv6 to anywhere but the mesh always is, and their names are asked of
+    /// `dns` through the tunnel or not at all. They reach the cluster as other pods do.
+    pub struct ExitSpec {
+        /// The node that holds the tunnel; its pods are placed there.
+        pub node: String,
+        /// A Secret in `kith-system` whose key `wg0.conf` is the provider's WireGuard file
+        /// (`PrivateKey`, `Address`, `DNS`; one `[Peer]` with `PublicKey`, `Endpoint`,
+        /// `PresharedKey`, `PersistentKeepalive`). kithd reads it; no container mounts it.
+        pub secret: String,
+        /// The namespaces whose pods may name this exit.
+        pub namespaces: Vec<String>,
+        /// Where its pods' names are asked, through the tunnel (IPv4). Without it: the file's `DNS`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub dns: Vec<String>,
+    }
 
     pub struct DnsRecordSpec {
         /// Name of the `DNSZone` the record is in.
@@ -1807,6 +1836,35 @@ impl Template {
                 ));
             }
         }
+        let pod = self.pod == Some(true);
+        if let Some(exit) = &self.exit {
+            if !pod {
+                return Err(format!("{at}: exit: only a `pod` leaves by an exit (set `pod: true`)"));
+            }
+            if !self.exec.is_empty() || !self.vms.is_empty() {
+                return Err(format!(
+                    "{at}: exit: only containers (an exec unit or a VM has the node's network, not the pod's)"
+                ));
+            }
+            crate::check_name(exit).map_err(|e| format!("{at}: exit: {e}"))?;
+        }
+        let mut published = std::collections::BTreeSet::new();
+        for c in self.containers() {
+            for p in c.ports.iter().filter(|p| p.publish == Some(true)) {
+                let at = format!("{at}, container `{}`, port {}", c.name, p.port);
+                if !pod {
+                    return Err(format!("{at}: publish: only a `pod`'s ports are published"));
+                }
+                if p.port < 1024 {
+                    return Err(format!(
+                        "{at}: publish: only ports from 1024 (those below are the node's)"
+                    ));
+                }
+                if !published.insert((p.port, p.protocol == Some(Protocol::Udp))) {
+                    return Err(format!("{at}: publish: published twice"));
+                }
+            }
+        }
         let mut names = std::collections::BTreeSet::new();
         for name in self.units().chain(self.init_containers.iter().map(|c| &c.name)) {
             if !names.insert(name) {
@@ -1933,12 +1991,37 @@ impl Spec for NodeWorkloadSpec {
         if !self.template.device_claims.is_empty() {
             return Err("template.deviceClaims: a NodeWorkload cannot hold DeviceClaims (use a Workload)".into());
         }
+        // (A copy on every node, an exit on one.)
+        if self.template.exit.is_some() {
+            return Err("template.exit: a NodeWorkload cannot leave by an Exit (use a Workload)".into());
+        }
         self.template.check("template")
+    }
+}
+
+impl Spec for ExitSpec {
+    fn check(&self) -> Result<(), String> {
+        crate::check_name(&self.node).map_err(|e| format!("node: {e}"))?;
+        crate::check_name(&self.secret).map_err(|e| format!("secret: {e}"))?;
+        if self.namespaces.is_empty() {
+            return Err("namespaces: at least one (the namespaces whose pods may leave by it)".into());
+        }
+        for namespace in &self.namespaces {
+            crate::check_name(namespace).map_err(|e| format!("namespaces: {e}"))?;
+        }
+        // (Asked through the tunnel, which carries IPv4 alone.)
+        if let Some(bad) = self.dns.iter().find(|a| a.parse::<std::net::Ipv4Addr>().is_err()) {
+            return Err(format!("dns: `{bad}` is not an IPv4 address"));
+        }
+        Ok(())
     }
 }
 
 impl Spec for JobSpec {
     fn check(&self) -> Result<(), String> {
+        if self.template.exit.is_some() {
+            return Err("template.exit: only a Workload leaves by an Exit".into());
+        }
         self.template.check("template")
     }
 }
@@ -1956,6 +2039,9 @@ impl Spec for CronJobSpec {
     fn check(&self) -> Result<(), String> {
         // (Its schedule and its timezone are read where it is run, which says in the
         // CronJob's status what it cannot read: v1 took any text for both, and still does.)
+        if self.job.template.exit.is_some() {
+            return Err("job.template.exit: only a Workload leaves by an Exit".into());
+        }
         self.job.template.check("job.template")
     }
 }

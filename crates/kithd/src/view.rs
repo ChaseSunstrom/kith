@@ -88,6 +88,12 @@ pub fn named(store: &Store, node: &str) -> BTreeSet<String> {
         let secret = backup.spec["s3"]["secret"].as_str();
         secrets.extend(secret.map(|secret| format!("Secret/{}/{secret}", namespace(backup))));
     }
+    // The node an Exit names holds its tunnel: it alone is sent the Exit and the Secret of its key.
+    for exit in store.list(Some("Exit")).filter(|exit| exit.spec["node"] == node) {
+        named.insert(exit.key());
+        let secret = exit.spec["secret"].as_str();
+        secrets.extend(secret.map(|secret| format!("Secret/kith-system/{secret}")));
+    }
     for list in store.list(Some("DNSBlockList")) {
         let map = list.spec["configMap"]["name"].as_str();
         named.extend(map.map(|map| format!("ConfigMap/kith-system/{map}")));
@@ -98,7 +104,8 @@ pub fn named(store: &Store, node: &str) -> BTreeSet<String> {
 }
 
 /// The kinds [`named`] reads: what it says changes only when one of these does.
-const NAMES: [&str; 7] = [
+const NAMES: [&str; 8] = [
+    "Exit",
     "Workload",
     "NodeWorkload",
     "Job",

@@ -360,7 +360,9 @@ pub(crate) async fn applied(
         let nodes: Vec<_> = nodes
             .map(|node| (node.metadata.name.as_str(), Some(&node.spec)))
             .collect();
-        access::control_stays(&state.store, &nodes).and_then(|()| crate::releases::claims(&state.store, &resources))
+        access::control_stays(&state.store, &nodes)
+            .and_then(|()| crate::releases::claims(&state.store, &resources))
+            .and_then(|()| crate::exits::admitted(&state.store, &resources))
     };
     if let Err(why) = claimed {
         shared.audit.record(caller, "apply", keys, Err(why.clone()));

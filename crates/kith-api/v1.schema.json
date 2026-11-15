@@ -432,6 +432,42 @@
       "title": "NetworkPolicy",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
+    "Exit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "Exit"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExitSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A WireGuard tunnel a node holds, the only way out for the pods that name it",
+      "title": "Exit",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
     "Volume": {
       "type": "object",
       "additionalProperties": false,
@@ -2076,6 +2112,40 @@
         "command"
       ]
     },
+    "ExitSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "The node that holds the tunnel; its pods are placed there."
+        },
+        "secret": {
+          "type": "string",
+          "description": "A Secret in `kith-system` whose key `wg0.conf` is the provider's WireGuard file\n(`PrivateKey`, `Address`, `DNS`; one `[Peer]` with `PublicKey`, `Endpoint`,\n`PresharedKey`, `PersistentKeepalive`). kithd reads it; no container mounts it."
+        },
+        "namespaces": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The namespaces whose pods may name this exit."
+        },
+        "dns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Where its pods' names are asked, through the tunnel (IPv4). Without it: the file's `DNS`."
+        }
+      },
+      "required": [
+        "node",
+        "secret",
+        "namespaces"
+      ],
+      "description": "A WireGuard tunnel one node holds, which the pods there that name it (a template's\n`exit`) leave by and by nothing else: no container is given a capability, a sysctl or\na tun device for it. While the tunnel is down what they send to the world is\ndropped, IPv6 to anywhere but the mesh always is, and their names are asked of\n`dns` through the tunnel or not at all. They reach the cluster as other pods do."
+    },
     "Expose": {
       "type": "object",
       "additionalProperties": false,
@@ -2994,6 +3064,13 @@
               "type": "null"
             }
           ]
+        },
+        "publish": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Reached at the same port of its node's own addresses too: kithd listens there\nand passes each connection (or each datagram) on to the pod. Only in a `pod`,\nand only ports from 1024."
         }
       },
       "required": [
@@ -3682,6 +3759,13 @@
             "null"
           ],
           "description": "Run each replica as Kubernetes runs a pod: its containers share a network of\ntheir own (any port is theirs, `localhost` is each other, and the replica has\nan address on the mesh), each may write its root file system unless it says\n`readOnlyRoot`, and each is the user its image names, root included (with what\na container runtime gives root, and nothing of the node's). Where kithd is not\nroot the replica shares the node's network."
+        },
+        "exit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Name of the `Exit` a `pod` leaves by: what it sends beyond the cluster goes\nthrough that tunnel or nowhere. Its replicas run on the exit's node, and only\ncontainers (an exec unit or a VM has the node's network)."
         },
         "annotations": {
           "type": "object",

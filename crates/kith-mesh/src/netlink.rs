@@ -121,6 +121,20 @@ impl Device {
     /// UDP port and address (of a cluster's /48), and up. An interface of that name that
     /// is something else is left alone, and an error.
     pub fn ensure(name: &str, key: &Key, port: u16, address: Ipv6Addr) -> Result<Device> {
+        let mut device = Device::make(name)?;
+        device.set(vec![
+            WireguardAttribute::PrivateKey(*key),
+            WireguardAttribute::ListenPort(port),
+        ])?;
+
+        // (The /48 on the interface is the route to every other node too.)
+        device.address(address, MESH_BITS, true)?;
+        up(device.index)?;
+        Ok(device)
+    }
+
+    /// The WireGuard interface `name`, made if it is not there, as it is.
+    pub(crate) fn make(name: &str) -> Result<Device> {
         let ask_route = |message, flags| ask(protocols::NETLINK_ROUTE, message, flags);
         let mut new = link(0, Some(name));
         let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
@@ -156,24 +170,16 @@ impl Device {
             _ => None,
         });
         let family = id.next().ok_or_else(|| Error::other("the kernel has no WireGuard"))?;
-        let mut device = Device {
+        Ok(Device {
             index,
             family,
             had: None,
             held: BTreeSet::new(),
-        };
-        device.set(vec![
-            WireguardAttribute::PrivateKey(*key),
-            WireguardAttribute::ListenPort(port),
-        ])?;
+        })
+    }
 
-        // (The /48 on the interface is the route to every other node too.)
-        device.address(address, MESH_BITS, true)?;
-        let mut up = link(index, None);
-        up.header.flags = LinkFlags::Up;
-        up.header.change_mask = LinkFlags::Up;
-        ask_route(RouteNetlinkMessage::SetLink(up), NLM_F_ACK)?;
-        Ok(device)
+    pub(crate) fn index(&self) -> u32 {
+        self.index
     }
 
     /// Put `address` on the interface, or take it off.
@@ -236,7 +242,7 @@ impl Device {
         message
     }
 
-    fn set(&mut self, attributes: Vec<WireguardAttribute>) -> Result<()> {
+    pub(crate) fn set(&mut self, attributes: Vec<WireguardAttribute>) -> Result<()> {
         let message = self.message(WireguardCmd::SetDevice, attributes);
         ask(protocols::NETLINK_GENERIC, message, NLM_F_ACK).map(drop)
     }

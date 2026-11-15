@@ -147,7 +147,7 @@ fn errors_point_at_the_mistake() {
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
     // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 35);
+    assert_eq!(KINDS.len(), 36);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -1511,5 +1511,96 @@ fn storage_limit_is_bytes_a_container_may_write() {
         );
         let without = spec.replace("storage", "memory");
         read(kind, &without).unwrap_or_else(|e| panic!("{kind} {without}: {e}"));
+    }
+}
+
+/// An Exit names its node, its Secret and the namespaces that may use it; a pod leaves by
+/// one only as a Workload's pod of containers, and only a pod publishes a port, from 1024.
+/// A build that knows no `exit` refuses a template that names one (unknown fields are
+/// errors), so no older node runs such a pod with the node's own way out.
+#[test]
+fn an_exit_and_a_published_port_are_checked() {
+    let read = |kind: &str, spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: n }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map_err(|e| e.msg)
+    };
+    let exit = "{ node: n1, secret: vpn, namespaces: [media], dns: [10.2.0.1] }";
+    read("Exit", exit).unwrap();
+    assert!(!kind("Exit").unwrap().namespaced);
+    for (bad, why) in [
+        ("{ node: n1, secret: vpn, namespaces: [] }", "namespaces: at least one"),
+        (
+            "{ node: n1, secret: vpn, namespaces: [Media] }",
+            "namespaces: invalid name",
+        ),
+        (
+            "{ node: n1, secret: vpn, namespaces: [m], dns: [fd00::1] }",
+            "dns: `fd00::1` is not an IPv4",
+        ),
+        ("{ node: n1, namespaces: [m] }", "secret"),
+        (
+            "{ node: n1, secret: vpn, namespaces: [m], key: x }",
+            "unknown field `key`",
+        ),
+    ] {
+        let refused = read("Exit", bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    let template = |extra: &str, ports: &str| {
+        format!("{{ template: {{ {extra} containers: [{{ name: c, image: i, ports: [{ports}] }}] }} }}")
+    };
+    read(
+        "Workload",
+        &template("pod: true, exit: vpn,", "{ port: 8080, publish: true }"),
+    )
+    .unwrap();
+    let both = "{ port: 6881, publish: true }, { port: 6881, protocol: udp, publish: true }";
+    read("Workload", &template("pod: true,", both)).unwrap();
+    read("NodeWorkload", &template("pod: true,", "{ port: 8080, publish: true }")).unwrap();
+    for (kind, bad, why) in [
+        ("Workload", template("exit: vpn,", ""), "exit: only a `pod`"),
+        ("Workload", template("pod: true, exit: Vpn,", ""), "exit: invalid name"),
+        (
+            "Workload",
+            "{ template: { pod: true, exit: vpn, exec: [{ name: e, command: [x] }] } }".into(),
+            "exit: only containers",
+        ),
+        (
+            "NodeWorkload",
+            template("pod: true, exit: vpn,", ""),
+            "a NodeWorkload cannot leave by an Exit",
+        ),
+        (
+            "Job",
+            template("pod: true, exit: vpn,", ""),
+            "only a Workload leaves by an Exit",
+        ),
+        (
+            "Workload",
+            template("", "{ port: 8080, publish: true }"),
+            "publish: only a `pod`",
+        ),
+        (
+            "Workload",
+            template("pod: true,", "{ port: 80, publish: true }"),
+            "only ports from 1024",
+        ),
+        (
+            "Workload",
+            template(
+                "pod: true,",
+                "{ port: 8080, publish: true }, { port: 8080, publish: true }",
+            ),
+            "published twice",
+        ),
+        (
+            "Workload",
+            template("pod: true, exitt: vpn,", ""),
+            "unknown field `exitt`",
+        ),
+    ] {
+        let refused = read(kind, &bad).unwrap_err();
+        assert!(refused.contains(why), "{kind} {bad}: {refused}");
     }
 }
