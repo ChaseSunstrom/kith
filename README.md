@@ -544,6 +544,12 @@ kith get node                                      # on either: alpha and beta, 
 kith node status                                   # who leads the store, who votes
 ```
 
+- A node that makes the cluster, or holds its CA, and listens on every address
+  (`--listen 0.0.0.0:7443`, or a restart with no `--listen`) must say where
+  the others reach it: `--advertise 192.168.1.10:7443`. Without it kithd refuses at
+  start, before it serves anything. (A node that joins says where it is by joining; on
+  kith OS, one that asked its network for an address says the one it was given.)
+
 - Every node keeps its own copy of the store (Raft, with the log on disk in
   `<state>/raft`). A change made through any node goes to the leader, is
   written to disk by more than half of the voting nodes, and only then
