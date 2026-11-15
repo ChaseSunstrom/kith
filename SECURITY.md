@@ -549,16 +549,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     notes, is 131 KiB; a larger report is sent in parts of at most half that, a
     status whole in each), and a worker makes at most 10 a second, 50 at once
     after a rest, a write counting once more for each 64 KiB (so at most about
-    640 KiB a second). Every write a worker sends counts, before a byte of it is
-    read: one refused for its list, one that is not a change, and the empty write
-    its controller makes before it starts a unit (one a second at most) too. One
-    past the rate is answered 429 with the seconds to wait, and is not read; the
-    worker's own kithd sends it again then. One that says it is over the size is
-    refused unread, and one that turns out larger is cut off there. None of them
-    reaches the log. In the audit log under the worker's name, a write refused for
-    its list or as no change is written each time; one refused for its size, or
-    for its rate, a line a minute of each, which says how many were not written
-    since the last. What is left: a taken worker can still write that much, within
+    640 KiB a second). Every write a worker sends counts: one refused for its
+    list, one that is not a change, and the empty write its controller makes
+    before it starts a unit (one a second at most) too. A write that says its
+    size (`Content-Length`, as kithd's do) is counted for it before a byte of it
+    is read: past the rate it is answered 429 with the seconds to wait, unread,
+    and the worker's own kithd sends it again then; over the size it is refused
+    unread. One that does not say its size is counted once, read (up to 1 MiB,
+    where it is cut off), and then counted for the rest. One whose bytes do not
+    all come within 15 seconds is let go. None of them reaches the log. In the
+    audit log under the worker's name, a write refused for its list or as no
+    change is written each time; one refused for its size, its rate or its
+    slowness, a line a minute of each, which says how many were not written since
+    the last. The audit log writes at most 60 refusals a minute in all, whoever
+    they are of, and counts the rest with its next entry: a worker refused in a
+    loop can use up that minute's, and the refusals of others then are counted,
+    not written. What is left: a taken worker can still write that much, within
     its list, to each control node it reaches (each holds it to its own count:
     three control nodes, three times as much), and the log between two snapshots
     (about 1100 entries) can then hold some 1.1 GiB of it on every node, which

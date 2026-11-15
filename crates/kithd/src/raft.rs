@@ -244,6 +244,10 @@ const WORKER_WRITE: usize = 1 << 20;
 const WORKER_RATE: f64 = 10.0;
 const WORKER_BURST: f64 = 50.0;
 
+/// How long a worker's write may take to send (its buffer is held meanwhile); a moment in
+/// tests, which send one that never ends.
+const BODY_PATIENCE: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 15 });
+
 /// What a worker's write of `bytes` counts for against [`WORKER_RATE`].
 fn cost(bytes: usize) -> f64 {
     1.0 + (bytes >> 16) as f64
@@ -462,30 +466,43 @@ async fn write(
         audit(&shared, &name, why.clone());
         refused(why)
     };
-    // Every write of a worker counts, refused or not, and past its rate it is not read.
-    if let Some(wait) = over_rate(&shared, &name, 1.0) {
-        return wait;
-    }
+    // Every write of a worker counts, refused or not, for the size it says it is (once, where
+    // it says none), and past its rate it is not read.
     let most = WORKER_WRITE >> 10;
     let declared = headers.get(header::CONTENT_LENGTH);
     let declared = declared.and_then(|length| length.to_str().ok()?.parse::<u64>().ok());
+    let charged = declared.map_or(1.0, |bytes| cost(bytes.min(WORKER_WRITE as u64) as usize));
+    if let Some(wait) = over_rate(&shared, &name, charged) {
+        return wait;
+    }
     if let Some(bytes) = declared.filter(|bytes| *bytes > WORKER_WRITE as u64) {
         let said = bytes >> 10;
         return too_large(format!(
             "a worker's write is at most {most} KiB, and this one says it is {said} KiB"
         ));
     }
-    let bytes = match axum::body::to_bytes(body, WORKER_WRITE).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
+    // (Its buffer is held while it comes: a write that stalls is let go.)
+    let read = tokio::time::timeout(BODY_PATIENCE, axum::body::to_bytes(body, WORKER_WRITE)).await;
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
             return too_large(format!(
                 "a worker's write is at most {most} KiB, and this one was not read whole ({e})"
             ));
         }
+        Err(_) => {
+            let why = format!(
+                "a worker's write was not sent in {} s, and is let go",
+                BODY_PATIENCE.as_secs()
+            );
+            audit_throttled(&shared, &name, "slow", &why);
+            return refused(why);
+        }
     };
-    // (What else it counts for, now that its size is known.)
-    if bytes.len() >= 1 << 16
-        && let Some(wait) = over_rate(&shared, &name, cost(bytes.len()) - 1.0)
+    // (What else it counts for, now that its size is known: one that did not say.)
+    let more = cost(bytes.len()) - charged;
+    if more > 0.0
+        && let Some(wait) = over_rate(&shared, &name, more)
     {
         return wait;
     }
@@ -573,10 +590,11 @@ impl Shared {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
-                    Forward::Wait(wait, why) if Instant::now() + wait > deadline => return Err(unavailable(why)),
-                    Forward::Wait(wait, why) => {
+                    Forward::Wait(wait, why) if Instant::now() + wait > deadline => return Err(rate_wait(&why)),
+                    // (Waited already: asked again at once, and the deadline still ahead.)
+                    Forward::Wait(wait, _) => {
                         tokio::time::sleep(wait).await;
-                        refused = Some(why);
+                        continue;
                     }
                 }
             }
@@ -660,6 +678,15 @@ fn no_majority(refused: Option<String>) -> Error {
         Some(why) => unavailable(format!("{NO_MAJORITY} (the last try: {why})")),
         None => unavailable(NO_MAJORITY),
     }
+}
+
+/// The change was not taken in time because this worker writes past its rate, not for want
+/// of a leader: `why` is what the control node said.
+fn rate_wait(why: &str) -> Error {
+    unavailable(format!(
+        "the control node asked this worker to wait: it wrote more than {WORKER_RATE} writes a second \
+         (or more than its burst of {WORKER_BURST}) ({why})"
+    ))
 }
 
 const NO_MAJORITY: &str = "no leader, or it did not hear from more than half of the voting nodes in time \
@@ -1200,15 +1227,47 @@ mod tests {
                 .all(|e| e["who"] != "node bound-k")
         );
 
+        // What a worker may still write, set here.
+        let left = |writes: f64| {
+            let bucket = (writes, Instant::now());
+            SPENT.lock().unwrap().buckets.insert("bound-w".into(), bucket);
+        };
+        // A body that never ends: none of these is sent a byte of it.
+        let unsent = |length: Option<usize>| {
+            let never = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+            let call = to_w.post(&url).body(reqwest::Body::wrap_stream(never));
+            let call = match length {
+                Some(length) => call.header(reqwest::header::CONTENT_LENGTH, length),
+                None => call,
+            };
+            tokio::time::timeout(Duration::from_secs(30), call.send())
+        };
+        // One that says it is 1 MiB, with a write left: it counts for 17, so it is answered
+        // 429 at once, unread.
+        left(1.0);
+        let reply = unsent(Some(WORKER_WRITE)).await.expect("answered unread").unwrap();
+        assert_eq!(reply.status().as_u16(), 429, "{:?}", reply.text().await);
+        // One that does not say, and stalls: refused once its time is up, and in the audit log.
+        left(WORKER_BURST);
+        let begun = Instant::now();
+        let reply = unsent(None).await.expect("answered when its time was up").unwrap();
+        let said = reply.text().await.unwrap();
+        assert!(said.contains("was not sent in"), "{said}");
+        assert!(begun.elapsed() >= BODY_PATIENCE, "{:?}", begun.elapsed());
+        let audited = shared.audit.tail(200).unwrap();
+        assert!(
+            audited
+                .iter()
+                .any(|e| e["who"] == "node bound-w" && e.to_string().contains("was not sent in")),
+            "{audited:?}"
+        );
+
         // The worker's own kithd (from a view, through c) sends a write c asks it to wait for
         // again once it may: here, after 3 s (its bucket 20 writes short).
         let worker = shared_with("bound-worker", w.clone(), &[]).await;
         worker.view.send_replace(Some(u64::MAX));
         *worker.upstream.lock().unwrap() = Some((address.clone(), to_w.clone()));
-        let short = |by: f64| {
-            let bucket = (-by, Instant::now());
-            SPENT.lock().unwrap().buckets.insert("bound-w".into(), bucket);
-        };
+        let short = |by: f64| left(-by);
         short(20.0);
         let begun = Instant::now();
         let done = worker.write(os("bound-w", 10)).await;
@@ -1220,7 +1279,15 @@ mod tests {
         let learner = shared_with("bound-learner", w.clone(), &[at("bound-c", &address, None)]).await;
         short(20.0);
         match learner.forward(1, &BasicNode::new(&address), &os("bound-w", 10)).await {
-            Forward::Wait(wait, why) => assert!(wait >= Duration::from_secs(1), "{why}"),
+            Forward::Wait(wait, why) => {
+                assert!(wait >= Duration::from_secs(1), "{why}");
+                // Past its deadline, its log says why: not that there is no leader.
+                let said = rate_wait(&why).to_string();
+                assert!(
+                    said.contains("asked this worker to wait") && !said.contains("no leader"),
+                    "{said}"
+                );
+            }
             _ => panic!("not asked to wait"),
         }
     }
