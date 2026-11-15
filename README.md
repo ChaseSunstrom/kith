@@ -320,9 +320,21 @@ spec:
   one there is (on the node, its files are yours), and root, when asked for, is root of
   that namespace alone. It is still in your groups there (a namespace made without
   privileges cannot leave them), for what that is worth to it: the files it can reach
-  are its image, its volumes and the devices it claims. On kith OS, where kithd is root, there is no user namespace yet:
-  the container is that user of the node, and `runAsUser: 0` is the node's root with
-  three capabilities (to send signals, to take a port below 1024, to write the audit log).
+  are its image, its volumes and the devices it claims. On kith OS, where kithd is root,
+  a container is a user namespace of its own too: its users 0 to 65535 are 65536 users of
+  the node that no other container has (taken as it starts, given back once it is gone,
+  and found again from what still runs when kithd starts over), so `runAsUser: 0` is root
+  of that namespace alone, with three capabilities (to send signals, to take a port below
+  1024, to write the audit log), and a `runAsUser` of 65536 or more is refused. Its image
+  and its volumes are mounted id-mapped: a file its user 1000 makes is user 1000's on the
+  disk, as before, and no owner on the disk is changed to fit its range. Some keep the node's users,
+  as every container did before, so that `runAsUser: 0` is the node's root with those
+  three capabilities: one whose image or a volume is on a file system that takes no
+  id-mapped mount (ext4, xfs, btrfs and tmpfs take one; a volume of another node is NFS,
+  which does not), one given devices (theirs are the node's users), a pod's (for now) and
+  a NodeWorkload's (the node's own). A container's status says which it is: `hostUsers:
+  false` for a namespace of its own. Any user of the node may take a port below 1024
+  there, as a container's root of its own namespace may not otherwise.
 - **Nothing more than that user.** No capabilities (on kith OS the one for ports below
   1024 is kept), and no way to any: `no_new_privs` is set, so a setuid program in the
   image is an ordinary program.
@@ -362,8 +374,9 @@ spec:
   sandbox starts too, and so does `no_new_privs`. What it costs: inside a user namespace
   a program is that namespace's root, and reaches kernel code a plain user never calls
   (mounting, more of the network); much of what has let a user become the node's root was
-  found there. A container that is the node's root (`runAsUser: 0` on kith OS, or a pod
-  whose image is root's) is not started with it, and says so.
+  found there. A container that is the node's root (`runAsUser: 0` on kith OS where it
+  keeps the node's users, or a pod whose image is root's) is not started with it, and
+  says so.
 - **Whose image it is.** With `signedBy`, the image is run only if one of those keys
   signed it, as `cosign sign --key` does: the signature is looked for in the image's own
   repository (the tag `sha256-DIGEST.sig`) and checked against the manifest's digest
@@ -414,14 +427,16 @@ spec:
   node is a wide door into a kernel driver, and no filter here narrows it. All of this is
   for keeping an honest program's mistakes small. Untrusted programs belong in a VM
   ([Virtual machines](#virtual-machines)), which is what a `vms` unit is for.
-- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS; the filter is a
+- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS for a pod, a
+  container given devices or one with a volume of another node; the filter is a
   list of what is refused, not of what is allowed, so a call the kernel gains later is let
   through until it is named here; signatures with a certificate instead of a key
   (cosign's keyless signing), a transparency log, and signatures kept as referrers of the
   image (cosign's newer bundle format) are not read; keys are named by each template,
   not once for a cluster or a registry; an `exec` unit is none of this: it is a process
   of the host. The user namespace of the first kind (kithd as your service) has been run;
-  the kith OS kind has been run in VMs with the default user and with root.
+  the kith OS kind has been run in VMs with the default user and with root, and its
+  id-mapped volumes beside one of another node.
 
 ### A replica as a pod
 

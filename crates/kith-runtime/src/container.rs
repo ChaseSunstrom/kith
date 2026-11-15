@@ -15,7 +15,7 @@ use oci_spec::runtime::{
     LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, MountBuilder,
     RootBuilder, Spec, UserBuilder,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -106,6 +106,125 @@ pub struct Unit {
     pub netns: Option<PathBuf>,
     /// What it is called (a pod's containers are all called as the pod is). Without it: its id.
     pub hostname: Option<String>,
+    /// It is the node's own users where kithd is root, as a NodeWorkload is: no user namespace
+    /// of its own (see [`shifts`]).
+    pub host_users: bool,
+}
+
+/// How many ids a container's user namespace has where kithd is root: 0 to 65535, all an
+/// image's files may name.
+const RANGE: u32 = 65536;
+/// How many ranges of [`RANGE`] the node's ids have for containers: all below 2^31 but the
+/// first, which is the node's own users'.
+const RANGES: u32 = 32767;
+/// Where a container's image and volumes are mounted id-mapped before it is made, in a mount
+/// namespace that is the making thread's alone (see [`stage`]).
+const STAGE: &str = "/run/kith-stage";
+
+/// The ranges of containers being made, which no bundle's `config.json` names yet.
+static TAKING: std::sync::Mutex<BTreeSet<u32>> = std::sync::Mutex::new(BTreeSet::new());
+
+fn taking() -> std::sync::MutexGuard<'static, BTreeSet<u32>> {
+    TAKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A range of ids being taken by a container: free again when dropped, by when its bundle
+/// names it, or the bundle is gone.
+struct Range(u32);
+
+impl Drop for Range {
+    fn drop(&mut self) {
+        taking().remove(&self.0);
+    }
+}
+
+/// The lowest range of ids no container has: not one that a bundle under `bundles` maps, nor
+/// one being taken. What is taken is what the bundles say, so it holds over a restart of
+/// kithd, and a range is free once its container's bundle is removed.
+fn take_range(bundles: &Path) -> Result<Range> {
+    let mut taken = taking();
+    let mut used = taken.clone();
+    for entry in fs::read_dir(bundles).ctx("listing containers")?.flatten() {
+        // (An exec unit's marker has no config.json.)
+        let Ok(spec) = Spec::load(entry.path().join("config.json")) else {
+            continue;
+        };
+        let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().clone());
+        used.extend(maps.iter().flatten().map(|map| map.host_id()));
+    }
+    let Some(base) = (1..=RANGES).map(|k| k * RANGE).find(|base| !used.contains(base)) else {
+        return err("every range of ids on this node is a container's");
+    };
+    taken.insert(base);
+    Ok(Range(base))
+}
+
+/// Whether a container gets a user namespace of its own where kithd is root. Not one that keeps
+/// the node's users; not one given device nodes (the node's, whose owners are the node's users);
+/// not one in a network namespace (a pod's: its network is made by the node's root); and not one
+/// with its image or a volume on a file system that takes no id-mapped mount (NFS: a volume of
+/// another node). Those are what they were before: their users are the node's.
+fn shifts(image: &Image, unit: &Unit) -> bool {
+    use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, FsType, TMPFS_MAGIC, statfs};
+    // XFS's number, which nix leaves out where libc is musl.
+    let xfs = FsType(0x5846_5342 as _);
+    let kinds = [EXT4_SUPER_MAGIC, TMPFS_MAGIC, xfs, BTRFS_SUPER_MAGIC];
+    let mappable = |path: &Path| statfs(path).is_ok_and(|fs| kinds.contains(&fs.filesystem_type()));
+    unit.devices.is_empty()
+        && unit.netns.is_none()
+        && !unit.host_users
+        && mappable(&image.rootfs)
+        && unit.mounts.iter().all(|volume| mappable(&volume.host))
+}
+
+/// Mounts, in the calling thread's own mount namespace, what a container whose ids start at
+/// `base` is made of: its image at `STAGE/root` and each of its volumes at `STAGE/v<n>`,
+/// id-mapped to its range (a file of the image's root is its root's, and one a volume's user
+/// owns on disk is that user's in it), and its bundle at `STAGE/bundle`. The container's mount
+/// namespace is made as a copy of this one; the node's never has them, and they go with it.
+fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()> {
+    use kith_dm_sys::{NODEV, NOSUID, RDONLY, mount_mapped};
+    use nix::mount::{MsFlags, mount};
+    use std::os::fd::AsFd;
+    nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )?;
+    let stage = Path::new(STAGE);
+    fs::create_dir_all(stage)?;
+    // (Its root may pass through, to what is its own: nothing else of the node's is on the way.)
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+    mount(Some("tmpfs"), stage, Some("tmpfs"), flags, Some("mode=0711"))?;
+    let users = kith_dm_sys::user_namespace(base, RANGE)?;
+    fs::create_dir(stage.join("root"))?;
+    // (Writable until the container's root is made read-only, after its mount points are made
+    // in it, as they are in an image that is not mapped; under an overlay, never written.)
+    let image_only = if unit.writable { RDONLY } else { 0 };
+    mount_mapped(&image.rootfs, &stage.join("root"), users.as_fd(), image_only | NODEV)?;
+    if unit.writable {
+        fs::create_dir(stage.join("bundle"))?;
+        mount(
+            Some(bundle),
+            &stage.join("bundle"),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )?;
+    }
+    for (n, volume) in unit.mounts.iter().enumerate() {
+        let at = stage.join(format!("v{n}"));
+        match fs::metadata(&volume.host)?.is_dir() {
+            true => fs::create_dir(&at)?,
+            false => drop(File::create(&at)?),
+        }
+        let only = if volume.read_only { RDONLY } else { 0 };
+        mount_mapped(&volume.host, &at, users.as_fd(), NOSUID | NODEV | only)?;
+    }
+    Ok(())
 }
 
 /// What root keeps in a container that is `as_image`, where kithd is root: what Docker and
@@ -153,6 +272,8 @@ pub struct Handle {
     bundle: PathBuf,
     /// Path of the container's cgroup under `/sys/fs/cgroup`.
     pub cgroup: PathBuf,
+    /// The first of the node's ids its user namespace maps from 0, where it has one of its own.
+    range: Option<u32>,
 }
 
 impl Runtime {
@@ -218,7 +339,7 @@ impl Runtime {
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
 
         // Validate the id before it is used as a directory name.
-        let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
+        ContainerBuilder::new(id.into(), SyscallType::Linux)
             .validate_id()
             .ctx(&what)?;
         let state = self.root.join("state").join(id);
@@ -231,16 +352,25 @@ impl Runtime {
             },
         )
         .ctx(&what)?;
-        let spec = spec(id, image, unit, &cgroup, &bundle).ctx(&what)?;
-        // (The spec names a user only where kithd is root: see `spec`.)
+        let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
+        let range = match uid.is_root() && shifts(image, unit) {
+            true => Some(take_range(&self.root.join("containers")).ctx(&what)?),
+            false => None,
+        };
+        let shift = range.as_ref().map(|range| range.0);
+        let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
+        // (The spec names a user only where kithd is root: see `spec_shifted`.)
         let user = spec.process().as_ref().map(|process| process.user());
-        if let Some(user) = user.filter(|user| user.uid() != 0) {
+        if let Some(user) = user.filter(|user| user.uid() != 0 || shift.is_some()) {
             // Its output is its own: an image that writes its log to /dev/stdout by name
-            // opens the file again, and may only if it is its user's.
+            // opens the file again, and may only if it is its user's (the node's id of it).
+            let base = shift.unwrap_or(0);
             for output in [&stdout, &stderr] {
-                std::os::unix::fs::fchown(output, Some(user.uid()), Some(user.gid())).ctx(&what)?;
+                std::os::unix::fs::fchown(output, Some(base + user.uid()), Some(base + user.gid())).ctx(&what)?;
             }
-            for volume in unit.mounts.iter().filter(|volume| volume.give) {
+            // (A volume is its user's on disk as it is in the container: an id-mapped mount
+            // shows its owners as they are. A new one is root's until given.)
+            for volume in unit.mounts.iter().filter(|volume| volume.give && user.uid() != 0) {
                 give(&volume.host, user.uid(), user.gid()).ctx(format!(
                     "{what}: giving {} to user {}",
                     volume.host.display(),
@@ -249,13 +379,21 @@ impl Runtime {
             }
         }
         fs::create_dir_all(&bundle).ctx(&what)?;
-        let built = (|| {
+        let build = || {
             if unit.writable {
                 fs::create_dir(bundle.join("upper")).ctx(&what)?;
                 fs::create_dir(bundle.join("work")).ctx(&what)?;
+                // (Its own layer is its root's: the first id of its range.)
+                for layer in shift.iter().flat_map(|_| ["upper", "work"]) {
+                    std::os::unix::fs::chown(bundle.join(layer), shift, shift).ctx(&what)?;
+                }
             }
+            // (From here the bundle names its range: no other container takes it.)
             spec.save(bundle.join("config.json")).ctx(&what)?;
-            let container = builder
+            if let Some(base) = shift {
+                stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
+            }
+            let container = ContainerBuilder::new(id.into(), SyscallType::Linux)
                 .with_root_path(self.root.join("state"))
                 .ctx(&what)?
                 // Never the caller's stdin: a container must not read kithd's terminal.
@@ -272,7 +410,14 @@ impl Runtime {
                 Some(pid) => Ok((container, pid)),
                 None => err(format!("{what}: no process was created")),
             }
-        })();
+        };
+        let built = match shift {
+            None => build(),
+            // (In a thread of its own, whose mount namespace `stage` makes its own: the
+            // container's is made from the thread's, and the node's stays as it was.)
+            Some(_) => std::thread::scope(|scope| scope.spawn(build).join())
+                .unwrap_or_else(|_| err(format!("{what}: its making panicked"))),
+        };
         if built.is_err() {
             // Nothing half-made stays behind to block the next attempt.
             let _ = fs::remove_dir_all(self.root.join("state").join(id));
@@ -286,6 +431,7 @@ impl Runtime {
             reaped: false,
             bundle,
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            range: shift,
         };
         // Before its program runs: the devices it may open, and no other. (Where kithd is
         // root; elsewhere the container is a user namespace, which makes no device node.)
@@ -358,6 +504,7 @@ impl Runtime {
             reaped: false,
             bundle: marker.clone(),
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            range: None,
         };
         let manager = manager(&cgroup);
         let options = ControllerOpt {
@@ -616,6 +763,12 @@ impl Handle {
     /// The process id of the container's init, or of the exec unit's command.
     pub fn pid(&self) -> i32 {
         self.pid.as_raw()
+    }
+
+    /// The first of the node's ids its user namespace maps 0 to: `None` where its users are
+    /// the node's (an exec unit, a container where kithd is not root, or one [`shifts`] keeps so).
+    pub fn range(&self) -> Option<u32> {
+        self.range
     }
 
     /// Where a container's writes to its root land: `None` for an exec unit. A read-only root
@@ -959,8 +1112,9 @@ impl Executor for Entry {
 /// so a program writing the volume meanwhile cannot have something outside it given away.
 //
 // ponytail: a walk of the whole volume when its user changes, and two workloads with two
-// users on one volume walk it at every start. Idmapped mounts (the files stay as they
-// are, each container sees them as its own) when a volume is big enough for that to hurt.
+// users on one volume walk it at every start. (A container's range of ids never walks one:
+// its volumes are id-mapped, see `stage`.) A mount that maps the volume's owner to the
+// container's user, when a volume is big enough for that to hurt.
 fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     fn held(dir: &Path) -> io::Result<File> {
@@ -995,6 +1149,7 @@ fn give(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
     walk(top, uid, gid, 128)
 }
 
+#[cfg(test)]
 fn spec(
     id: &str,
     image: &Image,
@@ -1013,7 +1168,8 @@ fn spec(
     )
 }
 
-/// [`spec`], for a kithd that is the user `uid`.
+/// [`spec_shifted`], for a container whose users are kithd's (no range of its own).
+#[cfg(test)]
 fn spec_of(
     id: &str,
     image: &Image,
@@ -1023,26 +1179,54 @@ fn spec_of(
     uid: nix::unistd::Uid,
     gid: nix::unistd::Gid,
 ) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
-    // Who the process is. Where kithd is root it is that user of the node, with nothing
-    // root has. Where it is not, the container is a user namespace whose one user is
-    // kithd's own, and the program is given a second one inside (`Entry`).
-    //
-    // ponytail: no user namespace where kithd is root (kith OS): the image's files and the
-    // volumes are root's there, and a namespace needs them shifted to its users (idmapped
-    // mounts, or a chown of every image). So `runAsUser: 0` on kith OS is the node's root
-    // with three capabilities, as before.
+    spec_shifted(id, image, unit, cgroup, bundle, (uid, gid), None)
+}
+
+/// The container's spec, for a kithd that is the user `kithd`, where `shift` is the first id
+/// of the range its user namespace maps (where kithd is root, and [`shifts`] says so).
+fn spec_shifted(
+    id: &str,
+    image: &Image,
+    unit: &Unit,
+    cgroup: &str,
+    bundle: &Path,
+    (uid, gid): (nix::unistd::Uid, nix::unistd::Gid),
+    shift: Option<u32>,
+) -> std::result::Result<Spec, Box<dyn std::error::Error>> {
+    // Who the process is. Where kithd is root it is that user of its own range of the node's
+    // ids (its root is not the node's), or, where it keeps the node's users, that user of the
+    // node with nothing root has. Where kithd is not root, the container is a user namespace
+    // whose one user is kithd's own, and the program is given a second one inside (`Entry`).
     let (user, group) = who(image, unit)?;
     if unit.non_root && user == 0 {
         return Err("runAsNonRoot: this container would be root (its image names no other user, or names root): say who with runAsUser".into());
     }
-    let mut spec = if uid.is_root() {
-        Spec::default()
-    } else {
-        Spec::rootless(uid.as_raw(), gid.as_raw())
+    let shift = shift.filter(|_| uid.is_root());
+    let mut spec = match shift {
+        _ if !uid.is_root() => Spec::rootless(uid.as_raw(), gid.as_raw()),
+        None => Spec::default(),
+        // (What a user namespace mounts: the node's /sys bound in, as it may mount no other.)
+        Some(base) => {
+            if user >= RANGE || group >= RANGE {
+                let why = format!("user {user} (group {group}) is past the {RANGE} ids a container has here");
+                return Err(why.into());
+            }
+            let mut spec = Spec::rootless(base, base);
+            let map = oci_spec::runtime::LinuxIdMappingBuilder::default()
+                .container_id(0u32)
+                .host_id(base)
+                .size(RANGE)
+                .build()?;
+            let mut linux = spec.linux().clone().unwrap_or_default();
+            linux.set_uid_mappings(Some(vec![map]));
+            linux.set_gid_mappings(Some(vec![map]));
+            spec.set_linux(Some(linux));
+            spec
+        }
     };
     // With `/proc` as the kernel has it, the node's root could write the node's settings
     // (`/proc/sys` asks who you are, not what you may): only another user is given that.
-    if unit.nested && uid.is_root() && user == 0 {
+    if unit.nested && uid.is_root() && shift.is_none() && user == 0 {
         let why = "userNamespaces: this container is the node's root (runAsUser 0, or its image's user), who is not given a /proc that hides nothing: name another user";
         return Err(why.into());
     }
@@ -1071,7 +1255,10 @@ fn spec_of(
     }
     linux.set_namespaces(Some(namespaces));
     spec.set_linux(Some(linux));
-    let rootfs = RootBuilder::default().path(&image.rootfs).readonly(!unit.writable);
+    // (A range's image is its id-mapped mount, made by `stage`; so are its own layer and volumes.)
+    let staged = |name: &str| Path::new(STAGE).join(name);
+    let image_root = shift.map_or(image.rootfs.clone(), |_| staged("root"));
+    let rootfs = RootBuilder::default().path(&image_root).readonly(!unit.writable);
     spec.set_root(Some(rootfs.build()?));
     // Linux refuses hostnames over 64 bytes; ids are ASCII (validated by the caller).
     let hostname = unit.hostname.as_deref().unwrap_or(id);
@@ -1192,13 +1379,14 @@ fn spec_of(
         // The first mount, on the root itself: the image below, the container's own layer
         // over it, and everything after is mounted on the two together. (It is made in the
         // container's mount namespace, and goes with it.)
-        let layer = |name: &str| bundle.join(name).display().to_string();
+        let held = shift.map_or(bundle.to_path_buf(), |_| staged("bundle"));
+        let layer = |name: &str| held.join(name).display().to_string();
         let mut options = vec![
-            format!("lowerdir={}", image.rootfs.display()),
+            format!("lowerdir={}", image_root.display()),
             format!("upperdir={}", layer("upper")),
             format!("workdir={}", layer("work")),
         ];
-        if !root {
+        if !root || shift.is_some() {
             // (What a user namespace may write its bookkeeping in.)
             options.push("userxattr".into());
         }
@@ -1215,7 +1403,7 @@ fn spec_of(
         let resolv = MountBuilder::default().destination("/etc/resolv.conf").typ("bind");
         mounts.push(resolv.source("/etc/resolv.conf").options(options).build()?);
     }
-    for volume in &unit.mounts {
+    for (n, volume) in unit.mounts.iter().enumerate() {
         check_mount(volume)?;
         // Not over a mount the container already has (/tmp, /run, its resolv.conf, another volume).
         if mounts.iter().any(|m| m.destination() == Path::new(&volume.container)) {
@@ -1226,7 +1414,8 @@ fn spec_of(
             options.push("ro".into());
         }
         let bind = MountBuilder::default().destination(&volume.container).typ("bind");
-        mounts.push(bind.source(&volume.host).options(options).build()?);
+        let source = shift.map_or(volume.host.clone(), |_| staged(&format!("v{n}")));
+        mounts.push(bind.source(source).options(options).build()?);
     }
     spec.set_mounts(Some(mounts));
 
@@ -1909,6 +2098,7 @@ mod tests {
                 reaped: true,
                 bundle: bundle.clone(),
                 cgroup: cgroup.clone(),
+                range: None,
             }
         };
         // Processes still listed: the handle comes back and the bundle is kept.
@@ -1944,6 +2134,7 @@ mod tests {
                 reaped: true,
                 bundle: bundle.clone(),
                 cgroup: cgroup.clone(),
+                range: None,
             }
         };
         discard_leftovers(&state, fresh("4242\n").finish(err("removing the cgroup")));
@@ -2024,5 +2215,171 @@ mod tests {
             assert!(said.contains(part), "`{part}` is not in: {said}");
         }
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Where kithd is root and the container has a range: its 65536 ids are the range's, its
+    /// root is the image mounted id-mapped (no owner of it changed), each volume is its own
+    /// id-mapped mount, and its users are what they would be without the range.
+    #[test]
+    fn idmapped_a_containers_ids_are_its_range_and_its_image_and_volumes_are_mapped() {
+        let (uid, gid) = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            rootfs: "/images/x/rootfs".into(),
+            ..Image::default()
+        };
+        let unit = Unit {
+            as_image: true,
+            writable: true,
+            mounts: vec![bind("/srv/data", "/data", false), bind("/srv/ro", "/ro", true)],
+            ..Unit::default()
+        };
+        let base = 3 * RANGE;
+        let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), (uid, gid), Some(base)).unwrap();
+        let linux = made.linux().as_ref().unwrap();
+        for maps in [linux.uid_mappings(), linux.gid_mappings()] {
+            let maps = maps.as_ref().unwrap();
+            assert_eq!(maps.len(), 1);
+            assert_eq!(
+                (maps[0].container_id(), maps[0].host_id(), maps[0].size()),
+                (0, base, RANGE)
+            );
+        }
+        let user = oci_spec::runtime::LinuxNamespaceType::User;
+        assert!(linux.namespaces().as_ref().unwrap().iter().any(|ns| ns.typ() == user));
+        assert_eq!(
+            made.root().as_ref().unwrap().path(),
+            Path::new(STAGE).join("root").as_path()
+        );
+        let mounts = made.mounts().as_ref().unwrap();
+        assert_eq!(
+            mounts[0].options().as_ref().unwrap(),
+            &[
+                "lowerdir=/run/kith-stage/root",
+                "upperdir=/run/kith-stage/bundle/upper",
+                "workdir=/run/kith-stage/bundle/work",
+                "userxattr"
+            ]
+        );
+        let source = |at: &str| {
+            let found = mounts.iter().find(|m| m.destination() == Path::new(at)).unwrap();
+            found.source().clone().unwrap()
+        };
+        assert_eq!(source("/data"), Path::new("/run/kith-stage/v0"));
+        assert_eq!(source("/ro"), Path::new("/run/kith-stage/v1"));
+        // Its root is the range's first id, with what a runtime gives root: none of it the node's.
+        let process = made.process().as_ref().unwrap();
+        assert_eq!((process.user().uid(), process.user().gid()), (0, 0));
+        assert_eq!(
+            process.capabilities().as_ref().unwrap().bounding(),
+            &Some(HashSet::from(ROOTS))
+        );
+        // A root that is not the node's may have a /proc that hides nothing.
+        let nested = Unit {
+            nested: true,
+            user: Some(0),
+            ..Unit::default()
+        };
+        assert!(spec_shifted("a", &image, &nested, "/kith/a", Path::new("/b"), (uid, gid), Some(base)).is_ok());
+        assert!(spec_shifted("a", &image, &nested, "/kith/a", Path::new("/b"), (uid, gid), None).is_err());
+        // A user past the range has no id in it: refused, never the node's.
+        let far = Unit {
+            user: Some(RANGE + 4),
+            ..Unit::default()
+        };
+        let said = spec_shifted("a", &image, &far, "/kith/a", Path::new("/b"), (uid, gid), Some(base));
+        assert!(said.unwrap_err().to_string().contains("past the 65536 ids"));
+        // Where kithd is not root a range means nothing: one user, its own.
+        let (me, us) = (nix::unistd::Uid::from_raw(1000), nix::unistd::Gid::from_raw(1000));
+        let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), (me, us), Some(base)).unwrap();
+        let maps = made.linux().as_ref().unwrap().uid_mappings().clone().unwrap();
+        assert_eq!((maps[0].host_id(), maps[0].size()), (1000, 1));
+        assert_eq!(made.root().as_ref().unwrap().path(), Path::new("/images/x/rootfs"));
+    }
+
+    /// Two containers never share a range: one being made holds its own until its bundle names
+    /// it, a bundle's names it until the bundle goes (also over a restart), and a freed one is
+    /// taken again.
+    #[test]
+    fn idmapped_two_containers_never_share_a_range() {
+        let bundles = std::env::temp_dir().join(format!("kith-ranges-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bundles);
+        fs::create_dir_all(bundles.join("exec-unit")).unwrap();
+        let first = take_range(&bundles).unwrap();
+        let second = take_range(&bundles).unwrap();
+        assert_ne!(first.0, second.0);
+        assert!(
+            first.0 >= RANGE && second.0 >= RANGE,
+            "the node's own first range is never given"
+        );
+        // The first is now named by its bundle, and no longer held: still not given again.
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let root = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        let spec = spec_shifted(
+            "a",
+            &image,
+            &Unit::default(),
+            "/kith/a",
+            Path::new("/b"),
+            root,
+            Some(first.0),
+        );
+        fs::create_dir_all(bundles.join("a")).unwrap();
+        spec.unwrap().save(bundles.join("a").join("config.json")).unwrap();
+        let named = first.0;
+        drop(first);
+        let third = take_range(&bundles).unwrap();
+        assert!(third.0 != named && third.0 != second.0);
+        // Its bundle gone, its range is free again.
+        fs::remove_dir_all(bundles.join("a")).unwrap();
+        let fourth = take_range(&bundles).unwrap();
+        assert_eq!(fourth.0, named);
+        let _ = fs::remove_dir_all(&bundles);
+    }
+
+    /// What keeps a container's users the node's: devices, a pod's network, a NodeWorkload, or
+    /// a file system that takes no id-mapped mount. Otherwise it gets a range.
+    #[test]
+    fn idmapped_only_where_every_file_system_takes_it() {
+        let here = std::env::temp_dir().join(format!("kith-shifts-{}", std::process::id()));
+        fs::create_dir_all(&here).unwrap();
+        let image = Image {
+            rootfs: here.clone(),
+            ..Image::default()
+        };
+        let mapped = nix::sys::statfs::statfs(&here).unwrap().filesystem_type();
+        let takes = [
+            nix::sys::statfs::EXT4_SUPER_MAGIC,
+            nix::sys::statfs::TMPFS_MAGIC,
+            nix::sys::statfs::XFS_SUPER_MAGIC,
+            nix::sys::statfs::BTRFS_SUPER_MAGIC,
+        ];
+        assert_eq!(shifts(&image, &Unit::default()), takes.contains(&mapped));
+        let kept = [
+            Unit {
+                devices: vec!["/dev/dri/card0".into()],
+                ..Unit::default()
+            },
+            Unit {
+                netns: Some("/proc/1/ns/net".into()),
+                ..Unit::default()
+            },
+            Unit {
+                host_users: true,
+                ..Unit::default()
+            },
+            // (/proc is no file system an id-mapped mount takes, as NFS is not.)
+            Unit {
+                mounts: vec![bind("/proc", "/x", true)],
+                ..Unit::default()
+            },
+        ];
+        for unit in kept {
+            assert!(!shifts(&image, &unit), "{unit:?}");
+        }
+        let _ = fs::remove_dir_all(&here);
     }
 }

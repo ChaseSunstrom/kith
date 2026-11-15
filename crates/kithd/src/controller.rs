@@ -1340,6 +1340,13 @@ impl Controller {
                     if let Some(message) = &slot.message {
                         c["message"] = json!(message);
                     }
+                    // Where kithd is root: whether its users are the node's (no range of its own:
+                    // a NodeWorkload, a pod, devices, or a volume no id-mapped mount takes).
+                    if let (Run::Container(_), Some(handle)) = (&slot.run, &slot.handle)
+                        && nix::unistd::getuid().is_root()
+                    {
+                        c["hostUsers"] = json!(handle.range().is_none());
+                    }
                     let pods = shared.pods.lock().expect("nothing panics holding the pods");
                     if let Some(address) = slot.pod.as_ref().and_then(|(pod, _)| pods.address(pod)) {
                         c["address"] = json!(address);
@@ -2002,6 +2009,8 @@ async fn start(
             .filter(|path| !path.starts_with(crate::vm::PCI))
             .cloned()
             .collect(),
+        // A NodeWorkload is the node's own: it keeps the node's users.
+        host_users: slot.owner.starts_with("NodeWorkload/"),
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the
