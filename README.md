@@ -367,7 +367,9 @@ spec:
   the rule), and taking it out of the `Cluster` is the way back. Not under any rule:
   a cluster Image (packed from a Volume on a node, signed by no one). Not read: cosign's
   keyless signatures (certificates), a transparency log, and signatures kept as OCI
-  referrers; `spec.images` is all kithd reads of a `Cluster` today.
+  referrers. `spec.images` is all kithd reads of a `Cluster` today: its `domain`, `voters`,
+  `updatePolicy`, `mesh` and `values` are kept and not acted on, and `kith lint`, `kith
+  diff` and `kith apply` say so of each one a file sets.
 - **What it still reaches.** The node's network (and so every port on its loopback, and
   the sockets programs of the node listen on by name alone, without a file), the
   kernel through every call the filter lets by, and the devices it claims: a GPU's render

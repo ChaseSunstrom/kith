@@ -32,7 +32,7 @@
         "kind",
         "metadata"
       ],
-      "description": "Cluster-wide settings: domain, voter set, update policy, mesh settings",
+      "description": "Cluster-wide settings: the keys that sign images (the other fields are kept and not acted on)",
       "title": "Cluster",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
@@ -1415,14 +1415,14 @@
             "string",
             "null"
           ],
-          "description": "DNS domain for public names."
+          "description": "DNS domain for public names. Kept and not acted on: nothing reads it."
         },
         "voters": {
           "type": "array",
           "items": {
             "type": "string"
           },
-          "description": "Names of the nodes that vote in Raft."
+          "description": "Names of the nodes that vote in Raft. Kept and not acted on: who votes is said\nwhen a node joins (`kith node token`)."
         },
         "updatePolicy": {
           "anyOf": [
@@ -1432,7 +1432,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Kept and not acted on: an update is an `OSRelease`."
         },
         "mesh": {
           "anyOf": [
@@ -1442,12 +1443,13 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Kept and not acted on: the mesh is set by kithd's flags."
         },
         "values": {
           "type": "object",
           "additionalProperties": true,
-          "description": "Cluster-wide package values."
+          "description": "Cluster-wide package values. Kept and not acted on: a package takes its own."
         },
         "images": {
           "type": "array",

@@ -646,3 +646,19 @@ spec:
     let (_, out, _) = sb.kith(&["history", "DeviceClaim/gpu"]);
     assert_eq!(out.lines().count(), 3, "{out}");
 }
+
+/// A Cluster's fields that nothing reads: `kith lint` says so of each one the file sets, on
+/// stderr, and the file is still fine.
+#[test]
+fn cluster_fields_nothing_reads_are_said() {
+    let sandbox = Sandbox::new("cluster-fields");
+    let cluster = "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: { name: home }\nspec:\n";
+    sandbox.write("set.yaml", &format!("{cluster}  voters: [a]\n  images: []\n"));
+    let (code, _, said) = sandbox.kith(&["lint", "-f", "set.yaml"]);
+    let note = "note: Cluster/home: spec.voters is kept and not acted on";
+    assert!(code == 0 && said.contains(note), "{code}: {said}");
+    assert!(!said.contains("spec.images"), "{said}");
+    sandbox.write("read.yaml", &format!("{cluster}  images: []\n"));
+    let (code, _, said) = sandbox.kith(&["lint", "-f", "read.yaml"]);
+    assert!(code == 0 && !said.contains("note:"), "{code}: {said}");
+}
