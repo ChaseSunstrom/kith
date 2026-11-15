@@ -37,13 +37,49 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
+- **An Identity's write is decided again where the log is kept.** An apply, a delete or
+  a rollback by an Identity, of any kind (a Role, a RoleBinding and an Identity
+  included), is asked about on the node it reaches, and then decided again on the
+  leader as it is put in the log: the leader first applies every entry it holds, and
+  asks its own store what the Identity may do now; a node that no longer leads sends the
+  write back, to be passed to whichever does. A write that changes a Role, a
+  RoleBinding, an Identity or a KindDefinition (which says whether a kind is namespaced,
+  so which rule matches it), or an import, goes into the log alone: the Identities'
+  writes wait for it to be applied, and it waits for those already on their way. So
+  access is decided in the log's order: a RoleBinding deleted before a write is put in
+  the log stops that write, even one that a node which had not heard of the deletion
+  yet let through, and the refusal says so ("decided again as the write was put in the
+  log"). One whose right to change access went cannot bind itself again through such a
+  node either. A node passes on the Identity's name with the write (`x-kith-for`); the
+  leader takes it from a control node only, and a worker's writes are held to a
+  worker's list whatever it names. A write waits at most 10 seconds for what comes
+  before it, and is then refused with "try again". So whoever may change a Role, a
+  RoleBinding, an Identity or a KindDefinition can, by changing access over and over,
+  slow the Identities' writes by up to those 10 seconds each, and past them make the
+  writes fail (they are refused, to be tried again): there is no rate on it.
+  What is decided once, where it arrives, and not again: an import or a restore of a
+  whole store; what the controllers write for themselves (a backup made, a status); a
+  blob put; a Volume's files; a package pushed; `kith run`; a seat's activity (a
+  Seat's status, `/v1/seats/NAME/activity`); a node's lock, its codes and keys
+  (`/v1/lock/NAME` and its lock, unlock, wipe, seal, unseal and duress,
+  `/v1/lock/NAME/recovery`, `/v1/lock/NAME/passphrase` and `/v1/duress`); and a
+  worker's write from its view. What it does not stop: a write put in the log before the change, which is
+  the log's order and not the clock's (a deletion still on its way when the write
+  reached the leader comes after it); a node of an older kith, in a cluster that is
+  half updated, which passes on no name, so its writes are decided where they arrived
+  (and a leader of an older kith decides nothing again); a taken control node, which
+  can name anyone or write as itself; and a certificate that stops standing for its
+  Identity (one made again, or the Identity deleted) while the write is on its way: the
+  leader is given the name, not the key, and asks what the Roles bound to that name
+  allow.
 - **A node's certificate has no right of its own on the API**: it reads nothing and
   writes nothing there. What a node does there is pass on what someone asked it, to the
   node that has the thing: a unit's output, a Volume's files, a node's passphrase, a
   backup's restore. It names who asked (a header, `x-kith-for`), and the node that gets
   the request asks its own store what that caller may do, and writes both in its audit
-  log (`alice via node a`). The header is read on those four requests and from a node
-  only: sent by an Identity, or anywhere else, it changes nothing. `kith run` is passed
+  log (`alice via node a`). The header is read on those four requests and on a write
+  passed on to the leader (above), and from a node only: sent by an Identity, or
+  anywhere else, it changes nothing. `kith run` is passed
   to the node the app is for on the node-to-node routes, with who asked in the request,
   and checked the same way there.
   **A control node's word for who asked is taken**: one that is taken can name the local

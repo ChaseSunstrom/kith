@@ -11,6 +11,7 @@
 // ponytail: Raft messages are JSON over the node API (a snapshot is an array of numbers).
 // Fine for stores of a few MB; a binary body is the upgrade if snapshots get slow.
 
+use crate::access::{self, Caller};
 use crate::cluster::Peer;
 use crate::{Shared, pki};
 use axum::body::Body;
@@ -450,10 +451,51 @@ async fn write(
             Ok(command) => command,
             Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
         };
-        let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
-        return Json(match written {
-            Ok(Ok(written)) => Some((written.data, written.log_id.index)),
-            _ => None,
+        // The Identity a control node passes the write on for, if it says one: whose Roles
+        // are asked again here, in the log's order (a node that says none is let write as itself).
+        let who = match headers
+            .get(access::FOR)
+            .map(|name| name.to_str().ok().and_then(Caller::named))
+        {
+            None => None,
+            Some(Some(Caller::Identity(name))) => {
+                let node = match &peer.subject {
+                    Some(pki::Subject::Node(node, ..)) => node.clone(),
+                    _ => "unknown".into(),
+                };
+                Some(Caller::Via(node, Box::new(Caller::Identity(name))))
+            }
+            Some(_) => {
+                let why = format!("{} names no Identity", access::FOR);
+                return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
+            }
+        };
+        // Decided only where the log is led: a node that no longer leads may be behind, and
+        // sends it back to be passed to whichever does.
+        let leads = {
+            let metrics = shared.raft.metrics();
+            let metrics = metrics.borrow();
+            metrics.current_leader == Some(metrics.id)
+        };
+        if !leads {
+            return Json(None::<(Reply, u64)>).into_response();
+        }
+        // On a task of its own: a sender that hangs up neither lets go of the turn while the
+        // write is on its way nor stops it.
+        let shared = shared.clone();
+        let done = tokio::spawn(async move {
+            let turn = shared.turn(&command, who.as_ref()).await?;
+            let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
+            drop(turn);
+            Ok(match written {
+                Ok(Ok(written)) => Some((written.data, written.log_id.index)),
+                _ => None,
+            })
+        });
+        return Json(match done.await {
+            Ok(Ok(written)) => written,
+            Ok(Err(refused)) => Some((Err::<Done, Error>(refused), 0u64)),
+            Err(_) => None,
         })
         .into_response();
     };
@@ -544,11 +586,17 @@ impl Shared {
     // "not found", an apply that names a revision "conflict". Request ids kept in the
     // state machine are the fix when that matters.
     pub async fn submit(&self, command: Command) -> Result<Done, Error> {
+        self.submit_as(command, None).await
+    }
+
+    /// [`Shared::submit`] for `who`: an Identity's write is decided again where it is put in
+    /// the log ([`Shared::turn`]).
+    pub async fn submit_as(&self, command: Command, who: Option<&Caller>) -> Result<Done, Error> {
         if let Command::Apply { resources, .. } = &command {
             let state = self.store.lock().expect("a handler panicked holding the store");
             crate::blobs::put_first(&state.store, resources).map_err(Error::Invalid)?;
         }
-        self.write(command).await
+        self.write_as(command, who).await.map(|(done, _)| done)
     }
 
     /// [`Shared::submit`] for the blob store's own Blobs: the bytes were just put.
@@ -558,6 +606,60 @@ impl Shared {
 
     /// [`Shared::write`], and the index of the log the change is at: this node has applied it.
     pub async fn write_at(&self, command: Command) -> Result<(Done, u64), Error> {
+        self.write_as(command, None).await
+    }
+
+    /// Leave to put `command` in the log here, to be held until it is in: decided again for
+    /// an Identity, in the log's order with what changes access.
+    ///
+    /// A change to who may do what (a Role, a RoleBinding, an Identity, a KindDefinition, or a
+    /// whole store) is put in the log by itself, nothing of an Identity's on its way beside it, and is applied
+    /// here before its leave is given back. An Identity's write waits for what is in this
+    /// node's log to be applied, and is asked about again on the store that makes: a Role taken
+    /// away before it is in the log is a Role it no longer has. Everything else goes as it comes.
+    /// Each wait is held to [`PATIENCE`]: past it the write is refused, to be tried again.
+    /// An Identity's own access change is held to both: alone, and asked about again.
+    //
+    // ponytail: the leave is held until the change is applied, not only until it is in the log
+    // (openraft 0.9 says nothing between): an Identity's write waits for it to be applied anyway.
+    pub(crate) async fn turn(
+        &self,
+        command: &Command,
+        who: Option<&Caller>,
+    ) -> Result<Option<Box<dyn Send + '_>>, Error> {
+        let alone = changes_access(command);
+        let caller = who.filter(|who| who.identity().is_some());
+        if caller.is_none() && !alone {
+            return Ok(None);
+        }
+        let asked = async {
+            let held: Box<dyn Send + '_> = match alone {
+                true => Box::new(self.order.write().await),
+                false => Box::new(self.order.read().await),
+            };
+            if caller.is_some() {
+                let last = self.raft.metrics().borrow().last_log_index;
+                let wait = self.raft.wait(None);
+                wait.applied_index_at_least(last, "access decided again")
+                    .await
+                    .map_err(unavailable)?;
+            }
+            Ok(held)
+        };
+        let late = unavailable("an access change before this write is not applied yet; try again");
+        let held = tokio::time::timeout(PATIENCE, asked).await.map_err(|_| late)??;
+        let refused = caller.and_then(|caller| {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            crate::api::refused(&state.store, caller, command)
+        });
+        match refused {
+            Some(why) => Err(Error::Invalid(why)),
+            None => Ok(Some(held)),
+        }
+    }
+
+    /// [`Shared::submit_as`] after the blobs: [`Shared::write_at`] for `who`.
+    async fn write_as(&self, command: Command, who: Option<&Caller>) -> Result<(Done, u64), Error> {
         // Whoever applies, here is where a kind's admission module is asked.
         let command = match command {
             Command::Apply { resources, at } => {
@@ -578,7 +680,10 @@ impl Shared {
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
         loop {
+            let turn = self.turn(&command, who).await?;
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
+            // (Let go before the leader is asked: it holds its own.)
+            drop(turn);
             let leader = match written {
                 Ok(Ok(written)) => return written.data.map(|done| (done, written.log_id.index)),
                 Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to)))) => to.leader_id.zip(to.leader_node),
@@ -586,7 +691,7 @@ impl Shared {
                 Err(_) => return Err(no_majority(refused)),
             };
             if let Some((id, leader)) = leader {
-                match self.forward(id, &leader, &command).await {
+                match self.forward(id, &leader, &command, who).await {
                     Forward::Done(reply, index) => return reply.map(|done| (done, index)),
                     Forward::Failed(e) => return Err(e),
                     Forward::Again(why) => refused = why.or(refused),
@@ -610,7 +715,7 @@ impl Shared {
     // The change may hold a Secret: it goes to the node the leader is by its Node, and to no
     // other at that address. A leader no Node names is not sent it; asking again waits for
     // the store to say.
-    async fn forward(&self, id: NodeId, leader: &BasicNode, command: &Command) -> Forward {
+    async fn forward(&self, id: NodeId, leader: &BasicNode, command: &Command, who: Option<&Caller>) -> Forward {
         let named = {
             let state = self.store.lock().expect("a handler panicked holding the store");
             let node = state.store.list(Some("Node")).find(|node| {
@@ -628,7 +733,11 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
-        let call = client.post(format!("https://{at}/v1/raft/write"));
+        let mut call = client.post(format!("https://{at}/v1/raft/write"));
+        // Whose write it is, for the leader to decide again in the log's order (`write`).
+        if let Some(name) = who.and_then(Caller::identity) {
+            call = call.header(access::FOR, name);
+        }
         match call.timeout(PATIENCE).json(command).send().await {
             // Only a worker is held to a rate (this one keeps the log, as a learner): it sends
             // the change again once the leader says it may, if that is before its deadline.
@@ -659,6 +768,23 @@ impl Shared {
                 Forward::Failed(unavailable(why))
             }
         }
+    }
+}
+
+/// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
+fn changes_access(command: &Command) -> bool {
+    let access = |kind: &str| {
+        // (A KindDefinition says whether a kind is namespaced: which rule matches it.)
+        ["Role", "RoleBinding", "Identity", "KindDefinition"]
+            .iter()
+            .any(|of| of.eq_ignore_ascii_case(kind))
+    };
+    let keyed = |key: &str| access(key.split('/').next().unwrap_or_default());
+    match command {
+        Command::Apply { resources, .. } => resources.iter().any(|resource| access(&resource.kind)),
+        Command::Delete { key } | Command::Rollback { key, .. } => keyed(key),
+        Command::Import { .. } => true,
+        Command::Status { .. } | Command::Patch { .. } | Command::Report { .. } => false,
     }
 }
 
@@ -1278,7 +1404,10 @@ mod tests {
         // to wait as well.
         let learner = shared_with("bound-learner", w.clone(), &[at("bound-c", &address, None)]).await;
         short(20.0);
-        match learner.forward(1, &BasicNode::new(&address), &os("bound-w", 10)).await {
+        match learner
+            .forward(1, &BasicNode::new(&address), &os("bound-w", 10), None)
+            .await
+        {
             Forward::Wait(wait, why) => {
                 assert!(wait >= Duration::from_secs(1), "{why}");
                 // Past its deadline, its log says why: not that there is no leader.
@@ -1463,14 +1592,14 @@ mod tests {
             key: "Secret/default/s".into(),
         };
         let leader = BasicNode::new(&taken);
-        let Forward::Again(why) = shared.forward(1, &leader, &command).await else {
+        let Forward::Again(why) = shared.forward(1, &leader, &command, None).await else {
             panic!("a write was taken by another node than the leader");
         };
         let why = why.expect("the refusal is kept");
         assert!(why.contains("node b was called, and node x answered"), "{why}");
         assert_eq!(to_x.load(Ordering::SeqCst), 0, "x was sent the write");
         // A leader that no Node names is sent nothing either, and that is what is said.
-        let Forward::Again(why) = shared.forward(7, &leader, &command).await else {
+        let Forward::Again(why) = shared.forward(7, &leader, &command, None).await else {
             panic!("a write was sent to a leader no Node names");
         };
         assert!(why.is_some_and(|why| why.contains("no Node names")));
@@ -1637,5 +1766,485 @@ mod tests {
             next_change(1, &left, &four, &set(&[1, 2, 3]), &set(&[]), &set(&[]), &set(&[])),
             voters(&[1, 3])
         );
+    }
+
+    /// A node `{tag}-c` that leads a cluster of its own, whose store lets the Identity alice
+    /// apply ConfigMaps (by `RoleBinding/alice-writes`), with a control Node for each of `controls`.
+    async fn leading(tag: &str, controls: &[&str]) -> (Arc<Shared>, pki::Ca) {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = pki::Ca::create().unwrap();
+        let shared = shared_with(tag, node(&ca, &format!("{tag}-c")), &[]).await;
+        for name in controls {
+            let text = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {name}}}\nspec: {{}}\n");
+            let node = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            // Joined: a Node made by hand is not let in.
+            let joined = serde_json::json!({ "raftId": kith_store::node_id(name).to_string() });
+            store.set_status(&format!("Node/{name}"), Some(joined)).unwrap();
+        }
+        let id = shared.raft.metrics().borrow().id;
+        let one = BTreeMap::from([(id, BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let access = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: alice}\nspec: {}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: maps}\n\
+                      spec: {rules: [{kinds: [ConfigMap], verbs: [apply]}]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-writes}\n\
+                      spec: {role: maps, subjects: [alice]}\n";
+        let resources = kith_api::Resource::from_source(access).unwrap();
+        let resources = resources.into_iter().map(Result::unwrap).collect();
+        let at = kith_api::store::now();
+        shared.write(Command::Apply { resources, at }).await.unwrap();
+        (shared, ca)
+    }
+
+    fn map(name: &str) -> kith_api::Resource {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{name: {name}}}\nspec: {{data: {{a: b}}}}\n");
+        kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()
+    }
+
+    fn unbind() -> Command {
+        Command::Delete {
+            key: "RoleBinding/alice-writes".into(),
+        }
+    }
+
+    fn alice() -> Caller {
+        Caller::Identity("alice".into())
+    }
+
+    fn holds(shared: &Shared, key: &str) -> bool {
+        shared.store.lock().unwrap().store.get(key).is_some()
+    }
+
+    /// Alice's write is let through by her Role as it comes, and her RoleBinding is deleted
+    /// before the write is in the log: asked again in the log's order, it is refused.
+    #[tokio::test]
+    async fn rechecked_refuses_a_write_ordered_after_its_role_went() {
+        let (shared, _ca) = leading("recheck-order", &[]).await;
+        let first = crate::api::applied(&shared, &alice(), vec![map("first")]).await;
+        assert!(
+            first.is_ok() && holds(&shared, "ConfigMap/default/first"),
+            "alice's Role did not let her write"
+        );
+
+        // An access change holds the log: alice's write is asked about and let through, then
+        // waits its turn while her RoleBinding goes (by Raft itself, past the turn held here).
+        let alone = shared.order.write().await;
+        let waiting = shared.clone();
+        let late = tokio::spawn(async move { crate::api::applied(&waiting, &alice(), vec![map("late")]).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!late.is_finished(), "the write did not wait for the access change");
+        shared.raft.client_write(unbind()).await.unwrap();
+        drop(alone);
+        match late.await.unwrap() {
+            Err(crate::api::ApiError::Store(Error::Invalid(why))) => {
+                assert!(why.contains("decided again") && why.contains("ConfigMap"), "{why}")
+            }
+            Err(_) => panic!("refused for another reason"),
+            Ok(_) => panic!("a write ordered after its RoleBinding went was applied"),
+        }
+        assert!(
+            !holds(&shared, "ConfigMap/default/late"),
+            "the refused write is in the store"
+        );
+        // And her next write is refused where it comes in, as before.
+        let next = crate::api::applied(&shared, &alice(), vec![map("next")]).await;
+        assert!(matches!(next, Err(crate::api::ApiError::Refused(_))));
+    }
+
+    /// An Identity's own change to who may do what is decided again too: once its right to make
+    /// it went, no apply, delete or rollback of a Role, RoleBinding or Identity of its is applied.
+    #[tokio::test]
+    async fn rechecked_refuses_an_access_change_by_one_whose_right_went() {
+        let (shared, _ca) = leading("recheck-keys", &[]).await;
+        let apply = |text: &str| Command::Apply {
+            resources: kith_api::Resource::from_source(text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect(),
+            at: kith_api::store::now(),
+        };
+        let keys = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: keys}\n\
+                    spec: {rules: [{kinds: [Role, RoleBinding, Identity], verbs: [apply, delete]}]}\n---\n\
+                    apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-keys}\n\
+                    spec: {role: keys, subjects: [alice]}\n";
+        shared.write(apply(keys)).await.unwrap();
+        // While it is bound, the change is hers to make.
+        let spare = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: spare}\n\
+                     spec: {rules: [{kinds: [ConfigMap], verbs: [get]}]}\n";
+        let made = shared.submit_as(apply(spare), Some(&alice())).await;
+        assert!(made.is_ok() && holds(&shared, "Role/spare"), "{made:?}");
+        let revoke = Command::Delete {
+            key: "RoleBinding/alice-keys".into(),
+        };
+        shared.write(revoke).await.unwrap();
+
+        let kept = ["Role/maps", "Role/spare", "RoleBinding/alice-writes", "Identity/alice"];
+        let now = |shared: &Shared| {
+            let state = shared.store.lock().unwrap();
+            kept.map(|key| state.store.get(key).cloned())
+        };
+        let before = now(&shared);
+        let mut tried = vec![
+            apply(
+                "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-all}\n\
+                 spec: {role: keys, subjects: [alice]}\n",
+            ),
+            apply(
+                "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: maps}\n\
+                 spec: {rules: [{kinds: [ConfigMap, Secret, Role, RoleBinding], verbs: [apply, delete]}]}\n",
+            ),
+            apply("apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n"),
+        ];
+        for key in kept {
+            let at = kith_api::store::now();
+            tried.push(Command::Delete { key: key.into() });
+            tried.push(Command::Rollback {
+                key: key.into(),
+                to: 1,
+                at,
+            });
+        }
+        for (n, command) in tried.into_iter().enumerate() {
+            let said = format!("{command:?}");
+            // Hers, and hers as passed on by another node.
+            let who = match n % 2 {
+                0 => alice(),
+                _ => Caller::Via("recheck-keys-f".into(), Box::new(alice())),
+            };
+            match shared.submit_as(command, Some(&who)).await {
+                Err(Error::Invalid(why)) => assert!(why.contains("decided again"), "{said}: {why}"),
+                done => panic!("{said} by {who}: {done:?}"),
+            }
+        }
+        assert!(now(&shared) == before, "a refused access change is in the store");
+        assert!(!holds(&shared, "RoleBinding/alice-all") && !holds(&shared, "Identity/bob"));
+    }
+
+    /// A write passed on by another control node says whose it is, and the leader decides
+    /// it again; one that says no one is the node's own, and a name that is no Identity's is refused.
+    #[tokio::test]
+    async fn rechecked_through_a_follower() {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        use crate::cluster::{Cluster, listen, node_router};
+        let (shared, ca) = leading("recheck-via", &["recheck-via-f"]).await;
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let c = node(&ca, "recheck-via-c");
+        let listener = listen(tcp, pki::server_config(&c).unwrap()).unwrap();
+        let app = node_router(shared.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let f = node(&ca, "recheck-via-f");
+        let client = Cluster::new(f.clone(), None).unwrap();
+        let client = client.to(&at("recheck-via-c", &address, None)).unwrap();
+        let url = format!("https://{address}/v1/raft/write");
+        // A worker that names an Identity too: what it may write is a worker's, whoever it names.
+        let worker = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: recheck-via-w}\nspec: {trust: worker}\n";
+        let worker = kith_api::Resource::from_source(worker).unwrap().remove(0).unwrap();
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(worker).unwrap();
+            let joined = serde_json::json!({ "raftId": kith_store::node_id("recheck-via-w").to_string() });
+            store.set_status("Node/recheck-via-w", Some(joined)).unwrap();
+        }
+        let worker = Cluster::new(node(&ca, "recheck-via-w"), None).unwrap();
+        let worker = worker.to(&at("recheck-via-c", &address, None)).unwrap();
+        let send_as = |client: &reqwest::Client, command: Command, who: Option<&[u8]>| {
+            let call = client.post(&url).json(&command);
+            let call = match who {
+                Some(name) => call.header(access::FOR, reqwest::header::HeaderValue::from_bytes(name).unwrap()),
+                None => call,
+            };
+            async move {
+                let said = call.send().await.unwrap().text().await.unwrap();
+                serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"))
+            }
+        };
+        let send = |command, who: Option<&str>| send_as(&client, command, who.map(str::as_bytes));
+        let apply = |name: &str| Command::Apply {
+            resources: vec![map(name)],
+            at: kith_api::store::now(),
+        };
+        let written = |text: &str| Command::Apply {
+            resources: kith_api::Resource::from_source(text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect(),
+            at: kith_api::store::now(),
+        };
+        let bind = |name: &str| {
+            written(&format!(
+                "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: {name}}}\nspec: {{role: keys, subjects: [alice]}}\n"
+            ))
+        };
+        let keys = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: keys}\n\
+                    spec: {rules: [{kinds: [Role, RoleBinding, Identity], verbs: [apply, delete]}]}\n---\n\
+                    apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-keys}\n\
+                    spec: {role: keys, subjects: [alice]}\n";
+        shared.write(written(keys)).await.unwrap();
+
+        // While her RoleBindings are there, alice's writes passed on are taken, a RoleBinding too.
+        let said = send(apply("via-1"), Some("alice")).await;
+        assert!(matches!(said, Some((Ok(_), index)) if index > 0), "{said:?}");
+        let said = send(bind("via-bound"), Some("alice")).await;
+        assert!(matches!(said, Some((Ok(_), _))), "{said:?}");
+        assert!(holds(&shared, "RoleBinding/via-bound"));
+        let revoke = |key: &str| Command::Delete { key: key.into() };
+        shared.write(revoke("RoleBinding/via-bound")).await.unwrap();
+        // A name that is no Identity's is not taken as one, nor one that is not text.
+        for name in [&b"local socket"[..], b"\xff"] {
+            let said = send_as(&client, apply("via-2"), Some(name)).await;
+            assert!(
+                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("names no Identity")),
+                "{said:?}"
+            );
+        }
+        assert!(!holds(&shared, "ConfigMap/default/via-2"));
+        shared.write(unbind()).await.unwrap();
+        shared.write(revoke("RoleBinding/alice-keys")).await.unwrap();
+
+        // Her right to change access went on the leader: passed on, she cannot bind herself
+        // again, nor make an Identity.
+        let identity = written("apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n");
+        for command in [bind("via-rebound"), identity] {
+            let said = send(command, Some("alice")).await;
+            assert!(
+                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("decided again")),
+                "{said:?}"
+            );
+        }
+        assert!(!holds(&shared, "RoleBinding/via-rebound") && !holds(&shared, "Identity/bob"));
+
+        // A worker's write is held to what a worker may write, whatever Identity it names.
+        let mut worker_said = vec![];
+        for (n, name) in [None, Some(&b"alice"[..]), Some(b"local socket"), Some(b"\xff")]
+            .into_iter()
+            .enumerate()
+        {
+            let mut os = serde_json::Map::new();
+            os.insert("os".into(), format!("v{n}").into());
+            let mine = Command::Patch {
+                statuses: vec![("Node/recheck-via-w".into(), os)],
+            };
+            let said = send_as(&worker, mine, name).await;
+            let theirs = Command::Apply {
+                resources: vec![map(&format!("worker-{n}"))],
+                at: kith_api::store::now(),
+            };
+            let refused = send_as(&worker, theirs, name).await;
+            worker_said.push((matches!(said, Some((Ok(_), _))), refused));
+        }
+        for (n, (taken, refused)) in worker_said.into_iter().enumerate() {
+            assert!(taken, "the worker's own status was not taken (header {n})");
+            assert!(
+                matches!(&refused, Some((Err(Error::Invalid(why)), 0)) if !why.contains("decided again") && !why.contains("names no Identity")),
+                "{refused:?}"
+            );
+            assert!(!holds(&shared, &format!("ConfigMap/default/worker-{n}")));
+        }
+
+        // After it went: the follower's own forward says alice's, and the leader refuses it.
+        let follower = shared_with("recheck-via-f", f, &[at("recheck-via-c", &address, None)]).await;
+        let id = follower.raft.metrics().borrow().id;
+        follower
+            .raft
+            .initialize(BTreeMap::from([(id, BasicNode::new(""))]))
+            .await
+            .unwrap();
+        let applied = follower.raft.wait(Some(Duration::from_secs(30)));
+        applied.applied_index_at_least(Some(0), "applies").await.unwrap();
+        let leader = BasicNode::new(&address);
+        match follower.forward(1, &leader, &apply("via-3"), Some(&alice())).await {
+            Forward::Done(Err(Error::Invalid(why)), _) => assert!(why.contains("decided again"), "{why}"),
+            Forward::Done(reply, _) => panic!("the leader did not decide again: {reply:?}"),
+            _ => panic!("the leader was not reached"),
+        }
+        assert!(!holds(&shared, "ConfigMap/default/via-3"));
+        // The same write as the node's own (no one named) is the node's to make.
+        let said = send(apply("via-4"), None).await;
+        assert!(matches!(said, Some((Ok(_), _))), "{said:?}");
+        assert!(holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
+    }
+
+    /// A write passed on to a node that does not lead (any more) is not decided there, on a
+    /// store that may be behind: it is sent back, to be passed to whichever leads.
+    #[tokio::test]
+    async fn rechecked_only_where_the_log_is_led() {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        use crate::cluster::{Cluster, listen, node_router};
+        let ca = pki::Ca::create().unwrap();
+        let behind = shared_with("recheck-led-c", node(&ca, "recheck-led-c"), &[]).await;
+        {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: recheck-led-f}\nspec: {}\n";
+            let node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            let store = &mut behind.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            let joined = serde_json::json!({ "raftId": kith_store::node_id("recheck-led-f").to_string() });
+            store.set_status("Node/recheck-led-f", Some(joined)).unwrap();
+        }
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&node(&ca, "recheck-led-c")).unwrap()).unwrap();
+        let app = node_router(behind.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let client = Cluster::new(node(&ca, "recheck-led-f"), None).unwrap();
+        let client = client.to(&at("recheck-led-c", &address, None)).unwrap();
+        let command = Command::Apply {
+            resources: vec![map("led")],
+            at: kith_api::store::now(),
+        };
+        let call = client.post(format!("https://{address}/v1/raft/write"));
+        let said = call.header(access::FOR, "alice").json(&command).send().await.unwrap();
+        let said = said.text().await.unwrap();
+        // Its store knows no alice: decided here, it would be refused for good.
+        let said = serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"));
+        assert!(said.is_none(), "{said:?}");
+    }
+
+    /// While an access change holds the log, what is no one's (the node's own, a join, the
+    /// admin's) goes as it comes.
+    #[tokio::test]
+    async fn rechecked_leaves_a_nodes_own_writes_alone() {
+        let (shared, _ca) = leading("recheck-own", &[]).await;
+        let _alone = shared.order.write().await;
+        let soon = Duration::from_secs(3);
+        let node = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: joins}\nspec: {}\n";
+        let node = kith_api::Resource::from_source(node).unwrap().remove(0).unwrap();
+        let at = kith_api::store::now();
+        let fields = serde_json::json!({ "os": "x" }).as_object().unwrap().clone();
+        let writes = [
+            (
+                Command::Apply {
+                    resources: vec![map("own")],
+                    at,
+                },
+                None,
+            ),
+            (
+                Command::Apply {
+                    resources: vec![node],
+                    at,
+                },
+                None,
+            ),
+            (
+                Command::Patch {
+                    statuses: vec![("Node/joins".into(), fields)],
+                },
+                None,
+            ),
+            (
+                Command::Apply {
+                    resources: vec![map("admin")],
+                    at,
+                },
+                Some(Caller::Admin),
+            ),
+        ];
+        for (command, who) in writes {
+            let done = tokio::time::timeout(soon, shared.submit_as(command, who.as_ref())).await;
+            assert!(matches!(done, Ok(Ok(_))), "{done:?}");
+        }
+        assert!(holds(&shared, "ConfigMap/default/own") && holds(&shared, "Node/joins"));
+        // What holds the log alone: a change to who may do what, and only that.
+        assert!(changes_access(&unbind()));
+        assert!(changes_access(&Command::Rollback {
+            key: "role/x".into(),
+            to: 1,
+            at
+        }));
+        assert!(changes_access(&Command::Import {
+            store: Default::default()
+        }));
+        // (A KindDefinition says whether a kind is namespaced, so which rule matches it.)
+        assert!(changes_access(&Command::Delete {
+            key: "KindDefinition/widgets".into()
+        }));
+        assert!(!changes_access(&Command::Delete {
+            key: "ConfigMap/default/own".into()
+        }));
+        assert!(!changes_access(&Command::Status { statuses: vec![] }));
+    }
+
+    /// What the leader asks again of a rollback, a delete and anything else: the kind's own
+    /// right, what the kind reaches into besides, and nothing past an apply, delete or rollback.
+    #[test]
+    fn rechecked_rollback_delete_and_the_rest() {
+        let mut store = kith_api::store::Store::default();
+        let access = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: carol}\nspec: {}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: dave}\nspec: {}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: kinds}\n\
+                      spec: {rules: [{kinds: [Share, Backup, Release, ConfigMap], verbs: [apply]}]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: files}\n\
+                      spec: {rules: [{kinds: [Volume, Secret], verbs: [get, apply]}]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: carol-kinds}\n\
+                      spec: {role: kinds, subjects: [carol, dave]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: dave-files}\n\
+                      spec: {role: files, subjects: [dave]}\n";
+        for resource in kith_api::Resource::from_source(access).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let (carol, dave) = (Caller::Identity("carol".into()), Caller::Identity("dave".into()));
+        let back = |key: &str| Command::Rollback {
+            key: key.into(),
+            to: 1,
+            at: kith_api::store::now(),
+        };
+        let refused = crate::api::refused;
+        // Apply on a Share or a Backup is not enough: what it reaches into is asked too.
+        let why = refused(&store, &carol, &back("Share/default/s")).expect("a Share without Volume");
+        assert!(why.contains("apply Volume") && why.contains("decided again"), "{why}");
+        let why = refused(&store, &carol, &back("Backup/default/b")).expect("a Backup without Volume");
+        assert!(why.contains("get Volume"), "{why}");
+        // With it, both go back.
+        assert_eq!(refused(&store, &dave, &back("Share/default/s")), None);
+        assert_eq!(refused(&store, &dave, &back("Backup/default/b")), None);
+        // A Release goes back while its binding stands, and not once it is gone.
+        assert_eq!(refused(&store, &carol, &back("Release/default/r")), None);
+        // A delete asks Delete, which Apply is not.
+        let delete = Command::Delete {
+            key: "ConfigMap/default/m".into(),
+        };
+        let why = refused(&store, &carol, &delete).expect("a delete without Delete");
+        assert!(why.contains("delete ConfigMap"), "{why}");
+        // Nothing but an apply, a delete or a rollback is an Identity's to write.
+        let why = refused(&store, &dave, &Command::Status { statuses: vec![] }).expect("a Status");
+        assert!(why.contains("not an apply, a delete or a rollback"), "{why}");
+        store.delete("RoleBinding/carol-kinds").unwrap();
+        let why = refused(&store, &carol, &back("Release/default/r")).expect("a Release, unbound");
+        assert!(why.contains("apply Release"), "{why}");
+    }
+
+    /// Neither wait is past [`PATIENCE`]: an Identity's write behind an access change that
+    /// never finishes, and an access change behind an Identity's write that never finishes, are
+    /// each refused, to be tried again.
+    #[tokio::test]
+    async fn rechecked_wait_is_bounded() {
+        let ((one, _), (two, _)) = tokio::join!(leading("recheck-wait-1", &[]), leading("recheck-wait-2", &[]));
+        let _alone = one.order.write().await;
+        let _beside = two.order.read().await;
+        let begun = Instant::now();
+        let at = kith_api::store::now();
+        let theirs = Command::Apply {
+            resources: vec![map("waits")],
+            at,
+        };
+        let alice = alice();
+        let (written, changed) = tokio::join!(one.submit_as(theirs, Some(&alice)), two.write(unbind()));
+        let took = begun.elapsed();
+        for done in [written.map(drop), changed.map(drop)] {
+            assert!(
+                matches!(&done, Err(Error::Io(why)) if why.contains("try again")),
+                "{done:?}"
+            );
+        }
+        assert!(took >= PATIENCE && took < PATIENCE + Duration::from_secs(5), "{took:?}");
+        assert!(!holds(&one, "ConfigMap/default/waits") && holds(&two, "RoleBinding/alice-writes"));
     }
 }

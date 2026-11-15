@@ -287,7 +287,8 @@ async fn change(
 ) -> Result<Done, ApiError> {
     let (shared, caller) = (shared.clone(), caller.clone());
     let done = tokio::spawn(async move {
-        let done = shared.submit(command).await;
+        // Who asked goes with the write: an Identity's is decided again where it is put in the log.
+        let done = shared.submit_as(command, Some(&caller)).await;
         let said = done.as_ref().map(drop).map_err(Error::to_string);
         shared.audit.record(&caller, verb, what, said);
         done
@@ -307,6 +308,48 @@ struct ApplyOptions {
 /// besides themselves, which whoever writes them must be allowed too.
 fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
     allowed(shared, caller, |_| reached(written))
+}
+
+/// Why `caller` may not write `command`, as the store now stands: the asking of [`applied`],
+/// [`deleted`] and `rollback` made again where the write is put in the log (`raft.rs`), so
+/// that a Role taken away while the write was on its way still stops it. Any other command
+/// with an Identity's name on it is refused.
+///
+/// Not every route an Identity reaches is decided here. Seat activity (`seats.rs`), `/v1/lock`
+/// and the duress routes (`crypt.rs`), blobs, volume files, backups and the node routes of
+/// `cluster.rs` ask [`permit`] as the request arrives and then `submit` or `write` with no
+/// caller: they are decided once, and a Role taken away meanwhile does not stop them (T-0555).
+/// Before a caller is passed with them, this must learn their commands: seat activity writes a
+/// Status, which it would refuse, and `unlock` of a forgotten NodeKey sends a Delete after
+/// `permit` asked for Apply, which it would ask as Delete.
+pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Option<String> {
+    let asks = match command {
+        Command::Apply { resources, .. } => takes(store, resources),
+        Command::Rollback { key, .. } => {
+            let (kind, namespace) = place_of(key);
+            let mut asks = vec![(Verb::Apply, kind.clone(), namespace.clone())];
+            asks.extend(reached(&[(kind, namespace)]));
+            asks
+        }
+        Command::Delete { key } => {
+            let (kind, namespace) = place_of(key);
+            vec![(Verb::Delete, kind, namespace)]
+        }
+        _ => {
+            return Some(format!(
+                "{caller} may not write this to the store: it is not an apply, a delete or a rollback"
+            ));
+        }
+    };
+    let grants = Grants::of(caller, store);
+    let (verb, kind, namespace) = asks
+        .into_iter()
+        .find(|(verb, kind, namespace)| !grants.may(verb, kind, namespace.as_deref()))?;
+    let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
+    let verb = word(&verb);
+    Some(format!(
+        "{caller} may not {verb} {kind}{place} (decided again as the write was put in the log): no Role bound to it allows that now"
+    ))
 }
 
 /// Who `caller` is as a writer of a Release or a Source: whoever a node passed on, not the node.
