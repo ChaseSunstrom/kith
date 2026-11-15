@@ -354,13 +354,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is opened through the one above (never through a link, never into another file system),
   emptied, and what directories it holds that are not empty are moved into a new
   `scratch.*` level beside the scratch, which is removed next. At most four directories are
-  open, and `..` is never taken. A removal ends at the first entry it cannot remove (or a
-  rename to another file system, or of a mount point), with that error in the log. What a
+  open, and `..` is never taken. Where the disk has no room or no file left to make a level
+  of, the first directory to move becomes the level itself, by a rename. A removal ends at
+  the first entry it cannot remove (a mount point, or a directory on another file system),
+  with that error in the log. What a
   stop or an error leaves is the scratch and its levels, each a `scratch.*` in the replica
   directory, removed as trees of their own at the next count of its pod's roots (only a pod
   with running roots that is walked: one with a limit, or while the disk is under twice its
-  reserve), or when the pod is gone, with its replica directory; two sweepers of the same
-  scratch at once are harmless. A limit held at
+  reserve); two sweepers of the same scratch at once are harmless to what is outside it, and
+  one may end early at what the other took, for the next count to go on with. When the pod
+  is gone its replica directory is removed whole, in one call that is none of the above: a
+  stop does not cut it short, and it keeps a directory open for each level it is deep in, so
+  a chain of directories deeper than kithd may have files open is not removed by it. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
