@@ -616,6 +616,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let _ = std::fs::remove_file(&socket);
     }
     let mut runtime = kith_runtime::Runtime::new(state.join("runtime"));
+    if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
+        eprintln!("kithd: {said}");
+    }
     // The registry's door, and the one copy of what opens it: the runtime's, for its pulls.
     // (No door is no kithd: without one a pull of `localhost:PORT/…` would ask whatever
     // else took the port, in the clear.)

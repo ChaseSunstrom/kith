@@ -263,7 +263,7 @@
       <figcaption>on one machine</figcaption>
 <pre><span class="c">$</span> cargo build --release
 <span class="c">$</span> export PATH=$PWD/target/release:$PATH
-<span class="c">$</span> kithd &amp;
+<span class="c">$</span> systemd-run --user --scope --quiet kithd &amp;
 <span class="c">$</span> kith apply -f examples/hello.yaml
 <span class="c">$</span> kith get -w workload
 <span class="c">$</span> kith logs workload/hello -f</pre>

@@ -175,6 +175,15 @@ impl Runtime {
         })
     }
 
+    /// Why no container can start here, said once at start; `None` where one can (root's
+    /// kithd, on kith OS, makes `/kith` itself and is not asked).
+    pub fn cgroup_problem(&self) -> Option<String> {
+        if nix::unistd::getuid().is_root() {
+            return None;
+        }
+        probe(Path::new("/sys/fs/cgroup"), &self.cgroup_parent)
+    }
+
     /// Kill and remove every container a previous owner of `root` left behind,
     /// e.g. after a crash. Returns how many there were.
     pub fn cleanup(&self) -> Result<usize> {
@@ -770,6 +779,25 @@ fn cgroup_parent() -> Result<String> {
         Some(parent) if parent != Path::new("/") => Ok(parent.display().to_string()),
         _ => err("no delegated cgroup: run kith inside a systemd user session or scope"),
     }
+}
+
+/// What to tell the person when a cgroup cannot be made in `parent` (below `root`, the cgroup
+/// mount): a mkdir and an rmdir of an empty one. `None` where it can be made.
+fn probe(root: &Path, parent: &str) -> Option<String> {
+    let dir = root
+        .join(parent.trim_start_matches('/'))
+        .join(format!("kith-probe-{}", std::process::id()));
+    let _ = fs::remove_dir(&dir); // a stale one of a process that had our number
+    if let Err(e) = fs::create_dir(&dir) {
+        return Some(format!(
+            "cannot make a cgroup in {}: {e}; containers will not start (the API still works). \
+             A kithd that is not root needs the user's own cgroup (a login's or a system service's is \
+             not): run it in the user's systemd with `systemd-run --user --scope kithd`",
+            dir.parent().unwrap_or(&dir).display()
+        ));
+    }
+    let _ = fs::remove_dir(&dir);
+    None
 }
 
 /// Processes and threads one container may have.
@@ -1968,5 +1996,33 @@ mod tests {
         assert!(!has_processes(&cgroup), "nothing is left in it or below");
         let _ = fs::remove_dir_all(&cgroup);
         assert!(!has_processes(&cgroup), "a cgroup that is gone has none");
+    }
+
+    /// A parent we can make a cgroup in: nothing is said and nothing is left behind. One we
+    /// cannot (here a path below a file, which fails for root too): the path, the error, that
+    /// containers will not start, and the command that runs kithd in the user's systemd.
+    #[test]
+    fn cgroup_probe_says_where_a_cgroup_cannot_be_made() {
+        let root = std::env::temp_dir().join(format!("kith-cgroup-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("user.slice")).unwrap();
+        assert_eq!(probe(&root, "/user.slice"), None);
+        assert_eq!(
+            fs::read_dir(root.join("user.slice")).unwrap().count(),
+            0,
+            "no cgroup left behind"
+        );
+
+        fs::write(root.join("file"), "").unwrap();
+        let said = probe(&root, "/file").expect("a file has no cgroups below it");
+        for part in [
+            root.join("file").to_str().unwrap(),
+            "Not a directory",
+            "containers will not start",
+            "systemd-run --user --scope kithd",
+        ] {
+            assert!(said.contains(part), "`{part}` is not in: {said}");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }
