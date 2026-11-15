@@ -76,13 +76,20 @@ const CHUNK: usize = 8192;
 /// that node waits for the answer ([`CONNECT`]), so that it hears a no and tries the next
 /// replica, where no answer would cost a client that had spoken its connection.
 const FOUND: Duration = Duration::from_secs(2);
-/// How many connections to Services this node passes on at a time, from its own side and
-/// (for the other nodes together, so no node can take them all) from the mesh; one
-/// over is said no to, if it is kept, and hung up on if not (see [`taken`]).
+/// How many connections to Services this node passes on at a time, from its own side; one
+/// over is hung up on.
 const SERVING: usize = 4096;
+/// How many connections from the other nodes this node relays to its replicas at a time, all
+/// of them together (so no node can take them all); one over is said no to, if it is kept,
+/// from a spare ([`SPARE`]), and hung up on past those ([`admit`]).
 const RELAYING: usize = 4096;
 /// How many of the relayed ones one other node may hold.
 const RELAYING_PER_NODE: usize = 1024;
+/// How many connections past [`RELAYING`] this node keeps to say no to, in all, and how many
+/// one other node may hold: a node that keeps asking a full node costs it at most these
+/// sockets, and the rest of its asks are hung up on ([`admit`]).
+const SPARE: usize = 256;
+const SPARE_PER_NODE: usize = 64;
 /// The most threads the connections to Services are on, one to a core. Each connection
 /// still takes the store's lock and the table's for a moment as it starts: past a few
 /// threads those moments queue, and the rest of kithd keeps a core of its own.
@@ -295,6 +302,8 @@ struct Proxy {
     /// passes on to a replica here.
     serving: Limits,
     relaying: Limits,
+    /// Places for the over-limit connections of other nodes, to be said no to ([`admit`]).
+    spares: Limits,
     /// The connections to each other node's kithd that no client's is on now, and since when.
     /// (As the kernel's, on no thread's runtime: the next client's may be on another.)
     kept: Mutex<BTreeMap<String, Vec<(std::net::TcpStream, Instant)>>>,
@@ -484,10 +493,6 @@ impl Proxy {
         let IpAddr::V6(caller) = from.peer_addr().ok()?.ip() else {
             return None;
         };
-        // (The place is held while the connection between the nodes lasts.)
-        // (Over the limit, the connection is still answered: no to what it asks if it is kept,
-        // and hung up on, as before, if it is not.)
-        let place = self.relaying.take(caller.into());
         let find = |port, workload: String, replica| async move {
             let asked_for = {
                 let table = self.table.lock().expect("nothing panics holding the table");
@@ -500,7 +505,7 @@ impl Proxy {
             }
             self.local(&workload, replica, port).await.ok()
         };
-        taken(from, place.is_some(), find).await
+        admit(&self.relaying, &self.spares, caller.into(), from, find).await
     }
 
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
@@ -652,6 +657,30 @@ where
     }
 }
 
+/// [`taken`] for a connection from node `caller`, with its place: one for relaying (room for
+/// replicas), or past the relayed ones, a spare ([`SPARE`]), which only says no. Held while
+/// the connection lasts. Past the spares, the line is read (so the hang-up is an end, not a
+/// reset) and the connection is hung up on with no answer.
+async fn admit<F, Fut>(relaying: &Limits, spares: &Limits, caller: IpAddr, from: TcpStream, find: F) -> Option<()>
+where
+    F: Fn(u16, String, Option<u32>) -> Fut,
+    Fut: Future<Output = Option<TcpStream>>,
+{
+    let (room, _held) = match relaying.take(caller) {
+        Some(place) => (true, place),
+        None => match spares.take(caller) {
+            Some(spare) => (false, spare),
+            None => {
+                let mut from = BufReader::new(from);
+                let mut line = Vec::new();
+                let _ = within((&mut from).take(300).read_until(b'\n', &mut line)).await;
+                return None;
+            }
+        },
+    };
+    taken(from, room, find).await
+}
+
 /// Bytes both ways between `local` (a client here, or a replica) and the other node's
 /// kithd on `relay`, each way in frames: two bytes of length and as many bytes, and a
 /// length of none where that side says no more. So `relay` outlasts the connection: Ok
@@ -754,6 +783,7 @@ pub async fn run(
         turns: Turns::default(),
         serving: Limits::new(SERVING, SERVING),
         relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
+        spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
         kept: Mutex::default(),
     });
     let me = kith_mesh::node_address(prefix, proxy.me());
@@ -1570,10 +1600,11 @@ spec:
     async fn over_its_limit_says_no() {
         use tokio::io::AsyncReadExt;
         let (replica, replicas) = replica().await;
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let full = Limits::new(1, 1);
-        let _held = full.take(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).unwrap();
-        let room = full.take(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)).is_some();
-        assert!(!room);
+        let _held = full.take(local).unwrap();
+        assert!(full.take(local).is_none());
+        let spares = Limits::new(2, 2);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let at = listener.local_addr().unwrap();
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -1581,10 +1612,20 @@ spec:
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let lines = lines.clone();
-                tokio::spawn(taken(stream, room, move |port, workload: String, which| {
-                    lines.lock().unwrap().push(format!("{port} {workload} {which:?}"));
-                    async move { TcpStream::connect(replica).await.ok() }
-                }));
+                let (relaying, spare) = (full.clone(), spares.clone());
+                tokio::spawn(async move {
+                    admit(
+                        &relaying,
+                        &spare,
+                        local,
+                        stream,
+                        move |port, workload: String, which| {
+                            lines.lock().unwrap().push(format!("{port} {workload} {which:?}"));
+                            async move { TcpStream::connect(replica).await.ok() }
+                        },
+                    )
+                    .await
+                });
             }
         });
         let mut relay = Relay::new(TcpStream::connect(at).await.unwrap());
@@ -1598,6 +1639,38 @@ spec:
         old.write_all(b"8080 web 2\n").await.unwrap();
         let mut heard = Vec::new();
         assert_eq!(old.read_to_end(&mut heard).await.unwrap(), 0);
+    }
+
+    /// Past the spares too, an over-limit connection is hung up on with no answer, a kept
+    /// asking included: a node that keeps asking a full node holds at most [`SPARE`] of
+    /// them, and the next reads end of file, not a no.
+    #[tokio::test]
+    async fn over_its_limit_and_past_the_spare_is_hung_up_on() {
+        use tokio::io::AsyncReadExt;
+        let (replica, replicas) = replica().await;
+        let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let full = Limits::new(1, 1);
+        let _held = full.take(local).unwrap();
+        let spares = Limits::new(1, 1);
+        let _spare = spares.take(local).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (relaying, spare) = (full.clone(), spares.clone());
+                tokio::spawn(async move {
+                    admit(&relaying, &spare, local, stream, move |_, _: String, _| async move {
+                        TcpStream::connect(replica).await.ok()
+                    })
+                    .await
+                });
+            }
+        });
+        let mut relay = TcpStream::connect(at).await.unwrap();
+        relay.write_all(b"kept 8080 web 1\n").await.unwrap();
+        let mut heard = Vec::new();
+        assert_eq!(relay.read_to_end(&mut heard).await.unwrap(), 0);
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
     }
 
     /// A client's connection that ends as none does (here: silent for the idle time) takes
