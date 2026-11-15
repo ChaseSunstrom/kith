@@ -180,7 +180,10 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   linked in: no containerd, no shim, no root. Images are pulled into a
   content-addressed store; one pulled before starts without asking the registry
   (about 25 ms from `kith apply` to first output here), so `pullPolicy: always` is
-  how you follow a tag that moves. Memory and CPU limits, `command`/`args`, and `env`
+  how you follow a tag that moves. A cluster Image of this node's own registry is
+  always asked, whatever its policy: one deleted, or made again under its name, is
+  not started from the copy kept here (asking for an unchanged one takes about 22 ms
+  here). Memory and CPU limits, `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
   had run for a minute), then after a wait that doubles from a second up to a
