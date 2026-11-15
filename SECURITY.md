@@ -142,9 +142,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   Every start from one of the node's Images asks this registry for the manifest, whatever
   the pull policy, so an Image deleted, or whose namespace was deleted and made again under
   the same name, is not started from the copy kept on the node; the old bytes stay on the
-  node's disk until the Image is removed. And kithd pulls an Image only for what runs in
-  the Image's own namespace: an Image is a packed Volume. Reading kithd's memory is being
-  root on the node outside any container, which nothing here defends against.
+  node's disk until the Image is removed. And
+  kithd pulls an Image only for what runs in the Image's own namespace: an Image is a
+  packed Volume. Reading kithd's memory is being root on the node outside any container,
+  which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
