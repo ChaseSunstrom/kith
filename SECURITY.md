@@ -479,10 +479,21 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Devices under names that start with its own, with no hardware behind them, and
     so have a join under such a name refused until that Device is deleted or
     another name is chosen. A control node's own writes
-    are not held to this (it can lead: the cluster is taken with it). Nothing bounds
-    how much or how often a worker writes within its list: its reports can fill the
-    store's log. For the round (3 seconds) in which another node still has the file
-    of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
+    are not held to this (it can lead: the cluster is taken with it). How much and
+    how often a worker writes is held too, by each control node it asks: a write is
+    at most 1 MiB (an honest report of 300 units, each with a long message and
+    notes, is 131 KiB), and a worker makes at most 10 a second, 50 at once after a
+    rest, a write counting once more for each 64 KiB (so at most about 640 KiB a
+    second); one over the size is refused, one past the rate is answered 429 with
+    the seconds to wait, and the worker's own kithd sends it again then. Neither
+    reaches the log, and a worker's refusals are written in the audit log once a
+    minute at most. What is left: a taken worker can still write that much, within
+    its list, to each control node it reaches (three control nodes, three times as
+    much), and the log between two snapshots (about 1100 entries) can then hold
+    some 1.1 GiB of it on every node, which takes such a worker about half an hour
+    to write through one control node. Nothing bounds the store's whole size or
+    what the disk has left. For the round (3 seconds) in which another node still
+    has the file of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
     a moment ago) is still followed, still has the store, and what it writes as the
     node that leads is held to no list: delete its Node. It cannot read a Secret
