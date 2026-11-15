@@ -470,15 +470,32 @@ async fn write(
                 return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
             }
         };
-        let turn = match shared.turn(&command, who.as_ref()).await {
-            Ok(turn) => turn,
-            Err(refused) => return Json(Some((Err::<Done, _>(refused), 0u64))).into_response(),
+        // Decided only where the log is led: a node that no longer leads may be behind, and
+        // sends it back to be passed to whichever does.
+        let leads = {
+            let metrics = shared.raft.metrics();
+            let metrics = metrics.borrow();
+            metrics.current_leader == Some(metrics.id)
         };
-        let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
-        drop(turn);
-        return Json(match written {
-            Ok(Ok(written)) => Some((written.data, written.log_id.index)),
-            _ => None,
+        if !leads {
+            return Json(None::<(Reply, u64)>).into_response();
+        }
+        // On a task of its own: a sender that hangs up neither lets go of the turn while the
+        // write is on its way nor stops it.
+        let shared = shared.clone();
+        let done = tokio::spawn(async move {
+            let turn = shared.turn(&command, who.as_ref()).await?;
+            let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
+            drop(turn);
+            Ok(match written {
+                Ok(Ok(written)) => Some((written.data, written.log_id.index)),
+                _ => None,
+            })
+        });
+        return Json(match done.await {
+            Ok(Ok(written)) => written,
+            Ok(Err(refused)) => Some((Err::<Done, Error>(refused), 0u64)),
+            Err(_) => None,
         })
         .into_response();
     };
@@ -595,8 +612,8 @@ impl Shared {
     /// Leave to put `command` in the log here, to be held until it is in: decided again for
     /// an Identity, in the log's order with what changes access.
     ///
-    /// A change to who may do what (a Role, a RoleBinding, an Identity, or a whole store) is
-    /// put in the log by itself, nothing of an Identity's on its way beside it, and is applied
+    /// A change to who may do what (a Role, a RoleBinding, an Identity, a KindDefinition, or a
+    /// whole store) is put in the log by itself, nothing of an Identity's on its way beside it, and is applied
     /// here before its leave is given back. An Identity's write waits for what is in this
     /// node's log to be applied, and is asked about again on the store that makes: a Role taken
     /// away before it is in the log is a Role it no longer has. Everything else goes as it comes.
@@ -757,7 +774,8 @@ impl Shared {
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
 fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
-        ["Role", "RoleBinding", "Identity"]
+        // (A KindDefinition says whether a kind is namespaced: which rule matches it.)
+        ["Role", "RoleBinding", "Identity", "KindDefinition"]
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };
@@ -1952,10 +1970,33 @@ mod tests {
             resources: vec![map(name)],
             at: kith_api::store::now(),
         };
+        let written = |text: &str| Command::Apply {
+            resources: kith_api::Resource::from_source(text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect(),
+            at: kith_api::store::now(),
+        };
+        let bind = |name: &str| {
+            written(&format!(
+                "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{name: {name}}}\nspec: {{role: keys, subjects: [alice]}}\n"
+            ))
+        };
+        let keys = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: keys}\n\
+                    spec: {rules: [{kinds: [Role, RoleBinding, Identity], verbs: [apply, delete]}]}\n---\n\
+                    apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-keys}\n\
+                    spec: {role: keys, subjects: [alice]}\n";
+        shared.write(written(keys)).await.unwrap();
 
-        // While her RoleBinding is there, alice's write passed on is taken.
+        // While her RoleBindings are there, alice's writes passed on are taken, a RoleBinding too.
         let said = send(apply("via-1"), Some("alice")).await;
         assert!(matches!(said, Some((Ok(_), index)) if index > 0), "{said:?}");
+        let said = send(bind("via-bound"), Some("alice")).await;
+        assert!(matches!(said, Some((Ok(_), _))), "{said:?}");
+        assert!(holds(&shared, "RoleBinding/via-bound"));
+        let revoke = |key: &str| Command::Delete { key: key.into() };
+        shared.write(revoke("RoleBinding/via-bound")).await.unwrap();
         // A name that is no Identity's is not taken as one, nor one that is not text.
         for name in [&b"local socket"[..], b"\xff"] {
             let said = send_as(&client, apply("via-2"), Some(name)).await;
@@ -1966,6 +2007,19 @@ mod tests {
         }
         assert!(!holds(&shared, "ConfigMap/default/via-2"));
         shared.write(unbind()).await.unwrap();
+        shared.write(revoke("RoleBinding/alice-keys")).await.unwrap();
+
+        // Her right to change access went on the leader: passed on, she cannot bind herself
+        // again, nor make an Identity.
+        let identity = written("apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n");
+        for command in [bind("via-rebound"), identity] {
+            let said = send(command, Some("alice")).await;
+            assert!(
+                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("decided again")),
+                "{said:?}"
+            );
+        }
+        assert!(!holds(&shared, "RoleBinding/via-rebound") && !holds(&shared, "Identity/bob"));
 
         // A worker's write is held to what a worker may write, whatever Identity it names.
         let mut worker_said = vec![];
@@ -2016,6 +2070,41 @@ mod tests {
         let said = send(apply("via-4"), None).await;
         assert!(matches!(said, Some((Ok(_), _))), "{said:?}");
         assert!(holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
+    }
+
+    /// A write passed on to a node that does not lead (any more) is not decided there, on a
+    /// store that may be behind: it is sent back, to be passed to whichever leads.
+    #[tokio::test]
+    async fn rechecked_only_where_the_log_is_led() {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        use crate::cluster::{Cluster, listen, node_router};
+        let ca = pki::Ca::create().unwrap();
+        let behind = shared_with("recheck-led-c", node(&ca, "recheck-led-c"), &[]).await;
+        {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: recheck-led-f}\nspec: {}\n";
+            let node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            let store = &mut behind.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            let joined = serde_json::json!({ "raftId": kith_store::node_id("recheck-led-f").to_string() });
+            store.set_status("Node/recheck-led-f", Some(joined)).unwrap();
+        }
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(&node(&ca, "recheck-led-c")).unwrap()).unwrap();
+        let app = node_router(behind.clone()).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        let client = Cluster::new(node(&ca, "recheck-led-f"), None).unwrap();
+        let client = client.to(&at("recheck-led-c", &address, None)).unwrap();
+        let command = Command::Apply {
+            resources: vec![map("led")],
+            at: kith_api::store::now(),
+        };
+        let call = client.post(format!("https://{address}/v1/raft/write"));
+        let said = call.header(access::FOR, "alice").json(&command).send().await.unwrap();
+        let said = said.text().await.unwrap();
+        // Its store knows no alice: decided here, it would be refused for good.
+        let said = serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"));
+        assert!(said.is_none(), "{said:?}");
     }
 
     /// While an access change holds the log, what is no one's (the node's own, a join, the
@@ -2072,6 +2161,10 @@ mod tests {
         }));
         assert!(changes_access(&Command::Import {
             store: Default::default()
+        }));
+        // (A KindDefinition says whether a kind is namespaced, so which rule matches it.)
+        assert!(changes_access(&Command::Delete {
+            key: "KindDefinition/widgets".into()
         }));
         assert!(!changes_access(&Command::Delete {
             key: "ConfigMap/default/own".into()

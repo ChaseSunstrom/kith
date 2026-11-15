@@ -41,8 +41,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   a rollback by an Identity, of any kind (a Role, a RoleBinding and an Identity
   included), is asked about on the node it reaches, and then decided again on the
   leader as it is put in the log: the leader first applies every entry it holds, and
-  asks its own store what the Identity may do now. A write that changes a Role, a
-  RoleBinding or an Identity (or an import) goes into the log alone: the Identities'
+  asks its own store what the Identity may do now; a node that no longer leads sends the
+  write back, to be passed to whichever does. A write that changes a Role, a
+  RoleBinding, an Identity or a KindDefinition (which says whether a kind is namespaced,
+  so which rule matches it), or an import, goes into the log alone: the Identities'
   writes wait for it to be applied, and it waits for those already on their way. So
   access is decided in the log's order: a RoleBinding deleted before a write is put in
   the log stops that write, even one that a node which had not heard of the deletion
@@ -52,12 +54,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   leader takes it from a control node only, and a worker's writes are held to a
   worker's list whatever it names. A write waits at most 10 seconds for what comes
   before it, and is then refused with "try again". So whoever may change a Role, a
-  RoleBinding or an Identity can slow the Identities' writes, each by at most those 10
-  seconds, by changing access over and over: there is no rate on it.
+  RoleBinding, an Identity or a KindDefinition can, by changing access over and over,
+  slow the Identities' writes by up to those 10 seconds each, and past them make the
+  writes fail (they are refused, to be tried again): there is no rate on it.
   What is decided once, where it arrives, and not again: an import or a restore of a
   whole store; what the controllers write for themselves (a backup made, a status); a
-  blob put; a Volume's files; a package pushed; `kith run`; and a worker's write from
-  its view. What it does not stop: a write put in the log before the change, which is
+  blob put; a Volume's files; a package pushed; `kith run`; a seat's activity (a
+  Seat's status, `/v1/seats/NAME/activity`); a node's lock, its codes and keys
+  (`/v1/lock/NAME` and its lock, unlock, wipe, seal, unseal and duress,
+  `/v1/lock/NAME/recovery`, `/v1/lock/NAME/passphrase` and `/v1/duress`); and a
+  worker's write from its view. What it does not stop: a write put in the log before the change, which is
   the log's order and not the clock's (a deletion still on its way when the write
   reached the leader comes after it); a node of an older kith, in a cluster that is
   half updated, which passes on no name, so its writes are decided where they arrived
