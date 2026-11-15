@@ -1177,6 +1177,24 @@ fn workloads_move_off_a_lost_node() {
     wait_for("gamma to have caught up", || status(&gamma) == status(&alpha));
 }
 
+/// (Not behind KITH_E2E: it pulls nothing.)
+#[test]
+fn a_node_says_what_it_serves_and_a_start_without_the_flag_takes_it_off() {
+    let test = "serves";
+    let dns = free_port();
+    let mut alpha = Node::start(test, "alpha", &["--dns", &format!("127.0.0.1:{dns}")]);
+    let said = format!("serves dns {dns}");
+    wait_for("alpha to say it answers DNS", || {
+        alpha.kith(&["get", "node"]).1.contains(&said)
+    });
+    alpha.stop();
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    wait_for("alpha, started without --dns, to take it off", || {
+        let (code, nodes, _) = alpha.kith(&["get", "node"]);
+        code == 0 && nodes.contains("ready at") && !nodes.contains("serves")
+    });
+}
+
 #[test]
 fn a_drain_moves_what_can_move_and_undrain_lets_a_replica_back() {
     if std::env::var_os("KITH_E2E").is_none() {

@@ -793,7 +793,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
 /// null when it serves neither, so a start without the flags takes off what the last start said.
 fn serves(dns: Option<std::net::SocketAddr>, ingress: bool) -> serde_json::Value {
     let mut said = serde_json::Map::new();
-    if let Some(dns) = dns {
+    // (Port 0 is "any port": not one to tell anyone.)
+    if let Some(dns) = dns.filter(|dns| dns.port() != 0) {
         said.insert("dns".into(), dns.port().into());
     }
     if ingress {
@@ -810,8 +811,9 @@ fn serves(dns: Option<std::net::SocketAddr>, ingress: bool) -> serde_json::Value
 async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
+    let mut generation = shared.generation.subscribe();
     loop {
-        // (Not known until the store has this node: asked again until it does.)
+        // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let said = |own: &kith_api::Resource| {
@@ -821,16 +823,27 @@ async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping
             };
             state.store.get(&node).map(|own| said(own) == serves)
         };
-        // Asked on every pass, not once: a whole-status write to this Node would take it off.
-        if says == Some(false) {
+        // Looked at whenever the store changes, not once: a whole-status write to this Node
+        // would take it off.
+        let wrote = says == Some(false);
+        if wrote {
             let fields = serde_json::Map::from_iter([("serves".to_string(), serves.clone())]);
             let statuses = vec![(node.clone(), fields)];
             if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
                 eprintln!("kithd: serves: saying what this node serves: {e}");
             }
         }
+        // No tick: the store's change wakes this. After a write, a rest first, so one that was
+        // refused (or a view that has not caught up) is not sent again at every change.
+        let rest = async {
+            if wrote {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            } else {
+                let _ = generation.changed().await;
+            }
+        };
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            () = rest => {}
             _ = stopping.changed() => return,
         }
     }
@@ -891,6 +904,11 @@ apiVersion: kith.dev/v1
 kind: Node
 metadata: { name: e }
 spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: f }
+spec: {}
 ";
         let mut store = Store::default();
         for resource in Resource::from_source(nodes).unwrap() {
@@ -907,15 +925,32 @@ spec: {}
         );
         set(
             "Node/c",
-            serde_json::json!({ "address": "198.51.100.3:7443", "serves": { "dns": 5353 } }),
+            serde_json::json!({ "address": "[::ffff:198.51.100.3]:7443", "serves": { "dns": 5353 } }),
         );
         set(
             "Node/d",
             serde_json::json!({ "address": "10.8.0.4:7443", "serves": { "dns": 53 } }),
         );
-        set("Node/e", serde_json::json!({ "address": "198.51.100.5:7443" }));
-        let names: Vec<&str> = store.serving().iter().map(|node| node.metadata.name.as_str()).collect();
+        // An empty `serves` is nothing served; this machine's own address is no place on a LAN.
+        set(
+            "Node/e",
+            serde_json::json!({ "address": "198.51.100.5:7443", "serves": {} }),
+        );
+        set(
+            "Node/f",
+            serde_json::json!({ "address": "127.0.0.1:7443", "serves": { "ingress": true } }),
+        );
+        let serving = store.serving();
+        let names: Vec<&str> = serving.iter().map(|node| node.metadata.name.as_str()).collect();
         assert_eq!(names, ["a", "c"]);
+        // An IPv4 address seen in IPv6's clothes is the IPv4 one.
+        assert_eq!(
+            serving[1].lan_address().map(|at| at.to_string()).as_deref(),
+            Some("198.51.100.3")
+        );
+        // A port of 0 is any port: not said.
+        let any: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
+        assert_eq!(serves(Some(any), false), serde_json::Value::Null);
     }
 
     #[test]

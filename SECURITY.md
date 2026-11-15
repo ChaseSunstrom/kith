@@ -293,7 +293,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     is taken. A worker's replica takes over a lost Volume only when no control node
     has one, whatever time it says it synced. A worker's `status.serves` (the DNS port
     it says it answers, and ingress) is its own word and nothing more: a control node
-    does not probe it, and nothing outside the cluster acts on it yet. A Node's address
+    does not probe it, and nothing outside the cluster acts on it yet. A worker that
+    runs from a view is refused the word that it serves ingress; one that is sent the
+    whole store (`kith node token --worker --ingress`, or a worker from before views)
+    may say it, and any worker may say it answers DNS. A Node's address
     on the LAN is the one the admitting control node saw at join, not the node's word.
 
     A worker keeps a view of the store, not the store (`docs/adr-workers.md`). A

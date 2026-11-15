@@ -918,11 +918,14 @@ kith get dnsrecord                   # each one says `served`, or why not
   cannot take them.
 - `status.serves` on a Node says what the node answers: `dns` the port it serves
   DNS on, and `ingress: true` if it serves ingress. A node says it from its own
-  `--dns` and `--ingress` flags, and a restart without them takes it off. That is
-  the node's word. A node's address on the LAN is `status.address`, the address
-  the control node that admitted it saw at join; a node behind NAT, or one that
-  moved to another address, is not covered (delete it and join it again). A
-  roaming node has its address on the mesh instead. `kith get node` shows both.
+  `--dns` and `--ingress` flags (a `--dns` on port 0 is not said), and a restart
+  without them sets it to null. That is the node's word, and a node that is
+  unreachable is not counted as serving. A node's address on the LAN is the host
+  of `status.address`, the address the control node that admitted it saw at
+  join; a node behind NAT, or one that moved to another address, is not covered
+  (delete it and join it again), and this machine's own address (`127.0.0.1`) is
+  not one. A roaming node has its address on the mesh instead. `kith get node`
+  shows both.
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
   zone itself. Names in values are full names (`nas.home.example`).

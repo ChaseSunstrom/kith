@@ -275,13 +275,15 @@ fn check_name(name: &str) -> Result<(), String> {
 impl Resource {
     /// The address on the LAN that a Node's peers reach it at: the host of `status.address`, which the
     /// control node that admitted it saw. None for a roaming Node (its address is on the mesh) and for
-    /// one not admitted yet.
+    /// one not admitted yet, and for an address that is no place on a LAN (this machine's own, or
+    /// none). An IPv4 address that was seen in IPv6's clothes is given as the IPv4 one it is.
     pub fn lan_address(&self) -> Option<std::net::IpAddr> {
         if self.spec["roaming"] == true {
             return None;
         }
         let address = self.status.as_ref()?["address"].as_str()?;
-        address.parse::<std::net::SocketAddr>().ok().map(|at| at.ip())
+        let at = address.parse::<std::net::SocketAddr>().ok()?.ip().to_canonical();
+        (!at.is_loopback() && !at.is_unspecified()).then_some(at)
     }
 
     /// Validate one parsed YAML document. Errors point into the source.

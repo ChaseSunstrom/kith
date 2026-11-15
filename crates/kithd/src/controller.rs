@@ -1463,10 +1463,17 @@ mod tests {
             changed.notify_one();
         };
         let (woken, ()) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(5), until_woken(&changed, &mut exited, TICK, &mut stopping)),
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                until_woken(&changed, &mut exited, TICK, &mut stopping)
+            ),
             poke
         );
-        assert_eq!(woken.ok(), Some(false), "a change did not wake the loop before its {TICK:?} tick");
+        assert_eq!(
+            woken.ok(),
+            Some(false),
+            "a change did not wake the loop before its {TICK:?} tick"
+        );
     }
 
     /// A unit runs the cluster Images of its own namespace and no other's, by either name

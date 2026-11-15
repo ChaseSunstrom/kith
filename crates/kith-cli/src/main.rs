@@ -1823,7 +1823,7 @@ fn status_summary(resource: &Resource) -> String {
             (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
             // A Node: its address, which is its LAN address unless it roams (then a mesh address), and what it serves.
             (Some(state), _, Some(address)) if resource.kind == "Node" => {
-                let mesh = if resource.lan_address().is_none() {
+                let mesh = if resource.spec["roaming"] == true {
                     " (mesh)"
                 } else {
                     ""
