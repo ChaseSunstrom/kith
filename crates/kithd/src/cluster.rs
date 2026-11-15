@@ -59,7 +59,7 @@ fn client(ca: &str, me: Option<&Identity>) -> Fallible<reqwest::Client> {
 }
 
 /// A client that calls one node as `me`: no other node's certificate is taken at its address.
-pub(crate) fn client_for(ca: &str, me: Option<&Identity>, pin: Option<pki::Pin>) -> Fallible<reqwest::Client> {
+pub(crate) fn client_for(ca: &str, me: Option<&Identity>, pin: Option<pki::Held>) -> Fallible<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .use_preconfigured_tls(pki::client_config(ca, me, pin)?)
         .connect_timeout(Duration::from_secs(5))
@@ -84,23 +84,35 @@ impl Cluster {
     /// name, and by the key its Node names where it names one. One per node (a new one when
     /// the key changes), so a connection kept open is not made again for each call.
     pub fn to(&self, to: &crate::view::Upstream) -> Fallible<reqwest::Client> {
+        self.pin_to(to.name.clone(), pki::Who::Name(to.name.clone()), to.certificate.clone())
+    }
+
+    /// A client that calls the voter whose id in Raft is `id` and no other: its certificate must
+    /// be for a node name that gives that id, and carry the key `print` where its Node names one.
+    /// For a link used before its Node is in the store, which then has the name alone to go by.
+    pub fn to_voter(&self, id: kith_store::NodeId, print: Option<String>) -> Fallible<reqwest::Client> {
+        // (Not a node name, so `forget_but` knows these apart.)
+        self.pin_to(format!("#{id}"), pki::Who::Id(id), print)
+    }
+
+    fn pin_to(&self, key: String, who: pki::Who, print: Option<String>) -> Fallible<reqwest::Client> {
         let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
-        if let Some((print, client)) = made.get(&to.name)
-            && *print == to.certificate
+        if let Some((kept, client)) = made.get(&key)
+            && *kept == print
         {
             return Ok(client.clone());
         }
-        let pin = (to.name.clone(), to.certificate.clone());
-        let client = client_for(&self.me.ca, Some(&self.me), Some(pin))?;
-        made.insert(to.name.clone(), (to.certificate.clone(), client.clone()));
+        let client = client_for(&self.me.ca, Some(&self.me), Some((who, print.clone())))?;
+        made.insert(key, (print, client.clone()));
         Ok(client)
     }
 
     /// Forget the clients of nodes that are no more (`is_node` says which are), so what [`Cluster::to`]
-    /// holds is as big as the nodes there are, whatever Nodes came and went.
+    /// holds is as big as the nodes there are, whatever Nodes came and went. (A voter's, by id,
+    /// stay: as many as the ids Raft has had as members, which only an admin's changes make.)
     pub fn forget_but(&self, is_node: impl Fn(&str) -> bool) {
         let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
-        made.retain(|name, _| is_node(name));
+        made.retain(|key, _| key.starts_with('#') || is_node(key));
     }
 }
 
@@ -1225,11 +1237,6 @@ pub(crate) mod pinned_peer {
             ("src/blobs.rs", 2),
             // The boot-time unlock: only a key wrapped under the disk's own secret goes.
             ("src/crypt.rs", 1),
-            // The probe of a candidate voter asks for the CA, which every node hands out; and the
-            // Raft links, which hold the plain client they were made with (T-0424).
-            ("src/raft.rs", 2),
-            // The Raft links are made before the store is: they know an id and an address.
-            ("src/main.rs", 1),
             // `client_for` (the pinned clients and the plain one) and the join, which the token's
             // hash of the CA makes safe: its client takes any certificate, and the CA it is handed
             // has to be the token's.

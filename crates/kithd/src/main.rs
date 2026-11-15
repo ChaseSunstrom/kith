@@ -419,7 +419,8 @@ async fn replica(
         })
     };
     let name = cluster.as_ref().map_or("local", |cluster| &cluster.me.name);
-    let network = raft::Network(cluster.as_ref().map(|cluster| cluster.client.clone()));
+    let network = raft::Network::default();
+    let reach = network.0.clone();
     // A worker that runs from a view keeps no store: what Raft kept here before is erased
     // (a kithd that stopped between its first view and the erasing left it).
     let view = view::load(state)?;
@@ -451,6 +452,8 @@ async fn replica(
         upstream: Mutex::default(),
         lost_after,
     });
+    // (Raft's links look a voter's Node up in the store; the state holds Raft, so by a weak hold.)
+    let _ = reach.set(Arc::downgrade(&shared));
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
     if let Some((store, at, _)) = view {

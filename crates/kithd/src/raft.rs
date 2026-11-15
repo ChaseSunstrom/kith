@@ -30,17 +30,22 @@ use kith_store::{Command, Done, NodeId, Reply, TypeConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-/// How Raft reaches the other nodes: the node API, as this node. `None` outside a cluster.
-pub struct Network(pub Option<reqwest::Client>);
+/// How Raft reaches the other nodes: the node API, as this node, each link held to the voter it
+/// is for. The store is opened with the network, so what a link looks the voter's Node up in is
+/// set once the node's state is made: until then, and outside a cluster, a link reaches no one.
+#[derive(Clone, Default)]
+pub struct Network(pub Arc<OnceLock<Weak<Shared>>>);
 
 pub struct Link {
-    client: Option<reqwest::Client>,
+    shared: Arc<OnceLock<Weak<Shared>>>,
     target: NodeId,
     address: String,
+    /// The last refusal or failure put in the log, so a link that fails at every heartbeat says it once.
+    said: Option<String>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for Network {
@@ -48,28 +53,68 @@ impl RaftNetworkFactory<TypeConfig> for Network {
 
     async fn new_client(&mut self, target: NodeId, node: &BasicNode) -> Link {
         Link {
-            client: self.0.clone(),
+            shared: self.0.clone(),
             target,
             address: node.addr.clone(),
+            said: None,
         }
     }
+}
+
+/// The Node whose Raft id is `id`, if the store has it: its name, and the print of its key.
+fn voter(shared: &Shared, id: NodeId) -> (Option<String>, Option<String>) {
+    let state = shared.store.lock().expect("nothing panics holding the store");
+    let id = id.to_string();
+    let named = |node: &&kith_api::Resource| {
+        node.status
+            .as_ref()
+            .is_some_and(|status| status["raftId"].as_str() == Some(&id))
+    };
+    let node = state.store.list(Some("Node")).find(named);
+    let print = |node: &kith_api::Resource| node.status.as_ref()?["certificate"].as_str().map(str::to_string);
+    (node.map(|node| node.metadata.name.clone()), node.and_then(print))
+}
+
+/// The client for the voter `id`, held to it: its certificate's name gives `id`, and its key is
+/// the one its Node names once that Node is in the store (a join, an empty store: by name alone).
+/// With the name its Node has, for a log line; the error says who was called and who answered.
+fn to_voter(shared: &Shared, id: NodeId) -> Result<(reqwest::Client, Option<String>), String> {
+    let cluster = shared.cluster.as_ref().ok_or("this node is not in a cluster")?;
+    let (name, print) = voter(shared, id);
+    Ok((cluster.to_voter(id, print)?, name))
 }
 
 impl Link {
     // The error type is openraft's.
     #[allow(clippy::result_large_err)]
-    async fn call<Q, A, E>(&self, what: &str, rpc: &Q, option: RPCOption) -> Result<A, RPCError<NodeId, BasicNode, E>>
+    async fn call<Q, A, E>(
+        &mut self,
+        what: &str,
+        rpc: &Q,
+        option: RPCOption,
+    ) -> Result<A, RPCError<NodeId, BasicNode, E>>
     where
         Q: Serialize,
         A: DeserializeOwned,
         E: std::error::Error + DeserializeOwned,
     {
-        let alone = || Unreachable::new(&std::io::Error::other("this node is not in a cluster"));
-        let client = self.client.as_ref().ok_or_else(alone)?;
+        let unreachable = |why: &str| Unreachable::new(&std::io::Error::other(why.to_string()));
+        let shared = self.shared.get().and_then(Weak::upgrade);
+        let shared = shared.ok_or_else(|| unreachable("this node is not in a cluster"))?;
+        let (client, name) = to_voter(&shared, self.target).map_err(|why| unreachable(&why))?;
         let call = client.post(format!("https://{}/v1/raft/{what}", self.address));
         let reply = call.timeout(option.hard_ttl()).json(rpc).send().await;
         let reply = reply.and_then(reqwest::Response::error_for_status);
-        let reply = reply.map_err(|e| Unreachable::new(&e))?;
+        let reply = reply.map_err(|e| {
+            let to = name.map_or(String::new(), |name| format!(" to node {name}"));
+            let said = format!("raft link{to} at {}: {}", self.address, crate::cluster::why(&e));
+            if self.said.as_ref() != Some(&said) {
+                eprintln!("kithd: {said}");
+                self.said = Some(said);
+            }
+            Unreachable::new(&e)
+        })?;
+        self.said = None;
         let reply: Result<A, E> = reply.json().await.map_err(|e| NetworkError::new(&e))?;
         reply.map_err(|e| RemoteError::new(self.target, e).into())
     }
@@ -555,12 +600,12 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
     if let ChangeMembers::ReplaceAllVoters(next) = &change {
         let mut there = current.clone();
         for id in next.difference(&voters) {
-            let client = shared.cluster.as_ref().map(|cluster| &cluster.client);
+            // (The candidate and no other: the Node it is in the store, or its name alone.)
             let address = wanted.get(id).map_or("", |node| node.addr.as_str());
-            let asked = client.map(|client| client.get(format!("https://{address}/v1/ca")));
+            let asked = to_voter(&shared, *id).map(|(client, _)| client.get(format!("https://{address}/v1/ca")));
             let answered = match asked {
-                Some(asked) => asked.timeout(Duration::from_secs(2)).send().await.is_ok(),
-                None => false,
+                Ok(asked) => asked.timeout(Duration::from_secs(2)).send().await.is_ok(),
+                Err(_) => false,
             };
             if !answered {
                 there.remove(id);
@@ -595,6 +640,83 @@ mod tests {
         roaming: &BTreeSet<NodeId>,
     ) -> Option<ChangeMembers<NodeId, BasicNode>> {
         super::next_change(me, wanted, known, voters, current, lost, roaming, &BTreeSet::new())
+    }
+
+    #[tokio::test]
+    async fn raft_link_goes_to_the_voter_it_is_for_and_to_no_other() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use kith_store::openraft::Vote;
+        use std::sync::atomic::Ordering;
+        let ca = pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (taken, to_x) = answering_as(&x).await;
+        let (home, to_b) = answering_as(&b).await;
+        let (print_b, print_x) = (pki::print_of(&b.cert).unwrap(), pki::print_of(&x.cert).unwrap());
+        let id = kith_store::node_id("b");
+        // A vote to voter b at `address`: the link it was sent on, and how it came out.
+        let vote_at = |shared: Arc<Shared>, address: String| async move {
+            let mut network = Network::default();
+            let _ = network.0.set(Arc::downgrade(&shared));
+            let mut link = network.new_client(id, &BasicNode::new(address)).await;
+            let vote = VoteRequest::new(Vote::new(1, kith_store::node_id("a")), None);
+            let done = link.vote(vote, RPCOption::new(Duration::from_secs(5))).await;
+            (done.is_ok(), link.said)
+        };
+        let said = |said: Option<String>| said.expect("the refusal is in the log");
+
+        // A store with no Node yet (a join, an empty one): by the name alone. Another node of the
+        // CA at b's address is refused in the handshake, with who was called and who answered.
+        let empty = shared_with("link-empty", a.clone(), &[]).await;
+        let (done, why) = vote_at(empty.clone(), taken.clone()).await;
+        assert!(!done && said(why).contains("the voter with raft id"), "answered");
+        assert_eq!(to_x.load(Ordering::SeqCst), 0, "x was sent the vote");
+        let (_, why) = vote_at(empty.clone(), taken.clone()).await;
+        assert!(said(why).contains("was called, and node x answered"));
+        // b itself is sent it (whatever it answers: the call was made, and its refusal is not a pin's).
+        let (_, why) = vote_at(empty.clone(), home.clone()).await;
+        assert_eq!(to_b.load(Ordering::SeqCst), 1);
+        assert!(
+            why.is_none_or(|w| !w.contains("was called")),
+            "b was refused as another node"
+        );
+
+        // With the Node (raft id b's) the key is held to as well: the right name and another key.
+        let known = |tag: &'static str, print: String| {
+            let (a, home) = (a.clone(), home.clone());
+            async move {
+                let shared = shared_with(tag, a, &[at("b", &home, Some(print.clone()))]).await;
+                let status = serde_json::json!({
+                    "address": home, "certificate": print, "state": "ready", "raftId": id.to_string(),
+                });
+                shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .store
+                    .set_status("Node/b", Some(status))
+                    .unwrap();
+                shared
+            }
+        };
+        let wrong = known("link-wrong", print_x).await;
+        let (done, why) = vote_at(wrong, home.clone()).await;
+        assert!(!done && said(why).contains("node b at"), "refused, and said by whom");
+        assert_eq!(
+            to_b.load(Ordering::SeqCst),
+            1,
+            "b was sent a vote on another key than its Node's"
+        );
+        let right = known("link-right", print_b).await;
+        let (_, why) = vote_at(right.clone(), home.clone()).await;
+        assert_eq!(to_b.load(Ordering::SeqCst), 2, "b, on its own key, is sent the vote");
+        assert!(
+            why.is_none_or(|w| !w.contains("another key")),
+            "b was refused on its own key"
+        );
+        // And another node at b's address is refused here too.
+        let (done, why) = vote_at(right, taken).await;
+        assert!(!done && said(why).contains("was called, and node x answered"));
+        assert_eq!(to_x.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

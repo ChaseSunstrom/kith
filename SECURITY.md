@@ -55,21 +55,24 @@ Only the newest version is fixed. There are no security releases of older ones.
   while that node's Node is in the store: each request is asked again.
 - **What one node passes on to another is pinned to its name.** A passphrase, a Volume's
   key, a caller's Volume files, a restore, `kith run`, a unit's output, a Volume's copy,
-  a blob copied from the node that holds it, a Raft write sent on to the leader and
-  the ping of the nodes go to the node that was named, at its address by its Node: the
+  a blob copied from the node that holds it, a Raft write sent on to the leader, the
+  ping of the nodes, each Raft link between voters (votes, appends and snapshots, which
+  hold every Secret) and the CA probe of a node that may be made a voter go to the node
+  that was named, at its address by its Node: the
   handshake is refused unless the certificate is for `NAME.node.kith` and, if the Node
   names a key (`status.certificate`), is that key. So another node of the CA that
   answers at a moved or reused address is sent nothing and what it says is not taken
   for the named node's word, and the error says who was called and who answered. A
-  Node that names no key is held to its name alone.
-  Not pinned: the Raft links between voters, and the CA probe of a node that may be
-  made a voter (they are made before the store is, with an id and an address: whoever
-  answers at a voter's address with a certificate of the CA is sent the log, so every
-  Secret, and can answer its votes; T-0424); joining (the joining node has no store,
-  and checks the CA by its hash from the token); a blob fetched by its digest (what
-  comes is checked against the digest); and a locked disk's key asked at boot, before
-  there is a store (only a key wrapped under the disk's own secret is sent, but the
-  disk's id is seen by whoever answers).
+  Node that names no key is held to its name alone. A Raft link knows its voter by
+  its raft id, so its certificate's name must give that id, and the key too once that
+  voter's Node is in the store; a store with no Node for it yet (a node just joined)
+  holds the link to the name alone, as does a voter whose Node was deleted and that
+  still gets the store until it is taken out of the voters.
+  Not pinned: joining (the joining node has no store, and checks the CA by its hash
+  from the token); a blob fetched by its digest (what comes is checked against the
+  digest); and a locked disk's key asked at boot, before there is a store (only a key
+  wrapped under the disk's own secret is sent, but the disk's id is seen by whoever
+  answers).
 - **What a node fetches or sends for someone who is not the admin** (a Source's
   repository, a package pushed to a registry, a `DNSBlockList`'s `url`) goes only to
   addresses that are not this node's own or on its networks, each redirect and each place a registry sends an upload

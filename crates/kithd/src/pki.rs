@@ -325,28 +325,57 @@ pub fn ingress_config(certificates: Arc<dyn rustls::server::ResolvesServerCert>)
 /// Checks a server like any other, but for the name every node has rather than the address dialled.
 /// With a pin, it has to be that node besides: its name, and the key its Node names if it names one.
 #[derive(Debug)]
-struct AnyNode(Arc<WebPkiServerVerifier>, Option<Pin>);
+struct AnyNode(Arc<WebPkiServerVerifier>, Option<Held>);
 
-/// The one node a client will talk to: its name, and the print of its key ([`key_print`]).
+/// A node a join names (a worker's first): its name, and the print of its key ([`key_print`]).
 pub type Pin = (String, Option<String>);
 
+/// The one node a client will talk to: who it is, and the print of its key.
+pub type Held = (Who, Option<String>);
+
+/// A node by its name, or by its id in Raft (which its name gives, `kith_store::node_id`): a
+/// Raft link knows the id of the voter it is for before it knows any Node.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Who {
+    Name(String),
+    Id(kith_store::NodeId),
+}
+
+impl Who {
+    fn is(&self, name: &str) -> bool {
+        match self {
+            Who::Name(called) => called == name,
+            Who::Id(id) => kith_store::node_id(name) == *id,
+        }
+    }
+}
+
+impl std::fmt::Display for Who {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Who::Name(name) => write!(f, "node {name}"),
+            Who::Id(id) => write!(f, "the voter with raft id {id}"),
+        }
+    }
+}
+
 /// Is the certificate `cert` the node's that `pin` names?
-fn pinned(cert: &CertificateDer<'_>, pin: &Pin) -> bool {
+fn pinned(cert: &CertificateDer<'_>, pin: &Held) -> bool {
     let Some(Subject::Node(name, key, _)) = subject_of(cert) else {
         return false;
     };
-    name == pin.0 && pin.1.as_ref().is_none_or(|print| *print == key_print(&key))
+    pin.0.is(&name) && pin.1.as_ref().is_none_or(|print| *print == key_print(&key))
 }
 
 /// Why a certificate is not the pinned node's: names the node that was called and who answered.
-fn unpinned(cert: &CertificateDer<'_>, pin: &Pin) -> String {
+fn unpinned(cert: &CertificateDer<'_>, pin: &Held) -> String {
     let called = &pin.0;
     match subject_of(cert) {
-        Some(Subject::Node(name, ..)) if name == *called => {
-            format!("node {called} answered with another key than its Node names")
+        Some(Subject::Node(name, ..)) if called.is(&name) => {
+            format!("{called} answered with another key than its Node names")
         }
-        Some(Subject::Node(name, ..)) => format!("node {called} was called, and node {name} answered"),
-        _ => format!("node {called} was called, and what answered is no node of the cluster"),
+        Some(Subject::Node(name, ..)) => format!("{called} was called, and node {name} answered"),
+        _ => format!("{called} was called, and what answered is no node of the cluster"),
     }
 }
 
@@ -392,7 +421,7 @@ impl ServerCertVerifier for AnyNode {
 
 /// TLS for calling a node: its certificate must be from `ca`. With `me`, ours is presented.
 /// With `pin`, only the node it names is called, whoever answers at the address.
-pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Pin>) -> Fallible<ClientConfig> {
+pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Held>) -> Fallible<ClientConfig> {
     let verifier = WebPkiServerVerifier::builder_with_provider(roots(ca)?, provider()).build();
     let builder = tls(
         "setting up TLS",
