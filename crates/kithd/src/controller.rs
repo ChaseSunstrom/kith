@@ -308,7 +308,7 @@ pub async fn run(
     let left = wait_for_storage(counts.chain(removals).collect(), Duration::from_secs(2)).await;
     if !left.is_empty() {
         eprintln!(
-            "kithd: gave up waiting after 2 s for {}: the state disk may be busy, and the next start finishes it",
+            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left goes at its pod's next count, or with its replica directory once the pod is gone",
             left.join(", ")
         );
     }

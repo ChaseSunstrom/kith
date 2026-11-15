@@ -325,10 +325,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
   gives up between files, and kithd waits 2 seconds for it so the state disk can be
   unmounted, and says in its log which it gave up on. A removal looks at the stop every
-  1,024 files or directories; only a tree more than 128 directories deep is removed in one
-  call, which a stop does not cut short. A removal opens each directory through its
-  parent's handle, never through a link. What is left is removed at its replica's next
-  count. A limit held at
+  1,024 steps (entries looked at), at any depth, holding one directory at a time (opened
+  through the one above, never through a link, and never into another file system). A
+  removal ends at the first entry it cannot remove, with that error in the log. What is left
+  is removed at the next count of its pod's roots (only a pod with running roots that is
+  walked: one with a limit, or while the disk is under twice its reserve), or when the pod is
+  gone, with its replica directory. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload

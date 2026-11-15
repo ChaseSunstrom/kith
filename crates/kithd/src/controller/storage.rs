@@ -232,20 +232,25 @@ pub fn aside(scratch: &Path) -> bool {
     std::fs::rename(scratch, gone).is_ok()
 }
 
-/// Removes every scratch moved aside in the replica directory `replica`, till `stop` is set.
-//
-/// A scratch the stop cut short is left as it is, and the next sweep takes the rest.
+/// Removes every scratch moved aside in the replica directory `replica`, till `stop` is set. A
+/// scratch the stop cut short is left as it is: it goes at the next count of its pod's roots
+/// (which only a pod with running roots that is walked has), or when the pod is gone and its
+/// replica directory is removed.
 pub fn sweep(replica: &Path, stop: &AtomicBool) {
+    sweep_until(replica, &|| stop.load(Ordering::Relaxed));
+}
+
+fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
     for entry in std::fs::read_dir(replica).into_iter().flatten().flatten() {
-        if stop.load(Ordering::Relaxed) {
+        if halted() {
             return;
         }
         if entry.file_name().to_string_lossy().starts_with("scratch.") {
-            match remove_tree(&entry.path(), &|| stop.load(Ordering::Relaxed)) {
+            match remove_tree(&entry.path(), halted) {
                 Ok(true) => {}
                 Ok(false) => {
                     eprintln!(
-                        "kithd: stopped removing {}: the rest goes at the next sweep",
+                        "kithd: stopped removing {}: it is left for the pod's next count, or for its replica directory's removal",
                         entry.path().display()
                     );
                     return;
@@ -257,88 +262,107 @@ pub fn sweep(replica: &Path, stop: &AtomicBool) {
     }
 }
 
-/// How many steps of a removal (an entry removed, a directory entered) pass between two looks
-/// at the stop.
+/// How many steps of a removal (an entry looked at) pass between two looks at the stop.
 const BATCH: usize = 1024;
 
 /// Removes the directory `root` and all in it, asking `halted` first and then every [`BATCH`]
-/// steps: true once it is done, false when it was halted (what is left stays, the rest of a
-/// directory included). A pod wrote what is in it and kithd is root here, so each directory
-/// is opened through its parent's handle and never through a link, one that shuts its owner
-/// out is opened up first, and a link is unlinked, never followed. The first error is returned
-/// once the rest is done.
+/// steps: true once it is done, false when it was halted (what is left stays). A pod wrote what
+/// is in it and kithd is root here, so only one directory is held, whatever the depth (a chain
+/// thousands deep would hold more descriptors than kithd has): each is opened through the one
+/// held, never through a link, one that shuts its owner out is opened up first, and a link is
+/// unlinked, never followed. An entry that is a directory is tried with `rmdir` first and
+/// opened only if it is not empty; once a directory is empty the walk opens `..` of it and
+/// lists that again (never above `root`). The first error that leaves an entry in place ends
+/// the removal with it, as `remove_dir_all` does, so what cannot be removed cannot be walked
+/// round for ever; a directory on another file system than `root`'s ends it so too. A `root`
+/// that is a link or a file is unlinked.
 fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
-    use crate::backups::{DEEPEST, open_dir, within};
-    use nix::sys::stat::{FchmodatFlags, fchmodat};
-    use std::os::unix::fs::PermissionsExt;
-    type Held = (std::fs::File, std::fs::ReadDir, std::ffi::OsString);
-    let open = |parent: Option<&std::fs::File>, name: &std::ffi::OsStr| -> std::io::Result<Held> {
-        let path = parent.map_or_else(|| PathBuf::from(name), |dir| within(dir, name));
-        let dir = match (open_dir(&path), parent) {
-            (Err(e), Some(parent)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                let open = Mode::from_bits_truncate(0o700);
-                fchmodat(Some(parent.as_raw_fd()), name, open, FchmodatFlags::NoFollowSymlink)?;
-                open_dir(&path)?
-            }
-            (opened, _) => opened?,
-        };
-        let mode = dir.metadata()?.permissions().mode();
-        if mode & 0o700 != 0o700 {
-            dir.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777 | 0o700))?;
-        }
-        let listing = std::fs::read_dir(within(&dir, ".".as_ref()))?;
-        Ok((dir, listing, name.to_owned()))
-    };
-    let mut first: Option<std::io::Error> = None;
-    let mut note = |done: std::io::Result<()>| {
-        if let Err(e) = done
-            && e.kind() != std::io::ErrorKind::NotFound
+    use nix::errno::Errno;
+    use nix::sys::stat::{FchmodatFlags, fchmod, fchmodat};
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+    use std::os::fd::IntoRawFd;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let top = match crate::backups::open_dir(root) {
+        Err(e)
+            if matches!(
+                e.raw_os_error().map(Errno::from_raw),
+                Some(Errno::ELOOP | Errno::ENOTDIR)
+            ) =>
         {
-            first.get_or_insert(e);
+            return std::fs::remove_file(root).map(|()| true);
         }
+        opened => Dir::from_fd(opened?.into_raw_fd())?,
     };
-    let mut inside = vec![open(None, root.as_os_str())?];
-    let mut steps = 0usize;
-    loop {
-        steps += 1;
-        if steps % BATCH == 1 && halted() {
-            return Ok(false);
-        }
-        let held = inside.len();
-        let Some((dir, listing, _)) = inside.last_mut() else {
-            break;
-        };
-        let Some(entry) = listing.next() else {
-            let Some((_, _, name)) = inside.pop() else { break };
-            note(match inside.last() {
-                Some((parent, ..)) => std::fs::remove_dir(within(parent, &name)),
-                None => std::fs::remove_dir(root),
-            });
-            continue;
-        };
-        let Ok(entry) = entry else {
-            note(Err(std::io::Error::other("a directory listing failed")));
-            continue;
-        };
-        let name = entry.file_name();
-        let path = within(dir, &name);
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            // ponytail: deeper than a pod's own directories go is one `remove_dir_all` that a
-            // stop does not cut; a held directory is an open file, so the walk holds only so many.
-            if held > DEEPEST {
-                note(std::fs::remove_dir_all(&path));
-            } else {
-                match open(Some(dir), &name) {
-                    Ok(under) => inside.push(under),
-                    // (A link put there since the listing is unlinked, not followed.)
-                    Err(e) => note(std::fs::remove_file(&path).or(Err(e))),
-                }
+    let device = fstat(top.as_raw_fd())?.st_dev;
+    // `name` in the directory `fd`, held to the root's file system and opened up if it shuts out.
+    let open = |fd: i32, name: &std::ffi::CStr| -> std::io::Result<Dir> {
+        let dir = match Dir::openat(Some(fd), name, flags, Mode::empty()) {
+            Err(Errno::EACCES) => {
+                fchmodat(
+                    Some(fd),
+                    name,
+                    Mode::from_bits_truncate(0o700),
+                    FchmodatFlags::NoFollowSymlink,
+                )?;
+                Dir::openat(Some(fd), name, flags, Mode::empty())?
             }
-        } else {
-            note(std::fs::remove_file(&path));
+            opened => opened?,
+        };
+        let meta = fstat(dir.as_raw_fd())?;
+        if meta.st_dev != device {
+            let said = format!("a file system is mounted at {}", name.to_string_lossy());
+            return Err(std::io::Error::other(said));
+        }
+        if meta.st_mode & 0o700 != 0o700 {
+            fchmod(dir.as_raw_fd(), Mode::from_bits_truncate(meta.st_mode | 0o700))?;
+        }
+        Ok(dir)
+    };
+    let (mut here, mut depth, mut steps) = (top, 0usize, 0usize);
+    loop {
+        let fd = here.as_raw_fd();
+        let mut down = None;
+        for entry in here.iter() {
+            steps += 1;
+            if steps % BATCH == 1 && halted() {
+                return Ok(false);
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            if matches!(name.to_bytes(), b"." | b"..") {
+                continue;
+            }
+            let dir = match entry.file_type() {
+                Some(kind) => kind == nix::dir::Type::Directory,
+                None => fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|meta| is_dir(&meta)),
+            };
+            let gone = if dir {
+                match unlinkat(Some(fd), name, UnlinkatFlags::RemoveDir) {
+                    Err(Errno::ENOTEMPTY | Errno::EEXIST) => {
+                        down = Some(name.to_owned());
+                        break;
+                    }
+                    // (A link put there since the listing is unlinked, not followed.)
+                    Err(Errno::ENOTDIR) => unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir),
+                    gone => gone,
+                }
+            } else {
+                unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir)
+            };
+            if let Err(e) = gone
+                && e != Errno::ENOENT
+            {
+                return Err(e.into());
+            }
+        }
+        match down {
+            Some(name) => (here, depth) = (open(fd, &name)?, depth + 1),
+            None if depth > 0 => (here, depth) = (open(fd, c"..")?, depth - 1),
+            None => break,
         }
     }
-    first.map_or(Ok(true), Err)
+    drop(here);
+    std::fs::remove_dir(root).map(|()| true)
 }
 
 /// Whether a pod whose running units (none stopping) started at `started` may be replaced for a
@@ -810,5 +834,91 @@ mod tests {
         std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(outside.join("shut/kept").exists());
         std::fs::remove_dir_all(top).unwrap();
+    }
+
+    /// `depth` directories `d` inside one another below `top`, a file at the bottom: made through
+    /// the handle of each (a path that long is no path).
+    fn chain(top: &Path, depth: usize) {
+        use crate::backups::{open_dir, within};
+        let mut at = open_dir(top).unwrap();
+        for _ in 0..depth {
+            std::fs::create_dir(within(&at, "d".as_ref())).unwrap();
+            at = open_dir(&within(&at, "d".as_ref())).unwrap();
+        }
+        std::fs::write(within(&at, "bottom".as_ref()), "x").unwrap();
+    }
+
+    /// How many directories `d` deep `top` goes.
+    fn deep(top: &Path) -> usize {
+        use crate::backups::{open_dir, within};
+        let mut at = open_dir(top).unwrap();
+        let mut down = 0;
+        while let Ok(under) = open_dir(&within(&at, "d".as_ref())) {
+            (at, down) = (under, down + 1);
+        }
+        down
+    }
+
+    #[test]
+    fn storage_stop_a_chain_of_thousands_of_directories_is_removed_one_descriptor_at_a_time() {
+        let top = dir("chain");
+        let root = top.join("scratch.1");
+        std::fs::create_dir(&root).unwrap();
+        chain(&root, 2000);
+        // Stopped from inside the walk, well below the 128th directory: all of it is left.
+        let looks = std::cell::Cell::new(0);
+        let stopped = remove_tree(&root, &|| {
+            looks.set(looks.get() + 1);
+            looks.get() > 1
+        });
+        assert!(!stopped.unwrap());
+        assert_eq!(deep(&root), 2000);
+        // Let alone, all of it goes.
+        assert!(remove_tree(&root, &|| false).unwrap());
+        assert!(!root.exists());
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn storage_stop_a_scratch_that_is_a_link_or_a_file_is_unlinked_not_followed() {
+        let top = dir("odd");
+        let outside = top.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("kept"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, top.join("scratch.1")).unwrap();
+        std::fs::write(top.join("scratch.2"), "x").unwrap();
+        sweep(&top, &AtomicBool::new(false));
+        assert!(top.join("scratch.1").symlink_metadata().is_err());
+        assert!(top.join("scratch.2").symlink_metadata().is_err());
+        assert!(outside.join("kept").exists());
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn storage_stop_a_sweep_halted_inside_a_scratch_leaves_it_and_the_ones_after() {
+        let replica = dir("halted");
+        for scratch in ["scratch.1", "scratch.2"] {
+            std::fs::create_dir_all(replica.join(scratch)).unwrap();
+            for n in 0..2000 {
+                std::fs::write(replica.join(scratch).join(format!("f{n}")), "x").unwrap();
+            }
+        }
+        // Its looks: before the first scratch, at the start of its removal, and 1,024 steps in.
+        let looks = std::cell::Cell::new(0);
+        sweep_until(&replica, &|| {
+            looks.set(looks.get() + 1);
+            looks.get() > 2
+        });
+        let left: Vec<usize> = ["scratch.1", "scratch.2"]
+            .iter()
+            .map(|scratch| std::fs::read_dir(replica.join(scratch)).map_or(0, Iterator::count))
+            .collect();
+        assert!(
+            left.contains(&2000) && left.iter().any(|n| 0 < *n && *n < 2000),
+            "{left:?}"
+        );
+        sweep_until(&replica, &|| false);
+        assert_eq!(std::fs::read_dir(&replica).unwrap().count(), 0);
+        std::fs::remove_dir_all(replica).unwrap();
     }
 }
