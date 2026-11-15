@@ -223,7 +223,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   a mode and a time each, and refuses an entry more than 128 directories down (as deep
   as a Backup packs, so what a restore takes is backed up again); an entry's headers (its name, and a long name, PAX header or sparse map the tar crate
   reads whole) are refused past 256 KiB, and an archive that ends inside an entry is
-  refused: its memory does not grow with the archive. An unpack that fails opens what
+  refused: its memory does not grow with the archive. A sparse entry with a map in blocks
+  after its header is refused by name before the tar crate adds the map up (it does so
+  unchecked, and kith's own Backups write no sparse entry): such archives are not restored.
+  An unpack that fails opens what
   it unpacked to its owner and removes it, holding open only the directories it is
   inside of, through no link, and one that finds such a leftover beside the Volume does
   the same first. Each directory is made when it comes, stays open to its owner while

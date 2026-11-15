@@ -392,6 +392,18 @@ const HEADERS: u64 = 256 * 1024;
 impl std::io::Read for Metered {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let got = self.file.read(buf)?;
+        // The tar crate adds each map block after a GNU sparse header to where the next entry
+        // starts, unchecked, and reads them while it finds the entry (before kithd has the
+        // entry): a header of 512 bytes, type `S`, with its is-extended byte (482) set is
+        // refused here. (Kith's own archives have no sparse entry. A long name's data block
+        // that looks so is refused too: a path of over 482 bytes, with an `S` at byte 156.)
+        if self.read.get().is_some() && got == 512 && buf[156] == b'S' && buf[482] != 0 {
+            let name = buf[..100].split(|b| *b == 0).next().unwrap_or_default();
+            return Err(std::io::Error::other(format!(
+                "{} is a sparse entry with an extended sparse map, which is not restored",
+                String::from_utf8_lossy(name).escape_debug()
+            )));
+        }
         if let Some(read) = self.read.get() {
             let read = read.saturating_add(got as u64);
             if read > HEADERS {
@@ -1815,10 +1827,9 @@ mod tests {
 
     /// A GNU sparse entry that says it is near 2^64 bytes long, with sparse maps after it
     /// (the tar crate adds 512 to where the next entry starts for each map, unchecked, past
-    /// where its length put it): not unpacked. Where overflow is checked (a debug build, as
-    /// tests are) the tar crate panics; where it wraps (a release build) the entry fails.
+    /// where its length put it): refused by name, as every sparse entry with maps after it is.
     #[test]
-    fn unpack_of_a_sparse_entry_near_two_to_the_64_fails() {
+    fn unpack_sparse_entry_near_two_to_the_64_fails() {
         let root = temp("sparsewrap");
         let blobs = root.join("blobs");
         let to = root.join("to");
@@ -1845,9 +1856,11 @@ mod tests {
         }
         std::io::Write::write_all(tar.get_mut(), &[7u8; 4096]).unwrap();
         let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        // (Refused by kithd before the tar crate adds the maps up: no panic to catch, in a
+        // debug or a release build.)
         for cap in [1 << 40, u64::MAX] {
-            let unpacked = std::panic::catch_unwind(|| unpack_to(&archive, &to, 0, cap));
-            assert!(!matches!(unpacked, Ok(Ok(_))), "{cap}: {unpacked:?}");
+            let said = unpack_to(&archive, &to, 0, cap).unwrap_err();
+            assert!(said.to_string().contains("extended sparse map"), "{cap}: {said}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
