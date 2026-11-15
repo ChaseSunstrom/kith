@@ -131,14 +131,14 @@ async fn fetch_list(url: &str, sha256: Option<&str>) -> Result<String, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
     // kithd fetches as root from inside the cluster: not from this node or its networks, and
     // from the address that was looked at (not one a second lookup gives).
-    let (host, _, addresses) = crate::sources::vetted(&parsed.origin().ascii_serialization())
+    let (host, _, addresses) = crate::sources::vetted(&parsed.origin().ascii_serialization(), false)
         .await
-        .map_err(|e| match e.contains("its own networks") {
-            true => format!(
+        .map_err(|e| match e {
+            crate::sources::Refused::Inward(_) => format!(
                 "{url}: a list is not fetched from this node or its own networks (a list of your own goes in a \
                  ConfigMap in kith-system)"
             ),
-            false => e,
+            crate::sources::Refused::Address(why) => why,
         })?;
     // (No redirect is followed: the address is the one the spec names. Nor a proxy, which
     // would look the name up again itself.)

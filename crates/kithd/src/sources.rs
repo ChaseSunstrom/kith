@@ -80,19 +80,28 @@ fn host(url: &str) -> &str {
 }
 
 /// Is this an address of this node or of the networks around it (loopback, private,
-/// link-local, shared, unspecified), in whatever form it is written?
-fn inward(ip: std::net::IpAddr) -> bool {
+/// link-local, shared, unspecified, broadcast, multicast), in whatever form it is
+/// written? With `lan`, the private and shared ranges (10/8, 172.16/12, 192.168/16,
+/// 100.64/10, fc00::/7) are not: a server on the LAN may be asked; the rest still are.
+fn inward(ip: std::net::IpAddr, lan: bool) -> bool {
     let v4 = |ip: std::net::Ipv4Addr| {
         let shared = ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64;
-        ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified() || shared || ip.is_broadcast()
+        let private = (ip.is_private() || shared) && !lan;
+        ip.is_loopback()
+            || private
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
     };
     match ip {
         std::net::IpAddr::V4(ip) => v4(ip),
         std::net::IpAddr::V6(ip) => {
             let first = ip.segments()[0];
-            // (Unique-local, link-local, the old site-local; and the forms that carry an
-            // IPv4 address inside: mapped, compatible, 6to4, NAT64.)
-            let local = (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || (first & 0xffc0) == 0xfec0;
+            // (Unique-local, link-local, the old site-local, multicast; and the forms that
+            // carry an IPv4 address inside: mapped, compatible, 6to4, NAT64.)
+            let unique = (first & 0xfe00) == 0xfc00 && !lan;
+            let local = unique || (first & 0xffc0) == 0xfe80 || (first & 0xffc0) == 0xfec0 || ip.is_multicast();
             let [a, b, c, d] = [ip.octets()[2], ip.octets()[3], ip.octets()[4], ip.octets()[5]];
             let sixtofour = first == 0x2002 && v4(std::net::Ipv4Addr::new(a, b, c, d));
             let [a, b, c, d] = [ip.octets()[12], ip.octets()[13], ip.octets()[14], ip.octets()[15]];
@@ -112,7 +121,7 @@ fn inward(ip: std::net::IpAddr) -> bool {
 /// fetch connects there and nowhere else, so a name that changes its answer after this
 /// look gets nothing by it.
 pub async fn outward(url: &str) -> Fallible<Vec<String>> {
-    let (host, port, found) = vetted(url).await?;
+    let (host, port, found) = vetted(url, false).await?;
     // (One entry for the name: curl keeps only the last it is given for a host and port.)
     let all: Vec<String> = found.iter().map(|address| at(address.ip())).collect();
     Ok(vec![format!("{host}:{port}:{}", all.join(","))])
@@ -168,45 +177,72 @@ thread_local! {
     pub static LOOPBACK_IS_OUTSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Why [`vetted`] took no address.
+#[derive(Debug, PartialEq)]
+pub enum Refused {
+    /// The URL is not one that is fetched from (its shape, its port, ssh, its lookup): says why.
+    Address(String),
+    /// This host is (or is also) this node or its own networks.
+    Inward(String),
+}
+
+/// (A Source's words for it; another caller says its own.)
+impl From<Refused> for String {
+    fn from(refused: Refused) -> String {
+        match refused {
+            Refused::Address(why) => why,
+            Refused::Inward(host) => {
+                format!("{host}: only a Source in kith-system is fetched from this node or its own networks")
+            }
+        }
+    }
+}
+
 /// The host and port `url` names and the addresses it is at, if none of them is this
-/// node or its networks.
-pub async fn vetted(url: &str) -> Fallible<(String, u16, Vec<std::net::SocketAddr>)> {
+/// node or its networks (with `lan`, the networks' private ranges may be: [`inward`]).
+/// With no port, the scheme's: 80 for http, 443 otherwise.
+pub async fn vetted(url: &str, lan: bool) -> Result<(String, u16, Vec<std::net::SocketAddr>), Refused> {
     let host = host(url);
     let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = authority.split('/').next().unwrap_or_default();
     // What is vetted must be what whoever fetches connects to: nothing that one reader
     // of a URL takes for the host's end and another does not.
     if url.contains(['?', '#', '\\']) || authority.contains(['@', '%']) || url.chars().any(char::is_whitespace) {
-        return Err(format!(
-            "{url}: a Source's address is scheme://host[:port]/path, and no more"
-        ));
+        return Err(Refused::Address(format!(
+            "{url}: an address here is scheme://host[:port]/path, and no more"
+        )));
     }
     // (A name with a dot at its end is another spelling of the name: whoever connects may
     // look it up again under the one that was not held.)
     if host.ends_with('.') {
-        return Err(format!("{url}: a host is written with no dot at its end"));
+        return Err(Refused::Address(format!(
+            "{url}: a host is written with no dot at its end"
+        )));
     }
     let after = authority.rsplit_once(']').map_or(authority, |(_, after)| after);
     let port: u16 = match after.rsplit_once(':') {
-        Some((_, port)) => port.parse().map_err(|_| format!("{url}: {port:?} is not a port"))?,
+        Some((_, port)) => port
+            .parse()
+            .map_err(|_| Refused::Address(format!("{url}: {port:?} is not a port")))?,
+        // (The port held must be the one connected to: a client given a held address
+        // with a port uses that port when the URL names none.)
+        None if url.starts_with("http://") => 80,
         None => 443,
     };
     if url.starts_with("ssh://") {
-        return Err(format!(
+        return Err(Refused::Address(format!(
             "{host}: only a Source in kith-system is fetched over ssh (with this node's keys)"
-        ));
+        )));
     }
     let found: Vec<_> = match tokio::net::lookup_host((host, port)).await {
         Ok(found) => found.collect(),
-        Err(e) => return Err(format!("{host}: {e}")),
+        Err(e) => return Err(Refused::Address(format!("{host}: {e}"))),
     };
-    let inward = |ip: std::net::IpAddr| inward(ip) || ours(ip);
+    let inward = |ip: std::net::IpAddr| inward(ip, lan) || ours(ip);
     #[cfg(test)]
     let inward = |ip: std::net::IpAddr| inward(ip) && !(ip.is_loopback() && LOOPBACK_IS_OUTSIDE.get());
     match found.is_empty() || found.iter().any(|address| inward(address.ip())) {
-        true => Err(format!(
-            "{host}: only a Source in kith-system is fetched from this node or its own networks"
-        )),
+        true => Err(Refused::Inward(host.to_string())),
         false => Ok((host.to_string(), port, found)),
     }
 }
@@ -901,7 +937,37 @@ mod tests {
             assert_eq!(host(url), at);
         }
         for ip in ["8.8.8.8", "2606:4700::1111", "100.128.0.1"] {
-            assert!(!inward(ip.parse().unwrap()), "{ip}");
+            assert!(!inward(ip.parse().unwrap(), false), "{ip}");
+        }
+        // Allowing the LAN lets its private ranges through, and nothing more of this node.
+        for ip in [
+            "10.1.2.3",
+            "192.168.1.1",
+            "172.16.0.1",
+            "100.64.0.1",
+            "fd00::1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert!(
+                inward(ip.parse().unwrap(), false) && !inward(ip.parse().unwrap(), true),
+                "{ip}"
+            );
+        }
+        for ip in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fec0::1",
+            "ff02::1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(inward(ip.parse().unwrap(), true), "{ip}");
         }
         for ip in [
             "127.0.0.1",
@@ -918,8 +984,10 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:7f00:1",
             "::127.0.0.1",
+            "224.0.0.1",
+            "ff02::1",
         ] {
-            assert!(inward(ip.parse().unwrap()), "{ip}");
+            assert!(inward(ip.parse().unwrap(), false), "{ip}");
         }
         assert!(path_allowed("clusters/prod").is_ok());
         for path in ["../x", "a/../b", "/abs", "a//b", "-x", ":(top)"] {
@@ -961,6 +1029,11 @@ mod tests {
         assert_eq!(
             outward("https://8.8.8.8:8443/x").await,
             Ok(vec!["8.8.8.8:8443:8.8.8.8".to_string()])
+        );
+        // (With no port, the scheme's: what is held is the port that is connected to.)
+        assert_eq!(
+            outward("http://8.8.8.8/x").await,
+            Ok(vec!["8.8.8.8:80:8.8.8.8".to_string()])
         );
         // A Node's public address, and this machine's own (whatever a socket binds to).
         assert!(outward("https://8.8.4.4/x").await.is_ok());

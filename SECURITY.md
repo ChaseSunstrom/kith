@@ -525,8 +525,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   fill a node's disk through a restore into such a Volume. The primary's copy route builds
   its archive with no cap of its own; the replica that takes it is what stops at the
   size (and a replica of a Volume with no `size` stops at nothing). (T-0230.)
-- **A node started with no `--release-key` trusts the key of the first OSRelease it
-  takes.** Give the key when installing. (T-0231.) What a taken admin credential can
+- **A node with no release key trusts the key of the first OSRelease it takes.** Build
+  the image with one (`KITH_RELEASE_KEY`, kept in the signed root) or give it at
+  install (`releaseKey`), and that first release must be signed by it. A node with
+  none says so at every start and in its Node's `status.os.releaseKeys` (`none`), and
+  one whose keys cannot be read says so and takes no release. An OSRelease's image is
+  fetched only from an address that is not the node's own or on its networks, checked
+  and then held for the connection (no proxy, no redirect); `--lan-releases` lets the
+  networks' private ranges through, never the node itself, loopback or link-local.
+  The image's keys are only where a fresh node starts: once it updates, its keys move
+  by a signed handover or `--release-key`, not by a new image. (T-0231.) What a taken admin credential can
   still do with OSRelease and UpdatePlan is restart nodes into releases their keys
   signed that are no older than the newest each node has run well (its floor,
   `os-release-floor`): not into an older one, and not onto other keys, since a
@@ -593,7 +601,7 @@ Severity:
 | 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
 | 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Fixed: each is capped by the Volume's `size` (files, directories and links counted in 4 KiB blocks, a sparse entry at its whole length; the download at twice the size and 1 MiB). Stays: a Volume with no `size` is not capped, and there is no quota on the directory. |
-| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Open: T-0231. |
+| 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Fixed: a key is given in the image (`KITH_RELEASE_KEY`) or the install's answers (`releaseKey`); the image's address is checked as a Source's and the checked address connected to; `--lan-releases` lets the private ranges of the node's networks through, never the node itself, loopback or link-local. Stays: a node given no key at all pins the first release's, and says so at every start and in its status. (T-0231.) |
 | 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host, or is not good now (run out, or not yet started), is refused and the stored certificate stays in use; an order has ten minutes in all. Not checked: that the URLs a directory gives are on the directory's own host (the operator names the authority, and ACME does not oblige one host). (T-0232.) |
 
 The T- numbers are the maintainer's task numbers, the same ones commits carry.

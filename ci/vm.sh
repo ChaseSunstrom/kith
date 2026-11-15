@@ -60,7 +60,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    good, and is the same node), then one whose root is broken (three
                    tries, and it is back on the slot that worked); same needs
   --test rollout   instead: three nodes on a network of their own, claimed and joined
-                   over TLS; a release with another file's signature (refused), a signed
+                   over TLS, their image built with a release key; a first release by
+                   another key (refused), one with another file's signature (refused), a signed
                    one (each node takes it in turn, one cluster throughout), then one
                    that cannot start (one node tries, comes back, the plan is paused);
                    also needs curl, python3, xxd
@@ -221,7 +222,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout and chaos: three nodes and nothing more said to kithd; share, pods, kube and
         # worker: two, on the mesh; services: one, on the mesh.)
-        others='2 3' more='' inside=2049
+        others='2 3' more='' inside=2049 lan='' base=$root/target/os
         seed() { :; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
         others=2 more=--mesh
@@ -281,6 +282,12 @@ if [ -n "$test" ] && [ "$test" != init ]; then
             case $test${KITH_E2E:-} in pods1 | kube1) truncate -s 2G "$1" ;; esac
         }
       elif [ "$test" = rollout ]; then
+        # The nodes run an image built with the release key: the first release they take
+        # is one it signed, whoever applies one. (They fetch from this machine, on the
+        # network QEMU gives them: their own, so --lan-releases.)
+        public=$("$root/target/debug/kith" package keygen "$work/key")
+        KITH_RELEASE_KEY=$public sh "$root/os/build.sh" --out "$work/base" >&2
+        base=$work/base lan=--lan-releases
         # Two releases, both signed: one that runs, and one whose root is not the one its
         # verity tree was made for. The nodes fetch them from this machine.
         KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
@@ -290,7 +297,6 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         dd if=/dev/urandom of="$work/broken.root" bs=4096 count=8 conv=notrunc status=none
         sh "$root/os/update.sh" 9.0.0-broken "$(sha256sum "$work/broken.root" | cut -d ' ' -f 1)" "$work/broken.root" \
             "$work/next/root.verity" "$work/next/kith-a.efi" "$work/next/kith-b.efi" >"$work/www/broken.update"
-        public=$("$root/target/debug/kith" package keygen "$work/key")
         sign() { sh "$root/os/update.sh" --sign "$work/${2:-key}" "$work/www/$1.update"; }
         # A second key, which the first hands over to in the release every node takes.
         public2=$("$root/target/debug/kith" package keygen "$work/key2")
@@ -304,12 +310,12 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         # this machine's loopback), with a fixed address, and one out to this machine (which
         # reaches the node's API through it, and tries its NFS port, or port $inside).
         node() { # N [kithd's further arguments]
-            [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
+            [ -f "$work/n$1.raw" ] || { cp "$base/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
         }
@@ -1288,6 +1294,23 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
             exit 0
         fi
 
+        # Before any release, each node says it takes releases from its image's keys.
+        whose=$(any GET /v1/resources | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+nodes = (r for r in found if r["kind"] == "Node")
+print(",".join(sorted(((n.get("status") or {}).get("os") or {}).get("releaseKeys", "?") for n in nodes)))
+') || fail "the nodes could not be listed"
+        [ "$whose" = image,image,image ] || fail "the nodes do not take releases from the image's keys alone: $whose"
+        # The first release applied, signed by a key the image was not built with: refused,
+        # where a node with no key would have taken that key for its own.
+        by=$public2
+        release stranger 9.0.0-stranger "$(sign next key2)" next
+        until_says "a first release by a key the image was not built with refused" "^Paused 0 $was .*not signed by a key this node takes releases from"
+        [ "$(starts 1 a)$(starts 2 a)$(starts 3 a)" = 111 ] || fail "a node restarted for a release it refused"
+        by=$public
+
         # A release whose signature is another file's: the first node asked refuses it,
         # writes nothing, and the plan stops there.
         release forged 9.0.0-next "$(sign broken)" next
@@ -1334,7 +1357,7 @@ print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each of them he
             sleep 1
         done
         [ "$(($(starts 1 a) + $(starts 2 a) + $(starts 3 a)))" = 6 ] || fail "expected three tries of the broken release on one node"
-        echo "vm.sh: ok: three nodes, claimed and joined over TLS; a forged release refused; a signed one taken by all three, one at a time, as one cluster, and with it the key it handed over to; a release under their floor and one by the key left out refused; one that cannot start, signed by the new key, tried by one node, which came back, and the plan paused: $line"
+        echo "vm.sh: ok: three nodes, claimed and joined over TLS; a first release by a key their image was not built with refused; a forged release refused; a signed one taken by all three, one at a time, as one cluster, and with it the key it handed over to; a release under their floor and one by the key left out refused; one that cannot start, signed by the new key, tried by one node, which came back, and the plan paused: $line"
         exit 0
     fi
     if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ]; then

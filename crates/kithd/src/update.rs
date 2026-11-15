@@ -347,25 +347,29 @@ fn forget(state: &Path) -> std::io::Result<()> {
     std::fs::File::open(state)?.sync_all()
 }
 
-/// What this node's status says of its system: what it runs, and an update that did not
-/// take. An update that did is forgotten here.
-fn report(state: &Path, version: &str, slot: char) -> Value {
+/// What this node's status says of its system: what it runs, whose releases it takes
+/// (`Keys::whose`), and an update that did not take. An update that did is forgotten here.
+fn report(state: &Path, version: &str, slot: char, whose: &str) -> Value {
     let was: Option<Tried> = std::fs::read(tried(state))
         .ok()
         .and_then(|text| serde_json::from_slice(&text).ok());
+    let runs = json!({ "version": version, "slot": slot.to_string(), "releaseKeys": whose });
     match was {
         Some(tried) if tried.version == version => {
             let _ = forget(state);
-            json!({ "version": version, "slot": slot.to_string() })
+            runs
         }
         Some(tried) => {
             let why = match tried.why.as_str() {
                 "" => format!("it did not come up; the node is back on {version}"),
                 why => why.to_string(),
             };
-            json!({ "version": version, "slot": slot.to_string(), "failed": tried.version, "why": why })
+            let mut runs = runs;
+            runs["failed"] = json!(tried.version);
+            runs["why"] = json!(why);
+            runs
         }
-        None => json!({ "version": version, "slot": slot.to_string() }),
+        None => runs,
     }
 }
 
@@ -376,39 +380,104 @@ fn version_in(os_release: &str) -> Option<String> {
 }
 
 /// Whose releases this node becomes: the keys it was started with (`--release-key`), or
-/// else the key of the first release it took, kept in its state. An OSRelease names its
-/// own `publicKey`, and whoever may apply one may name any: the node is who must know.
+/// else the ones kept in its state (handed over, or the first it took), or else the ones
+/// its system was built or installed with (`/etc/kith/release-keys`), and only with none of
+/// those the key of the first release it takes. An OSRelease names its own `publicKey`, and
+/// whoever may apply one may name any: the node is who must know.
 #[derive(Clone)]
 pub struct Keys {
     given: Vec<String>,
     kept: PathBuf,
     /// Where the floor is kept: see `floor`.
     floor: PathBuf,
+    /// The keys in the system it runs (`KITH_RELEASE_KEY` when the image was built): none
+    /// off kith OS.
+    image: Option<PathBuf>,
+}
+
+/// The keys in a file of them, one a line (`#` lines are notes). Only a file that is not
+/// there is no keys: one that cannot be read is an error, not a node that takes any key.
+fn keys_in(file: &Path) -> Result<Vec<String>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        text => text.map_err(|e| format!("reading this node's release keys ({}): {e}", file.display()))?,
+    };
+    let keys = text.lines().map(str::trim);
+    Ok(keys
+        .filter(|key| !key.is_empty() && !key.starts_with('#'))
+        .map(str::to_string)
+        .collect())
 }
 
 impl Keys {
     pub fn new(given: Vec<String>, state: &Path) -> Keys {
         let (kept, floor) = (state.join("os-release-keys"), state.join("os-release-floor"));
-        Keys { given, kept, floor }
+        Keys {
+            given,
+            kept,
+            floor,
+            image: None,
+        }
     }
 
-    /// Refuses a release whose key is not one of this node's. `Ok(true)`: it has none
-    /// yet, and this key is to be kept once it has signed an update.
+    /// The keys this node takes releases from, and whose they are: `given`, `kept`,
+    /// `image`, or `none` (no keys: the first release's is taken).
+    fn mine(&self) -> Result<(Vec<String>, &'static str), String> {
+        if !self.given.is_empty() {
+            return Ok((self.given.iter().map(|key| key.trim().to_string()).collect(), "given"));
+        }
+        let kept = keys_in(&self.kept)?;
+        if !kept.is_empty() {
+            return Ok((kept, "kept"));
+        }
+        match &self.image {
+            Some(image) => match keys_in(image)? {
+                keys if keys.is_empty() => Ok((keys, "none")),
+                keys => Ok((keys, "image")),
+            },
+            None => Ok((Vec::new(), "none")),
+        }
+    }
+
+    /// Whose keys this node takes releases from, for its status (`os.releaseKeys`). One
+    /// it cannot read says `unread`: it takes nothing then.
+    fn whose(&self) -> &'static str {
+        self.mine().map_or("unread", |(_, whose)| whose)
+    }
+
+    /// What a node that takes releases from no key (or from keys it cannot read) says at
+    /// its start, every start.
+    fn unkeyed(&self) -> Option<String> {
+        match self.mine() {
+            Ok((_, "none")) => Some(
+                "kithd: this node has no release key: the first kith OS release it takes sets it, \
+                 whoever applies that one (give it with --release-key, or KITH_RELEASE_KEY when \
+                 building the image, or `releaseKey` when installing)"
+                    .to_string(),
+            ),
+            Err(e) => Some(format!(
+                "kithd: this node's release keys could not be read ({e}): it takes no release"
+            )),
+            Ok(_) => None,
+        }
+    }
+
+    /// What the first update this node takes keeps in its state: the keys of its system if
+    /// it has any (the next system may have none), or the release's own.
+    fn first_kept(&self, public: &str) -> String {
+        match self.mine() {
+            Ok((keys, "image")) => format!("{}\n", keys.join("\n")),
+            _ => format!("{public}\n"),
+        }
+    }
+
+    /// Refuses a release whose key is not one of this node's. `Ok(true)`: none is kept in
+    /// its state yet, and what `first_kept` says is to be kept once it has signed an update.
     fn refused(&self, public: Option<&str>) -> Result<bool, String> {
-        // (Only a file that is not there is no key yet: one that cannot be read is not.)
-        let kept = match std::fs::read_to_string(&self.kept) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            kept => kept.map_err(|e| format!("reading this node's release keys ({}): {e}", self.kept.display()))?,
-        };
-        let kept = kept.lines().map(str::trim);
-        let kept = kept.filter(|key| !key.is_empty() && !key.starts_with('#'));
-        let mine: Vec<&str> = match self.given.is_empty() {
-            true => kept.collect(),
-            false => self.given.iter().map(|key| key.trim()).collect(),
-        };
+        let (mine, whose) = self.mine()?;
         match public {
             _ if mine.is_empty() => Ok(true),
-            Some(public) if mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())) => Ok(false),
+            Some(public) if mine.iter().any(|key| key.eq_ignore_ascii_case(public.trim())) => Ok(whose == "image"),
             _ => Err(format!(
                 "the release is not signed by a key this node takes releases from: start kithd with \
                  --release-key for a new one (on kith OS: `-- --release-key KEY` in the config \
@@ -608,8 +677,47 @@ fn raise(file: &Path, version: &str) -> Result<(), String> {
     }
 }
 
+/// The client an update is fetched with: `host`'s vetted addresses are the ones connected
+/// to, through no proxy (which would look the name up again itself), and no redirect is
+/// followed (the address is the release's, and the release is what was applied: nowhere
+/// else).
+fn client(host: &str, addresses: &[std::net::SocketAddr]) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .resolve_to_addrs(host, addresses)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        // (A server that goes quiet is a download that broke, not one to wait out.)
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// The host of a release's image and the addresses it may be fetched from: outside this
+/// node and its networks, or with `lan` (`--lan-releases`) in their private ranges too.
+async fn pinned(url: &reqwest::Url, lan: bool) -> Result<(String, Vec<std::net::SocketAddr>), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("the release's image, {url}: it is fetched over http or https"));
+    }
+    match crate::sources::vetted(&url.origin().ascii_serialization(), lan).await {
+        Ok((host, _, addresses)) => Ok((host, addresses)),
+        Err(crate::sources::Refused::Inward(_)) if lan => Err(format!(
+            "the release's image, {url}: an update is not fetched from this node, nor from its \
+             networks but for their private ranges"
+        )),
+        Err(crate::sources::Refused::Inward(_)) => Err(format!(
+            "the release's image, {url}: an update is not fetched from this node or its own \
+             networks (start kithd with --lan-releases for a release server on their private ranges)"
+        )),
+        Err(crate::sources::Refused::Address(why)) => Err(format!("the release's image: {why}")),
+    }
+}
+
 /// The update file at `url`, into this node's other slot, if it is the release's: signed
-/// by its key, and the version it says.
+/// by its key, and the version it says. Not from this node or its own networks (their
+/// private ranges only with `lan`, `--lan-releases`): an OSRelease is written by whoever
+/// may write one, and kithd fetches as root.
+#[allow(clippy::too_many_arguments)]
 async fn fetch(
     url: &str,
     wanted: String,
@@ -618,23 +726,19 @@ async fn fetch(
     keys: &Keys,
     runs: &str,
     back: bool,
+    lan: bool,
 ) -> Result<String, String> {
     let text = |field: &str| release[field].as_str().map(str::to_string);
     let (signature, public) = (text("signature"), text("publicKey"));
     above(&keys.floor, &wanted)?;
     let first = keys.refused(public.as_deref())?;
     let (kept, runs, keys, release) = (keys.kept.clone(), runs.to_string(), keys.clone(), release.clone());
-    let client = reqwest::Client::builder()
-        // (The address is the release's, and the release is what was applied: nowhere else.)
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
-        // (A server that goes quiet is a download that broke, not one to wait out.)
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("the release's image, {url}: {e}"))?;
+    let (host, addresses) = pinned(&parsed, lan).await?;
+    let client = client(&host, &addresses)?;
     let failed = |e: reqwest::Error| format!("fetching {url}: {e}");
     let mut response = client
-        .get(url)
+        .get(parsed)
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -677,7 +781,7 @@ async fn fetch(
                     // (The first release this node takes, signed and the version asked
                     // for: its key is the one it takes from now on.)
                     if let (true, Some(public)) = (first, &public) {
-                        let keep = crate::pki::write_whole(&kept, format!("{public}\n").as_bytes());
+                        let keep = crate::pki::write_whole(&kept, keys.first_kept(public).as_bytes());
                         keep.map_err(|e| format!("keeping the release's key ({}): {e}", kept.display()))?;
                     }
                     keys.pend(&release, version, header, &runs)
@@ -717,8 +821,17 @@ async fn fetch(
 }
 
 /// A kith OS node's part: say what it runs, and when a plan says so, become the release.
-pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut stopping: watch::Receiver<bool>) {
-    let keys = Keys::new(keys, &state);
+pub async fn node(
+    shared: Arc<Shared>,
+    state: PathBuf,
+    keys: Vec<String>,
+    lan: bool,
+    mut stopping: watch::Receiver<bool>,
+) {
+    let keys = Keys {
+        image: Some(PathBuf::from("/etc/kith/release-keys")),
+        ..Keys::new(keys, &state)
+    };
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let version = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -727,6 +840,9 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
     else {
         return;
     };
+    if let Some(unkeyed) = keys.unkeyed() {
+        eprintln!("{unkeyed}");
+    }
     let me = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
     let (mut raised, mut unraised) = (false, String::new());
@@ -750,7 +866,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
                 Err(_) => {}
             }
         }
-        let said = report(&state, &version, slot);
+        let said = report(&state, &version, slot, keys.whose());
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -805,7 +921,7 @@ pub async fn node(shared: Arc<Shared>, state: PathBuf, keys: Vec<String>, mut st
             let write =
                 |trying: &Tried| crate::pki::write_whole(&tried(&state), &serde_json::to_vec(trying).expect("text"));
             let wrote = match write(&trying) {
-                Ok(()) => fetch(&url, wanted.clone(), &release, slot, &keys, &version, back).await,
+                Ok(()) => fetch(&url, wanted.clone(), &release, slot, &keys, &version, back, lan).await,
                 Err(e) => Err(format!("keeping a note of the update: {e}")),
             };
             match wrote {
@@ -884,12 +1000,203 @@ mod tests {
         let url = format!("http://{}/kith-os.update", listener.local_addr().unwrap());
         let release = json!({ "publicKey": "bb22", "signature": "00" });
         let keys = Keys::new(vec!["aa11".into()], &dir);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true)
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, true)
             .await
             .unwrap_err();
         assert!(said.contains("not signed by a key this node takes"), "{said}");
         let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
         assert!(asked.is_err(), "nothing was to be fetched");
+    }
+
+    #[test]
+    fn release_key_none_given_says_so() {
+        let dir = scratch("none");
+        let image = dir.join("image-keys");
+        let keys = Keys {
+            image: Some(image.clone()),
+            ..Keys::new(Vec::new(), &dir)
+        };
+        // No key anywhere: said at the start and in the node's status.
+        let said = keys.unkeyed().expect("a node with no key says so");
+        assert!(
+            said.contains("--release-key") && said.contains("KITH_RELEASE_KEY"),
+            "{said}"
+        );
+        assert_eq!(keys.whose(), "none");
+        // An empty file of keys (or one of notes only) is no key either.
+        std::fs::write(&image, "# none\n\n").unwrap();
+        assert_eq!((keys.whose(), keys.unkeyed().is_some()), ("none", true));
+        // Built with a key, given one, or keeping one: nothing to say.
+        std::fs::write(&image, "aa11\n").unwrap();
+        assert_eq!((keys.whose(), keys.unkeyed()), ("image", None));
+        let given = Keys::new(vec!["aa11".into()], &dir);
+        assert_eq!((given.whose(), given.unkeyed()), ("given", None));
+        crate::pki::write_whole(&keys.kept, b"bb22\n").unwrap();
+        assert_eq!((keys.whose(), keys.unkeyed()), ("kept", None));
+        // Keys that cannot be read are not none: such a node takes no release at all, and
+        // says so at every start too.
+        std::fs::remove_file(&keys.kept).unwrap();
+        std::fs::create_dir(&keys.kept).unwrap();
+        assert_eq!(keys.whose(), "unread");
+        let said = keys.unkeyed().expect("a node whose keys cannot be read says so");
+        assert!(
+            said.contains("could not be read") && said.contains("takes no release"),
+            "{said}"
+        );
+        assert!(keys.refused(Some("aa11")).is_err());
+    }
+
+    #[test]
+    fn release_key_none_given_is_in_the_nodes_status() {
+        let dir = scratch("status");
+        let keys = Keys::new(Vec::new(), &dir);
+        assert_eq!(report(&dir, "1", 'a', keys.whose())["releaseKeys"], "none");
+        crate::pki::write_whole(&keys.kept, b"aa11\n").unwrap();
+        assert_eq!(report(&dir, "1", 'a', keys.whose())["releaseKeys"], "kept");
+    }
+
+    #[test]
+    fn release_key_of_the_install_is_the_only_one() {
+        let dir = scratch("image");
+        let image = dir.join("image-keys");
+        std::fs::write(&image, "# the keys this system was built with\nAA11\ncc33\n").unwrap();
+        let keys = Keys {
+            image: Some(image.clone()),
+            ..Keys::new(Vec::new(), &dir)
+        };
+        // Whoever applies the first release does not choose the key: the system says it.
+        let said = keys.refused(Some("bb22")).unwrap_err();
+        assert!(said.contains("not signed by a key this node takes"), "{said}");
+        assert!(keys.refused(None).is_err());
+        // Its own key is taken, and what is kept then is the system's keys, not the release's
+        // (the next system may have been built with none).
+        assert_eq!(keys.refused(Some("aa11")), Ok(true));
+        assert_eq!(keys.first_kept("aa11"), "AA11\ncc33\n");
+        // Once kept (or handed over), the kept keys are the node's; given ones are over all.
+        crate::pki::write_whole(&keys.kept, b"bb22\n").unwrap();
+        assert_eq!(keys.refused(Some("bb22")), Ok(false));
+        assert!(keys.refused(Some("aa11")).is_err());
+        let given = Keys {
+            image: Some(image.clone()),
+            ..Keys::new(vec!["dd44".into()], &dir)
+        };
+        assert!(given.refused(Some("dd44")).is_ok() && given.refused(Some("aa11")).is_err());
+        // A file of the system's keys that cannot be read takes nothing.
+        let unread = Keys {
+            image: Some(dir.clone()),
+            ..Keys::new(Vec::new(), &dir.join("elsewhere"))
+        };
+        assert!(unread.refused(Some("aa11")).is_err());
+        // No system file (off kith OS): the first release's key, as before.
+        let first = Keys::new(Vec::new(), &dir.join("elsewhere"));
+        assert_eq!(first.first_kept("aa11"), "aa11\n");
+    }
+
+    #[tokio::test]
+    async fn os_image_vetted_refuses_loopback() {
+        let dir = scratch("vetted");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let release = json!({ "publicKey": "aa11", "signature": "00" });
+        let keys = Keys::new(vec!["aa11".into()], &dir);
+        let at = listener.local_addr().unwrap();
+        for url in [
+            format!("http://{at}/kith-os.update"),
+            format!("http://localhost:{}/kith-os.update", at.port()),
+        ] {
+            let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false)
+                .await
+                .unwrap_err();
+            assert!(said.contains("--lan-releases"), "{said}");
+            // Allowing the LAN does not allow this node itself.
+            let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, true)
+                .await
+                .unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+        }
+        // Nor what a cloud answers on at its link-local address (looked at, never asked).
+        for lan in [false, true] {
+            let url = "http://169.254.169.254/kith-os.update";
+            let said = fetch(url, "2".into(), &release, 'a', &keys, "1", true, lan)
+                .await
+                .unwrap_err();
+            assert!(said.contains("not fetched from this node"), "{said}");
+            assert!(!said.contains("Source"), "an OS update's words: {said}");
+        }
+        let asked = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(asked.is_err(), "nothing was to be fetched");
+    }
+
+    /// `--lan-releases` lets the private ranges of the node's networks through: a release
+    /// server on the LAN. (Looked up, not asked: an address literal needs no lookup.)
+    #[tokio::test]
+    async fn os_image_vetted_lan_lets_private_ranges_through() {
+        for url in [
+            "http://10.254.253.252/kith-os.update",
+            "http://[fd12:3456:789a::1]/kith-os.update",
+        ] {
+            let url = reqwest::Url::parse(url).unwrap();
+            let said = pinned(&url, false).await.unwrap_err();
+            assert!(said.contains("--lan-releases"), "{said}");
+            let (_, addresses) = pinned(&url, true).await.unwrap();
+            assert_eq!(addresses.len(), 1, "{url}");
+        }
+    }
+
+    /// A URL with no port is fetched from its scheme's: the addresses held carry it, and
+    /// what is connected to is one of them, at that port (port 80 cannot be listened on
+    /// here, so this is the address the fetch is given, through the name it looks up).
+    #[tokio::test]
+    async fn os_image_vetted_portless_url_holds_its_schemes_port() {
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let mut ports = Vec::new();
+        for url in ["http://localhost/kith-os.update", "https://localhost/kith-os.update"] {
+            let (host, addresses) = pinned(&reqwest::Url::parse(url).unwrap(), false).await.unwrap();
+            assert_eq!(host, "localhost");
+            ports.push(
+                addresses
+                    .iter()
+                    .map(|at| at.port())
+                    .collect::<std::collections::BTreeSet<_>>(),
+            );
+        }
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+        assert_eq!(ports, [[80].into(), [443].into()]);
+        // Neither ssh nor anything else but HTTP.
+        let said = pinned(&reqwest::Url::parse("ssh://8.8.8.8/x").unwrap(), false)
+            .await
+            .unwrap_err();
+        assert!(said.contains("http") && !said.contains("Source"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn os_image_vetted_address_is_the_one_connected_to() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = listener.local_addr().unwrap();
+        let answering = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut asked, _) = listener.accept().await.unwrap();
+                let _ = asked.read(&mut [0; 1024]).await;
+                let said = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                asked.write_all(said.as_bytes()).await.unwrap();
+            }
+        });
+        // A name nobody can look up reaches the address it was vetted at, and only that.
+        let held = client("releases.example", &[at]).unwrap();
+        let url = format!("http://releases.example:{}/kith-os.update", at.port());
+        assert_eq!(held.get(url).send().await.unwrap().status(), 404);
+        // And the fetch, by a name it looks up, goes on to the address that was vetted.
+        // (This thread takes loopback for outside: it stands for a server elsewhere.)
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let keys = Keys::new(vec!["aa11".into()], &scratch("vetted-out"));
+        let release = json!({ "publicKey": "aa11", "signature": "00" });
+        let url = format!("http://localhost:{}/kith-os.update", at.port());
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+        let said = said.unwrap_err();
+        assert!(said.contains("404"), "{said}");
+        answering.await.unwrap();
     }
 
     /// A release key: what signs with it, and its public half as an OSRelease names it.
@@ -1115,12 +1422,12 @@ mod tests {
         raise(&keys.floor, "1.10").unwrap();
         // The node is back on the slot of 1.8 and its plan allows a downgrade (so what it
         // runs is no limit): 1.9 is still under what it once ran well.
-        let said = fetch(&url, "1.9".into(), &release, 'a', &keys, "1", true)
+        let said = fetch(&url, "1.9".into(), &release, 'a', &keys, "1", true, true)
             .await
             .unwrap_err();
         assert!(said.contains("1.10") && said.contains("os-release-floor"), "{said}");
         std::fs::write(&keys.floor, "?").unwrap();
-        let said = fetch(&url, "2.0".into(), &release, 'a', &keys, "1", true)
+        let said = fetch(&url, "2.0".into(), &release, 'a', &keys, "1", true, true)
             .await
             .unwrap_err();
         assert!(said.contains("no update is taken"), "{said}");
@@ -1166,9 +1473,11 @@ mod tests {
         });
         let release = json!({ "publicKey": "aa11", "signature": "00" });
         let keys = Keys::new(Vec::new(), &dir);
-        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true)
-            .await
-            .unwrap_err();
+        // (This thread takes loopback for outside: it stands for a release server elsewhere.)
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(true);
+        let said = fetch(&url, "2".into(), &release, 'a', &keys, "1", true, false).await;
+        crate::sources::LOOPBACK_IS_OUTSIDE.set(false);
+        let said = said.unwrap_err();
         assert!(said.contains("302") && said.contains("redirect"), "{said}");
         answering.await.unwrap();
         let asked = tokio::time::timeout(Duration::from_millis(200), elsewhere.accept()).await;
@@ -1397,20 +1706,25 @@ mod tests {
     fn update_reports_what_a_node_runs_and_what_it_failed_to_become() {
         let state = std::env::temp_dir().join(format!("kith-update-{}", std::process::id()));
         std::fs::create_dir_all(&state).unwrap();
-        assert_eq!(report(&state, "1", 'a'), json!({ "version": "1", "slot": "a" }));
+        let runs = |version: &str, slot: &str| json!({ "version": version, "slot": slot, "releaseKeys": "kept" });
+        assert_eq!(report(&state, "1", 'a', "kept"), runs("1", "a"));
         // It became what it tried: nothing to say, and the note is gone.
         std::fs::write(tried(&state), r#"{"version":"2"}"#).unwrap();
-        assert_eq!(report(&state, "2", 'b'), json!({ "version": "2", "slot": "b" }));
+        assert_eq!(report(&state, "2", 'b', "kept"), runs("2", "b"));
         assert!(!tried(&state).exists());
         // It is back as what it was: said at every start, until a plan lets go of it.
         std::fs::write(tried(&state), r#"{"version":"2"}"#).unwrap();
-        let said = report(&state, "1", 'a');
+        let said = report(&state, "1", 'a', "kept");
         assert_eq!(
-            (&said["failed"], &said["why"]),
-            (&json!("2"), &json!("it did not come up; the node is back on 1"))
+            (&said["failed"], &said["why"], &said["releaseKeys"]),
+            (
+                &json!("2"),
+                &json!("it did not come up; the node is back on 1"),
+                &json!("kept")
+            )
         );
         std::fs::write(tried(&state), r#"{"version":"2","why":"the release is not signed"}"#).unwrap();
-        assert_eq!(report(&state, "1", 'a')["why"], "the release is not signed");
+        assert_eq!(report(&state, "1", 'a', "kept")["why"], "the release is not signed");
         assert!(tried(&state).exists());
         assert_eq!(
             version_in("NAME=\"kith OS\"\nVERSION_ID=0.0.1\n").as_deref(),
@@ -1426,8 +1740,8 @@ mod tests {
         for torn in ["", "{", r#"{"version":"2","why":"the rel"#] {
             crate::pki::write_whole(&tried(&state), torn.as_bytes()).unwrap();
             assert_eq!(
-                report(&state, "1", 'a'),
-                json!({ "version": "1", "slot": "a" }),
+                report(&state, "1", 'a', "given"),
+                json!({ "version": "1", "slot": "a", "releaseKeys": "given" }),
                 "{torn:?}"
             );
         }
