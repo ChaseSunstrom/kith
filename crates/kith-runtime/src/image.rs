@@ -1752,7 +1752,8 @@ mod tests {
         for (path, ..) in apart {
             assert_ne!(ino(&a.join(path)), ino(&b.join(path)), "{path} is one file");
         }
-        for path in ["user-x", "capable"] {
+        // (Where no capability could be set, `capable` is a plain file like any other.)
+        for path in ["user-x", "capable"].into_iter().take(1 + usize::from(capable)) {
             assert_ne!(ino(&a.join(path)), ino(&b.join(path)), "{path} is one file");
             assert_eq!(links(&a.join(path)), 1, "{path} went into the index");
         }
