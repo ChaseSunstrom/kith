@@ -212,6 +212,16 @@ impl Runtime {
         let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
             .validate_id()
             .ctx(&what)?;
+        let state = self.root.join("state").join(id);
+        clear_kept(
+            &state,
+            &bundle,
+            &Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            || {
+                let _ = manager(&cgroup).remove();
+            },
+        )
+        .ctx(&what)?;
         let spec = spec(id, image, unit, &cgroup, &bundle).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -273,10 +283,16 @@ impl Runtime {
         if nix::unistd::getuid().is_root()
             && let Err(e) = devfilter::attach(&handle.cgroup, &allowed(&spec))
         {
-            let _ = handle.delete();
+            handle.discard(&state);
             return Err(e).ctx(&what);
         }
-        handle.no_swap(unit, &what)
+        match handle.no_swap(unit, &what) {
+            Ok(()) => Ok(handle),
+            Err(e) => {
+                handle.discard(&state);
+                Err(e)
+            }
+        }
     }
 
     /// Create the exec unit `id`: `unit.command` as a plain process of this host (its
@@ -292,8 +308,18 @@ impl Runtime {
         };
         let limits = resources(unit).ctx(&what)?;
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
-        // Marks the id as taken, and tells `cleanup` about the cgroup after a crash.
+        // Marks the id as taken, and tells `cleanup` about the cgroup after a crash. Its marker is
+        // its state and its bundle: a kept id (see `discard_leftovers`) is taken only once it is gone.
         let marker = self.root.join("state").join(id);
+        clear_kept(
+            &marker,
+            &marker,
+            &Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+            || {
+                let _ = manager(&cgroup).remove();
+            },
+        )
+        .ctx(&what)?;
         fs::create_dir(&marker).ctx(&what)?;
         let child = Command::new(&self.shim)
             .arg(SHIM)
@@ -321,7 +347,7 @@ impl Runtime {
             go: child.stdin.take(),
             pid: Pid::from_raw(child.id() as i32),
             reaped: false,
-            bundle: marker,
+            bundle: marker.clone(),
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
         };
         let manager = manager(&cgroup);
@@ -336,10 +362,10 @@ impl Runtime {
             .add_task(handle.pid)
             .and_then(|()| manager.apply(&options))
             .ctx(&what);
-        match confined {
-            Ok(()) => handle.no_swap(unit, &what),
+        match confined.and_then(|()| handle.no_swap(unit, &what)) {
+            Ok(()) => Ok(handle),
             Err(e) => {
-                let _ = handle.delete();
+                handle.discard(&marker);
                 Err(e)
             }
         }
@@ -561,17 +587,21 @@ impl Handle {
 
     /// A memory limit that swap could stretch is no limit. The OCI resources cannot say
     /// "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
-    fn no_swap(self, unit: &Unit, what: &str) -> Result<Handle> {
+    fn no_swap(&self, unit: &Unit, what: &str) -> Result<()> {
         if unit.memory_bytes.is_some() {
             match fs::write(self.cgroup.join("memory.swap.max"), "0") {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    let _ = self.delete();
                     return Err(e).ctx(format!("{what}: turning swap off"));
                 }
                 _ => {} // No such file: this kernel does no swap accounting.
             }
         }
-        Ok(self)
+        Ok(())
+    }
+
+    /// Drop a handle whose unit is never handed out: see [`discard_leftovers`].
+    fn discard(self, state: &Path) {
+        discard_leftovers(state, self.delete());
     }
 
     /// The process id of the container's init, or of the exec unit's command.
@@ -618,6 +648,11 @@ impl Handle {
         Ok(code)
     }
 
+    /// Whether its exit status has been collected: then `pid` is no longer a zombie to reap.
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
+    }
+
     pub fn kill(&mut self) -> Result<()> {
         match &mut self.container {
             Some(container) => container
@@ -628,8 +663,9 @@ impl Handle {
         }
     }
 
-    /// Kill it if it still runs, then remove its cgroup, state and bundle.
-    pub fn delete(mut self) -> Result<()> {
+    /// Kill it if it still runs, then remove its cgroup, state and bundle. A failure while the
+    /// unit still has processes gives the handle back, and keeps the bundle (see [`Undeleted`]).
+    pub fn delete(mut self) -> std::result::Result<(), Undeleted> {
         // A helper still waiting for the word to go ends when its input does.
         drop(self.go.take());
         let deleted = match &mut self.container {
@@ -641,12 +677,78 @@ impl Handle {
                     .ctx("deleting the exec unit")
             }
         };
-        // It was killed just now: collect it, or it stays a zombie for as long as we live.
-        if deleted.is_ok() && !self.reaped {
-            let _ = waitpid(self.pid, None);
+        self.finish(deleted)
+    }
+
+    /// What a delete leaves once its removal was tried with `deleted`.
+    fn finish(self, deleted: Result<()>) -> std::result::Result<(), Undeleted> {
+        match deleted {
+            Err(error) if has_processes(&self.cgroup) => Err(Undeleted {
+                error,
+                handle: Some(Box::new(self)),
+            }),
+            deleted => {
+                // It was killed just now: collect it, or it stays a zombie for as long as we live.
+                if deleted.is_ok() && !self.reaped {
+                    let _ = waitpid(self.pid, None);
+                }
+                let removed = fs::remove_dir_all(&self.bundle).ctx("deleting the container");
+                deleted.and(removed).map_err(|error| Undeleted { error, handle: None })
+            }
         }
-        fs::remove_dir_all(&self.bundle).ctx("deleting the container")?;
-        deleted
+    }
+}
+
+/// A [`Handle::delete`] that failed. `handle` is the unit's handle back while its cgroup still
+/// has processes: the unit is not gone, and it can be asked again. `None` means the processes
+/// are gone and only the cleanup failed: nothing of the unit runs.
+pub struct Undeleted {
+    pub error: crate::Error,
+    pub handle: Option<Box<Handle>>,
+}
+
+/// What a discarded unit leaves: a failed delete with processes left keeps its state (the
+/// id stays taken), for the next start's cleanup to find and remove; with them gone, the
+/// state goes too, as a delete always removed it.
+fn discard_leftovers(state: &Path, deleted: std::result::Result<(), Undeleted>) {
+    if let Err(gone) = deleted {
+        eprintln!("kith: {}", gone.error);
+        if gone.handle.is_none() {
+            let _ = fs::remove_dir_all(state);
+        }
+    }
+}
+
+/// Clears the kept id `state` (see [`discard_leftovers`]) before a unit takes it: once its cgroup
+/// has no processes, the empty cgroup, state and bundle go. While processes remain nothing is removed
+/// and the id is refused. The check comes first: removing a cgroup kills what is in it.
+fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl FnOnce()) -> Result<()> {
+    if !state.exists() {
+        return Ok(());
+    }
+    if has_processes(cgroup) {
+        return err(format!(
+            "the last run of this id still has processes: it can be run again once they are gone ({})",
+            state.display()
+        ));
+    }
+    remove_cgroup();
+    let _ = fs::remove_dir_all(state);
+    let _ = fs::remove_dir_all(bundle);
+    Ok(())
+}
+
+/// Whether a cgroup still has processes, its child cgroups' included (`populated` in `cgroup.events`,
+/// which a unit's `nested` cgroups set too). A cgroup that is gone has none; one whose events cannot be
+/// read may have some. Without `cgroup.events` its own `cgroup.procs` says.
+fn has_processes(cgroup: &Path) -> bool {
+    match fs::read_to_string(cgroup.join("cgroup.events")) {
+        Ok(events) => events.lines().any(|line| line.trim() == "populated 1"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::read_to_string(cgroup.join("cgroup.procs")) {
+            Ok(procs) => !procs.trim().is_empty(),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        },
+        Err(_) => true,
     }
 }
 
@@ -1751,5 +1853,114 @@ mod tests {
         // Nor over a mount the container already has, nor twice on one path.
         assert!(mounted(vec![bind("/srv/data", "/tmp", false)]).is_err());
         assert!(mounted(vec![bind("/srv/a", "/data", false), bind("/srv/b", "/data", false)]).is_err());
+    }
+
+    /// A failed delete hands the handle back only while the unit's cgroup still has processes:
+    /// then the bundle stays too. A failure with the processes gone holds nothing back.
+    #[test]
+    fn failed_delete_keeps_the_handle_only_while_processes_remain() {
+        let root = std::env::temp_dir().join(format!("kith-failed-delete-{}", std::process::id()));
+        let (bundle, cgroup) = (root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: Option<&str>| {
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&bundle).unwrap();
+            fs::create_dir_all(&cgroup).unwrap();
+            if let Some(procs) = procs {
+                fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+            }
+            Handle {
+                container: None,
+                go: None,
+                pid: Pid::from_raw(0),
+                reaped: true,
+                bundle: bundle.clone(),
+                cgroup: cgroup.clone(),
+            }
+        };
+        // Processes still listed: the handle comes back and the bundle is kept.
+        let still = fresh(Some("4242\n")).finish(err("removing the cgroup"));
+        let still = still.expect_err("a unit with processes is not gone");
+        assert!(still.handle.is_some() && bundle.exists(), "{}", still.error);
+        // Only the cleanup failed (no processes): nothing is held back, and the bundle goes.
+        let cleanup = fresh(Some("")).finish(err("removing the cgroup"));
+        let cleanup = cleanup.expect_err("the removal failed");
+        assert!(cleanup.handle.is_none() && !bundle.exists(), "{}", cleanup.error);
+        // A cgroup that is gone has no processes either; a deleted unit is deleted.
+        let gone = fresh(None).finish(Ok(()));
+        assert!(gone.is_ok() && !bundle.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A unit that is never handed out keeps its state while processes remain, so the next
+    /// start's cleanup finds them; once they are gone, the state goes with the bundle.
+    #[test]
+    fn a_discarded_unit_keeps_its_state_only_while_processes_remain() {
+        let root = std::env::temp_dir().join(format!("kith-discarded-{}", std::process::id()));
+        let (state, bundle, cgroup) = (root.join("state"), root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: &str| {
+            let _ = fs::remove_dir_all(&root);
+            for dir in [&state, &bundle, &cgroup] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+            Handle {
+                container: None,
+                go: None,
+                pid: Pid::from_raw(0),
+                reaped: true,
+                bundle: bundle.clone(),
+                cgroup: cgroup.clone(),
+            }
+        };
+        discard_leftovers(&state, fresh("4242\n").finish(err("removing the cgroup")));
+        assert!(state.exists() && bundle.exists(), "the processes are still there");
+        discard_leftovers(&state, fresh("").finish(err("removing the cgroup")));
+        assert!(!state.exists() && !bundle.exists(), "only the cleanup failed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A kept id is refused by `create` and `exec` (through `clear_kept`, which both call before
+    /// they take the id) while its last run has processes: nothing of it is removed. Once they are
+    /// gone the id is cleared and can be taken.
+    #[test]
+    fn create_refuses_a_kept_id() {
+        let root = std::env::temp_dir().join(format!("kith-kept-id-{}", std::process::id()));
+        let (state, bundle, cgroup) = (root.join("state"), root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: &str| {
+            let _ = fs::remove_dir_all(&root);
+            for dir in [&state, &bundle, &cgroup] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+        };
+        fresh("4242\n");
+        let refused = clear_kept(&state, &bundle, &cgroup, || {
+            panic!("a cgroup with processes is not removed")
+        });
+        assert!(refused.is_err(), "the processes are still there");
+        assert!(state.exists() && bundle.exists(), "nothing of a live run is removed");
+        fresh("");
+        assert!(clear_kept(&state, &bundle, &cgroup, || {}).is_ok());
+        assert!(
+            !state.exists() && !bundle.exists(),
+            "its last run is gone: the id is free"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A unit's processes may sit in its child cgroups (`nested`): `populated` in `cgroup.events`
+    /// counts them, where its own `cgroup.procs` is empty.
+    #[test]
+    fn has_processes_counts_child_cgroups() {
+        let cgroup = std::env::temp_dir().join(format!("kith-populated-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cgroup);
+        fs::create_dir_all(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.procs"), "").unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(has_processes(&cgroup), "a child cgroup has processes");
+        fs::write(cgroup.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!has_processes(&cgroup), "nothing is left in it or below");
+        let _ = fs::remove_dir_all(&cgroup);
+        assert!(!has_processes(&cgroup), "a cgroup that is gone has none");
     }
 }

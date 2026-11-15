@@ -24,7 +24,7 @@ fn sh(rt: &Runtime, image: &kith_runtime::Image, dir: &Path, id: &str, unit: Uni
         .unwrap();
     c.start().unwrap();
     let code = c.wait().unwrap();
-    c.delete().unwrap();
+    c.delete().map_err(|e| e.error).unwrap();
     (code, fs::read_to_string(out).unwrap(), fs::read_to_string(err).unwrap())
 }
 
@@ -186,7 +186,7 @@ async fn writable_root() {
     let files = || (File::create(&out).unwrap(), File::create(&err).unwrap());
     let (o, e) = files();
     match rt.create("can", &image, &unit, o, e) {
-        Ok(made) => made.delete().unwrap(),
+        Ok(made) => made.delete().map_err(|e| e.error).unwrap(),
         Err(e) => {
             eprintln!("skipped: no overlay for this user here: {e}");
             return fs::remove_dir_all(&dir).unwrap();
@@ -289,7 +289,7 @@ async fn pull_and_run() {
     c.start().unwrap();
     assert_eq!(c.wait().unwrap(), 0);
     assert_eq!(fs::read_to_string(&out).unwrap(), "hello from limits\n");
-    c.delete().unwrap();
+    c.delete().map_err(|e| e.error).unwrap();
     assert!(!cgroup.exists(), "delete removes the cgroup");
     assert!(!dir.join("runtime/containers/limits").exists());
 
@@ -338,7 +338,7 @@ async fn pull_and_run() {
     c.start().unwrap();
     c.kill().unwrap();
     assert_eq!(c.wait().unwrap(), 137);
-    c.delete().unwrap();
+    c.delete().map_err(|e| e.error).unwrap();
 
     // Bad ids never reach the filesystem.
     let bad = rt.create(

@@ -32,6 +32,9 @@ const SETTLED: Duration = Duration::from_secs(60);
 /// or a child exit wakes it sooner (`until_woken`). What this covers is a Job's next run and a
 /// failed status report, retried on the next pass. Neither is on the measured paths (T-0185).
 const TICK: Duration = Duration::from_secs(10);
+/// How long a unit whose stop failed with processes left waits before its stop is tried again: a try
+/// can block for about 100 ms, on the async thread.
+const STOP_RETRY: Duration = Duration::from_secs(2);
 /// Failed runs a Job shrugs off when it does not say (`retries`).
 const JOB_RETRIES: u32 = 3;
 
@@ -103,6 +106,16 @@ struct Slot {
     after: u32,
     /// Not started yet for that: waiting, with no time to be woken at.
     held: bool,
+    /// Its handle could not be deleted while processes remain: it is still stopping, and its
+    /// id and device nodes are held back from new units until a later pass finds it gone.
+    leaving: bool,
+    /// Stopped to be replaced or dropped (stale or no longer wanted): once it is gone its slot goes,
+    /// and what is wanted starts afresh. Not set for one that ended on its own (see `kept_once_gone`).
+    drop: bool,
+    /// When its stop was last tried: one still stopping is tried again at most every `STOP_RETRY`.
+    tried: Option<Instant>,
+    /// Its job run was counted as ended (a run stopped by its revision is counted once).
+    accounted: bool,
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
@@ -120,6 +133,9 @@ struct Slot {
 
 impl Slot {
     fn ready(&self) -> bool {
+        if self.leaving {
+            return false;
+        }
         match self.init {
             // (What ran first and ended well holds nothing back.)
             true => self.done(),
@@ -220,8 +236,8 @@ pub async fn run(
             break;
         }
     }
-    for (id, slot) in controller.slots {
-        stop(&id, slot.handle);
+    for (id, mut slot) in controller.slots {
+        stop(&id, &mut slot);
     }
 }
 
@@ -241,10 +257,110 @@ async fn until_woken(
     }
 }
 
-fn stop(id: &str, handle: Option<Handle>) {
-    if let Some(Err(e)) = handle.map(Handle::delete) {
-        eprintln!("kithd: {id}: {e}");
+/// Deletes a unit's handle. One whose processes remain keeps it: the slot is `leaving` (its id
+/// and devices held back) until a later pass finds it gone. A cleanup-only failure holds nothing.
+fn stop(id: &str, slot: &mut Slot) {
+    let Some(handle) = slot.handle.take() else {
+        slot.leaving = false;
+        return;
+    };
+    slot.tried = Some(Instant::now());
+    match handle.delete() {
+        Ok(()) => {
+            // Gone: the "stopping" message of an earlier pass is over.
+            if slot.message.as_deref().is_some_and(|m| m.starts_with("stopping: ")) {
+                slot.message = None;
+            }
+        }
+        Err(undeleted) => {
+            slot.handle = undeleted.handle.map(|handle| *handle);
+            if slot.handle.is_some() {
+                slot.probes = None;
+                if slot.state == "running" {
+                    slot.state = "stopping";
+                }
+                let message = format!(
+                    "stopping: {}; its devices and name are held until it is gone",
+                    undeleted.error
+                );
+                // Said once, not on every pass while it stays stuck.
+                if slot.message.as_ref() != Some(&message) {
+                    eprintln!("kithd: {id}: {}", undeleted.error);
+                }
+                slot.message = Some(message);
+            } else {
+                eprintln!("kithd: {id}: {}", undeleted.error);
+            }
+        }
     }
+    slot.leaving = slot.handle.is_some();
+}
+
+/// Stops the unit `id` if it has one. Its slot is kept while it is `leaving`, and once it is gone
+/// unless it is dropped: `drop` marks one stopped to be replaced or dropped (see `kept_once_gone`).
+fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str, drop: bool) {
+    if let Some(mut slot) = slots.remove(id) {
+        slot.drop |= drop;
+        stop(id, &mut slot);
+        if slot.leaving || kept_once_gone(slot.drop) {
+            slots.insert(id.to_string(), slot);
+        }
+    }
+}
+
+/// Whether a slot whose handle is gone is kept. One stopped to be replaced or dropped is not: what
+/// is wanted starts afresh. One that ended on its own is, with its state, exit code and restarts
+/// (and its backoff), so it is not run again.
+fn kept_once_gone(drop: bool) -> bool {
+    !drop
+}
+
+/// Whether the running container `slot` takes the devices of `new` as it runs, with no new start
+/// (see `in_place`). Then a difference in devices alone is no reason to replace it: a plug that is
+/// refused is tried again at the next pass, and the unit keeps running.
+fn plugs_in_place(slot: &Slot, new: &Slot) -> bool {
+    let running = slot.handle.is_some() && !slot.leaving && matches!(slot.run, Run::Container(_));
+    running && devices_in_place(slot, new)
+}
+
+/// Whether `new` differs from `slot` in input devices alone, all of which the container takes as it
+/// runs (see `in_place`). Only a running container can be given them (see `plugs_in_place`).
+fn devices_in_place(slot: &Slot, new: &Slot) -> bool {
+    let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
+        (slot.devices.iter().collect(), new.devices.iter().collect());
+    let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
+    in_place(&was, &now, &gone)
+}
+
+/// What a refused change of a running container's devices does to the unit. A refused removal
+/// replaces it: the container may still hold a node the kernel gives to another device. A refused
+/// plug alone keeps it running, and it is tried again at the next pass. (`plugged`: the plugs went in.)
+fn refusal_replaces(plugged: bool) -> bool {
+    plugged
+}
+
+/// Why a unit `id` of `owner`, with the device nodes `devices`, waits: a unit still stopping has its
+/// id, and the device nodes it had (its processes may still hold them). Units of one owner share one
+/// set of devices, so a sibling's hold is the owner's own and does not hold it back. `None` when
+/// nothing is held.
+fn held_by_leaving(
+    id: &str,
+    owner: &str,
+    devices: &[PathBuf],
+    leaving: &[(String, String, Vec<PathBuf>)],
+) -> Option<String> {
+    leaving.iter().find_map(|(other, other_owner, held)| {
+        if other == id {
+            return Some(format!("waiting: {other} is still stopping: its processes remain"));
+        }
+        if other_owner == owner {
+            return None;
+        }
+        devices
+            .iter()
+            .find(|path| held.contains(path))
+            .map(|path| format!("waiting: {other} is still stopping and has {}", path.display()))
+    })
 }
 
 /// May a container that was given the device nodes `was` be given `now` as it runs, with
@@ -619,6 +735,10 @@ impl Controller {
                             init: at < inits,
                             after: at.min(inits) as u32,
                             held: false,
+                            leaving: false,
+                            drop: false,
+                            tried: None,
+                            accounted: false,
                             tuned: None,
                             handle: None,
                             state: "pending",
@@ -642,26 +762,36 @@ impl Controller {
         // or taken from, a container as it runs: a session is not started over for that.
         // (One that is still on the node and no longer the container's is another matter:
         // what the container has open stays open until it is stopped.)
-        for (id, slot) in &mut self.slots {
-            let (Some(new), Some(handle)) = (wanted.get(id), &slot.handle) else {
-                continue;
-            };
-            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
-                (slot.devices.iter().collect(), new.devices.iter().collect());
-            let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
-            if !in_place(&was, &now, &gone) || !matches!(slot.run, Run::Container(_)) {
+        // A unit still stopping is asked again first: once it is gone (and removed), what waits
+        // for its id or its devices is started in this same pass.
+        let stopping_now: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stopping_now {
+            // Its main may have died while the cgroup would not go: collect it, or it stays a zombie
+            // that `reap_orphans` cannot pass.
+            if let Some(handle) = self
+                .slots
+                .get_mut(id)
+                .and_then(|slot| slot.handle.as_mut())
+                .filter(|h| !h.is_reaped())
+            {
+                let _ = handle.try_wait();
+            }
+            // A stop that failed is tried again after STOP_RETRY: each try can block for a while.
+            if self
+                .slots
+                .get(id)
+                .and_then(|slot| slot.tried)
+                .is_some_and(|at| at.elapsed() < STOP_RETRY)
+            {
                 continue;
             }
-            let given = now.difference(&was).try_for_each(|path| handle.plug(path));
-            let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
-            match taken {
-                Ok(()) => {
-                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
-                    slot.devices = new.devices.clone();
-                }
-                // (Started over, as before: by the comparison below.)
-                Err(e) => eprintln!("kithd: {id}: {e}"),
-            }
+            // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
+            stop_unit(&mut self.slots, id, !wanted.contains_key(id));
         }
         let mut stale: Vec<String> = Vec::new();
         fn of(slot: &Slot) -> (&str, u32) {
@@ -672,16 +802,21 @@ impl Controller {
         let differs = |new: &Slot, slot: &Slot| {
             // A Job's run is not started over because a value changed under it.
             let new_values = new.env.is_ok() && new.env != slot.env && !self.jobs.contains_key(&slot.owner);
+            // (Input devices plugged in or out do not replace a running container: see plugs_in_place.)
+            let devices = new.devices != slot.devices && !plugs_in_place(slot, new);
             new.run != slot.run
                 || new.pod != slot.pod
                 || new.notes != slot.notes
                 || new.policy != slot.policy
-                || new.devices != slot.devices
+                || devices
                 || new.seat != slot.seat
                 || new.volumes != slot.volumes
                 || new_values
         };
         for (id, slot) in &self.slots {
+            if slot.leaving {
+                continue;
+            }
             let Some(new) = wanted.get(id) else {
                 stale.push(id.clone());
                 continue;
@@ -722,7 +857,10 @@ impl Controller {
             };
             let ids = self.slots.iter().filter(|(id, slot)| {
                 let new = wanted.get(*id);
-                slot.owner == owner && go.contains(&slot.replica) && new.is_some_and(|new| differs(new, slot))
+                slot.owner == owner
+                    && !slot.leaving
+                    && go.contains(&slot.replica)
+                    && new.is_some_and(|new| differs(new, slot))
             });
             stale.extend(ids.map(|(id, _)| id.clone()));
         }
@@ -731,18 +869,67 @@ impl Controller {
         let first = self
             .slots
             .iter()
-            .filter(|(_, slot)| slot.init && anew.contains(&of(slot)));
+            .filter(|(_, slot)| slot.init && !slot.leaving && anew.contains(&of(slot)));
         let first: Vec<String> = first
             .map(|(id, _)| id.clone())
             .filter(|id| !stale.contains(id))
             .collect();
         stale.extend(first);
         for id in stale {
-            stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+            stop_unit(&mut self.slots, &id, true);
+        }
+        // The input devices of running units, given or taken as they run. After the stops above: a
+        // device a unit still stopping holds (one stopped this pass that did not go included) is not
+        // given to another, and what waits for it says so in its status.
+        let leaving_now: Vec<(String, String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()))
+            .collect();
+        // Units whose removal was refused: replaced below, once the borrows of the loop are over.
+        let mut replace: Vec<String> = Vec::new();
+        for (id, slot) in &mut self.slots {
+            let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
+                continue;
+            };
+            if !plugs_in_place(slot, new) {
+                continue;
+            }
+            let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
+                (slot.devices.iter().collect(), new.devices.iter().collect());
+            let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
+            if let Some(why) = held_by_leaving(id, &slot.owner, &added, &leaving_now) {
+                slot.message = Some(why);
+                continue;
+            }
+            let plugged = now.difference(&was).try_for_each(|path| handle.plug(path));
+            let plugged_ok = plugged.is_ok();
+            let taken = plugged.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
+            match taken {
+                Ok(()) => {
+                    eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
+                    slot.devices = new.devices.clone();
+                    slot.message = None;
+                }
+                // Still running: the comparison above does not replace it for this, so the change is
+                // tried again at the next pass. A refused removal replaces it (see refusal_replaces).
+                Err(e) => {
+                    eprintln!("kithd: {id}: {e}");
+                    slot.message = Some(format!("waiting: {e}"));
+                    if refusal_replaces(plugged_ok) {
+                        replace.push(id.clone());
+                    }
+                }
+            }
+        }
+        for id in replace {
+            stop_unit(&mut self.slots, &id, true);
         }
         let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
             match self.slots.get_mut(&id) {
+                Some(slot) if slot.leaving => {}
                 Some(slot) if !differs(&new, slot) => {
                     (slot.revision, slot.init, slot.after) = (new.revision, new.init, new.after);
                     // A ConfigMap or a Secret that changed: written again where it is mounted,
@@ -801,9 +988,22 @@ impl Controller {
         for slot in self.slots.values().filter(|slot| slot.done()) {
             *first.entry((slot.owner.clone(), slot.replica)).or_default() += 1;
         }
+        // The units still stopping, with their devices: what is due waits for them (see
+        // held_by_leaving). One that starts stopping in this pass is added as it does.
+        let mut leaving: Vec<(String, String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.leaving)
+            .map(|(id, slot)| (id.clone(), slot.owner.clone(), slot.devices.clone()))
+            .collect();
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
                 return TICK; // the caller stops everything
+            }
+            if slot.leaving {
+                // Asked again by step 2, not here: it has no process left to watch.
+                slot.held = true;
+                continue;
             }
             if let Some(handle) = &mut slot.handle {
                 if slot.probes.as_ref().is_some_and(|p| !p.health.borrow().live) {
@@ -823,7 +1023,7 @@ impl Controller {
                         -1
                     }
                 };
-                stop(id, slot.handle.take());
+                stop(id, slot);
                 slot.probes = None;
                 slot.exit_code = Some(code);
                 slot.failures = if slot.started.elapsed() >= SETTLED {
@@ -839,6 +1039,12 @@ impl Controller {
                 }
                 // (What waited for an init container starts in the pass after this one.)
                 job_moved |= self.jobs.contains_key(&slot.owner) || slot.init;
+                if slot.leaving {
+                    // Its processes remain: it is stopping, and what is due waits for it.
+                    leaving.push((id.clone(), slot.owner.clone(), slot.devices.clone()));
+                    slot.held = true;
+                    continue;
+                }
             }
             let ended = first.get(&(slot.owner.clone(), slot.replica)).copied().unwrap_or(0);
             slot.held = slot.start_at.is_some() && ended < slot.after;
@@ -848,6 +1054,11 @@ impl Controller {
                     false => "waiting for its init containers".into(),
                 });
             } else if slot.start_at.is_some_and(|at| at <= Instant::now()) {
+                if let Some(why) = held_by_leaving(id, &slot.owner, &slot.devices, &leaving) {
+                    slot.held = true;
+                    slot.message = Some(why);
+                    continue;
+                }
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
                     started = start(shared, &self.runtime, &self.logs, mesh, id, slot) => started,
@@ -869,10 +1080,18 @@ impl Controller {
                         job_moved = true;
                     }
                     Err(message) => {
+                        let message = match slot.leaving {
+                            true => format!("{message}; its devices and name are held until it is gone"),
+                            false => message,
+                        };
                         (slot.state, slot.message) = ("failed", Some(message));
                         slot.start_at = Some(Instant::now() + backoff(slot.failures));
                         slot.failures += 1;
                         job_moved |= self.jobs.contains_key(&slot.owner);
+                        if slot.leaving {
+                            leaving.push((id.clone(), slot.owner.clone(), slot.devices.clone()));
+                            slot.held = true;
+                        }
                     }
                 }
             }
@@ -882,7 +1101,9 @@ impl Controller {
         // CPU for who yields while the seat is busy. Said again only when it changes; a unit
         // never told anything is left as the runtime made it.
         for (id, slot) in self.slots.iter_mut() {
-            let Some(handle) = &slot.handle else { continue };
+            let Some(handle) = slot.handle.as_ref().filter(|_| !slot.leaving) else {
+                continue;
+            };
             let asked = tunes.get(&slot.owner).copied();
             if asked.is_none() && slot.tuned.is_none() {
                 continue;
@@ -909,10 +1130,12 @@ impl Controller {
         }
 
         // What exec units forked and left behind is ours to collect, now that every unit's own exit has been.
+        // (A reaped one has no zombie left under its pid to wait for.)
         let mains: Vec<i32> = self
             .slots
             .values()
             .filter_map(|s| s.handle.as_ref())
+            .filter(|h| !h.is_reaped())
             .map(Handle::pid)
             .collect();
         kith_runtime::reap_orphans(&mains);
@@ -1031,7 +1254,7 @@ impl Controller {
         if job.revision != revision {
             // Applied again with changes: it runs again.
             for id in mine(&self.slots, None) {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id, true);
             }
             *job = Progress {
                 revision,
@@ -1058,6 +1281,10 @@ impl Controller {
         for run in runs {
             let ids = mine(&self.slots, Some(run));
             let slots = || ids.iter().map(|id| &self.slots[id]);
+            // A run whose units are still stopping was counted when it ended: not again.
+            if slots().any(|s| s.accounted) {
+                continue;
+            }
             let failed = slots().find(|s| s.state == "failed" || (s.state == "exited" && s.exit_code != Some(0)));
             if let Some(culprit) = failed {
                 job.failed += 1;
@@ -1070,8 +1297,13 @@ impl Controller {
             } else {
                 continue; // still going
             }
+            for id in &ids {
+                if let Some(slot) = self.slots.get_mut(id) {
+                    slot.accounted = true;
+                }
+            }
             for id in ids {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id, true);
             }
         }
         let timeout = spec.timeout_seconds.map(|s| Duration::from_secs(s.into()));
@@ -1085,7 +1317,7 @@ impl Controller {
         }
         if job.outcome.is_some() {
             for id in mine(&self.slots, None) {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id, true);
             }
             return (Vec::new(), Instant::now());
         }
@@ -1263,7 +1495,7 @@ async fn start(
     logs: &Path,
     mesh: Option<(std::net::Ipv6Addr, &str)>,
     id: &str,
-    slot: &Slot,
+    slot: &mut Slot,
 ) -> Result<Handle, String> {
     let resources = match &slot.run {
         Run::Container(c) => &c.resources,
@@ -1422,7 +1654,9 @@ async fn start(
     match handle.start() {
         Ok(()) => Ok(handle),
         Err(e) => {
-            stop(id, Some(handle));
+            // It never ran; what processes it left are the slot's to hold until they are gone.
+            slot.handle = Some(handle);
+            stop(id, slot);
             Err(e.to_string())
         }
     }
@@ -1540,6 +1774,124 @@ mod tests {
         assert!(!fits(&[key], &[key], &[]));
         assert!(!fits(&[card], &[card, pad], &[]));
         assert!(!fits(&[key], &[key, card], &[]));
+    }
+
+    /// A slot of `owner`, with the device nodes `devices`, that runs the container `name`.
+    fn slot_of(owner: &str, devices: &[&str], name: &str) -> Slot {
+        let container: Container = serde_json::from_value(json!({ "name": name, "image": "img" })).unwrap();
+        Slot {
+            owner: owner.into(),
+            revision: None,
+            replica: 0,
+            run: Run::Container(container),
+            policy: RestartPolicy::Always,
+            env: Ok(Vec::new()),
+            rolling: false,
+            probes: None,
+            pod: None,
+            notes: BTreeMap::new(),
+            devices: devices.iter().map(PathBuf::from).collect(),
+            seat: None,
+            volumes: Vec::new(),
+            files: Ok(Vec::new()),
+            init: false,
+            after: 0,
+            held: false,
+            leaving: false,
+            drop: false,
+            tried: None,
+            accounted: false,
+            tuned: None,
+            handle: None,
+            state: "pending",
+            restarts: 0,
+            failures: 0,
+            exit_code: None,
+            message: None,
+            started: Instant::now(),
+            start_at: None,
+        }
+    }
+
+    /// A unit whose stop failed while processes remain is leaving: nothing with its id, or with a
+    /// device node it holds, starts until it is gone. A device it does not hold is no hold. Units of
+    /// one owner share its devices, so a sibling's hold is no hold for the others.
+    #[test]
+    fn leaving_units_hold_back_their_id_and_their_device_nodes() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let leaving = vec![(
+            "w_a_b_0_x".to_string(),
+            "Workload/a/b".to_string(),
+            paths(&["/dev/dri/card0"]),
+        )];
+        let same_id = held_by_leaving("w_a_b_0_x", "Workload/a/b", &[], &leaving).expect("the same id is held");
+        assert!(same_id.contains("still stopping"), "{same_id}");
+        let same_device = held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/dri/card0"]), &leaving)
+            .expect("a device it holds is held");
+        assert!(same_device.contains("/dev/dri/card0"), "{same_device}");
+        assert_eq!(
+            held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/input/event0"]), &leaving),
+            None
+        );
+        assert_eq!(
+            held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/dri/card0"]), &[]),
+            None
+        );
+        assert_eq!(
+            held_by_leaving("w_a_b_1_x", "Workload/a/b", &paths(&["/dev/dri/card0"]), &leaving),
+            None,
+            "a sibling of the same owner shares the devices"
+        );
+    }
+
+    /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit
+    /// code and restarts stay, and it is not run again. One stopped to be replaced is removed.
+    #[test]
+    fn leaving_exit_is_not_run_again() {
+        let id = "w_a_b_0_app";
+        let mut ended = slot_of("Workload/a/b", &[], "app");
+        (ended.leaving, ended.state, ended.exit_code) = (true, "exited", Some(0));
+        let mut slots = BTreeMap::from([(id.to_string(), ended)]);
+        stop_unit(&mut slots, id, false);
+        let kept = slots.get(id).expect("an exit is kept");
+        assert_eq!(
+            (kept.state, kept.exit_code, kept.leaving, kept.start_at.is_none()),
+            ("exited", Some(0), false, true),
+            "kept as it ended, with nothing to start"
+        );
+        stop_unit(&mut slots, id, true);
+        assert!(
+            !slots.contains_key(id),
+            "a replaced unit goes, and what is wanted starts afresh"
+        );
+    }
+
+    /// An input device plugged into a running container is no reason to start it over, so the device
+    /// alone does not make the slot differ. Only a container that runs takes them so; a DRI node, or
+    /// an input device the unit did not start with, still restarts it.
+    #[test]
+    fn input_devices_alone_do_not_replace_a_running_container() {
+        let slot = slot_of("Workload/a/b", &["/dev/input/event0"], "app");
+        let plugged = slot_of("Workload/a/b", &["/dev/input/event0", "/dev/input/event1"], "app");
+        let card = slot_of("Workload/a/b", &["/dev/dri/card0"], "app");
+        assert!(devices_in_place(&slot, &plugged), "a plug is taken in place");
+        assert!(!devices_in_place(&slot, &card), "a DRI node is not");
+        // Without a handle nothing runs: the unit is replaced, not plugged.
+        assert!(
+            !plugs_in_place(&slot, &plugged),
+            "a unit that is not running is replaced"
+        );
+    }
+
+    /// A refused removal replaces the unit, since the container may still hold the node it lost. A
+    /// refused plug alone keeps it running, and it is tried again at the next pass.
+    #[test]
+    fn refused_unplug_replaces_the_unit() {
+        assert!(
+            refusal_replaces(true),
+            "the plugs went in, so the refusal is the removal"
+        );
+        assert!(!refusal_replaces(false), "a refused plug alone is tried again");
     }
 
     #[test]
