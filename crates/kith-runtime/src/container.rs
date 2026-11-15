@@ -270,13 +270,20 @@ impl Runtime {
         };
         // Before its program runs: the devices it may open, and no other. (Where kithd is
         // root; elsewhere the container is a user namespace, which makes no device node.)
+        let state = self.root.join("state").join(id);
         if nix::unistd::getuid().is_root()
             && let Err(e) = devfilter::attach(&handle.cgroup, &allowed(&spec))
         {
-            let _ = handle.delete();
+            handle.discard(&state);
             return Err(e).ctx(&what);
         }
-        handle.no_swap(unit, &what)
+        match handle.no_swap(unit, &what) {
+            Ok(()) => Ok(handle),
+            Err(e) => {
+                handle.discard(&state);
+                Err(e)
+            }
+        }
     }
 
     /// Create the exec unit `id`: `unit.command` as a plain process of this host (its
@@ -321,7 +328,7 @@ impl Runtime {
             go: child.stdin.take(),
             pid: Pid::from_raw(child.id() as i32),
             reaped: false,
-            bundle: marker,
+            bundle: marker.clone(),
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
         };
         let manager = manager(&cgroup);
@@ -336,10 +343,10 @@ impl Runtime {
             .add_task(handle.pid)
             .and_then(|()| manager.apply(&options))
             .ctx(&what);
-        match confined {
-            Ok(()) => handle.no_swap(unit, &what),
+        match confined.and_then(|()| handle.no_swap(unit, &what)) {
+            Ok(()) => Ok(handle),
             Err(e) => {
-                let _ = handle.delete();
+                handle.discard(&marker);
                 Err(e)
             }
         }
@@ -561,17 +568,21 @@ impl Handle {
 
     /// A memory limit that swap could stretch is no limit. The OCI resources cannot say
     /// "no swap" (libcgroups reads 0 as "leave it"), so it is written here.
-    fn no_swap(self, unit: &Unit, what: &str) -> Result<Handle> {
+    fn no_swap(&self, unit: &Unit, what: &str) -> Result<()> {
         if unit.memory_bytes.is_some() {
             match fs::write(self.cgroup.join("memory.swap.max"), "0") {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    let _ = self.delete();
                     return Err(e).ctx(format!("{what}: turning swap off"));
                 }
                 _ => {} // No such file: this kernel does no swap accounting.
             }
         }
-        Ok(self)
+        Ok(())
+    }
+
+    /// Drop a handle whose unit is never handed out: see [`discard_leftovers`].
+    fn discard(self, state: &Path) {
+        discard_leftovers(state, self.delete());
     }
 
     /// The process id of the container's init, or of the exec unit's command.
@@ -616,6 +627,11 @@ impl Handle {
     fn reaped(&mut self, code: i32) -> Result<i32> {
         self.reaped = true;
         Ok(code)
+    }
+
+    /// Whether its exit status has been collected: then `pid` is no longer a zombie to reap.
+    pub fn is_reaped(&self) -> bool {
+        self.reaped
     }
 
     pub fn kill(&mut self) -> Result<()> {
@@ -670,6 +686,18 @@ impl Handle {
 pub struct Undeleted {
     pub error: crate::Error,
     pub handle: Option<Handle>,
+}
+
+/// What a discarded unit leaves: a failed delete with processes left keeps its state (the
+/// id stays taken), for the next start's cleanup to find and remove; with them gone, the
+/// state goes too, as a delete always removed it.
+fn discard_leftovers(state: &Path, deleted: std::result::Result<(), Undeleted>) {
+    if let Err(gone) = deleted {
+        eprintln!("kith: {}", gone.error);
+        if gone.handle.is_none() {
+            let _ = fs::remove_dir_all(state);
+        }
+    }
 }
 
 /// Whether a cgroup still has processes. A cgroup that is gone has none; one whose
@@ -1817,6 +1845,34 @@ mod tests {
         // A cgroup that is gone has no processes either; a deleted unit is deleted.
         let gone = fresh(None).finish(Ok(()));
         assert!(gone.is_ok() && !bundle.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A unit that is never handed out keeps its state while processes remain, so the next
+    /// start's cleanup finds them; once they are gone, the state goes with the bundle.
+    #[test]
+    fn a_discarded_unit_keeps_its_state_only_while_processes_remain() {
+        let root = std::env::temp_dir().join(format!("kith-discarded-{}", std::process::id()));
+        let (state, bundle, cgroup) = (root.join("state"), root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: &str| {
+            let _ = fs::remove_dir_all(&root);
+            for dir in [&state, &bundle, &cgroup] {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+            Handle {
+                container: None,
+                go: None,
+                pid: Pid::from_raw(0),
+                reaped: true,
+                bundle: bundle.clone(),
+                cgroup: cgroup.clone(),
+            }
+        };
+        discard_leftovers(&state, fresh("4242\n").finish(err("removing the cgroup")));
+        assert!(state.exists() && bundle.exists(), "the processes are still there");
+        discard_leftovers(&state, fresh("").finish(err("removing the cgroup")));
+        assert!(!state.exists() && !bundle.exists(), "only the cleanup failed");
         let _ = fs::remove_dir_all(&root);
     }
 }

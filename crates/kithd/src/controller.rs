@@ -257,17 +257,23 @@ fn stop(id: &str, slot: &mut Slot) {
         return;
     };
     if let Err(undeleted) = handle.delete() {
-        eprintln!("kithd: {id}: {}", undeleted.error);
         slot.handle = undeleted.handle;
         if slot.handle.is_some() {
             slot.probes = None;
             if slot.state == "running" {
                 slot.state = "stopping";
             }
-            slot.message = Some(format!(
+            let message = format!(
                 "stopping: {}; its devices and name are held until it is gone",
                 undeleted.error
-            ));
+            );
+            // Said once, not on every pass while it stays stuck.
+            if slot.message.as_ref() != Some(&message) {
+                eprintln!("kithd: {id}: {}", undeleted.error);
+            }
+            slot.message = Some(message);
+        } else {
+            eprintln!("kithd: {id}: {}", undeleted.error);
         }
     }
     slot.leaving = slot.handle.is_some();
@@ -703,8 +709,26 @@ impl Controller {
             .map(|(id, _)| id.clone())
             .collect();
         for id in &stopping_now {
+            // Its main may have died while the cgroup would not go: collect it, or it stays a zombie
+            // that `reap_orphans` cannot pass.
+            if let Some(handle) = self
+                .slots
+                .get_mut(id)
+                .and_then(|slot| slot.handle.as_mut())
+                .filter(|h| !h.is_reaped())
+            {
+                let _ = handle.try_wait();
+            }
             stop_unit(&mut self.slots, id);
         }
+        // The devices of the units still stopping: a device one holds is not plugged into another
+        // running unit until it is gone (what waits for it says so in its status).
+        let leaving_now: Vec<(String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, s)| (id.clone(), s.devices.clone()))
+            .collect();
         for (id, slot) in &mut self.slots {
             let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
                 continue;
@@ -715,12 +739,18 @@ impl Controller {
             if !in_place(&was, &now, &gone) || !matches!(slot.run, Run::Container(_)) {
                 continue;
             }
+            let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
+            if let Some(why) = held_by_leaving(id, &added, &leaving_now) {
+                slot.message = Some(why);
+                continue;
+            }
             let given = now.difference(&was).try_for_each(|path| handle.plug(path));
             let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
             match taken {
                 Ok(()) => {
                     eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
                     slot.devices = new.devices.clone();
+                    slot.message = None;
                 }
                 // (Started over, as before: by the comparison below.)
                 Err(e) => eprintln!("kithd: {id}: {e}"),
@@ -1013,10 +1043,12 @@ impl Controller {
         }
 
         // What exec units forked and left behind is ours to collect, now that every unit's own exit has been.
+        // (A reaped one has no zombie left under its pid to wait for.)
         let mains: Vec<i32> = self
             .slots
             .values()
             .filter_map(|s| s.handle.as_ref())
+            .filter(|h| !h.is_reaped())
             .map(Handle::pid)
             .collect();
         kith_runtime::reap_orphans(&mains);

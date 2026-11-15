@@ -93,10 +93,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   makes no device nodes.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
-  keeps its devices and its name, and a unit that wants them waits until a later pass finds
-  its cgroup empty. What is left: kithd holds this in memory, so a restart of kithd forgets
-  it; a process that moved out of the unit's cgroup is not counted; and a cgroup whose
-  processes cannot be read is taken to still run.
+  keeps its devices and its name, and a unit that wants them, or a device plugged into a
+  running unit, waits until a later pass finds its cgroup empty. What is left: kithd holds
+  this in memory, so a restart of kithd forgets it; a process that moved out of the unit's
+  cgroup is not counted; a cgroup whose processes cannot be read is taken to still run;
+  devices are compared by the path they were given, so two paths to one node are not
+  matched; at kithd's shutdown a failed stop is not retried, and its processes outlive
+  kithd until the next start's cleanup, which ignores kill and remove errors; a unit that
+  failed before it was handed out keeps its id until that same cleanup, if processes remain.
 - **A pod** (a template that says `pod: true`, and so every Deployment, StatefulSet,
   DaemonSet and Job sent through the Kubernetes API) is a container with three of those
   taken off, as Kubernetes has them: it is the user its image names, root included; root
