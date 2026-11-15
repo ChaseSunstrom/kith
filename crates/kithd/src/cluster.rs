@@ -1064,13 +1064,56 @@ fn node_key(name: &str) -> String {
     format!("Node/{name}")
 }
 
+/// [`register`] for the node the cluster started on, at each start, and the only way it is called for it:
+/// it makes its Node only while the store holds no Node at all (the start that made the cluster, or one
+/// that ended before its Node was in), so a node deleted stays deleted across its restart. False: its Node
+/// is gone, or is a joiner's under the name (another certificate), and nothing was written.
+/// It waits for the store to have all the log of the term it is in applied first: until then a Node
+/// that is there may not show.
+pub async fn register_first(
+    shared: &Shared,
+    name: &str,
+    address: &str,
+    id: u64,
+    print: &str,
+    more: serde_json::Value,
+) -> Result<bool, kith_api::store::Error> {
+    let caught_up = |m: &kith_store::openraft::RaftMetrics<_, _>| {
+        m.current_leader.is_some() && m.last_applied.is_some_and(|log| log.leader_id.term == m.current_term)
+    };
+    let wait = shared.raft.wait(Some(Duration::from_secs(30)));
+    wait.metrics(caught_up, "the log of this term applied")
+        .await
+        .map_err(|e| kith_api::store::Error::Io(format!("no leader to say what the store holds: {e}")))?;
+    let (has_none, own) = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let own = state.store.get(&node_key(name)).map(|node| {
+            let said = node.status.as_ref().and_then(|status| status["certificate"].as_str());
+            said.is_some_and(|said| said != print)
+        });
+        (state.store.list(Some("Node")).next().is_none(), own)
+    };
+    if !has_none && own.is_none() {
+        eprintln!(
+            "kithd: node {name} was deleted, or never registered: it does not put itself back; join again with a token to be a node"
+        );
+        return Ok(false);
+    }
+    // A Node of the name that holds another certificate is a joiner's, made after the delete: not written over.
+    if own == Some(true) {
+        eprintln!("kithd: node {name}: the Node of that name holds another node's certificate: not written over");
+        return Ok(false);
+    }
+    register(shared, name, address, id, print, more).await.map(|()| true)
+}
+
 /// Put `Node/<name>` in the store: reachable at `address`, `id` in Raft (as text: not
 /// every JSON reader keeps 64 bits), and holding the certificate whose key's print is
 /// `print` ([`admitted`]), with what it says of itself on the mesh if it joined there, all
 /// in one entry: no entry makes it half a node. The leader then starts sending it the store.
 /// `more` is what else its status says from the start: `ca` (it is the node that holds the CA
 /// key, which no change may make a worker), `view` (a worker that is sent a view instead).
-pub async fn register(
+async fn register(
     shared: &Shared,
     name: &str,
     address: &str,
@@ -1499,6 +1542,64 @@ pub(crate) mod pinned_peer {
         // The plain client takes any node of the cluster: it is not for what is meant for one.
         let any = cluster.client.post(format!("https://{taken}/v1/secret")).send().await;
         assert!(any.unwrap().status().is_success() && to_x.load(Ordering::SeqCst) == 1);
+    }
+
+    /// The node a cluster started on makes its Node when the store holds none at all (the start
+    /// that made the cluster, or one that died before the first Node was in), and later only
+    /// says where it is.
+    #[tokio::test]
+    async fn first_node_makes_its_node_when_the_store_has_none_and_then_only_its_address() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("first-node", cluster, &[]).await;
+        let address = |shared: &Shared| {
+            let state = shared.store.lock().unwrap();
+            let node = state.store.get("Node/a").map(|node| node.status.clone().unwrap());
+            node.map(|status| status["address"].as_str().unwrap().to_string())
+        };
+        assert!(
+            register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null)
+                .await
+                .unwrap()
+        );
+        assert_eq!(address(&shared).as_deref(), Some("127.0.0.1:1"));
+        assert!(
+            register_first(&shared, "a", "127.0.0.1:2", 1, "p", serde_json::Value::Null)
+                .await
+                .unwrap()
+        );
+        assert_eq!(address(&shared).as_deref(), Some("127.0.0.1:2"));
+    }
+
+    /// With another node's Node in the store and its own gone, it is deleted: nothing is written.
+    #[tokio::test]
+    async fn first_node_deleted_is_not_made_again() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let shared = shared_of("first-node-deleted", cluster, &[at("b", "127.0.0.1:3", None)]).await;
+        for _ in 0..2 {
+            let put = register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null);
+            assert!(!put.await.unwrap());
+            assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
+        }
+    }
+
+    /// A Node of its name that holds another certificate is a joiner's, made after the delete: its
+    /// status is not written over.
+    #[tokio::test]
+    async fn first_node_leaves_a_node_that_holds_another_certificate_alone() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let others = [at("a", "127.0.0.1:9", Some("joiner".into()))];
+        let shared = shared_of("first-node-joiner", cluster, &others).await;
+        let put = register_first(&shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null);
+        assert!(!put.await.unwrap());
+        let state = shared.store.lock().unwrap();
+        let status = state.store.get("Node/a").unwrap().status.clone().unwrap();
+        assert_eq!(
+            (status["address"].as_str(), status["certificate"].as_str()),
+            (Some("127.0.0.1:9"), Some("joiner"))
+        );
     }
 
     /// A name whose Raft id a Node has is refused at the join (it would be taken for that Node's
