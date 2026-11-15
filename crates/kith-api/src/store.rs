@@ -202,6 +202,21 @@ impl Store {
         live.filter(move |r| kind.is_none_or(|k| r.kind == k))
     }
 
+    /// The Nodes that serve DNS or ingress, for other code to route to. Left out: a Node that is
+    /// unreachable, one with no LAN address to reach it at, and one that says it serves neither.
+    pub fn serving(&self) -> Vec<&Resource> {
+        self.list(Some("Node"))
+            .filter(|node| {
+                let Some(status) = node.status.as_ref() else {
+                    return false;
+                };
+                let serves = &status["serves"];
+                let answers = serves["dns"].is_u64() || serves["ingress"] == true;
+                answers && status["state"] != "unreachable" && node.lan_address().is_some()
+            })
+            .collect()
+    }
+
     /// The `KindDefinition` that makes `kind` (named exactly), if one does.
     pub fn definition(&self, kind: &str) -> Option<&Resource> {
         self.list(Some("KindDefinition"))

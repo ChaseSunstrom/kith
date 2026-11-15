@@ -131,6 +131,31 @@ fn named(status: Option<&Value>) -> Vec<&str> {
     image.chain(backups).collect()
 }
 
+/// What a node says it serves (`status.serves`): null, or `dns` a port and `ingress` true, and nothing else.
+fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
+    let fields = match serves {
+        Value::Null => return Ok(()),
+        Value::Object(fields) => fields,
+        _ => return Err(refused(key, "`serves` is null or an object of dns and ingress")),
+    };
+    if let Some(other) = fields.keys().find(|key| !matches!(key.as_str(), "dns" | "ingress")) {
+        return Err(refused(key, format!("serves has no {other}")));
+    }
+    let port = fields
+        .get("dns")
+        .map(|dns| dns.as_u64().filter(|port| (1..=65535).contains(port)));
+    if port == Some(None) {
+        return Err(refused(key, "`dns` is a port from 1 to 65535"));
+    }
+    if fields
+        .get("ingress")
+        .is_some_and(|ingress| *ingress != Value::Bool(true))
+    {
+        return Err(refused(key, "`ingress` is true or not said"));
+    }
+    Ok(())
+}
+
 fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
@@ -139,7 +164,15 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh"])?;
+            only(key, fields, &["os", "mesh", "serves"])?;
+            if let Some(serves) = fields.get("serves") {
+                serving_shape(key, serves)?;
+                // A worker that joined to run from a view was let in to read the store, not to answer ingress.
+                let viewed = live.status.as_ref().is_some_and(|status| status["view"] == true);
+                if viewed && serves.get("ingress").is_some() {
+                    return Err(refused(key, "ingress is not served by a worker that runs from a view"));
+                }
+            }
             // Two nodes that say one key are both left out of the mesh: saying another's cuts it off.
             let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
             let theirs = |other: &Resource| {
@@ -621,6 +654,51 @@ spec: { volume: there, every: 1d }
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_worker_says_what_it_serves_of_its_own_node_in_its_shape() {
+        let mut store = store();
+        let serves = |fields: Value| patch_of("Node/w", json!({ "serves": fields }));
+        // What it serves on its own Node, and null to take it off.
+        let fine = [
+            json!({ "dns": 53 }),
+            json!({ "dns": 65535, "ingress": true }),
+            json!({ "ingress": true }),
+            Value::Null,
+        ];
+        for said in fine {
+            assert!(try_as(&store, "w", serves(said.clone())).is_ok(), "{said}");
+        }
+        // Outside its shape: a port out of range or not a number, ingress that is not true, another key.
+        let outside = [
+            json!({ "dns": 0 }),
+            json!({ "dns": 65536 }),
+            json!({ "dns": "53" }),
+            json!({ "ingress": false }),
+            json!({ "dns": 53, "lan": "192.0.2.5" }),
+            json!("yes"),
+        ];
+        for said in outside {
+            assert!(try_as(&store, "w", serves(said.clone())).is_err(), "{said}");
+        }
+        // Another node's serves.
+        let theirs = patch_of("Node/w", json!({ "serves": { "dns": 53 } }));
+        assert!(try_as(&store, "w-b", theirs).is_err());
+        // A viewed worker: the control node that let it join to view did not let it serve ingress.
+        store
+            .set_status(
+                "Node/w-b",
+                Some(json!({ "address": "192.0.2.9:7443", "raftId": "3", "view": true })),
+            )
+            .unwrap();
+        let ingress = patch_of("Node/w-b", json!({ "serves": { "ingress": true } }));
+        assert!(try_as(&store, "w-b", ingress).unwrap_err().contains("ingress"));
+        let dns = patch_of("Node/w-b", json!({ "serves": { "dns": 53 } }));
+        assert!(try_as(&store, "w-b", dns).is_ok());
+        // `view` is a control node's to write, as its address is.
+        let view = patch_of("Node/w", json!({ "view": true }));
+        assert!(try_as(&store, "w", view).unwrap_err().contains("view"));
     }
 
     fn unit(replica: u64, more: Value) -> Value {

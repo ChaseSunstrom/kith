@@ -1821,10 +1821,37 @@ fn status_summary(resource: &Resource) -> String {
             status["address"].as_str(),
         ) {
             (Some(state), Some(why), _) if state != "succeeded" => format!("{state}: {}", clean(why)),
+            // A Node: its address, which is its LAN address unless it roams (then a mesh address), and what it serves.
+            (Some(state), _, Some(address)) if resource.kind == "Node" => {
+                let mesh = if resource.lan_address().is_none() {
+                    " (mesh)"
+                } else {
+                    ""
+                };
+                let serves = serves_summary(status);
+                format!("{state} at {}{mesh}{serves}", clean(address))
+            }
             (Some(state), _, Some(address)) => format!("{state} at {}", clean(address)),
             (Some(state), ..) | (None, _, Some(state)) => clean(state),
             _ => String::new(),
         },
+    }
+}
+
+/// What a Node says it serves (`status.serves`), for its STATUS: `; serves dns 53, ingress`, or nothing.
+fn serves_summary(status: &serde_json::Value) -> String {
+    let serves = &status["serves"];
+    let mut said = Vec::new();
+    if let Some(port) = serves["dns"].as_u64() {
+        said.push(format!("dns {port}"));
+    }
+    if serves["ingress"] == true {
+        said.push("ingress".to_string());
+    }
+    if said.is_empty() {
+        String::new()
+    } else {
+        format!("; serves {}", said.join(", "))
     }
 }
 
@@ -2033,5 +2060,35 @@ mod drain_tests {
         assert!(text[2].contains("stays on a: no other node can take it"), "{text:?}");
         assert!(text[3].starts_with("  NodeWorkload/agent comes off a:"), "{text:?}");
         assert_eq!(drain_text("a", &[]), ["nothing runs on a: nothing moves"]);
+    }
+
+    #[test]
+    fn nodes_say_their_lan_address_or_that_they_are_on_the_mesh_and_what_they_serve() {
+        use crate::table_row;
+        use kith_api::Resource;
+        let node = |spec: serde_json::Value, status: serde_json::Value| {
+            let node = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "n" },
+                "spec": spec, "status": status,
+            });
+            serde_json::from_value::<Resource>(node).unwrap()
+        };
+        let lan = node(
+            json!({}),
+            json!({ "address": "192.0.2.7:7443", "state": "ready", "serves": { "dns": 53, "ingress": true } }),
+        );
+        assert_eq!(lan.lan_address().map(|ip| ip.to_string()).as_deref(), Some("192.0.2.7"));
+        assert_eq!(table_row(&lan)[4], "ready at 192.0.2.7:7443; serves dns 53, ingress");
+        let roaming = node(
+            json!({ "roaming": true }),
+            json!({ "address": "10.8.0.4:7443", "state": "ready" }),
+        );
+        assert!(roaming.lan_address().is_none());
+        assert_eq!(table_row(&roaming)[4], "ready at 10.8.0.4:7443 (mesh)");
+        let plain = node(
+            json!({}),
+            json!({ "address": "198.51.100.9:7443", "state": "ready", "serves": {} }),
+        );
+        assert_eq!(table_row(&plain)[4], "ready at 198.51.100.9:7443");
     }
 }

@@ -779,13 +779,61 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry, encrypted) };
-        let (served, nodes, (), (), (), (), (), _) =
-            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, storage);
+        let saying = say_serves(shared.clone(), serves(args.dns, args.ingress), stopping.clone());
+        let (served, nodes, (), (), (), (), (), (), _) =
+            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, saying, storage);
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);
     served
+}
+
+/// What this node serves, as its own Node says it (`status.serves`): the DNS port and ingress, or
+/// null when it serves neither, so a start without the flags takes off what the last start said.
+fn serves(dns: Option<std::net::SocketAddr>, ingress: bool) -> serde_json::Value {
+    let mut said = serde_json::Map::new();
+    if let Some(dns) = dns {
+        said.insert("dns".into(), dns.port().into());
+    }
+    if ingress {
+        said.insert("ingress".into(), true.into());
+    }
+    if said.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(said)
+    }
+}
+
+/// Keep what this node says it serves as its flags say, for as long as the node runs.
+async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping: watch::Receiver<bool>) {
+    let Some(cluster) = &shared.cluster else { return };
+    let node = format!("Node/{}", cluster.me.name);
+    loop {
+        // (Not known until the store has this node: asked again until it does.)
+        let says = {
+            let state = shared.store.lock().expect("nothing panics holding the store");
+            let said = |own: &kith_api::Resource| {
+                own.status
+                    .as_ref()
+                    .map_or(serde_json::Value::Null, |s| s["serves"].clone())
+            };
+            state.store.get(&node).map(|own| said(own) == serves)
+        };
+        // Asked on every pass, not once: a whole-status write to this Node would take it off.
+        if says == Some(false) {
+            let fields = serde_json::Map::from_iter([("serves".to_string(), serves.clone())]);
+            let statuses = vec![(node.clone(), fields)];
+            if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
+                eprintln!("kithd: serves: saying what this node serves: {e}");
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+            _ = stopping.changed() => return,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -801,6 +849,74 @@ mod tests {
 
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn serves_says_the_dns_port_and_ingress_and_is_null_when_neither_flag_is_given() {
+        let dns: std::net::SocketAddr = "192.0.2.1:5353".parse().unwrap();
+        assert_eq!(
+            serves(Some(dns), true),
+            serde_json::json!({ "dns": 5353, "ingress": true })
+        );
+        assert_eq!(serves(None, true), serde_json::json!({ "ingress": true }));
+        assert_eq!(serves(Some(dns), false), serde_json::json!({ "dns": 5353 }));
+        // A restart without the flags takes what the last start said off.
+        assert_eq!(serves(None, false), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn serving_lists_the_nodes_that_answer_dns_or_ingress_and_leaves_out_the_unreachable_and_the_unaddressed() {
+        use kith_api::{Resource, store::Store};
+        let nodes = "\
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: c }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: d }
+spec: { roaming: true }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: e }
+spec: {}
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(nodes).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let mut set = |key: &str, status: serde_json::Value| store.set_status(key, Some(status)).unwrap();
+        set(
+            "Node/a",
+            serde_json::json!({ "address": "192.0.2.1:7443", "serves": { "dns": 53, "ingress": true } }),
+        );
+        set(
+            "Node/b",
+            serde_json::json!({ "address": "192.0.2.2:7443", "serves": { "ingress": true }, "state": "unreachable" }),
+        );
+        set(
+            "Node/c",
+            serde_json::json!({ "address": "198.51.100.3:7443", "serves": { "dns": 5353 } }),
+        );
+        set(
+            "Node/d",
+            serde_json::json!({ "address": "10.8.0.4:7443", "serves": { "dns": 53 } }),
+        );
+        set("Node/e", serde_json::json!({ "address": "198.51.100.5:7443" }));
+        let names: Vec<&str> = store.serving().iter().map(|node| node.metadata.name.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+    }
 
     #[test]
     fn args_from_the_config_give_way_to_the_command_lines_and_lists_stay_lists() {
