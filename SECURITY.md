@@ -115,11 +115,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   large, still shows) and a process that takes the port in kithd's place learns no
   password. Its connections, shaken or not, are at most 64 at a time. One on which no byte
   moves for 5 s after its handshake is closed, unless a request on it is being answered: an
-  answer may wait on a copy from another node, so the time does not run then, and that
-  request holds its slot until the answer ends, however long that takes. So a process of the
-  node can still take the registry's slots in turn, keep one with a byte now and then, or
-  hold one on a request, and slow Image pulls. Kithd's other listeners and its open-file
-  limit are not bounded by this. And kithd pulls an Image only for what runs in the Image's
+  answer may wait on a copy from another node, so the time does not run then. A request's
+  head must arrive whole within 5 s of its first byte, and a refused request closes its
+  connection after its 401. What is left: a process of the node can take the registry's
+  slots in turn, each for a few seconds at most, which holds a pull up but does not stop it;
+  and a request it is answering holds its slot until the answer ends, however long that
+  takes. Kithd's other listeners and its open-file limit are not bounded by this. And kithd pulls an Image only for what runs in the Image's
   own namespace: an Image is a packed Volume. Reading kithd's memory is being root on the
   node outside any container, which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory

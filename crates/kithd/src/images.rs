@@ -380,8 +380,12 @@ impl Door {
         }
         let why =
             json!({ "errors": [{ "code": "UNAUTHORIZED", "message": "this registry answers its node's kithd only" }] });
-        // (Basic, and no token realm: there is nowhere else to send the password.)
-        let ask = [(header::WWW_AUTHENTICATE, "Basic realm=\"kithd\"")];
+        // (Basic, and no token realm: there is nowhere else to send the password. And the
+        // connection closes after it: nothing more is answered on one that was refused.)
+        let ask = [
+            (header::WWW_AUTHENTICATE, "Basic realm=\"kithd\""),
+            (header::CONNECTION, "close"),
+        ];
         Some((StatusCode::UNAUTHORIZED, ask, axum::Json(why)).into_response())
     }
 }
@@ -390,13 +394,16 @@ impl Door {
 /// is accepted and kept until it closes; kithd pulls a handful of layers at a time), and
 /// the time a connection may move no byte, from its handshake's end, before it is closed
 /// (while it is answering a request, that time does not run).
-// ponytail: a process of the node can still take the registry's slots in turn, or keep one
-// with a byte now and then, and slow Image pulls: telling peers apart needs their identity,
+// ponytail: a process of the node can still take the registry's slots in turn (a few seconds
+// each), or hold one on a request, and slow Image pulls: telling peers apart needs their identity,
 // which SO_PEERCRED does not give on TCP. A limit per user, or a Unix socket, if that is seen.
 const CONNECTIONS: usize = 64;
 const IDLE: Duration = Duration::from_secs(5);
-/// How long a TLS handshake may take (on the loopback it is milliseconds).
+/// How long a TLS handshake may take (on the loopback it is milliseconds), and how long a
+/// request's head may take to arrive whole (hyper's header read time; a head past 64 KiB is
+/// refused by hyper, too).
 const HANDSHAKE: Duration = Duration::from_secs(2);
+const HEAD: Duration = Duration::from_secs(5);
 
 type Secured = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
 
@@ -422,12 +429,6 @@ struct Answering(Busy);
 impl Drop for Answering {
     fn drop(&mut self) {
         self.0.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Listener>> for Busy {
-    fn connect_info(stream: axum::serve::IncomingStream<'_, Listener>) -> Busy {
-        stream.io().busy.clone()
     }
 }
 
@@ -488,34 +489,12 @@ impl tokio::io::AsyncWrite for Slotted {
 }
 
 /// The registry's connections, each once its handshake is done.
-struct Listener(
-    tokio::sync::mpsc::Receiver<(Slotted, std::net::SocketAddr)>,
-    std::net::SocketAddr,
-);
-
-impl axum::serve::Listener for Listener {
-    type Io = Slotted;
-    type Addr = std::net::SocketAddr;
-
-    async fn accept(&mut self) -> (Slotted, std::net::SocketAddr) {
-        match self.0.recv().await {
-            Some(accepted) => accepted,
-            None => std::future::pending().await,
-        }
-    }
-
-    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        Ok(self.1)
-    }
-}
-
 fn listen(
     tcp: tokio::net::TcpListener,
     tls: Arc<OnceLock<Tls>>,
     bound: usize,
     idle: Duration,
-) -> std::io::Result<Listener> {
-    let at = tcp.local_addr()?;
+) -> tokio::sync::mpsc::Receiver<Slotted> {
     let (tx, ready) = tokio::sync::mpsc::channel(bound);
     let slots = Arc::new(tokio::sync::Semaphore::new(bound));
     tokio::spawn(async move {
@@ -532,7 +511,7 @@ fn listen(
                 () = tx.closed() => return,
                 accepted = tcp.accept() => accepted,
             };
-            let Ok((stream, from)) = accepted else {
+            let Ok((stream, _)) = accepted else {
                 // Out of file descriptors, most likely: let some close.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -550,16 +529,17 @@ fn listen(
                         busy: Busy::default(),
                         _slot: slot,
                     };
-                    let _ = tx.send((stream, from)).await;
+                    let _ = tx.send(stream).await;
                 }
             });
         }
     });
-    Ok(Listener(ready, at))
+    ready
 }
 
 /// `app` on `tcp` behind the door: TLS, and the password before anything of a request
-/// (its path, too) is looked at, whatever it asks for.
+/// (its path, too) is looked at, whatever it asks for. Each connection is served by hyper
+/// itself, so a request's head must arrive whole within `HEAD`.
 async fn behind(
     tcp: tokio::net::TcpListener,
     door: Arc<Door>,
@@ -567,8 +547,8 @@ async fn behind(
     mut stopping: watch::Receiver<bool>,
     bound: usize,
     idle: Duration,
-) -> std::io::Result<()> {
-    let listener = listen(tcp, door.tls.clone(), bound, idle)?;
+) {
+    let mut accepted = listen(tcp, door.tls.clone(), bound, idle);
     let guard = move |request: axum::extract::Request, next: axum::middleware::Next| {
         let door = door.clone();
         async move {
@@ -576,22 +556,42 @@ async fn behind(
                 Some(refused) => refused,
                 None => {
                     // (A refused request is not answered, so it does not hold the idle time off.)
-                    let _answering = request
-                        .extensions()
-                        .get::<axum::extract::connect_info::ConnectInfo<Busy>>()
-                        .map(|axum::extract::connect_info::ConnectInfo(busy)| busy.answering());
+                    let busy = request.extensions().get::<Busy>();
+                    debug_assert!(busy.is_some(), "a connection of the registry carries its Busy");
+                    let _answering = busy.map(|busy| busy.answering());
                     next.run(request).await
                 }
             }
         }
     };
-    let app = app
-        .layer(axum::middleware::from_fn(guard))
-        .into_make_service_with_connect_info::<Busy>();
-    let served = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = stopping.changed().await;
-    });
-    served.await
+    let app = app.layer(axum::middleware::from_fn(guard));
+    // ponytail: hyper's limits, a head within 64 KiB and within HEAD of its first byte; no
+    // other request limit. A slow answer is not bounded here (the copy of a blob may take as long).
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEAD)
+        .max_buf_size(64 * 1024);
+    let mut open = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = stopping.changed() => break,
+            Some(stream) = accepted.recv() => {
+                // (Each connection carries its own Busy, read by the guard.)
+                let service = hyper_util::service::TowerToHyperService::new(
+                    app.clone().layer(axum::Extension(stream.busy.clone())),
+                );
+                let http = http.clone();
+                open.spawn(async move {
+                    let _ = http.serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                });
+            }
+            // (Finished connections are let go as they finish, not kept until the end.)
+            Some(_) = open.join_next(), if !open.is_empty() => {}
+        }
+    }
+    // (Nothing more is accepted; what is open is answered out, as before.)
+    drop(accepted);
+    while open.join_next().await.is_some() {}
 }
 
 /// Serves the cluster's Images on this node's loopback, to kithd's own pulls (no door:
@@ -605,9 +605,7 @@ pub async fn serve(shared: Arc<Shared>, door: Option<Arc<Door>>, stopping: watch
     };
     // (`get` answers HEAD too, without the body.)
     let app = axum::Router::new().fallback(axum::routing::get(move |uri: Uri| answer(shared.clone(), uri)));
-    if let Err(e) = behind(tcp, door, app, stopping, CONNECTIONS, IDLE).await {
-        eprintln!("kithd: registry: {e}");
-    }
+    behind(tcp, door, app, stopping, CONNECTIONS, IDLE).await;
 }
 
 #[cfg(test)]
@@ -974,27 +972,163 @@ mod tests {
 
     /// kithd's pull keeps a connection pooled between its requests: one that is answered,
     /// then left past the idle time, is closed by the registry, and the next request
-    /// (a GET, so safe to send again) is still answered.
+    /// (a GET, so safe to send again) is still answered on a new connection. A proxy in
+    /// between counts the connections the client opens and sees the registry close the first.
     #[tokio::test]
     async fn registry_bounds_a_pull_waits_past_the_idle_time_and_pulls_again() {
         let idle = Duration::from_secs(2);
         let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
         let (door, _stop) = bounded(app, 2, idle).await;
         let (port, password) = (door.local.port, door.local.password.clone());
+        let (opened_by_client, closed_by_registry) = (
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = proxy.local_addr().unwrap().port();
+        let (counted, closed) = (opened_by_client.clone(), closed_by_registry.clone());
+        tokio::spawn(async move {
+            while let Ok((mut from_client, _)) = proxy.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let closed = closed.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut to_registry) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut from_client, &mut to_registry).await;
+                    }
+                    closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
         let trusted = reqwest::Certificate::from_der(&(door.local.certificate)().unwrap()).unwrap();
         let client = reqwest::Client::builder().tls_certs_only([trusted]).build().unwrap();
-        let url = format!("https://localhost:{port}/v2/team/hello/manifests/1");
-        for when in ["first", "again"] {
+        let url = format!("https://localhost:{front}/v2/team/hello/manifests/1");
+        let pull = || async {
             let said = client
                 .get(&url)
                 .basic_auth("kithd", Some(&password))
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(said.status(), 200, "the pull {when}");
-            assert_eq!(said.text().await.unwrap(), "inside", "the pull {when}");
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
+            assert_eq!(said.status(), 200);
+            assert_eq!(said.text().await.unwrap(), "inside");
+        };
+        pull().await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            closed_by_registry.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the registry did not close the connection the first pull left idle"
+        );
+        pull().await;
+        assert_eq!(
+            opened_by_client.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the second pull did not open a connection of its own"
+        );
+    }
+
+    /// A request head that is not complete within the head time closes its connection, which
+    /// gives its slot back: a connection that drips a head one byte a second (the idle time
+    /// is long, so it is not the idle time that closes it) is closed in about the head time,
+    /// and the next connection, on a bound of 1, is then served.
+    #[tokio::test]
+    async fn registry_bounds_a_head_dripped_past_the_head_time_is_closed() {
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let (door, _stop) = bounded(app, 1, Duration::from_secs(60)).await;
+        let (port, password) = (door.local.port, door.local.password.clone());
+        let certificate = (door.local.certificate)().unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut read, mut write) = tokio::io::split(shaken(port, certificate.clone()).await);
+        write
+            .write_all(b"GET /v2/team/quick HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        let dripping = tokio::spawn(async move {
+            for _ in 0..20 {
+                if write.write_all(b"X-Drip: a").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        let began = std::time::Instant::now();
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(20), read.read(&mut byte)).await;
+        dripping.abort();
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "a head dripped past the head time was not closed: {closed:?}"
+        );
+        assert!(
+            (Duration::from_secs(4)..Duration::from_secs(10)).contains(&began.elapsed()),
+            "the head was closed after {:?}, not about the head time",
+            began.elapsed()
+        );
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        let mut second = tokio::time::timeout(Duration::from_secs(10), shaken(port, certificate))
+            .await
+            .expect("the dripped connection's slot was not given back");
+        second
+            .write_all(
+                format!("GET /v2/team/quick HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {basic}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let said = tokio::time::timeout(Duration::from_secs(10), read_inside(&mut second)).await;
+        assert!(
+            matches!(&said, Ok(said) if said.ends_with(b"inside")),
+            "the connection after the dripped head was not answered: {said:?}"
+        );
+    }
+
+    /// An answer that refuses the password closes its connection: nothing more is said on it,
+    /// so a client that sends a request without a password cannot keep the slot it holds.
+    #[tokio::test]
+    async fn registry_bounds_a_refused_request_closes_its_connection() {
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let (door, _stop) = bounded(app, 2, Duration::from_secs(60)).await;
+        let port = door.local.port;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tls = shaken(port, (door.local.certificate)().unwrap()).await;
+        tls.write_all(b"GET /v2/team/quick HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut reply)).await;
+        assert!(ended.is_ok(), "the connection of a refused request was left open");
+        assert!(
+            reply.starts_with(b"HTTP/1.1 401"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// A raw TCP connection that says nothing holds a slot for the handshake time only: the
+    /// next connection, shaken, is served once that time has run out (the bound is 1).
+    #[tokio::test]
+    async fn registry_bounds_a_connection_that_says_nothing_gives_its_slot_back_after_the_handshake() {
+        let app = axum::Router::new().fallback(axum::routing::get(|| async { "inside" }));
+        let (door, _stop) = bounded(app, 1, Duration::from_secs(60)).await;
+        let (port, password) = (door.local.port, door.local.password.clone());
+        let certificate = (door.local.certificate)().unwrap();
+        let _silent = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        let mut next = tokio::time::timeout(Duration::from_secs(10), shaken(port, certificate))
+            .await
+            .expect("a connection that said nothing held its slot past the handshake time");
+        let basic = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
+        next.write_all(
+            format!("GET /v2/team/quick HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {basic}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let said = tokio::time::timeout(Duration::from_secs(10), read_inside(&mut next)).await;
+        assert!(
+            matches!(&said, Ok(said) if said.ends_with(b"inside")),
+            "the connection after the silent one was not answered: {said:?}"
+        );
     }
 
     #[test]

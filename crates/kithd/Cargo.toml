@@ -39,7 +39,7 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 # `kith run` takes the connection over after the 101, and the ingress reads the requests of
 # a host with paths or headers (axum's own dependencies, already built).
 hyper = { version = "1", default-features = false, features = ["http1", "client", "server"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
 # (In the tree already.) ACME speaks base64url.
 base64 = "0.22"
 # Controllers and admission hooks (PLAN 4.10): an interpreter, about 0.9 MB. (wasmtime, which
