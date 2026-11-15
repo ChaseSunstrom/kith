@@ -227,6 +227,8 @@ if [ -n "$test" ] && [ "$test" != init ]; then
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
+        # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
+        [ "$test" != pods ] || more='--mesh --storage-reserve 8388608'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
         # A container image the nodes have without asking anybody (they reach no registry
@@ -758,8 +760,39 @@ EOF
             grep -q 'went on from step 1: step 2' "$work/train-again.out" || fail "the Job run again after the drain did not go on from the first's step: $(cat "$work/train-again.out" "$work/train-again.err")"
             echo "vm.sh: the drain off: the Job ran and went on from the step the first left on its Volume" >&2
 
+            # What a pod writes outside its Volumes is counted (README, resources.storage). NAME,
+            # more of its container, how many bytes it writes to /fill, and what its replacement
+            # says: it is replaced, says why, and starts again from an empty root.
+            fills() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"$1"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"fill","image":"kith.test/pod:1","command":["/bin/pod","fill","/fill","$3"]$2}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload $1 was not applied"
+                waited=0
+                until line=$(units Workload "$1") && printf '%s\n' "$line" | grep -q "$4" \
+                    && any GET "/v1/logs/Workload/default/$1?replica=0" >"$work/$1.out" 2>/dev/null \
+                    && [ "$(grep -o 'fill: an empty root' "$work/$1.out" | wc -l)" -ge 2 ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for $1 to be replaced and start again; it says: $line: $(cat "$work/$1.out")"
+                    sleep 1
+                done
+                ! grep -q 'fill: /fill was there' "$work/$1.out" || fail "$1 started again with what it wrote in its root: $(cat "$work/$1.out")"
+                ! grep -q 'fill: a write failed' "$work/$1.out" || fail "$1 filled its node's state disk before it was replaced: $(cat "$work/$1.out")"
+                grep -aq "kithd: .*$4" "$work"/n?.log || fail "no node said on its console why $1 was replaced"
+                api 1 DELETE "/v1/resources/Workload/default/$1" >/dev/null || fail "the Workload $1 was not deleted"
+                echo "vm.sh: $1 replaced and started again from an empty root: $line" >&2
+            }
+            # Past its limit of 1 MiB at about 128 KiB a second.
+            fills over ',"resources":{"storage":"1Mi"}' 2097152 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
+            # With no limit, writing until its node's disk is full: it is replaced once the disk
+            # has less free than its reserve, and its write never fails.
+            fills full '' 1073741824 'replaced: the node.s state disk has [0-9]* bytes free, under its reserve of 8388608'
+            # Past its limit with a file it removed and holds open: no name to walk to, still counted.
+            fills unlinked ',"resources":{"storage":"1Mi"}' '2097152","unlinked' 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root"
             exit 0
         fi
         if [ "$test" = kube ]; then
