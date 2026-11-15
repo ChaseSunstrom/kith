@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-"""Size and memory budgets (PLAN.md §3.2, §8). CI fails when one is exceeded.
+"""Size, memory and time budgets (PLAN.md §3.2, §8). CI fails when one is exceeded.
 
 Budgets are deliberately tight: raise one only in a commit that says why.
 The plan's ceiling for kithd is 40 MB idle on a 3-node cluster; one idle node
 in agent mode sits far below that, and its budget is set near what it measures
 so that creep shows up long before the ceiling does.
+
+Time budgets are ceilings for a regression, not claims of speed. They are measured
+on the CI runner and set at twice the slowest median of its runs; until then a time
+is printed with no budget and does not fail.
+
+    python3 ci/budgets.py            # sizes, RSS and times, each with its budget
+    python3 ci/budgets.py --times    # the times only: medians of five runs each
+    python3 ci/budgets.py --self-test
 """
+import json
 import os
 import shutil
 import signal
+import socket
+import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,6 +28,7 @@ import time
 
 TARGET = "x86_64-unknown-linux-musl"  # static, as shipped
 MB = 1024 * 1024
+RUNS = 5  # each time is the median of this many runs
 
 # Measured 6.5 MB and 4.0 MB when kithd first ran workloads (API server, store,
 # controller, container runtime, registry client with TLS); 8.2 MB and 5.7 MB with
@@ -34,6 +47,193 @@ KITHD_IDLE_RSS = 9 * MB
 SIZE_BUDGETS = {"kith": 3 * MB, "kithd": KITHD_SIZE * MB}
 # name -> (argv after the binary, max peak RSS in bytes)
 RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
+
+# Seconds, one per timed path. None: no budget yet (set from the CI runner's medians).
+TIME_BUDGETS = {
+    "apply to a running container": None,
+    "a status change reaching a second kithd": None,
+    "one DNS answer from kithd": None,
+}
+# A local image (no registry): a rootfs holding the static kithd, which runs until stopped.
+IMAGE = "local.test/timing:1"
+WORKLOAD = {"apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": {"name": "timing"},
+            "spec": {"replicas": 1, "template": {"containers": [{"name": "main", "image": IMAGE, "command": ["/kithd", "--state", "/s", "--socket", "/s.sock"]}]}}}
+
+
+def over(seconds, budget):
+    """True when a timed run exceeds its budget. No budget yet: nothing is exceeded."""
+    return budget is not None and seconds > budget
+
+
+def wait_until(ok, what, limit=60.0):
+    deadline = time.monotonic() + limit
+    while not ok():
+        if time.monotonic() > deadline:
+            sys.exit(f"{what}: not within {limit:.0f} s")
+        time.sleep(0.005)
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Daemon:
+    """A kithd of its own: state and socket under dir, its log beside them."""
+
+    def __init__(self, bins, dir, *args):
+        os.makedirs(dir, exist_ok=True)
+        self.bins = bins
+        self.socket = os.path.join(dir, "kithd.sock")
+        self.log = open(os.path.join(dir, "kithd.log"), "w")
+        argv = [os.path.join(bins, "kithd"), "--state", os.path.join(dir, "state"), "--socket", self.socket, *args]
+        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
+        wait_until(lambda: os.path.exists(self.socket) or self.proc.poll() is not None, "kithd to serve")
+        if self.proc.poll() is not None:
+            sys.exit(f"kithd did not start: see {self.log.name}")
+
+    def kith(self, *args):
+        argv = [os.path.join(self.bins, "kith"), "--socket", self.socket, *args]
+        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+
+    def apply(self, name, doc):
+        """`kith apply` of doc, written to a file beside the node's state."""
+        path = os.path.join(os.path.dirname(self.socket), name + ".json")
+        with open(path, "w") as f:
+            json.dump(doc, f)
+        return self.kith("apply", "-f", path)
+
+    def stop(self):
+        self.proc.send_signal(signal.SIGTERM)
+        self.proc.wait()
+        self.log.close()
+
+
+def local_image(state, bins):
+    """Makes IMAGE in the state directory of a node that is not yet started."""
+    digest = f"{1:064x}"
+    images = os.path.join(state, "runtime", "images", digest)
+    os.makedirs(os.path.join(images, "rootfs"))
+    shutil.copy(os.path.join(bins, "kithd"), os.path.join(images, "rootfs", "kithd"))
+    with open(os.path.join(images, "config.json"), "w") as f:
+        f.write("{}")
+    os.makedirs(os.path.join(state, "runtime", "refs"))
+    said = {"digest": f"sha256:{digest}", "entrypoint": [], "cmd": [], "env": [], "user": None}
+    with open(os.path.join(state, "runtime", "refs", IMAGE.replace("/", "%2f")), "w") as f:
+        json.dump(said, f)
+
+
+def apply_to_running(bins, dir):
+    """Seconds from `kith apply` of a one-replica Workload to its replica running."""
+    local_image(os.path.join(dir, "state"), bins)
+    node = Daemon(bins, dir)
+    try:
+        began = time.monotonic()
+        node.apply("workload", WORKLOAD)
+        wait_until(lambda: running(node, "timing") == 1, "the container to run")
+        return time.monotonic() - began
+    finally:
+        node.stop()
+
+
+def running(node, name):
+    listing = json.loads(node.kith("get", "Workload", "-o", "json"))
+    return sum(w.get("status", {}).get("ready", 0) for w in listing if w["metadata"]["name"] == name)
+
+
+def crossing(bins, dir):
+    """Seconds from a change written on one kithd until another kithd, joined to it, has it."""
+    address = f"127.0.0.1:{free_port()}"
+    first = Daemon(bins, os.path.join(dir, "a"), "--name", "a", "--listen", address)
+    try:
+        token = first.kith("node", "token").strip()
+        second = Daemon(bins, os.path.join(dir, "b"), "--name", "b", "--join", address, "--token", token)
+        try:
+            def config(value):
+                return {"apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": {"name": "crossing"}, "spec": {"data": {"k": value}}}
+
+            def seen(value):
+                return f'"{value}"' in second.kith("get", "ConfigMap", "-o", "json")
+
+            first.apply("before", config("before"))
+            wait_until(lambda: seen("before"), "the second node to have the ConfigMap")
+            began = time.monotonic()
+            first.apply("after", config("after"))
+            wait_until(lambda: seen("after"), "the change to reach the second node")
+            return time.monotonic() - began
+        finally:
+            second.stop()
+    finally:
+        first.stop()
+
+
+def dns_query(name):
+    """A DNS query for the A record of name, as bytes."""
+    labels = b"".join(bytes([len(p)]) + p.encode() for p in name.split("."))
+    return struct.pack(">HHHHHH", 0x5151, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack(">HH", 1, 1)
+
+
+def dns_answer(bins, dir):
+    """Seconds from `kith apply` of a DNSRecord to kithd's answer carrying its address."""
+    port = free_port()
+    node = Daemon(bins, dir, "--dns", f"127.0.0.1:{port}")
+    try:
+        node.apply("zone", {"apiVersion": "kith.dev/v1", "kind": "DNSZone", "metadata": {"name": "home"}, "spec": {"domain": "home.example"}})
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.settimeout(0.05)
+
+            def reply(name):
+                udp.sendto(dns_query(name), ("127.0.0.1", port))
+                try:
+                    return udp.recv(512)
+                except TimeoutError:
+                    return b""
+
+            wait_until(lambda: reply("warm.home.example") != b"", "kithd to answer")
+            address = socket.inet_aton("192.168.1.20")
+            record = {"apiVersion": "kith.dev/v1", "kind": "DNSRecord", "metadata": {"name": "nas"},
+                      "spec": {"zone": "home", "name": "nas", "type": "A", "values": ["192.168.1.20"]}}
+            began = time.monotonic()
+            node.apply("record", record)
+            wait_until(lambda: address in reply("nas.home.example"), "the answer to carry the record", limit=30)
+            return time.monotonic() - began
+    finally:
+        node.stop()
+
+
+TIMED = {
+    "apply to a running container": apply_to_running,
+    "a status change reaching a second kithd": crossing,
+    "one DNS answer from kithd": dns_answer,
+}
+
+
+def medians(bins, tmp, runs):
+    """name -> (median seconds, every run in seconds) for the three timed paths."""
+    found = {}
+    for name, measure in TIMED.items():
+        times = []
+        for i in range(runs):
+            dir = os.path.join(tmp, f"{name.split()[0]}-{i}")
+            times.append(measure(bins, dir))
+        found[name] = (statistics.median(times), times)
+    return found
+
+
+def check(name, what, actual, limit):
+    ok = actual <= limit
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: {what} {actual / MB:.2f} MB (budget {limit / MB:.2f} MB)")
+    return ok
+
+
+def check_time(name, seconds, budget):
+    if budget is None:
+        print(f"time {name}: {seconds * 1000:.1f} ms (no budget yet: printed, not enforced)")
+        return True
+    ok = not over(seconds, budget)
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: {seconds * 1000:.1f} ms (budget {budget * 1000:.1f} ms)")
+    return ok
 
 
 def peak_rss(argv, env):
@@ -79,39 +279,42 @@ def musl_cc(env):
     return {**env, var: wrapper}
 
 
-def check(name, what, actual, limit):
-    ok = actual <= limit
-    print(f"{'ok  ' if ok else 'FAIL'} {name}: {what} {actual / MB:.2f} MB (budget {limit / MB:.2f} MB)")
-    return ok
-
-
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
     self_test = "--self-test" in sys.argv
+    bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
     with tempfile.TemporaryDirectory() as tmp:
         build_env = musl_cc(os.environ.copy())
         for binary in SIZE_BUDGETS:
             package = "kith-cli" if binary == "kith" else binary
             build = ["cargo", "build", "--release", "--quiet", "--target", TARGET, "-p", package]
             subprocess.run(build, check=True, env=build_env)
-    bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
-    results = []
-    for binary, limit in SIZE_BUDGETS.items():
-        size = os.path.getsize(os.path.join(bin_dir, binary))
-        results.append(check(binary, "binary size", size, 1 if self_test else limit))
-    with tempfile.TemporaryDirectory() as tmp:
+        if "--times" in sys.argv:
+            # The same three paths, unjudged: the numbers the budgets are set from.
+            print(f"load {os.getloadavg()[0]:.1f} on {os.cpu_count()} CPUs")
+            for name, (median, times) in medians(bin_dir, tmp, RUNS).items():
+                runs = ", ".join(f"{t * 1000:.1f}" for t in times)
+                print(f"{name}: median {median * 1000:.1f} ms of {RUNS} runs ({runs} ms)")
+            return
+        results = []
+        for binary, limit in SIZE_BUDGETS.items():
+            size = os.path.getsize(os.path.join(bin_dir, binary))
+            results.append(check(binary, "binary size", size, 1 if self_test else limit))
         env = {**os.environ, "KITH_STORE": os.path.join(tmp, "store.json")}
         for name, (args, limit) in RSS_BUDGETS.items():
             rss = peak_rss([os.path.join(bin_dir, "kith"), *args], env)
             results.append(check(name, "peak RSS", rss, 1 if self_test else limit))
         rss = idle_rss(os.path.join(bin_dir, "kithd"), tmp)
         results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
+        for name, (median, _) in medians(bin_dir, tmp, 1 if self_test else RUNS).items():
+            budget = 0.001 if self_test else TIME_BUDGETS[name]
+            results.append(check_time(name, median, budget))
     if self_test:
-        # With 1-byte budgets every check must fail; otherwise the checks check nothing.
+        # With 1-byte and 1 ms budgets every check must fail; otherwise the checks check nothing.
         if any(results):
-            sys.exit("self-test failed: a check passed against a 1-byte budget")
-        print("self-test ok: every check fails against a 1-byte budget")
+            sys.exit("self-test failed: a check passed against a 1-byte or 1 ms budget")
+        print("self-test ok: every check fails against a 1-byte or 1 ms budget")
     elif not all(results):
         sys.exit(1)
 

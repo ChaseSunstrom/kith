@@ -29,6 +29,9 @@ jobs:
         run: python3 ci/budgets.py --self-test
       - name: Binary-size and RSS budgets
         run: python3 ci/budgets.py
+      # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
+      - name: Times on the CI runner (printed, not enforced)
+        run: python3 ci/budgets.py --times
       # Compares files only: the page, docs/numbers.json, ci/compare.txt and the README's drawings.
       - name: The website shows the numbers that were measured
         run: python3 ci/site_numbers.py --check
