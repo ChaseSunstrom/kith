@@ -219,13 +219,26 @@ Only the newest version is fixed. There are no security releases of older ones.
   size and unpacks it as a hole), and the unpack stops, with the Volume empty (or a
   replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
   downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
-  it is unpacked. An unpack keeps each directory of the archive in memory until the end
-  (well under 1 KiB each): bounded by the cap at one directory per 4 KiB of the Volume's
-  `size`, and by nothing for a Volume with no `size`, which is not capped at all. There is
-  no quota on the directory and no count of inodes. A restore from S3 that is refused
-  leaves the downloaded archive (up to twice the `size` and 1 MiB) in the node's blob
-  store until blobs are next cleaned up. A sync of a Volume that is gone from the store
-  (or whose spec does not parse) takes nothing and says so.
+  it is unpacked. An unpack holds only the directories the archive is inside of, a path,
+  a mode and a time each, and refuses an entry more than 128 directories down (as deep
+  as a Backup packs, so what a restore takes is backed up again); an entry's headers (its name, and a long name, PAX header or sparse map the tar crate
+  reads whole) are refused past 256 KiB, and an archive that ends inside an entry is
+  refused: its memory does not grow with the archive. An unpack that fails opens what
+  it unpacked to its owner and removes it, holding open only the directories it is
+  inside of, through no link, and one that finds such a leftover beside the Volume does
+  the same first. Each directory is made when it comes, stays open to its owner while
+  the archive is inside it, and is given its mode and time when the archive leaves it,
+  through no link: one whose path leads elsewhere by then is left as it is. An archive
+  in depth-first order (kith's own, GNU tar's) unpacks with every directory's mode,
+  owner and time; one that is not leaves its directories' times as the unpack left
+  them, and where kithd is not root, an entry that comes after the archive left a
+  directory that shuts its owner out is refused. A restore unpacks into a directory
+  beside the Volume, `.NAME.restoring` (a dot no Volume's name starts with), and renames
+  it over the Volume's empty one: a move that fails leaves the Volume's directory as it
+  was, mode and owner too. There is no quota on the directory and no count of inodes. A
+  restore from S3 unpacks from its download, which is removed once the unpack is done or
+  refused. A sync of a Volume that is gone from the store (or whose spec does not parse)
+  takes nothing and says so.
 - **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
   apply a Volume and a Workload in its namespace, checked on the node that is asked; the
   node that has the Volume takes the request from that node as it takes any other node's.
@@ -271,6 +284,46 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **What a replica writes outside its Volumes is counted, not held at the write.** Its
+  containers' writable roots and its disk scratch share the node's state disk, with no
+  quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`
+  limit, and every pod while the disk has less than twice its reserve free) and replaces
+  a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
+  5% of it and at most 1 GiB unless said where kithd is root, none where it is not), the
+  one that wrote the most, if that is a tenth of the reserve or more. That one goes even
+  when the disk is low for a cause that is no replica's root (kithd's own store, logs and
+  Images, and Volumes, count against no replica), and then the next, one a count, once
+  what the last wrote is gone. A fast writer is not stopped between two counts: at the
+  disk's speed it can write past its limit, or fill the disk, before a count sees it, and
+  then kithd's store, logs and other replicas' writes fail until it is replaced. A count
+  starts at least 10 seconds after the last ended and counts the replicas one after another, each
+  in 5 seconds at most: on a slow disk 20 replicas take up to 110 seconds between a
+  write and its replica's replacement. A count walks every file by directory handle, not following links, each file
+  once however many names it has, and adds each removed file a process of the replica
+  still holds open (or maps) on those disks. A removed file held only by a descriptor in
+  flight (sent over a socket with SCM_RIGHTS, then closed) is open in no process and
+  counts nothing, against the limit or the reserve: nothing in kithd stops a replica
+  filling the disk so, only the blocks the filesystem keeps for root. One whose
+  descriptor another replica's process holds (a socket in a shared Volume) counts against
+  that replica, not its writer. A limited replica whose count does not end in 5 seconds,
+  or reaches 128 directories deep, two counts in a row, is replaced (once may be a slow
+  disk, slow for every replica): one with millions of small files is, though under its
+  limit. One whose counts end so every other time is not replaced for that, though what
+  each walked counts against its limit. An unlimited one so counted counts what was walked.
+  A count or removal runs on a thread that cannot be killed: one stuck on a disk that does
+  not answer is said after a minute, and until it ends no replica is limited (a count) or
+  replaced for the reserve (a removal). An empty
+  file costs the disk an inode and the count nothing, and a directory kithd cannot read
+  (where it is not root) is passed over, as is a held-open file it cannot look at. A file
+  removed from a Volume on the state disk but held open counts against the replica (more
+  than it wrote outside its Volumes, never less). A process that cannot be killed keeps
+  its replica's replacement waiting, and no replica is replaced for the reserve meanwhile.
+  A count can count a file twice (moved between the walk and the look at open files) and
+  counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
+  gives up between files, and kithd waits 2 seconds for it so the state disk can be
+  unmounted; one directory set aside is removed in one call, which a stop does not cut
+  short. What is left is removed at its replica's next count. A limit held at
+  the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
   that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound
@@ -600,7 +653,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   (above), but a Volume with no `size` is not capped: a bucket someone else writes can
   fill a node's disk through a restore into such a Volume. The primary's copy route builds
   its archive with no cap of its own; the replica that takes it is what stops at the
-  size (and a replica of a Volume with no `size` stops at nothing). (T-0230.)
+  size (and a replica of a Volume with no `size` stops at nothing). (T-0230.) An archive
+  that is not in depth-first order, which kith does not make, is restored with its
+  directories' times as the unpack left them, and where kithd is not root one whose
+  directory shuts its owner out before all of it is unpacked is refused. A restored
+  Volume's directory is the one the unpack made beside it, with kithd's mode and owner,
+  not the empty one it took the place of. (T-0380.)
 - **A node with no release key trusts the key of the first OSRelease it takes.** Build
   the image with one (`KITH_RELEASE_KEY`, kept in the signed root) or give it at
   install (`releaseKey`), and that first release must be signed by it. A node with

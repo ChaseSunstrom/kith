@@ -90,6 +90,11 @@ impl Incoming {
         self.file.write_all(bytes)
     }
 
+    /// Where the bytes are until they are kept, and gone once this is dropped.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The file under its name, on disk. `expected`: the name the bytes must hash to.
     pub fn keep(self, expected: Option<&str>) -> Result<(String, u64), String> {
         let name = self.hasher.finalize().to_hex()[..62].to_string();

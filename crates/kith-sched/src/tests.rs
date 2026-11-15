@@ -112,6 +112,7 @@ fn filters_each_turn_a_node_away() {
                 n.spec.reserved = Some(Resources {
                     cpu: Some(quantity("1500m")),
                     memory: None,
+                    storage: None,
                 });
                 n.capacity.cpu = 2.0;
             },
@@ -454,6 +455,7 @@ fn random_cluster(rng: &mut Lcg) -> (Vec<Node>, Vec<Replica>) {
             n.spec.reserved = Some(Resources {
                 cpu: Some(quantity("500m")),
                 memory: Some(quantity("512Mi")),
+                storage: None,
             });
         }
         nodes.push(n);

@@ -189,7 +189,8 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   images of one Alpine base took 44% less disk here, and unpacked 4 to 6% slower (each
   file is read once more to find its equals, on up to four threads; on one thread it
   was a quarter slower).
-  Memory and CPU limits, `command`/`args`, and `env`
+  Memory and CPU limits, a limit on what a replica writes (`resources.storage`,
+  [below](#a-replica-as-a-pod)), `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
   had run for a minute), then after a wait that doubles from a second up to a
@@ -417,14 +418,31 @@ spec:
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
+- **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
+  replica writes outside its Volumes: its containers' roots and its scratch on the state
+  disk, counted together against the sum of their limits, with a file it removed that
+  one of its processes still holds open. kithd counts about every 10 seconds, and a
+  replica past it is replaced: each container is started again from an empty root and
+  an empty scratch, and its status says how much it wrote. A limited replica whose files
+  cannot all be counted in 5 seconds, or that nests directories 128 deep, two counts in
+  a row, is replaced too, and says so. A node keeps part of its state disk free
+  (`--storage-reserve BYTES`; where kithd is root, 5% of the disk and at most 1 GiB
+  unless said; 0 for none, and where it is not): under it, the replica that wrote the
+  most (a tenth of the reserve at least) is replaced, limit or none, one a count, once
+  what the last one replaced wrote is gone, even when what filled the disk is no
+  replica's root: kithd's own store, logs and Images, and Volumes, count against no
+  replica. The limit is counted, not held at the write: between two counts a fast writer
+  can pass it, a removed file held only by a descriptor in flight on a socket counts
+  nothing, and a kithd that is not root counts only what it can read (SECURITY.md). (`storage` limits a container only:
+  a Node's `reserved`, a seat's `reserve` and a Namespace's `quota` refuse it.)
 - **The image's user.** Each container is the user its image names, root included,
   with the capabilities a container runtime gives root and no more, in namespaces
   and a root of its own and behind the same filter on system calls as every container.
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
 - Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace); what a pod writes to its root has
-  no quota; the range pods' addresses are taken from is fixed.
+  capabilities and the filter (no user namespace); the range pods' addresses are taken
+  from is fixed.
 
 ### What a container is given
 
@@ -484,8 +502,10 @@ spec:
   to the container's user, and go when the replica does.
 - **A scratch** is an empty directory that the containers of one replica which name
   it share. It outlives a container that is restarted and goes with its replica. On
-  the state disk it has no quota; in memory, what is written counts as the memory of
-  the container that wrote it. (`emptyDir.sizeLimit` is taken and limits nothing.)
+  the state disk it counts toward its replica's `resources.storage` (and the reserve);
+  in memory, what is written counts as the memory of the container that wrote it. (A
+  disk `emptyDir`'s `sizeLimit` is added to the storage of the first container that
+  mounts it; a memory one's limits nothing.)
 - **`envFrom`** gives every key of a ConfigMap or a Secret as a variable (one that
   cannot name a variable, with a `=` in it, is passed over); a variable in `env` of the
   same name wins. As with `env`, a changed value replaces the container.
@@ -502,7 +522,7 @@ spec:
   starts, with the reason in its status. **`dropCapabilities`** takes capabilities
   (`NET_RAW`, without `CAP_`) from whatever the container would have had: a pod's root
   has fourteen, root on kith OS three, anyone else none or one.
-- Not yet: `subPath` of a volume or of a scratch; a size limit for a scratch; a mode
+- Not yet: `subPath` of a volume or of a scratch; a mode
   for one file among the others. Where kithd is not root, the files of a map are your
   user's, which is the one user its containers have.
 
@@ -1404,7 +1424,8 @@ Not answered, each refused in words:
   `emptyDir`, and an initContainer with a `restartPolicy` (a sidecar). What a chart
   commonly says is carried, as [kith's own fields](#what-a-container-is-given):
   volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
-  `initContainers`, `runAsNonRoot` and dropped capabilities.
+  `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage`
+  with a disk `emptyDir`'s `sizeLimit` as `resources.storage`.
 - A StatefulSet with a claim template and more than one replica; a CronJob in a
   time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
 - `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
@@ -3693,11 +3714,18 @@ kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it h
 3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
 was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
 builds: a breakpoint on every function, taken off the first time it is hit, so each one
-that runs is seen once and in order (x86_64 Linux). A name is matched whatever a
-`cargo update` or a new compiler makes of the letters Rust writes before each crate's
-name, so the file outlives most of those; code written since is not in it, and
-`python3 ci/order.py --check`, which CI runs, fails once under four fifths of its
-names are still in kithd, or are not together where its code starts. A toolchain with
+that runs is seen once and in order (x86_64 Linux). The file holds each name as a
+pattern, without what an ordinary change gives another value: the letters Rust writes
+before each crate's name (a `cargo update` or a new compiler changes them), the number
+of an `impl` in its module (one more for every `impl` written above it) and the number
+the compiler ends a copy of a function with. So the file outlives most changes; code
+written since is not in it, and each function kithd runs at start that is left where
+the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
+--check`, which CI runs, fails once under 95 in 100 of its names are still in kithd,
+or under four fifths of those are together where its code starts. The order is of
+one compiler, the one `rust-toolchain.toml` names (rustup installs it by itself):
+Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held
+5.96 MB. After naming another there, run `python3 ci/order.py` again. A toolchain with
 no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
 again (the check then fails, saying there is no lld).
 

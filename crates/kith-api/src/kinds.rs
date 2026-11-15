@@ -128,6 +128,10 @@ spec! {
         pub cpu: Option<Quantity>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub memory: Option<Quantity>,
+        /// What a container's pod may write outside its Volumes, in bytes: its writable root
+        /// and its disk scratch, counted together for the pod. Past it the pod is replaced.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub storage: Option<Quantity>,
     }
 
     // ---- Cluster, Node, Namespace ----
@@ -1281,12 +1285,10 @@ impl Spec for ClusterSpec {
 
 no_checks!(
     BlobSpec,
-    NodeSpec,
     NetworkPolicySpec,
     VolumeClaimSpec,
     ConfigMapSpec,
     SecretSpec,
-    SeatSpec,
     DeviceSpec,
     PackageSpec,
     ReleaseSpec,
@@ -1297,6 +1299,29 @@ no_checks!(
     RoleBindingSpec,
     IdentitySpec,
 );
+
+/// `storage` limits a container's pod alone: in the Resources a node keeps back, a namespace's
+/// quota or a seat's reserve, `field`, it would look like a limit and limit nothing.
+fn storage_unread(field: &str, resources: &Option<Resources>) -> Result<(), String> {
+    match resources.as_ref().is_some_and(|r| r.storage.is_some()) {
+        true => Err(format!(
+            "{field}.storage: is not read here: it limits what a container's pod writes, in the container's resources"
+        )),
+        false => Ok(()),
+    }
+}
+
+impl Spec for NodeSpec {
+    fn check(&self) -> Result<(), String> {
+        storage_unread("reserved", &self.reserved)
+    }
+}
+
+impl Spec for SeatSpec {
+    fn check(&self) -> Result<(), String> {
+        storage_unread("reserve", &self.reserve)
+    }
+}
 
 /// A kind's name: letters and digits, a capital first (`GameServer`).
 pub(crate) fn kind_name(name: &str) -> Result<(), String> {
@@ -1731,6 +1756,19 @@ impl Template {
         for vm in &self.vms {
             vm.check().map_err(|e| format!("{at}, vm `{}`: {e}", vm.name))?;
         }
+        let stored = |r: &Option<Resources>| r.as_ref().is_some_and(|r| r.storage.is_some());
+        if let Some(e) = self.exec.iter().find(|e| stored(&e.resources)) {
+            return Err(format!(
+                "{at}, exec `{}`: resources.storage: an exec unit has no root of its own to count",
+                e.name
+            ));
+        }
+        if let Some(vm) = self.vms.iter().find(|vm| stored(&vm.resources)) {
+            return Err(format!(
+                "{at}, vm `{}`: resources.storage: a VM writes to its disks, not to a root of its own",
+                vm.name
+            ));
+        }
         if self.confidential == Some(true) {
             if self.containers().next().is_some() || !self.exec.is_empty() {
                 return Err(format!(
@@ -1806,6 +1844,14 @@ impl Template {
             }
             if c.run_as_non_root == Some(true) && c.run_as_user == Some(0) {
                 return Err(format!("{at}: runAsNonRoot, and runAsUser: 0 is root"));
+            }
+            if let Some(storage) = c.resources.as_ref().and_then(|r| r.storage.as_ref())
+                && storage.bytes().is_none()
+            {
+                return Err(format!(
+                    "{at}: resources.storage: `{}` is not a whole number of bytes from 1 to 2^53 - 1",
+                    String::from(storage.clone())
+                ));
             }
             for mount in &c.volume_mounts {
                 mount
@@ -2002,6 +2048,7 @@ fn header_refused(name: &str, value: &str) -> Option<String> {
 
 impl Spec for NamespaceSpec {
     fn check(&self) -> Result<(), String> {
+        storage_unread("quota", &self.quota)?;
         for host in &self.hosts {
             let name = host.strip_prefix("*.").unwrap_or(host);
             if !dns_name(name) {
