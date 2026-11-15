@@ -1286,8 +1286,9 @@ EOF
             echo "vm.sh: the admin writing through n2 and n3" >&2
 
             # n2 is cut off from the others (its card on the cluster's network unplugged), so
-            # it does not hear of the deletion; the RoleBinding is deleted through n1, the node
-            # the cluster started on.
+            # it does not hear of the deletion; the RoleBinding is deleted through n1, whichever
+            # of n1 and n3 leads then. (Had n2 led, it leads no more once it is plugged back:
+            # its write is then passed on to the one that does, and refused there all the same.)
             monitor 2 'set_link lan off'
             sleep 2
             begun=$(date +%s.%N)
@@ -1340,7 +1341,8 @@ if kept:
 if not after:
     wrong.append("no write was begun after the deletion: the test showed nothing")
 if code != "422" or "decided again" not in late:
-    wrong.append(f"the write n2 let through while it was cut off was not refused where the log is kept: {code} {late[:300]}")
+    wrong.append(f"the write n2 let through while it was cut off was not refused where the log is kept: {code} {late[:300]}"
+                 + (" (it waited on a log no majority held: n2 may have led when it was cut off, and kept leading past the 10 s it waits; run again)" if code == "500" and "no leader" in late else ""))
 if wrong:
     sys.exit("; ".join(wrong))
 print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by all three nodes; none of the {len(after)} begun after the deletion was acknowledged or kept, and the one n2 let through while cut off was refused by the leader")
