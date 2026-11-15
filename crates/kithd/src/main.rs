@@ -217,23 +217,33 @@ fn main() -> ExitCode {
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
         installer(boot.expect("there is one"), source);
     }
+    let config = boot.as_mut().map(|boot| std::mem::take(&mut boot.args));
     // (As the first process, a mistake in its arguments is clap's to say, and then a restart.)
-    let args = if first {
-        use clap::{CommandFactory, FromArgMatches};
-        // What the node's config says, then the command line's own, which is the last word.
-        let mut given = init::arguments(std::env::args());
-        let config = boot
-            .as_mut()
-            .map(|boot| std::mem::take(&mut boot.args))
-            .unwrap_or_default();
-        given.splice(1..1, config);
-        let matched = Args::command().args_override_self(true).try_get_matches_from(given);
-        matched
-            .and_then(|matched| Args::from_arg_matches(&matched))
-            .map_err(|e| e.to_string())
-    } else {
-        Ok(Args::parse())
+    let read = move || {
+        if first {
+            use clap::{CommandFactory, FromArgMatches};
+            // What the node's config says, then the command line's own, which is the last word.
+            let mut given = init::arguments(std::env::args());
+            given.splice(1..1, config.unwrap_or_default());
+            let matched = Args::command().args_override_self(true).try_get_matches_from(given);
+            matched
+                .and_then(|matched| Args::from_arg_matches(&matched))
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(Args::parse())
+        }
     };
+    // On a thread of their own: clap builds its command on the stack (70 kB of it), and that
+    // thread's stack goes back when it ends; this one's stays for as long as the daemon runs.
+    // (A thread that cannot be made is a start that failed, like a mistake in the arguments.)
+    let args = std::thread::Builder::new()
+        .spawn(read)
+        .map_err(|e| format!("reading the arguments: {e}"))
+        .and_then(|read| {
+            read.join()
+                .map_err(|_| "reading the arguments: it panicked".to_string())
+        })
+        .and_then(|args| args);
     let done = args.and_then(|args| run(args, boot));
     if let Err(msg) = &done {
         eprintln!("kithd: {msg}");
@@ -716,7 +726,14 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let lost_after = std::time::Duration::from_secs(args.lost_after);
             let scheduler = sched::run(shared.clone(), lost_after, stopping.clone());
             let view = view::follow(shared.clone(), state.clone(), args.ingress, stopping.clone());
-            let (served, (), (), (), (), ()) = tokio::join!(served, members, registered, pings, scheduler, view);
+            let (served, (), (), (), (), ()) = tokio::join!(
+                served,
+                apart(members),
+                apart(registered),
+                apart(pings),
+                apart(scheduler),
+                apart(view)
+            );
             served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {
@@ -742,16 +759,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone());
             let crons = cron::run(shared.clone(), stopping.clone());
             tokio::join!(
-                units,
-                releases,
-                repositories,
-                sources,
-                controllers,
-                plans,
-                system,
-                key,
-                hardware,
-                crons
+                apart(units),
+                apart(releases),
+                apart(repositories),
+                apart(sources),
+                apart(controllers),
+                apart(plans),
+                apart(system),
+                apart(key),
+                apart(hardware),
+                apart(crons)
             );
         };
         let names = async {
@@ -790,15 +807,42 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let images = images::run(shared.clone(), state.clone(), stopping.clone());
         let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
-        let storage = async { tokio::join!(shares, blobs, backups, replicas, images, registry, encrypted) };
+        let storage = async {
+            tokio::join!(
+                apart(shares),
+                apart(blobs),
+                apart(backups),
+                apart(replicas),
+                apart(images),
+                apart(registry),
+                apart(encrypted)
+            )
+        };
         let saying = say_serves(shared.clone(), serves(args.dns, args.ingress), stopping.clone());
-        let (served, nodes, (), (), (), (), (), (), _) =
-            tokio::join!(server, nodes, work, names, mesh, proxy, ingress, saying, storage);
+        let (served, nodes, (), (), (), (), (), (), _) = tokio::join!(
+            server,
+            apart(nodes),
+            apart(work),
+            apart(names),
+            apart(mesh),
+            apart(proxy),
+            apart(ingress),
+            apart(saying),
+            apart(storage)
+        );
         let _ = shared.raft.shutdown().await;
         served.map_err(|e| fail("serving", &e)).and(nodes)
     });
     let _ = std::fs::remove_file(&socket);
     served
+}
+
+/// `loops`, kept by itself and polled through a pointer. Every loop of the daemon is joined
+/// into one future; polled in line, each loop's working room was a part of that one future's
+/// stack frame (87 kB of it, touched at every poll, so held for as long as the daemon runs).
+/// Apart, a loop's frame is there while it is polled and the next one's takes its place.
+fn apart<'a, T>(loops: impl Future<Output = T> + 'a) -> std::pin::Pin<Box<dyn Future<Output = T> + 'a>> {
+    Box::pin(loops)
 }
 
 /// What this node serves, as its own Node says it (`status.serves`): the DNS port and ingress, or

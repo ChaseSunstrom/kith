@@ -242,6 +242,33 @@ pub struct Replica {
     pub id: NodeId,
 }
 
+/// Raft's settings. Every field is said here: openraft's `Default` reads its own with a
+/// command line parser, which a node would then run, deep on its stack, each time it starts
+/// (the test `settings_are_openrafts_but_for_ours` holds the rest to openraft's).
+#[allow(deprecated)] // (`send_snapshot_timeout`: a field still, and so said.)
+fn settings() -> openraft::Config {
+    openraft::Config {
+        cluster_name: "kith".into(),
+        // Slow enough for a node behind a home uplink, fast enough that a dead leader is
+        // replaced within a few seconds.
+        heartbeat_interval: 250,
+        election_timeout_min: 1000,
+        election_timeout_max: 2000,
+        // Status updates are log entries too: keep the log short.
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
+        max_in_snapshot_log_to_keep: 100,
+        install_snapshot_timeout: 200,
+        send_snapshot_timeout: 0,
+        max_payload_entries: 300,
+        replication_lag_threshold: 5000,
+        snapshot_max_chunk_size: 3 * 1024 * 1024,
+        purge_batch_size: 1,
+        enable_tick: true,
+        enable_heartbeat: true,
+        enable_elect: true,
+    }
+}
+
 /// Open (or create) the replica kept in `dir` and start Raft on it. A new directory
 /// becomes node `id`; an old one stays the node it was. `changed` is called with every
 /// change to the state, while the state is locked.
@@ -276,19 +303,7 @@ where
     let log = Log::open(&dir.join("log.redb"))?;
     let machine = Machine::open(dir, changed)?;
     let state = machine.state.clone();
-    let config = openraft::Config {
-        cluster_name: "kith".into(),
-        // Slow enough for a node behind a home uplink, fast enough that a dead leader is
-        // replaced within a few seconds.
-        heartbeat_interval: 250,
-        election_timeout_min: 1000,
-        election_timeout_max: 2000,
-        // Status updates are log entries too: keep the log short.
-        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(1000),
-        max_in_snapshot_log_to_keep: 100,
-        ..Default::default()
-    };
-    let config = Arc::new(config.validate().map_err(|e| format!("raft settings: {e}"))?);
+    let config = Arc::new(settings().validate().map_err(|e| format!("raft settings: {e}"))?);
     let raft = Raft::new(id, config, network, log, machine).await;
     let raft = raft.map_err(|e| format!("starting the store in {}: {e}", dir.display()))?;
     Ok(Replica { raft, state, id })
