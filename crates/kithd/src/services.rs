@@ -2267,4 +2267,169 @@ spec:
             assert!(probed.is_empty() && wanted.is_empty());
         }
     }
+
+    /// T-0326, step 1: a measurement, not a test of kithd. Twenty clients that each wait
+    /// for their answer reach an echoing replica through two "nodes", each on a thread of
+    /// its own. With a connection between the nodes for each client (as [`carry`] has it)
+    /// every request is a write of its own. With one link and one writer that takes
+    /// whatever frames wait: how many requests share a write, and so a segment, and so one
+    /// encrypted packet on the mesh? Prints both; asserts nothing about times.
+    #[test]
+    #[ignore = "a measurement: cargo test -p kithd --bin kithd link_trial -- --ignored --nocapture"]
+    fn link_trial_requests_that_share_a_write() {
+        use std::sync::atomic::AtomicUsize;
+        const CLIENTS: usize = 20;
+        const REQUEST: usize = 100;
+        const FOR: Duration = Duration::from_secs(3);
+        static WRITES: AtomicUsize = AtomicUsize::new(0);
+        static FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+        /// One link for every one of `locals`: a frame is which of them, a length and bytes.
+        async fn link(link: TcpStream, locals: Vec<TcpStream>) {
+            link.set_nodelay(true).unwrap();
+            let (from, mut to) = link.into_split();
+            let (waiting, mut waits) = mpsc::unbounded_channel::<Vec<u8>>();
+            let mut outs = Vec::new();
+            for (id, local) in locals.into_iter().enumerate() {
+                local.set_nodelay(true).unwrap();
+                let (mut read, write) = local.into_split();
+                outs.push(write);
+                let waiting = waiting.clone();
+                tokio::spawn(async move {
+                    let mut chunk = [0; 4096];
+                    while let Ok(n @ 1..) = read.read(&mut chunk).await {
+                        let mut frame = (id as u16).to_be_bytes().to_vec();
+                        frame.extend_from_slice(&(n as u16).to_be_bytes());
+                        frame.extend_from_slice(&chunk[..n]);
+                        if waiting.send(frame).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            // The one writer: whatever waits, of every stream, in one write.
+            tokio::spawn(async move {
+                let mut frames = Vec::new();
+                while waits.recv_many(&mut frames, 256).await > 0 {
+                    FRAMES.fetch_add(frames.len(), Ordering::Relaxed);
+                    WRITES.fetch_add(1, Ordering::Relaxed);
+                    if to.write_all(&frames.concat()).await.is_err() {
+                        return;
+                    }
+                    frames.clear();
+                }
+            });
+            let mut from = BufReader::new(from);
+            while let Ok(id) = from.read_u16().await {
+                let Ok(size) = from.read_u16().await else { return };
+                let mut bytes = vec![0; usize::from(size)];
+                if from.read_exact(&mut bytes).await.is_err() || outs[usize::from(id)].write_all(&bytes).await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        /// Requests answered in [`FOR`] by `CLIENTS` clients through two nodes, `shared`
+        /// (one link) or with a connection between the nodes for each.
+        fn run(shared: bool) -> usize {
+            let on = |name: &str| thread(format!("trial-{name}")).unwrap();
+            let (near, far, replicas, clients) = (on("near"), on("far"), on("replica"), on("clients"));
+            let bound = |on: &tokio::runtime::Handle| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let at = listener.local_addr().unwrap();
+                let _in = on.enter();
+                (TcpListener::from_std(listener).unwrap(), at)
+            };
+            let (replica, replica_at) = bound(&replicas);
+            let (there, there_at) = bound(&far);
+            let (here, here_at) = bound(&near);
+            replicas.spawn(async move {
+                while let Ok((mut client, _)) = replica.accept().await {
+                    client.set_nodelay(true).unwrap();
+                    tokio::spawn(async move {
+                        let (mut read, mut write) = client.split();
+                        let _ = tokio::io::copy(&mut read, &mut write).await;
+                    });
+                }
+            });
+            let to_replica = move || async move {
+                let replica = TcpStream::connect(replica_at).await.unwrap();
+                replica.set_nodelay(true).unwrap();
+                replica
+            };
+            far.spawn(async move {
+                if shared {
+                    let (from, _) = there.accept().await.unwrap();
+                    let mut all = Vec::new();
+                    for _ in 0..CLIENTS {
+                        all.push(to_replica().await);
+                    }
+                    link(from, all).await;
+                } else {
+                    while let Ok((mut from, _)) = there.accept().await {
+                        from.set_nodelay(true).unwrap();
+                        tokio::spawn(async move {
+                            let _ = tokio::io::copy_bidirectional(&mut from, &mut to_replica().await).await;
+                        });
+                    }
+                }
+            });
+            near.spawn(async move {
+                let mut all = Vec::new();
+                for _ in 0..CLIENTS {
+                    all.push(here.accept().await.unwrap().0);
+                }
+                if shared {
+                    link(TcpStream::connect(there_at).await.unwrap(), all).await;
+                } else {
+                    for mut client in all {
+                        client.set_nodelay(true).unwrap();
+                        tokio::spawn(async move {
+                            let mut to = TcpStream::connect(there_at).await.unwrap();
+                            to.set_nodelay(true).unwrap();
+                            let _ = tokio::io::copy_bidirectional(&mut client, &mut to).await;
+                        });
+                    }
+                }
+            });
+            let answered = Arc::new(AtomicUsize::new(0));
+            let (done, wait) = std::sync::mpsc::channel();
+            for _ in 0..CLIENTS {
+                let (answered, done) = (answered.clone(), done.clone());
+                clients.spawn(async move {
+                    let mut to = TcpStream::connect(here_at).await.unwrap();
+                    to.set_nodelay(true).unwrap();
+                    let (until, mut bytes) = (Instant::now() + FOR, [7; REQUEST]);
+                    while Instant::now() < until {
+                        to.write_all(&bytes).await.unwrap();
+                        to.read_exact(&mut bytes).await.unwrap();
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    done.send(()).unwrap();
+                });
+            }
+            for _ in 0..CLIENTS {
+                wait.recv_timeout(FOR * 10).expect("a client that got no answer");
+            }
+            answered.load(Ordering::Relaxed)
+        }
+
+        let each = run(false);
+        let shared = run(true);
+        // (Both ways on the link: a request and its answer are a frame each.)
+        let (writes, frames) = (WRITES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
+        let secs = FOR.as_secs() as usize;
+        println!(
+            "a connection for each client: {} requests a second, one write for each request each way",
+            each / secs
+        );
+        println!(
+            "one link, one writer: {} requests a second, {frames} frames in {writes} writes: {:.2} to a write",
+            shared / secs,
+            frames as f64 / writes.max(1) as f64
+        );
+        assert!(each > 0 && shared > 0 && frames >= 2 * shared);
+    }
 }
