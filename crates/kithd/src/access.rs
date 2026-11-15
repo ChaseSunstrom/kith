@@ -65,6 +65,16 @@ impl Caller {
             _ => None,
         }
     }
+
+    /// The Identity whose Roles decide what this may do, itself or passed on by a node:
+    /// whose write is decided again where it is put in the log (`raft.rs`).
+    pub fn identity(&self) -> Option<&str> {
+        match self {
+            Caller::Identity(name) => Some(name),
+            Caller::Via(_, who) => who.identity(),
+            _ => None,
+        }
+    }
 }
 
 /// As the audit log names them. An Identity's name has no space, so it is never taken for another.
@@ -142,7 +152,8 @@ impl Grants {
 
 /// What an Identity can reach on the TLS port. A new route is not open to them until it
 /// is named here: name it once its handler asks [`Grants`].
-const FOR_IDENTITIES: [&str; 24] = [
+const FOR_IDENTITIES: [&str; 25] = [
+    "/v1/duress",
     "/v1/backups",
     "/v1/blobs",
     "/v1/volumes",

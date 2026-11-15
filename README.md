@@ -1223,6 +1223,17 @@ spec:
   and no `kith-values` ConfigMap; any of these (or a template that fails) is
   `state: error` with the reason in `message`, and what was installed before
   stays as it was.
+- A Release acts with the rights of whoever applied it (or rolled it back),
+  which kithd writes down on it as `kith.dev/written-by`; what a client says
+  there is not taken. Each time it renders, every resource is asked for as if
+  that writer applied it, and so is what it reaches (a Backup's Volume and
+  Secret, a Share's Volume, a CronJob's Jobs), and the deletion of each one no
+  longer rendered. One refusal and nothing is applied: `state: error`, with a
+  message such as `Secret/store/db: Release/store/shop was applied by alice,
+  and alice may not apply Secret in namespace store: no Role bound to it
+  allows that`. A writer who loses a right, or whose Identity is deleted,
+  stops the next render, not what is installed. A Release from before kithd
+  wrote this down makes nothing new until it is applied again.
 - `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
   any version that is not a pre-release. A Release goes on the newest
   package that fits and stays on it; with `autoUpgrade: true` it follows
@@ -1337,7 +1348,10 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
   (5 at least) and applies its resources, marked `kith.dev/owned-by` like a
   Release's. A resource that names no namespace goes in the Source's. A
   Source applies only into its own namespace; one in `kith-system` applies
-  anywhere and any kind (it is the cluster's own). It does not take over what
+  anywhere and any kind. Either way it applies only what whoever applied it
+  may apply, as a Release does (above): so its repository's authors can make
+  whatever that writer can, and no more. A Release or a Source it makes acts
+  with the same writer's rights. It does not take over what
   is there and not its own; of two Sources that name one resource the one
   that has it keeps it (the first by name, if they come together) and the
   other says `error`. Sources are fetched several at
@@ -1436,6 +1450,25 @@ What works, by the real clients in the tests (`sh ci/kube.sh`, and
 - **helm**: `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`,
   `history`, `get manifest`, each with and without `--wait`, into a namespace it
   creates.
+- **Field managers**: `kubectl apply --server-side` keeps who set which field (in
+  `metadata.managedFields`, up to 64 managers an object). Two managers that apply
+  one object each keep their own fields; a second manager's different value for a
+  field the first set is a `409 Conflict` in Kubernetes's words, unless it says
+  `--force-conflicts` (it then takes the field). A field a manager leaves out of its
+  next apply goes, when no other manager has it. Fields are owned by their exact
+  path, a list that has no one key to merge by is owned whole, and only an apply makes
+  a manager (a `replace` or a `patch` takes a field from whoever had it). Applying
+  onto an object that exists, or replacing one, needs `get` as well as `apply`, as a
+  patch does. `kubectl get namespaces` and `get nodes` show an AGE: the time of the
+  oldest revision the store kept, which is when it was made unless the history was
+  trimmed or the node is a worker that runs from a view and holds only what the view
+  carried (an implicit namespace, one that only holds objects, has none).
+- **Watches**: `kubectl get --watch` reads what the store says changed, so one
+  change among 2000 objects makes and compares one object, not 2000 (what it shows
+  is what a list shows: the same Roles apply to every read). It reads the kind again
+  when it cannot know what changed: on a worker node that runs from a view, after a
+  change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys,
+  after the store was replaced, and for Namespaces.
 - **GitOps**: a [Source](#sources-gitops) follows a repository of Kubernetes
   manifests as they are; a file's objects are read exactly as the API reads them.
 
@@ -1806,8 +1839,9 @@ one that could give itself every right anyway.
   the old certificate's access; `kith delete identity/alice` ends it all.
 - Grant with care: `apply` on Role, RoleBinding or Identity is the power to
   grant oneself anything, and whoever may apply a Workload runs programs on
-  your nodes. A Release or Source acts for the cluster, not for whoever
-  applied it.
+  your nodes. A Release or a Source acts with the rights of whoever applied
+  it, and makes nothing they may not apply themselves (see Packages and
+  Sources); deleting one removes what it installed, whoever may delete it.
 
 Every change made through a node, and every refusal, is one line in that
 node's audit log (`audit.log` in its state directory, 4 MB and the four
@@ -1816,9 +1850,12 @@ went. A certificate that no longer stands for its Identity is a refusal too,
 and so is no certificate at all (one line a minute of those). Refusals past
 sixty a minute are counted rather than written. A watch ends when its
 Identity is deleted or given another certificate. `Audit` is not a name a
-custom kind may take. Permission is asked when a request arrives, not again
-when its write is committed: a Role removed in between does not stop a write
-already under way. `kith audit` shows the last of it,
+custom kind may take. Permission is asked when a request arrives, and an
+Identity's apply, delete or rollback is asked again on the leader as it is put
+in the log: a RoleBinding deleted before then stops it, even when the node it
+reached had not heard of the deletion yet. A write already in the log before
+the deletion stays (SECURITY.md says what else is decided once, where it
+arrives). `kith audit` shows the last of it,
 as does `GET /v1/audit` for an Identity with `get` on `Audit`.
 
 ```
@@ -2300,8 +2337,8 @@ spec:
   `samba-common-tools`, `nss_wrapper`).
 - The `status` of a Share says why it is given to nobody: no such Volume, an Identity in
   `users` that does not exist, or nobody named. Whoever applies a Share (or rolls one
-  back) must be allowed to apply the Volume it gives; a Release or a Source that renders
-  one gives a Volume of its own namespace, as it may run a workload that mounts it.
+  back) must be allowed to apply the Volume it gives; so must whoever applied a Release or a
+  Source that renders one.
 - `uid` is who writes: nobody (65534) unless you say, which is also who a container is
   with nothing said, so the two write each other's files. Where a container on the volume
   is another user (`runAsUser`, or its image's), name that user here.
@@ -3294,7 +3331,10 @@ of a wrong key, two seconds after the line was entered, as it does for every
 line that opens nothing; from then on nothing typed opens beta, the recovery
 key included. There is no way back. Codes are made by kith, never chosen, and
 none exists until someone who may apply NodeKeys makes one; `--off` takes it
-away (the node drops it when it hears).
+away (the node drops it when it hears). A code works at a node once that node,
+running, has heard of it (`kith get nodekey beta` then says `duress: true` in
+its status): a node that was off when the code was made takes it for a wrong
+key until it has run with the cluster in reach.
 
 `kith node duress --all` makes one code for the whole cluster. Typed at the
 waiting console of any encrypted node, it does to that node what its own code
@@ -3302,7 +3342,9 @@ does, and has the cluster forget the key of every other node that was under
 the code when it was made. Those nodes run on. They drop their TPM's seal and
 their passphrase when they hear of it, and from then on open with their own
 recovery keys alone, until `kith node unlock NAME` has the cluster hold NAME's
-key again. So the cluster makes no such code while one of its nodes has a
+key again. A node forgotten this way keeps its own code, which still erases
+it; the cluster's code is gone from all of them, and after `kith node unlock`
+a node has no code until one is made again. So the cluster makes no such code while one of its nodes has a
 recovery key nobody was shown (`kith node recovery` first), and a node that
 joins later is not under it: make the code again.
 
@@ -3860,6 +3902,7 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
 sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)
