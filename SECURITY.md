@@ -113,8 +113,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   at the registry's own port, so neither what is pulled nor the password is read off the
   loopback (by a container that is the node's root, say; that a pull happens, and how
   large, still shows) and a process that takes the port in kithd's place learns no
-  password. A process of the node that floods the port can hold Image pulls up. And kithd pulls an Image only for what runs in the Image's
-  own namespace: an Image is a packed Volume. Reading kithd's memory is being root on
+  password. Its connections, shaken or not, are at most 64 at a time, and one on which no
+  byte moves for 5 s after its handshake is closed; so a process of the node can still take
+  the registry's slots in turn, or keep one with a byte now and then, and slow Image pulls.
+  Kithd's other listeners and its open-file limit are not bounded by this. And kithd pulls
+  an Image only for what runs in the Image's own namespace: an Image is a packed Volume. Reading kithd's memory is being root on
   the node outside any container, which nothing here defends against.
 - **A Volume's archive** (a Backup, an Image, a replica's copy) is read through directory
   handles that are held open: nothing in the volume is reached by a path the workload
