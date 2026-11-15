@@ -325,12 +325,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
   gives up between files, and kithd waits 2 seconds for it so the state disk can be
   unmounted, and says in its log which it gave up on. A removal looks at the stop every
-  1,024 steps (entries looked at), at any depth, holding one directory at a time (opened
-  through the one above, never through a link, and never into another file system). A
-  removal ends at the first entry it cannot remove, with that error in the log. What is left
-  is removed at the next count of its pod's roots (only a pod with running roots that is
-  walked: one with a limit, or while the disk is under twice its reserve), or when the pod is
-  gone, with its replica directory. A limit held at
+  1,024 steps (entries looked at). It works a level at a time, so each directory is listed
+  once and the work is linear in the entries, at any depth: a directory that is not empty
+  is opened through the one above (never through a link, never into another file system),
+  emptied, and what directories it holds that are not empty are moved into a new
+  `scratch.*` level beside the scratch, which is removed next. At most four directories are
+  open, and `..` is never taken. A removal ends at the first entry it cannot remove (or a
+  rename to another file system, or of a mount point), with that error in the log. What a
+  stop or an error leaves is the scratch and its levels, each a `scratch.*` in the replica
+  directory, removed as trees of their own at the next count of its pod's roots (only a pod
+  with running roots that is walked: one with a limit, or while the disk is under twice its
+  reserve), or when the pod is gone, with its replica directory; two sweepers of the same
+  scratch at once are harmless. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload

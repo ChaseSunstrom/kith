@@ -227,15 +227,20 @@ pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Until) -> (u64, bool) {
 /// Moves the directory `scratch` aside, to a new name beside it (`scratch.N`): what is made at
 /// `scratch` next is empty. False when there is none.
 pub fn aside(scratch: &Path) -> bool {
+    std::fs::rename(scratch, scratch_name(scratch)).is_ok()
+}
+
+/// A new name `scratch.N` (nanoseconds since the epoch) beside `near`.
+fn scratch_name(near: &Path) -> PathBuf {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    let gone = scratch.with_file_name(format!("scratch.{}", nanos.unwrap_or_default().as_nanos()));
-    std::fs::rename(scratch, gone).is_ok()
+    near.with_file_name(format!("scratch.{}", nanos.unwrap_or_default().as_nanos()))
 }
 
 /// Removes every scratch moved aside in the replica directory `replica`, till `stop` is set. A
-/// scratch the stop cut short is left as it is: it goes at the next count of its pod's roots
-/// (which only a pod with running roots that is walked has), or when the pod is gone and its
-/// replica directory is removed.
+/// scratch the stop cut short is left as it is, with the levels its removal made beside it
+/// (each a `scratch.*` of its own): they go at the next count of its pod's roots (which only a
+/// pod with running roots that is walked has), or when the pod is gone and its replica
+/// directory is removed. One that is gone or made while the directory is listed is no error.
 pub fn sweep(replica: &Path, stop: &AtomicBool) {
     sweep_until(replica, &|| stop.load(Ordering::Relaxed));
 }
@@ -250,7 +255,7 @@ fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
                 Ok(true) => {}
                 Ok(false) => {
                     eprintln!(
-                        "kithd: stopped removing {}: it is left for the pod's next count, or for its replica directory's removal",
+                        "kithd: stopped removing {}: what is left of it is in it and in the scratch.* levels made beside it, each removed as a tree of its own at the pod's next count, or with its replica directory",
                         entry.path().display()
                     );
                     return;
@@ -266,24 +271,38 @@ fn sweep_until(replica: &Path, halted: &dyn Fn() -> bool) {
 const BATCH: usize = 1024;
 
 /// Removes the directory `root` and all in it, asking `halted` first and then every [`BATCH`]
-/// steps: true once it is done, false when it was halted (what is left stays). A pod wrote what
-/// is in it and kithd is root here, so only one directory is held, whatever the depth (a chain
-/// thousands deep would hold more descriptors than kithd has): each is opened through the one
-/// held, never through a link, one that shuts its owner out is opened up first, and a link is
-/// unlinked, never followed. An entry that is a directory is tried with `rmdir` first and
-/// opened only if it is not empty; once a directory is empty the walk opens `..` of it and
-/// lists that again, unless it is `root` itself (told by device and inode): `..` of `root` is
-/// never taken, so the walk cannot climb above `root` whatever is moved under it. The first error that leaves an entry in place ends
-/// the removal with it, as `remove_dir_all` does, so what cannot be removed cannot be walked
-/// round for ever; a directory on another file system than `root`'s ends it so too. A `root`
-/// that is a link or a file is unlinked.
+/// steps (a step is an entry looked at): true once it is done, false when it was halted (what
+/// is left stays). A pod wrote what is in it and kithd is root here, so no path is walked down
+/// and up (a chain thousands of directories deep holds more descriptors than kithd has, and
+/// listing a directory again after each child makes the work grow with the square of its
+/// entries): the tree is removed a level at a time, and each directory is listed once, so the
+/// work is linear in the entries.
+///
+/// A level is a directory whose entries are to be removed, the first being `root` (a
+/// `scratch.N` in a replica directory only kithd writes). Each entry of it is looked at once: a
+/// file or a link is unlinked (a link is never followed), a directory is tried with `rmdir`,
+/// and one that is not empty is opened (through the level's descriptor, never through a link;
+/// one that shuts its owner out is opened up first) and emptied flat: its files and links are
+/// unlinked, its empty directories removed, and each directory in it that is not empty is
+/// moved, with `renameat`, into the next level, a new directory `scratch.N` beside `root`
+/// (made when the first one is moved). Then it is closed and removed through the level's
+/// descriptor. When the level's listing is done it is removed by its path, and the next
+/// level, if there is one, becomes the level; done when there is none. So at most four
+/// directories are open (the level, the next level, the one being emptied, and a new one for
+/// a moment), memory does not grow with the tree, `..` is taken nowhere (nothing moved under
+/// the walk can lead it above `root`), and a directory on another file system than `root`'s
+/// (a mount point is `EBUSY` to rename, another file system `EXDEV`) ends the removal.
+///
+/// A halt leaves `root` and the levels where they are, each named `scratch.*` in the replica
+/// directory, for a sweep to remove as a tree of its own. A second remover of the same
+/// scratch at the same moment is harmless: what the first removed is `ENOENT` to the other,
+/// which ignores it (a directory that leaves not empty ends the removal at its own `rmdir`).
+/// Any other error that leaves an entry in place ends the removal with it, as `remove_dir_all`
+/// does: no path goes round again. A `root` that is a link or a file is unlinked.
 fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
     use nix::errno::Errno;
-    use nix::sys::stat::{FchmodatFlags, fchmod, fchmodat};
-    use nix::unistd::{UnlinkatFlags, unlinkat};
     use std::os::fd::IntoRawFd;
-    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    let top = match crate::backups::open_dir(root) {
+    let mut here = match crate::backups::open_dir(root) {
         Err(e)
             if matches!(
                 e.raw_os_error().map(Errno::from_raw),
@@ -292,26 +311,87 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
         {
             return std::fs::remove_file(root).map(|()| true);
         }
-        opened => Dir::from_fd(opened?.into_raw_fd())?,
+        opened => (Dir::from_fd(opened?.into_raw_fd())?, root.to_path_buf()),
     };
-    let top_meta = fstat(top.as_raw_fd())?;
-    let (device, top_ino) = (top_meta.st_dev, top_meta.st_ino);
-    // `name` in the directory `fd`, held to the root's file system and opened up if it shuts out.
-    let open = |fd: i32, name: &std::ffi::CStr| -> std::io::Result<Dir> {
+    let mut run = Removal {
+        halted,
+        steps: 0,
+        device: None,
+        moved: 0,
+        next: None,
+        beside: root.to_path_buf(),
+    };
+    loop {
+        let (mut level, path) = here;
+        let fd = level.as_raw_fd();
+        let device = fstat(fd)?.st_dev;
+        if *run.device.get_or_insert(device) != device {
+            return Err(std::io::Error::other(format!(
+                "a file system is mounted at {}",
+                path.display()
+            )));
+        }
+        for entry in level.iter() {
+            if run.halt() {
+                return Ok(false);
+            }
+            let entry = entry?;
+            let name = entry.file_name();
+            if is_dots(name) {
+                continue;
+            }
+            if clear(fd, name, is_directory(fd, &entry))? && !run.empty(fd, name)? {
+                return Ok(false);
+            }
+        }
+        drop(level);
+        match std::fs::remove_dir(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        match run.next.take() {
+            Some(next) => here = next,
+            None => return Ok(true),
+        }
+    }
+}
+
+/// What [`remove_tree`] carries from one level to the next.
+struct Removal<'a> {
+    halted: &'a dyn Fn() -> bool,
+    steps: usize,
+    /// The file system of the first level, which all of them are on.
+    device: Option<u64>,
+    /// Directories moved into a next level so far, which names them there.
+    moved: u64,
+    /// The level after the one being removed, once a directory was moved to it.
+    next: Option<(Dir, PathBuf)>,
+    /// The first level, beside which the next ones are made.
+    beside: PathBuf,
+}
+
+impl Removal<'_> {
+    /// Counts one entry looked at; true when this is one to ask the stop at, and it is set.
+    fn halt(&mut self) -> bool {
+        self.steps += 1;
+        self.steps % BATCH == 1 && (self.halted)()
+    }
+
+    /// `name` in the directory `fd`, opened up if it shuts out, and on the first level's file system.
+    fn open(&self, fd: i32, name: &std::ffi::CStr) -> std::io::Result<Dir> {
+        use nix::errno::Errno;
+        use nix::sys::stat::{FchmodatFlags, fchmod, fchmodat};
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
         let dir = match Dir::openat(Some(fd), name, flags, Mode::empty()) {
             Err(Errno::EACCES) => {
-                fchmodat(
-                    Some(fd),
-                    name,
-                    Mode::from_bits_truncate(0o700),
-                    FchmodatFlags::NoFollowSymlink,
-                )?;
+                let shut = Mode::from_bits_truncate(0o700);
+                fchmodat(Some(fd), name, shut, FchmodatFlags::NoFollowSymlink)?;
                 Dir::openat(Some(fd), name, flags, Mode::empty())?
             }
             opened => opened?,
         };
         let meta = fstat(dir.as_raw_fd())?;
-        if meta.st_dev != device {
+        if Some(meta.st_dev) != self.device {
             let said = format!("a file system is mounted at {}", name.to_string_lossy());
             return Err(std::io::Error::other(said));
         }
@@ -319,58 +399,93 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
             fchmod(dir.as_raw_fd(), Mode::from_bits_truncate(meta.st_mode | 0o700))?;
         }
         Ok(dir)
-    };
-    let (mut here, mut steps) = (top, 0usize);
-    loop {
-        let fd = here.as_raw_fd();
-        let mut down = None;
-        for entry in here.iter() {
-            steps += 1;
-            if steps % BATCH == 1 && halted() {
+    }
+
+    /// Empties `name`, a directory of the level `level`, flat, and removes it: false when halted.
+    fn empty(&mut self, level: i32, name: &std::ffi::CStr) -> std::io::Result<bool> {
+        use nix::errno::Errno;
+        use nix::unistd::{UnlinkatFlags, unlinkat};
+        let mut dir = self.open(level, name)?;
+        let fd = dir.as_raw_fd();
+        for entry in dir.iter() {
+            if self.halt() {
                 return Ok(false);
             }
             let entry = entry?;
-            let name = entry.file_name();
-            if matches!(name.to_bytes(), b"." | b"..") {
-                continue;
-            }
-            let dir = match entry.file_type() {
-                Some(kind) => kind == nix::dir::Type::Directory,
-                None => fstatat(Some(fd), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|meta| is_dir(&meta)),
-            };
-            let gone = if dir {
-                match unlinkat(Some(fd), name, UnlinkatFlags::RemoveDir) {
-                    Err(Errno::ENOTEMPTY | Errno::EEXIST) => {
-                        down = Some(name.to_owned());
-                        break;
-                    }
-                    // (A link put there since the listing is unlinked, not followed.)
-                    Err(Errno::ENOTDIR) => unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir),
-                    gone => gone,
-                }
-            } else {
-                unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir)
-            };
-            if let Err(e) = gone
-                && e != Errno::ENOENT
-            {
-                return Err(e.into());
+            let child = entry.file_name();
+            if !is_dots(child) && clear(fd, child, is_directory(fd, &entry))? {
+                self.shift(fd, child)?;
             }
         }
-        match down {
-            Some(name) => here = open(fd, &name)?,
-            None => {
-                // Told by what the directory is, not by a count a move under the walk could falsify.
-                let meta = fstat(fd)?;
-                if meta.st_dev == device && meta.st_ino == top_ino {
-                    break;
-                }
-                here = open(fd, c"..")?;
-            }
+        drop(dir);
+        match unlinkat(Some(level), name, UnlinkatFlags::RemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => Ok(true),
+            Err(e) => Err(e.into()),
         }
     }
-    drop(here);
-    std::fs::remove_dir(root).map(|()| true)
+
+    /// Moves `name`, a directory that is not empty in the directory `from`, into the next level.
+    fn shift(&mut self, from: i32, name: &std::ffi::CStr) -> std::io::Result<()> {
+        use nix::errno::Errno;
+        use nix::fcntl::renameat;
+        use nix::sys::stat::{FchmodatFlags, fchmodat};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::fs::DirBuilderExt;
+        if self.next.is_none() {
+            // (A name that is taken is an error: it is not for this removal to take it over.)
+            let path = scratch_name(&self.beside);
+            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+            let dir = Dir::from_fd(crate::backups::open_dir(&path)?.into_raw_fd())?;
+            self.next = Some((dir, path));
+        }
+        let to = self.next.as_ref().map_or(-1, |(dir, _)| dir.as_raw_fd());
+        self.moved += 1;
+        let new = std::ffi::CString::new(format!("d{}", self.moved)).unwrap_or_default();
+        let mut moved = renameat(Some(from), name, Some(to), new.as_c_str());
+        if moved == Err(Errno::EACCES) {
+            // Moving a directory to another parent takes write access to it, where kithd is not root.
+            let shut = Mode::from_bits_truncate(0o700);
+            fchmodat(Some(from), name, shut, FchmodatFlags::NoFollowSymlink)?;
+            moved = renameat(Some(from), name, Some(to), new.as_c_str());
+        }
+        match moved {
+            Ok(()) | Err(Errno::ENOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+fn is_dots(name: &std::ffi::CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
+}
+
+/// Whether the entry of the directory `fd` is a directory, by what the listing says or a look.
+fn is_directory(fd: i32, entry: &nix::dir::Entry) -> bool {
+    match entry.file_type() {
+        Some(kind) => kind == nix::dir::Type::Directory,
+        None => fstatat(Some(fd), entry.file_name(), AtFlags::AT_SYMLINK_NOFOLLOW).is_ok_and(|meta| is_dir(&meta)),
+    }
+}
+
+/// Removes `name` in the directory `fd` if it is a file, a link or an empty directory; true
+/// when it is a directory that is not empty. One that is gone already is removed.
+fn clear(fd: i32, name: &std::ffi::CStr, dir: bool) -> std::io::Result<bool> {
+    use nix::errno::Errno;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+    let gone = if dir {
+        match unlinkat(Some(fd), name, UnlinkatFlags::RemoveDir) {
+            Err(Errno::ENOTEMPTY | Errno::EEXIST) => return Ok(true),
+            // (A link put there since the listing is unlinked, not followed.)
+            Err(Errno::ENOTDIR) => unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir),
+            gone => gone,
+        }
+    } else {
+        unlinkat(Some(fd), name, UnlinkatFlags::NoRemoveDir)
+    };
+    match gone {
+        Ok(()) | Err(Errno::ENOENT) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Whether a pod whose running units (none stopping) started at `started` may be replaced for a
@@ -868,22 +983,30 @@ mod tests {
     }
 
     #[test]
-    fn storage_stop_a_chain_of_thousands_of_directories_is_removed_one_descriptor_at_a_time() {
+    fn storage_stop_a_chain_of_thousands_of_directories_is_removed_a_level_at_a_time() {
         let top = dir("chain");
         let root = top.join("scratch.1");
         std::fs::create_dir(&root).unwrap();
         chain(&root, 2000);
-        // Stopped from inside the walk, well below the 128th directory: all of it is left.
+        assert_eq!(deep(&root), 2000);
+        // Stopped from inside the walk, hundreds of levels down: what is left in the replica
+        // directory is the root and levels, each named `scratch.*`.
         let looks = std::cell::Cell::new(0);
         let stopped = remove_tree(&root, &|| {
             looks.set(looks.get() + 1);
             looks.get() > 1
         });
         assert!(!stopped.unwrap());
-        assert_eq!(deep(&root), 2000);
-        // Let alone, all of it goes.
+        let (scratch, others) = levels(&top);
+        assert!(scratch >= 1 && others == 0, "{scratch} {others}");
+        // A sweep that is not stopped removes each as a tree of its own, and leaves none.
+        sweep(&top, &AtomicBool::new(false));
+        assert_eq!(levels(&top), (0, 0));
+        // Let alone from the start, all of it goes.
+        std::fs::create_dir(&root).unwrap();
+        chain(&root, 2000);
         assert!(remove_tree(&root, &|| false).unwrap());
-        assert!(!root.exists());
+        assert_eq!(levels(&top), (0, 0));
         std::fs::remove_dir_all(top).unwrap();
     }
 
@@ -897,18 +1020,93 @@ mod tests {
         for n in 0..2000 {
             std::fs::write(root.join(format!("a/b/c/d/f{n}")), "x").unwrap();
         }
-        // On its second look, inside `d`, a writer that is still alive moves `d` up to the root.
+        // On its second look, inside `d` (in whichever level holds it by then), a writer that is
+        // still alive moves what the level holds up to the replica directory.
         let looks = std::cell::Cell::new(0);
-        let _ = remove_tree(&root, &|| {
+        let done = remove_tree(&root, &|| {
             looks.set(looks.get() + 1);
             if looks.get() == 2 {
-                std::fs::rename(root.join("a/b/c/d"), root.join("d")).unwrap();
+                for level in std::fs::read_dir(&top).unwrap().flatten() {
+                    if level.file_name().to_string_lossy().starts_with("scratch.") {
+                        for held in std::fs::read_dir(level.path()).unwrap().flatten() {
+                            std::fs::rename(held.path(), top.join("moved")).unwrap();
+                        }
+                    }
+                }
             }
             false
         });
+        assert!(done.unwrap());
         assert!(looks.get() >= 2);
+        assert!(!root.exists());
         assert_eq!(std::fs::read_to_string(beside.join("kept")).unwrap(), "x");
+        // The walk held the directory, not its path: what was in it is gone, wherever it went.
+        assert_eq!(std::fs::read_dir(top.join("moved")).unwrap().count(), 0);
+        let mut left: Vec<_> = std::fs::read_dir(&top)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["beside", "moved"]);
         std::fs::remove_dir_all(top).unwrap();
+    }
+
+    /// The names in `top`, those of the levels of a removal (`scratch.*`) apart from others.
+    fn levels(top: &Path) -> (usize, usize) {
+        let names: Vec<_> = std::fs::read_dir(top).unwrap().flatten().collect();
+        let scratch = names
+            .iter()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("scratch."))
+            .count();
+        (scratch, names.len() - scratch)
+    }
+
+    #[test]
+    fn storage_stop_a_wide_tree_is_removed_whole_each_directory_listed_once() {
+        let top = dir("wide");
+        let root = top.join("scratch.1");
+        std::fs::create_dir_all(root.join("a/b/wide")).unwrap();
+        for n in 0..2000 {
+            std::fs::create_dir(root.join(format!("a/b/wide/s{n}"))).unwrap();
+            std::fs::write(root.join(format!("a/b/wide/s{n}/f")), "x").unwrap();
+        }
+        assert!(remove_tree(&root, &|| false).unwrap());
+        assert_eq!(std::fs::read_dir(&top).unwrap().count(), 0);
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
+    fn storage_stop_a_removal_that_fails_ends_with_its_error_and_the_next_scratch_is_swept() {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return; // root removes in a read-only directory
+        }
+        let replica = dir("failing");
+        for scratch in ["scratch.1", "scratch.2"] {
+            std::fs::create_dir_all(replica.join(scratch)).unwrap();
+            for n in 0..2000 {
+                std::fs::write(replica.join(scratch).join(format!("f{n}")), "x").unwrap();
+            }
+        }
+        // Its looks: 1 the sweep's before the first scratch, 2 and 3 that scratch's (at its start
+        // and 1,024 steps in), 4 the sweep's before the second. Between 3 and 4 the replica
+        // directory is read-only, so the first scratch is emptied and cannot be removed.
+        let looks = std::cell::Cell::new(0);
+        sweep_until(&replica, &|| {
+            looks.set(looks.get() + 1);
+            let mode = if looks.get() == 3 { 0o500 } else { 0o700 };
+            std::fs::set_permissions(&replica, std::fs::Permissions::from_mode(mode)).unwrap();
+            false
+        });
+        assert!(looks.get() >= 5, "{}", looks.get());
+        // One scratch is left, emptied; the other, swept after the error, is gone.
+        let left: Vec<_> = std::fs::read_dir(&replica).unwrap().flatten().collect();
+        assert_eq!(left.len(), 1);
+        assert_eq!(std::fs::read_dir(left[0].path()).unwrap().count(), 0);
+        sweep_until(&replica, &|| false);
+        assert_eq!(levels(&replica), (0, 0));
+        std::fs::remove_dir_all(replica).unwrap();
     }
 
     #[test]
