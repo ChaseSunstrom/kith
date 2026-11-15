@@ -3749,9 +3749,15 @@ kithd is linked by the Rust toolchain's own lld, with the functions it runs from
 start until it has idled a while first in its code, in the order
 `crates/kithd/kithd.order` lists them. The kernel keeps in memory the pages around each
 one a process touches: with that code where the compiler put it, all over the binary,
-kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it holds
-3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
-was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
+kithd with nothing to do held 10.50 MB without the order and 4.62 MB with it
+(`python3 ci/budgets.py`; the budget stays 9.00 MB). Those are of the binary read from
+disk, as a node has it: `ci/budgets.py` drops the file's cache and reads it back before it
+starts kithd, so the number is the same right after a build and an hour later. Right
+after a build, with the file in the page cache as the linker wrote it, the kernel maps
+fewer pages around each one touched, and kithd held 8.75 MB without the order and 3.75 MB
+with it (an earlier version of this paragraph told those: 8.91 and 3.81). On tmpfs the
+cache cannot be dropped and the number is that of the file as it is there. The binary is
+11.35 MB, as it was without the order. `python3 ci/order.py` writes the file again from a run of the kithd it
 builds: a breakpoint on every function, taken off the first time it is hit, so each one
 that runs is seen once and in order (x86_64 Linux). The file holds each name as a
 pattern, without what an ordinary change gives another value: the letters Rust writes
@@ -3764,9 +3770,9 @@ the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
 or under four fifths of those are together where its code starts. The order is of
 one compiler, the one `rust-toolchain.toml` names (rustup installs it by itself):
 Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held
-5.96 MB. After naming another there, run `python3 ci/order.py` again. A toolchain with
-no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
-again (the check then fails, saying there is no lld).
+5.96 MB (measured right after the build). After naming another there, run `python3
+ci/order.py` again. A toolchain with no lld links kithd in the compiler's order, with a
+warning, and it holds the 10.50 MB again (the check then fails, saying there is no lld).
 
 That number is of a kithd with nothing to do on the machine that built it. As the first
 process of kith OS it does more before it serves (its mounts, the state partition, DHCP,
