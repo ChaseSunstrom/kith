@@ -110,9 +110,13 @@ class Daemon:
         return self.kith("apply", "-f", path)
 
     def said(self):
-        """The last lines of its log, on one line."""
+        """The last lines of its log and what it says of its Workloads and itself, on one line."""
         with open(self.log.name) as log:
-            return " | ".join(log.read().splitlines()[-6:])
+            lines = log.read().splitlines()[-6:]
+        for kind in ("Workload", "Node"):
+            status = [w.get("status") for w in json.loads(self.kith("get", kind, "-o", "json"))]
+            lines.append(f"{kind}: {json.dumps(status)[:700]}")
+        return " | ".join(lines)
 
     def stop(self):
         self.proc.send_signal(signal.SIGTERM)
