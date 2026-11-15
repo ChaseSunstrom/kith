@@ -235,7 +235,7 @@ fn tend(shared: &Shared, wanted: BTreeMap<String, Result<Up, String>>) {
         exits.up.remove(&name);
         forget = true;
     }
-    exits.failed.clear();
+    let was = std::mem::take(&mut exits.failed);
     for (name, up) in wanted {
         if exits.up.contains_key(&name) {
             continue;
@@ -253,6 +253,10 @@ fn tend(shared: &Shared, wanted: BTreeMap<String, Result<Up, String>>) {
                 exits.up.insert(name, up);
             }
             Err(why) => {
+                // (Said once, not each time it is tried again.)
+                if was.get(&name) != Some(&why) {
+                    eprintln!("kithd: exit {name}: no tunnel: {why}");
+                }
                 exits.failed.insert(name, why);
             }
         }

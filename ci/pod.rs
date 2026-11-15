@@ -37,9 +37,23 @@
 //!                              write BYTES to it, 64 KiB each half second, saying if a write
 //!                              fails (the disk is full), and wait; unlinked: removes FILE
 //!                              first and writes to it held open, with no name
+//!   pod probe                  what `vm.sh --test tunnel` runs behind an exit: answers on
+//!                              port 8080 (TCP, as HTTP) and sends back what comes to UDP
+//!                              8080; and each second asks 198.51.100.1:80 and a new name
+//!                              (over UDP, and over TCP) where its resolv.conf says, asks its
+//!                              node for a name, tries IPv6 out, sends `kithleak` to two
+//!                              addresses outside, and says how each went
+//!   pod init SCRIPT            as a machine's first process (that test's provider): mounts
+//!                              /dev and /proc, runs each line of SCRIPT in turn (`NAME=VALUE`
+//!                              words first are its environment; `&` first: left running),
+//!                              then waits
+//!   pod dns ADDRESS            on port 53, UDP and TCP, answers every name with ADDRESS and
+//!                              says each it was asked
+//!   pod shout TO WHAT          sends WHAT to TO (ADDRESS:PORT) over UDP, once a second, ten
+//!                              times
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 /// The byte at `i` of what `pod check` sends: one no lost, doubled or swapped byte keeps in
@@ -185,6 +199,66 @@ fn asked(host: &str, port: &str) -> std::io::Result<String> {
     stream.read_to_string(&mut answer)?;
     let (first, last) = (answer.lines().next().unwrap_or_default(), answer.lines().last().unwrap_or_default());
     Ok(format!("{first} {last}"))
+}
+
+/// A DNS question for `name`'s IPv4 address.
+fn question(name: &str, id: u16) -> Vec<u8> {
+    let mut asked = id.to_be_bytes().to_vec();
+    asked.extend([1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        asked.push(label.len() as u8);
+        asked.extend(label.as_bytes());
+    }
+    asked.extend([0, 0, 1, 0, 1]);
+    asked
+}
+
+/// What `pod dns` answers `asked` with (every name: `address`), and the name asked.
+fn answer(asked: &[u8], address: std::net::Ipv4Addr) -> Option<(Vec<u8>, String)> {
+    let mut end = 12;
+    let mut name = Vec::new();
+    while *asked.get(end)? != 0 {
+        let length = usize::from(asked[end]);
+        name.push(String::from_utf8_lossy(asked.get(end + 1..end + 1 + length)?).into_owned());
+        end += 1 + length;
+    }
+    let question = asked.get(12..end + 5)?;
+    let a = question[question.len() - 4..question.len() - 2] == [0, 1];
+    let mut said = asked[..2].to_vec();
+    said.extend([0x81, 0x80, 0, 1, 0, u8::from(a), 0, 0, 0, 0]);
+    said.extend(question);
+    if a {
+        said.extend([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        said.extend(address.octets());
+    }
+    Some((said, name.join(".")))
+}
+
+/// Whether `server` answers a question for `name` (over TCP, or UDP) within two seconds:
+/// "ok" with an address, "empty" without one, "silent" not at all.
+fn asks(server: SocketAddr, name: &str, tcp: bool) -> &'static str {
+    let id = (std::process::id() as u16) ^ (name.len() as u16);
+    let asked = question(name, id);
+    let mut said = [0; 512];
+    let heard = if tcp {
+        TcpStream::connect_timeout(&server, Duration::from_secs(2)).and_then(|mut stream| {
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.write_all(&[&(asked.len() as u16).to_be_bytes()[..], &asked].concat())?;
+            stream.read_exact(&mut said[..2])?;
+            stream.read(&mut said)
+        })
+    } else {
+        UdpSocket::bind("0.0.0.0:0").and_then(|socket| {
+            socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+            socket.send_to(&asked, server)?;
+            socket.recv(&mut said)
+        })
+    };
+    match heard {
+        Ok(n) if n >= 8 && said[6..8] != [0, 0] => "ok",
+        Ok(_) => "empty",
+        Err(_) => "silent",
+    }
 }
 
 /// Every file at or under `path` as "PATH MODE CONTENT", through links (as a mounted
@@ -469,6 +543,144 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked]"),
+        ["probe"] => {
+            std::thread::spawn(|| {
+                let listener = TcpListener::bind("0.0.0.0:8080").expect("port 8080");
+                for mut stream in listener.incoming().flatten() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = stream.read(&mut [0; 512]);
+                    let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\nthe web of a pod behind an exit");
+                }
+            });
+            std::thread::spawn(|| {
+                let socket = UdpSocket::bind("0.0.0.0:8080").expect("UDP port 8080");
+                let mut got = [0; 1500];
+                while let Ok((n, from)) = socket.recv_from(&mut got) {
+                    let _ = socket.send_to(&got[..n], from);
+                }
+            });
+            let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+            let server = resolv.lines().find_map(|line| line.strip_prefix("nameserver ")?.trim().parse::<std::net::IpAddr>().ok());
+            let server = SocketAddr::from((server.expect("a nameserver in /etc/resolv.conf"), 53));
+            // (Its node, where a pod not behind an exit asks for names: kith-mesh's GATEWAY.)
+            let node = SocketAddr::from(([100, 88, 0, 1], 53));
+            let outside = SocketAddr::from(([198, 51, 100, 1], 80));
+            for round in 1.. {
+                let fetched = TcpStream::connect_timeout(&outside, Duration::from_secs(3)).and_then(|mut stream| {
+                    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+                    stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
+                    let mut said = String::new();
+                    stream.read_to_string(&mut said).map(|_| said)
+                });
+                let web = if fetched.is_ok_and(|said| said.contains("outside")) { "ok" } else { "failed" };
+                // (A name std asks as every program does: musl, from /etc/resolv.conf.)
+                use std::net::ToSocketAddrs;
+                let named = format!("kithleak-{round}.example:80").to_socket_addrs();
+                let named = if named.is_ok_and(|mut found| found.any(|at| at == outside)) { "ok" } else { "failed" };
+                let tcp = asks(server, &format!("kithleak-tcp-{round}.example"), true);
+                let asked_node = asks(node, &format!("kithleak-node-{round}.example"), false);
+                let v6 = TcpStream::connect_timeout(&"[2001:db8::7]:80".parse().expect("an address"), Duration::from_secs(2));
+                let v6 = match v6 {
+                    Ok(_) => "connected".to_string(),
+                    Err(e) => format!("{:?}", e.kind()),
+                };
+                if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+                    for to in ["203.0.113.7:9", "10.0.2.2:9"] {
+                        let _ = socket.send_to(format!("kithleak {round}").as_bytes(), to);
+                    }
+                }
+                println!("probe {round}: web {web} dns {named} tcp-dns {tcp} node-dns {asked_node} ipv6 {v6}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        // WHAT to TO over UDP, once a second for ten seconds: what the tunnel test's count
+        // of the node's packets must see from a pod not behind an exit.
+        ["shout", to, what] => {
+            let socket = UdpSocket::bind("0.0.0.0:0").expect("a UDP socket");
+            for _ in 0..10 {
+                let _ = socket.send_to(what.as_bytes(), to);
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        ["init", script] => {
+            for (kind, at) in [("devtmpfs", "/dev"), ("proc", "/proc")] {
+                let _ = std::fs::create_dir_all(at);
+                let (kind, at) = (std::ffi::CString::new(kind).expect("a name"), std::ffi::CString::new(at).expect("a path"));
+                // mount(2), by x86-64's number for it (as `node` asks mknod).
+                let mut mounted: i64 = 165;
+                unsafe {
+                    std::arch::asm!(
+                        "syscall",
+                        inlateout("rax") mounted,
+                        in("rdi") kind.as_ptr(),
+                        in("rsi") at.as_ptr(),
+                        in("rdx") kind.as_ptr(),
+                        in("r10") 0u64,
+                        in("r8") 0u64,
+                        lateout("rcx") _,
+                        lateout("r11") _,
+                    );
+                }
+                assert!(mounted == 0, "init: mounting {at:?}: {mounted}");
+            }
+            let console = std::fs::OpenOptions::new().read(true).write(true).open("/dev/console").expect("a console");
+            let mut out = console.try_clone().expect("the console, again");
+            for line in std::fs::read_to_string(script).expect("the script").lines() {
+                let left = line.starts_with("& ");
+                let words: Vec<&str> = line.trim_start_matches("& ").split_whitespace().collect();
+                let told = words.iter().take_while(|word| word.contains('=')).count();
+                let Some((program, rest)) = words[told..].split_first() else { continue };
+                let mut command = std::process::Command::new(program);
+                command.args(rest).envs(words[..told].iter().filter_map(|word| word.split_once('=')));
+                command.stdout(console.try_clone().expect("the console")).stderr(console.try_clone().expect("the console"));
+                let done = match command.spawn() {
+                    Ok(_) if left => Ok(()),
+                    Ok(mut child) => match child.wait() {
+                        Ok(status) if status.success() => Ok(()),
+                        Ok(status) => Err(status.to_string()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = match done {
+                    Ok(()) => writeln!(out, "init: ok: {line}"),
+                    Err(why) => writeln!(out, "init: failed: {line}: {why}"),
+                };
+            }
+            let _ = writeln!(out, "init: ready");
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
+        ["dns", address] => {
+            let address: std::net::Ipv4Addr = address.parse().expect("an IPv4 address");
+            std::thread::spawn(move || {
+                let socket = UdpSocket::bind("0.0.0.0:53").expect("UDP port 53");
+                let mut asked = [0; 512];
+                while let Ok((n, from)) = socket.recv_from(&mut asked) {
+                    if let Some((said, name)) = answer(&asked[..n], address) {
+                        println!("dns: udp {name}");
+                        let _ = socket.send_to(&said, from);
+                    }
+                }
+            });
+            let listener = TcpListener::bind("0.0.0.0:53").expect("TCP port 53");
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut length = [0; 2];
+                let mut asked = vec![0; 512];
+                if stream.read_exact(&mut length).is_err() || usize::from(u16::from_be_bytes(length)) > asked.len() {
+                    continue;
+                }
+                asked.truncate(usize::from(u16::from_be_bytes(length)));
+                if stream.read_exact(&mut asked).is_ok()
+                    && let Some((said, name)) = answer(&asked, address)
+                {
+                    println!("dns: tcp {name}");
+                    let _ = stream.write_all(&[&(said.len() as u16).to_be_bytes()[..], &said].concat());
+                }
+            }
+        }
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
     }
 }

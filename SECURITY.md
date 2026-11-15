@@ -174,6 +174,31 @@ Only the newest version is fixed. There are no security releases of older ones.
   there has the fourteen capabilities a container runtime gives by default, and no
   other; and its root file system is its own to write. It keeps `no_new_privs`, the
   seccomp filter and its namespaces, and has a network namespace of its own.
+- **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
+  tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
+  the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
+  kithd writes, and reads back, routing rules in both families for that link: IPv4 to the
+  tunnel's own table (with no tunnel there, unreachable), IPv6 to the mesh's range only
+  and unreachable past it. The firewall (`inet kith-pods`, chain `passed`) drops whatever
+  comes from an exit's pod link (`kpx`) unless it goes to a tunnel, another pod or the
+  mesh, and drops what comes in by a tunnel unless it answers a connection an exit's pod
+  started (marked when it starts). These rules are the kernel's, so they hold with kithd
+  stopped or killed; a node that starts again makes them again before any pod. The pod's
+  DNS is the exit's, through the tunnel, and its packets to the node's own resolver are
+  dropped. When a tunnel is made again or goes, the connections its pods had are
+  forgotten (conntrack), so none goes on by an older path. A pod names an exit only from
+  a namespace the Exit lists: refused at apply, and again by the node before it starts
+  one. Its replicas are placed on the Exit's node, and every other node refuses to start
+  them; a build older than exits refuses such a template outright (its fields are
+  checked), so it cannot run one with no tunnel. The Exit and its Secret are sent only
+  to the Exit's node; the Secret is in `kith-system`, read by kithd, mounted in no
+  container. Writing an Exit is cluster-wide: a Role scoped to a namespace cannot. kithd
+  asks the kernel for this over netlink: routing rules (`RTM_NEWRULE`/`RTM_DELRULE`), a
+  WireGuard device and its peer, and conntrack's flush by mark; kith OS's kernel has
+  multiple routing tables in both families, connection marks and conntrack over netlink
+  for it. A published port (`publish: true`) is kithd listening on the node's IPv4
+  addresses and passing what comes to the pod: no rule of the kernel's lets anything
+  else in.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -361,6 +386,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **An Exit keeps a pod's packets in its tunnel, not the pod's secrets from its provider.**
+  The provider sees everything the pod sends, and answers its names. A published port of
+  an exit's pod is open to whoever reaches the node's address: it is the pod's web UI on
+  the LAN, and nothing keeps the internet from it but the node's own place on the network.
+  An Exit whose Secret's file is wrong, or whose node is not root, runs none of its pods
+  (they wait, and their status says why); a name in `Endpoint` is refused, not looked up.
+  An exit's pod is not given the cluster's names, and a Service may not reach it. A
+  Release or Source applied by an admin skips the apply-time namespace check (it writes
+  through the log); the node's own check before start still refuses an unlisted namespace.
 - **What a replica writes outside its Volumes is counted, not held at the write.** Its
   containers' writable roots and its disk scratch share the node's state disk, with no
   quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`

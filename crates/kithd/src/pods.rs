@@ -215,7 +215,8 @@ pub async fn publish(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
             kept
         });
         for (port, id) in wanted {
-            open.entry(port).or_insert_with(|| (id.clone(), tokio::spawn(relay(shared.clone(), id, port))));
+            open.entry(port)
+                .or_insert_with(|| (id.clone(), tokio::spawn(relay(shared.clone(), id, port))));
         }
         tokio::select! {
             _ = generation.changed() => {}

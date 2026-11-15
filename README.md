@@ -156,7 +156,7 @@ kith diff -f examples/           # what apply would change; exits 1 if anything
 kith apply -f examples/          # all or nothing
 kith history workload/hello
 kith rollback workload/hello --to 1
-kith schema                      # the 35 built-in kinds; `kith schema workload` prints its JSON Schema
+kith schema                      # the 36 built-in kinds; `kith schema workload` prints its JSON Schema
 ```
 
 Mistakes are reported with the file, line and column:
@@ -476,6 +476,78 @@ spec:
 - Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
   capabilities and the filter (no user namespace); the range pods' addresses are taken
   from is fixed.
+
+### A pod behind a VPN exit
+
+An app that must reach the internet only through a VPN (a download client, say) needs no
+VPN container beside it with `NET_ADMIN`, `/dev/net/tun`, sysctls and a killswitch. The
+node holds the WireGuard tunnel itself, and the pod is given nothing but a network that
+leads into it:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: vpn, namespace: kith-system }
+spec:
+  data:
+    wg0.conf: |              # the file your provider gives you, as it gives it
+      [Interface]
+      PrivateKey = ...
+      Address = 10.2.0.2/32
+      DNS = 10.2.0.1
+      [Peer]
+      PublicKey = ...
+      AllowedIPs = 0.0.0.0/0
+      Endpoint = 192.0.2.10:51820
+---
+apiVersion: kith.dev/v1
+kind: Exit
+metadata: { name: vpn }
+spec:
+  node: n1                   # the node that holds the tunnel; the pods run there
+  secret: vpn                # in kith-system: kithd reads it, no container mounts it
+  namespaces: [media]        # whose pods may leave by it
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: downloads, namespace: media }
+spec:
+  template:
+    pod: true
+    exit: vpn
+    containers:
+      - name: app
+        image: example/downloads:1
+        ports: [{ port: 8080, publish: true }]
+```
+
+- **Through the tunnel, or nowhere.** Before the pod's link is made, kithd writes rules
+  that send everything the pod sends outside the cluster to the tunnel's own routing
+  table, or, with no tunnel, to nowhere; and the firewall drops whatever of an exit's pod
+  would leave by any other link, whether kithd runs or not. With the provider silent, the
+  tunnel deleted or the Exit deleted, the pod reaches nothing outside; it does not fall
+  back to the node's own way out. IPv6 never leaves (only the mesh's range is routed),
+  and nothing from the tunnel comes in that the pod did not start.
+- **Names through the tunnel.** The pod asks the exit's DNS (`DNS` in the file, or the
+  Exit's `dns`), over UDP and TCP, through the tunnel: never the node's resolver or its
+  cache. So an exit's pod has no cluster DNS names, and a Service that sends to it may not
+  reach it.
+- **Only where the tunnel is.** An exit's pods are placed on its node; a node that holds
+  no tunnel for it, or a kithd that is not root, does not start them; and deleting the
+  Exit stops them. A Workload in a namespace the Exit does not list is refused when
+  applied (`Exit vpn does not list namespace other`), and again by the node. Only a
+  Workload's pods leave by an exit (not a Job's, a NodeWorkload's or an exec unit's).
+- **Its web UI from the LAN.** `publish: true` on a port (TCP, or `protocol: udp`) makes
+  kithd listen on that port of each of the node's IPv4 addresses and pass each connection
+  or datagram to the pod; the replies go back the same way, not through the tunnel. The
+  first pod of a node to publish a port has it; another waits for it to go (kithd's log
+  says so). `publish` works for any pod, not only an exit's.
+- **What an Exit is.** It is cluster-wide: whoever may write one decides which namespaces'
+  pods leave through it, so a Role scoped to a namespace cannot. Only the Exit's node is
+  sent the Exit and its Secret. `Endpoint` has to be an address, not a name (a name would
+  be asked outside the tunnel). The tunnel carries IPv4 only.
+- Not yet: OpenVPN, the provider's port forwarding, one key on two nodes, an exit's
+  traffic from a pod on another node, and phones or laptops through an exit.
 
 ### What a container is given
 
@@ -1592,14 +1664,14 @@ guest becomes, and what is still missing:
 | A guest that is | Becomes | Today |
 |---|---|---|
 | a web app with one port and a data directory (a password manager, a search engine, an automation tool, a package repository) | a Workload, a Volume, a Service with `expose` | works |
-| an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS on the node's own address (the forge's SSH) does not yet |
+| an app with its database and helpers beside it (a file cloud, a Git forge) | one pod: the containers share `localhost`; a Volume each | works; a port other than HTTPS (the forge's SSH) is a published port, on the pod's node only |
 | a media server with a GPU | a Workload with a `DeviceClaim` on the card | the claim works; transcoding is not tried on a real card |
 | a compose stack | [`kith import compose FILE`](#from-a-docker-compose-file) prints it as Workloads, Services and Volumes, and refuses by name what it cannot carry | works for what it carries |
 | a reverse proxy | kith's own ingress: a Service's `expose`, a certificate by ACME or your own | by host name and by path, with headers set; no rewriting of paths, no login in front of an app, no HTTP/2 to a host read by path |
 | a DNS filter | kith's own [DNS](#dns) with a `DNSBlockList`: hosts files and filter lists' plain rules | works; no per-client statistics or query log |
-| a mail relay, or anything on a port of the LAN that is not HTTPS | a Workload that shares its node's network (root, not a pod) | works only so; a port said in the Workload, not yet |
+| a mail relay, or anything on a port of the LAN that is not HTTPS | a pod whose port says [`publish: true`](#a-pod-behind-a-vpn-exit), or a Workload that shares its node's network (root, not a pod) | works; a published port is on one node, the first pod's there to ask for it |
 | a VPN endpoint for people (phones, laptops) | kith's own, with levels of access | not yet |
-| an app that must go out through a VPN | a Workload with an exit | not yet |
+| an app that must go out through a VPN | a Workload with an [exit](#a-pod-behind-a-vpn-exit), its web UI a published port | WireGuard; tested against a provider in a VM, not a real one |
 | a VM with no image (an appliance) | a [`vms` unit](#virtual-machines) | outbound network only, its disk not a Volume, not on kith OS: not yet |
 
 Moving a guest's data, one guest at a time:
