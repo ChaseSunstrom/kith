@@ -456,9 +456,15 @@ spec:
   cluster may differ: no pod reaches another by it), from `/8` to `/24` (a `/24` holds 254
   pods) and a whole network (`10.77.0.0/20`, not `10.77.0.1/20`); never loopback,
   link-local (169.254.0.0/16), multicast or reserved space. At start, as root, kithd reads the
-  addresses its node has on its links and refuses to start, naming the one, when a
-  link's address is inside the range (it changes nothing; a range that comes up on the node
-  later is not noticed). Pods of the old range go when kithd restarts.
+  addresses its node has on its links (not the loopback's) and finds one that is inside the
+  range or whose network (`192.168.1.5/16`) holds it; it changes nothing, and a range that comes
+  up on the node later is not noticed. When the range was named with `--pod-range` and
+  kithd is not the first process of a kith OS node, kithd then refuses to start, naming the
+  address and the link; on the default range, and on kith OS (a refusal there restarts the
+  machine, and a lease that lands in the range one day would make it loop), it says so on stderr
+  and goes on. The node's DNS answers names outside the cluster for any address in the
+  range, so a range that is not private lets whoever can reach its listener from such an
+  address use it: choose a private one. Pods of the old range go when kithd restarts.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its

@@ -628,9 +628,12 @@ EOF
             asks() {
                 name=$1
                 shift
+                # ($pinned: a Volume that puts the Job on its node.)
+                mounts=''
+                [ -z "${pinned:-}" ] || mounts=",\"volumeMounts\":[{\"volume\":\"$pinned\",\"path\":\"/state\"}]"
                 cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$name"},"spec":{"retries":0,"template":{"pod":true,"containers":[
-  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]}]}}}]
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]$mounts}]}}}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $name was not applied"
                 waited=0
@@ -676,6 +679,12 @@ EOF
             done
             grep -qE 'where: nameserver 100\.88\.0\.1 from 100\.88\.[0-9]+\.[0-9]+' "$work/at-n1.out" || fail "the pod on n1 is not in the default range: $(cat "$work/at-n1.out")"
             grep -qE 'where: nameserver 10\.77\.0\.1 from 10\.77\.[0-9]+\.[0-9]+' "$work/at-n2.out" || fail "the pod on n2 is not in the range of --pod-range: $(cat "$work/at-n2.out")"
+            # And one pod on n2 asks this machine, from behind its node's address: the node
+            # sends it as its own only if the masquerade rule matches the range it was told.
+            pinned=on-n2
+            asks egress 10.0.2.2 $((port + 9))
+            pinned=''
+            grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
             # A Workload of an image nothing else uses, deleted once it runs: its image is
             # looked for again at the end.
             cat >"$work/apply.json" <<EOF

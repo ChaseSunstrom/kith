@@ -279,6 +279,14 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether a range that clashes with an address of this node ends the start: one an operator
+/// named (not the default), when kithd is not the first process. There a refusal restarts the
+/// machine, and a lease that lands in the range one day would make a reboot loop nobody
+/// can reach: it is said and the start goes on.
+fn clash_refuses(range: kith_mesh::pod::Range, first_process: bool) -> bool {
+    range != kith_mesh::pod::Range::default() && !first_process
+}
+
 /// The installer (kith OS started with `kith.install`): nothing is served, a disk is
 /// written, and the machine is powered off.
 fn installer(boot: init::Boot, source: String) -> ! {
@@ -588,8 +596,17 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     }
     // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
     pods::set_range(args.pod_range);
-    if nix::unistd::getuid().is_root() {
-        args.pod_range.refuse_if_in_use()?;
+    if nix::unistd::getuid().is_root()
+        && let Err(clash) = args.pod_range.refuse_if_in_use()
+    {
+        if clash_refuses(args.pod_range, first_process) {
+            return Err(clash);
+        }
+        // (Not `eprintln!`: PID 1 must not panic on a stderr it cannot write.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
+        );
     }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
     // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
@@ -1001,6 +1018,14 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    #[test]
+    fn a_clash_of_the_pods_range_ends_the_start_only_for_one_named_outside_init() {
+        let (default, named) = (kith_mesh::pod::Range::default(), "10.77.0.0/20".parse().unwrap());
+        assert!(super::clash_refuses(named, false));
+        assert!(!super::clash_refuses(named, true), "as init it would loop the reboot");
+        assert!(!super::clash_refuses(default, false) && !super::clash_refuses(default, true));
     }
 
     #[test]

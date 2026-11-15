@@ -7,7 +7,8 @@
 // ponytail: the IPv4 range is a flag of the node's kithd ([`Range`]; 100.88.0.0/16, of the
 // range set aside for carriers' NAT, unless told). At most 65533 pods a node, whatever the
 // range holds; a range's own network is read once, at start: one that comes up on this node
-// later (a tailnet) and clashes is not noticed.
+// later (a tailnet) and clashes is not noticed; the gateway of an earlier range stays on the
+// loopback until reboot (nothing tells it from one an operator put there: it is only skipped).
 
 use crate::netlink::{ask_route, link, silent, up};
 use netlink_packet_core::{NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE};
@@ -116,20 +117,19 @@ impl Range {
         (self.network + u32::from(number)).into()
     }
 
-    /// Refuse a range that holds an address this node already has on a link (`held`: each
-    /// with its prefix length); the gateway on the loopback is its own, from an earlier start.
-    pub fn refuse_held(&self, held: &[(Ipv4Addr, u8)]) -> std::result::Result<(), String> {
-        let ours = |(address, bits): &(Ipv4Addr, u8)| *bits != 32 || *address != self.gateway();
-        match held
+    /// Whether the range overlaps the network (or the address) of one this node has on a
+    /// link other than the loopback, which holds the gateway of an earlier start. The
+    /// complaint names the address and the link.
+    pub fn refuse_held(&self, held: &[Held]) -> std::result::Result<(), String> {
+        let clash = held
             .iter()
-            .filter(|held| ours(held))
-            .find(|(address, _)| u32::from(*address) & self.mask() == self.network)
-        {
-            Some((address, bits)) => Err(format!(
-                "this node has {address}/{bits} on a link, inside the pods' range {self}: name another with --pod-range"
-            )),
-            None => Ok(()),
-        }
+            .filter(|held| held.link != LOOPBACK)
+            .find(|held| overlap((u32::from(held.address), held.bits), (self.network, self.bits)));
+        clash.map_or(Ok(()), |Held { address, bits, name, .. }| {
+            Err(format!(
+                "this node has {address}/{bits} on {name}, which overlaps the pods' range {self}: name another with --pod-range"
+            ))
+        })
     }
 
     /// [`Range::refuse_held`] for the addresses this machine has now (read, not changed).
@@ -139,13 +139,26 @@ impl Range {
     }
 }
 
-/// Whether two networks (address, bits) share an address.
-fn overlap((a, a_bits): (u32, u8), (b, b_bits): (u32, u8)) -> bool {
-    (a ^ b) >> (32 - a_bits.min(b_bits)) == 0
+/// The loopback's index: the first link of a machine.
+const LOOPBACK: u32 = 1;
+
+/// An IPv4 address this machine has on a link: with its prefix length, the link's index
+/// and its name.
+#[derive(Clone, Debug)]
+pub struct Held {
+    pub address: Ipv4Addr,
+    pub bits: u8,
+    pub link: u32,
+    pub name: String,
 }
 
-/// The IPv4 addresses on this machine's links, with their prefix lengths.
-fn held_addresses() -> Result<Vec<(Ipv4Addr, u8)>> {
+/// Whether two networks (address, bits) share an address.
+fn overlap((a, a_bits): (u32, u8), (b, b_bits): (u32, u8)) -> bool {
+    (a ^ b).checked_shr(32 - u32::from(a_bits.min(b_bits))).unwrap_or(0) == 0
+}
+
+/// The IPv4 addresses on this machine's links.
+fn held_addresses() -> Result<Vec<Held>> {
     let mut message = AddressMessage::default();
     message.header.family = AddressFamily::Inet;
     let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
@@ -153,13 +166,22 @@ fn held_addresses() -> Result<Vec<(Ipv4Addr, u8)>> {
         .into_iter()
         .filter_map(|found| match found {
             RouteNetlinkMessage::NewAddress(found) => {
-                let local = found.attributes.iter().find_map(|attribute| match attribute {
-                    AddressAttribute::Local(IpAddr::V4(local)) | AddressAttribute::Address(IpAddr::V4(local)) => {
-                        Some(*local)
+                // (Local is the link's own address; on a point-to-point one, Address is the peer's.)
+                let (mut local, mut peer, mut name) = (None, None, None);
+                for attribute in found.attributes {
+                    match attribute {
+                        AddressAttribute::Local(IpAddr::V4(a)) => local = local.or(Some(a)),
+                        AddressAttribute::Address(IpAddr::V4(a)) => peer = peer.or(Some(a)),
+                        AddressAttribute::Label(label) => name = Some(label),
+                        _ => {}
                     }
-                    _ => None,
-                });
-                local.map(|local| (local, found.header.prefix_len))
+                }
+                Some(Held {
+                    address: local.or(peer)?,
+                    bits: found.header.prefix_len,
+                    link: found.header.index,
+                    name: name.unwrap_or_else(|| format!("link {}", found.header.index)),
+                })
             }
             _ => None,
         })
@@ -551,34 +573,45 @@ mod tests {
     #[test]
     fn a_range_with_an_address_of_the_node_in_it_is_refused() {
         let ours = range("10.77.0.0/16").unwrap();
-        let held = |list: &[(&str, u8)]| -> Vec<(Ipv4Addr, u8)> {
-            list.iter().map(|(a, b)| (a.parse().unwrap(), *b)).collect()
+        // Each on link 2 (eth0), the loopback being link 1.
+        let held = |list: &[(&str, u8)]| -> Vec<Held> {
+            let on = |link, (a, bits): &(&str, u8)| Held {
+                address: a.parse().unwrap(),
+                bits: *bits,
+                link,
+                name: format!("link{link}"),
+            };
+            list.iter().map(|a| on(2, a)).collect()
         };
         // The node's own network (a LAN, a tailnet) and the loopback are not in it.
-        ours.refuse_held(&held(&[
-            ("127.0.0.1", 8),
-            ("192.168.1.5", 24),
-            ("100.101.1.2", 32),
-            ("10.78.0.1", 16),
-        ]))
-        .unwrap();
-        // The pods' own gateway, left on the loopback by an earlier start, is not a clash.
-        ours.refuse_held(&held(&[("10.77.0.1", 32)])).unwrap();
-        // One that is, is (even at the range's ends, or with the gateway's address and another length).
-        for clash in [
-            ("10.77.0.9", 24),
-            ("10.77.255.254", 32),
-            ("10.77.0.0", 8),
-            ("10.77.0.1", 16),
+        ours.refuse_held(&held(&[("192.168.1.5", 24), ("100.101.1.2", 32), ("10.78.0.1", 16)]))
+            .unwrap();
+        // Whatever the loopback holds is no clash: the gateway an earlier start left there
+        // (this range's too, after a restart onto the range of its pods), and 127/8.
+        let mut on_lo = held(&[("10.77.0.1", 32), ("10.77.9.9", 24), ("127.0.0.1", 8)]);
+        on_lo.iter_mut().for_each(|held| held.link = 1);
+        ours.refuse_held(&on_lo).unwrap();
+        // One that is, is (even at the range's ends, with another length, or its network
+        // holding the range: 192.168.1.5/16 and a range of 192.168.77.0/24), naming the link.
+        for (range, clash) in [
+            ("10.77.0.0/16", ("10.77.0.9", 24)),
+            ("10.77.0.0/16", ("10.77.255.254", 32)),
+            ("10.77.0.0/16", ("10.77.0.0", 8)),
+            ("10.77.0.0/16", ("10.77.0.1", 16)),
+            ("192.168.77.0/24", ("192.168.1.5", 16)),
         ] {
-            let said = ours.refuse_held(&held(&[("192.168.1.5", 24), clash])).unwrap_err();
+            let said = range
+                .parse::<Range>()
+                .unwrap()
+                .refuse_held(&held(&[("172.16.0.2", 24), clash]));
+            let said = said.unwrap_err();
             assert!(
-                said.contains(&format!("{}/{}", clash.0, clash.1)) && said.contains("--pod-range"),
+                said.contains(&format!("{}/{} on link2", clash.0, clash.1)) && said.contains("--pod-range"),
                 "{said}"
             );
         }
         // And the machine this runs on can be asked (what it has is anyone's: only that it answers).
-        assert!(held_addresses().is_ok_and(|held| held.iter().any(|(address, _)| address.is_loopback())));
+        assert!(held_addresses().is_ok_and(|held| held.iter().any(|held| held.address.is_loopback())));
     }
 
     #[test]
