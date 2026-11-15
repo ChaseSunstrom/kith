@@ -734,9 +734,11 @@ mod tests {
         own.local = Some(door.local.clone());
         let reference = format!("localhost:{}/default/hello:1", door.local.port);
         let always = kith_runtime::PullPolicy::Always;
-        own.pull(&reference, kith_runtime::PullPolicy::IfNotPresent)
+        let first = own
+            .pull(&reference, kith_runtime::PullPolicy::IfNotPresent)
             .await
             .unwrap();
+        assert_eq!(first.downloaded, 1, "the first pull did not fetch the Image's layer");
         let asking = std::time::Instant::now();
         let again = own.pull(&reference, always).await.unwrap();
         eprintln!(
@@ -744,6 +746,7 @@ mod tests {
             asking.elapsed().as_millis()
         );
         assert_eq!(again.digest, digest);
+        assert_eq!(again.downloaded, 0, "an unchanged Image's layer was downloaded again");
         state.lock().unwrap().delete("Image/default/hello").unwrap();
         for policy in [
             kith_runtime::PullPolicy::IfNotPresent,
@@ -752,6 +755,11 @@ mod tests {
         ] {
             let reason = own.pull(&reference, policy).await.unwrap_err().to_string();
             assert!(reason.contains("default/hello:1"), "{policy:?}: {reason}");
+            // The registry's refusal of the manifest it was asked for, not the store's copy.
+            assert!(
+                reason.contains("manifests/1"),
+                "{policy:?}: the registry was not asked: {reason}"
+            );
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
