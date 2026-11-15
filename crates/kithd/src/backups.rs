@@ -132,7 +132,11 @@ pub(crate) const DEEPEST: usize = 128;
 
 /// Every entry of the directory `dir` is open at into `tar`, under `at`.
 fn pack<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &std::fs::File, at: &Path) -> std::io::Result<()> {
-    if at.components().count() > DEEPEST {
+    // (As an unpack counts: `.` is no directory down, so what a restore takes is packed again.)
+    let down = at
+        .components()
+        .filter(|part| matches!(part, std::path::Component::Normal(_)));
+    if down.count() > DEEPEST {
         let said = format!("{} is more than {DEEPEST} directories deep", at.display());
         return Err(std::io::Error::other(said));
     }
@@ -244,16 +248,41 @@ fn unpack(archive: &Path, dir: &Path, cap: u64) -> Result<(), String> {
     }
     // (An archive may come from a bucket others can write: nothing in it becomes a program
     // that runs as its owner.)
-    unpack_beside(archive, dir, 0o6000, cap).and_then(|beside| {
-        // (`remove_dir` takes only a directory that is still empty.)
-        let moved = std::fs::remove_dir(dir).map_err(|_| full());
-        let moved = moved.and_then(|()| std::fs::rename(&beside, dir).map_err(failed));
-        if moved.is_err() {
-            let _ = std::fs::remove_dir_all(&beside);
-            let _ = std::fs::create_dir(dir);
+    unpack_beside(archive, dir, 0o6000, cap).and_then(|beside| into_place(&beside, dir))
+}
+
+/// The directory `beside` moved to `dir`, which must still be empty. It is renamed over
+/// `dir`, with nothing removed first: a move that fails leaves `dir` there as it was, its mode
+/// and owner too, and `beside` goes.
+fn into_place(beside: &Path, dir: &Path) -> Result<(), String> {
+    let moved = std::fs::rename(beside, dir).map_err(|e| {
+        // (A rename takes the place of an empty directory only.)
+        let full = [nix::errno::Errno::ENOTEMPTY, nix::errno::Errno::EEXIST];
+        if full.iter().any(|full| e.raw_os_error() == Some(*full as i32)) {
+            "the volume has files in it: a backup is restored into an empty volume".to_string()
+        } else {
+            format!("restoring into {}: {e}", dir.display())
         }
-        moved
-    })
+    });
+    if moved.is_err() {
+        remove_unpacked(beside);
+    }
+    moved
+}
+
+/// The object `object` of `bucket` restored into `dir` (see [`unpack`]), to at most `cap`
+/// bytes. It is downloaded into `blobs` and unpacked from there, and the download is
+/// removed when the unpack is done or refused: it is not a blob of the store.
+async fn from_bucket(bucket: &Bucket, object: &str, blobs: &Path, dir: PathBuf, cap: u64) -> Result<(), String> {
+    let mut answer = s3(bucket, reqwest::Method::GET, object, None).await?;
+    let mut incoming = Incoming::new(blobs).map_err(|e| e.to_string())?;
+    let said = |e: String| format!("the bucket: {e}");
+    receive(&mut answer, &mut incoming, QUIET, download_cap(cap))
+        .await
+        .map_err(said)?;
+    // (`incoming` goes with the closure, when the unpack ends however it ends: its file with it.)
+    let unpacked = tokio::task::spawn_blocking(move || unpack(incoming.path(), &dir, cap)).await;
+    unpacked.map_err(|e| e.to_string())?
 }
 
 /// What a file, a directory or a link takes of a disk at least, and the unit an unpack counts in.
@@ -265,54 +294,249 @@ const BLOCK: u64 = 4096;
 /// `cap` is how many bytes it may unpack to (a Volume with no size: `u64::MAX`). Each entry
 /// counts at the size it unpacks to rounded up to `BLOCK` and at least that (a directory, a
 /// link and an empty file take a block), before it is unpacked, and the one that passes `cap`
-/// is the error. (The directories are held, as entries, until the end: one per block of `cap`
-/// at most.) A GNU sparse entry says its whole length (the tar crate gives that as
+/// is the error. A GNU sparse entry says its whole length (the tar crate gives that as
 /// `size()`, and unpacks it as a hole that takes next to no disk): it counts whole, as
 /// the next archive of the Volume reads it whole.
 pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32, cap: u64) -> Result<PathBuf, String> {
     let failed = |e: std::io::Error| format!("unpacking for {}: {e}", dir.display());
-    let mut beside = dir.as_os_str().to_owned();
-    beside.push(".restoring");
-    let beside = PathBuf::from(beside);
-    let _ = std::fs::remove_dir_all(&beside);
-    let unpacked = (|| {
-        std::fs::create_dir(&beside)?;
-        let mut tar = tar::Archive::new(std::fs::File::open(archive)?);
-        tar.set_preserve_permissions(true);
-        tar.set_preserve_mtime(true);
-        tar.set_mask(mask);
-        // (Whose each file is, where kithd may say: as root, which it is on a node.)
-        tar.set_preserve_ownerships(std::fs::metadata("/proc/self").is_ok_and(|me| {
-            use std::os::unix::fs::MetadataExt;
-            me.uid() == 0
-        }));
-        // (The tar crate lets no entry out of where it unpacks: no `..`, no absolute path,
-        // no way through a link.) As `Archive::unpack` does it, with the count: directories
-        // last, deepest first, so that a mode that shuts one does not shut out what is in it.
-        let to = beside.canonicalize()?;
-        let (mut held, mut dirs) = (0u64, Vec::new());
-        for entry in tar.entries()? {
-            let mut entry = entry?;
-            // (In blocks, as the disk has it: a directory, a link and a file of a byte take 4 KiB.)
-            held = held.saturating_add(entry.size().div_ceil(BLOCK).max(1) * BLOCK);
-            if held > cap {
+    let beside = beside(dir).ok_or_else(|| failed(std::io::Error::other("a directory with no name")))?;
+    remove_unpacked(&beside);
+    let unpacked = std::fs::create_dir(&beside)
+        .and_then(|()| beside.canonicalize())
+        .and_then(|to| unpack_to(archive, &to, mask, cap));
+    if unpacked.is_err() {
+        remove_unpacked(&beside);
+    }
+    unpacked.map(|_| beside).map_err(failed)
+}
+
+/// Where [`unpack_beside`] unpacks for `dir`: `.NAME.restoring` in the same directory. A
+/// Volume's own directory is named for it, and a name starts with a letter or a digit, so
+/// this is no other Volume's (`x.restoring` beside `x` can be); only a `kith-system`
+/// Volume, whose path is the admin's to name, could be given one like it.
+fn beside(dir: &Path) -> Option<PathBuf> {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(dir.file_name()?);
+    name.push(".restoring");
+    Some(dir.with_file_name(name))
+}
+
+/// What an unpack left at `beside` removed, its directories first opened to their owner
+/// (one the archive shut, with files in it, cannot be emptied otherwise where kithd is not
+/// root): the most directories it held open at once. No link is followed: a directory is
+/// opened only where it is one. The walk holds the directories it is inside of, each open
+/// with its listing read through it and each one in it opened through it, to [`DEEPEST`]
+/// below `beside`; one deeper is left to the removal, which empties it where its owner may.
+pub(crate) fn remove_unpacked(beside: &Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+    let open = |path: &Path| {
+        let dir = open_dir(path).ok()?;
+        let mode = dir.metadata().ok()?.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777 | 0o700));
+        }
+        let listing = std::fs::read_dir(within(&dir, ".".as_ref())).ok()?;
+        Some((dir, listing))
+    };
+    let (mut inside, mut most) = (Vec::from_iter(open(beside)), 0);
+    loop {
+        let held = inside.len();
+        most = most.max(held);
+        let Some((dir, listing)) = inside.last_mut() else { break };
+        let Some(entry) = listing.next() else {
+            inside.pop();
+            continue;
+        };
+        if held <= DEEPEST
+            && let Ok(entry) = entry
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && let Some(under) = open(&within(dir, &entry.file_name()))
+        {
+            inside.push(under);
+        }
+    }
+    // (One left here fails the next unpack for the same Volume: said once, here.)
+    match std::fs::remove_dir_all(beside) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            eprintln!("kithd: {} was not removed: {e}", beside.display());
+        }
+        _ => {}
+    }
+    most
+}
+
+/// The directory at `path` open, not through a link in its place.
+fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let flags = nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_DIRECTORY;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits())
+        .open(path)
+}
+
+/// The archive that [`unpack_to`] reads, which counts what the tar crate reads of it while
+/// it finds the next entry (its header, and a long name, PAX header or sparse map it reads
+/// whole) and refuses more than [`HEADERS`].
+struct Metered {
+    file: std::fs::File,
+    /// How long the archive is: what an entry skips goes no further.
+    len: u64,
+    /// What was read since the last entry was asked for; none while an entry is unpacked.
+    read: std::rc::Rc<std::cell::Cell<Option<u64>>>,
+}
+
+/// The most an entry's headers may take, read: a path is 4 KiB at most.
+const HEADERS: u64 = 256 * 1024;
+
+impl std::io::Read for Metered {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.file.read(buf)?;
+        if let Some(read) = self.read.get() {
+            let read = read.saturating_add(got as u64);
+            if read > HEADERS {
                 return Err(std::io::Error::other(format!(
-                    "the archive unpacks to more than {cap} bytes, more than the Volume may hold"
+                    "an entry has headers of more than {HEADERS} bytes (a long name, a PAX header or a sparse map)"
                 )));
             }
-            if entry.header().entry_type().is_dir() {
-                dirs.push(entry);
-            } else {
-                entry.unpack_in(&to)?;
-            }
+            self.read.set(Some(read));
         }
-        dirs.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
-        dirs.into_iter().try_for_each(|mut dir| dir.unpack_in(&to).map(drop))
-    })();
-    if unpacked.is_err() {
-        let _ = std::fs::remove_dir_all(&beside);
+        Ok(got)
     }
-    unpacked.map(|()| beside).map_err(failed)
+}
+
+impl std::io::Seek for Metered {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        // (Past the end, a read would find nothing, which the tar crate takes for the
+        // archive's end: the archive is cut short, and refused.)
+        match self.file.seek(to)? {
+            at if at > self.len => Err(std::io::Error::other("the archive ends inside an entry")),
+            at => Ok(at),
+        }
+    }
+}
+
+/// A directory an unpack is inside of, as the archive says it: given its mode and time when
+/// the archive leaves it.
+struct Inside {
+    /// Where, under the directory unpacked to.
+    path: PathBuf,
+    mode: Option<u32>,
+    time: Option<std::time::SystemTime>,
+}
+
+/// The tar at `archive` unpacked into `to`, which is canonical, as [`unpack_beside`] says:
+/// the most directories it held at once.
+///
+/// (The tar crate lets no entry out of where it unpacks: no `..`, no absolute path, no way
+/// through a link.) Each directory is made when it comes, open to its owner until the archive
+/// leaves it, and then given its mode and time: an archive in depth-first order (kith's own,
+/// GNU tar's) leaves a directory once all that is in it is there, so a mode that shuts it
+/// does not shut out what is in it, and the time it is given stays. The directories held are
+/// those the archive is inside of, as many as it is deep and no more than [`DEEPEST`].
+fn unpack_to(archive: &Path, to: &Path, mask: u32, cap: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::PermissionsExt;
+    let read = std::rc::Rc::new(std::cell::Cell::new(None));
+    let file = std::fs::File::open(archive)?;
+    let len = file.metadata()?.len();
+    let mut tar = tar::Archive::new(Metered {
+        file,
+        len,
+        read: read.clone(),
+    });
+    tar.set_preserve_permissions(true);
+    tar.set_preserve_mtime(true);
+    tar.set_mask(mask);
+    // (Whose each file is, where kithd may say: as root, which it is on a node.)
+    tar.set_preserve_ownerships(std::fs::metadata("/proc/self").is_ok_and(|me| {
+        use std::os::unix::fs::MetadataExt;
+        me.uid() == 0
+    }));
+    let (mut held, mut inside, mut most) = (0u64, Vec::<Inside>::new(), 0);
+    // (With seek: what an entry leaves unread is skipped, not read and counted.)
+    let mut entries = tar.entries_with_seek()?;
+    loop {
+        read.set(Some(0));
+        let Some(entry) = entries.next() else { break };
+        read.set(None);
+        let mut entry = entry?;
+        // (In blocks, as the disk has it: a directory, a link and a file of a byte take 4 KiB.)
+        held = held.saturating_add(entry.size().div_ceil(BLOCK).max(1).saturating_mul(BLOCK));
+        if held > cap {
+            return Err(std::io::Error::other(format!(
+                "the archive unpacks to more than {cap} bytes, more than the Volume may hold"
+            )));
+        }
+        // (Where it goes, as the tar crate reads it: `.` and `/` are nothing, and an entry
+        // with `..` is not unpacked at all.)
+        let path = entry
+            .path()?
+            .components()
+            .try_fold(PathBuf::new(), |path, part| match part {
+                std::path::Component::Normal(part) => Some(path.join(part)),
+                std::path::Component::ParentDir => None,
+                _ => Some(path),
+            });
+        let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+            entry.unpack_in(to)?;
+            continue;
+        };
+        while inside
+            .last()
+            .is_some_and(|dir| path == dir.path || !path.starts_with(&dir.path))
+        {
+            close(to, inside.pop().expect("there is one"))?;
+        }
+        // (Those held are the ones it is in: as many as its path has parts, at most. A file
+        // is in one fewer, which the tar crate makes where the archive did not: as deep, too.
+        // A directory is also what the tar crate makes of an old header's name that ends in
+        // `/`, unless it is a link.)
+        let kind = entry.header().entry_type();
+        let is_dir = kind.is_dir()
+            || (!kind.is_hard_link()
+                && !kind.is_symlink()
+                && entry.header().as_ustar().is_none()
+                && entry.path_bytes().ends_with(b"/"));
+        if path.components().count() - usize::from(!is_dir) > DEEPEST {
+            let said = format!("{} is more than {DEEPEST} directories deep", path.display());
+            return Err(std::io::Error::other(said));
+        }
+        if entry.unpack_in(to)? && is_dir {
+            let mode = entry.header().mode().ok().map(|mode| mode & 0o7777 & !mask);
+            if mode.is_some_and(|mode| mode & 0o700 != 0o700) {
+                // (Made a moment ago by the tar crate, through the same path, as a directory.)
+                let open = std::fs::Permissions::from_mode(mode.unwrap_or(0) | 0o700);
+                std::fs::set_permissions(to.join(&path), open)?;
+            }
+            let time = entry.header().mtime().ok();
+            // (A time past what the clock holds, which a base-256 header can say, is no time.)
+            let time = time.and_then(|at| std::time::UNIX_EPOCH.checked_add(Duration::from_secs(at)));
+            inside.push(Inside { path, mode, time });
+            most = most.max(inside.len());
+        }
+    }
+    while let Some(dir) = inside.pop() {
+        close(to, dir)?;
+    }
+    Ok(most)
+}
+
+/// `dir`, under `to`, given its mode and time: only where its path still leads to it, with
+/// no link on the way, and through no link in its place.
+fn close(to: &Path, dir: Inside) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let at = to.join(&dir.path);
+    if at.canonicalize()? != at {
+        return Ok(());
+    }
+    let file = open_dir(&at)?;
+    if let Some(time) = dir.time {
+        file.set_times(std::fs::FileTimes::new().set_accessed(time).set_modified(time))?;
+    }
+    if let Some(mode) = dir.mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
 }
 
 // ---- S3 ----
@@ -743,24 +967,18 @@ pub async fn restore(
         let _alone = BUSY.lock().await;
         let state = shared.logs.parent().ok_or("kithd has no state directory")?;
         let into = crate::volumes::host_dir(state, &dir)?;
-        let archive = match (entry["blob"].as_str(), entry["object"].as_str(), &spec.s3) {
-            (Some(blob), _, _) => crate::blobs::here(&shared, &format!("Blob/{namespace}/{blob}")).await?,
+        match (entry["blob"].as_str(), entry["object"].as_str(), &spec.s3) {
+            (Some(blob), _, _) => {
+                let archive = crate::blobs::here(&shared, &format!("Blob/{namespace}/{blob}")).await?;
+                let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, &into, cap)).await;
+                unpacked.map_err(|e| e.to_string())?
+            }
             (None, Some(object), Some(s3_spec)) => {
                 let bucket = bucket(&shared, &namespace, s3_spec)?;
-                let mut answer = s3(&bucket, reqwest::Method::GET, object, None).await?;
-                let blobs = crate::blobs::dir(&shared);
-                let mut incoming = Incoming::new(&blobs).map_err(|e| e.to_string())?;
-                let said = |e: String| format!("the bucket: {e}");
-                receive(&mut answer, &mut incoming, QUIET, download_cap(cap))
-                    .await
-                    .map_err(said)?;
-                let kept = tokio::task::spawn_blocking(move || incoming.keep(None)).await;
-                blobs.join(kept.map_err(|e| e.to_string())??.0)
+                from_bucket(&bucket, object, &crate::blobs::dir(&shared), into, cap).await
             }
-            _ => return Err("the backup says neither which blob nor which object it is".to_string()),
-        };
-        let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, &into, cap)).await;
-        unpacked.map_err(|e| e.to_string())?
+            _ => Err("the backup says neither which blob nor which object it is".to_string()),
+        }
     };
     let restored: Result<(), String> = restored.await;
     shared.audit.record(&caller, "restore", what, restored.clone());
@@ -986,7 +1204,7 @@ mod tests {
         std::fs::write(root.join("junk"), vec![0xffu8; 4096]).unwrap();
         assert!(unpack(&root.join("junk"), &empty, u64::MAX).is_err());
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
-        assert!(!root.join("empty.restoring").exists());
+        assert!(!root.join(".empty.restoring").exists());
         unpack(&blobs.join(&name), &empty, u64::MAX).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1171,17 +1389,17 @@ mod tests {
         let refused = unpack(&archive, &into, 122_879).unwrap_err();
         assert!(refused.contains("more than 122879 bytes"), "{refused}");
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
-        assert!(!root.join("into.restoring").exists());
+        assert!(!root.join(".into.restoring").exists());
         // As much as it may hold: restored. (A volume with no size is `u64::MAX`.)
         unpack(&archive, &into, 122_880).unwrap();
         assert_eq!(std::fs::metadata(into.join("b/c")).unwrap().len(), 60_000);
         // What a killed kithd left beside the volume does not count, and is gone.
         let empty = root.join("empty");
-        std::fs::create_dir_all(root.join("empty.restoring")).unwrap();
-        std::fs::write(root.join("empty.restoring/junk"), vec![0u8; 5000]).unwrap();
+        std::fs::create_dir_all(root.join(".empty.restoring")).unwrap();
+        std::fs::write(root.join(".empty.restoring/junk"), vec![0u8; 5000]).unwrap();
         std::fs::create_dir_all(&empty).unwrap();
         unpack(&archive, &empty, u64::MAX).unwrap();
-        assert!(!root.join("empty.restoring").exists());
+        assert!(!root.join(".empty.restoring").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1199,7 +1417,7 @@ mod tests {
         let refused = unpack(&archive, &into, 1 << 20).unwrap_err();
         assert!(refused.contains("more than 1048576 bytes"), "{refused}");
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
-        assert!(!root.join("into.restoring").exists());
+        assert!(!root.join(".into.restoring").exists());
         unpack(&archive, &into, real).unwrap();
         assert_eq!(std::fs::metadata(into.join("hole")).unwrap().len(), real);
         let _ = std::fs::remove_dir_all(&root);
@@ -1227,9 +1445,476 @@ mod tests {
         let refused = unpack(&archive, &into, 1 << 20).unwrap_err();
         assert!(refused.contains("more than 1048576 bytes"), "{refused}");
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
-        assert!(!root.join("into.restoring").exists());
+        assert!(!root.join(".into.restoring").exists());
         unpack(&archive, &into, 4 << 20).unwrap();
         assert_eq!(std::fs::metadata(into.join("d299/f")).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory entry of a tar, of this mode.
+    fn dir_entry<W: std::io::Write>(tar: &mut tar::Builder<W>, path: &str, mode: u32) {
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mode(mode);
+        tar.append_data(&mut dir, path, &[][..]).unwrap();
+    }
+
+    #[test]
+    fn unpack_holds_no_more_directories_than_the_archive_is_deep() {
+        let root = temp("wide");
+        let (blobs, to) = (root.join("blobs"), root.join("to"));
+        std::fs::create_dir_all(&to).unwrap();
+        let to = to.canonicalize().unwrap();
+        // Ten thousand side by side: one held at a time.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        for n in 0..10_000 {
+            dir_entry(&mut tar, &format!("d{n}/"), 0o755);
+        }
+        let wide = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let most = unpack_to(&wide, &to, 0, u64::MAX).unwrap();
+        assert!(most <= 2, "{most}");
+        assert!(to.join("d9999").is_dir());
+        // Kith's own, five deep: five.
+        let from = root.join("from");
+        std::fs::create_dir_all(from.join("a/b/c/d/e")).unwrap();
+        std::fs::create_dir_all(from.join("z")).unwrap();
+        let (name, _) = archive(&from, &blobs).unwrap();
+        let again = root.join("again");
+        std::fs::create_dir_all(&again).unwrap();
+        assert_eq!(
+            unpack_to(&blobs.join(name), &again.canonicalize().unwrap(), 0, u64::MAX).unwrap(),
+            5
+        );
+        // Deeper than an archive kith makes: refused.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        let mut path = String::new();
+        for _ in 0..=DEEPEST {
+            path.push_str("d/");
+            dir_entry(&mut tar, &path, 0o755);
+        }
+        let deepest = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let deep = root.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let said = unpack_to(&deepest, &deep.canonicalize().unwrap(), 0, u64::MAX).unwrap_err();
+        assert!(said.to_string().contains("more than 128 directories deep"), "{said}");
+        // One entry 200 deep, with none of the 199 above it said: refused as well.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        dir_entry(&mut tar, &"e/".repeat(200), 0o755);
+        let one = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let deep = root.join("deeper");
+        std::fs::create_dir_all(&deep).unwrap();
+        let said = unpack_to(&one, &deep.canonicalize().unwrap(), 0, u64::MAX).unwrap_err();
+        assert!(said.to_string().contains("more than 128 directories deep"), "{said}");
+        // A file in 128: unpacked; in 129 (the tar crate would make them): refused.
+        for (dirs, fits) in [(DEEPEST, true), (DEEPEST + 1, false)] {
+            let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+            let mut file = tar::Header::new_gnu();
+            file.set_size(1);
+            file.set_mode(0o644);
+            tar.append_data(&mut file, format!("{}f", "f/".repeat(dirs)), &[1u8][..])
+                .unwrap();
+            let filed = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+            let deep = root.join(format!("file{dirs}"));
+            std::fs::create_dir_all(&deep).unwrap();
+            let unpacked = unpack_to(&filed, &deep.canonicalize().unwrap(), 0, u64::MAX);
+            assert_eq!(unpacked.is_ok(), fits, "{dirs}: {unpacked:?}");
+            // What a restore takes, the Volume's next backup packs again.
+            if fits {
+                archive(&deep, &blobs).unwrap();
+            }
+        }
+        // An old header's name that ends in `/` is a directory to the tar crate, whatever
+        // its type: as deep as one, and held as one (shut, with a file in it after).
+        for (dirs, fits) in [(DEEPEST, true), (DEEPEST + 1, false)] {
+            let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+            let mut old = tar::Header::new_gnu();
+            old.set_entry_type(tar::EntryType::Regular);
+            old.set_size(0);
+            old.set_mode(0o755);
+            for depth in 1..dirs {
+                tar.append_data(&mut old, "o/".repeat(depth), &[][..]).unwrap();
+            }
+            old.set_mode(0o500);
+            tar.append_data(&mut old, "o/".repeat(dirs), &[][..]).unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(1);
+            file.set_mode(0o644);
+            tar.append_data(&mut file, format!("{}f", "o/".repeat(dirs)), &[1u8][..])
+                .unwrap();
+            let olds = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+            let deep = root.join(format!("old{dirs}"));
+            std::fs::create_dir_all(&deep).unwrap();
+            let unpacked = unpack_to(&olds, &deep.canonicalize().unwrap(), 0, u64::MAX);
+            let deeper = |e: &std::io::Error| e.to_string().contains("more than 128 directories deep");
+            assert!(
+                if fits {
+                    unpacked.is_ok()
+                } else {
+                    unpacked.as_ref().is_err_and(deeper)
+                },
+                "{dirs}: {unpacked:?}"
+            );
+            if fits {
+                let last = deep.join("o/".repeat(dirs));
+                let mode = std::fs::metadata(&last).unwrap().permissions().mode();
+                assert_eq!(mode & 0o7777, 0o500);
+                assert_eq!(std::fs::read(last.join("f")).unwrap(), [1]);
+                std::fs::set_permissions(&last, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        // A directory's time past what the clock holds: unpacked, with no time given.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        let mut late = tar::Header::new_gnu();
+        late.set_entry_type(tar::EntryType::Directory);
+        late.set_size(0);
+        late.set_mode(0o755);
+        late.set_mtime(u64::MAX);
+        tar.append_data(&mut late, "late/", &[][..]).unwrap();
+        let latest = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let later = root.join("later");
+        std::fs::create_dir_all(&later).unwrap();
+        unpack_to(&latest, &later.canonicalize().unwrap(), 0, u64::MAX).unwrap();
+        assert!(later.join("late").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_gives_each_directory_its_mode_owner_and_time_in_a_depth_first_archive() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp("modes");
+        let (from, blobs, into) = (root.join("from"), root.join("blobs"), root.join("into"));
+        std::fs::create_dir_all(from.join("deep/er/est")).unwrap();
+        std::fs::create_dir_all(from.join("shut")).unwrap();
+        std::fs::create_dir_all(&into).unwrap();
+        std::fs::write(from.join("deep/er/est/f"), b"x").unwrap();
+        // Read-only for its owner, with a file in it.
+        std::fs::write(from.join("shut/in"), b"kept").unwrap();
+        let dirs = [
+            ("deep/er/est", 0o700, 3_000_000),
+            ("deep/er", 0o711, 2_000_000),
+            ("deep", 0o750, 1_000_000),
+            ("shut", 0o500, 4_000_000),
+        ];
+        let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        for (path, mode, time) in dirs {
+            std::fs::File::open(from.join(path))
+                .unwrap()
+                .set_modified(at(time))
+                .unwrap();
+            std::fs::set_permissions(from.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let (name, _) = archive(&from, &blobs).unwrap();
+        unpack(&blobs.join(name), &into, u64::MAX).unwrap();
+        for (path, mode, time) in dirs {
+            let (was, is) = (
+                std::fs::metadata(from.join(path)).unwrap(),
+                std::fs::metadata(into.join(path)).unwrap(),
+            );
+            assert_eq!(is.mode() & 0o7777, mode, "{path}");
+            assert_eq!(is.modified().unwrap(), at(time), "{path}");
+            assert_eq!((is.uid(), is.gid()), (was.uid(), was.gid()), "{path}");
+        }
+        assert_eq!(std::fs::read(into.join("shut/in")).unwrap(), b"kept");
+        for shut in [from.join("shut"), into.join("shut")] {
+            std::fs::set_permissions(shut, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The mode and time of what is outside the directory an unpack is in.
+    fn mode_and_time(path: &Path) -> (u32, std::time::SystemTime) {
+        let seen = std::fs::metadata(path).unwrap();
+        (seen.permissions().mode() & 0o7777, seen.modified().unwrap())
+    }
+
+    #[test]
+    fn unpack_link_put_where_a_directory_was_gets_no_mode_or_time_outside() {
+        let root = temp("relink");
+        let (blobs, outside) = (root.join("blobs"), root.join("outside"));
+        std::fs::create_dir_all(outside.join("d")).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(outside.join("d"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let before = (mode_and_time(&outside), mode_and_time(&outside.join("d")));
+        // An archive that makes a directory and later puts a link where it was, or where
+        // one above it was: refused by the tar crate, or unpacked; either way nothing outside changes.
+        let link = |tar: &mut tar::Builder<Incoming>, path: &str| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            tar.append_link(&mut header, path, &outside).unwrap();
+        };
+        for (dirs, at) in [(&["d/"][..], "d"), (&["e/", "e/d/"][..], "e")] {
+            let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+            for dir in dirs {
+                dir_entry(&mut tar, dir, 0o777);
+            }
+            link(&mut tar, at);
+            let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+            let into = root.join(format!("into-{at}"));
+            std::fs::create_dir_all(&into).unwrap();
+            let _ = unpack(&archive, &into, u64::MAX);
+            assert_eq!((mode_and_time(&outside), mode_and_time(&outside.join("d"))), before);
+        }
+        // Where the tar crate's own refusal is not what stops it: a directory the unpack is in,
+        // swapped for a link before it is given its mode and time, is left as it is.
+        let to = root.join("to");
+        std::fs::create_dir_all(to.join("x")).unwrap();
+        std::os::unix::fs::symlink(&outside, to.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, to.join("x/up")).unwrap();
+        let to = to.canonicalize().unwrap();
+        for path in ["d", "x/up/d"] {
+            let swapped = Inside {
+                path: PathBuf::from(path),
+                mode: Some(0o777),
+                time: Some(std::time::UNIX_EPOCH),
+            };
+            close(&to, swapped).unwrap();
+        }
+        assert_eq!((mode_and_time(&outside), mode_and_time(&outside.join("d"))), before);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restore_that_cannot_move_into_place_leaves_the_volumes_directory_as_it_was() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp("move");
+        let (beside, dir) = (root.join(".v.restoring"), root.join("v"));
+        std::fs::create_dir_all(beside.join("restored")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o701)).unwrap();
+        let inode = std::fs::metadata(&dir).unwrap().ino();
+        // What the Volume's workload wrote meanwhile: the move fails, and nothing was removed first.
+        std::fs::write(dir.join("late"), b"its own").unwrap();
+        let refused = into_place(&beside, &dir).unwrap_err();
+        assert!(refused.contains("restored into an empty volume"), "{refused}");
+        let now = std::fs::metadata(&dir).unwrap();
+        assert_eq!((now.ino(), now.mode() & 0o7777), (inode, 0o701));
+        assert_eq!(std::fs::read(dir.join("late")).unwrap(), b"its own");
+        assert!(!beside.exists());
+        // Empty: the unpacked directory is renamed over it.
+        std::fs::remove_file(dir.join("late")).unwrap();
+        std::fs::create_dir_all(beside.join("restored")).unwrap();
+        into_place(&beside, &dir).unwrap();
+        assert!(dir.join("restored").is_dir() && !beside.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a move that fails on an empty Volume leaves: the Volume's own directory, mode
+    /// 0701 and all (the old way removed it first and made it again with kithd's mode).
+    #[test]
+    fn restore_that_cannot_move_into_an_empty_volume_keeps_its_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp("moveempty");
+        let (beside, dir) = (root.join(".v.restoring"), root.join("v"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o701)).unwrap();
+        let inode = std::fs::metadata(&dir).unwrap().ino();
+        // Nothing beside it to move: the rename fails.
+        assert!(into_place(&beside, &dir).is_err());
+        let now = std::fs::metadata(&dir).unwrap();
+        assert_eq!((now.ino(), now.mode() & 0o7777), (inode, 0o701));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_that_fails_after_a_shut_directory_leaves_nothing_beside() {
+        // (Root empties a shut directory anyway: nothing to see there.)
+        if std::fs::metadata("/proc/self").is_ok_and(|me| std::os::unix::fs::MetadataExt::uid(&me) == 0) {
+            eprintln!("skipped: as root, a shut directory shuts no one out");
+            return;
+        }
+        let root = temp("shutleft");
+        let (blobs, dir) = (root.join("blobs"), root.join("v"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let beside = root.join(".v.restoring");
+        // A directory shut to its owner, with a file in it, closed by the file after it
+        // (the three take the cap's three blocks); then one more than the cap.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        dir_entry(&mut tar, "shut/", 0o500);
+        let mut file = tar::Header::new_gnu();
+        file.set_size(5);
+        file.set_mode(0o644);
+        tar.append_data(&mut file, "shut/in", &b"hello"[..]).unwrap();
+        tar.append_data(&mut file, "after", &b"after"[..]).unwrap();
+        file.set_size(BLOCK * 4);
+        tar.append_data(&mut file, "big", &vec![0u8; BLOCK as usize * 4][..])
+            .unwrap();
+        let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        assert!(unpack(&archive, &dir, BLOCK * 3).is_err());
+        assert!(!beside.exists(), "a shut directory kept what was unpacked");
+        // One left from before, shut: the next restore takes its place.
+        std::fs::create_dir_all(beside.join("shut")).unwrap();
+        std::fs::write(beside.join("shut/in"), b"old").unwrap();
+        std::fs::set_permissions(beside.join("shut"), std::fs::Permissions::from_mode(0o500)).unwrap();
+        unpack(&archive, &dir, u64::MAX).unwrap();
+        assert_eq!(std::fs::read(dir.join("shut/in")).unwrap(), b"hello");
+        assert!(!beside.exists());
+        std::fs::set_permissions(dir.join("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_refuses_headers_longer_than_a_path_and_sizes_that_wrap() {
+        let root = temp("headers");
+        let blobs = root.join("blobs");
+        let to = root.join("to");
+        std::fs::create_dir_all(&to).unwrap();
+        let to = to.canonicalize().unwrap();
+        // A long name a path can have: unpacked.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        let long = format!("{}/{}", "a".repeat(200), "b".repeat(200));
+        dir_entry(&mut tar, &format!("{long}/"), 0o755);
+        let fine = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        unpack_to(&fine, &to, 0, u64::MAX).unwrap();
+        assert!(to.join(&long).is_dir());
+        // A long name of a MiB: refused before it is read whole.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        dir_entry(&mut tar, &format!("{}/", "c".repeat(1 << 20)), 0o755);
+        let huge = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let said = unpack_to(&huge, &to, 0, u64::MAX).unwrap_err();
+        assert!(said.to_string().contains("headers of more than"), "{said}");
+        // A size near 2^64 (base-256): over the cap, not wrapped to nothing.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        let mut big = tar::Header::new_gnu();
+        big.set_size(u64::MAX - 1024);
+        big.set_mode(0o644);
+        big.set_path("big").unwrap();
+        big.set_cksum();
+        std::io::Write::write_all(tar.get_mut(), big.as_bytes()).unwrap();
+        let wraps = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let said = unpack_to(&wraps, &to, 0, 1 << 40).unwrap_err();
+        assert!(said.to_string().contains("more than the Volume may hold"), "{said}");
+        // Cut short where an entry's last block is padded out: refused, not taken for the end.
+        // (Written as it is: a tar::Builder would end it with two blocks of zeros.)
+        let mut short = Incoming::new(&blobs).unwrap();
+        let mut cut = tar::Header::new_gnu();
+        cut.set_size(1);
+        cut.set_mode(0o644);
+        cut.set_path("cut").unwrap();
+        cut.set_cksum();
+        std::io::Write::write_all(&mut short, cut.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut short, b"x").unwrap();
+        let short = blobs.join(short.keep(None).unwrap().0);
+        let said = unpack_to(&short, &to, 0, u64::MAX).unwrap_err();
+        assert!(said.to_string().contains("ends inside an entry"), "{said}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A GNU sparse entry that says it is near 2^64 bytes long, with sparse maps after it
+    /// (the tar crate adds 512 to where the next entry starts for each map, unchecked, past
+    /// where its length put it): not unpacked. Where overflow is checked (a debug build, as
+    /// tests are) the tar crate panics; where it wraps (a release build) the entry fails.
+    #[test]
+    fn unpack_of_a_sparse_entry_near_two_to_the_64_fails() {
+        let root = temp("sparsewrap");
+        let blobs = root.join("blobs");
+        let to = root.join("to");
+        std::fs::create_dir_all(&to).unwrap();
+        let to = to.canonicalize().unwrap();
+        let huge = u64::MAX - 2048;
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_mode(0o644);
+        header.set_size(huge);
+        header.set_path("hole").unwrap();
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(huge);
+        gnu.sparse[0].set_offset(0);
+        gnu.sparse[0].set_length(huge);
+        gnu.set_is_extended(true);
+        header.set_cksum();
+        std::io::Write::write_all(tar.get_mut(), header.as_bytes()).unwrap();
+        for more in [true, true, true, false] {
+            let mut map = tar::GnuExtSparseHeader::new();
+            map.set_is_extended(more);
+            std::io::Write::write_all(tar.get_mut(), map.as_bytes()).unwrap();
+        }
+        std::io::Write::write_all(tar.get_mut(), &[7u8; 4096]).unwrap();
+        let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        for cap in [1 << 40, u64::MAX] {
+            let unpacked = std::panic::catch_unwind(|| unpack_to(&archive, &to, 0, cap));
+            assert!(!matches!(unpacked, Ok(Ok(_))), "{cap}: {unpacked:?}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Restoring `x` leaves alone the directory `x.restoring` beside it (a Volume of that
+    /// name, or a system Volume's path), when the restore fails and when it is done.
+    #[test]
+    fn restore_leaves_a_directory_named_like_its_own_with_restoring_after_it() {
+        let root = temp("othername");
+        let (blobs, dir, other) = (root.join("blobs"), root.join("x"), root.join("x.restoring"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("data"), b"its own").unwrap();
+        let archive = tar_of(&blobs, &[("a", 60_000)]);
+        assert!(unpack(&archive, &dir, 4096).is_err());
+        assert_eq!(std::fs::read(other.join("data")).unwrap(), b"its own");
+        unpack(&archive, &dir, u64::MAX).unwrap();
+        assert_eq!(std::fs::read(other.join("data")).unwrap(), b"its own");
+        assert!(dir.join("a").is_file() && !root.join(".x.restoring").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Removing what an unpack left holds the directories it is inside of, not each one it
+    /// has seen: a thousand side by side are two at once. A shut one is opened and emptied,
+    /// and a link is not followed.
+    #[test]
+    fn remove_unpacked_holds_the_directories_it_is_inside_of() {
+        let root = temp("remove");
+        let (beside, outside) = (root.join(".v.restoring"), root.join("outside"));
+        std::fs::create_dir_all(outside.join("shut")).unwrap();
+        std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for n in 0..1000 {
+            let side = beside.join(format!("s{n}"));
+            std::fs::create_dir_all(&side).unwrap();
+            std::fs::write(side.join("f"), b"x").unwrap();
+            std::fs::set_permissions(&side, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        std::fs::create_dir_all(beside.join("a/b/c/d/e")).unwrap();
+        std::os::unix::fs::symlink(&outside, beside.join("out")).unwrap();
+        assert_eq!(remove_unpacked(&beside), 6);
+        assert!(!beside.exists());
+        assert_eq!(mode_and_time(&outside.join("shut")).0, 0o500);
+        // Deeper than an unpack makes: the walk holds no more than that, and the removal
+        // takes the rest.
+        std::fs::create_dir_all(beside.join("d/".repeat(DEEPEST + 5))).unwrap();
+        assert_eq!(remove_unpacked(&beside), DEEPEST + 1);
+        assert!(!beside.exists());
+        // Nothing there: nothing held.
+        assert_eq!(remove_unpacked(&beside), 0);
+        std::fs::set_permissions(outside.join("shut"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn restore_from_a_bucket_leaves_no_download_when_it_is_refused_or_done() {
+        let root = temp("leftover");
+        let (made, blobs) = (root.join("made"), root.join("blobs"));
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (bucket, kept) = fake_s3().await;
+        let tar = std::fs::read(tar_of(&made, &[("a", 60_000), ("b/c", 60_000)])).unwrap();
+        kept.lock()
+            .unwrap()
+            .insert("/examplebucket/junk.tar".into(), vec![0xffu8; 4096]);
+        kept.lock().unwrap().insert("/examplebucket/good.tar".into(), tar);
+        let left = || std::fs::read_dir(&blobs).map_or(0, |files| files.count());
+        // Not an archive; over the Volume's size; restored.
+        for (object, cap, fine) in [
+            ("junk.tar", u64::MAX, false),
+            ("good.tar", 4096, false),
+            ("good.tar", u64::MAX, true),
+        ] {
+            let into = root.join(format!("into-{object}-{cap}"));
+            std::fs::create_dir_all(&into).unwrap();
+            let restored = from_bucket(&bucket, object, &blobs, into.clone(), cap).await;
+            assert_eq!(restored.is_ok(), fine, "{object} {cap}: {restored:?}");
+            assert_eq!(left(), 0, "{object} {cap}");
+            assert_eq!(into.join("b/c").exists(), fine);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
