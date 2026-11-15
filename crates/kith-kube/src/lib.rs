@@ -397,9 +397,9 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("CronJob.spec.jobTemplate.metadata", Hint, r#"{"labels":{"a":"b"}}"#),
     ("CronJob.spec.jobTemplate.spec.backoffLimit", Carried, "2"),
     ("CronJob.spec.jobTemplate.spec.ttlSecondsAfterFinished", Hint, "60"),
-    ("CronJob.spec.startingDeadlineSeconds", Hint, "60"),
-    ("CronJob.spec.successfulJobsHistoryLimit", Hint, "3"),
-    ("CronJob.spec.failedJobsHistoryLimit", Hint, "1"),
+    ("CronJob.spec.startingDeadlineSeconds", Carried, "60"),
+    ("CronJob.spec.successfulJobsHistoryLimit", Carried, "3"),
+    ("CronJob.spec.failedJobsHistoryLimit", Carried, "1"),
     ("CronJob.spec.suspend", Refused, "true"),
     // What they use.
     ("Service.spec.selector", Carried, r#"{"app":"web"}"#),
@@ -1455,6 +1455,9 @@ fn cron_job(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
         concurrency,
         &[("Allow", "allow"), ("Forbid", "forbid"), ("Replace", "replace")],
     );
+    let deadline = cx.num(&mut spec, "startingDeadlineSeconds", "spec");
+    let succeeded = cx.num(&mut spec, "successfulJobsHistoryLimit", "spec");
+    let failed = cx.num(&mut spec, "failedJobsHistoryLimit", "spec");
     drop_default(&mut spec, "suspend", json!(false));
     let mut template = cx.map(&mut spec, "jobTemplate", "spec");
     let jp = "spec.jobTemplate";
@@ -1474,6 +1477,9 @@ fn cron_job(cx: &mut Cx, root: &mut Map, mut meta: Metadata, out: Out) {
         ("schedule", Some(json!(schedule))),
         ("timezone", some(timezone)),
         ("concurrency", concurrency),
+        ("startingDeadlineSeconds", some(deadline)),
+        ("successfulJobsHistoryLimit", some(succeeded)),
+        ("failedJobsHistoryLimit", some(failed)),
         ("job", Some(job)),
     ]);
     out.push(make("CronJob", meta, spec));
@@ -2087,6 +2093,9 @@ metadata:
 spec:
   schedule: "0 3 * * *"
   concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
       template:
@@ -2548,6 +2557,9 @@ spec:
         assert_eq!(svc.spec["ports"][0]["targetPort"], 8080);
         let cron = find(&all, "CronJob", "nightly");
         assert_eq!(cron.spec["concurrency"], "forbid");
+        assert_eq!(cron.spec["startingDeadlineSeconds"], 300);
+        assert_eq!(cron.spec["successfulJobsHistoryLimit"], 5);
+        assert_eq!(cron.spec["failedJobsHistoryLimit"], 1);
         assert_eq!(cron.spec["job"]["template"]["restartPolicy"], "never");
         let job = find(&all, "Job", "migrate");
         assert_eq!(job.spec["retries"], 2);

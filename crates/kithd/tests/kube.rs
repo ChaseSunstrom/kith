@@ -393,6 +393,9 @@ metadata:
 spec:
   schedule: "* * * * *"
   concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 0
   jobTemplate:
     spec:
       template:
@@ -805,6 +808,13 @@ fn unchanged_manifests_and_a_chart_are_held_as_they_were_sent() {
         (&tick["spec"]["schedule"], &tick["spec"]["concurrency"]),
         (&"* * * * *".into(), &"forbid".into())
     );
+    // (What it keeps and how late it may start is carried as Kubernetes says it.)
+    let keeps = [
+        &tick["spec"]["startingDeadlineSeconds"],
+        &tick["spec"]["successfulJobsHistoryLimit"],
+        &tick["spec"]["failedJobsHistoryLimit"],
+    ];
+    assert_eq!(keeps, [120, 2, 0], "{tick}");
     // The Ingress is the Service's way in from outside.
     let shop = cluster.held("service/shop");
     assert_eq!(shop["spec"]["expose"]["host"], "shop.example.com", "{shop}");
