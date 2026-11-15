@@ -812,10 +812,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   there for whoever watches the network or reads the disk or the cluster, and a disk
   that takes longer than those two seconds to write would answer late. A node the
   cluster would have opened by itself says after the code what a locked node says,
-  and does not open. The zeros are read back, and a disk that did not take them is
+  and does not open; it says so when it next asks the cluster, which is not held to
+  the two seconds. A code is known at a node only once that node, running, has heard
+  of it (the NodeKey's status says `duress` or `duressAll`): one that was off since
+  before the code was made takes it for a wrong key. The zeros are read back, and a disk that did not take them is
   written again ten times a second for as long as the node waits, with nothing said:
   **a disk that takes no write keeps its record**, and the cluster forgetting is then
-  all that was done. A node that runs is not touched by a code: its state is open.
+  all that was done. A code typed at a console does nothing to a node that runs (its
+  console takes no key then); sent to a node's port by whoever has it, it is a wipe
+  of a running node as well: the node erases its record and powers off.
   **Forgotten is not gone from every disk.** The cluster stops handing the key out
   and drops it from the NodeKey, which can no longer be rolled back; the store still
   keeps the NodeKey's earlier versions (up to 100), and the cluster's log and its
@@ -835,9 +840,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
+  A node the cluster's code forgot (not the one it was typed at) keeps its own code
+  and loses the cluster's; unlocked again, it has neither until they are made anew.
+  One that was off when the cluster's code was used still knows that code: typed at
+  it later, it erases itself, and the cluster, which had forgotten its key already,
+  goes on saying forgotten and not wiped.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
-  `recoverySeen` saying yes (the command says so when it fails: run it again). It
+  `recoverySeen` saying yes (the command says so when it fails: run it again). Where
+  the node sees that whoever asked is gone, it puts the old key back; if that write
+  fails, the new one stays, seen by nobody. It
   goes from the node that made it to the node that was asked over the cluster's TLS
   and is kept by neither; a control node that is taken can ask any node for one in
   an admin's name, as it can set a passphrase.

@@ -3294,7 +3294,10 @@ of a wrong key, two seconds after the line was entered, as it does for every
 line that opens nothing; from then on nothing typed opens beta, the recovery
 key included. There is no way back. Codes are made by kith, never chosen, and
 none exists until someone who may apply NodeKeys makes one; `--off` takes it
-away (the node drops it when it hears).
+away (the node drops it when it hears). A code works at a node once that node,
+running, has heard of it (`kith get nodekey beta` then says `duress: true` in
+its status): a node that was off when the code was made takes it for a wrong
+key until it has run with the cluster in reach.
 
 `kith node duress --all` makes one code for the whole cluster. Typed at the
 waiting console of any encrypted node, it does to that node what its own code
@@ -3302,7 +3305,9 @@ does, and has the cluster forget the key of every other node that was under
 the code when it was made. Those nodes run on. They drop their TPM's seal and
 their passphrase when they hear of it, and from then on open with their own
 recovery keys alone, until `kith node unlock NAME` has the cluster hold NAME's
-key again. So the cluster makes no such code while one of its nodes has a
+key again. A node forgotten this way keeps its own code, which still erases
+it; the cluster's code is gone from all of them, and after `kith node unlock`
+a node has no code until one is made again. So the cluster makes no such code while one of its nodes has a
 recovery key nobody was shown (`kith node recovery` first), and a node that
 joins later is not under it: make the code again.
 
