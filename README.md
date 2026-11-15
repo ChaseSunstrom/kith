@@ -571,8 +571,12 @@ kith node status                                   # who leads the store, who vo
   that proves membership, not which member (every node trusts every other).
   Without one, a caller can read the CA certificate and present a join token,
   nothing else, and is cut off after 15 s.
-- The token carries the CA's fingerprint: a joining node checks who it is
-  talking to before it sends the token's secret.
+- A token holds its secret, the CA's fingerprint, and the name and key print
+  of the node that made it: a joining node talks only to that node, and any
+  other node that answers at the `--join` address is sent nothing (the joiner
+  says which node it called and which answered). A token made before tokens
+  named their maker still joins, and the joiner says that it names no node:
+  then any node of the cluster that answers there is sent it.
 - A node keeps its identity in `<state>/pki`; after the first start it needs
   neither `--join` nor `--token`.
 - With `--mesh` (optionally `--mesh 51820`, the UDP port) a node joins the

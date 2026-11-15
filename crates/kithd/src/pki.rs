@@ -441,6 +441,65 @@ pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Held>) -> Fall
     }
 }
 
+/// TLS for asking the node that made a join token (`maker`: its name and key print) for the
+/// CA, which the joiner does not have yet: only that node is taken (the handshake shows it
+/// holds that key). Nothing else of its certificate is checked here: the CA it hands over is
+/// checked against the token, and the join itself goes through [`client_config`] with both.
+/// With no maker (a token from before tokens named one), whoever answers is taken.
+pub fn maker_config(maker: Option<(&str, &str)>) -> Fallible<ClientConfig> {
+    let held = maker.map(|(name, print)| (Who::Name(name.into()), Some(print.into())));
+    let maker = Maker(held, provider());
+    let builder = tls(
+        "setting up TLS",
+        ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
+    )?;
+    Ok(builder
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(maker))
+        .with_no_client_auth())
+}
+
+#[derive(Debug)]
+struct Maker(Option<Held>, Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for Maker {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _dialled: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        match &self.0 {
+            Some(pin) if !pinned(end_entity, pin) => Err(rustls::Error::General(unpinned(end_entity, pin))),
+            _ => Ok(ServerCertVerified::assertion()),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.1.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.1.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.1.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// Whose a verified client certificate is.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Subject {
@@ -485,10 +544,11 @@ pub fn same_key(pem: &str, der: &[u8]) -> bool {
     rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).is_ok_and(|key| key.as_ref() == der)
 }
 
-/// Join tokens: `kith1.<secret>.<CA fingerprint>`. The secret is good once, for an hour,
-/// on the node that made it; the fingerprint lets the joiner check who it is talking to
-/// before it sends the secret. Whoever made it says what the node it lets in is ([`Lets`]):
-/// the node that joins does not.
+/// Join tokens: `kith1.<secret>.<CA fingerprint>.<maker's key print>.<maker's name>`. The
+/// secret is good once, for an hour, on the node that made it; the rest lets the joiner
+/// check it is talking to that node, and no other node of the CA, before it sends anything.
+/// A token from before (and a claim token) is the first three parts alone. Whoever made it
+/// says what the node it lets in is ([`Lets`]): the node that joins does not.
 #[derive(Default)]
 pub struct Tokens(Mutex<Vec<([u8; 32], Instant, Lets)>>);
 
@@ -507,17 +567,36 @@ fn digest(secret: &str) -> [u8; 32] {
     digest.as_ref().try_into().expect("SHA-256 is 32 bytes")
 }
 
-/// The secret and the CA fingerprint of a token.
-pub fn token_parts(token: &str) -> Fallible<(&str, &str)> {
+/// A token's secret, its CA's fingerprint, and the node that made it (name, key print).
+pub type TokenParts<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+
+/// The secret and the CA fingerprint of a token, and the node that made it (its name and
+/// key print) where the token names one.
+pub fn token_parts(token: &str) -> Fallible<TokenParts<'_>> {
     let mut parts = token.trim().split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("kith1"), Some(secret), Some(ca), None) if secret.len() == 64 && ca.len() == 64 => Ok((secret, ca)),
+    let mut next = || parts.next();
+    let hash = |part: &str| part.len() == 64 && part.bytes().all(|b| b.is_ascii_hexdigit());
+    match (next(), next(), next(), next(), next(), next()) {
+        (Some("kith1"), Some(secret), Some(ca), None, ..) if secret.len() == 64 && ca.len() == 64 => {
+            Ok((secret, ca, None))
+        }
+        (Some("kith1"), Some(secret), Some(ca), Some(print), Some(name), None)
+            if secret.len() == 64 && ca.len() == 64 && hash(print) && valid_name(name).is_ok() =>
+        {
+            Ok((secret, ca, Some((name, print))))
+        }
         _ => Err("that is not a join token (`kith node token` prints one)".into()),
     }
 }
 
 impl Tokens {
-    pub fn mint(&self, ca: &str, lets: Lets) -> Fallible<String> {
+    /// A token of the CA `ca`; `maker` (this node) is named in it if given: a claim token,
+    /// which is sent by hand, names none.
+    pub fn mint(&self, ca: &str, maker: Option<&Identity>, lets: Lets) -> Fallible<String> {
+        let maker = match maker {
+            Some(me) => format!(".{}.{}", print_of(&me.cert)?, me.name),
+            None => String::new(),
+        };
         let mut secret = [0u8; 32];
         let filled = ring::rand::SystemRandom::new().fill(&mut secret);
         filled.map_err(|_| "no random bytes from the system")?;
@@ -525,14 +604,14 @@ impl Tokens {
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
         tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
         tokens.push((digest(&secret), Instant::now(), lets));
-        Ok(format!("kith1.{secret}.{}", fingerprint(ca)?))
+        Ok(format!("kith1.{secret}.{}{maker}", fingerprint(ca)?))
     }
 
     /// Whether `token` is good, and then what its maker said of its node; with `spend`, it is
     /// not good again.
     // Digests are compared, so how long the comparison takes says nothing about the secret.
     pub fn good(&self, token: &str, spend: bool) -> Option<Lets> {
-        let (secret, _) = token_parts(token).ok()?;
+        let (secret, ..) = token_parts(token).ok()?;
         let wanted = digest(secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
         tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
@@ -638,11 +717,12 @@ mod tests {
     fn tokens_are_good_once() {
         let ca = Ca::create().unwrap();
         let tokens = Tokens::default();
-        let token = tokens.mint(&ca.cert, Lets::Control).unwrap();
+        let token = tokens.mint(&ca.cert, None, Lets::Control).unwrap();
         assert_eq!(token_parts(&token).unwrap().1, fingerprint(&ca.cert).unwrap());
+        assert_eq!(token_parts(&token).unwrap().2, None);
         assert_eq!(tokens.good("kith1.nope.nope", true), None);
         let other = tokens
-            .mint(&ca.cert, Lets::Control)
+            .mint(&ca.cert, None, Lets::Control)
             .unwrap()
             .replace("kith1.", "kith1.0");
         assert_eq!(tokens.good(&other, true), None);
@@ -651,9 +731,32 @@ mod tests {
         assert_eq!(tokens.good(&token, true), None);
         // What its node is is what its maker said, kept here and not in the token.
         for lets in [Lets::Worker, Lets::WorkerWhole] {
-            let worker = tokens.mint(&ca.cert, lets).unwrap();
+            let worker = tokens.mint(&ca.cert, None, lets).unwrap();
             assert_eq!(tokens.good(&worker, true), Some(lets));
         }
+        // One that names its maker: the name and key print come back, and it is good as well.
+        let (cert, key) = ca.issue("node-1").unwrap();
+        let print = print_of(&cert).unwrap();
+        let me = Identity {
+            name: "node-1".into(),
+            ca: ca.cert.clone(),
+            cert,
+            key,
+        };
+        let named = tokens.mint(&ca.cert, Some(&me), Lets::Control).unwrap();
+        assert_eq!(token_parts(&named).unwrap().2, Some(("node-1", print.as_str())));
+        // A maker part that is not a key print and a name is no token.
+        let (head, _) = named.rsplit_once('.').unwrap();
+        let (three, _) = head.rsplit_once('.').unwrap();
+        for bad in [
+            format!("{head}.Node"),
+            format!("{head}."),
+            format!("{three}.ab.node-1"),
+            head.to_string(),
+        ] {
+            assert!(token_parts(&bad).is_err(), "{bad}");
+        }
+        assert_eq!(tokens.good(&named, true), Some(Lets::Control));
     }
 
     #[test]
