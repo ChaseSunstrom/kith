@@ -129,12 +129,12 @@ fn read<T>(shared: &Shared, look: impl FnOnce(&Store) -> Result<T, Error>) -> Re
         .map_err(ApiError::Store)
 }
 
-fn word(verb: &Verb) -> String {
+pub(crate) fn word(verb: &Verb) -> String {
     format!("{verb:?}").to_lowercase()
 }
 
 /// Where a resource is, or would be once applied: its namespace, or none.
-fn place(store: &Store, resource: &Resource) -> Option<String> {
+pub(crate) fn place(store: &Store, resource: &Resource) -> Option<String> {
     let namespaced = || match kith_api::kind(&resource.kind) {
         Some(kind) => kind.namespaced,
         // A kind nobody has defined (yet) is taken to be in no namespace: only a rule for everywhere covers it.
@@ -147,13 +147,66 @@ fn place(store: &Store, resource: &Resource) -> Option<String> {
 }
 
 /// The kind and namespace a key is of: `Kind/namespace/name`, or `Kind/name`.
-fn place_of(key: &str) -> (String, Option<String>) {
+pub(crate) fn place_of(key: &str) -> (String, Option<String>) {
     let mut parts = key.split('/');
     let kind = parts.next().unwrap_or_default().to_string();
     match (parts.next(), parts.next(), parts.next()) {
         (Some(namespace), Some(_), None) => (kind, Some(namespace.to_string())),
         _ => (kind, None),
     }
+}
+
+/// A right asked for: to do a verb to a kind, in a namespace (or in none).
+pub(crate) type Right = (Verb, String, Option<String>);
+
+/// What writing `resources` takes: the right to apply each, and to whatever each reaches
+/// into besides itself. The API asks it of whoever applies them, and the Release and Source
+/// controllers of whoever applied the Release or Source that renders them.
+pub(crate) fn takes(store: &Store, resources: &[Resource]) -> Vec<Right> {
+    let applied = resources
+        .iter()
+        .map(|resource| (Verb::Apply, resource.kind.clone(), place(store, resource)));
+    applied.chain(beyond(store, resources)).collect()
+}
+
+/// What `resources` reach into besides themselves.
+fn beyond(store: &Store, resources: &[Resource]) -> Vec<Right> {
+    // A claim that says `provision` has a Volume made for it on a node: whoever writes
+    // one must be allowed to write a Volume there.
+    let asks = |resource: &&Resource| resource.kind == "VolumeClaim" && resource.spec["provision"] == true;
+    let made = resources.iter().filter(asks);
+    let made = made.map(|resource| (Verb::Apply, "Volume".to_string(), place(store, resource)));
+    let written: Vec<_> = resources
+        .iter()
+        .map(|resource| (resource.kind.clone(), place(store, resource)))
+        .collect();
+    made.chain(reached(&written)).collect()
+}
+
+/// What resources known by kind and namespace alone reach into besides themselves.
+fn reached(written: &[(String, Option<String>)]) -> Vec<Right> {
+    let mut rights = Vec::new();
+    for (kind, place) in written {
+        let into: &[(Verb, &str)] = match kind.as_str() {
+            // A Backup sends a Volume's files where it says, signed with a Secret's keys:
+            // whoever writes one must be allowed to read both.
+            "Backup" => &[(Verb::Get, "Volume"), (Verb::Get, "Secret")],
+            // A CronJob's Jobs are made for it by the cluster, as it says them: whoever
+            // writes one must be allowed to write a Job.
+            "CronJob" => &[(Verb::Apply, "Job")],
+            // An Image is a Volume's files, for every process of every node to read.
+            "Image" => &[(Verb::Get, "Volume")],
+            // A Share gives a Volume's files, to read and to write, to whom it names:
+            // whoever writes one must be allowed to write the Volume.
+            "Share" => &[(Verb::Apply, "Volume")],
+            _ => &[],
+        };
+        rights.extend(
+            into.iter()
+                .map(|(verb, into)| (verb.clone(), into.to_string(), place.clone())),
+        );
+    }
+    rights
 }
 
 /// A refusal, with the reason, unless `caller` may do `verb` to each of `targets` (a
@@ -164,13 +217,24 @@ pub(crate) fn permit(
     verb: Verb,
     targets: impl FnOnce(&Store) -> Vec<(String, Option<String>)>,
 ) -> Result<(), ApiError> {
+    allowed(shared, caller, |store| {
+        let targets = targets(store).into_iter();
+        targets
+            .map(|(kind, namespace)| (verb.clone(), kind, namespace))
+            .collect()
+    })
+}
+
+/// A refusal, with the reason, unless `caller` has each of `rights`. The refusal goes in
+/// the audit log.
+fn allowed(shared: &Shared, caller: &Caller, rights: impl FnOnce(&Store) -> Vec<Right>) -> Result<(), ApiError> {
     let refused = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let grants = Grants::of(caller, &state.store);
-        let mut targets = targets(&state.store).into_iter();
-        targets.find(|(kind, namespace)| !grants.may(&verb, kind, namespace.as_deref()))
+        let mut rights = rights(&state.store).into_iter();
+        rights.find(|(verb, kind, namespace)| !grants.may(verb, kind, namespace.as_deref()))
     };
-    let Some((kind, namespace)) = refused else {
+    let Some((verb, kind, namespace)) = refused else {
         return Ok(());
     };
     let verb = word(&verb);
@@ -236,45 +300,30 @@ struct ApplyOptions {
     dry_run: bool,
 }
 
-/// What a resource reaches into besides itself, which whoever writes it must be allowed too.
-fn reach(shared: &Shared, caller: &Caller, resources: &[Resource]) -> Result<(), ApiError> {
-    let placed = |store: &Store| -> Vec<(String, Option<String>)> {
-        let placed = |resource: &Resource| (resource.kind.clone(), place(store, resource));
-        resources.iter().map(placed).collect()
-    };
-    // A claim that says `provision` has a Volume made for it on a node: whoever writes
-    // one must be allowed to write a Volume there.
-    let made = |store: &Store| -> Vec<(String, Option<String>)> {
-        let asks = |resource: &&Resource| resource.kind == "VolumeClaim" && resource.spec["provision"] == true;
-        let made = |resource: &Resource| ("Volume".to_string(), place(store, resource));
-        resources.iter().filter(asks).map(made).collect()
-    };
-    let (written, made) = {
-        let state = shared.store.lock().expect("a handler panicked holding the store");
-        (placed(&state.store), made(&state.store))
-    };
-    permit(shared, caller, Verb::Apply, |_| made)?;
-    reach_of(shared, caller, &written)
+/// What resources known by kind and namespace alone (a revision gone back to) reach into
+/// besides themselves, which whoever writes them must be allowed too.
+fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
+    allowed(shared, caller, |_| reached(written))
 }
 
-/// [`reach`], of resources known by kind and namespace alone (a revision gone back to).
-fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
-    let of = |kind: &str, into: &[&str]| -> Vec<(String, Option<String>)> {
-        let of = written.iter().filter(|(written, _)| written == kind);
-        of.flat_map(|(_, place)| into.iter().map(|kind| (kind.to_string(), place.clone())))
-            .collect()
-    };
-    // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
-    // writes one must be allowed to read both.
-    permit(shared, caller, Verb::Get, |_| of("Backup", &["Volume", "Secret"]))?;
-    // A CronJob's Jobs are made for it by the cluster, as it says them: whoever writes
-    // one must be allowed to write a Job.
-    permit(shared, caller, Verb::Apply, |_| of("CronJob", &["Job"]))?;
-    // An Image is a Volume's files, for every process of every node to read.
-    permit(shared, caller, Verb::Get, |_| of("Image", &["Volume"]))?;
-    // A Share gives a Volume's files, to read and to write, to whom it names: whoever
-    // writes one must be allowed to write the Volume.
-    permit(shared, caller, Verb::Apply, |_| of("Share", &["Volume"]))
+/// Who `caller` is as a writer of a Release or a Source: whoever a node passed on, not the node.
+fn writer(caller: &Caller) -> String {
+    match caller {
+        Caller::Via(_, who) | Caller::Checked(_, who) => writer(who),
+        caller => caller.to_string(),
+    }
+}
+
+/// `resources` with each Release and Source written down as `caller`'s: what the client
+/// said of it is not taken.
+fn stamped(caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
+    for resource in &mut resources {
+        if matches!(resource.kind.as_str(), "Release" | "Source") {
+            let annotations = &mut resource.metadata.annotations;
+            annotations.insert(crate::releases::WRITER.into(), writer(caller));
+        }
+    }
+    resources
 }
 
 /// What applying `resources` would do, if `caller` may: a dry run.
@@ -283,11 +332,8 @@ pub(crate) async fn plan(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
-    permit(shared, caller, Verb::Apply, |store| {
-        let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
-        resources.iter().map(target).collect()
-    })?;
-    reach(shared, caller, &resources)?;
+    let resources = stamped(caller, resources);
+    allowed(shared, caller, |store| takes(store, &resources))?;
     // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
     let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
     let claimed = {
@@ -344,12 +390,9 @@ pub(crate) async fn applied(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
+    let resources = stamped(caller, resources);
     // Each resource of the body is asked about: one that is not allowed refuses them all.
-    permit(shared, caller, Verb::Apply, |store| {
-        let target = |resource: &Resource| (resource.kind.clone(), place(store, resource));
-        resources.iter().map(target).collect()
-    })?;
-    reach(shared, caller, &resources)?;
+    allowed(shared, caller, |store| takes(store, &resources))?;
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
     let claimed = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
@@ -564,6 +607,21 @@ async fn rollback(
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
+    // Going back to a Release's or a Source's revision is applying it: as whoever goes back.
+    if key.starts_with("Release/") || key.starts_with("Source/") {
+        let Json(was) = read(&shared, |store| {
+            let history = store.history(&key)?;
+            let was = history.iter().find(|was| was.resource.metadata.revision == Some(to));
+            let mut was = was
+                .ok_or_else(|| Error::NotFound(format!("{key} revision {to}")))?
+                .resource
+                .clone();
+            was.metadata.revision = None;
+            Ok(was)
+        })?;
+        let mut changes = applied(&shared, &caller, vec![was]).await?;
+        return changes.pop().map(Json).ok_or_else(odd);
+    }
     if let Some(node) = key.strip_prefix("Node/") {
         let Json(()) = read(&shared, |store| {
             let was = store
@@ -761,6 +819,11 @@ mod tests {
     use rustls::pki_types::pem::PemObject;
     use std::time::Duration;
 
+    /// What a resource reaches into besides itself, which whoever writes it must be allowed too.
+    fn reach(shared: &Shared, caller: &Caller, resources: &[Resource]) -> Result<(), ApiError> {
+        allowed(shared, caller, |store| beyond(store, resources))
+    }
+
     /// Writing a Share or a Backup takes more than leave to write that kind: a Share gives
     /// a Volume away (leave to write it), a Backup reads a Volume and a Secret.
     #[tokio::test]
@@ -826,6 +889,75 @@ spec: {}
         // Going back to a revision of one is writing it.
         assert!(reach_of(&shared, &bob, &[place_of("Share/default/s")]).is_err());
         assert!(reach_of(&shared, &bob, &[place_of("ConfigMap/default/c")]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whoever applies a Release or a Source is written down on it by the server, whatever
+    /// the client sent: a dry run shows it, one passed on by a node is who asked it, and
+    /// going back to a revision is applying it.
+    #[tokio::test]
+    async fn release_rights_and_source_rights_are_whoever_applied_them() {
+        use crate::releases::WRITER;
+        let dir = std::env::temp_dir().join(format!("kithd-writer-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: bob}\nspec: {}\n---\n\
+                     apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: shop}\n\
+                     spec: {rules: [{kinds: [Release, Source], verbs: [apply], namespaces: [shop]}]}\n---\n\
+                     apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: bob-shop}\nspec: {role: shop, subjects: [bob]}\n";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let sent = "apiVersion: kith.dev/v1\nkind: Release\n\
+                    metadata: {name: r, namespace: shop, annotations: {'kith.dev/written-by': 'local socket'}}\n\
+                    spec: {package: {name: maps}}\n---\n\
+                    apiVersion: kith.dev/v1\nkind: Source\n\
+                    metadata: {name: s, namespace: shop, annotations: {'kith.dev/written-by': 'local socket'}}\n\
+                    spec: {git: {url: 'https://example.org/a.git'}}\n";
+        let sent: Vec<Resource> = kith_api::Resource::from_source(sent)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let bob = Caller::Identity("bob".into());
+        let written = |key: &str| {
+            let state = shared.store.lock().unwrap();
+            state.store.get(key).unwrap().metadata.annotations.get(WRITER).cloned()
+        };
+        let planned = plan(&shared, &bob, sent.clone()).await.ok().unwrap();
+        let stamps: Vec<_> = planned
+            .iter()
+            .map(|change| change.after.metadata.annotations.get(WRITER))
+            .collect();
+        assert_eq!(stamps, [Some(&"bob".to_string()); 2]);
+
+        let within = Duration::from_secs(30);
+        let first = tokio::time::timeout(within, applied(&shared, &Caller::Admin, sent.clone()));
+        first.await.unwrap().ok().unwrap();
+        assert_eq!(written("Release/shop/r").as_deref(), Some("local socket"));
+        let via = Caller::Via("n1".into(), Box::new(bob.clone()));
+        let again = tokio::time::timeout(within, applied(&shared, &via, sent.clone()));
+        again.await.unwrap().ok().unwrap();
+        assert_eq!(written("Release/shop/r").as_deref(), Some("bob"));
+        assert_eq!(written("Source/shop/s").as_deref(), Some("bob"));
+
+        // Back to what the local socket wrote: bob's, as bob goes back to it.
+        let back = rollback(
+            State(shared.clone()),
+            Extension(bob.clone()),
+            Path("Release/shop/r".to_string()),
+            Query(RollbackOptions { to: 1 }),
+        );
+        let Json(back) = tokio::time::timeout(within, back).await.unwrap().ok().unwrap();
+        // (Revision 1 written down as bob's is revision 2: nothing changes.)
+        assert_eq!(back.after.metadata.revision, Some(2));
+        assert_eq!(
+            back.after.metadata.annotations.get(WRITER).map(String::as_str),
+            Some("bob")
+        );
+        assert_eq!(written("Release/shop/r").as_deref(), Some("bob"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
