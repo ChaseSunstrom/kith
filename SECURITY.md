@@ -477,6 +477,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   out, and the address of a pod that was let go may by then be the next pod's, of any
   namespace, for at most the rest of the round in progress (its probes, 3 seconds
   together, and on the node that leads its status write) and one load of the program.
+- **A node over its limit of relayed Service connections** says no to up to 64 kept
+  connections from one other node (256 in all) and hangs up on the rest at once, reading
+  nothing from them. A kept connection that was said no to looks for a place again at its
+  next asking, and is passed on once one is free.
   A NetworkPolicy does not come into it: a Service a policy names is never the
   kernel's. Units run with `exec` and containers on the node's network share the one
   cgroup the program is on. A kithd that is killed leaves its program where it is

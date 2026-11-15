@@ -702,8 +702,9 @@ kith node status                                   # who leads the store, who vo
   `127.0.0.1` (or `::1`). A kithd that restarts drops the connections through
   it. A Service's connections are passed on by up to four threads of their
   own (one for each core, started with the first Service) and DNS answers on
-  one more, so a busy Service holds up neither the API nor a lookup. Only
-  TCP; a `targetPort` by name is a container port of that name.
+  one more, so a busy Service holds up neither the API nor a lookup. A node
+  over its limit for relaying says no to the others' asks, which try their
+  next replica. Only TCP; a `targetPort` by name is a container port of that name.
 - A `NetworkPolicy` says who may connect to the Workloads it selects through
   a Service: the first ingress rule that fits decides, and when a policy
   selects a Workload and no rule fits, the connection is refused. A peer is
