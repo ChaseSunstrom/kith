@@ -53,6 +53,19 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
   command on another node) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
+- **What one node passes on to another is pinned to its name.** A passphrase, a Volume's
+  key, a caller's Volume files, a restore, `kith run`, a unit's output, a Volume's copy
+  and a Raft write sent on to the leader go to the node that was named, at its address
+  by its Node: the handshake is refused unless the certificate is for `NAME.node.kith`
+  and, if the Node names a key (`status.certificate`), is that key. So another node of
+  the CA that answers at a moved or reused address is sent nothing, and the error says
+  who was called and who answered. A Node that names no key is held to its name alone.
+  Not pinned: joining (the joining node has no store, and checks the CA by its hash
+  from the token), a blob fetched by its digest (what comes is checked against the
+  digest), the ping that asks whether an address answers, the CA probe of a node that
+  may be made a voter, the Raft links between nodes (made before the store is, with an
+  id and an address: T-0302 left them), and a locked disk's key asked at boot, before
+  there is a store.
 - **What a node fetches or sends for someone who is not the admin** (a Source's
   repository, a package pushed to a registry, a `DNSBlockList`'s `url`) goes only to
   addresses that are not this node's own or on its networks, each redirect and each place a registry sends an upload

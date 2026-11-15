@@ -272,14 +272,27 @@ impl Shared {
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
             let leader = match written {
                 Ok(Ok(written)) => return written.data.map(|done| (done, written.log_id.index)),
-                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to)))) => to.leader_node,
+                Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(to)))) => to.leader_id.zip(to.leader_node),
                 Ok(Err(e)) => return Err(unavailable(e)),
                 Err(_) => return Err(unavailable(NO_MAJORITY)),
             };
-            if let (Some(leader), Some(cluster)) = (leader, &self.cluster)
+            // The change may hold a Secret: it goes to the node the leader is by its Node, and to
+            // no other at that address. A leader no Node names is not sent it; asking again waits
+            // for the store to say.
+            let named = leader.and_then(|(id, leader)| {
+                let state = self.store.lock().expect("a handler panicked holding the store");
+                let node = state.store.list(Some("Node")).find(|node| {
+                    node.status
+                        .as_ref()
+                        .is_some_and(|status| status["raftId"].as_str() == Some(&id.to_string()))
+                });
+                Some((crate::view::Upstream::of(node?)?, leader))
+            });
+            if let (Some((there, leader)), Some(cluster)) = (named, &self.cluster)
                 && !leader.addr.is_empty()
+                && let Ok(client) = cluster.to(&there)
             {
-                let call = cluster.client.post(format!("https://{}/v1/raft/write", leader.addr));
+                let call = client.post(format!("https://{}/v1/raft/write", leader.addr));
                 match call.timeout(PATIENCE).json(&command).send().await {
                     Ok(reply) => {
                         if let Ok(Some((reply, index))) = reply.json::<Option<(Reply, u64)>>().await {
@@ -293,8 +306,9 @@ impl Shared {
                     Err(e) if e.is_connect() => {}
                     Err(e) => {
                         let why = format!(
-                            "the leader at {} did not answer ({e}); look before trying again",
-                            leader.addr
+                            "the leader at {} did not answer ({}); look before trying again",
+                            leader.addr,
+                            crate::cluster::why(&e)
                         );
                         return Err(unavailable(why));
                     }

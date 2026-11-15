@@ -20,6 +20,7 @@ use crate::Shared;
 use crate::access::Caller;
 use crate::api::{ApiError, permit};
 use crate::backups::{DEEPEST, open_in, within};
+use crate::view::Upstream;
 use crate::volumes::{Dir, SYSTEM};
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -333,7 +334,12 @@ fn invalid(why: String) -> ApiError {
 
 /// Where the Volume is and how many bytes it says it holds, for a caller who may mount it,
 /// and the address of the node that has it.
-fn held(shared: &Shared, caller: &Caller, namespace: &str, name: &str) -> Result<(Dir, u64, Option<String>), ApiError> {
+fn held(
+    shared: &Shared,
+    caller: &Caller,
+    namespace: &str,
+    name: &str,
+) -> Result<(Dir, u64, Option<Upstream>), ApiError> {
     let both = [("Volume", namespace), ("Workload", namespace)];
     permit(shared, caller, Verb::Apply, |_| {
         both.map(|(kind, namespace)| (kind.to_string(), Some(namespace.to_string())))
@@ -353,8 +359,7 @@ fn held(shared: &Shared, caller: &Caller, namespace: &str, name: &str) -> Result
     }
     let bound = crate::volumes::size(&state.store, namespace, name).unwrap_or(u64::MAX);
     let there = state.store.get(&format!("Node/{}", dir.node));
-    let address = there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()));
-    Ok((dir, bound, address))
+    Ok((dir, bound, there.and_then(Upstream::of)))
 }
 
 /// The same request to the node that has the Volume, as this node, which has just checked
@@ -363,21 +368,25 @@ async fn elsewhere(
     shared: &Shared,
     caller: &Caller,
     dir: &Dir,
-    address: Option<String>,
+    there: Option<Upstream>,
     body: Option<Body>,
 ) -> Result<reqwest::Response, String> {
-    let (Some(cluster), Some(address)) = (&shared.cluster, address) else {
+    let (Some(cluster), Some(there)) = (&shared.cluster, there) else {
         return Err(format!("node {} that has the volume has no address yet", dir.node));
     };
-    let url = format!("https://{address}/v1/volumes/{}/{}/files", dir.namespace, dir.name);
+    // (The node that has the Volume, and not another at its address: the files are its own.)
+    let client = cluster.to(&there)?;
+    let url = format!(
+        "https://{}/v1/volumes/{}/{}/files",
+        there.address, dir.namespace, dir.name
+    );
     let asked = match body {
-        Some(body) => cluster
-            .client
+        Some(body) => client
             .put(url)
             .body(reqwest::Body::wrap_stream(body.into_data_stream())),
-        None => cluster.client.get(url),
+        None => client.get(url),
     };
-    let failed = |e: reqwest::Error| format!("asking node {}: {e}", dir.node);
+    let failed = |e: reqwest::Error| format!("asking node {}: {}", dir.node, crate::cluster::why(&e));
     // (For whoever asked this node: the node that has the Volume asks what they may.)
     let asked = asked.header(crate::access::FOR, caller.to_string());
     let answer = asked.send().await.map_err(failed)?;
@@ -397,12 +406,12 @@ pub async fn put(
     UrlPath((namespace, name)): UrlPath<(String, String)>,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
-    let (dir, bound, address) = held(&shared, &caller, &namespace, &name)?;
+    let (dir, bound, there) = held(&shared, &caller, &namespace, &name)?;
     let what = vec![format!("files into Volume/{namespace}/{name}")];
     let done = if dir.node == shared.members.me() {
         here(&shared, dir, bound, body).await
     } else {
-        match elsewhere(&shared, &caller, &dir, address, Some(body)).await {
+        match elsewhere(&shared, &caller, &dir, there, Some(body)).await {
             Ok(answer) => answer.json().await.map_err(|e| e.to_string()),
             Err(why) => Err(why),
         }
@@ -462,12 +471,12 @@ pub async fn get(
     Extension(caller): Extension<Caller>,
     UrlPath((namespace, name)): UrlPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let (dir, _, address) = held(&shared, &caller, &namespace, &name)?;
+    let (dir, _, there) = held(&shared, &caller, &namespace, &name)?;
     let what = vec![format!("files of Volume/{namespace}/{name}")];
     let started = if dir.node == shared.members.me() {
         out(&shared, &dir)
     } else {
-        elsewhere(&shared, &caller, &dir, address, None).await.map(|answer| {
+        elsewhere(&shared, &caller, &dir, there, None).await.map(|answer| {
             let chunks = futures_util::stream::unfold(answer, |mut answer| async move {
                 answer.chunk().await.transpose().map(|chunk| (chunk, answer))
             });

@@ -265,7 +265,7 @@ async fn sync(
         .map_err(slow)?;
     let mut answer = asked
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| crate::cluster::why(&e))?;
     if let (StatusCode::NOT_MODIFIED, Some(have)) = (answer.status(), have) {
         return Ok(have.to_string());
     }
@@ -340,9 +340,9 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
                     .unwrap_or(SYNC);
                 let last = status["synced"][&me].as_u64().max(tried.get(&key).copied());
                 let there = store.get(&format!("Node/{}", dir.node));
-                let address = there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()));
-                if let (true, Some(address)) = (last.is_none_or(|last| now >= last + every), address) {
-                    due.push((key, dir, address));
+                let there = there.and_then(crate::view::Upstream::of);
+                if let (true, Some(there)) = (last.is_none_or(|last| now >= last + every), there) {
+                    due.push((key, dir, there));
                 }
             }
             (due, mine)
@@ -352,9 +352,14 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
         for dir in mine {
             let _ = std::fs::remove_file(marker(&state, &dir));
         }
-        for (key, dir, address) in due {
+        for (key, dir, there) in due {
             tried.insert(key.clone(), now);
-            match sync(&shared, &cluster.client, &address, &state, &dir, now).await {
+            // (The node that has the Volume, and not another at its address: its files are its own.)
+            let synced = match cluster.to(&there) {
+                Ok(client) => sync(&shared, &client, &there.address, &state, &dir, now).await,
+                Err(why) => Err(why),
+            };
+            match synced {
                 Ok(_) => {
                     said.remove(&key);
                     // ponytail: each replica writes the whole `synced` with its own time in;

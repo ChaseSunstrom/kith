@@ -27,6 +27,7 @@
 
 use crate::Shared;
 use crate::cluster::Peer;
+use crate::view::Upstream;
 use crate::volumes::Dir;
 use axum::extract::{ConnectInfo, Path as Named, State};
 use axum::http::StatusCode;
@@ -367,8 +368,8 @@ pub fn close(state: &Path) {
 /// See to one volume of this node: open it if it is not, and every so often give its key
 /// to the nodes there are. What was done, if anything was.
 async fn tend(
-    client: Option<&reqwest::Client>,
-    peers: &[String],
+    cluster: Option<&crate::cluster::Cluster>,
+    peers: &[Upstream],
     state: &Path,
     (dir, size): (&Dir, u64),
     key: &mut Option<Vec<u8>>,
@@ -382,10 +383,13 @@ async fn tend(
     for peer in peers {
         // ponytail: one node after another, each given `QUIET` to answer; all at once when
         // a cluster is big enough for that to be felt.
-        match (client, &*key) {
-            (Some(client), Some(key)) if is_open => drop(give(client, peer, dir, key).await),
-            (Some(client), _) => said.push(ask(client, peer, dir).await),
-            (None, _) => {}
+        // (Each is the node it is, and not another at its address: a key is for that node's volume.)
+        let Some(client) = cluster.and_then(|cluster| cluster.to(peer).ok()) else {
+            continue;
+        };
+        match &*key {
+            Some(key) if is_open => drop(give(&client, &peer.address, dir, key).await),
+            _ => said.push(ask(&client, &peer.address, dir).await),
         }
     }
     if is_open {
@@ -412,7 +416,8 @@ async fn tend(
             filled.expect("the kernel gives random bytes");
             let mut keepers = 0;
             for peer in peers {
-                keepers += usize::from(give(client.expect("a node answered"), peer, &dir, &new).await);
+                let client = cluster.expect("a node answered").to(peer)?;
+                keepers += usize::from(give(&client, &peer.address, &dir, &new).await);
             }
             if keepers == 0 {
                 return Err("no other node took its key to keep".into());
@@ -438,14 +443,13 @@ async fn tend(
     Err(format!("the key the cluster keeps does not open it: {failed}"))
 }
 
-/// The addresses of the nodes that keep the keys of `me`'s volumes: the other control nodes.
-/// A worker is given none and asked for none.
-fn keepers(store: &Store, me: &str) -> Vec<String> {
-    let address = |node: &kith_api::Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
+/// The nodes that keep the keys of `me`'s volumes, as they are called: the other control
+/// nodes. A worker is given none and asked for none.
+fn keepers(store: &Store, me: &str) -> Vec<Upstream> {
     let others = store
         .list(Some("Node"))
         .filter(|node| node.metadata.name != me && node.spec["trust"] != "worker");
-    others.filter_map(address).collect()
+    others.filter_map(Upstream::of).collect()
 }
 
 /// Keeps this node's encrypted volumes open.
@@ -473,11 +477,11 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
             (crate::volumes::encrypted(&held.store, &me), keepers(&held.store, &me))
         };
         round += 1;
-        let client = shared.cluster.as_ref().map(|cluster| &cluster.client);
+        let cluster = shared.cluster.as_ref();
         for (dir, size) in mine {
             let name = format!("{}/{}", dir.namespace, dir.name);
             let key = keys.entry(name.clone()).or_default();
-            match tend(client, &peers, &state, (&dir, size), key, round.is_multiple_of(SPREAD)).await {
+            match tend(cluster, &peers, &state, (&dir, size), key, round.is_multiple_of(SPREAD)).await {
                 Ok(None) => {}
                 Ok(Some(what)) => {
                     said.remove(&name);
@@ -559,9 +563,15 @@ spec: { node: a, path: /srv/data, size: 1Gi, encrypted: true }
             let status = serde_json::json!({ "address": address });
             store.set_status(&format!("Node/{name}"), Some(status)).unwrap();
         }
-        assert_eq!(keepers(&store, "a"), ["10.0.0.2:7443", "10.0.0.3:7443"]);
+        let addresses = |me| {
+            keepers(&store, me)
+                .into_iter()
+                .map(|node| node.address)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(addresses("a"), ["10.0.0.2:7443", "10.0.0.3:7443"]);
         // (A worker's own encrypted Volume is kept by the control nodes, all of them.)
-        assert_eq!(keepers(&store, "w").len(), 3);
+        assert_eq!(addresses("w").len(), 3);
     }
 
     /// one it was given whatever comes later, and gives nothing to a node that is locked.
