@@ -36,8 +36,13 @@ and a Rust toolchain. Most of the time it takes is the build.
 2. Start the daemon.
 
    ```sh
-   kithd &
+   systemd-run --user --scope --quiet kithd &
    ```
+
+   (Not plain `kithd &`: a container's cgroup goes next to kithd's own, which has to be
+   your user's. From an ssh login or a system service it is root's, and kithd would take
+   workloads and start none; it says so at start. `systemd-run --user --scope` runs it in
+   your user's systemd.)
 
    You should see `kithd: serving …/kithd.sock` (a socket under `/run/user/`
    that only you can open), and after it where the state is kept.
