@@ -421,6 +421,13 @@ fn made_at(resource: &Resource) -> u64 {
     made.and_then(|made| made.parse().ok()).unwrap_or(0)
 }
 
+/// The time (as [`rfc3339`] writes it) of the oldest revision the store kept of `resource`:
+/// when a thing that no client made here (a namespace, a node) was first seen.
+fn oldest(store: &Store, resource: &Resource) -> String {
+    let first = store.history(&resource.key()).ok().and_then(|history| history.first());
+    rfc3339(first.map_or(0, |first| first.at))
+}
+
 /// Sets what is at `path` (`/a/b`) of `at`, making the mappings on the way; nothing where
 /// something that is not a mapping is in the way.
 fn set(mut at: &mut Value, path: &str, value: Value) {
@@ -905,6 +912,7 @@ fn made(
                 "metadata": {
                     "name": resource.metadata.name, "labels": resource.metadata.labels,
                     "uid": uid(&resource.key()), "resourceVersion": version(resource).to_string(),
+                    "creationTimestamp": oldest(store, resource),
                 },
                 "spec": {},
                 "status": {
@@ -951,8 +959,15 @@ fn objects(
             names.insert(kith_api::DEFAULT_NAMESPACE);
             names.extend(store.list(Some("Namespace")).map(|r| r.metadata.name.as_str()));
             let object = |name: &str| {
-                let said = store.get(&format!("Namespace/{name}")).and_then(served);
-                said.map(|(_, object)| object).unwrap_or_else(|| {
+                let said = store.get(&format!("Namespace/{name}")).and_then(|r| {
+                    let (_, mut object) = served(r)?;
+                    // (One made through these paths has been given the time it was made.)
+                    if object.pointer("/metadata/creationTimestamp").is_none() {
+                        set(&mut object, "/metadata/creationTimestamp", oldest(store, r).into());
+                    }
+                    Some(object)
+                });
+                said.unwrap_or_else(|| {
                     json!({
                         "apiVersion": "v1", "kind": "Namespace",
                         "metadata": { "name": name, "uid": uid(name), "resourceVersion": "1" },
@@ -2562,6 +2577,57 @@ spec: {role: writer, subjects: [carol]}
             assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `kubectl get namespaces` and `get nodes` print an AGE: the object's creationTimestamp
+    /// is the time of the oldest revision the store kept of what holds it.
+    #[test]
+    fn age_of_a_namespace_and_a_node_is_its_oldest_revision() {
+        let mut store = Store::default();
+        let held = |kind: &str, name: &str| -> Resource {
+            let meta = json!({ "name": name });
+            let status = json!({ "address": "10.0.0.2:7000", "state": "reachable" });
+            let spec = if kind == "Node" {
+                json!({ "address": "10.0.0.2:7000" })
+            } else {
+                json!({})
+            };
+            let mut held: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": kind, "metadata": meta, "spec": spec,
+            }))
+            .unwrap();
+            if kind == "Node" {
+                held.status = Some(status);
+            }
+            held
+        };
+        store.at(Some(1_700_000_000));
+        store.apply(held("Namespace", "shop")).unwrap();
+        store.put(held("Node", "n2"));
+        // A later change of the namespace keeps the age of its first revision.
+        store.at(Some(1_700_000_500));
+        let mut again = held("Namespace", "shop");
+        again.metadata.labels.insert("a".into(), "b".into());
+        store.apply(again).unwrap();
+        let grants = Grants::of(&Caller::Admin, &store);
+        let kind = |of: &str| KINDS.iter().find(|kind| kind.kind == of).unwrap();
+        for (of, name) in [("Namespace", "shop"), ("Node", "n2")] {
+            let found = objects(&store, kind(of), None, Some(name), &grants, &Verb::Get);
+            assert_eq!(found.len(), 1, "{of}");
+            assert_eq!(
+                found[0]["metadata"]["creationTimestamp"],
+                rfc3339(1_700_000_000),
+                "{of}: {found:?}"
+            );
+            let cells: Vec<_> = row(of, &found[0])
+                .into_iter()
+                .filter(|(name, _)| *name == "Age")
+                .collect();
+            assert!(
+                cells[0].1.as_str().is_some_and(|age| age.ends_with('d')),
+                "{of}: {cells:?}"
+            );
+        }
     }
 
     #[test]
