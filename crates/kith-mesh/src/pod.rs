@@ -4,11 +4,13 @@
 //! in its node's /80 of the mesh, which every node reaches. Made and set up over netlink
 //! and by the kernel's own calls: no `ip`, no `nft`, no plugin.
 //
-// ponytail: the IPv4 range is fixed (100.88.0.0/16, of the range set aside for carriers'
-// NAT): a node whose own network uses it needs this to be a flag. 65533 pods a node.
+// ponytail: the IPv4 range is a flag of the node's kithd ([`Range`]; 100.88.0.0/16, of the
+// range set aside for carriers' NAT, unless told). At most 65533 pods a node, whatever the
+// range holds; a range's own network is read once, at start: one that comes up on this node
+// later (a tailnet) and clashes is not noticed.
 
 use crate::netlink::{ask_route, link, silent, up};
-use netlink_packet_core::{NLM_F_ACK, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REPLACE};
+use netlink_packet_core::{NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE};
 use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressMessage};
 use netlink_packet_route::link::{InfoData, InfoKind, InfoVeth, LinkAttribute, LinkInfo};
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType};
@@ -19,22 +21,160 @@ use std::io::{Error, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
-/// What every pod sends through, and where it asks for names: an address of the node's
-/// that is on no wire.
-pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(100, 88, 0, 1);
 const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-/// The numbers a pod of a node may have (0 is the range's own, 1 the node's).
-pub const NUMBERS: std::ops::RangeInclusive<u16> = 2..=65534;
+
+/// The IPv4 range a node's pods get their addresses from (`kithd --pod-range`): an address
+/// only that node knows. Its first address is what every pod sends through and where it
+/// asks for names ([`Range::gateway`]: on no wire), pod `number` has the range's `number`th.
+/// From /8 to /24 (a /24 holds 254 pods at most), whole networks, and none that is not a
+/// private or public unicast one (no loopback, link-local, multicast or reserved).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Range {
+    network: u32,
+    bits: u8,
+}
+
+impl Default for Range {
+    fn default() -> Self {
+        Self::new(Ipv4Addr::new(100, 88, 0, 0), 16).expect("the default range is a good one")
+    }
+}
+
+impl std::fmt::Display for Range {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", Ipv4Addr::from(self.network), self.bits)
+    }
+}
+
+impl std::str::FromStr for Range {
+    type Err = String;
+    fn from_str(text: &str) -> std::result::Result<Self, String> {
+        let (address, bits) = text
+            .split_once('/')
+            .ok_or("not an IPv4 network: say ADDRESS/BITS, as 10.77.0.0/16")?;
+        let address: Ipv4Addr = address
+            .parse()
+            .map_err(|_| format!("{address} is not an IPv4 address"))?;
+        let bits: u8 = bits.parse().map_err(|_| format!("{bits} is not a number of bits"))?;
+        Self::new(address, bits)
+    }
+}
+
+impl Range {
+    pub fn new(network: Ipv4Addr, bits: u8) -> std::result::Result<Self, String> {
+        if bits > 24 {
+            return Err(format!(
+                "{network}/{bits} holds fewer than 254 addresses: /24 is the smallest range"
+            ));
+        }
+        if bits < 8 {
+            return Err(format!("{network}/{bits} is larger than /8"));
+        }
+        let range = Self {
+            network: network.into(),
+            bits,
+        };
+        if range.network & !range.mask() != 0 {
+            return Err(format!(
+                "{network}/{bits} is not a network (bits are set after the first {bits}): did you mean {}/{bits}?",
+                Ipv4Addr::from(range.network & range.mask())
+            ));
+        }
+        // 0.0.0.0/8, loopback, link-local, multicast and what is reserved after it.
+        let nots = [
+            (0, 8, "this network"),
+            (127 << 24, 8, "loopback"),
+            (169 << 24 | 254 << 16, 16, "link-local"),
+            (224 << 24, 3, "multicast or reserved"),
+        ];
+        for (other, other_bits, what) in nots {
+            if overlap((range.network, bits), (other, other_bits)) {
+                return Err(format!("{range} is {what} (or holds it)"));
+            }
+        }
+        Ok(range)
+    }
+
+    fn mask(&self) -> u32 {
+        u32::MAX << (32 - self.bits)
+    }
+
+    /// What every pod sends through, and where it asks for names: the range's first address,
+    /// the node's own on no wire.
+    pub fn gateway(&self) -> Ipv4Addr {
+        (self.network + 1).into()
+    }
+
+    /// The numbers a pod of a node may have (0 is the range's own, 1 the node's, the last
+    /// address is its broadcast); no more than a pod's number holds.
+    pub fn numbers(&self) -> std::ops::RangeInclusive<u16> {
+        2..=(!self.mask() - 1).min(65534) as u16
+    }
+
+    /// The IPv4 address of pod `number`.
+    pub fn address(&self, number: u16) -> Ipv4Addr {
+        (self.network + u32::from(number)).into()
+    }
+
+    /// Refuse a range that holds an address this node already has on a link (`held`: each
+    /// with its prefix length); the gateway on the loopback is its own, from an earlier start.
+    pub fn refuse_held(&self, held: &[(Ipv4Addr, u8)]) -> std::result::Result<(), String> {
+        let ours = |(address, bits): &(Ipv4Addr, u8)| *bits != 32 || *address != self.gateway();
+        match held
+            .iter()
+            .filter(|held| ours(held))
+            .find(|(address, _)| u32::from(*address) & self.mask() == self.network)
+        {
+            Some((address, bits)) => Err(format!(
+                "this node has {address}/{bits} on a link, inside the pods' range {self}: name another with --pod-range"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Range::refuse_held`] for the addresses this machine has now (read, not changed).
+    pub fn refuse_if_in_use(&self) -> std::result::Result<(), String> {
+        let held = held_addresses().map_err(|e| format!("reading this node's addresses: {e}"))?;
+        self.refuse_held(&held)
+    }
+}
+
+/// Whether two networks (address, bits) share an address.
+fn overlap((a, a_bits): (u32, u8), (b, b_bits): (u32, u8)) -> bool {
+    (a ^ b) >> (32 - a_bits.min(b_bits)) == 0
+}
+
+/// The IPv4 addresses on this machine's links, with their prefix lengths.
+fn held_addresses() -> Result<Vec<(Ipv4Addr, u8)>> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+    let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| match found {
+            RouteNetlinkMessage::NewAddress(found) => {
+                let local = found.attributes.iter().find_map(|attribute| match attribute {
+                    AddressAttribute::Local(IpAddr::V4(local)) | AddressAttribute::Address(IpAddr::V4(local)) => {
+                        Some(*local)
+                    }
+                    _ => None,
+                });
+                local.map(|local| (local, found.header.prefix_len))
+            }
+            _ => None,
+        })
+        .collect())
+}
 
 /// The addresses of a node's pod `number`: the IPv4 one, and the one in the node's /80.
-pub fn addresses(node_net: Option<Ipv6Addr>, number: u16) -> (Ipv4Addr, Option<Ipv6Addr>) {
+pub fn addresses(range: Range, node_net: Option<Ipv6Addr>, number: u16) -> (Ipv4Addr, Option<Ipv6Addr>) {
     let [high, low] = number.to_be_bytes();
     let v6 = node_net.map(|net| {
         let mut bytes = net.octets();
         (bytes[13], bytes[14], bytes[15]) = (1, high, low);
         bytes.into()
     });
-    (Ipv4Addr::new(100, 88, high, low), v6)
+    (range.address(number), v6)
 }
 
 fn address(index: u32, address: IpAddr, bits: u8) -> Result<()> {
@@ -113,8 +253,9 @@ pub fn within<T: Send>(namespace: &(impl AsFd + Sync), f: impl FnOnce() -> T + S
 /// Make the pod `number` its network namespace, with the addresses [`addresses`] gives
 /// it, and give the namespace back: it lasts while this, or a process in it, does, and
 /// the links go with it. Only root can ([`node`] comes first, once).
-pub fn make(number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> {
-    let (v4, _) = addresses(None, number);
+pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> {
+    let (v4, _) = addresses(range, None, number);
+    let gateway = range.gateway();
     let host = format!("kp{number}");
     // (A thread of its own: it is in the pod's namespace for a while, and nothing else of
     // this process must find itself there.)
@@ -150,8 +291,8 @@ pub fn make(number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> {
         let eth0 = index_of("eth0")?;
         up(eth0)?;
         address(eth0, v4.into(), 32)?;
-        route(eth0, Some(GATEWAY.into()), None)?;
-        route(eth0, None, Some(GATEWAY.into()))?;
+        route(eth0, Some(gateway.into()), None)?;
+        route(eth0, None, Some(gateway.into()))?;
         if let Some(v6) = v6 {
             address(eth0, v6.into(), 128)?;
             route(eth0, None, Some(GATEWAY6.into()))?;
@@ -162,22 +303,22 @@ pub fn make(number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> {
         .unwrap_or_else(|_| Err(Error::other("the thread making the namespace panicked")))
 }
 
-/// Make this machine the node its pods need, once before the first: [`GATEWAY`] on the
-/// loopback, packets passed on between links, and what leaves from a pod's IPv4 address
+/// Make this machine the node its pods need, once before the first: the range's gateway on
+/// the loopback, packets passed on between links, and what leaves from a pod's IPv4 address
 /// sent as the node's own.
 ///
 /// A machine that passed nothing on until now (or `guarded`: until this was done here
 /// before) passes on only what comes from or goes to a pod: it is no more of a router for
 /// anyone else than it was. Returns whether that is so, for the caller to say next time.
-pub fn node(guarded: bool) -> Result<bool> {
-    node_with(guarded, true)
+pub fn node(range: Range, guarded: bool) -> Result<bool> {
+    node_with(range, guarded, true)
 }
 
-fn node_with(guarded: bool, masquerade: bool) -> Result<bool> {
-    crate::address4(1, GATEWAY, 32, None)?;
+fn node_with(range: Range, guarded: bool, masquerade: bool) -> Result<bool> {
+    crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
-    nat(guard, masquerade)?;
+    nat(range, guard, masquerade)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -227,7 +368,7 @@ fn is(bytes: &[u8]) -> Vec<u8> {
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
 /// comes in from or goes out to a pod's link.
-fn nat(guard: bool, masquerade: bool) -> Result<()> {
+fn nat(range: Range, guard: bool, masquerade: bool) -> Result<()> {
     const TABLE: &str = "kith-pods";
     let (ip, inet) = (2u8, 1u8);
     // (New table, delete table, new chain, new rule: of the subsystem nftables, 10.)
@@ -269,15 +410,27 @@ fn nat(guard: bool, masquerade: bool) -> Result<()> {
     say(new_table, ip, 0, &[text(1, TABLE)]);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
     say(new_chain, ip, 0, &chain("out", "nat", 4, 100, None));
-    // The first two bytes of where it comes from (12 into the IP header) are the range's.
-    let from = expression("payload", &[number(1, 1), number(2, 1), number(3, 12), number(4, 2)]);
-    let [first, second, ..] = GATEWAY.octets();
+    // Where it comes from (4 bytes, 12 into the IP header), with all but the range's bits
+    // cleared (bitwise: and with the mask, or with 0), is the range's network.
+    let from = expression("payload", &[number(1, 1), number(2, 1), number(3, 12), number(4, 4)]);
+    let value = |bytes: [u8; 4]| attribute(1, &bytes);
+    let (mask, network) = (range.mask().to_be_bytes(), range.network.to_be_bytes());
+    let masked = expression(
+        "bitwise",
+        &[
+            number(1, 1),
+            number(2, 1),
+            number(3, 4),
+            attribute(4 | NESTED, &value(mask)),
+            attribute(5 | NESTED, &value([0; 4])),
+        ],
+    );
     if masquerade {
         say(
             new_rule,
             ip,
             0,
-            &rule("out", &[from, is(&[first, second]), expression("masq", &[])]),
+            &rule("out", &[from, masked, is(&network), expression("masq", &[])]),
         );
     }
     if guard {
@@ -324,11 +477,119 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
 
+    fn range(text: &str) -> std::result::Result<Range, String> {
+        text.parse()
+    }
+
+    #[test]
+    fn the_range_gives_the_gateway_the_numbers_and_the_addresses() {
+        let default = Range::default();
+        assert_eq!(default.to_string(), "100.88.0.0/16");
+        assert_eq!(
+            (default.gateway(), default.numbers()),
+            (Ipv4Addr::new(100, 88, 0, 1), 2..=65534)
+        );
+        let small = range("10.77.4.0/24").unwrap();
+        assert_eq!(
+            (small.gateway(), small.numbers()),
+            (Ipv4Addr::new(10, 77, 4, 1), 2..=254)
+        );
+        assert_eq!(small.address(254), Ipv4Addr::new(10, 77, 4, 254));
+        // A range larger than a pod's number holds is used as far as that goes.
+        let large = range("10.0.0.0/8").unwrap();
+        assert_eq!(
+            (large.numbers(), large.address(0x0102)),
+            (2..=65534, Ipv4Addr::new(10, 0, 1, 2))
+        );
+        let middle = range("198.18.16.0/20").unwrap();
+        assert_eq!(
+            (middle.numbers(), middle.address(0x0102)),
+            (2..=4094, Ipv4Addr::new(198, 18, 17, 2))
+        );
+    }
+
+    #[test]
+    fn a_range_that_is_not_one_is_refused_with_its_reason() {
+        let refused = |text: &str, why: &str| {
+            let said = range(text).expect_err(text);
+            assert!(said.contains(why), "{text}: {said}");
+        };
+        refused("10.77.0.0", "ADDRESS/BITS");
+        refused("fd00::/64", "not an IPv4 address");
+        refused("10.77.0.0/x", "not a number");
+        refused("10.77.0.0/25", "fewer than 254");
+        refused("10.77.0.0/32", "fewer than 254");
+        refused("10.0.0.0/7", "larger than /8");
+        refused("10.77.0.1/16", "did you mean 10.77.0.0/16");
+        for (text, what) in [
+            ("127.0.0.0/8", "loopback"),
+            ("127.5.0.0/16", "loopback"),
+            ("169.254.0.0/16", "link-local"),
+            ("169.254.7.0/24", "link-local"),
+            ("224.0.0.0/24", "multicast"),
+            ("239.1.0.0/16", "multicast"),
+            ("240.0.0.0/16", "reserved"),
+            ("0.0.0.0/8", "this network"),
+            ("0.9.0.0/16", "this network"),
+        ] {
+            refused(text, what);
+        }
+        // What is next to them is fine: 126, 128, 169.253, 169.255, and 223.
+        for text in [
+            "126.0.0.0/16",
+            "128.0.0.0/16",
+            "169.253.0.0/16",
+            "169.255.0.0/16",
+            "223.1.0.0/16",
+            "100.64.0.0/10",
+            "192.168.0.0/24",
+        ] {
+            range(text).expect(text);
+        }
+    }
+
+    #[test]
+    fn a_range_with_an_address_of_the_node_in_it_is_refused() {
+        let ours = range("10.77.0.0/16").unwrap();
+        let held = |list: &[(&str, u8)]| -> Vec<(Ipv4Addr, u8)> {
+            list.iter().map(|(a, b)| (a.parse().unwrap(), *b)).collect()
+        };
+        // The node's own network (a LAN, a tailnet) and the loopback are not in it.
+        ours.refuse_held(&held(&[
+            ("127.0.0.1", 8),
+            ("192.168.1.5", 24),
+            ("100.101.1.2", 32),
+            ("10.78.0.1", 16),
+        ]))
+        .unwrap();
+        // The pods' own gateway, left on the loopback by an earlier start, is not a clash.
+        ours.refuse_held(&held(&[("10.77.0.1", 32)])).unwrap();
+        // One that is, is (even at the range's ends, or with the gateway's address and another length).
+        for clash in [
+            ("10.77.0.9", 24),
+            ("10.77.255.254", 32),
+            ("10.77.0.0", 8),
+            ("10.77.0.1", 16),
+        ] {
+            let said = ours.refuse_held(&held(&[("192.168.1.5", 24), clash])).unwrap_err();
+            assert!(
+                said.contains(&format!("{}/{}", clash.0, clash.1)) && said.contains("--pod-range"),
+                "{said}"
+            );
+        }
+        // And the machine this runs on can be asked (what it has is anyone's: only that it answers).
+        assert!(held_addresses().is_ok_and(|held| held.iter().any(|(address, _)| address.is_loopback())));
+    }
+
     #[test]
     fn a_pods_addresses_are_its_nodes() {
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
-        let (v4, v6) = addresses(Some(net), 0x0102);
+        let (v4, v6) = addresses(Range::default(), Some(net), 0x0102);
         assert_eq!(v4, Ipv4Addr::new(100, 88, 1, 2));
+        assert_eq!(
+            addresses(range("10.77.0.0/20").unwrap(), None, 0x0102).0,
+            Ipv4Addr::new(10, 77, 1, 2)
+        );
         let (v6, net) = (v6.unwrap().octets(), net.octets());
         assert_eq!((&v6[..10], &v6[10..]), (&net[..10], &[0, 0, 0, 1, 1, 2][..]));
         assert_ne!(v6, crate::node_address(crate::prefix(b"test"), "alpha").octets());
@@ -344,20 +605,22 @@ mod tests {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh pods");
         }
         up(1).unwrap();
+        // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
+        let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(false) {
+        let masquerade = match node(range, false) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(false, false).unwrap());
+            assert!(node_with(range, false, false).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
             .map(|number| {
-                let (v4, v6) = addresses(Some(net), number);
-                let namespace = make(number, v6).unwrap();
+                let (v4, v6) = addresses(range, Some(net), number);
+                let namespace = make(range, number, v6).unwrap();
                 let listener = within(&namespace, || TcpListener::bind("[::]:80")).unwrap().unwrap();
                 (namespace, listener, v4, v6.unwrap())
             })
@@ -407,7 +670,7 @@ mod tests {
                 .collect();
             let local = IpAddr::from(Ipv4Addr::LOCALHOST);
             assert_eq!((from[0], from[2], from[3]), (local, pods[1].3.into(), local));
-            let node = if masquerade { GATEWAY } else { pods[0].2 };
+            let node = if masquerade { range.gateway() } else { pods[0].2 };
             assert_eq!(
                 from[4],
                 IpAddr::from(node),
@@ -415,6 +678,6 @@ mod tests {
             );
         });
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(true, masquerade).unwrap());
+        assert!(node_with(range, true, masquerade).unwrap());
     }
 }

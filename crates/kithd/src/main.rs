@@ -91,6 +91,9 @@ struct Args {
     /// first, while the state disk is under its reserve); pulled again when a unit needs it. 0 keeps every image
     #[arg(long, env = "KITH_IMAGE_GRACE", value_name = "SECONDS", default_value_t = 86400)]
     image_grace: u64,
+    /// The IPv4 network this node's pods get their addresses from (/8 to /24; refused if an address of this node, a LAN or a tailnet, is in it)
+    #[arg(long, env = "KITH_POD_RANGE", value_name = "ADDR/BITS", default_value_t = kith_mesh::pod::Range::default())]
+    pod_range: kith_mesh::pod::Range,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -573,6 +576,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         early = stops().ok();
         boot.network();
     }
+    // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
+    pods::set_range(args.pod_range);
+    if nix::unistd::getuid().is_root() {
+        args.pod_range.refuse_if_in_use()?;
+    }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
     // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
     //
@@ -983,6 +991,30 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    #[test]
+    fn the_pods_range_is_the_default_or_a_network_the_node_names() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Args::try_parse_from(["kithd"].into_iter().chain(args.iter().copied()));
+        assert_eq!(parse(&[]).unwrap().pod_range.to_string(), "100.88.0.0/16");
+        assert_eq!(
+            parse(&["--pod-range", "10.77.0.0/20"])
+                .unwrap()
+                .pod_range
+                .gateway()
+                .to_string(),
+            "10.77.0.1"
+        );
+        let refused = parse(&["--pod-range", "127.0.0.0/16"])
+            .err()
+            .expect("loopback")
+            .to_string();
+        assert!(
+            refused.contains("--pod-range") && refused.contains("loopback"),
+            "{refused}"
+        );
+        assert!(parse(&["--pod-range", "10.77.0.0/25"]).is_err() && parse(&["--pod-range", "10.77.0.0"]).is_err());
     }
 
     use super::*;

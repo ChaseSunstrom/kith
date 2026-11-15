@@ -442,6 +442,16 @@ spec:
   (`--mesh`), so every node reaches it and Services send to it. What it asks outside
   the cluster leaves from behind its node's address. It is told this node's DNS, with
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+  The IPv4 address only its node knows is taken from `100.88.0.0/16` unless that node's
+  kithd is told another with `--pod-range ADDRESS/BITS` (or `KITH_POD_RANGE`; on kith OS
+  after ` -- ` on the kernel command line or in `boot.args` of the config partition), for a
+  node whose own network or tailnet is in it. It is the node's own to name (nodes of one
+  cluster may differ: no pod reaches another by it), from `/8` to `/24` (a `/24` holds 254
+  pods) and a whole network (`10.77.0.0/20`, not `10.77.0.1/20`); never loopback,
+  link-local (169.254.0.0/16), multicast or reserved space. At start, as root, kithd reads the
+  addresses its node has on its links and refuses to start, naming the one, when a
+  link's address is inside the range (it changes nothing; a range that comes up on the node
+  later is not noticed). Pods of the old range go when kithd restarts.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
@@ -467,8 +477,7 @@ spec:
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
 - Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace); the range pods' addresses are taken
-  from is fixed.
+  capabilities and the filter (no user namespace).
 
 ### What a container is given
 
