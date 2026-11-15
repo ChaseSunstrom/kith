@@ -306,15 +306,39 @@ pub async fn run(
     }
     // A count or removal holds directories of the state disk open: it is waited for, a little,
     // so the disk can be unmounted once kithd is gone.
-    let jobs = controller.count.into_iter().map(|job| job.waiting.map(drop).boxed());
-    let removals = controller.replacing.into_values().filter_map(|(_, job)| job);
-    let all = jobs.chain(removals.map(|job| job.waiting.map(drop).boxed()));
-    if tokio::time::timeout(Duration::from_secs(2), futures_util::future::join_all(all))
-        .await
-        .is_err()
-    {
-        eprintln!("kithd: a storage count or removal had not given up in 2 s: the state disk may be busy");
+    let counts = controller
+        .count
+        .into_iter()
+        .map(|job| ("the storage count".to_string(), job.waiting.map(drop).boxed()));
+    let removals = controller.replacing.into_iter().filter_map(|(pod, (_, job))| {
+        Some((
+            format!("the removal of pod {pod}'s old files"),
+            job?.waiting.map(drop).boxed(),
+        ))
+    });
+    let left = wait_for_storage(counts.chain(removals).collect(), Duration::from_secs(2)).await;
+    if !left.is_empty() {
+        eprintln!(
+            "kithd: gave up waiting after 2 s for {}: the state disk may be busy; what a removal left (the scratch and the scratch.* levels beside it, each listed once, at most four directories open, never `..`, never across a file system) goes as trees of their own at its pod's next count, or with its replica directory once the pod is gone",
+            left.join(", ")
+        );
     }
+}
+
+/// Waits for the jobs (named for the log) to be done, up to `bound`: the names of those that
+/// were not. A removal looks at the stop every 1,024 steps, so it is soon.
+async fn wait_for_storage(
+    jobs: Vec<(String, futures_util::future::BoxFuture<'static, ()>)>,
+    bound: Duration,
+) -> Vec<String> {
+    let mut left: BTreeSet<String> = jobs.iter().map(|(what, _)| what.clone()).collect();
+    let mut running: futures_util::stream::FuturesUnordered<_> =
+        jobs.into_iter().map(|(what, job)| job.map(move |()| what)).collect();
+    let deadline = tokio::time::Instant::now() + bound;
+    while let Ok(Some(what)) = tokio::time::timeout_at(deadline, futures_util::StreamExt::next(&mut running)).await {
+        left.remove(&what);
+    }
+    left.into_iter().collect()
 }
 
 /// Waits for the next pass: a store change or a child exit ends the wait at once, and `wake`
@@ -1344,9 +1368,12 @@ impl Controller {
         // wait that long. What is not reported now still differs on the next pass.
         if !statuses.is_empty() && self.report.as_ref().is_none_or(|report| report.is_finished()) {
             let (shared, node) = (shared.clone(), node.to_string());
+            // In parts a control node takes from a worker, the largest report too.
             self.report = Some(tokio::spawn(async move {
-                if let Err(e) = shared.submit(kith_store::Command::Report { node, statuses }).await {
-                    eprintln!("kithd: saving status: {e}");
+                for report in crate::raft::in_parts(&node, statuses) {
+                    if let Err(e) = shared.submit(report).await {
+                        eprintln!("kithd: saving status: {e}");
+                    }
                 }
             }));
         }
@@ -2590,5 +2617,19 @@ mod tests {
             said.ends_with("has no replica 0: its copies are 1, 2; pick one with --replica"),
             "{said}"
         );
+    }
+
+    #[tokio::test]
+    async fn storage_stop_waits_for_the_jobs_and_names_the_ones_left() {
+        let (done, finishing) = tokio::sync::oneshot::channel::<()>();
+        let (_held, hung) = tokio::sync::oneshot::channel::<()>();
+        let jobs = vec![
+            ("the count".to_string(), finishing.map(drop).boxed()),
+            ("the removal of pod b".to_string(), hung.map(drop).boxed()),
+        ];
+        done.send(()).unwrap();
+        let left = wait_for_storage(jobs, Duration::from_millis(50)).await;
+        assert_eq!(left, ["the removal of pod b"]);
+        assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
     }
 }

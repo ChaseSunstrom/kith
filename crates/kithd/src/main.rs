@@ -753,8 +753,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     let registered = match pki::print_of(&cluster.me.cert) {
                         Ok(print) => {
                             let more = serde_json::json!({ "ca": true });
-                            let registered = cluster::register(&shared, &cluster.me.name, &reachable, id, &print, more);
-                            registered.await.map_err(|e| e.to_string())
+                            let registered =
+                                cluster::register_first(&shared, &cluster.me.name, &reachable, id, &print, more);
+                            registered.await.map(drop).map_err(|e| e.to_string())
                         }
                         Err(e) => Err(e),
                     };

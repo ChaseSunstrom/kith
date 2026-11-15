@@ -995,6 +995,42 @@ fn refused_is_said_with_the_field_and_nothing_is_dropped_in_silence() {
     cluster.refused(&["apply", "-f", "over.yaml"], &["was not made as a StatefulSet"]);
 }
 
+/// A Deployment and a Job of one name are two kinds and may share it: their pods are
+/// not one, and `kubectl logs job/x` is the Job's output, not the Deployment's.
+#[test]
+fn a_deployment_and_a_job_of_one_name_make_two_pods() {
+    let Some(cluster) = Cluster::start("kube-pod-names") else {
+        return;
+    };
+    let both = "apiVersion: apps/v1\nkind: Deployment\nmetadata: { name: x }\nspec:\n  replicas: 1\n  selector: { matchLabels: { app: x } }\n  template:\n    metadata: { labels: { app: x } }\n    spec:\n      containers: [{ name: main, image: 'nginx:1.27-alpine' }]\n---\napiVersion: batch/v1\nkind: Job\nmetadata: { name: x }\nspec:\n  template:\n    spec:\n      restartPolicy: Never\n      containers: [{ name: main, image: 'busybox:1.36', command: ['true'] }]\n";
+    cluster.write("both.yaml", both);
+    cluster.ok(&["apply", "-f", "both.yaml"]);
+    // Two names: a pod's name says what made it.
+    let mut names = Vec::new();
+    eventually("a pod of the Deployment and one of the Job", 30, || {
+        names = cluster
+            .ok(&["get", "pods", "-o", "name"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names == ["pod/x-0", "pod/x-j0"]
+    });
+    // What each wrote, in the files kithd keeps (nothing runs here, these images are empty).
+    let logs = cluster.dir.join("state/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("w_default_x_0_main.out"), "the deployment's\n").unwrap();
+    std::fs::write(logs.join("j_default_x_0_main.out"), "the job's\n").unwrap();
+    assert_eq!(cluster.ok(&["logs", "job/x"]), "the job's\n");
+    assert_eq!(cluster.ok(&["logs", "deployment/x"]), "the deployment's\n");
+    assert_eq!(cluster.ok(&["logs", "x-j0"]), "the job's\n");
+    assert_eq!(cluster.ok(&["logs", "x-0"]), "the deployment's\n");
+    // A pod of one name is that kind's: no other ending is a pod.
+    for no in ["x-j1", "x-n0", "x-1", "x-j", "x-j00", "x-+0", "x-00"] {
+        cluster.refused(&["logs", no], &["NotFound"]);
+    }
+}
+
 #[test]
 fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     let Some(cluster) = Cluster::start("kube-access") else {

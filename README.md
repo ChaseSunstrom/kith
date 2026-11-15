@@ -1391,7 +1391,7 @@ helm install site ./chart --wait
 | PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
 | Namespace | a Namespace |
 | ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, PodDisruptionBudget, IngressClass | kept as sent (a `KubeObject`), read back, and said to give nothing |
-| Pod, ReplicaSet, Node, Event | made for reading from what kith runs: `kubectl get pods`, `describe`, `logs` |
+| Pod, ReplicaSet, Node, Event | made for reading from what kith runs: `kubectl get pods`, `describe`, `logs` (a pod's name says what runs it, so a Deployment and a Job of one name make two: a Deployment's or StatefulSet's pods are `NAME-0`, a Job's `NAME-j0` and a DaemonSet's `NAME-n0`) |
 
 What works, by the real clients in the tests (`sh ci/kube.sh`, and
 `sh ci/kube.sh --vm` for what needs pods that run):

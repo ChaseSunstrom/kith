@@ -335,8 +335,19 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   A count can count a file twice (moved between the walk and the look at open files) and
   counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
   gives up between files, and kithd waits 2 seconds for it so the state disk can be
-  unmounted; one directory set aside is removed in one call, which a stop does not cut
-  short. What is left is removed at its replica's next count. A limit held at
+  unmounted, and says in its log which it gave up on. A removal looks at the stop every
+  1,024 steps (entries looked at). It works a level at a time, so each directory is listed
+  once and the work is linear in the entries, at any depth: a directory that is not empty
+  is opened through the one above (never through a link, never into another file system),
+  emptied, and what directories it holds that are not empty are moved into a new
+  `scratch.*` level beside the scratch, which is removed next. At most four directories are
+  open, and `..` is never taken. A removal ends at the first entry it cannot remove (or a
+  rename to another file system, or of a mount point), with that error in the log. What a
+  stop or an error leaves is the scratch and its levels, each a `scratch.*` in the replica
+  directory, removed as trees of their own at the next count of its pod's roots (only a pod
+  with running roots that is walked: one with a limit, or while the disk is under twice its
+  reserve), or when the pod is gone, with its replica directory; two sweepers of the same
+  scratch at once are harmless. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
@@ -557,19 +568,58 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Devices under names that start with its own, with no hardware behind them, and
     so have a join under such a name refused until that Device is deleted or
     another name is chosen. A control node's own writes
-    are not held to this (it can lead: the cluster is taken with it). Nothing bounds
-    how much or how often a worker writes within its list: its reports can fill the
-    store's log. For the round (3 seconds) in which another node still has the file
-    of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
+    are not held to this (it can lead: the cluster is taken with it). How much and
+    how often a worker writes is held too, by each control node it asks: a write is
+    at most 1 MiB (an honest report of 300 units, each with a long message and
+    notes, is 131 KiB; a larger report is sent in parts of at most half that, a
+    status whole in each), and a worker makes at most 10 a second, 50 at once
+    after a rest, a write counting once more for each 64 KiB (so at most about
+    640 KiB a second). Every write a worker sends counts: one refused for its
+    list, one that is not a change, and the empty write its controller makes
+    before it starts a unit (one a second at most) too. A write that says its
+    size (`Content-Length`, as kithd's do) is counted for it before a byte of it
+    is read: past the rate it is answered 429 with the seconds to wait, unread,
+    and the worker's own kithd sends it again then; over the size it is refused
+    unread. One that does not say its size is counted once, read (up to 1 MiB,
+    where it is cut off), and then counted for the rest. One whose bytes do not
+    all come within 15 seconds is let go. None of them reaches the log. In the
+    audit log under the worker's name, a write refused for its list or as no
+    change is written each time; one refused for its size, its rate or its
+    slowness, a line a minute of each, which says how many were not written since
+    the last. The audit log writes at most 60 refusals a minute in all, whoever
+    they are of, and counts the rest with its next entry: a worker refused in a
+    loop can use up that minute's, and the refusals of others then are counted,
+    not written. What is left: a taken worker can still write that much, within
+    its list, to each control node it reaches (each holds it to its own count:
+    three control nodes, three times as much), and the log between two snapshots
+    (about 1100 entries) can then hold some 1.1 GiB of it on every node, which
+    takes such a worker about half an hour to write through one control node. What
+    it writes over its own status is replaced, but **the Devices and Seats it makes
+    under its own name are not counted**: each write can be a new one, so the store
+    itself (and every snapshot, on every node) can grow by up to about 2.2 GiB an
+    hour through one control node (640 KiB a second for 3600 seconds), until
+    someone deletes them or its Node. Nothing bounds the store's whole size or
+    what the disk has left. For the round (3 seconds) in which another node still
+    has the file of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
     a moment ago) is still followed, still has the store, and what it writes as the
-    node that leads is held to no list: delete its Node. It cannot read a Secret
+    node that leads, or sends on Raft's own routes, is held to no list, no size but
+    the 64 MiB any node's write may be, and no rate: delete its Node. It cannot read a Secret
     nothing placed on it names, or one that says `trust: control`; it is not sent a
     Volume it is no replica of, a Blob nothing on it names, or the key of an
     encrypted Volume.
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.
+  - A deleted node does not put itself back, the one the cluster started on included: that one
+    makes its own Node only while the store holds no Node at all, so on a restart with its
+    Node gone it writes nothing and says so. It joins again with a token. Two edges: when
+    every Node of the store is deleted, the node makes its own again (no Node is left to
+    tell that from a first start that ended too early); and a first start that ended before
+    its Node was written, after a joiner's went in, is told "deleted, or never registered"
+    at the next start and joins again. A Node of its name holding another certificate (a
+    joiner's) is not written over. It waits up to 30 s for a leader and for the store to be
+    caught up: with none, nothing is written in that run and the next start tries again.
   - A request that was already running when the Node was deleted (a `kith run` in
     progress, a copy of a blob or a volume) runs to its end. A watch is told no more.
   - A node answers by the store it has: one that is cut off from the others, or

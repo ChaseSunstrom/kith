@@ -323,6 +323,41 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     wait_for("the old certificate to be taken", || api() == "403");
 }
 
+/// The node the cluster started on, deleted and started again, does not put its Node back.
+#[test]
+fn deleted_first_node_is_not_made_again_by_its_restart() {
+    let test = "deleted_first_node";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let taken = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join("taken");
+    let _ = std::fs::remove_dir_all(&taken);
+    std::fs::create_dir_all(&taken).unwrap();
+    for file in ["node.crt", "node.key"] {
+        std::fs::copy(alpha.dir.join("state/pki").join(file), taken.join(file)).unwrap();
+    }
+    beta.ok(&["delete", "node/alpha"]);
+    wait_for("alpha to be refused", || {
+        status_as_node(&beta.address(), &taken, "GET", "/v1/resources") == "401"
+    });
+    // beta takes a deleted node's certificate again (as for a cluster that locked itself out), so that
+    // what alpha writes at its start could commit: only alpha's own guard keeps its Node out.
+    beta.stop();
+    beta.child = Node::spawn(&beta.dir, "beta", beta.port, &["--admit-deleted-nodes"]);
+    wait_for("beta to answer again", || beta.kith(&["get", "node"]).0 == 0);
+    alpha.stop();
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
+    // (Its registration ran at the start: given time, it would have put the Node back.)
+    std::thread::sleep(Duration::from_secs(8));
+    let names: Vec<_> = beta.nodes().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["beta"]);
+}
+
 #[test]
 fn the_store_survives_its_leader() {
     if std::env::var_os("KITH_E2E").is_none() {
