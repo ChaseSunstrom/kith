@@ -929,6 +929,14 @@ kith get dnsrecord                   # each one says `served`, or why not
 - A `DNSZone` is a domain kithd answers itself; a `DNSRecord` is a name in one:
   A, AAAA, CNAME, TXT, SRV, NS or PTR, `*.apps` for a wildcard, `@` for the
   zone itself. Names in values are full names (`nas.home.example`).
+- A host a Service exposes (`expose.host`, see [More than one node](#more-than-one-node))
+  under a zone's domain is answered at the LAN address of each node that serves
+  ingress, for that zone's TTL and clients: one A record per node, IPv4 only
+  (no AAAA for the LAN). A host under two zones is the longer zone's; a DNSRecord of
+  the same name is answered instead. A host its Namespace does not keep for it,
+  one that is refused, and one under no zone are not answered here. Roaming,
+  unreachable and LAN-less nodes are left out. The table is rebuilt when a
+  Namespace's hosts or a node's `serves` or state changes.
 - Split horizon: a zone with `clients: [192.168.0.0/16]` is what those clients
   get, in place of a zone for everyone with the same domain. A client inside
   two different `clients` lists gets only one of them, the list with the
@@ -978,6 +986,33 @@ kith get dnsrecord                   # each one says `served`, or why not
   A question that carries options of the client's own (its subnet, a cookie)
   is asked each time.
 - In a cluster every node started with `--dns` answers the same names.
+
+### Forwarding one zone
+
+Keep the house resolver as the one clients ask, and send one domain of kith's
+DNSZone to kithd: `apps.example.test` here, with kithd on a LAN address of a
+DNS node (`192.0.2.10`). Run kithd with `--dns 192.0.2.10:53`, and with
+`--dns-upstream` set to resolvers that are not the house resolver (`1.1.1.1,9.9.9.9`),
+so a name kithd does not know goes out and does not come back to it.
+
+The setting for each resolver, from what its documentation says the menu or file
+is called; none of them was tried on a device for this guide, so check the name
+against your version:
+
+- AdGuard Home: Settings, DNS settings, Upstream DNS servers: add the line
+  `[/apps.example.test/]192.0.2.10:53` above the other upstreams.
+- dnsmasq: `server=/apps.example.test/192.0.2.10#53` in the config (or a file in
+  `/etc/dnsmasq.d/`), then restart dnsmasq.
+- Technitium: Zones, Add Conditional Forwarder Zone: zone `apps.example.test`,
+  forwarder `192.0.2.10`.
+- UniFi: the gateway's forward domain setting (Forward Domain in Network's
+  settings; where it sits depends on the version). Clients keep the gateway
+  as their resolver.
+
+Then `dig @<house resolver> www.apps.example.test` should give kithd's answer,
+and `dig @<house resolver> www.example.org` the same answer as before. Only one
+zone is forwarded: the others stay with the house resolver, which is what a
+forwarder for one domain is for.
 
 Not yet: DNSSEC and zone transfers.
 
