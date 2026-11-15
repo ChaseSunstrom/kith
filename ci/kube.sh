@@ -52,4 +52,6 @@ export KITH_KUBECTL="$cache/kubectl-$kubectl_version" KITH_HELM="$cache/helm-$he
 # What kubectl and helm send as protobuf is read by a table: it must be the one
 # Kubernetes's own types give (they are fetched once, by hash, like the clients).
 python3 ci/kube_proto.py --check || fail "crates/kithd/src/kubeproto.txt is not what ci/kube_proto.py writes"
+# (The merge-key table is checked against those files too: a plain `cargo test` fetches nothing.)
+cargo test -q -p kithd --bin kithd merge_keys -- --ignored || fail "the merge-key table is not what the types give"
 cargo test -q -p kithd --test kube "$@"

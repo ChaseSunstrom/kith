@@ -26,6 +26,8 @@ pub struct State {
 }
 
 /// How many changed keys are kept: a reader further behind than that reads everything.
+/// (Entries are counted, not distinct keys: one command that changes more than this many
+/// makes every reader read everything once.)
 const TOUCHED: usize = 4096;
 
 /// The keys the last commands changed, oldest first, each with the index of the log it

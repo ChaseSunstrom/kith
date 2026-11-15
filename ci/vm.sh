@@ -27,6 +27,8 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
+#   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
+#                               RoleBinding was deleted is refused where the log is kept
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -157,6 +159,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
+  --test access    instead: three nodes as for rollout, and the cluster's admin
+                   writing through n2 and n3 by a RoleBinding that is deleted through
+                   n1, once while n2 is cut off from the others. Expected: no write
+                   begun after the deletion was acknowledged is acknowledged or
+                   kept, and the one n2 let through while it was cut off is refused
+                   when it reaches the leader, which decided again; needs what
+                   --test rollout needs
   --help           this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
@@ -179,7 +188,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | services | kube | worker | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, services, kube, worker, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | services | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, services, kube, worker, chaos, access" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -199,8 +208,9 @@ if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 vms='' web=''
-# (What a test left running goes with it.)
-trap 'kill $vms $web 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
+# (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
+# names a directory, for a failure that does not come again.)
+trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
@@ -214,7 +224,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -230,7 +240,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
-        # (rollout and chaos: three nodes and nothing more said to kithd; share, pods, kube and
+        # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
         # worker: two, on the mesh; services: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os
         seed() { :; }
@@ -1323,6 +1333,113 @@ EOF
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
         was=${line#- 0 } was=${was%% *}
+        if [ "$test" = access ]; then
+            # The cluster's admin is an Identity like any other: its Role becomes one that may
+            # read and delete everything and apply only Roles and RoleBindings, and a RoleBinding
+            # of its own (maps-root) lets it apply ConfigMaps, until that is deleted.
+            printf '%s' '[{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"cluster-admin"},"spec":{"rules":[{"kinds":["*"],"verbs":["get","list","watch","delete","exec"]},{"kinds":["Role","RoleBinding"],"verbs":["apply"]}]}},
+{"apiVersion":"kith.dev/v1","kind":"Role","metadata":{"name":"maps"},"spec":{"rules":[{"kinds":["ConfigMap"],"verbs":["apply"]}]}},
+{"apiVersion":"kith.dev/v1","kind":"RoleBinding","metadata":{"name":"maps-root"},"spec":{"role":"maps","subjects":["root"]}}]' >"$work/grant.json"
+            api 1 POST /v1/apply "$work/grant.json" >/dev/null || fail "the admin's Roles were not applied"
+            # Two writers, through n2 and through n3: numbered ConfigMaps, and a note of every
+            # attempt, as for chaos: NAME NODE BEGUN ANSWERED ok|no.
+            writer() { # N
+                i=0 patience=5
+                while ! [ -e "$work/stop" ]; do
+                    i=$((i + 1))
+                    printf '[{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"a%s-%s"},"spec":{"data":{"n":"a%s-%s"}}}]' "$1" "$i" "$1" "$i" >"$work/a$1.json"
+                    begun=$(date +%s.%N) said=no
+                    ! api "$1" POST /v1/apply "$work/a$1.json" >/dev/null 2>&1 || said=ok
+                    echo "a$1-$i $1 $begun $(date +%s.%N) $said" >>"$work/writes$1"
+                    sleep 0.1
+                done
+            }
+            acked() { cat "$work"/writes? 2>/dev/null | awk -v n="$1" '$5 == "ok" && $2 == n' | wc -l; }
+            monitor() { echo "$2" | socat - "unix-connect:$work/keys$1" >/dev/null; } # N COMMAND
+            writers=''
+            for n in 2 3; do
+                writer "$n" &
+                vms="$vms $!" writers="$writers $!"
+            done
+            waited=0
+            until [ "$(acked 2)" -ge 10 ] && [ "$(acked 3)" -ge 10 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the admin's writes through n2 and n3 were not acknowledged: $(acked 2) and $(acked 3)"
+                sleep 1
+            done
+            echo "vm.sh: the admin writing through n2 and n3" >&2
+
+            # n2 is cut off from the others (its card on the cluster's network unplugged), so
+            # it does not hear of the deletion; the RoleBinding is deleted through n1, whichever
+            # of n1 and n3 leads then. (Had n2 led, it leads no more once it is plugged back:
+            # its write is then passed on to the one that does, and refused there all the same.)
+            monitor 2 'set_link lan off'
+            sleep 2
+            begun=$(date +%s.%N)
+            (patience=30 && api 1 DELETE /v1/resources/RoleBinding/maps-root) >/dev/null || fail "the RoleBinding maps-root was not deleted"
+            echo "$begun $(date +%s.%N)" >"$work/deleted"
+            # A write through n2, which still holds the RoleBinding and lets it through; it
+            # waits for the leader until the card is plugged back, and is refused there.
+            printf '[{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"late"},"spec":{"data":{"n":"late"}}}]' >"$work/late.json"
+            curl -s -o "$work/late" -w '%{http_code}' --max-time 40 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" \
+                --resolve "kith:$((port + 2)):127.0.0.1" -H 'Content-Type: application/json' --data-binary "@$work/late.json" \
+                "https://kith:$((port + 2))/v1/apply" >"$work/late.code" &
+            late=$!
+            sleep 3
+            monitor 2 'set_link lan on'
+            wait "$late" || true
+            sleep 5
+            : >"$work/stop"
+            # shellcheck disable=SC2086 # (a list of process numbers)
+            wait $writers
+
+            # Each node's own list, until the three say the same; then against the notes.
+            cat "$work"/writes? >"$work/writes"
+            lists() { for n in 1 2 3; do api "$n" GET '/v1/resources?kind=ConfigMap' >"$work/list$n.json" 2>/dev/null || { echo "n$n did not answer" >"$work/wrong"; return 1; }; done; }
+            tries=0
+            until lists && said=$(python3 -c '
+import json, sys
+work = sys.argv[1]
+def held(n):
+    found = json.load(open(f"{work}/list{n}.json"))
+    found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+    return {r["metadata"]["name"] for r in found if r["kind"] == "ConfigMap"}
+lists = [held(n) for n in (1, 2, 3)]
+writes = {name: (float(begun), float(answered), said) for name, node, begun, answered, said in (line.split() for line in open(f"{work}/writes"))}
+begun, deleted = (float(at) for at in open(f"{work}/deleted").read().split())
+code, late = open(f"{work}/late.code").read().strip(), open(f"{work}/late").read()
+wrong = []
+if not lists[0] == lists[1] == lists[2]:
+    wrong.append("the nodes hold different writes: " + ", ".join(str(len(held)) for held in lists))
+acked = {name for name, (at, answered, said) in writes.items() if said == "ok"}
+lost = sorted(acked - lists[0])
+if lost:
+    wrong.append(f"{len(lost)} acknowledged writes are not held: {lost[:5]}")
+after = [name for name, (at, answered, said) in writes.items() if at > deleted]
+taken = sorted(name for name in after if writes[name][2] == "ok")
+if taken:
+    wrong.append(f"{len(taken)} writes begun after the deletion was acknowledged were acknowledged: {taken[:5]}")
+kept = sorted(name for name in lists[0] if name == "late" or (name in writes and writes[name][0] > deleted))
+if kept:
+    wrong.append(f"{len(kept)} writes begun after the deletion was acknowledged are held: {kept[:5]}")
+if not after:
+    wrong.append("no write was begun after the deletion: the test showed nothing")
+if code != "422" or "decided again" not in late:
+    wrong.append(f"the write n2 let through while it was cut off was not refused where the log is kept: {code} {late[:300]}"
+                 + (" (it waited on a log no majority held: n2 may have led when it was cut off, and kept leading past the 10 s it waits; run again)" if code == "500" and "no leader" in late else ""))
+if wrong:
+    sys.exit("; ".join(wrong))
+print(f"{len(acked)} writes acknowledged of {len(writes)} tried, each held by all three nodes; none of the {len(after)} begun after the deletion was acknowledged or kept, and the one n2 let through while cut off was refused by the leader")
+' "$work" 2>"$work/wrong"); do
+                tries=$((tries + 1))
+                [ "$tries" -lt 60 ] || fail "after the deletion: $(cat "$work/wrong")"
+                sleep 1
+            done
+            ! grep -al 'Kernel panic\|panicked at' "$work"/n?.log || fail "a node panicked"
+            echo "vm.sh: ok: three nodes; the admin writing through n2 and n3 by a RoleBinding deleted through n1 while n2 was cut off: $said"
+            exit 0
+        fi
+
         if [ "$test" = chaos ]; then
             # Three writers on this machine, one through each node: numbered ConfigMaps, and
             # a note of every attempt: NAME NODE BEGUN ANSWERED ok|no. (Each node has two
@@ -1973,8 +2090,13 @@ with open(sys.argv[1], "r+b") as disk:
                 up beta3
                 # Its key deleted from the store: the running machine gives it again, and has not restarted.
                 api DELETE /v1/resources/NodeKey/kith-000902 >/dev/null
-                sleep 5
-                api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the machine did not give its key again once it was deleted"
+                tries=0
+                until api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"'; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 150 ] || fail "the machine did not give its key again once it was deleted"
+                    sleep 0.2
+                done
+                echo "vm.sh: the machine gave its key again after $tries tries of 0.2 s"
                 ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
                 # A passphrase, given through the other node (which keeps none of it): too short
                 # a one is refused; taken away, the disk has no line of it; given again, it has.

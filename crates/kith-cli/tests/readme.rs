@@ -151,6 +151,53 @@ fn readme_and_security_say_who_reads_an_image_on_a_node() {
     }
 }
 
+/// Whose rights a Release and a Source act with is said in both documents, and the
+/// review's finding about it is fixed.
+#[test]
+fn readme_and_security_say_whose_rights_a_release_and_a_source_act_with() {
+    let security = std::fs::read_to_string(root().join("SECURITY.md")).unwrap();
+    let finding = security
+        .lines()
+        .find(|line| line.contains("is rendered and applied with the node's rights, not its writer's"))
+        .expect("SECURITY.md: the review's finding about Releases is gone");
+    assert!(finding.contains("| Fixed: "), "{finding}");
+    for (name, text, said) in [
+        (
+            "SECURITY.md",
+            security.as_str(),
+            "A Release or a Source makes only what its writer may make",
+        ),
+        (
+            "SECURITY.md",
+            &security,
+            "A Release and a Source act with their writer's rights, as far as these go",
+        ),
+        (
+            "README.md",
+            README,
+            "A Release acts with the rights of whoever applied it",
+        ),
+        (
+            "README.md",
+            README,
+            "it applies only what whoever applied it\n  may apply",
+        ),
+        (
+            "README.md",
+            README,
+            "A Release or a Source acts with the rights of whoever applied\n  it",
+        ),
+    ] {
+        assert!(text.contains(said), "{name} no longer says {said:?}");
+    }
+    for (name, text, stale) in [
+        ("README.md", README, "acts for the cluster, not for whoever"),
+        ("SECURITY.md", &security, "its files are applied as the node"),
+    ] {
+        assert!(!text.contains(stale), "{name} still says {stale:?}");
+    }
+}
+
 /// The table beside k3s is the one `sh ci/compare.sh` wrote down: not numbers typed in.
 #[test]
 fn readme_carries_the_measured_comparison() {
