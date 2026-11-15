@@ -523,8 +523,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os` and `mesh` in its own Node's status (not a mesh key
-    another Node says, which would cut both off), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
+    status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
@@ -604,7 +605,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     answers a CA's challenges. Never the account's key (`kith-system/acme-account`),
     whatever names it: a control node started with `--acme` orders and renews every
     certificate, writes the Secrets and the thumbprint, and the worker writes none of
-    them (refused: `a worker writes only what it says of itself`). That a worker
+    them (refused: `a worker writes only what it says of itself`). It says, in its own
+    Node's status, which thumbprint its view holds, and the leader asks the CA for
+    nothing until each reachable ingress worker says the right one: a worker that lies
+    there holds up every order and renewal, as answering the CA's challenge wrongly
+    would (each ingress node is one the CA may ask), and gains nothing else. That a worker
     serves ingress is its token's maker's to say, not the node's: the control node
     that admits it writes `ingress` into its Node's spec from the token, never from
     what the joining node asks, and only a worker whose Node says it may say in its

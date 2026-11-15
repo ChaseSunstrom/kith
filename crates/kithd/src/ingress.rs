@@ -1021,12 +1021,12 @@ async fn order(
 
 /// Write down the account's thumbprint for the workers that serve ingress (they answer the
 /// authority's challenges with it, and have nothing else of the account), unless the store
-/// has it already. Whether it was written now.
-async fn tell_thumbprint(shared: &Shared, account: &acme::Account) -> bool {
+/// has it already.
+async fn tell_thumbprint(shared: &Shared, account: &acme::Account) {
     let thumbprint = account.thumbprint();
     let kept = thumbprint_of(&shared.store.lock().expect("nothing panics holding the store").store);
     if kept.as_deref() == Some(thumbprint.as_str()) {
-        return false;
+        return;
     }
     let (namespace, name) = THUMBPRINT.split_once('/').expect("namespace/name");
     let map = json!({
@@ -1044,10 +1044,34 @@ async fn tell_thumbprint(shared: &Shared, account: &acme::Account) -> bool {
         Ok(command) => shared.submit(command).await.map(drop).map_err(|e| e.to_string()),
         Err(e) => Err(e),
     };
-    if let Err(e) = &told {
+    if let Err(e) = told {
         eprintln!("kithd: ingress: writing down the ACME account's thumbprint: {e}");
     }
-    told.is_ok()
+}
+
+/// The reachable workers that serve ingress from a view whose Node does not say their view holds
+/// `thumbprint` (`status.thumbprint`). The authority asks any node that serves ingress, so an
+/// order waits on these: asked first, one would answer the challenge 404 and the order fail.
+fn unanswered(store: &Store, thumbprint: &str) -> Vec<String> {
+    let waits = |status: &Value| {
+        status["view"] == true
+            && status["serves"]["ingress"] == true
+            && status["state"] != "unreachable"
+            && status["thumbprint"] != thumbprint
+    };
+    store
+        .list(Some("Node"))
+        .filter(|node| node.status.as_ref().is_some_and(waits))
+        .map(|node| node.metadata.name.clone())
+        .collect()
+}
+
+/// What this worker (`me`) is to say its view holds, the thumbprint it answers challenges with
+/// (`holds`), where its own Node does not say it yet.
+fn to_say(store: &Store, me: &str, holds: Option<&str>) -> Option<String> {
+    let own = store.get(&format!("Node/{me}"))?;
+    let says = own.status.as_ref().and_then(|status| status["thumbprint"].as_str());
+    holds.filter(|holds| says != Some(*holds)).map(str::to_string)
 }
 
 /// Until told to stop: with `strays` (`--ingress`), serve ports 443 and 80 from what the store
@@ -1077,6 +1101,9 @@ pub async fn run(
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
     let mut said = false;
+    // (What this worker last said its view holds, and when; the workers the last order waited on.)
+    let mut saying: Option<(String, Instant)> = None;
+    let mut waited = Vec::new();
     loop {
         let (worker, wanted, (wanting, account, naming)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -1105,10 +1132,30 @@ pub async fn run(
         }
         // The leader keeps the thumbprint written whether or not anything is ordered now, so
         // a worker has it before a renewal asks; and whoever orders writes it first.
-        let told = match account.as_ref().filter(|_| acme.is_some() && (leads || orders)) {
-            Some(account) => tell_thumbprint(&shared, account).await,
-            None => false,
-        };
+        if let Some(account) = account.as_ref().filter(|_| acme.is_some() && (leads || orders)) {
+            tell_thumbprint(&shared, account).await;
+        }
+        // A worker that serves ingress says when its view holds the thumbprint it answers
+        // challenges with: the leader orders once each one has it. (The same word again only
+        // after a while: one refused, or a view not caught up yet, is not sent at every change.)
+        if worker && served.is_some() {
+            let holds = web.thumbprint.lock().expect("nothing panics holding it").clone();
+            let says = to_say(
+                &shared.store.lock().expect("nothing panics holding the store").store,
+                &me,
+                holds.as_deref(),
+            );
+            let again =
+                |(was, at): &(String, Instant)| Some(was) != says.as_ref() || at.elapsed() > Duration::from_secs(10);
+            if let Some(print) = says.clone().filter(|_| saying.as_ref().is_none_or(again)) {
+                saying = Some((print.clone(), Instant::now()));
+                let fields = serde_json::Map::from_iter([("thumbprint".to_string(), Value::from(print))]);
+                let statuses = vec![(format!("Node/{me}"), fields)];
+                if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
+                    eprintln!("kithd: ingress: saying this node's view holds the ACME account's thumbprint: {e}");
+                }
+            }
+        }
         if let Some(directory) = acme.as_deref().filter(|_| orders && !wanting.is_empty()) {
             let orders = async {
                 match account {
@@ -1125,11 +1172,25 @@ pub async fn run(
                         }
                     }
                     Some(account) => {
-                        // A worker answers a challenge with the thumbprint its view holds: one
-                        // written now has a few seconds to reach the views before it is asked.
-                        if told {
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        // A worker answers a challenge with the thumbprint its view holds: none is
+                        // asked for until each that serves ingress says it has it (its view may be
+                        // any while behind). The store's change when one says it wakes this again.
+                        let print = account.thumbprint();
+                        let waits = unanswered(
+                            &shared.store.lock().expect("nothing panics holding the store").store,
+                            &print,
+                        );
+                        if !waits.is_empty() {
+                            if waits != waited {
+                                eprintln!(
+                                    "kithd: ingress: no certificate is asked for until each ingress worker's view holds the ACME account's thumbprint; waiting on: {}",
+                                    waits.join(", ")
+                                );
+                            }
+                            waited = waits;
+                            return;
                         }
+                        waited.clear();
                         for (host, of) in &wanting {
                             order(&shared, directory, &account, host, of, &mut tried).await;
                         }
@@ -2268,10 +2329,18 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
             at: now(),
         };
         shared.submit(command).await.unwrap();
-        let mut serves = serde_json::Map::new();
-        serves.insert("serves".into(), json!({ "ingress": true }));
-        let statuses = vec![("Node/edge".to_string(), serves)];
-        shared.submit(kith_store::Command::Patch { statuses }).await.unwrap();
+        let say_of_edge = |field: &str, said: Value| {
+            let fields = serde_json::Map::from_iter([(field.to_string(), said)]);
+            kith_store::Command::Patch {
+                statuses: vec![("Node/edge".to_string(), fields)],
+            }
+        };
+        shared
+            .submit(say_of_edge("serves", json!({ "ingress": true })))
+            .await
+            .unwrap();
+        // (It runs from a view, as the control node that let it join wrote.)
+        shared.submit(say_of_edge("view", true.into())).await.unwrap();
 
         let (base, asked) = crate::acme::tests::authority(host, |_, answer| answer.clone()).await;
         let directory = format!("{base}/directory");
@@ -2291,32 +2360,39 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
         // (Before the certificate: the worker's view, which has the host and no certificate.)
         let before = view_of(&shared);
         let deadline = Instant::now() + Duration::from_secs(60);
-        // (When the thumbprint was written, and when the authority was first asked.)
-        let (mut printed, mut first_asked) = (None, None);
+        // (When the thumbprint was written, and when the worker said its view holds it.)
+        let (mut printed, mut reported) = (None, None);
         while shared.store.lock().unwrap().store.get(&key).is_none() {
             assert!(
                 Instant::now() < deadline,
                 "no certificate was ordered: {:?}",
                 asked.lock().unwrap()
             );
+            let print = thumbprint_of(&shared.store.lock().unwrap().store);
             let now = Instant::now();
-            if thumbprint_of(&shared.store.lock().unwrap().store).is_some() {
+            if print.is_some() {
                 printed.get_or_insert(now);
             }
-            if !asked.lock().unwrap().is_empty() {
-                first_asked.get_or_insert(now);
+            // The worker's view is a while behind (longer than any fixed pause): until it says
+            // it holds the thumbprint, the authority is asked nothing, as the worker would
+            // answer its challenge 404 and the order fail.
+            if reported.is_none() {
+                assert!(
+                    asked.lock().unwrap().is_empty(),
+                    "the authority was asked before the worker had the thumbprint"
+                );
+            }
+            if let Some(print) =
+                print.filter(|_| reported.is_none() && printed.is_some_and(|at| now >= at + Duration::from_secs(7)))
+            {
+                shared.submit(say_of_edge("thumbprint", print.into())).await.unwrap();
+                reported = Some(());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // The worker's view is given time to have the thumbprint before the authority asks it
-        // (asked at once, a worker whose view is a moment behind answers 404 and the order fails).
-        // (Either not seen yet: it was in the last tenth of a second.)
-        let now = Instant::now();
-        let (printed, first_asked) = (printed.unwrap_or(now), first_asked.unwrap_or(now));
         assert!(
-            first_asked >= printed + Duration::from_secs(4),
-            "the authority was asked {:?} after the thumbprint was written",
-            first_asked - printed
+            reported.is_some(),
+            "a certificate was ordered before the worker said it had the thumbprint"
         );
         let _ = stop.send(true);
         ordering.await.unwrap();
@@ -2379,5 +2455,52 @@ spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {ho
             worker.store.lock().unwrap().store == held,
             "the worker wrote to its view"
         );
+    }
+
+    /// Orders wait on each reachable worker that serves ingress from a view until it says its
+    /// view holds the thumbprint; a worker says it when its own Node does not.
+    #[test]
+    fn the_leader_orders_once_each_ingress_worker_holds_the_thumbprint() {
+        let mut store = Store::default();
+        let node = |name: &str| {
+            format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n---\n")
+        };
+        let source: String = ["a", "b", "c", "d", "e"].map(node).concat();
+        for resource in Resource::from_source(&source).unwrap() {
+            store.put(resource.unwrap());
+        }
+        let set = |store: &mut Store, name: &str, status: Value| {
+            store.set_status(&format!("Node/{name}"), Some(status)).unwrap()
+        };
+        // a: a control node that serves ingress (it has the account); b: a viewed worker that
+        // does not serve ingress; c and d: viewed ingress workers, d unreachable; e: one that
+        // says it already.
+        set(&mut store, "a", json!({ "serves": { "ingress": true } }));
+        set(&mut store, "b", json!({ "view": true, "serves": { "dns": 53 } }));
+        set(&mut store, "c", json!({ "view": true, "serves": { "ingress": true } }));
+        set(
+            &mut store,
+            "d",
+            json!({ "view": true, "serves": { "ingress": true }, "state": "unreachable" }),
+        );
+        set(
+            &mut store,
+            "e",
+            json!({ "view": true, "serves": { "ingress": true }, "thumbprint": "print" }),
+        );
+        assert_eq!(unanswered(&store, "print"), ["c"]);
+        assert_eq!(unanswered(&store, "another"), ["c", "e"]);
+
+        assert_eq!(to_say(&store, "c", Some("print")).as_deref(), Some("print"));
+        assert_eq!(to_say(&store, "e", Some("print")), None);
+        assert_eq!(to_say(&store, "e", Some("another")).as_deref(), Some("another"));
+        assert_eq!(to_say(&store, "c", None), None);
+        assert_eq!(to_say(&store, "gone", Some("print")), None);
+        set(
+            &mut store,
+            "c",
+            json!({ "view": true, "serves": { "ingress": true }, "thumbprint": "print" }),
+        );
+        assert!(unanswered(&store, "print").is_empty());
     }
 }

@@ -150,7 +150,8 @@ logged naming it, on both nodes):
   traffic.)
 - **Its own Node's status**: `os`, `mesh` (its key, its port, whom it reaches) and `serves`
   (the DNS port it answers, `ingress: true` if it answers ingress; null when it serves
-  neither), the fields a node writes of itself after it has joined. A worker that runs from
+  neither), the fields a node writes of itself after it has joined, and `thumbprint` (the
+  ACME account's thumbprint its view holds, in a thumbprint's shape). A worker that runs from
   a view is refused `serves.ingress` unless its Node's spec says `ingress` (written by the
   control node that let it join, from the token); the address and `view` are never its to write. A mesh key another Node says is
   refused: two nodes that say one key are both left out of the mesh today, so a worker
@@ -345,7 +346,8 @@ Not measured: a store whose units report ten times a second.
 - **`status.view` on a Node.** "No field is added to a kind" holds for specs. A control node
   writes `view: true` into a worker's status when it sends it its first view (or lets it in
   as one that asked for a view), and the node that leads sends the store to no worker whose
-  status says so. A worker cannot write it (its own Node's `os` and `mesh` are all it may).
+  status says so. A worker cannot write it (its own Node's `os`, `mesh`, `serves` and `thumbprint` are all
+  it may).
   A node whose status says it does not become a control node again by a change to its Node.
 - **A worker says at the join that it can run from a view**, and is told the name and key of
   the node that let it in. Whether it is sent a view or the store is not its to choose (the
@@ -391,8 +393,14 @@ node orders and the worker answers. Decided and built:
   that says so is served by control nodes only).
 - **Who orders.** A control node with `--acme`: one that serves ingress orders for itself,
   and the one that leads orders for the hosts only workers serve. It writes the thumbprint
-  before its first order. The worker writes no certificate, no Secret, no thumbprint and no
-  Service's `tls` status; the write list refuses each.
+  before its first order, and asks the authority for nothing until each reachable worker
+  that serves ingress from a view says, as `thumbprint` in its own Node's status, that its
+  view holds it: the authority may ask any node that serves ingress, and one whose view is
+  behind would answer 404 and fail the order for an hour. (No fixed pause is long enough
+  for a view that lags; the leader logs whom it waits on.) A worker that says a wrong one
+  holds up orders, as a wrong answer to the challenge would. The worker writes no
+  certificate, no Secret, no ConfigMap and no Service's `tls` status; the write list
+  refuses each.
 - **A worker that served ingress before this** was sent the whole store, and its Node says
   no `ingress`. It is not moved silently: its kithd says at start what to do, and each
   control node that sends it the store says so once, by name. Writing `ingress: true`

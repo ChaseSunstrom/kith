@@ -164,7 +164,19 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves"])?;
+            only(key, fields, &["os", "mesh", "serves", "thumbprint"])?;
+            // The ACME account's thumbprint its view holds: the leader orders once each ingress
+            // worker says it has it. (Wrong, it holds up orders, as a wrong answer to the
+            // authority's challenge would.)
+            let print = fields.get("thumbprint");
+            if print.is_some_and(|print| {
+                !print.is_null()
+                    && !print
+                        .as_str()
+                        .is_some_and(|print| print.len() <= 64 && crate::acme::token_like(print))
+            }) {
+                return Err(refused(key, "`thumbprint` is a thumbprint or null"));
+            }
             if let Some(serves) = fields.get("serves") {
                 serving_shape(key, serves)?;
                 // A worker that joined to run from a view answers ingress only when its token let
@@ -716,6 +728,23 @@ spec: { volume: there, every: 1d }
         // `view` is a control node's to write, as its address is.
         let view = patch_of("Node/w", json!({ "view": true }));
         assert!(try_as(&store, "w", view).unwrap_err().contains("view"));
+        // The ACME account's thumbprint its view holds (the leader orders once each ingress
+        // worker says it has it): a thumbprint's shape, or null; on its own Node only.
+        let print = |said: Value| patch_of("Node/w", json!({ "thumbprint": said }));
+        let thumbprint = "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs";
+        assert!(try_as(&store, "w", print(thumbprint.into())).is_ok());
+        assert!(try_as(&store, "w", print(Value::Null)).is_ok());
+        for said in [
+            json!(7),
+            json!("a b"),
+            json!("a.b"),
+            json!(""),
+            json!("x".repeat(65)),
+            json!({}),
+        ] {
+            assert!(try_as(&store, "w", print(said.clone())).is_err(), "{said}");
+        }
+        assert!(try_as(&store, "w-b", print(thumbprint.into())).is_err());
     }
 
     /// Make `node` a worker that joined to serve ingress from a view, as its join writes it.
@@ -813,6 +842,11 @@ spec: { volume: there, every: 1d }
             .unwrap();
         assert!(try_as(&store, "w-b", serves("w-b")).is_err());
         assert!(try_as(&store, "w", serves("w-b")).is_err());
+        // And the one write the ingress loop makes on a worker: the thumbprint its view holds,
+        // on its own Node (the leader orders once each ingress worker has it), on no other.
+        let holds = |node: &str| patch_of(&format!("Node/{node}"), json!({ "thumbprint": "t" }));
+        assert!(try_as(&store, "w", holds("w")).is_ok());
+        assert!(try_as(&store, "w", holds("w-b")).is_err());
     }
 
     fn unit(replica: u64, more: Value) -> Value {

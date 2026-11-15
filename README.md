@@ -756,8 +756,9 @@ kith node status                                   # who leads the store, who vo
   fewer than three nodes.
 
   A worker writes to the store only what it says of itself: its units' state, its
-  own Node's `os` and `mesh`, its Devices and Seats, and the backups and images of
-  the Volumes that are on it. The control node it writes to checks each write and
+  own Node's `os`, `mesh`, `serves` and `thumbprint`, its Devices and Seats, and
+  the backups and images of the Volumes that are on it. The control node it writes
+  to checks each write and
   refuses the rest, in the audit log under the worker's name (`kith audit`). So run
   `kith` on a control node, and point a kubeconfig, `curl` and the web UI at one: a
   worker's port answers no person (`this node is a worker and answers no one by
@@ -802,8 +803,8 @@ kith node status                                   # who leads the store, who vo
   It is let in only by a token that says so, and a plain worker's token refuses a
   kithd started with `--ingress`. Its certificates are ordered by a control node:
   start the control nodes with `--acme` (with or without `--ingress`); the one that
-  leads orders for the workers' hosts, and the worker answers the authority's
-  challenges on port 80:
+  leads orders for the workers' hosts once each ingress worker says its view holds the
+  thumbprint, and the worker answers the authority's challenges on port 80:
 
   ```sh
   kithd --acme ...                         # on each control node
