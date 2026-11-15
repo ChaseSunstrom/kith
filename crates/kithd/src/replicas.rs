@@ -195,6 +195,24 @@ fn replica(store: &Store, dir: &Dir, me: &str) -> bool {
     now.is_some_and(|now| now.node != me) && replicas.is_some_and(|replicas| replicas.iter().any(|r| r == me))
 }
 
+/// What was taken in, unpacked beside `into` (to at most `cap` bytes) and then given to
+/// `finish`, which puts it in its place: the archive's hash. The archive does not stay, and
+/// when it unpacks to more than `cap` the copy in `into` is as it was.
+fn place(
+    incoming: Incoming,
+    temp: &Path,
+    into: &Path,
+    cap: u64,
+    finish: impl FnOnce(PathBuf) -> Result<(), String>,
+) -> Result<String, String> {
+    let (hash, _) = incoming.keep(None)?;
+    let archive = temp.join(&hash);
+    // (From this cluster's own node, as it is there: modes and all.)
+    let placed = crate::backups::unpack_beside(&archive, into, 0, cap).and_then(finish);
+    let _ = std::fs::remove_file(&archive);
+    placed.map(|()| hash)
+}
+
 /// Brings this node's copy of `dir` up to date from the node at `address`. The hash of what
 /// it has now.
 async fn sync(
@@ -221,23 +239,19 @@ async fn sync(
         return Ok(have.to_string());
     }
     let temp = state.join("replicas/.receiving");
+    // (No more than the Volume may hold, where it says: what is sent is another node's say.)
+    let cap = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        crate::volumes::size(&state.store, &dir.namespace, &dir.name).unwrap_or(u64::MAX)
+    };
     let mut incoming = Incoming::new(&temp).map_err(|e| e.to_string())?;
-    loop {
-        let chunk = tokio::time::timeout(QUIET, answer.chunk()).await.map_err(slow)?;
-        let Some(chunk) = chunk.map_err(|e| e.to_string())? else {
-            break;
-        };
-        incoming.write(&chunk).map_err(|e| e.to_string())?;
-    }
+    crate::backups::receive(&mut answer, &mut incoming, QUIET, crate::backups::download_cap(cap)).await?;
     let (state, dir, aside) = (state.to_path_buf(), dir.clone(), have.is_none().then_some(now));
     let shared = shared.clone();
     let placed = tokio::task::spawn_blocking(move || {
-        let (hash, _) = incoming.keep(None)?;
-        let archive = temp.join(&hash);
         let into = crate::volumes::host_dir(&state, &dir)?;
         let marker = self::marker(&state, &dir);
-        // (From this cluster's own node, as it is there: modes and all.)
-        let placed = crate::backups::unpack_beside(&archive, &into, 0).and_then(|new| {
+        let hash = place(incoming, &temp, &into, cap, |new| {
             // This node may have been made the primary while that came: what is here is the
             // volume itself then, in use, and stays. (The store is held for the two renames.)
             let store = shared.store.lock().expect("a handler panicked holding the store");
@@ -248,9 +262,7 @@ async fn sync(
             // (No marker while the two are changing places: a crash there starts over.)
             let _ = std::fs::remove_file(&marker);
             swap(&new, &into, aside).map_err(|e| format!("{}: {e}", into.display()))
-        });
-        let _ = std::fs::remove_file(&archive);
-        placed?;
+        })?;
         let wrote =
             std::fs::create_dir_all(marker.parent().unwrap_or(&state)).and_then(|()| std::fs::write(&marker, &hash));
         wrote.map_err(|e| format!("{}: {e}", marker.display()))?;
@@ -495,5 +507,59 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join("file")).unwrap(), "three");
         assert_eq!(std::fs::read_to_string(root.join("d.was-9/file")).unwrap(), "two");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a primary sends: a tar of one file of `size` bytes, as bytes taken in.
+    fn sent(temp: &Path, size: usize) -> Incoming {
+        let mut tar = tar::Builder::new(Incoming::new(temp).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size as u64);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, "big", &vec![5u8; size][..]).unwrap();
+        tar.into_inner().unwrap()
+    }
+
+    #[test]
+    fn replica_capped_keeps_the_copy_it_had_when_what_is_sent_unpacks_past_the_size() {
+        let root = std::env::temp_dir().join(format!("kith-replica-capped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (temp, into) = (root.join("temp"), root.join("d"));
+        std::fs::create_dir_all(&into).unwrap();
+        std::fs::write(into.join("old"), "before").unwrap();
+        let swapped = |new: PathBuf| swap(&new, &into, None).map_err(|e| e.to_string());
+        let refused = place(sent(&temp, 100_000), &temp, &into, 99_999, swapped).unwrap_err();
+        assert!(refused.contains("more than 99999 bytes"), "{refused}");
+        // The copy as it was, nothing beside it and no archive left.
+        assert_eq!(std::fs::read_to_string(into.join("old")).unwrap(), "before");
+        assert!(!root.join("d.restoring").exists() && !root.join("d.old").exists());
+        assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+        // As much as the volume holds: the copy.
+        place(sent(&temp, 100_000), &temp, &into, 100_000, swapped).unwrap();
+        assert_eq!(std::fs::metadata(into.join("big")).unwrap().len(), 100_000);
+        assert!(!into.join("old").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn replica_capped_stops_a_primary_that_sends_more_than_the_volume_may_hold() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let serve = || async {
+            let chunks = (0..400).map(|_| Ok::<_, std::io::Error>(vec![1u8; 10_000]));
+            axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+        };
+        tokio::spawn(async move { axum::serve(listener, axum::Router::new().fallback(serve)).await });
+        let temp = std::env::temp_dir().join(format!("kith-replica-sent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut answer = reqwest::get(url).await.unwrap();
+        let mut incoming = Incoming::new(&temp).unwrap();
+        // (A volume of 1 MB is sent as much as 3 MB and a bit: 4 MB are more.)
+        let most = crate::backups::download_cap(1_000_000);
+        let said = crate::backups::receive(&mut answer, &mut incoming, QUIET, most).await;
+        assert!(said.unwrap_err().contains("more than 3048576 bytes"));
+        drop(incoming);
+        assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

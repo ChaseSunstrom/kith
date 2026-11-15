@@ -118,7 +118,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   handles that are held open: nothing in the volume is reached by a path the workload
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
-  as its volume had them).
+  as its volume had them). A restore, a replica's first copy and each sync unpack no more
+  than the Volume's `size`, where it says one: the entries are counted as they come, a GNU
+  sparse entry at the whole length it says (what the next archive of the Volume reads;
+  the tar crate gives it as its size and unpacks it as a hole), and the unpack stops, with
+  the Volume empty (or a replica's old copy as it was) and nothing beside it, at the entry
+  that passes it. What is downloaded from a bucket or a primary stops at twice the `size`
+  and 1 MiB, before any of it is unpacked. There is no quota on the directory, no count of
+  files, and no cap where the Volume has no `size`.
 - **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
   apply a Volume and a Workload in its namespace, checked on the node that is asked; the
   node that has the Volume takes the request from that node as it takes any other node's.
@@ -279,8 +286,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   with them (a node behind the same NAT, or in the same IPv6 /64): the count is taken
   before a certificate is shown. A firewall in front of the port is the answer to that.
 - **Backup buckets and S3 endpoints may be on the node's own network** on purpose, and a
-  restore, a replica's copy and its sync take as many bytes as they are sent: a bucket
-  someone else writes can fill a node's disk. (T-0230.)
+  restore, a replica's copy and its sync take no more than the Volume's `size` says
+  (below), but a Volume with no `size` is not capped: a bucket someone else writes can
+  fill a node's disk through a restore into such a Volume, and so can a primary that is
+  sent to a replica of one. (T-0230.)
 - **A node started with no `--release-key` trusts the key of the first OSRelease it
   takes.** Give the key when installing. (T-0231.) What a taken admin credential can
   still do with OSRelease and UpdatePlan is restart nodes into releases their keys

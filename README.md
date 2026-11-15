@@ -1934,6 +1934,13 @@ spec:
   `kith-system`; a node sends one copy at a time; `PATH.was-TIME` directories are yours to
   delete; a replica that never synced takes nothing over (the volume waits for its
   node); moving a volume back is done by hand.
+- A restore of a Backup and a replica's first copy and each sync unpack no more than the
+  Volume's `size`, and stop with an error (the Volume left empty, or the replica's old copy
+  as it was) when what arrives passes it: the files are counted as they come, a sparse
+  file at its whole length, and what is downloaded stops at twice the `size` and 1 MiB. A
+  Volume with no `size` is not capped, and nothing limits the directory itself (no quota,
+  no count of files): a Volume that holds more than its `size` cannot be restored from its
+  own Backup.
 
 ### Encrypted volumes
 
