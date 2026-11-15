@@ -14,6 +14,7 @@ with no budget (None) would be printed and not fail.
     python3 ci/budgets.py --times    # the times only: medians of five runs each
     python3 ci/budgets.py --self-test
 """
+import argparse
 import json
 import os
 import re
@@ -365,16 +366,20 @@ def relro_writable(binary, pid):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Hold the binaries to their size, memory and time budgets (builds them first).")
+    parser.add_argument("--self-test", action="store_true", help="check the checks: with 1-byte and 1 ms budgets every one must fail")
+    parser.add_argument("--times", action="store_true", help="print the median times of the timed paths, unjudged, and stop")
+    args = parser.parse_args()
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
-    self_test = "--self-test" in sys.argv
+    self_test = args.self_test
     # The binaries the image ships, built by the one command line that builds them for it: a
     # package built alone gets other features of the crates both share, so it is another binary
     # (and each order would build those crates again).
     built = subprocess.run(["sh", "ci/musl.sh"], check=True, stdout=subprocess.PIPE, text=True)
     bin_dir = built.stdout.strip()
     with tempfile.TemporaryDirectory() as tmp:
-        if "--times" in sys.argv:
+        if args.times:
             # The same three paths, unjudged: the numbers the budgets are set from.
             print(f"load {os.getloadavg()[0]:.1f} on {os.cpu_count()} CPUs")
             for name, (median, times) in medians(bin_dir, tmp, RUNS).items():
