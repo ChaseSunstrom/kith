@@ -413,10 +413,11 @@ fn catching_up(shared: &Shared, path: &str, name: &str, born: Option<u64>) -> bo
 
 /// How long the voters are given to say whether a node stands.
 const ASKING: Duration = Duration::from_secs(2);
-/// How long a voter's "no" is kept, and the most a "yes" is.
-const KEPT: Duration = Duration::from_secs(30);
+/// How long a voter's "no" is kept, and the most a "yes" is. (Tests keep every answer for as
+/// long as they run, however slow the machine: what they count does not lapse midway.)
+const KEPT: Duration = Duration::from_secs(if cfg!(test) { 600 } else { 30 });
 /// How long no word is kept: the voters may be back in a moment.
-const QUIET: Duration = Duration::from_secs(5);
+const QUIET: Duration = Duration::from_secs(if cfg!(test) { 600 } else { 5 });
 /// How many senders' answers are kept: a node is led by one at a time, and sent a store by it.
 const VOUCHED: usize = 16;
 
@@ -446,6 +447,25 @@ fn keep(kept: &mut std::collections::HashMap<(String, String), Kept>, now: std::
     });
 }
 
+/// Keep what the voters said (`said`, [`verdict`]) of `id`, at `now`, if what is kept of it is
+/// still the asking that was to lapse at `until`: one that took longer was dropped by [`keep`],
+/// and the asking that took its place has its own answer coming.
+fn answered(
+    kept: &mut std::collections::HashMap<(String, String), Kept>,
+    id: &(String, String),
+    until: std::time::Instant,
+    said: Option<bool>,
+    now: std::time::Instant,
+) {
+    let Some(kept) = kept.get_mut(id) else {
+        return;
+    };
+    if matches!(kept.word, Word::Asking(_)) && kept.until == until {
+        kept.word = if said == Some(true) { Word::Yes } else { Word::No };
+        kept.until = now + if said.is_some() { KEPT } else { QUIET };
+    }
+}
+
 /// Does a voter this node last knew say the node `name`, of the key `key`, stands, and none that
 /// it does not? Asked of a node this one has not heard of ([`unheard`]): it was away, and the
 /// sender joined since (it may lead by now) or was deleted since (it must not lead this node,
@@ -469,29 +489,20 @@ async fn vouched(shared: &Arc<Shared>, name: &str, key: &[u8], born: Option<u64>
             None if kept.len() >= VOUCHED => return false,
             None => {
                 let (shared, asked) = (shared.clone(), id.clone());
+                let until = now + 2 * ASKING;
                 // (A task of its own: a sender that hangs up does not leave it half asked.)
                 let asked = tokio::spawn(async move {
                     // (Each voter is given ASKING, its answer read and all: no more is waited.)
                     let said = ask(&shared, &asked.0, &asked.1, born).await;
                     let cluster = shared.cluster.as_ref().expect("asked by a node of a cluster");
                     let mut kept = cluster.vouched.lock().expect("nothing panics holding what was vouched");
-                    if let Some(kept) = kept.get_mut(&asked) {
-                        kept.word = if said == Some(true) { Word::Yes } else { Word::No };
-                        kept.until = std::time::Instant::now() + if said.is_some() { KEPT } else { QUIET };
-                    }
+                    answered(&mut kept, &asked, until, said, std::time::Instant::now());
                     said
                 });
                 use futures_util::FutureExt;
                 let asked = asked.map(|done| done.ok().flatten()).boxed().shared();
                 let word = Word::Asking(asked.clone());
-                kept.insert(
-                    id,
-                    Kept {
-                        word,
-                        until: now + 2 * ASKING,
-                        born,
-                    },
-                );
+                kept.insert(id, Kept { word, until, born });
                 asked
             }
         }
@@ -504,6 +515,12 @@ async fn vouched(shared: &Arc<Shared>, name: &str, key: &[u8], born: Option<u64>
 async fn ask(shared: &Shared, name: &str, print: &str, born: Option<u64>) -> Option<bool> {
     let me = kith_store::node_id(&shared.cluster.as_ref()?.me.name);
     let sender = kith_store::node_id(name);
+    // Raft says which voters it has only once it has started: until then it seems to know none,
+    // and that would take the sender. A call it answers comes after that.
+    let started = shared.raft.with_raft_state(|_| ());
+    if tokio::time::timeout(ASKING, started).await.is_err() {
+        return None;
+    }
     let voters: Vec<_> = {
         let metrics = shared.raft.metrics().borrow().clone();
         let membership = metrics.membership_config.membership();
@@ -1902,6 +1919,35 @@ mod tests {
         assert!(kept.keys().all(|(name, _)| name == "x"), "a yes outlived the index");
         keep(&mut kept, now + KEPT, 0);
         assert!(kept.is_empty());
+    }
+
+    /// An asking that took longer than it was given was dropped, and another asked in its place:
+    /// the late answer is not written over that one, nor over what it said.
+    #[test]
+    fn a_late_answer_is_not_kept_over_a_later_asking() {
+        use futures_util::FutureExt;
+        let asking = || Word::Asking(futures_util::future::ready(None).boxed().shared());
+        let (now, id) = (std::time::Instant::now(), ("d".to_string(), "k".to_string()));
+        let (first, second) = (now + 2 * ASKING, now + 5 * ASKING);
+        let mut kept = std::collections::HashMap::new();
+        let at = |word, until| Kept {
+            word,
+            until,
+            born: None,
+        };
+        kept.insert(id.clone(), at(asking(), second));
+        answered(&mut kept, &id, first, Some(true), now);
+        assert!(matches!(kept[&id].word, Word::Asking(_)) && kept[&id].until == second);
+        answered(&mut kept, &id, second, Some(false), now);
+        assert!(matches!(kept[&id].word, Word::No) && kept[&id].until == now + KEPT);
+        answered(&mut kept, &id, second, Some(true), now);
+        assert!(matches!(kept[&id].word, Word::No), "an answer was kept over an answer");
+        // No word at all is kept a short while; an id that was dropped stays dropped.
+        kept.insert(id.clone(), at(asking(), first));
+        answered(&mut kept, &id, first, None, now);
+        assert!(matches!(kept[&id].word, Word::No) && kept[&id].until == now + QUIET);
+        answered(&mut kept, &("e".to_string(), "k".to_string()), first, Some(true), now);
+        assert_eq!(kept.len(), 1);
     }
 
     /// `/v1/netboot` refuses an Identity that may not apply Nodes before it reads the body:

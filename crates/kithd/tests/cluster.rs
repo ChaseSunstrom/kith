@@ -1152,7 +1152,10 @@ fn a_node_that_is_down_is_not_made_a_voter() {
 }
 
 /// A node that was away while another joined is led by that one when it is back: it has not
-/// heard of it, asks the voters it last knew, and is told it stands.
+/// heard of it, asks the voters it last knew, and is told it stands. (A kithd from before the
+/// asking took any node it had not heard of, and passes this too: it keeps the asking from
+/// shutting a joiner out. That a deleted node is refused is
+/// `vouched_lets_in_a_joiner_and_not_a_deleted_node`, in cluster.rs, against voters made up.)
 #[test]
 fn away_during_a_join_catches_up_from_the_joiner() {
     if std::env::var_os("KITH_E2E").is_none() {

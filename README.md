@@ -530,9 +530,10 @@ kith node status                                   # who leads the store, who vo
   join it again with a new token: it gets a new certificate, and the old one stays
   refused. What that node already copied it still has: see SECURITY.md.
 - A node that was away while another joined takes the store from that one (it may
-  lead by now) once a voter it last knew says the newcomer is a member; one that
-  reaches none of the voters it last knew (all of them were replaced while it was
-  away, or are down) stays behind until it is joined again.
+  lead by now) once a voter it last knew says the newcomer is a member. While it
+  reaches none of them it waits, asking again every five seconds, and catches up by
+  itself once one is back; only when all of them were replaced while it was away does
+  it stay behind until it is joined again.
 - Every node tells every other one, every two seconds, which nodes it has
   heard from (none of this goes through the store). A node nobody has heard
   from for ten seconds shows as `unreachable` in `kith get node`, and as
