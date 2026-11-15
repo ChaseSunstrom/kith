@@ -11,6 +11,9 @@
 //! key: …         the key itself, only until another node holds it
 //! tpm: …         the key as this machine's TPM sealed it, if the cluster lets it
 //! passphrase: …  the key wrapped under its owner's passphrase, if one was given
+//! seen: yes      somebody was shown the recovery key, or typed it
+//! duress: …      the public key of this node's duress code, if the cluster made one
+//! duress-all: …  and of the cluster's, which forgets every node
 //! peers: …       where to ask
 //! ```
 //!
@@ -37,6 +40,30 @@
 //! the key is on the disk again, behind a secret a person chose, which whoever has the
 //! disk can guess at for as long as they like; a locked node drops the line when it
 //! hears of it.
+//!
+//! A recovery key nobody saw opens nothing: an install nobody watched printed it to a log.
+//! `kith node recovery` has a running node make a new one (the old one stops opening) and
+//! shows it, once; the record says `seen` from then on, as it does once a recovery key
+//! typed at the console opened the state, and the NodeKey's status says so
+//! (`recoverySeen`), for the cluster to warn while no node has one.
+//!
+//! A duress code (`kith node duress`) is for whoever is made to open a node: it has the
+//! recovery key's shape, and typed at the waiting console it erases the lock record (the
+//! disk's secret and every wrapped key with it), has the cluster forget the node's key
+//! when a node answers, and is answered as a wrong key is, at the same time after it was
+//! entered. Only the public key of a signing key drawn from the code is kept (in the
+//! NodeKey and in the record), so neither says what the code is; the cluster forgets
+//! (`POST /v1/forget`) only for a signature of that key over a number it just gave.
+//! What it does not do: a disk copied beforehand, with its recovery key, still opens;
+//! flash may keep the record's old blocks; and the record shows that a code exists.
+//!
+//! The cluster's code (`kith node duress --all`) is one code on every NodeKey there is
+//! when it is made. Typed at one node's console it does to that node what its own code
+//! does, and has the cluster forget the key of every other node under it (`forgotten`):
+//! those run on, with their records, drop what opens them with no node asked (the TPM's
+//! seal, a passphrase), and from then on open with their own recovery keys alone, until
+//! `kith node unlock` has the cluster hold a key again. So no such code is made while one
+//! of them has a recovery key nobody was shown.
 //!
 //! Neither the store alone (the key is wrapped with what only the disk has) nor the disk
 //! alone opens the state. Who answers `/v1/unlock` is not checked by certificate (the
@@ -76,6 +103,11 @@ pub struct Record {
     /// The key as this machine's TPM sealed it (tpm.rs).
     tpm: Option<Vec<u8>>,
     pass: Option<Pass>,
+    /// Whether somebody was shown this disk's recovery key, or typed it.
+    seen: bool,
+    /// The public keys of the duress codes the cluster made for this node, and for all.
+    duress: Option<Vec<u8>>,
+    duress_all: Option<Vec<u8>>,
     peers: Vec<String>,
 }
 
@@ -98,11 +130,13 @@ fn chosen(passphrase: &str) -> bool {
     (8..=256).contains(&passphrase.len()) && passphrase.bytes().all(typed)
 }
 
-/// How a state was opened at a start: by its owner (the key was still on the disk, or
-/// the recovery key was typed), by the cluster's answer, or by the machine's own TPM.
+/// How a state was opened at a start: by its owner (the key was still on the disk, or its
+/// passphrase was typed), by the recovery key typed (so somebody has it), by the cluster's
+/// answer, or by the machine's own TPM.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum By {
     Owner,
+    Recovery,
     Cluster,
     Tpm,
 }
@@ -184,6 +218,23 @@ impl Pass {
     }
 }
 
+/// The signing key drawn from a duress code (16 bytes, shown and typed as a recovery key
+/// is): what is kept of a code is this key's public half, which says nothing of the code.
+fn duress_key(code: &[u8]) -> ring::signature::Ed25519KeyPair {
+    let drawn = hkdf::Salt::new(hkdf::HKDF_SHA256, b"kith-lock duress").extract(code);
+    let mut seed = [0; 32];
+    let filled = drawn
+        .expand(&[b"sign"], hkdf::HKDF_SHA256)
+        .and_then(|seed_of| seed_of.fill(&mut seed));
+    filled.expect("32 bytes are within what HKDF gives");
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).expect("32 bytes are a seed")
+}
+
+/// What a forget is signed over: the disk's id and the number the cluster just gave.
+fn forget_text(id: &str, nonce: &[u8]) -> Vec<u8> {
+    [b"kith-forget ", id.as_bytes(), b" ", nonce].concat()
+}
+
 /// The recovery key as shown and typed: 32 hex digits in fours.
 fn shown(recovery: &[u8]) -> String {
     let digits = hex(recovery);
@@ -212,6 +263,10 @@ impl Record {
                 "tpm" => record.tpm = Some(unhex(value)?),
                 // (One that cannot be read opens nothing: the node asks as if it had none.)
                 "passphrase" => record.pass = Pass::parse(value),
+                "seen" => record.seen = true,
+                // (One that cannot be a key is none: nothing typed is then a duress code.)
+                "duress" => record.duress = unhex(value).filter(|key| key.len() == 32),
+                "duress-all" => record.duress_all = unhex(value).filter(|key| key.len() == 32),
                 "peers" => record.peers = value.split_whitespace().map(str::to_string).collect(),
                 // (A line of a later kithd's.)
                 _ => {}
@@ -235,6 +290,14 @@ impl Record {
         }
         if let Some(pass) = &self.pass {
             text += &format!("passphrase: {}\n", pass.text());
+        }
+        if self.seen {
+            text += "seen: yes\n";
+        }
+        for (name, key) in [("duress", &self.duress), ("duress-all", &self.duress_all)] {
+            if let Some(key) = key {
+                text += &format!("{name}: {}\n", hex(key));
+            }
         }
         if !self.peers.is_empty() {
             text += &format!("peers: {}\n", self.peers.join(" "));
@@ -337,6 +400,9 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         tpm: None,
         pass: None,
         peers: Vec::new(),
+        seen: false,
+        duress: None,
+        duress_all: None,
     };
     record.write(&disk, config + AT)?;
     Ok(shown(&recovery))
@@ -359,14 +425,128 @@ async fn asked(client: &reqwest::Client, peer: &str, record: &Record) -> Result<
     let reply = ask.json(&json!({ "id": record.id() })).send().await;
     let reply = reply.map_err(|e| format!("{peer} cannot be reached ({e})"))?;
     if !reply.status().is_success() {
-        return Err(format!(
-            "{peer} does not hand this node's key out: it is locked (`kith node unlock`), wiped, or not known there"
-        ));
+        return Err(refusing(peer));
     }
     let said = reply.json::<Value>().await.ok();
     let wrapped = said.and_then(|said| unhex(said["wrapped"].as_str()?));
     let key = wrapped.and_then(|wrapped| unwrap(&record.secret, &wrapped));
     key.ok_or(format!("what {peer} answered is not this node's key"))
+}
+
+fn refusing(peer: &str) -> String {
+    format!("{peer} does not hand this node's key out: it is locked (`kith node unlock`), wiped, or not known there")
+}
+
+/// Have the node at `peer` forget the key of the disk `id`, by a duress code's key: it
+/// gives a number, and takes the number signed. Whether it did.
+async fn forgotten(client: &reqwest::Client, peer: &str, id: &str, pair: &ring::signature::Ed25519KeyPair) -> bool {
+    let ask = |body: Value| client.post(format!("https://{peer}/v1/forget")).json(&body).send();
+    let taken = async {
+        let given: Value = ask(json!({ "id": id })).await.ok()?.json().await.ok()?;
+        let nonce = unhex(given["nonce"].as_str()?)?;
+        let signature = hex(pair.sign(&forget_text(id, &nonce)).as_ref());
+        let answer = ask(json!({ "id": id, "nonce": hex(&nonce), "signature": signature })).await;
+        answer.ok().filter(|answer| answer.status().is_success())
+    };
+    taken.await.is_some()
+}
+
+/// The lock record of the config partition `config`, erased: the disk's secret and every
+/// wrapped key with it. Read back: a disk that took the write and kept the record is not
+/// erased.
+fn erase(config: &Path) -> std::io::Result<()> {
+    let disk = File::options().read(true).write(true).open(config)?;
+    let mut back = [1; ROOM];
+    disk.write_all_at(&[0; ROOM], AT)?;
+    disk.sync_all()?;
+    disk.read_exact_at(&mut back, AT)?;
+    match back == [0; ROOM] {
+        true => Ok(()),
+        false => Err(std::io::Error::other("the lock record is still on the disk")),
+    }
+}
+
+/// How long after a line is read from the console it is answered, whatever it was: a
+/// wrong key and a duress code are answered with the same words at the same time.
+const ANSWER: Duration = Duration::from_secs(2);
+/// What is said of every line that opens nothing.
+const WRONG: &str = "kithd: init: that does not open this node's state";
+
+/// What a line typed at the waiting console is.
+enum Typed {
+    Opens(Vec<u8>, By),
+    Duress(ring::signature::Ed25519KeyPair),
+    Wrong,
+}
+
+/// (Off the thread that asks the cluster: a passphrase costs its tries.)
+fn judged(record: &Record, line: &str) -> Typed {
+    let code = typed(line);
+    if let Some(key) = code.as_ref().and_then(|recovery| unwrap(recovery, &record.recovery)) {
+        return Typed::Opens(key, By::Recovery);
+    }
+    if let Some(pair) = code.map(|code| duress_key(&code)) {
+        use ring::signature::KeyPair;
+        let public = pair.public_key().as_ref();
+        let made = [&record.duress, &record.duress_all].into_iter().flatten();
+        if made.into_iter().any(|key| key == public) {
+            return Typed::Duress(pair);
+        }
+    }
+    // (Only what can be a passphrase is tried.)
+    let pass = record.pass.as_ref().filter(|_| chosen(line));
+    let opened = pass.and_then(|pass| pass.open(line));
+    opened.map_or(Typed::Wrong, |key| Typed::Opens(key, By::Owner))
+}
+
+/// A duress code that was typed: its key, for the cluster to be told with.
+type Duressed = tokio::sync::watch::Sender<Option<Arc<ring::signature::Ed25519KeyPair>>>;
+
+/// The waiting console: each of `lines` judged as it is read, until one opens the state.
+/// A line that opens nothing is answered ([`ANSWER`] after it was read, by `say`) in the
+/// same words whatever it was, and the next is judged meanwhile: a duress code does not
+/// wait behind the answer to a wrong key. For a duress code the record is `erase`d
+/// first (whether it is: tried again for as long as it is not) and `forget` is given its
+/// key; nothing typed opens from then on.
+async fn console(
+    mut record: Record,
+    lines: std::sync::mpsc::Receiver<String>,
+    say: impl Fn(&str),
+    erase: impl Fn() -> bool,
+    forget: &Duressed,
+) -> (Vec<u8>, By) {
+    let (mut answers, mut erased) = (std::collections::VecDeque::new(), true);
+    loop {
+        while let Ok(line) = lines.try_recv() {
+            if line.is_empty() {
+                continue;
+            }
+            answers.push_back(tokio::time::Instant::now() + ANSWER);
+            let judge = record.clone();
+            let judged = tokio::task::spawn_blocking(move || judged(&judge, &line)).await;
+            let gone = forget.borrow().is_some();
+            match judged.unwrap_or(Typed::Wrong) {
+                Typed::Opens(key, by) if !gone => return (key, by),
+                Typed::Duress(pair) if !gone => {
+                    erased = erase();
+                    // (And from memory: what was typed before no longer opens either.)
+                    (record.recovery, record.pass) = (Vec::new(), None);
+                    forget.send_replace(Some(Arc::new(pair)));
+                }
+                _ => {}
+            }
+        }
+        erased = erased || erase();
+        let next = tokio::time::Instant::now() + Duration::from_millis(100);
+        match answers.front() {
+            Some(&due) if due <= next => {
+                tokio::time::sleep_until(due).await;
+                answers.pop_front();
+                say(WRONG);
+            }
+            _ => tokio::time::sleep_until(next).await,
+        }
+    }
 }
 
 /// Whether the machine's consoles show what is typed at them.
@@ -386,44 +566,32 @@ fn echo(shown: bool) {
 
 /// The key, from the cluster or from whoever types the recovery key or the node's
 /// passphrase: asked until one gives it. And which did.
-async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
-    let (client, lines) = (client(), crate::install::keyboard());
+async fn fetched(record: &Record, config: &Path, join: Option<&String>) -> (Vec<u8>, By) {
+    let (client, lines, id) = (client(), crate::install::keyboard(), record.id());
     let pass = record.pass.as_ref();
+    let (forget, mut forgetting) = tokio::sync::watch::channel(None);
+    // (Said nowhere: a duress code looks like a wrong key, whatever became of it. A disk
+    // that did not take it is written again, ten times a second, while this node waits.)
+    let erased = || erase(config).is_ok();
     // (Read all the while: a peer that does not answer takes its time to say so.)
-    let console = async {
-        loop {
-            while let Ok(line) = lines.try_recv() {
-                let recovery = typed(&line).and_then(|recovery| unwrap(&recovery, &record.recovery));
-                let key = recovery.map(|key| (key, "the recovery key"));
-                // (A passphrase costs its tries: only what can be one is tried, and not on
-                // the thread that asks the cluster.)
-                let tried = match (pass.filter(|_| key.is_none() && chosen(&line)), line.clone()) {
-                    (Some(pass), line) => {
-                        let pass = pass.clone();
-                        let opened = tokio::task::spawn_blocking(move || pass.open(&line)).await;
-                        opened.ok().flatten().map(|key| (key, "its passphrase"))
-                    }
-                    (None, _) => None,
-                };
-                match key.or(tried) {
-                    Some(opened) => return opened,
-                    None if !line.is_empty() => eprintln!(
-                        "kithd: init: that is not this node's recovery key{}",
-                        if pass.is_some() { ", nor its passphrase" } else { "" }
-                    ),
-                    None => {}
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
+    let console = console(record.clone(), lines, |said| eprintln!("{said}"), erased, &forget);
     let cluster = async {
-        let mut said = String::new();
+        let (mut said, mut told) = (String::new(), false);
         loop {
             let mut why = "it knows of no node to ask".to_string();
             for peer in record.peers.iter().chain(join) {
+                // (After a duress code the cluster forgets before it is asked again: then
+                // it hands nothing out, and this node looks like one that is locked.)
+                let duress = forgetting.borrow_and_update().clone();
+                if let Some(pair) = duress.as_ref().filter(|_| !told) {
+                    told = forgotten(&client, peer, &id, pair).await;
+                }
                 match asked(&client, peer, record).await {
-                    Ok(key) => return key,
+                    // (Looked at only now: a code typed while the key was on its way.)
+                    Ok(key) if forgetting.borrow().is_none() => return key,
+                    // (Not taken: the record is erased, and this state opens no more. And
+                    // the cluster has the key still, or again: it is told again.)
+                    Ok(_) => (why, told) = (refusing(peer), false),
                     Err(e) => why = e,
                 }
             }
@@ -431,7 +599,10 @@ async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
                 eprintln!("kithd: init: still locked: {why}");
                 said = why;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = forgetting.changed() => {}
+            }
         }
     };
     eprintln!(
@@ -448,9 +619,10 @@ async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
     }
     let fetched = tokio::select! {
         key = cluster => (key, By::Cluster),
-        (key, with) = console => {
+        (key, by) = console => {
+            let with = if by == By::Recovery { "the recovery key" } else { "its passphrase" };
             eprintln!("kithd: init: opened with {with}");
-            (key, By::Owner)
+            (key, by)
         }
     };
     if pass.is_some() {
@@ -461,7 +633,7 @@ async fn fetched(record: &Record, join: Option<&String>) -> (Vec<u8>, By) {
 
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
 /// however long the key takes to come: the key, and who gave it.
-pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By), String> {
+pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Result<(Vec<u8>, By), String> {
     let device = init::labelled("state").ok_or("this node's state is encrypted, and no partition is labelled state")?;
     let name = device.file_name().unwrap_or_default().to_string_lossy();
     let sectors = std::fs::read_to_string(format!("/sys/class/block/{name}/size"));
@@ -485,7 +657,7 @@ pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By
             if let Some(Err(why)) = refused {
                 eprintln!("kithd: init: {why}");
             }
-            fetched(record, join).await
+            fetched(record, config, join).await
         }
     };
     let mapped = kith_dm_sys::crypt("kith-state", &device, 0, sectors, &key);
@@ -495,9 +667,29 @@ pub async fn open(record: &Record, join: Option<&String>) -> Result<(Vec<u8>, By
     Ok((key, by))
 }
 
-/// A passphrase to give this node's state (none: to take away), and where to say how it
-/// went: from [`pass`] to [`keep`], which alone writes the record.
-type Chosen = (Option<String>, tokio::sync::oneshot::Sender<Result<(), String>>);
+/// `record` with a new recovery key for the state `opened` is the key of, and the key as
+/// it is shown. The old one stops opening: one line of the record holds one. Whoever
+/// asked is shown it: seen.
+fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
+    let recovery: [u8; 16] = random();
+    let with = Record {
+        recovery: wrap(&recovery, opened),
+        seen: true,
+        ..record.clone()
+    };
+    (with, shown(&recovery))
+}
+
+/// What its owner asks of this node's record: a passphrase to give its state (none: to take
+/// away), or a new recovery key.
+enum Change {
+    Passphrase(Option<String>),
+    Recovery,
+}
+
+/// A change, and where to say how it went (a new recovery key: the key, as shown): from
+/// [`pass`] and [`recovery`] to [`keep`], which alone writes the record.
+type Chosen = (Change, tokio::sync::oneshot::Sender<Result<Option<String>, String>>);
 static CHOSEN: std::sync::OnceLock<tokio::sync::mpsc::Sender<Chosen>> = std::sync::OnceLock::new();
 
 /// For as long as the node runs: have the cluster hold the key and take it off the disk
@@ -531,19 +723,29 @@ pub async fn keep(
     };
     // (Locked before this start: then it was opened with the recovery key, by its owner,
     // and stays open.)
-    let mut was_locked = (by != By::Owner).then_some(false);
+    let mut was_locked = (!matches!(by, By::Owner | By::Recovery)).then_some(false);
     // Whether the record's seal is one this system opens, and why none could be made.
     let (mut fits, mut unsealed) = (by == By::Tpm, None::<String>);
     let (chosen, mut chosen_here) = tokio::sync::mpsc::channel::<Chosen>(1);
     let _ = CHOSEN.set(chosen);
     let mut shut = false;
+    // (Typed at the console: somebody has this disk's recovery key.)
+    if by == By::Recovery && !record.seen {
+        let with = Record {
+            seen: true,
+            ..record.clone()
+        };
+        if write(&with) {
+            record = with;
+        }
+    }
     loop {
         let (mine, peers) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let this = |key: &&kith_api::Resource| {
                 let wrapped = key.spec["wrapped"].as_str().and_then(unhex);
                 let key_held = wrapped.and_then(|wrapped| unwrap(&record.secret, &wrapped));
-                key.spec["id"] == id.as_str() && (key.spec["wiped"] == true || key_held.as_ref() == Some(&opened))
+                key.spec["id"] == id.as_str() && (gone(key) || key_held.as_ref() == Some(&opened))
             };
             let mine = state.store.get(&me).filter(this);
             let address = |node: &kith_api::Resource| {
@@ -559,9 +761,7 @@ pub async fn keep(
                 eprintln!(
                     "kithd: the cluster has wiped this node: its lock record is erased and its state can no longer be opened"
                 );
-                let none = File::options().write(true).open(&config);
-                let erased = none.and_then(|disk| disk.write_all_at(&[0; ROOM], AT).and_then(|()| disk.sync_all()));
-                if let Err(e) = erased {
+                if let Err(e) = erase(&config) {
                     eprintln!("kithd: erasing the lock record: {e}");
                 }
                 init::POWER_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -570,12 +770,25 @@ pub async fn keep(
             }
             (Some(spec), key) => {
                 let locked = spec["locked"] == true;
-                let seal = spec["seal"] == true && !locked;
-                shut = locked;
+                // (Forgotten, by the cluster's duress code: this node runs on, and what
+                // opens it with no node asked goes as it does when it is locked. Its
+                // recovery key is then what opens it, until `kith node unlock`.)
+                let forgotten = spec["forgotten"] == true;
+                if forgotten && !shut {
+                    eprintln!(
+                        "kithd: the cluster has forgotten the key of this node's state (its duress code was typed): this node runs on, and opens next with its recovery key alone"
+                    );
+                }
+                let seal = spec["seal"] == true && !locked && !forgotten;
+                shut = locked || forgotten;
                 // (What opens the state with no node asked goes when the cluster says so.)
+                // (And the duress codes the cluster made: known here with no node in reach.)
+                let public = |field: &str| spec[field].as_str().and_then(unhex).filter(|key| key.len() == 32);
                 let left = Record {
                     tpm: record.tpm.clone().filter(|_| seal),
-                    pass: record.pass.clone().filter(|_| !locked),
+                    pass: record.pass.clone().filter(|_| !shut),
+                    duress: public("duress"),
+                    duress_all: public("duressAll"),
                     ..record.clone()
                 };
                 if left != record && write(&left) {
@@ -583,9 +796,12 @@ pub async fn keep(
                         eprintln!("kithd: this machine's TPM no longer holds the key of its state");
                     }
                     if left.pass != record.pass {
-                        eprintln!("kithd: the cluster has locked this node: its passphrase no longer opens its state");
+                        eprintln!(
+                            "kithd: the cluster no longer hands this node's key out: its passphrase no longer opens its state"
+                        );
                     }
                     (record.tpm, record.pass) = (left.tpm, left.pass);
+                    (record.duress, record.duress_all) = (left.duress, left.duress_all);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
                 // the node would open by its TPM, locked or not. And so a passphrase.)
@@ -656,8 +872,15 @@ pub async fn keep(
                     Some(why) => json!({ "sealed": false, "message": why }),
                     None => json!({ "sealed": sealed }),
                 };
-                if record.pass.is_some() {
-                    status["passphrase"] = true.into();
+                for (name, set) in [
+                    ("passphrase", record.pass.is_some()),
+                    ("recoverySeen", record.seen),
+                    ("duress", record.duress.is_some()),
+                    ("duressAll", record.duress_all.is_some()),
+                ] {
+                    if set {
+                        status[name] = true.into();
+                    }
                 }
                 if said.flatten() != Some(status.clone()) {
                     let statuses = vec![(me.clone(), Some(status))];
@@ -683,25 +906,36 @@ pub async fn keep(
             _ = generation.changed() => {}
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             _ = stopping.changed() => return,
-            Some((passphrase, done)) = chosen_here.recv() => {
-                let pass = match passphrase {
-                    None => Ok(None),
-                    _ if shut => Err("the cluster has locked this node: unlock it first".to_string()),
-                    Some(passphrase) => {
-                        // (Off the threads that serve: it takes its memory and its time.)
-                        let key = opened.clone();
-                        let made = tokio::task::spawn_blocking(move || Pass::new(&passphrase, &key, COST)).await;
-                        let made = made.ok().flatten().map(Some);
-                        made.ok_or("no key could be drawn from the passphrase (19 MiB of memory are needed)".to_string())
-                    }
-                };
-                let with = pass.and_then(|pass| {
-                    let with = Record { pass, ..record.clone() };
-                    let wrote = write(&with).then_some(with);
-                    wrote.ok_or("the lock record could not be written".to_string())
-                });
-                let _ = done.send(with.map(|with| record = with));
-            }
+            Some((change, done)) = chosen_here.recv() => match change {
+                Change::Recovery => {
+                    let (with, recovery) = renewed(&record, &opened);
+                    let wrote = write(&with).then(|| record = with);
+                    let wrote = wrote.ok_or("the lock record could not be written".to_string());
+                    let _ = done.send(wrote.map(|()| Some(recovery)));
+                }
+                Change::Passphrase(passphrase) => {
+                    let pass = match passphrase {
+                        None => Ok(None),
+                        _ if shut => Err("the cluster does not hand this node's key out (locked, or forgotten): unlock it first".to_string()),
+                        Some(passphrase) => {
+                            // (Off the threads that serve: it takes its memory and its time.)
+                            let key = opened.clone();
+                            let made = tokio::task::spawn_blocking(move || Pass::new(&passphrase, &key, COST)).await;
+                            let made = made.ok().flatten().map(Some);
+                            made.ok_or("no key could be drawn from the passphrase (19 MiB of memory are needed)".to_string())
+                        }
+                    };
+                    let with = pass.and_then(|pass| {
+                        let with = Record { pass, ..record.clone() };
+                        let wrote = write(&with).then_some(with);
+                        wrote.ok_or("the lock record could not be written".to_string())
+                    });
+                    let _ = done.send(with.map(|with| {
+                        record = with;
+                        None
+                    }));
+                }
+            },
         }
     }
 }
@@ -710,7 +944,7 @@ pub async fn keep(
 /// of that id is asked: a second one, written beside a locked one, opens nothing.
 fn handed_out<'a>(store: &'a kith_api::store::Store, id: &str) -> Option<(&'a str, &'a str)> {
     let held = || store.list(Some("NodeKey")).filter(|key| key.spec["id"] == id);
-    let shut = held().any(|key| key.spec["locked"] == true || key.spec["wiped"] == true);
+    let shut = held().any(|key| key.spec["locked"] == true || gone(key));
     let wrapped = |key: &'a kith_api::Resource| {
         let wrapped = key.spec["wrapped"].as_str().filter(|wrapped| !wrapped.is_empty())?;
         Some((key.metadata.name.as_str(), wrapped))
@@ -736,8 +970,9 @@ pub async fn unlock(State(shared): State<Arc<Shared>>, Json(asked): Json<Asked>)
     }
 }
 
-/// `POST /v1/lock/NAME?do=lock|unlock|wipe|seal|unseal` (`kith node lock`, `unlock`,
-/// `wipe`, `seal`): for who may apply NodeKeys.
+/// `POST /v1/lock/NAME?do=lock|unlock|wipe|seal|unseal|duress|no-duress` (`kith node lock`,
+/// `unlock`, `wipe`, `seal`, `duress`): for who may apply NodeKeys. A duress code is made
+/// here and answered this once (`code`); the NodeKey keeps its public key alone.
 pub async fn set(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
@@ -758,23 +993,49 @@ pub async fn set(
             "the cluster holds no key for {name}: its state is not encrypted, or its key is still on its own disk"
         ))?;
         let wiped = held.spec["wiped"] == true;
+        let mut code = None;
+        match what {
+            // (Forgotten: the NodeKey goes, and the node, running or opened next with its
+            // recovery key, gives the cluster its key to hold as a new node does.)
+            "unlock" if held.spec["forgotten"] == true => {
+                let key = held.key();
+                let deleted = shared.submit(Command::Delete { key }).await;
+                let said = json!({ "node": name, "locked": false, "wiped": false, "seal": false });
+                return deleted.map(|_| said).map_err(|e| e.to_string());
+            }
+            "wipe" => {}
+            _ if held.spec["forgotten"] == true => {
+                return Err(format!(
+                    "the cluster has forgotten {name}'s key (a duress code was typed): `kith node unlock {name}` has it held again"
+                ));
+            }
+            _ if wiped => return Err(format!("{name} was wiped: its key is gone")),
+            _ => {}
+        }
         match what {
             "lock" => held.spec["locked"] = true.into(),
-            "unlock" if wiped => return Err(format!("{name} was wiped: its key is gone")),
             "unlock" => drop(held.spec.as_object_mut().and_then(|spec| spec.remove("locked"))),
             "wipe" => held.spec = json!({ "id": held.spec["id"], "wiped": true }),
-            "seal" if wiped => return Err(format!("{name} was wiped: its key is gone")),
             "seal" => held.spec["seal"] = true.into(),
             "unseal" => drop(held.spec.as_object_mut().and_then(|spec| spec.remove("seal"))),
-            _ => return Err("do=lock, unlock, wipe, seal or unseal".to_string()),
+            "duress" => {
+                let (made, public) = duress_made();
+                (code, held.spec["duress"]) = (Some(made), public.into());
+            }
+            "no-duress" => drop(held.spec.as_object_mut().and_then(|spec| spec.remove("duress"))),
+            _ => return Err("do=lock, unlock, wipe, seal, unseal, duress or no-duress".to_string()),
         }
-        let said = json!({
+        let mut said = json!({
             "node": name, "locked": held.spec["locked"] == true, "wiped": held.spec["wiped"] == true,
             "seal": held.spec["seal"] == true,
         });
+        if let Some(code) = code {
+            said["code"] = code.into();
+        }
         let (resources, at) = (vec![held], kith_api::store::now());
         let applied = shared.submit(Command::Apply { resources, at }).await;
-        applied.map(|_| said).map_err(|e| e.to_string())
+        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await?;
+        Ok(said)
     }
     .await;
     let said = done.as_ref().map(drop).map_err(String::clone);
@@ -787,9 +1048,341 @@ pub async fn set(
     }
 }
 
+/// The NodeKeys a write put back that the cluster had forgotten, as they were before it:
+/// the write was made from what the store held a moment earlier, and a duress code was
+/// taken in between.
+fn put_back(done: &kith_store::Done) -> Vec<kith_api::Resource> {
+    let kith_store::Done::Changes(changes) = done else {
+        return Vec::new();
+    };
+    let was = |change: &kith_api::store::Change| {
+        let before = change.before.clone()?;
+        (gone(&before) && !gone(&change.after)).then_some(before)
+    };
+    changes.iter().filter_map(was).collect()
+}
+
+/// Forgotten stays forgotten: what [`put_back`] names of a write that was `done` is
+/// written as it was, and the write is said to have failed.
+async fn stays_forgotten(shared: &Shared, done: &kith_store::Done) -> Result<(), String> {
+    let back = put_back(done);
+    if back.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = back.iter().map(|key| key.metadata.name.clone()).collect();
+    let (resources, at) = (back, kith_api::store::now());
+    let again = shared.submit(Command::Apply { resources, at }).await;
+    let names = names.join(", ");
+    Err(match again {
+        Ok(_) => format!("a duress code was typed meanwhile: the cluster has forgotten the key of {names}"),
+        Err(e) => format!(
+            "a duress code was typed meanwhile, and the key of {names} could not be forgotten again ({e}): `kith node wipe` it"
+        ),
+    })
+}
+
 #[derive(serde::Deserialize)]
 pub struct Given {
     passphrase: Option<String>,
+}
+
+/// Have NAME, another node, change its own lock record (`what`: its passphrase, its
+/// recovery key) for whoever asked this node, and what it answered.
+async fn at_node(shared: &Shared, caller: &Caller, name: &str, what: &str, body: Value) -> Result<Value, String> {
+    let cluster = shared.cluster.as_ref().ok_or("this node is in no cluster")?;
+    // (Asked by a node, this is the node it meant, or nobody is.)
+    let there = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        let there = state
+            .store
+            .get(&format!("Node/{name}"))
+            .filter(|_| caller.node().is_none());
+        there.and_then(crate::view::Upstream::of)
+    };
+    let there = there.ok_or(format!("{name} is not a node known here with an address"))?;
+    // (Only the node named is sent it: not another of the cluster at its address.)
+    let ask = cluster.to(&there)?;
+    let ask = ask.post(format!("https://{}/v1/lock/{name}/{what}", there.address));
+    let ask = ask.timeout(Duration::from_secs(60)).json(&body);
+    // (For whoever asked this node: the node the record is of asks what they may.)
+    let ask = ask.header(crate::access::FOR, caller.to_string());
+    let unreached = |e: reqwest::Error| {
+        let e = crate::cluster::why(&e);
+        format!("{name} cannot be reached, and its lock record is its own to write ({e})")
+    };
+    let answer = ask.send().await.map_err(unreached)?;
+    let fine = answer.status().is_success();
+    let said: Value = answer.json().await.map_err(unreached)?;
+    match said["error"].as_str() {
+        _ if fine => Ok(said),
+        why => Err(why.map_or(format!("{name} refused"), String::from)),
+    }
+}
+
+/// Have [`keep`] make a change to this node's (`name`'s) record, and what came of it.
+async fn changed(name: &str, change: Change) -> Result<Option<String>, String> {
+    let here = CHOSEN.get().ok_or(format!("{name}'s state is not encrypted"))?;
+    let (done, said) = tokio::sync::oneshot::channel();
+    let gone = format!("{name} is stopping");
+    here.send((change, done)).await.map_err(|_| gone.clone())?;
+    said.await.map_err(|_| gone)?
+}
+
+/// A duress code, as shown, and the public key (hex) that is kept of it.
+fn duress_made() -> (String, String) {
+    use ring::signature::KeyPair;
+    let code: [u8; 16] = random();
+    (shown(&code), hex(duress_key(&code).public_key().as_ref()))
+}
+
+/// `POST /v1/lock/NAME/recovery` (`kith node recovery`): NAME makes itself a new recovery
+/// key, which is answered this once and kept nowhere (not in the store, nor in the audit
+/// log); the one it had opens its state no more. For who may apply NodeKeys. Another node
+/// asks NAME, as itself, having checked the caller.
+pub async fn recovery(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Named(name): Named<String>,
+) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+        return refused.into_response();
+    }
+    let done = async {
+        let cluster = shared.cluster.as_ref();
+        let cluster = cluster.ok_or("this node is in no cluster: the key of its state is its own to keep")?;
+        let made = match name != cluster.me.name {
+            true => at_node(&shared, &caller, &name, "recovery", json!({})).await?["recovery"]
+                .as_str()
+                .map(String::from),
+            false => changed(&name, Change::Recovery).await?,
+        };
+        made.ok_or(format!("{name} answered no recovery key"))
+    }
+    .await;
+    let said = done.as_ref().map(drop).map_err(String::clone);
+    shared
+        .audit
+        .record(&caller, "recovery", vec![format!("NodeKey/{name}")], said);
+    match done {
+        Ok(recovery) => Json(json!({ "node": name, "recovery": recovery })).into_response(),
+        Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
+    }
+}
+
+/// The nodes of these NodeKeys whose recovery key nobody was shown. Forgotten, a node
+/// opens with its recovery key alone: so each has one somebody was shown before there is
+/// a code that forgets them all.
+fn never_shown(keys: &[kith_api::Resource]) -> Vec<&str> {
+    let unseen = |key: &&kith_api::Resource| key.status.as_ref().is_none_or(|status| status["recoverySeen"] != true);
+    keys.iter()
+        .filter(unseen)
+        .map(|key| key.metadata.name.as_str())
+        .collect()
+}
+
+/// `POST /v1/duress[?off]` (`kith node duress --all`): one duress code for the cluster,
+/// its public key written to every NodeKey there is (`off`: taken from each). Typed at
+/// any of those nodes' waiting consoles, it has the cluster forget all of their keys. For
+/// who may apply NodeKeys; a node whose key the cluster comes to hold later is not under it.
+pub async fn duress_all(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Query(asked): Query<BTreeMap<String, String>>,
+) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+        return refused.into_response();
+    }
+    let (code, public) = duress_made();
+    let off = asked.contains_key("off");
+    let mut keys: Vec<kith_api::Resource> = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        state
+            .store
+            .list(Some("NodeKey"))
+            .filter(|key| !gone(key))
+            .cloned()
+            .collect()
+    };
+    let unseen = never_shown(&keys);
+    if !off && !unseen.is_empty() {
+        let why = format!(
+            "nobody was shown the recovery key of {}: `kith node recovery NAME` shows a new one, and with the cluster's key forgotten it alone opens a node",
+            unseen.join(", ")
+        );
+        return refuse(StatusCode::CONFLICT, why).into_response();
+    }
+    for key in &mut keys {
+        match (off, key.spec.as_object_mut()) {
+            (true, Some(spec)) => drop(spec.remove("duressAll")),
+            _ => key.spec["duressAll"] = public.clone().into(),
+        }
+    }
+    let names: Vec<String> = keys.iter().map(|key| key.metadata.name.clone()).collect();
+    let what = if off {
+        "no duress code for all"
+    } else {
+        "duress code for all"
+    };
+    let done = async {
+        if keys.is_empty() {
+            return Err("the cluster holds no node's key: no node's state is encrypted".to_string());
+        }
+        let applied = shared
+            .submit(Command::Apply {
+                resources: keys,
+                at: kith_api::store::now(),
+            })
+            .await;
+        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await
+    }
+    .await;
+    let about = names.iter().map(|name| format!("NodeKey/{name}")).collect();
+    shared.audit.record(&caller, what, about, done.clone());
+    match done {
+        Ok(()) if off => Json(json!({ "nodes": names })).into_response(),
+        Ok(()) => Json(json!({ "nodes": names, "code": code })).into_response(),
+        Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
+    }
+}
+
+/// What is to be said while the cluster holds nodes' keys and nobody was shown the
+/// recovery key of any of them: with every node off, nothing then opens one.
+fn unseen(store: &kith_api::store::Store) -> Option<String> {
+    let mut held = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
+    let seen = |key: &kith_api::Resource| key.status.as_ref().is_some_and(|status| status["recoverySeen"] == true);
+    let first = held.next().filter(|first| !seen(first))?;
+    (!held.any(seen)).then(|| {
+        format!(
+            "nobody was shown the recovery key of any node whose state is encrypted: once all of them are off, nothing opens one. `kith node recovery {}` shows a new one",
+            first.metadata.name
+        )
+    })
+}
+
+/// `GET /v1/lock` → `{warning}`: what [`unseen`] says, for who may read NodeKeys
+/// (`kith get node` and the web UI show it).
+pub async fn warned(State(shared): State<Arc<Shared>>, Extension(caller): Extension<Caller>) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::List, kind) {
+        return refused.into_response();
+    }
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    Json(json!({ "warning": unseen(&state.store) })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct Forget {
+    id: String,
+    nonce: Option<String>,
+    signature: Option<String>,
+}
+
+/// The numbers given to whoever asked to forget and not yet answered: when, for which
+/// disk, and the number. A minute each, and [`OUTSTANDING`] at most (the oldest goes):
+/// whoever reaches the port can ask.
+static GIVEN: std::sync::Mutex<std::collections::VecDeque<(std::time::Instant, String, [u8; 32])>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+const OUTSTANDING: usize = 64;
+const FRESH: Duration = Duration::from_secs(60);
+
+/// A number for a forget of the disk `id`, to be signed.
+fn given(id: String) -> [u8; 32] {
+    let nonce = random();
+    let mut given = GIVEN.lock().expect("nothing panics holding the numbers");
+    if given.len() >= OUTSTANDING {
+        given.pop_front();
+    }
+    given.push_back((std::time::Instant::now(), id, nonce));
+    nonce
+}
+
+/// Whether `nonce` was given for `id` within the last minute; it answers this once.
+fn taken(id: &str, nonce: &[u8]) -> bool {
+    let mut given = GIVEN.lock().expect("nothing panics holding the numbers");
+    let at = given
+        .iter()
+        .position(|(_, of, number)| of == id && number[..] == *nonce);
+    let was = at.and_then(|at| given.remove(at));
+    was.is_some_and(|(when, ..)| when.elapsed() < FRESH)
+}
+
+/// The NodeKeys a forget of the disk `id` wipes, as they are to be written: the one of
+/// that id whose duress key signed `nonce`, or, signed by the cluster's code, every one
+/// under that code. None unless a key the cluster made signed it.
+fn forgetting(store: &kith_api::store::Store, id: &str, nonce: &[u8], signature: &[u8]) -> Vec<kith_api::Resource> {
+    let text = forget_text(id, nonce);
+    let signed = |key: &Value| {
+        let public = key.as_str().and_then(unhex);
+        let public = public.map(|public| ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public));
+        public.is_some_and(|public| public.verify(&text, signature).is_ok())
+    };
+    // (The disk the code was typed at erased its record: wiped. Another node under the
+    // cluster's code has its record still, and its recovery key: forgotten.)
+    let without = |key: &kith_api::Resource| kith_api::Resource {
+        spec: match key.spec["id"] == id {
+            true => json!({ "id": key.spec["id"], "wiped": true }),
+            false => json!({ "id": key.spec["id"], "forgotten": true }),
+        },
+        ..key.clone()
+    };
+    let live = || store.list(Some("NodeKey")).filter(|key| !gone(key));
+    // (Every NodeKey of that id is asked: one written beside it hides no code.)
+    let asking: Vec<&kith_api::Resource> = live().filter(|key| key.spec["id"] == id).collect();
+    let all = asking.iter().find(|key| signed(&key.spec["duressAll"]));
+    match (all, asking.iter().find(|key| signed(&key.spec["duress"]))) {
+        (Some(under), _) => live()
+            .filter(|key| key.spec["duressAll"] == under.spec["duressAll"])
+            .map(without)
+            .collect(),
+        (None, Some(one)) => vec![without(one)],
+        (None, None) => Vec::new(),
+    }
+}
+
+/// Whether the cluster no longer has the key this NodeKey was made for: wiped (its node's
+/// record is erased with it), or forgotten (the cluster's duress code: the node has its
+/// record, and its recovery key opens it).
+fn gone(key: &kith_api::Resource) -> bool {
+    key.spec["wiped"] == true || key.spec["forgotten"] == true
+}
+
+/// `POST /v1/forget {id}` → `{nonce}`, then `POST /v1/forget {id, nonce, signature}`: a
+/// node at whose waiting console a duress code was typed has the cluster forget its key
+/// (the cluster's code: every node's under it). Open to whoever reaches the port, as
+/// `/v1/unlock` is; taken only for the number just given, once, signed by the key of a
+/// duress code the cluster made. One refusal for every reason.
+pub async fn forget(State(shared): State<Arc<Shared>>, Json(asked): Json<Forget>) -> Response {
+    let refused = || refuse(StatusCode::NOT_FOUND, "no key is handed out for that").into_response();
+    let hexed = |text: &Option<String>| text.as_deref().and_then(unhex);
+    // (An id is a SHA-256 in hex: what is kept for whoever asks is no longer than one.)
+    if asked.id.len() != 64 {
+        return refused();
+    }
+    let (Some(nonce), Some(signature)) = (hexed(&asked.nonce), hexed(&asked.signature)) else {
+        return Json(json!({ "nonce": hex(&given(asked.id)) })).into_response();
+    };
+    if !taken(&asked.id, &nonce) {
+        return refused();
+    }
+    let wiped = {
+        let state = shared.store.lock().expect("a handler panicked holding the store");
+        forgetting(&state.store, &asked.id, &nonce, &signature)
+    };
+    if wiped.is_empty() {
+        return refused();
+    }
+    let about: Vec<String> = wiped.iter().map(kith_api::Resource::key).collect();
+    let (resources, at) = (wiped, kith_api::store::now());
+    let applied = shared.submit(Command::Apply { resources, at }).await;
+    let applied = applied.map(drop).map_err(|e| e.to_string());
+    eprintln!("kithd: a duress code was typed: forgetting {}", about.join(", "));
+    shared.audit.record(&"a duress code", "forget", about, applied.clone());
+    match applied {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(_) => refused(),
+    }
 }
 
 /// `POST /v1/lock/NAME/passphrase {passphrase}` (`kith node passphrase`): NAME's state
@@ -821,37 +1414,10 @@ pub async fn pass(
         let cluster = shared.cluster.as_ref();
         let cluster = cluster.ok_or("this node is in no cluster: the key of its state is its own to keep")?;
         if name != cluster.me.name {
-            // (Asked by a node, this is the node it meant, or nobody is.)
-            let there = {
-                let state = shared.store.lock().expect("a handler panicked holding the store");
-                let there = state.store.get(&format!("Node/{name}")).filter(|_| caller.node().is_none());
-                there.and_then(crate::view::Upstream::of)
-            };
-            let there = there.ok_or(format!("{name} is not a node known here with an address"))?;
-            // (Only the node named is sent it: not another of the cluster at its address.)
-            let ask = cluster.to(&there)?;
-            let ask = ask.post(format!("https://{}/v1/lock/{name}/passphrase", there.address));
-            let ask = ask.timeout(Duration::from_secs(60)).json(&json!({ "passphrase": passphrase }));
-            // (For whoever asked this node: the node the passphrase is of asks what they may.)
-            let ask = ask.header(crate::access::FOR, caller.to_string());
-            let unreached = |e: reqwest::Error| {
-                let e = crate::cluster::why(&e);
-                format!("{name} cannot be reached, and a passphrase is its own to keep ({e})")
-            };
-            let answer = ask.send().await.map_err(unreached)?;
-            let fine = answer.status().is_success();
-            let said: Value = answer.json().await.map_err(unreached)?;
-            return match said["error"].as_str() {
-                _ if fine => Ok(()),
-                why => Err(why.map_or(format!("{name} refused"), String::from)),
-            };
+            let body = json!({ "passphrase": passphrase });
+            return at_node(&shared, &caller, &name, "passphrase", body).await.map(drop);
         }
-        let here = CHOSEN.get().ok_or(format!("{name}'s state is not encrypted"))?;
-        let (done, said) = tokio::sync::oneshot::channel();
-        let gone = format!("{name} is stopping");
-        let sent = here.send((passphrase.clone(), done)).await;
-        sent.map_err(|_| gone.clone())?;
-        said.await.map_err(|_| gone)?
+        changed(&name, Change::Passphrase(passphrase.clone())).await.map(drop)
     }
     .await;
     shared
@@ -962,8 +1528,17 @@ mod tests {
                 salt: vec![3; 16],
                 wrapped: vec![4; 92],
             }),
+            seen: true,
+            duress: Some(vec![6; 32]),
+            duress_all: Some(vec![8; 32]),
             peers: vec!["10.0.0.1:7443".into(), "[fd00::2]:7443".into()],
         };
+        // A record from before these lines has none of them; a duress line that cannot be
+        // a key is none.
+        let old =
+            b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\nduress: 0606\n"; // pragma: allowlist secret
+        let old = Record::parse(old).unwrap();
+        assert_eq!((old.seen, old.duress, old.duress_all), (false, None, None));
         let path = std::env::temp_dir().join(format!("kith-crypt-record-{}", std::process::id()));
         let disk = File::options()
             .read(true)
@@ -1028,5 +1603,267 @@ mod tests {
         assert_eq!(handed_out(&store, "bb"), None);
         assert_eq!(handed_out(&store, "cc"), None);
         assert_eq!(handed_out(&store, "dd"), None);
+    }
+
+    /// A NodeKey as a node gives it, with what the cluster wrote on it since.
+    fn node_key(name: &str, spec: Value, status: Value) -> kith_api::Resource {
+        let key = json!({
+            "apiVersion": "kith.dev/v1", "kind": "NodeKey", "metadata": { "name": name },
+            "spec": spec, "status": status,
+        });
+        serde_json::from_value(key).unwrap()
+    }
+
+    fn stored(keys: &[kith_api::Resource]) -> kith_api::store::Store {
+        let mut store = kith_api::store::Store::default();
+        for key in keys {
+            store.apply(key.clone()).unwrap();
+            store.set_status(&key.key(), key.status.clone()).unwrap();
+        }
+        store
+    }
+
+    /// A duress code as `kith node duress` shows it, its key, and the public key kept.
+    fn code() -> (String, ring::signature::Ed25519KeyPair, String) {
+        use ring::signature::KeyPair;
+        let code: [u8; 16] = random();
+        let pair = duress_key(&code);
+        let public = hex(pair.public_key().as_ref());
+        (shown(&code), pair, public)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn duress_looks_wrong() {
+        let (key, recovery): ([u8; 64], [u8; 16]) = (random(), random());
+        let (duress, _, public) = code();
+        let record = Record {
+            secret: vec![7; 32],
+            recovery: wrap(&recovery, &key),
+            pass: Pass::new("correct horse battery", &key, (64, 1)),
+            duress: unhex(&public),
+            ..Record::default()
+        };
+        let wrong = shown(&random::<16>());
+        // What is typed, what the console says of it, when (by this test's clock: it is
+        // paused, and moves only when the console waits), and what was erased.
+        let keyboard = |lines: &[&str]| {
+            let (type_it, typed) = std::sync::mpsc::channel();
+            for line in lines {
+                type_it.send(line.to_string()).unwrap();
+            }
+            (type_it, typed)
+        };
+        let began = tokio::time::Instant::now();
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push((began.elapsed(), line.to_string()));
+        // (The disk refuses the first two writes.)
+        let erased = std::cell::Cell::new(0);
+        let erase = || {
+            erased.set(erased.get() + 1);
+            erased.get() >= 3
+        };
+        let (told, _) = tokio::sync::watch::channel(None);
+
+        // A wrong key, the duress code, the recovery key itself, a wrong passphrase: all
+        // typed before the first is answered.
+        let (_open, lines) = keyboard(&[&wrong, &duress, &shown(&recovery), "correct horse batterz"]);
+        let waiting = console(record.clone(), lines, &say, &erase, &told);
+        let opened = tokio::time::timeout(Duration::from_secs(60), waiting).await;
+        assert!(opened.is_err(), "after a duress code nothing typed opens the state");
+        // Each is answered with the same words, ANSWER after it was read, the duress code
+        // as the wrong key before it; none waited behind another's answer.
+        let answers: Vec<(Duration, String)> = (1..=4).map(|_| (ANSWER, WRONG.to_string())).collect();
+        assert_eq!(*said.borrow(), answers);
+        assert_eq!(
+            erased.get(),
+            3,
+            "the record is erased by the duress code alone: again until the disk took it"
+        );
+        assert!(told.borrow().is_some(), "and its key is there to tell the cluster with");
+
+        // With no duress code typed, the same wrong key is answered so, and the recovery
+        // key opens: typed after it, a moment later.
+        said.borrow_mut().clear();
+        let (began, (told, _)) = (began.elapsed(), tokio::sync::watch::channel(None));
+        let (type_it, lines) = keyboard(&[&wrong]);
+        let later = async {
+            tokio::time::sleep(ANSWER + Duration::from_secs(1)).await;
+            type_it.send(shown(&recovery)).unwrap();
+            std::future::pending::<()>().await
+        };
+        let opened = tokio::select! {
+            opened = console(record.clone(), lines, &say, &erase, &told) => opened,
+            () = later => unreachable!(),
+        };
+        assert_eq!(opened, (key.to_vec(), By::Recovery));
+        assert_eq!(*said.borrow(), [(began + ANSWER, WRONG.to_string())]);
+        assert_eq!(erased.get(), 3);
+        // A record that names no duress code takes that code for a wrong key.
+        let none = Record { duress: None, ..record };
+        assert!(matches!(judged(&none, &duress), Typed::Wrong));
+    }
+
+    #[test]
+    fn forgotten_keys_written_over_are_put_back() {
+        let wrapped = json!({ "id": "a", "wrapped": "00" });
+        let change = |before: Value, after: Value| kith_api::store::Change {
+            action: kith_api::store::Action::Updated,
+            before: Some(node_key("n", before, json!({}))),
+            after: node_key("n", after, json!({})),
+        };
+        let done = kith_store::Done::Changes(vec![
+            // A lock made from what the store held before the duress code was taken.
+            change(json!({ "id": "a", "forgotten": true }), wrapped.clone()),
+            change(json!({ "id": "a", "wiped": true }), wrapped.clone()),
+            // A wipe of a forgotten key, and a write to a key that was never forgotten.
+            change(
+                json!({ "id": "a", "forgotten": true }),
+                json!({ "id": "a", "wiped": true }),
+            ),
+            change(wrapped.clone(), json!({ "id": "a", "wrapped": "00", "locked": true })),
+        ]);
+        let back: Vec<Value> = put_back(&done).into_iter().map(|key| key.spec).collect();
+        assert_eq!(
+            back,
+            [
+                json!({ "id": "a", "forgotten": true }),
+                json!({ "id": "a", "wiped": true })
+            ]
+        );
+        assert!(put_back(&kith_store::Done::Nothing).is_empty());
+    }
+
+    #[test]
+    fn duress_all_forgets_every_key_and_exists_only_once_made() {
+        let (_, pair, public) = code();
+        let (_, own, own_public) = code();
+        let seen = json!({ "recoverySeen": true });
+        let held = |name: &str, id: &str| node_key(name, json!({ "id": id, "wrapped": "0102" }), seen.clone());
+        let nonce = [5; 32];
+        let signed = |pair: &ring::signature::Ed25519KeyPair, id: &str| pair.sign(&forget_text(id, &nonce));
+        let keys = |store: &kith_api::store::Store, id: &str, pair: &ring::signature::Ed25519KeyPair| {
+            let wiped = forgetting(store, id, &nonce, signed(pair, id).as_ref());
+            let said = |key: &kith_api::Resource| (key.metadata.name.clone(), key.spec.clone());
+            wiped.iter().map(said).collect::<Vec<(String, Value)>>()
+        };
+        // No admin made a code: whatever signs, nothing is forgotten.
+        let mut plain = vec![held("a", "aa"), held("b", "bb"), held("c", "cc")];
+        assert!(keys(&stored(&plain), "aa", &pair).is_empty());
+        // The cluster's code, on every NodeKey there was when it was made (c came later),
+        // and a's own beside it.
+        for key in &mut plain[..2] {
+            key.spec["duressAll"] = public.clone().into();
+        }
+        plain[0].spec["duress"] = own_public.into();
+        let store = stored(&plain);
+        // a's own code forgets a's key alone; the cluster's, typed at a, every key under it:
+        // a's record is erased (wiped), b has its record and its recovery key (forgotten).
+        let wiped = ("a".to_string(), json!({ "id": "aa", "wiped": true }));
+        assert_eq!(keys(&store, "aa", &own), std::slice::from_ref(&wiped));
+        let forgotten = ("b".to_string(), json!({ "id": "bb", "forgotten": true }));
+        assert_eq!(keys(&store, "aa", &pair), [wiped, forgotten]);
+        // (Signed for another disk than the one asked for, or by a's code for b: nothing.)
+        let other = forgetting(&store, "bb", &nonce, signed(&pair, "aa").as_ref());
+        assert!(other.is_empty() && keys(&store, "bb", &own).is_empty());
+        // Forgotten, neither is handed out, and c is as it was.
+        let mut store = store;
+        for key in forgetting(&store, "aa", &nonce, signed(&pair, "aa").as_ref()) {
+            store.apply(key).unwrap();
+        }
+        assert_eq!((handed_out(&store, "aa"), handed_out(&store, "bb")), (None, None));
+        assert_eq!(handed_out(&store, "cc"), Some(("c", "0102")));
+        // And a code that was used forgets nothing more.
+        assert!(keys(&store, "aa", &pair).is_empty() && keys(&store, "bb", &pair).is_empty());
+
+        // No code for all while a node under it has a recovery key nobody was shown.
+        let unseen = node_key(
+            "d",
+            json!({ "id": "dd", "wrapped": "0102" }),
+            json!({ "sealed": false }),
+        );
+        let never = node_key("e", json!({ "id": "ee", "wrapped": "0102" }), Value::Null);
+        assert_eq!(never_shown(&[held("a", "aa"), unseen, never]), ["d", "e"]);
+        assert!(never_shown(&[held("a", "aa")]).is_empty());
+    }
+
+    #[test]
+    fn forget_unproven_is_refused() {
+        let (_, pair, public) = code();
+        let key = node_key(
+            "a",
+            json!({ "id": "aa", "wrapped": "0102", "duress": public }),
+            Value::Null,
+        );
+        let store = stored(&[key]);
+        let forgot = |nonce: &[u8], signature: &[u8]| !forgetting(&store, "aa", nonce, signature).is_empty();
+        // A copy of the disk has its id, its secret and the code's public key, not the code:
+        // signed with another key, with the public key itself, or not at all.
+        let nonce = given("aa".into());
+        let (_, copy, _) = code();
+        assert!(!forgot(&nonce, copy.sign(&forget_text("aa", &nonce)).as_ref()));
+        assert!(!forgot(&nonce, &unhex(&public).unwrap()) && !forgot(&nonce, &[]));
+        // The code's key over the number just given is taken: once.
+        let signature = pair.sign(&forget_text("aa", &nonce));
+        assert!(taken("aa", &nonce) && forgot(&nonce, signature.as_ref()));
+        assert!(!taken("aa", &nonce), "an answer sent a second time");
+        // A number that was given for another disk, one never given, and one given more
+        // than a minute ago: none is taken.
+        let other = given("bb".into());
+        assert!(!taken("aa", &other) && !taken("aa", &[9; 32]));
+        let old = std::time::Instant::now().checked_sub(FRESH + Duration::from_secs(1));
+        GIVEN.lock().unwrap().push_back((old.unwrap(), "aa".into(), [3; 32]));
+        assert!(!taken("aa", &[3; 32]), "an answer to an old number");
+        // And a signature over another number than the one sent with it opens nothing.
+        let next = given("aa".into());
+        assert!(taken("aa", &next) && !forgot(&next, signature.as_ref()));
+        // Whoever keeps asking has the oldest numbers forgotten, not the room grow.
+        let first = given("aa".into());
+        for _ in 0..OUTSTANDING {
+            given("zz".into());
+        }
+        assert!(!taken("aa", &first) && GIVEN.lock().unwrap().len() == OUTSTANDING);
+    }
+
+    #[test]
+    fn new_recovery_key_opens_and_the_old_one_does_not() {
+        let (key, old): ([u8; 64], [u8; 16]) = (random(), random());
+        let record = Record {
+            secret: vec![7; 32],
+            recovery: wrap(&old, &key),
+            ..Record::default()
+        };
+        assert!(matches!(judged(&record, &shown(&old)), Typed::Opens(opened, By::Recovery) if opened == key));
+        let (with, new) = renewed(&record, &key);
+        assert!(matches!(judged(&with, &new), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&with, &shown(&old)), Typed::Wrong));
+        // Whoever asked was shown it; nothing else of the record changed, and the key
+        // shown is not in it.
+        assert!(with.seen && !record.seen && new != shown(&old));
+        let same = Record {
+            recovery: record.recovery.clone(),
+            seen: false,
+            ..with.clone()
+        };
+        assert_eq!(same, record);
+        assert!(!with.text().contains(&new.replace('-', "")));
+    }
+
+    #[test]
+    fn unseen_recovery_keys_are_warned_of_until_one_was_shown() {
+        let held = |name: &str, status: Value| node_key(name, json!({ "id": name, "wrapped": "0102" }), status);
+        // No node's state is encrypted: nothing to say.
+        assert_eq!(unseen(&stored(&[])), None);
+        // Installed with nobody watching, and sealed or not: said, with a node to ask.
+        let nobody = [held("a", Value::Null), held("b", json!({ "sealed": true }))];
+        let warning = unseen(&stored(&nobody)).unwrap();
+        assert!(warning.contains("nobody was shown") && warning.contains("`kith node recovery a`"));
+        // One of them was shown its key (`kith node recovery`, or typed at its console): no more.
+        let one = [held("a", Value::Null), held("b", json!({ "recoverySeen": true }))];
+        assert_eq!(unseen(&stored(&one)), None);
+        // A wiped node's key opens nothing, shown or not.
+        let mut wiped = held("c", json!({ "recoverySeen": true }));
+        wiped.spec = json!({ "id": "c", "wiped": true });
+        assert!(unseen(&stored(&[held("a", Value::Null), wiped.clone()])).is_some());
+        assert_eq!(unseen(&stored(&[wiped])), None);
     }
 }

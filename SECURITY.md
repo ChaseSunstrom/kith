@@ -796,6 +796,60 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is kept by neither, nor by the store or the audit log; it is in kithd's memory on
   both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
   disk keeps of sectors it has replaced is not kith's to say.
+- **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
+  node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
+  makes one), it writes zeros over the node's lock record (the disk's secret, and what
+  the recovery key, a passphrase and the TPM's seal opened) and has the cluster forget
+  the node's key. What it does not do: a disk copied beforehand, with its recovery key
+  or a passphrase it had, still opens, and until a node of the cluster has heard the
+  code such a copy started on the cluster's network is still handed its key; flash
+  may keep the record's old blocks (the secret is not in a TPM); the record shows that
+  a code exists, though not what it is (a public key made from 128 random bits). The
+  console answers every line that opens nothing with the same words two seconds after
+  it was entered, the duress code among them, by a clock a test owns; that is all that
+  is the same. A write to the disk, a request to the cluster, the cluster's own log
+  and audit log (which say that a duress code was typed), and the missing record are
+  there for whoever watches the network or reads the disk or the cluster, and a disk
+  that takes longer than those two seconds to write would answer late. A node the
+  cluster would have opened by itself says after the code what a locked node says,
+  and does not open. The zeros are read back, and a disk that did not take them is
+  written again ten times a second for as long as the node waits, with nothing said:
+  **a disk that takes no write keeps its record**, and the cluster forgetting is then
+  all that was done. A node that runs is not touched by a code: its state is open.
+  **Forgotten is not gone from every disk.** The cluster stops handing the key out
+  and drops it from the NodeKey, which can no longer be rolled back; the store still
+  keeps the NodeKey's earlier versions (up to 100), and the cluster's log and its
+  backups keep what was written: whoever reads a control node's state or a backup
+  finds the node's key there, wrapped under the secret that was on the erased disk,
+  which opens nothing without a copy of that disk. A change to a NodeKey made in the
+  same moment (`kith node lock`, a new code) can write the key back for the length
+  of one write: it is forgotten again and the change refused, and a waiting node that
+  is handed its key after a code tells the cluster again.
+  **The cluster forgets for whoever has the code**, at any node's port and with no
+  certificate (a waiting node cannot read its own): `POST /v1/forget` gives a number
+  and takes it back signed with the code's key, within a minute, once; a copy of the
+  disk without the code, a second sending and an old number are refused, all with one
+  answer. So a code that leaks is a wipe for whoever reaches the port, and the
+  cluster's code (`kith node duress --all`) is that for every node under it: keep a
+  code as a recovery key is kept. Whoever reaches the port can also ask for numbers
+  until a waiting node's own is pushed out of the 64 that are kept: the node asks
+  again every few seconds, and is not told while they keep at it. Only a control
+  node forgets: a worker that is asked refuses, and the waiting node asks the next.
+  **A new recovery key (`kith node recovery`) is written before it is shown**: an
+  answer lost on its way leaves a key nobody saw, the old one opening no more and
+  `recoverySeen` saying yes (the command says so when it fails: run it again). It
+  goes from the node that made it to the node that was asked over the cluster's TLS
+  and is kept by neither; a control node that is taken can ask any node for one in
+  an admin's name, as it can set a passphrase.
+  **The cluster's code forgets; it does not erase the others.** Typed at one node, it
+  erases that node, and every other node under it loses the cluster's copy of its key:
+  it runs on with its state open, drops its seal and its passphrase when it hears, and
+  opens from then on with its own recovery key alone until `kith node unlock`. A node
+  that was off did not hear and still opens by its seal or passphrase; a node on a
+  kithd from before this gives its key to the cluster again; and the cluster makes no
+  such code while a node under it has a recovery key nobody was shown, where "shown"
+  (`recoverySeen`: by `kith node recovery`, or typed at its console) is not "kept": a
+  key shown and lost opens nothing either. It has run in VMs on disk files only.
 - **Confidential machines (SEV-SNP, TDX) and device passthrough** have never been run on
   real hardware.
 - **Most of kithd's and kith's memory is writable for as long as they run.** Both are

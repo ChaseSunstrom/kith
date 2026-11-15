@@ -68,8 +68,11 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/audit", get(audit))
         .route("/v1/run", post(run::run))
         .route("/v1/tokens", post(crate::cluster::token))
+        .route("/v1/lock", get(crate::crypt::warned))
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))
+        .route("/v1/lock/{name}/recovery", post(crate::crypt::recovery))
+        .route("/v1/duress", post(crate::crypt::duress_all))
         .route("/v1/seats/{name}/activity", post(crate::seats::activity))
         .route("/v1/drain/{name}", get(drain_plan).post(drain_set))
         // (The network boot file is 40 MB.)
@@ -564,6 +567,11 @@ async fn rollback(
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
+    // (What the cluster has forgotten or wiped is in the versions before it.)
+    if key.starts_with("NodeKey/") {
+        let why = "a NodeKey is not rolled back: `kith node lock`, `unlock`, `seal` and `wipe` change it";
+        return Err(ApiError::Store(Error::Invalid(why.into())));
+    }
     if let Some(node) = key.strip_prefix("Node/") {
         let Json(()) = read(&shared, |store| {
             let was = store

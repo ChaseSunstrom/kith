@@ -256,7 +256,11 @@ fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Resul
         Some(_) => return Err(refused(key, "a status is an object")),
     };
     match live.kind.as_str() {
-        "NodeKey" if live.metadata.name == who.name => only(key, &fields, &["sealed", "message", "passphrase"]),
+        "NodeKey" if live.metadata.name == who.name => only(
+            key,
+            &fields,
+            &["sealed", "message", "passphrase", "recoverySeen", "duress", "duressAll"],
+        ),
         // What its session does (`activity`), and nothing else of the status.
         "Seat" if live.spec["node"] == who.name => {
             let rest = |status: &Fields| -> Vec<(String, Value)> {
