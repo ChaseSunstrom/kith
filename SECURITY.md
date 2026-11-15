@@ -209,8 +209,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
   downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
   it is unpacked. An unpack holds only the directories the archive is inside of, a path,
-  a mode and a time each, and refuses an archive more than 128 directories deep: its
-  memory does not grow with the archive. Each directory is made when it comes, stays open
+  a mode and a time each, and refuses a directory more than 128 directories down; an
+  entry's headers (its name, and a long name, PAX header or sparse map the tar crate
+  reads whole) are refused past 256 KiB: its memory does not grow with the archive. A
+  restore that fails opens what it unpacked to its owner and removes it, and one that
+  finds such a leftover beside the Volume does the same first. Each directory is made when it comes, stays open
   to its owner while the archive is inside it, and is given its mode and time when the
   archive leaves it, through no link: one whose path leads elsewhere by then is left as
   it is. An archive in depth-first order (kith's own, GNU tar's) unpacks with every
