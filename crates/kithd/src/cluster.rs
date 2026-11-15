@@ -17,7 +17,7 @@
 use crate::pki::{self, Identity};
 use crate::{Shared, api};
 use axum::extract::connect_info::{ConnectInfo, Connected};
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -50,6 +50,9 @@ pub struct Cluster {
     pub client: reqwest::Client,
     /// The clients [`Cluster::to`] made, by node name: each with the print it was pinned to.
     pinned: std::sync::Mutex<std::collections::HashMap<String, (Option<String>, reqwest::Client)>>,
+    /// What the voters this node last knew said of a node it has not heard of, by its name and
+    /// the print of its key ([`vouched`]).
+    vouched: std::sync::Mutex<std::collections::HashMap<(String, String), Kept>>,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -77,6 +80,7 @@ impl Cluster {
             claims: pki::Tokens::default(),
             joining: tokio::sync::Mutex::new(()),
             pinned: Default::default(),
+            vouched: Default::default(),
         })
     }
 
@@ -353,20 +357,17 @@ pub fn admitted(shared: &Shared, name: &str, key: &[u8]) -> bool {
         return true;
     }
     let state = shared.store.lock().expect("a handler panicked holding the store");
-    stands(&state.store, name, key)
+    stands(&state.store, name, &pki::key_print(key))
 }
 
-/// [`admitted`], asked of a store.
-fn stands(store: &kith_api::store::Store, name: &str, key: &[u8]) -> bool {
+/// [`admitted`], asked of a store, for the key whose print is `print`.
+fn stands(store: &kith_api::store::Store, name: &str, print: &str) -> bool {
     let node = store.get(&node_key(name));
     let Some(status) = node.and_then(|node| node.status.as_ref()) else {
         return false;
     };
     let joined = status["raftId"].is_string();
-    joined
-        && status["certificate"]
-            .as_str()
-            .is_none_or(|print| print == pki::key_print(key))
+    joined && status["certificate"].as_str().is_none_or(|named| named == print)
 }
 
 /// What the leader sends a node to bring its store up to date, and what asks for its vote:
@@ -382,12 +383,21 @@ const CATCHING_UP: [&str; 3] = ["/v1/raft/append", "/v1/raft/vote", "/v1/raft/sn
 /// before this) is unheard of only by a node that has not heard of itself: one that has
 /// just joined, or the one that was deleted.
 fn unheard(store: &kith_api::store::Store, me: &str, applied: u64, path: &str, name: &str, born: Option<u64>) -> bool {
-    CATCHING_UP.contains(&path)
-        && store.get(&node_key(name)).is_none()
+    CATCHING_UP.contains(&path) && behind(store, me, applied, name, born)
+}
+
+/// [`unheard`] on any route: whether the store of `me` is too far behind to know of `name`.
+fn behind(store: &kith_api::store::Store, me: &str, applied: u64, name: &str, born: Option<u64>) -> bool {
+    store.get(&node_key(name)).is_none()
         && match born {
             Some(born) => applied < born,
             None => store.get(&node_key(me)).is_none(),
         }
+}
+
+/// The index of the store this node has applied.
+fn applied(shared: &Shared) -> u64 {
+    shared.raft.metrics().borrow().last_applied.map_or(0, |log| log.index)
 }
 
 /// [`unheard`], asked of this node.
@@ -396,9 +406,179 @@ fn catching_up(shared: &Shared, path: &str, name: &str, born: Option<u64>) -> bo
         return false;
     };
     // (Read before the store: an index that is a moment old only says "behind" a moment longer.)
-    let applied = shared.raft.metrics().borrow().last_applied.map_or(0, |log| log.index);
+    let applied = applied(shared);
     let state = shared.store.lock().expect("a handler panicked holding the store");
     unheard(&state.store, &cluster.me.name, applied, path, name, born)
+}
+
+/// How long the voters are given to say whether a node stands.
+const ASKING: Duration = Duration::from_secs(2);
+/// How long a voter's "no" is kept, and the most a "yes" is. (Tests keep every answer for as
+/// long as they run, however slow the machine: what they count does not lapse midway.)
+const KEPT: Duration = Duration::from_secs(if cfg!(test) { 600 } else { 30 });
+/// How long no word is kept: the voters may be back in a moment.
+const QUIET: Duration = Duration::from_secs(if cfg!(test) { 600 } else { 5 });
+/// How many senders' answers are kept: a node is led by one at a time, and sent a store by it.
+const VOUCHED: usize = 16;
+
+type Asking = futures_util::future::Shared<futures_util::future::BoxFuture<'static, Option<bool>>>;
+
+/// What the voters said of one sender, and until when it holds.
+struct Kept {
+    word: Word,
+    until: std::time::Instant,
+    /// The index its certificate says its Node was there by: a "yes" holds until this node is past it.
+    born: Option<u64>,
+}
+
+enum Word {
+    /// Being asked: what else that node sends meanwhile waits for the same answer.
+    Asking(Asking),
+    Yes,
+    /// One said no, or none said either.
+    No,
+}
+
+/// Forget what no longer holds at `now`, for a store applied up to `applied`.
+fn keep(kept: &mut std::collections::HashMap<(String, String), Kept>, now: std::time::Instant, applied: u64) {
+    kept.retain(|_, kept| {
+        let past = matches!(kept.word, Word::Yes) && kept.born.is_some_and(|born| applied >= born);
+        now < kept.until && !past
+    });
+}
+
+/// Keep what the voters said (`said`, [`verdict`]) of `id`, at `now`, if what is kept of it is
+/// still the asking that was to lapse at `until`: one that took longer was dropped by [`keep`],
+/// and the asking that took its place has its own answer coming.
+fn answered(
+    kept: &mut std::collections::HashMap<(String, String), Kept>,
+    id: &(String, String),
+    until: std::time::Instant,
+    said: Option<bool>,
+    now: std::time::Instant,
+) {
+    let Some(kept) = kept.get_mut(id) else {
+        return;
+    };
+    if matches!(kept.word, Word::Asking(_)) && kept.until == until {
+        kept.word = if said == Some(true) { Word::Yes } else { Word::No };
+        kept.until = now + if said.is_some() { KEPT } else { QUIET };
+    }
+}
+
+/// Does a voter this node last knew say the node `name`, of the key `key`, stands, and none that
+/// it does not? Asked of a node this one has not heard of ([`unheard`]): it was away, and the
+/// sender joined since (it may lead by now) or was deleted since (it must not lead this node,
+/// nor send it a store). Each sender is asked about once, whatever it sends meanwhile, and the
+/// answer kept; a voter that does not answer, answers "not yet", or is of a build with no such
+/// question says nothing either way. A node that knows of no voter at all (it has just joined)
+/// takes the sender, as before: it has no one to ask.
+async fn vouched(shared: &Arc<Shared>, name: &str, key: &[u8], born: Option<u64>) -> bool {
+    let Some(cluster) = &shared.cluster else {
+        return false;
+    };
+    let id = (name.to_string(), pki::key_print(key));
+    let asking = {
+        let mut kept = cluster.vouched.lock().expect("nothing panics holding what was vouched");
+        let now = std::time::Instant::now();
+        keep(&mut kept, now, applied(shared));
+        match kept.get(&id).map(|kept| &kept.word) {
+            Some(Word::Yes) => return true,
+            Some(Word::No) => return false,
+            Some(Word::Asking(asking)) => asking.clone(),
+            None if kept.len() >= VOUCHED => return false,
+            None => {
+                let (shared, asked) = (shared.clone(), id.clone());
+                let until = now + 2 * ASKING;
+                // (A task of its own: a sender that hangs up does not leave it half asked.)
+                let asked = tokio::spawn(async move {
+                    // (Each voter is given ASKING, its answer read and all: no more is waited.)
+                    let said = ask(&shared, &asked.0, &asked.1, born).await;
+                    let cluster = shared.cluster.as_ref().expect("asked by a node of a cluster");
+                    let mut kept = cluster.vouched.lock().expect("nothing panics holding what was vouched");
+                    answered(&mut kept, &asked, until, said, std::time::Instant::now());
+                    said
+                });
+                use futures_util::FutureExt;
+                let asked = asked.map(|done| done.ok().flatten()).boxed().shared();
+                let word = Word::Asking(asked.clone());
+                kept.insert(id, Kept { word, until, born });
+                asked
+            }
+        }
+    };
+    asking.await == Some(true)
+}
+
+/// What the voters this node last knew (not itself, and not the sender, whose word for itself is
+/// worth nothing) say of the node `name` whose key has the print `print`: [`verdict`].
+async fn ask(shared: &Shared, name: &str, print: &str, born: Option<u64>) -> Option<bool> {
+    let me = kith_store::node_id(&shared.cluster.as_ref()?.me.name);
+    let sender = kith_store::node_id(name);
+    // Raft says which voters it has only once it has started: until then it seems to know none,
+    // and that would take the sender. A call it answers comes after that.
+    let started = shared.raft.with_raft_state(|_| ());
+    if tokio::time::timeout(ASKING, started).await.is_err() {
+        return None;
+    }
+    let voters: Vec<_> = {
+        let metrics = shared.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        if membership.voter_ids().next().is_none() {
+            return Some(true);
+        }
+        let asked = |id: &kith_store::NodeId| *id != me && *id != sender;
+        let at = |id| Some((id, membership.get_node(&id)?.addr.clone()));
+        membership.voter_ids().filter(asked).filter_map(at).collect()
+    };
+    let asked = voters.into_iter().map(|(id, address)| async move {
+        // (Held to the voter's name, and to its key where this node's store names one.)
+        let (client, _) = crate::raft::to_voter(shared, id).ok()?;
+        let mut url = reqwest::Url::parse(&format!("https://{address}/v1/raft/stands")).ok()?;
+        url.query_pairs_mut()
+            .append_pair("name", name)
+            .append_pair("key", print);
+        if let Some(born) = born {
+            url.query_pairs_mut().append_pair("born", &born.to_string());
+        }
+        let answer = client.get(url).timeout(ASKING).send().await.ok()?;
+        answer.error_for_status().ok()?.json::<String>().await.ok()
+    });
+    verdict(&futures_util::future::join_all(asked).await)
+}
+
+/// No if any voter said so, yes if one did and none said no, and otherwise nothing.
+fn verdict(said: &[Option<String>]) -> Option<bool> {
+    let any = |word: &str| said.iter().any(|said| said.as_deref() == Some(word));
+    if any("no") {
+        Some(false)
+    } else {
+        any("yes").then_some(true)
+    }
+}
+
+#[derive(Deserialize)]
+struct Standing {
+    name: String,
+    key: String,
+    born: Option<u64>,
+}
+
+/// Whether the certificate of the node `name` for the key whose print is `key` stands in this
+/// node's store: "yes", "no", or "not yet" where this store is too far behind to know (as by
+/// [`behind`]). Asked by a node that was away and is sent Raft's messages by a node it has not
+/// heard of ([`vouched`]); answered only to a node that stands here (`members_only`).
+async fn standing(State(shared): State<Arc<Shared>>, Query(asked): Query<Standing>) -> Json<&'static str> {
+    let me = shared.cluster.as_ref().map_or("", |cluster| cluster.me.name.as_str());
+    let applied = applied(&shared);
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    Json(if stands(&state.store, &asked.name, &asked.key) {
+        "yes"
+    } else if behind(&state.store, me, applied, &asked.name, asked.born) {
+        "not yet"
+    } else {
+        "no"
+    })
 }
 
 /// What a worker (`spec.trust`) is refused among the nodes' routes: the second hop of
@@ -434,10 +614,20 @@ async fn members_only(
         let why = "this node is a worker: it keeps a view of the store and takes no part in it";
         return refuse(StatusCode::FORBIDDEN, why).into_response();
     }
+    // A node this one has not heard of is taken once a voter this one last knew vouches for it.
+    let (known, unheard) = match &peer.subject {
+        Some(pki::Subject::Node(name, key, born)) => {
+            let known = admitted(&shared, name, key);
+            (known, !known && catching_up(&shared, path, name, *born))
+        }
+        _ => (false, false),
+    };
+    let let_in = match &peer.subject {
+        Some(pki::Subject::Node(name, key, born)) if unheard => vouched(&shared, name, key, *born).await,
+        _ => known,
+    };
     let (status, why) = match &peer.subject {
-        Some(pki::Subject::Node(name, key, born))
-            if admitted(&shared, name, key) || catching_up(&shared, path, name, *born) =>
-        {
+        Some(pki::Subject::Node(name, ..)) if let_in => {
             // A worker does not vote, is not followed, and its word for who asked is not taken.
             let worker = CONTROL_ONLY.contains(&path) && crate::access::worker(&shared, name);
             if worker && (path == RUN_HOP || !votes(&shared, name)) {
@@ -462,7 +652,13 @@ async fn members_only(
                     .audit
                     .record(&who, request.method().as_str(), vec![path.to_string()], refused);
             }
-            (StatusCode::UNAUTHORIZED, EVICTED)
+            // (Unheard of and not vouched for: as a node it is, but not to be followed.)
+            let status = if unheard {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            (status, EVICTED)
         }
         Some(pki::Subject::User(..)) => (
             StatusCode::FORBIDDEN,
@@ -492,6 +688,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
+        .route("/v1/raft/stands", get(standing))
         .route("/v1/view", get(crate::view::serve))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .route("/v1/volume-copy/{namespace}/{name}", get(crate::replicas::copy))
@@ -1380,6 +1577,184 @@ pub(crate) mod pinned_peer {
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
     }
 
+    /// Serves `node_router(shared)` on a loopback port, as the node `me`: the address.
+    async fn serving(shared: Arc<Shared>, me: &Identity) -> String {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(me).unwrap()).unwrap();
+        let app = node_router(shared).into_make_service_with_connect_info::<Peer>();
+        tokio::spawn(async move { drop(axum::serve(listener, app).await) });
+        address
+    }
+
+    /// A call to `address` as `who`: its status, and what it said.
+    async fn call_as(
+        who: &Identity,
+        request: impl FnOnce(&reqwest::Client) -> reqwest::RequestBuilder,
+    ) -> (u16, String) {
+        let client = client_for(&who.ca, Some(who), None).unwrap();
+        let answer = request(&client).send().await.unwrap();
+        (answer.status().as_u16(), answer.text().await.unwrap())
+    }
+
+    /// Serves, on a loopback port, as the voter `me`: `/v1/raft/stands` says what `words` has for
+    /// the name asked, or `otherwise`, and is counted. `words` None is a build that has no such
+    /// route (404 to all).
+    async fn voter_saying(
+        me: &Identity,
+        words: Option<&'static [(&'static str, &'static str)]>,
+        otherwise: &'static str,
+    ) -> (String, Arc<AtomicUsize>) {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(me).unwrap()).unwrap();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = asked.clone();
+        let app = match words {
+            None => Router::new(),
+            Some(words) => Router::new().route(
+                "/v1/raft/stands",
+                get(
+                    move |axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        let name = query.get("name").map(String::as_str);
+                        let word = words.iter().find(|(of, _)| Some(*of) == name);
+                        std::future::ready(Json(word.map_or(otherwise, |(_, word)| *word)))
+                    },
+                ),
+            ),
+        };
+        tokio::spawn(async move { drop(axum::serve(listener, app.into_make_service()).await) });
+        (address, asked)
+    }
+
+    use std::collections::HashMap;
+
+    /// A node that was away is sent Raft's messages by nodes it has not heard of. It takes them
+    /// once a voter it last knew says the node stands, and refuses them (403, and Raft never sees
+    /// them) when one says it does not, or none says either: asked once per sender, the answer kept.
+    #[tokio::test]
+    async fn vouched_lets_in_a_joiner_and_not_a_deleted_node() {
+        use kith_store::openraft::raft::VoteRequest;
+        use kith_store::openraft::{BasicNode, Vote};
+        let ca = pki::Ca::create().unwrap();
+        let born = |name: &str| {
+            let (cert, key) = ca.issue_born(name, 50).unwrap();
+            Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (gamma, alpha, beta) = (node(&ca, "gamma"), node(&ca, "alpha"), node(&ca, "beta"));
+        // alpha has heard of d and f, knows x was deleted, and has not caught up to n; beta is of a
+        // build that has no such question, and carol does not answer.
+        let words: &'static [_] = &[("d", "yes"), ("e", "yes"), ("f", "yes"), ("n", "not yet")];
+        let (to_alpha, asked) = voter_saying(&alpha, Some(words), "no").await;
+        let (to_beta, _) = voter_saying(&beta, None, "").await;
+        let shared = shared_with("vouched", gamma.clone(), &[]).await;
+        let id = kith_store::node_id;
+        let members = std::collections::BTreeMap::from([
+            (id("gamma"), BasicNode::new("")),
+            (id("alpha"), BasicNode::new(&to_alpha)),
+            (id("beta"), BasicNode::new(&to_beta)),
+            (id("carol"), BasicNode::new("127.0.0.1:1")),
+        ]);
+        shared.raft.initialize(members).await.unwrap();
+        let address = serving(shared.clone(), &gamma).await;
+        let send = |who: Identity, what: &'static str| {
+            let address = address.clone();
+            async move {
+                let vote = VoteRequest::new(Vote::new(1000, id(&who.name)), None);
+                let body = if what == "vote" {
+                    serde_json::to_value(vote).unwrap()
+                } else {
+                    serde_json::json!({})
+                };
+                call_as(&who, |client| {
+                    client.post(format!("https://{address}/v1/raft/{what}")).json(&body)
+                })
+                .await
+            }
+        };
+        let asked_now = || asked.load(Ordering::SeqCst);
+
+        // A voter it knew says x is gone: refused, as evicted, and Raft never sees it (a body
+        // that is not Raft's would be refused by Raft's own handler with another status).
+        let (x, d) = (born("x"), born("d"));
+        let (status, said) = send(x.clone(), "vote").await;
+        assert!(status == 403 && said.contains(EVICTED), "{status} {said}");
+        assert_eq!(asked_now(), 1);
+        for what in ["append", "snapshot", "vote"] {
+            let (status, said) = send(x.clone(), what).await;
+            assert!(status == 403 && said.contains(EVICTED), "{what}: {status} {said}");
+        }
+        assert_eq!(asked_now(), 1, "the answer was not kept");
+
+        // A joiner that leads by now: let in, after one asking however many messages it sends.
+        let sent: Vec<_> = (0..5).map(|_| send(d.clone(), "vote")).collect();
+        for (status, said) in futures_util::future::join_all(sent).await {
+            assert_eq!(status, 200, "{said}");
+        }
+        assert_eq!(asked_now(), 2);
+
+        // "Not yet", no such route, and no answer are no word: refused.
+        let (status, said) = send(born("n"), "append").await;
+        assert!(status == 403 && said.contains(EVICTED), "{status} {said}");
+        assert_eq!(asked_now(), 3);
+
+        // The answers kept are for 16 senders: then one that would be let in is not even asked.
+        for n in 0..13 {
+            let (status, _) = send(born(&format!("s{n}")), "append").await;
+            assert_eq!(status, 403);
+        }
+        assert_eq!(asked_now(), 16);
+        let (status, _) = send(born("f"), "vote").await;
+        assert_eq!((status, asked_now()), (403, 16));
+    }
+
+    /// `/v1/raft/stands` says yes, no or not yet of a name and key, to a node of this cluster only.
+    #[tokio::test]
+    async fn stands_route_answers_only_a_node_that_stands() {
+        let ca = pki::Ca::create().unwrap();
+        let (alpha, d, x) = (node(&ca, "alpha"), node(&ca, "d"), node(&ca, "x"));
+        let (print_d, print_x) = (pki::print_of(&d.cert).unwrap(), pki::print_of(&x.cert).unwrap());
+        let nodes = [
+            at("alpha", "127.0.0.1:1", None),
+            at("d", "127.0.0.1:1", Some(print_d.clone())),
+        ];
+        let shared = shared_with("stands-route", alpha.clone(), &nodes).await;
+        let address = serving(shared, &alpha).await;
+        let ask = |who: &Identity, query: String| {
+            let url = format!("https://{address}/v1/raft/stands?{query}");
+            let who = who.clone();
+            async move { call_as(&who, |client| client.get(url)).await }
+        };
+        for (query, word) in [
+            (format!("name=d&key={print_d}"), "yes"),
+            (format!("name=d&key={print_x}"), "no"),
+            // Born after what this node has: it cannot know yet.
+            (format!("name=x&key={print_x}&born=1000"), "not yet"),
+            (format!("name=x&key={print_x}&born=0"), "no"),
+            // No index, and this node has heard of itself: it would know.
+            (format!("name=x&key={print_x}"), "no"),
+        ] {
+            assert_eq!(ask(&d, query.clone()).await, (200, format!("\"{word}\"")), "{query}");
+        }
+        // A node whose Node is not there (deleted), and an Identity: refused.
+        let (status, said) = ask(&x, format!("name=d&key={print_d}")).await;
+        assert!(status == 401 && said.contains(EVICTED), "{status} {said}");
+        let (cert, key, _) = ca.issue_user("carol").unwrap();
+        let carol = Identity {
+            name: "carol".into(),
+            ca: ca.cert.clone(),
+            cert,
+            key,
+        };
+        assert_eq!(ask(&carol, format!("name=d&key={print_d}")).await.0, 403);
+    }
+
     fn sources(dir: &std::path::Path, into: &mut Vec<(String, String)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -1479,6 +1854,7 @@ mod tests {
     #[test]
     fn an_evicted_nodes_key_stands_for_no_node() {
         let mut store = kith_api::store::Store::default();
+        let stands = |store: &kith_api::store::Store, name: &str, key: &[u8]| stands(store, name, &pki::key_print(key));
         // A node that has not heard of itself has not heard of the others: it is being sent
         // the store, and takes it from a node whose certificate says no index.
         let unheard = |store: &kith_api::store::Store, applied, name: &str, born| {
@@ -1521,6 +1897,57 @@ mod tests {
         assert!(unheard(&store, 4, "b", Some(5)));
         // One that says no index, to a node that has heard of itself: deleted.
         assert!(!unheard(&store, 0, "b", None));
+    }
+
+    /// One voter's no outweighs any yes; "not yet", no answer and no such route are no word.
+    /// A no is kept 30 seconds; a yes until this node is past the index its Node was there by.
+    #[test]
+    fn vouched_answers_are_weighed_and_kept_for_a_while() {
+        let said = |words: &[Option<&str>]| verdict(&words.iter().map(|w| w.map(String::from)).collect::<Vec<_>>());
+        assert_eq!(said(&[Some("yes"), None, Some("not yet")]), Some(true));
+        assert_eq!(said(&[Some("yes"), Some("no")]), Some(false));
+        assert_eq!(said(&[None, Some("not yet"), Some("maybe")]), None);
+        assert_eq!(said(&[]), None);
+        let now = std::time::Instant::now();
+        let mut kept = std::collections::HashMap::new();
+        let at = |word, until, born| Kept { word, until, born };
+        kept.insert(("x".to_string(), "k".to_string()), at(Word::No, now + KEPT, Some(5)));
+        kept.insert(("d".to_string(), "k".to_string()), at(Word::Yes, now + KEPT, Some(5)));
+        keep(&mut kept, now + KEPT - Duration::from_secs(1), 4);
+        assert_eq!(kept.len(), 2);
+        keep(&mut kept, now, 5);
+        assert!(kept.keys().all(|(name, _)| name == "x"), "a yes outlived the index");
+        keep(&mut kept, now + KEPT, 0);
+        assert!(kept.is_empty());
+    }
+
+    /// An asking that took longer than it was given was dropped, and another asked in its place:
+    /// the late answer is not written over that one, nor over what it said.
+    #[test]
+    fn a_late_answer_is_not_kept_over_a_later_asking() {
+        use futures_util::FutureExt;
+        let asking = || Word::Asking(futures_util::future::ready(None).boxed().shared());
+        let (now, id) = (std::time::Instant::now(), ("d".to_string(), "k".to_string()));
+        let (first, second) = (now + 2 * ASKING, now + 5 * ASKING);
+        let mut kept = std::collections::HashMap::new();
+        let at = |word, until| Kept {
+            word,
+            until,
+            born: None,
+        };
+        kept.insert(id.clone(), at(asking(), second));
+        answered(&mut kept, &id, first, Some(true), now);
+        assert!(matches!(kept[&id].word, Word::Asking(_)) && kept[&id].until == second);
+        answered(&mut kept, &id, second, Some(false), now);
+        assert!(matches!(kept[&id].word, Word::No) && kept[&id].until == now + KEPT);
+        answered(&mut kept, &id, second, Some(true), now);
+        assert!(matches!(kept[&id].word, Word::No), "an answer was kept over an answer");
+        // No word at all is kept a short while; an id that was dropped stays dropped.
+        kept.insert(id.clone(), at(asking(), first));
+        answered(&mut kept, &id, first, None, now);
+        assert!(matches!(kept[&id].word, Word::No) && kept[&id].until == now + QUIET);
+        answered(&mut kept, &("e".to_string(), "k".to_string()), first, Some(true), now);
+        assert_eq!(kept.len(), 1);
     }
 
     /// `/v1/netboot` refuses an Identity that may not apply Nodes before it reads the body:

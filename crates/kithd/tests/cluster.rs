@@ -1151,6 +1151,116 @@ fn a_node_that_is_down_is_not_made_a_voter() {
     wait_for("beta to catch up", || beta.kith(&["get", "ConfigMap/still"]).0 == 0);
 }
 
+/// A node that was away while another joined is led by that one when it is back: it has not
+/// heard of it, asks the voters it last knew, and is told it stands. (A kithd from before the
+/// asking took any node it had not heard of, and passes this too: it keeps the asking from
+/// shutting a joiner out. That a deleted node is refused is
+/// `vouched_lets_in_a_joiner_and_not_a_deleted_node`, in cluster.rs, against voters made up.)
+#[test]
+fn away_during_a_join_catches_up_from_the_joiner() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "away";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |alpha: &Node, name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let said = |node: &Node, what: &str| {
+        let (code, status, _) = node.kith(&["node", "status"]);
+        let line = status.lines().find(|line| line.starts_with(what));
+        line.filter(|_| code == 0)
+            .map(|line| line[what.len()..].trim().to_string())
+    };
+    let (mut beta, mut epsilon) = (join(&alpha, "beta"), join(&alpha, "epsilon"));
+    wait_for("three voters", || {
+        said(&alpha, "voters:").as_deref() == Some("alpha, beta, epsilon")
+    });
+    // gamma knows alpha, beta and epsilon as voters, and goes away.
+    let mut gamma = join(&alpha, "gamma");
+    wait_for("gamma to have the store", || gamma.nodes().len() == 4);
+    gamma.stop();
+    let (state, away) = (gamma.dir.join("state"), gamma.dir.join("away"));
+    let copied = Command::new("cp").arg("-a").arg(&state).arg(&away).status().unwrap();
+    assert!(copied.success());
+    // Meanwhile delta joins and epsilon is deleted: delta votes in its place.
+    let delta = join(&alpha, "delta");
+    alpha.ok(&["delete", "node/epsilon"]);
+    epsilon.stop();
+    wait_for("delta to vote", || {
+        said(&alpha, "voters:").as_deref() == Some("alpha, beta, delta")
+    });
+    for attempt in 0.. {
+        // Until delta leads: whoever else does is stopped a moment. (Until all three name it: one
+        // just back that has not heard from the leader yet would ask for votes, and might lead.)
+        let mut fresh = false;
+        for round in 0.. {
+            let mut leader = None;
+            wait_for("all three to name one leader", || {
+                leader = said(&delta, "leader:").filter(|leader| leader != "none");
+                leader.is_some() && [&alpha, &beta].iter().all(|node| said(node, "leader:") == leader)
+            });
+            let leader = leader.unwrap();
+            if leader == "delta" && fresh {
+                break;
+            }
+            assert!(round < 12, "delta never led");
+            if leader == "delta" {
+                // A leader stopped and started again leads its old term a moment, and gamma, on
+                // an older one still, would take what it sends: alpha and beta start afresh.
+                for (node, name) in [(&mut alpha, "alpha"), (&mut beta, "beta")] {
+                    node.stop();
+                    node.child = Node::spawn(&node.dir, name, node.port, &[]);
+                    wait_for("it to answer again", || node.kith(&["get", "node"]).0 == 0);
+                }
+                fresh = true;
+                continue;
+            }
+            fresh = false;
+            let node = if leader == "alpha" { &mut alpha } else { &mut beta };
+            node.stop();
+            wait_for("another to lead", || {
+                said(&delta, "leader:").is_some_and(|now| now != leader && now != "none")
+            });
+            node.child = Node::spawn(&node.dir, &leader, node.port, &[]);
+            wait_for("it to answer again", || node.kith(&["get", "node"]).0 == 0);
+        }
+        // gamma is back as it went away: it is sent the store by delta, which it has not heard
+        // of, and follows it.
+        let _ = std::fs::remove_dir_all(&state);
+        let copied = Command::new("cp").arg("-a").arg(&away).arg(&state).status().unwrap();
+        assert!(copied.success());
+        gamma.child = Node::spawn(&gamma.dir, "gamma", gamma.port, &[]);
+        // Had another led a moment (a loaded machine misses heartbeats), gamma could take the
+        // store from it and prove nothing: that try is let go and gamma starts over. (Another
+        // leads for an election's timeout at least, a second or more: the voters are asked often.)
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut led = None;
+        while led.is_none() {
+            assert!(Instant::now() < deadline, "gamma never caught up from delta");
+            std::thread::sleep(Duration::from_millis(50));
+            let another = |node: &Node| said(node, "leader:").is_some_and(|it| it != "delta" && it != "none");
+            if [&delta, &alpha, &beta].into_iter().any(another) {
+                led = Some(false);
+            } else if said(&gamma, "leader:").as_deref() == Some("delta") {
+                let names: Vec<_> = gamma.nodes().into_iter().map(|(name, _)| name).collect();
+                let caught_up = names.contains(&"delta".to_string()) && !names.contains(&"epsilon".to_string());
+                led = caught_up.then_some(true);
+            }
+        }
+        if led == Some(true) {
+            break;
+        }
+        assert!(attempt < 5, "another kept leading gamma");
+        gamma.stop();
+    }
+}
+
 #[test]
 fn workloads_move_off_a_lost_node() {
     if std::env::var_os("KITH_E2E").is_none() {
