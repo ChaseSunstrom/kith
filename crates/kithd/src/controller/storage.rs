@@ -291,7 +291,11 @@ const BATCH: usize = 1024;
 /// directories are open (the level, the next level, the one being emptied, and a new one for
 /// a moment), memory does not grow with the tree, `..` is taken nowhere (nothing moved under
 /// the walk can lead it above `root`), and a directory on another file system than `root`'s
-/// (a mount point is `EBUSY` to rename, another file system `EXDEV`) ends the removal.
+/// (a mount point is `EBUSY` to remove, and one opened is seen by its device) ends the removal.
+/// Where the disk has no room or no file left to make a level of (a full disk is why a pod may
+/// be replaced), the first directory to move is the next level itself, by a rename; one moved
+/// into a level that holds its new name already (a level that was a pod's directory may) takes
+/// the next name.
 ///
 /// A halt leaves `root` and the levels where they are, each named `scratch.*` in the replica
 /// directory, for a sweep to remove as a tree of its own. A second remover of the same
@@ -300,6 +304,18 @@ const BATCH: usize = 1024;
 /// Any other error that leaves an entry in place ends the removal with it, as `remove_dir_all`
 /// does: no path goes round again. A `root` that is a link or a file is unlinked.
 fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
+    remove_tree_with(root, halted, |path| {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    })
+}
+
+/// [`remove_tree`], with what makes a level's directory (a test's has no room).
+fn remove_tree_with(
+    root: &Path,
+    halted: &dyn Fn() -> bool,
+    make: fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
     use nix::errno::Errno;
     use std::os::fd::IntoRawFd;
     let mut here = match crate::backups::open_dir(root) {
@@ -320,6 +336,7 @@ fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> 
         moved: 0,
         next: None,
         beside: root.to_path_buf(),
+        make,
     };
     loop {
         let (mut level, path) = here;
@@ -368,6 +385,8 @@ struct Removal<'a> {
     next: Option<(Dir, PathBuf)>,
     /// The first level, beside which the next ones are made.
     beside: PathBuf,
+    /// Makes a level's directory.
+    make: fn(&Path) -> std::io::Result<()>,
 }
 
 impl Removal<'_> {
@@ -405,7 +424,11 @@ impl Removal<'_> {
     fn empty(&mut self, level: i32, name: &std::ffi::CStr) -> std::io::Result<bool> {
         use nix::errno::Errno;
         use nix::unistd::{UnlinkatFlags, unlinkat};
-        let mut dir = self.open(level, name)?;
+        let mut dir = match self.open(level, name) {
+            // (Gone since it was listed: another remover took it.)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            opened => opened?,
+        };
         let fd = dir.as_raw_fd();
         for entry in dir.iter() {
             if self.halt() {
@@ -429,25 +452,51 @@ impl Removal<'_> {
         use nix::errno::Errno;
         use nix::fcntl::renameat;
         use nix::sys::stat::{FchmodatFlags, fchmodat};
+        use std::io::ErrorKind::{QuotaExceeded, StorageFull};
         use std::os::fd::IntoRawFd;
-        use std::os::unix::fs::DirBuilderExt;
         if self.next.is_none() {
             // (A name that is taken is an error: it is not for this removal to take it over.)
             let path = scratch_name(&self.beside);
-            std::fs::DirBuilder::new().mode(0o700).create(&path)?;
-            let dir = Dir::from_fd(crate::backups::open_dir(&path)?.into_raw_fd())?;
-            self.next = Some((dir, path));
+            match (self.make)(&path) {
+                Ok(()) => {
+                    let dir = Dir::from_fd(crate::backups::open_dir(&path)?.into_raw_fd())?;
+                    self.next = Some((dir, path));
+                }
+                // A disk with no room or no file left to make (why a pod may be replaced at
+                // all) makes no directory: the one to move is the next level itself, by a
+                // rename, which takes neither. (Opened first: that opens it up, too.)
+                Err(e) if matches!(e.kind(), StorageFull | QuotaExceeded) => {
+                    let dir = self.open(from, name)?;
+                    return match renameat(Some(from), name, None, &path) {
+                        Ok(()) => {
+                            self.next = Some((dir, path));
+                            Ok(())
+                        }
+                        Err(Errno::ENOENT) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    };
+                }
+                Err(e) => return Err(e),
+            }
         }
         let to = self.next.as_ref().map_or(-1, |(dir, _)| dir.as_raw_fd());
-        self.moved += 1;
-        let new = std::ffi::CString::new(format!("d{}", self.moved)).unwrap_or_default();
-        let mut moved = renameat(Some(from), name, Some(to), new.as_c_str());
-        if moved == Err(Errno::EACCES) {
-            // Moving a directory to another parent takes write access to it, where kithd is not root.
-            let shut = Mode::from_bits_truncate(0o700);
-            fchmodat(Some(from), name, shut, FchmodatFlags::NoFollowSymlink)?;
-            moved = renameat(Some(from), name, Some(to), new.as_c_str());
-        }
+        let mut opened_up = false;
+        let moved = loop {
+            self.moved += 1;
+            let new = std::ffi::CString::new(format!("d{}", self.moved)).unwrap_or_default();
+            match renameat(Some(from), name, Some(to), new.as_c_str()) {
+                // Moving a directory to another parent takes write access to it, where kithd is not root.
+                Err(Errno::EACCES) if !opened_up => {
+                    let shut = Mode::from_bits_truncate(0o700);
+                    fchmodat(Some(from), name, shut, FchmodatFlags::NoFollowSymlink)?;
+                    opened_up = true;
+                }
+                // (A level that was a pod's own directory may hold the name: the next name, then.
+                // Each try is a name that is there, so there are no more tries than names.)
+                Err(Errno::ENOTEMPTY | Errno::EEXIST | Errno::ENOTDIR) => {}
+                moved => break moved,
+            }
+        };
         match moved {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(e) => Err(e.into()),
@@ -937,6 +986,10 @@ mod tests {
         std::fs::write(root.join("a/b/closed/f"), "x").unwrap();
         std::fs::set_permissions(root.join("a/b/closed"), std::fs::Permissions::from_mode(0o000)).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("a/out")).unwrap();
+        // (And one made after the files: a listing gives one of the two early, whichever its order.)
+        std::fs::create_dir_all(root.join("a/late/closed")).unwrap();
+        std::fs::write(root.join("a/late/closed/f"), "x").unwrap();
+        std::fs::set_permissions(root.join("a/late/closed"), std::fs::Permissions::from_mode(0o000)).unwrap();
         // Asked to stop at its second look: the walk ends, with the rest left where it is.
         let looks = std::cell::Cell::new(0);
         let stopped = remove_tree(&root, &|| {
@@ -947,9 +1000,13 @@ mod tests {
         assert!(root.exists());
         let left = std::fs::read_dir(root.join("a")).unwrap().count();
         assert!(0 < left && left < 2500, "{left}");
-        // Let alone, it takes all of it, and no more.
+        // Let alone, it takes all of it, and no more. (The stop may have left a level beside the
+        // root, with the shut directory in it, by the order the directory was listed in: the
+        // sweep takes it.)
         assert!(remove_tree(&root, &|| false).unwrap());
         assert!(!root.exists());
+        sweep(&top, &AtomicBool::new(false));
+        assert_eq!(levels(&top), (0, 1));
         assert_eq!(
             std::fs::metadata(outside.join("shut")).unwrap().permissions().mode() & 0o777,
             0
@@ -1073,6 +1130,60 @@ mod tests {
         }
         assert!(remove_tree(&root, &|| false).unwrap());
         assert_eq!(std::fs::read_dir(&top).unwrap().count(), 0);
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    /// A disk with no room makes no level: the directories themselves become the levels, and one
+    /// that holds the names a move would take (a non-empty `d1`, a file `d2`, a link `d3`) is no
+    /// trouble, nor is the link followed.
+    #[test]
+    fn storage_stop_a_tree_is_removed_whole_where_no_level_can_be_made() {
+        let top = dir("full");
+        let (root, outside) = (top.join("scratch.1"), top.join("outside"));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("kept"), "x").unwrap();
+        // Whichever of these is moved first becomes the level, and holds the first names the
+        // others would be moved in under: two directories that are not empty, a file, a link.
+        for n in 0..50 {
+            let s = root.join(format!("a/s{n}"));
+            std::fs::create_dir_all(s.join("d1")).unwrap();
+            std::fs::create_dir_all(s.join("d2")).unwrap();
+            std::fs::write(s.join("d1/f"), "x").unwrap();
+            std::fs::write(s.join("d2/f"), "x").unwrap();
+            std::fs::write(s.join("d3"), "x").unwrap();
+            std::os::unix::fs::symlink(&outside, s.join("d4")).unwrap();
+        }
+        let full = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert!(remove_tree_with(&root, &|| false, full).unwrap());
+        assert_eq!(levels(&top), (0, 1));
+        // A chain: each directory is the next level in its turn.
+        std::fs::create_dir(&root).unwrap();
+        chain(&root, 300);
+        assert!(remove_tree_with(&root, &|| false, full).unwrap());
+        assert_eq!(levels(&top), (0, 1));
+        assert!(outside.join("kept").exists());
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    /// A directory another remover took between the listing and the open does not end the removal.
+    #[test]
+    fn storage_stop_a_directory_gone_before_it_is_opened_is_no_error() {
+        let top = dir("gone");
+        let root = top.join("scratch.1");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        let run = Removal {
+            halted: &|| false,
+            steps: 0,
+            device: None,
+            moved: 0,
+            next: None,
+            beside: root.clone(),
+            make: |_| Ok(()),
+        };
+        let mut run = run;
+        let level = crate::backups::open_dir(&root).unwrap();
+        let gone = std::ffi::CString::new("never-there").unwrap();
+        assert!(run.empty(level.as_raw_fd(), &gone).unwrap());
         std::fs::remove_dir_all(top).unwrap();
     }
 
