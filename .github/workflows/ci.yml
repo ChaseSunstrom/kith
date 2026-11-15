@@ -27,8 +27,11 @@ jobs:
       - run: cargo test --workspace
       # A container of a kithd that is not root goes beside kithd's own cgroup, which has to be the
       # user's: the runner's is the system's, so the budget steps run in a scope of the user's systemd.
+      # Ubuntu's AppArmor gives a user namespace made by a program it has no profile for no rights
+      # (a container's mounts are then refused): this throwaway machine is told not to.
       - name: A systemd session of the runner's user, for the containers the time checks start
         run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo loginctl enable-linger "$(id -un)"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           for _ in $(seq 50); do [ -S "/run/user/$(id -u)/systemd/private" ] && break; sleep 0.2; done
