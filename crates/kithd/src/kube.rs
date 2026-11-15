@@ -708,8 +708,40 @@ fn replica_set(deployment: &Value, resource: &Resource) -> Value {
     })
 }
 
-/// The pods of what `owner` runs: one for each replica its status tells of, named by the
-/// owner and the replica's number. Made up: a pod is not a resource of kith's.
+/// The kinds that run pods, and the mark each puts before a replica's number in a pod's
+/// name: a Workload's pods are `NAME-N` (a StatefulSet's names are a contract), a Job's
+/// `NAME-jN` and a NodeWorkload's `NAME-nN`. A Job and a Workload may share a name, so the
+/// mark is what keeps their pods apart.
+const POD_MARKS: [(&str, &str); 3] = [("Workload", ""), ("Job", "j"), ("NodeWorkload", "n")];
+
+/// The name of the pod that replica `replica` of `holder` (`Workload`, `Job` or
+/// `NodeWorkload`) named `owner` is. The one place a pod's name is made.
+fn pod_name(holder: &str, owner: &str, replica: u64) -> String {
+    let mark = POD_MARKS
+        .iter()
+        .find(|(kind, _)| *kind == holder)
+        .map_or("", |(_, mark)| mark);
+    format!("{owner}-{mark}{replica}")
+}
+
+/// What a pod's name says: the kind that runs it, that kind's resource's name and the
+/// replica. The one place a pod's name is read, and only what [`pod_name`] makes is read
+/// (so `x-j0` is the Workload `x`'s pod 0 only as `x-j0-0`): anything else is no pod.
+fn pod_owner(pod: &str) -> Option<(&'static str, &str, u32)> {
+    // (Only the part after the last dash is looked at, whatever the owner is called.)
+    let (owner, ending) = pod.rsplit_once('-')?;
+    let (holder, replica) = POD_MARKS.iter().find_map(|(holder, mark)| {
+        let digits = ending.strip_prefix(mark)?;
+        // (Digits alone: not `+1`, and not a number with a zero before it, which is another's name.)
+        let canonical = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        let replica: u32 = digits.parse().ok().filter(|_| canonical)?;
+        (pod_name(holder, owner, replica.into()) == pod).then_some((*holder, replica))
+    })?;
+    (!owner.is_empty()).then_some((holder, owner, replica))
+}
+
+/// The pods of what `owner` runs: one for each replica its status tells of, named by
+/// [`pod_name`]. Made up: a pod is not a resource of kith's.
 fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
     let (template, meta) = (&owner["spec"]["template"], &owner["metadata"]);
     let mut replicas: BTreeMap<u64, Vec<&Value>> = BTreeMap::new();
@@ -828,7 +860,7 @@ fn pods(owner: &Value, resource: &Resource) -> Vec<Value> {
         json!({
             "apiVersion": "v1", "kind": "Pod",
             "metadata": {
-                "name": format!("{}-{replica}", resource.metadata.name), "namespace": meta["namespace"],
+                "name": pod_name(&resource.kind, &resource.metadata.name, replica), "namespace": meta["namespace"],
                 "labels": labels, "ownerReferences": owned, "uid": uid(&format!("{} {replica}", meta["uid"])),
                 "resourceVersion": meta["resourceVersion"], "creationTimestamp": meta["creationTimestamp"],
             },
@@ -2104,13 +2136,15 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
         let why = format!("{asked}: a unit's output is kept as it was written, all its runs in one file and not when");
         return Err(status(StatusCode::BAD_REQUEST, "BadRequest", why));
     }
-    // Which replica of what: a pod's name is its owner's and the replica's number.
-    let owner = pod.rsplit_once('-').and_then(|(owner, replica)| {
-        let replica: u32 = replica.parse().ok()?;
+    // Which replica of what: the name says (a Job's and a Workload's of one name are two).
+    let owner = pod_owner(pod).and_then(|(holder, owner, replica)| {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
-        let keys = ["Workload", "NodeWorkload", "Job"].map(|holder| format!("{holder}/{namespace}/{owner}"));
-        let made_here = |key: &String| state.store.get(key).is_some_and(|owner| raw(owner).is_some());
-        Some((keys.into_iter().find(made_here)?, replica))
+        let key = format!("{holder}/{namespace}/{owner}");
+        state
+            .store
+            .get(&key)
+            .is_some_and(|held| raw(held).is_some())
+            .then_some((key, replica))
     });
     let (key, replica) = owner.ok_or_else(|| not_found(&KINDS[0], pod))?;
     // What a unit wrote is read by who may read the resource that runs it.
@@ -2375,16 +2409,159 @@ spec: {role: writer, subjects: [carol]}
         let running = json!({ "state": "running", "succeeded": 0, "containers": [], "nodes": nodes });
         assert!(said(running).is_empty());
         let done = json!({ "state": "succeeded", "succeeded": 1, "containers": [], "nodes": nodes });
-        assert_eq!(said(done.clone()), [("ask-0".into(), "Succeeded".into(), 0.into())]);
+        assert_eq!(said(done.clone()), [("ask-j0".into(), "Succeeded".into(), 0.into())]);
         assert_eq!(pods(&job, &held(done))[0]["spec"]["nodeName"], "n2");
         let failed = json!({ "state": "failed", "succeeded": 1, "failed": 1, "containers": [], "nodes": nodes });
         assert_eq!(
             said(failed),
             [
-                ("ask-0".into(), "Succeeded".into(), 0.into()),
-                ("ask-1".into(), "Failed".into(), Value::Null)
+                ("ask-j0".into(), "Succeeded".into(), 0.into()),
+                ("ask-j1".into(), "Failed".into(), Value::Null)
             ]
         );
+    }
+
+    /// A pod's name says what made it, so one made from a name two kinds hold is two
+    /// names; it is made by `pod_name` and read back by `pod_owner`, and nothing else
+    /// that ends otherwise is a pod.
+    #[test]
+    fn pod_name_is_made_and_read_back_for_each_kind() {
+        let made = |kind, owner, replica| pod_name(kind, owner, replica);
+        assert_eq!(made("Workload", "x", 0), "x-0");
+        assert_eq!(made("Job", "x", 0), "x-j0");
+        assert_eq!(made("NodeWorkload", "x", 12), "x-n12");
+        for owner in ["x", "web-2", "x-j0", "x-n0", "a-b-c", "j", "0", "x-"] {
+            for (kind, replica) in [("Workload", 0), ("Job", 3), ("NodeWorkload", 41)] {
+                let name = made(kind, owner, replica);
+                assert_eq!(pod_owner(&name), Some((kind, owner, replica as u32)), "{name}");
+            }
+        }
+        // An owner named for another's pod is still its own: x-j0's pod is x-j0-0.
+        assert_eq!(pod_owner("x-j0-0"), Some(("Workload", "x-j0", 0)));
+        assert_eq!(pod_owner("x-j0-j0"), Some(("Job", "x-j0", 0)));
+        let all: Vec<_> = ["Workload", "Job", "NodeWorkload"]
+            .map(|kind| made(kind, "x", 0))
+            .into();
+        assert_eq!(all.len(), all.iter().collect::<BTreeSet<_>>().len(), "{all:?}");
+        // No other ending is a pod: no number, a sign, a leading zero, a letter of no kind,
+        // two marks, a number too big, no owner.
+        for no in [
+            "x",
+            "x-",
+            "x-j",
+            "x-n",
+            "x-+1",
+            "x-00",
+            "x-01",
+            "x-j01",
+            "x-jj0",
+            "x-jn0",
+            "x-J0",
+            "x-a0",
+            "x-0a",
+            "x-j0a",
+            "x-4294967296",
+            "x-j4294967296",
+            "-0",
+            "-j0",
+            "",
+            "-",
+            "x_0",
+            "x-1.0",
+            "x- 1",
+        ] {
+            assert_eq!(pod_owner(no), None, "{no:?}");
+        }
+    }
+
+    /// A Deployment and a Job of one name are two kinds and may share it: what the
+    /// Kubernetes API says of their pods and logs is of two pods, one each.
+    /// (`kubectl` is the real client of this, in tests/kube.rs; this is the same routes.)
+    #[tokio::test]
+    async fn a_deployment_and_a_job_of_one_name_are_two_pods_for_get_and_log() {
+        let dir = std::env::temp_dir().join(format!("kithd-kube-podnames-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let ask = |method: &str, group: &str, rest: &str, body: Value| {
+            let shared = shared.clone();
+            let (group, rest, body) = (group.to_string(), rest.to_string(), body.to_string());
+            let mut request = axum::http::Request::builder().method(method).body(()).unwrap();
+            request.extensions_mut().insert(Caller::Admin);
+            async move {
+                let (parts, ()) = request.into_parts();
+                let answer = serve(shared, parts, &group, &rest, Asked::new(), body.as_bytes()).await;
+                match answer {
+                    Ok(answer) => {
+                        let (code, body) = (answer.status(), answer.into_body());
+                        let text = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+                        (code, String::from_utf8_lossy(&text).into_owned())
+                    }
+                    Err(no) => (no.code, no.why),
+                }
+            }
+        };
+        let template = json!({ "metadata": { "labels": { "app": "x" } }, "spec": { "containers": [{ "name": "main", "image": "i" }] } });
+        let deployment = json!({
+            "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "x" },
+            "spec": { "replicas": 1, "selector": { "matchLabels": { "app": "x" } }, "template": template },
+        });
+        let job = json!({
+            "apiVersion": "batch/v1", "kind": "Job", "metadata": { "name": "x" },
+            "spec": { "template": { "spec": { "restartPolicy": "Never", "containers": [{ "name": "main", "image": "i" }] } } },
+        });
+        let made = ask("POST", "apps", "namespaces/default/deployments", deployment).await;
+        assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
+        let made = ask("POST", "batch", "namespaces/default/jobs", job).await;
+        assert_eq!(made.0, StatusCode::CREATED, "{}", made.1);
+        let units = json!({ "containers": [{ "name": "main", "replica": 0, "state": "running", "ready": true, "restarts": 0 }] });
+        {
+            let mut state = shared.store.lock().unwrap();
+            state
+                .store
+                .set_status("Workload/default/x", Some(units.clone()))
+                .unwrap();
+            let status = json!({ "state": "running", "containers": units["containers"] });
+            state.store.set_status("Job/default/x", Some(status)).unwrap();
+        }
+        let (code, listed) = ask("GET", "", "namespaces/default/pods", Value::Null).await;
+        assert_eq!(code, StatusCode::OK, "{listed}");
+        let listed: Value = serde_json::from_str(&listed).unwrap();
+        let mut names: Vec<_> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pod| pod["metadata"]["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["x-0", "x-j0"], "{listed}");
+        // Each is got by its name, and is its owner's.
+        for (name, owner) in [("x-0", "Deployment"), ("x-j0", "Job")] {
+            let (code, one) = ask("GET", "", &format!("namespaces/default/pods/{name}"), Value::Null).await;
+            assert_eq!(code, StatusCode::OK, "{name}: {one}");
+            let one: Value = serde_json::from_str(&one).unwrap();
+            let owned = &one["metadata"]["ownerReferences"][0]["kind"];
+            assert!(
+                owned == owner || (owner == "Deployment" && owned == "ReplicaSet"),
+                "{name}: {one}"
+            );
+        }
+        // A name that is neither is no pod.
+        for no in ["x-1", "x-j1", "x-n0", "x-00"] {
+            let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{no}"), Value::Null).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{no}: {said}");
+            let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{no}/log"), Value::Null).await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{no}: {said}");
+        }
+        // What each wrote is its own: the log of the Job's pod is the Job's.
+        std::fs::create_dir_all(&shared.logs).unwrap();
+        std::fs::write(shared.logs.join("w_default_x_0_main.out"), "the deployment's\n").unwrap();
+        std::fs::write(shared.logs.join("j_default_x_0_main.out"), "the job's\n").unwrap();
+        for (pod, wrote) in [("x-0", "the deployment's\n"), ("x-j0", "the job's\n")] {
+            let (code, said) = ask("GET", "", &format!("namespaces/default/pods/{pod}/log"), Value::Null).await;
+            assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
