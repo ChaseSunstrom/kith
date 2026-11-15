@@ -862,8 +862,9 @@ kith node status                                   # who leads the store, who vo
   another ACME directory; giving the flag agrees to that authority's terms)
   and another before it runs out. The host's DNS has to point at the ingress
   nodes first: the authority checks by asking port 80 there, and any node
-  with `--ingress` can answer (an ingress worker's are ordered by a control
-  node with `--acme`, above). `kith get service/NAME -o yaml` shows how it
+  with `--ingress` can answer (an ingress worker's are ordered by the control
+  node that leads the store, and only while it has `--acme`: give it to every
+  control node that may lead, above). `kith get service/NAME -o yaml` shows how it
   went (`tls`: its `secret` names the Secret whose certificate serves the
   host, one applied by hand included); after a failure kithd tries again an
   hour later, not sooner.

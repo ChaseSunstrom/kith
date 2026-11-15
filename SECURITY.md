@@ -548,7 +548,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 
     **An ingress worker** (`kith node token --worker --ingress`) runs from a view as
     any worker does, and its view holds what serving the cluster's hosts needs too:
-    the `tls-` Secret (certificate and key) of every host a Service exposes, and the
+    the `tls-` Secret (certificate and key) of every host a Service exposes (so whoever
+    may apply a Service with `expose.host` in a namespace decides that this namespace's
+    `tls-HOST` Secret is sent to every ingress worker: of that namespace only, and never
+    one with `trust: control`), and the
     ConfigMap `kith-system/acme`, the ACME account's thumbprint, with which it
     answers a CA's challenges. Never the account's key (`kith-system/acme-account`),
     whatever names it: a control node started with `--acme` orders and renews every

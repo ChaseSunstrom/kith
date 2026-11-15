@@ -165,6 +165,15 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
             status.is_some_and(|status| status["expose"]["state"] == "refused")
         };
         services.sort_by_key(said_refused);
+        // And one it has not reported on yet (no `address`) is not served where another
+        // claims its host: which came first is the leader's word, not this view's.
+        let host = |service: &Resource| service.spec["expose"]["host"].as_str().map(str::to_ascii_lowercase);
+        let mut claims: BTreeMap<String, usize> = BTreeMap::new();
+        for claimed in services.iter().filter_map(|service| host(service)) {
+            *claims.entry(claimed).or_default() += 1;
+        }
+        let unreported = |service: &Resource| service.status.as_ref().is_none_or(|status| status["address"].is_null());
+        services.retain(|service| !unreported(service) || host(service).is_none_or(|claimed| claims[&claimed] < 2));
     }
     for service in services {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
@@ -1094,6 +1103,11 @@ pub async fn run(
                 say(&shared, &service, tls).await;
             }
         }
+        // The leader keeps the thumbprint written whether or not anything is ordered now, so
+        // a worker has it before a renewal asks (one written only then reaches it a little late).
+        if let Some(account) = account.as_ref().filter(|_| leads && acme.is_some()) {
+            tell_thumbprint(&shared, account).await;
+        }
         if let Some(directory) = acme.as_deref().filter(|_| orders && !wanting.is_empty()) {
             let orders = async {
                 match account {
@@ -1293,6 +1307,48 @@ mod tests {
             refused,
             BTreeMap::from([("Service/default/b".to_string(), said.to_string())])
         );
+    }
+
+    /// In a worker's view (which keeps no history to say which came first) a host two Services
+    /// claim goes by what the leader wrote in their status: one it has not reported on yet is
+    /// not served, so the worker never serves the one the leader then refuses.
+    #[test]
+    fn in_a_view_a_host_two_services_claim_goes_by_the_leaders_word() {
+        let mut store = Store::default();
+        let service = |name: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: shop.example.org, via: edge }}\n---\n"
+            )
+        };
+        for resource in Resource::from_source(&(service("a") + &service("b"))).unwrap() {
+            store.put(resource.unwrap());
+        }
+        let prefix = kith_mesh::prefix(b"ca");
+        let served = |store: &Store| {
+            exposed_in(store, prefix, true)
+                .0
+                .get("shop.example.org")
+                .map(|of| of.service.clone())
+        };
+        // Neither reported on yet: neither is served.
+        assert_eq!(served(&store), None);
+        // The leader reported on b, and refused a (b came first): b, though a sorts first.
+        let mut b = store.get("Service/default/b").unwrap().clone();
+        b.status = Some(json!({ "address": "fd00::1", "expose": null }));
+        store.put(b);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/b"));
+        let mut a = store.get("Service/default/a").unwrap().clone();
+        let refused = "the host shop.example.org is already exposed by Service/default/b";
+        a.status = Some(json!({ "address": "fd00::2", "expose": { "state": "refused", "message": refused } }));
+        store.put(a);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/b"));
+        // One Service alone on its host is served before the leader says anything of it.
+        store.delete("Service/default/b").unwrap();
+        let mut a = store.get("Service/default/a").unwrap().clone();
+        a.status = None;
+        store.put(a);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/a"));
     }
 
     #[tokio::test]

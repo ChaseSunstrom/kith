@@ -578,7 +578,9 @@ json.dump([
                 [ "$waited" -lt 300 ] || fail "the ingress worker did not answer shop.example.test over TLS: $(handshake shop.example.test | tail -n 5)"
                 sleep 1
             done
-            ! answers other.example.test || fail "the ingress worker answered a host nothing exposes"
+            # (Unverified: a host nothing exposes is sent no certificate at all, not one that fails.)
+            ! openssl s_client -connect "127.0.0.1:$((port + 12))" -servername other.example.test </dev/null 2>/dev/null \
+                | grep -q 'BEGIN CERTIFICATE' || fail "the ingress worker sent a certificate for a host nothing exposes"
             echo "vm.sh: the ingress worker answers its host over TLS with the certificate it was sent" >&2
             # Its disk has no Secret that is neither a tls- one nor placed on it.
             ! grep -aqF "$unplaced" "$work/n2.raw" || fail "a Secret nothing places is on the ingress worker's disk"

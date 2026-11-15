@@ -334,7 +334,7 @@ Not measured: a store whose units report ten times a second.
    `spec.node` or over another node's (a name cut at 63 characters among them), a `synced`
    larger than a control node's.
 2. The view: the route, the client, `view.json`, the barrier, the API's refusal. `--ingress`
-   on a worker is refused when kithd starts.
+   on a worker whose Node does not say `ingress` is refused when kithd starts (T-0390).
 3. A VM test with one worker: it runs a Workload with a Secret, holds no other Secret on
    its disk, loses the Secret when the Workload leaves, comes back up with no control
    node in reach, and follows a control node that goes away.

@@ -1061,6 +1061,36 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
                 "Secret/shop/tls-shop.example.test"
             ]
         );
+
+        // It serves ingress again; then what made a host's Secret sent goes, while it still does.
+        let mut node = store.get("Node/i").unwrap().clone();
+        node.spec["ingress"] = true.into();
+        store.put(node);
+        let touched = BTreeSet::from(["Node/i"]);
+        let Some(Sent::Changed { put, .. }) = round_of(&store, 23, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert!(keys(&put).contains(&"Secret/default/tls-api.example.test".to_string()));
+        // The Service that exposed the host is deleted: the host's Secret goes with it.
+        store.delete("Service/default/api").unwrap();
+        let touched = BTreeSet::from(["Service/default/api"]);
+        let Some(Sent::Changed { gone, .. }) = round_of(&store, 24, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert!(
+            gone.contains(&"Secret/default/tls-api.example.test".to_string()),
+            "{gone:?}"
+        );
+        // A host's Secret is made one for control nodes: it goes, though its host is exposed.
+        let mut secret = store.get("Secret/shop/tls-shop.example.test").unwrap().clone();
+        secret.spec["trust"] = "control".into();
+        store.put(secret);
+        let touched = BTreeSet::from(["Secret/shop/tls-shop.example.test"]);
+        let Some(Sent::Changed { put, gone, .. }) = round_of(&store, 25, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert_eq!(gone, ["Secret/shop/tls-shop.example.test"]);
+        assert!(put.is_empty(), "{:?}", keys(&put));
     }
 
     /// Serve `app` on a loopback port with the node certificate of `me`; the port.
