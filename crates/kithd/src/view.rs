@@ -300,6 +300,18 @@ pub struct Upstream {
     pub certificate: Option<String>,
 }
 
+impl Upstream {
+    /// The node a Node resource is, as it says it is called: none until it has an address.
+    pub fn of(node: &Resource) -> Option<Upstream> {
+        let status = node.status.as_ref()?;
+        Some(Upstream {
+            name: node.metadata.name.clone(),
+            address: status["address"].as_str()?.to_string(),
+            certificate: status["certificate"].as_str().map(str::to_string),
+        })
+    }
+}
+
 /// `view.json`: the view a worker runs from when no control node is in reach.
 #[derive(Serialize, Deserialize)]
 struct Saved {
@@ -472,13 +484,8 @@ fn due(shared: &Shared, me: &str, ingress: bool) -> bool {
 fn control_nodes(shared: &Shared, me: &str) -> Vec<Upstream> {
     let state = shared.store.lock().expect("a handler panicked holding the store");
     let upstream = |node: &Resource| {
-        let status = node.status.as_ref()?;
         let control = node.spec["trust"] != "worker" && node.metadata.name != me;
-        control.then_some(Upstream {
-            name: node.metadata.name.clone(),
-            address: status["address"].as_str()?.to_string(),
-            certificate: status["certificate"].as_str().map(str::to_string),
-        })
+        control.then(|| Upstream::of(node)).flatten()
     };
     state.store.list(Some("Node")).filter_map(upstream).collect()
 }
@@ -493,10 +500,9 @@ async fn stream(
 ) -> Result<bool, String> {
     let shared = follower.shared;
     let cluster = shared.cluster.as_ref().expect("a worker is in a cluster");
-    let failed = |e: reqwest::Error| e.to_string();
+    let failed = |e: reqwest::Error| crate::cluster::why(&e);
     // No other node's certificate is taken at that address: a worker cannot stand in for it.
-    let pin = (upstream.name.clone(), upstream.certificate.clone());
-    let client = crate::cluster::client_for(&cluster.me.ca, Some(&cluster.me), Some(pin))?;
+    let client = cluster.to(upstream)?;
     let asked = client.get(format!("https://{}/v1/view", upstream.address));
     let mut reply = asked.send().await.map_err(failed)?;
     if reply.status() == StatusCode::NOT_FOUND {

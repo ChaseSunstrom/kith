@@ -692,7 +692,7 @@ pub async fn restore(
             .cloned()
             .ok_or_else(|| invalid(format!("{key} has no such backup")))?;
         let there = state.store.get(&format!("Node/{}", dir.node));
-        let address = there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()));
+        let address = there.and_then(crate::view::Upstream::of);
         // (What the Volume holds, where it says: no more than that is restored into it.)
         let cap = crate::volumes::size(&state.store, &namespace, &spec.volume).unwrap_or(u64::MAX);
         (spec, dir, entry, address, cap)
@@ -707,17 +707,25 @@ pub async fn restore(
     }
     // The volume is another node's: it is asked, for the caller (whom it checks as this node did).
     if dir.node != me {
-        let (Some(cluster), Some(address)) = (&shared.cluster, address) else {
+        let (Some(cluster), Some(there)) = (&shared.cluster, address) else {
             return Err(io(format!("node {} that has the volume has no address yet", dir.node)));
         };
         let url = format!(
-            "https://{address}/v1/backups/{namespace}/{name}/restore?at={}",
-            entry["at"]
+            "https://{}/v1/backups/{namespace}/{name}/restore?at={}",
+            there.address, entry["at"]
         );
+        // (The node that has the volume, and no other at its address.)
+        let client = cluster.to(&there).map_err(io)?;
         // (As long as a volume takes to unpack, and no longer than an hour.)
-        let asked = cluster.client.post(url).timeout(Duration::from_secs(3600));
+        let asked = client.post(url).timeout(Duration::from_secs(3600));
         let asked = asked.header(crate::access::FOR, caller.to_string()).send().await;
-        let failed = |e: reqwest::Error| io(format!("asking node {} to restore: {e}", dir.node));
+        let failed = |e: reqwest::Error| {
+            io(format!(
+                "asking node {} to restore: {}",
+                dir.node,
+                crate::cluster::why(&e)
+            ))
+        };
         let answer = asked.map_err(failed)?;
         let (fine, status) = (answer.status().is_success(), answer.status());
         let said: Value = answer.json().await.map_err(failed)?;

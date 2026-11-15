@@ -627,8 +627,9 @@ pub(crate) async fn output(
         // (A Job is run by one node, all of its runs.)
         let replica = if key.starts_with("Job/") { 0 } else { options.replica };
         let node = status["nodes"][replica.to_string()].as_str()?;
-        let there = state.store.get(&format!("Node/{node}"))?.status.as_ref()?;
-        let address = there["address"].as_str().filter(|_| node != cluster.me.name)?;
+        let there = crate::view::Upstream::of(state.store.get(&format!("Node/{node}"))?);
+        let there = there.filter(|_| node != cluster.me.name)?;
+        let address = &there.address;
         // (Whatever the caller said of `here`, the other node is asked for its own.)
         let mut query = format!(
             "replica={}&stderr={}&previous={}&here=true",
@@ -641,12 +642,16 @@ pub(crate) async fn output(
         if let Some(unit) = &options.unit {
             url.query_pairs_mut().append_pair("unit", unit);
         }
-        Some((node.to_string(), url))
+        Some((node.to_string(), there, url))
     });
-    if let (Some((node, url)), Some(cluster)) = (elsewhere, &shared.cluster) {
-        let failed = |e: reqwest::Error| ApiError::Store(Error::Io(format!("asking node {node} for the output: {e}")));
-        let asked = cluster
-            .client
+    if let (Some((node, there, url)), Some(cluster)) = (elsewhere, &shared.cluster) {
+        let failed = |e: reqwest::Error| {
+            let e = crate::cluster::why(&e);
+            ApiError::Store(Error::Io(format!("asking node {node} for the output: {e}")))
+        };
+        // (That node, and no other at its address: the output of a unit may hold secrets.)
+        let client = cluster.to(&there).map_err(|e| ApiError::Store(Error::Io(e)))?;
+        let asked = client
             .get(url)
             .header(crate::access::FOR, caller.to_string())
             .timeout(std::time::Duration::from_secs(10))

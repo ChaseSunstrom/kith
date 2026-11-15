@@ -338,6 +338,18 @@ fn pinned(cert: &CertificateDer<'_>, pin: &Pin) -> bool {
     name == pin.0 && pin.1.as_ref().is_none_or(|print| *print == key_print(&key))
 }
 
+/// Why a certificate is not the pinned node's: names the node that was called and who answered.
+fn unpinned(cert: &CertificateDer<'_>, pin: &Pin) -> String {
+    let called = &pin.0;
+    match subject_of(cert) {
+        Some(Subject::Node(name, ..)) if name == *called => {
+            format!("node {called} answered with another key than its Node names")
+        }
+        Some(Subject::Node(name, ..)) => format!("node {called} was called, and node {name} answered"),
+        _ => format!("node {called} was called, and what answered is no node of the cluster"),
+    }
+}
+
 impl ServerCertVerifier for AnyNode {
     fn verify_server_cert(
         &self,
@@ -349,11 +361,10 @@ impl ServerCertVerifier for AnyNode {
     ) -> Result<ServerCertVerified, rustls::Error> {
         let name = ServerName::try_from(ANY_NODE).expect("a DNS name");
         let verified = self.0.verify_server_cert(end_entity, intermediates, &name, ocsp, now)?;
-        if self.1.as_ref().is_some_and(|pin| !pinned(end_entity, pin)) {
-            let why = "this is another node of the cluster than the one that was called";
-            return Err(rustls::Error::General(why.into()));
+        match &self.1 {
+            Some(pin) if !pinned(end_entity, pin) => Err(rustls::Error::General(unpinned(end_entity, pin))),
+            _ => Ok(verified),
         }
-        Ok(verified)
     }
 
     fn verify_tls12_signature(

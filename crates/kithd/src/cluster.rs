@@ -45,8 +45,11 @@ pub struct Cluster {
     /// Tokens of another use: who sends one becomes the cluster's first admin (`--claim`).
     pub claims: pki::Tokens,
     joining: tokio::sync::Mutex<()>,
-    /// Calls other nodes as this one.
+    /// Calls other nodes as this one: any node of the cluster is taken at the address. Only for
+    /// calls that carry nothing for one node alone; the rest go through [`Cluster::to`].
     pub client: reqwest::Client,
+    /// The clients [`Cluster::to`] made, by node name: each with the print it was pinned to.
+    pinned: std::sync::Mutex<std::collections::HashMap<String, (Option<String>, reqwest::Client)>>,
 }
 
 type Fallible<T> = Result<T, String>;
@@ -73,8 +76,44 @@ impl Cluster {
             tokens: pki::Tokens::default(),
             claims: pki::Tokens::default(),
             joining: tokio::sync::Mutex::new(()),
+            pinned: Default::default(),
         })
     }
+
+    /// A client that calls the node `to` and no other: its certificate must be that node's by
+    /// name, and by the key its Node names where it names one. One per node (a new one when
+    /// the key changes), so a connection kept open is not made again for each call.
+    pub fn to(&self, to: &crate::view::Upstream) -> Fallible<reqwest::Client> {
+        let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
+        if let Some((print, client)) = made.get(&to.name)
+            && *print == to.certificate
+        {
+            return Ok(client.clone());
+        }
+        let pin = (to.name.clone(), to.certificate.clone());
+        let client = client_for(&self.me.ca, Some(&self.me), Some(pin))?;
+        made.insert(to.name.clone(), (to.certificate.clone(), client.clone()));
+        Ok(client)
+    }
+
+    /// Forget the clients of nodes that are no more (`is_node` says which are), so what [`Cluster::to`]
+    /// holds is as big as the nodes there are, whatever Nodes came and went.
+    pub fn forget_but(&self, is_node: impl Fn(&str) -> bool) {
+        let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
+        made.retain(|name, _| is_node(name));
+    }
+}
+
+/// An error with what caused it: a refused certificate is the last of the chain, and names
+/// the node that was called and who answered.
+pub fn why(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text = format!("{text}: {cause}");
+        source = cause.source();
+    }
+    text
 }
 
 /// Who is on the other end of a TCP connection.
@@ -1047,6 +1086,205 @@ pub async fn request_join(
         return Err(format!("{address} answered with a CA the token is not for"));
     }
     Ok(joined)
+}
+
+/// What the tests of a call to one node need: nodes of one CA, and one that counts what it is sent.
+#[cfg(test)]
+pub(crate) mod pinned_peer {
+    use super::*;
+    use crate::view::Upstream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub fn node(ca: &pki::Ca, name: &str) -> Identity {
+        let (cert, key) = ca.issue(name).unwrap();
+        Identity {
+            name: name.into(),
+            ca: ca.cert.clone(),
+            cert,
+            key,
+        }
+    }
+
+    /// Serves, on a loopback port, as the node `me`: whatever is asked is counted, and answered `{}`.
+    /// The address, and how many requests got through.
+    pub async fn answering_as(me: &Identity) -> (String, Arc<AtomicUsize>) {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, pki::server_config(me).unwrap()).unwrap();
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counted = sent.clone();
+        let app = Router::new().fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Json(serde_json::json!({})))
+        });
+        tokio::spawn(async move { drop(axum::serve(listener, app.into_make_service()).await) });
+        (address, sent)
+    }
+
+    /// `node` as a Node would say it is called at `address`, its key printed or not.
+    pub fn at(node: &str, address: &str, certificate: Option<String>) -> Upstream {
+        Upstream {
+            name: node.into(),
+            address: address.into(),
+            certificate,
+        }
+    }
+
+    /// The state of the node `me`, whose store has a Node for each of `nodes`, called where they say.
+    pub async fn shared_with(tag: &str, me: Identity, nodes: &[Upstream]) -> Arc<Shared> {
+        let dir = std::env::temp_dir().join(format!("kithd-pinned-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cluster = Cluster::new(me, None).unwrap();
+        let shared = crate::replica(Some(cluster), &dir, Duration::from_secs(300)).await;
+        let shared = shared.unwrap();
+        for node in nodes {
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{name: {}}}\nspec: {{}}\n",
+                node.name
+            );
+            let resource = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            let status = serde_json::json!({
+                "address": node.address, "certificate": node.certificate, "state": "ready", "raftId": "1",
+            });
+            let mut state = shared.store.lock().unwrap();
+            state.store.apply(resource).unwrap();
+            let key = format!("Node/{}", node.name);
+            state.store.set_status(&key, Some(status)).unwrap();
+        }
+        shared
+    }
+
+    #[tokio::test]
+    async fn pinned_peer_is_the_node_named_and_no_other() {
+        let ca = pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let cluster = Cluster::new(a, None).unwrap();
+        let (taken, to_x) = answering_as(&x).await;
+        let (home, to_b) = answering_as(&b).await;
+        let (print_b, print_x) = (pki::print_of(&b.cert).unwrap(), pki::print_of(&x.cert).unwrap());
+        let call = |address: &str, print: Option<String>| {
+            let client = cluster.to(&at("b", address, print)).unwrap();
+            client
+                .post(format!("https://{address}/v1/secret"))
+                .body("hunter2")
+                .send()
+        };
+
+        // Another node of the cluster answers at the address of b: refused in the handshake, so
+        // nothing of the request is sent, and the error says who was called and who answered.
+        for print in [Some(print_b.clone()), None] {
+            let said = why(&call(&taken, print).await.unwrap_err());
+            assert!(said.contains("node b was called, and node x answered"), "{said}");
+        }
+        assert_eq!(to_x.load(Ordering::SeqCst), 0);
+        // The right name with another key than its Node names: refused.
+        let said = why(&call(&home, Some(print_x)).await.unwrap_err());
+        assert!(said.contains("node b answered with another key"), "{said}");
+        // A Node that names no key is held to its name alone; one that does, to both.
+        assert_eq!(to_b.load(Ordering::SeqCst), 0);
+        for print in [None, Some(print_b.clone())] {
+            assert!(call(&home, print).await.unwrap().status().is_success());
+        }
+        assert_eq!(to_b.load(Ordering::SeqCst), 2);
+        // One client for a node, replaced when its key changes: the map is as big as the nodes called.
+        assert_eq!(cluster.pinned.lock().unwrap().len(), 1);
+        // A node whose Node is deleted is forgotten, and the others are not.
+        cluster.to(&at("c", &home, None)).unwrap();
+        cluster.forget_but(|name| name == "c");
+        assert_eq!(cluster.pinned.lock().unwrap().keys().collect::<Vec<_>>(), ["c"]);
+        // The plain client takes any node of the cluster: it is not for what is meant for one.
+        let any = cluster.client.post(format!("https://{taken}/v1/secret")).send().await;
+        assert!(any.unwrap().status().is_success() && to_x.load(Ordering::SeqCst) == 1);
+    }
+
+    fn sources(dir: &std::path::Path, into: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, into);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                // What a file does is above its first test module.
+                let code = text.split("#[cfg(test)]").next().unwrap().to_string();
+                let name = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap();
+                into.push((name.display().to_string().replace('\\', "/"), code));
+            }
+        }
+    }
+
+    /// A call that carries what is meant for one node goes through `Cluster::to`, which pins the
+    /// peer to its name and key. Every other way a client is made or used here (the cluster's plain
+    /// client, which takes any node of the cluster; a client of one's own; the TLS settings of one)
+    /// is on this list, each with its reason, and no others.
+    #[test]
+    fn every_call_to_a_node_is_pinned_or_on_the_short_list() {
+        let short_list = [
+            // The upload to a bucket: a client of the world outside, by the name it was given.
+            ("src/backups.rs", 1),
+            // A blob fetched by digest and checked against it, whoever sends it (two calls).
+            ("src/blobs.rs", 2),
+            // The boot-time unlock: only a key wrapped under the disk's own secret goes.
+            ("src/crypt.rs", 1),
+            // The probe of a candidate voter asks for the CA, which every node hands out; and the
+            // Raft links, which hold the plain client they were made with (T-0424).
+            ("src/raft.rs", 2),
+            // The Raft links are made before the store is: they know an id and an address.
+            ("src/main.rs", 1),
+            // `client_for` (the pinned clients and the plain one) and the join, which the token's
+            // hash of the CA makes safe: its client takes any certificate, and the CA it is handed
+            // has to be the token's.
+            ("src/cluster.rs", 3),
+            // The TLS settings of a client, which `client_for` is given a pin for.
+            ("src/pki.rs", 1),
+            // The world outside: registries, images, ACME, the update, the installer.
+            ("src/registry.rs", 2),
+            ("src/acme.rs", 3),
+            ("src/update.rs", 1),
+            ("src/install.rs", 1),
+        ];
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 20, "the sources were not found");
+        for (file, code) in &files {
+            // (`.client` takes in `cluster.client` and an alias of it: `&c.client`, a closure.)
+            // (Not `.clients`, a field of its own: what follows the name is not a letter.)
+            let field = code
+                .split(".client")
+                .skip(1)
+                .filter(|after| !after.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+                .count();
+            let plain = code.matches("Client::builder").count() + code.matches("client_config(").count() + field;
+            let allowed = short_list.iter().find(|(name, _)| name == file).map_or(0, |(_, n)| *n);
+            assert_eq!(
+                plain, allowed,
+                "{file} makes or uses a client {plain} times; the short list says {allowed}"
+            );
+            // The key a Node names is only ever put in a pin here and in `to`.
+            if file != "src/cluster.rs" && file != "src/pki.rs" {
+                assert!(!code.contains("client_for("), "{file} builds its own pinned client");
+            }
+        }
+        // And what is pinned is: each relay goes through `to`.
+        for relay in [
+            "src/crypt.rs",
+            "src/volume_files.rs",
+            "src/backups.rs",
+            "src/api/run.rs",
+            "src/api.rs",
+            "src/encrypted.rs",
+            "src/replicas.rs",
+            "src/view.rs",
+            "src/raft.rs",
+            "src/blobs.rs",
+            "src/members.rs",
+        ] {
+            let (_, code) = files.iter().find(|(name, _)| name == relay).unwrap();
+            assert!(code.contains("cluster.to("), "{relay} does not pin");
+        }
+    }
 }
 
 #[cfg(test)]

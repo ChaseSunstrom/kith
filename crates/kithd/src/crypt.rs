@@ -822,17 +822,22 @@ pub async fn pass(
         let cluster = cluster.ok_or("this node is in no cluster: the key of its state is its own to keep")?;
         if name != cluster.me.name {
             // (Asked by a node, this is the node it meant, or nobody is.)
-            let address = {
+            let there = {
                 let state = shared.store.lock().expect("a handler panicked holding the store");
                 let there = state.store.get(&format!("Node/{name}")).filter(|_| caller.node().is_none());
-                there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()))
+                there.and_then(crate::view::Upstream::of)
             };
-            let address = address.ok_or(format!("{name} is not a node known here with an address"))?;
-            let ask = cluster.client.post(format!("https://{address}/v1/lock/{name}/passphrase"));
+            let there = there.ok_or(format!("{name} is not a node known here with an address"))?;
+            // (Only the node named is sent it: not another of the cluster at its address.)
+            let ask = cluster.to(&there)?;
+            let ask = ask.post(format!("https://{}/v1/lock/{name}/passphrase", there.address));
             let ask = ask.timeout(Duration::from_secs(60)).json(&json!({ "passphrase": passphrase }));
             // (For whoever asked this node: the node the passphrase is of asks what they may.)
             let ask = ask.header(crate::access::FOR, caller.to_string());
-            let unreached = |e: reqwest::Error| format!("{name} cannot be reached, and a passphrase is its own to keep ({e})");
+            let unreached = |e: reqwest::Error| {
+                let e = crate::cluster::why(&e);
+                format!("{name} cannot be reached, and a passphrase is its own to keep ({e})")
+            };
             let answer = ask.send().await.map_err(unreached)?;
             let fine = answer.status().is_success();
             let said: Value = answer.json().await.map_err(unreached)?;
@@ -861,6 +866,27 @@ pub async fn pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn pinned_peer_is_sent_no_passphrase() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        // Node/b is where another node of the cluster answers now: its address was b's.
+        let (taken, to_x) = answering_as(&x).await;
+        let there = at("b", &taken, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("passphrase", a, &[there]).await;
+        let given = Json(Given {
+            passphrase: Some("correct horse".into()),
+        });
+        let answer = pass(State(shared), Extension(Caller::Admin), Named("b".into()), given).await;
+        assert_eq!(answer.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+        let said = String::from_utf8_lossy(&body);
+        assert!(said.contains("node b was called, and node x answered"), "{said}");
+        assert_eq!(to_x.load(Ordering::SeqCst), 0, "x was sent the passphrase");
+    }
 
     #[test]
     fn crypt_keys_open_only_under_their_secret() {

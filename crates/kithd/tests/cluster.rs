@@ -616,6 +616,64 @@ fn volume_files_go_in_and_come_out_through_another_node() {
 }
 
 #[test]
+fn relays_reach_the_node_they_name() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "relays";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two nodes with addresses", || {
+        alpha.nodes().iter().filter(|(_, at)| !at.is_empty()).count() == 2
+    });
+    let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: beta, path: d }\n";
+    std::fs::write(alpha.dir.join("volume.yaml"), yaml).unwrap();
+    alpha.ok(&["apply", "-f", "volume.yaml"]);
+    let src = alpha.dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("file"), b"for beta and no other").unwrap();
+    let data = beta.dir.join("state/volumes/default/data/d");
+    std::fs::create_dir_all(&data).unwrap();
+
+    // The node the Volume is on gets what is sent to it, through alpha.
+    alpha.ok(&["volume", "put", "data", "src"]);
+    assert_eq!(std::fs::read(data.join("file")).unwrap(), b"for beta and no other");
+
+    // Beta is gone, and another node of the cluster answers at its address: the CA signed it, and
+    // it is not beta. What alpha relays for beta is not sent to it.
+    let (port, token) = (beta.port, alpha.ok(&["node", "token"]));
+    beta.stop();
+    let gamma = Node::start_in(
+        None,
+        "127.0.0.1",
+        port,
+        test,
+        "gamma",
+        &["--join", &alpha.address(), "--token", token.trim()],
+    );
+    wait_for("gamma to be listed", || {
+        alpha.nodes().iter().any(|(name, _)| name == "gamma")
+    });
+    for args in [
+        &["volume", "put", "data", "src"][..],
+        &["volume", "get", "data", "back"],
+    ] {
+        let (code, _, err) = alpha.kith(args);
+        assert!(
+            code != 0 && err.contains("node beta was called, and node gamma answered"),
+            "{args:?}: {err}"
+        );
+    }
+    assert!(std::fs::read_dir(alpha.dir.join("back")).is_ok_and(|mut back| back.next().is_none()));
+    assert!(!gamma.dir.join("state/volumes/default/data").exists());
+}
+
+#[test]
 fn a_volumes_replica_has_its_files_and_takes_over_when_its_node_is_lost() {
     if std::env::var_os("KITH_E2E").is_none() {
         eprintln!("skipped: set KITH_E2E=1");

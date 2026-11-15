@@ -19,6 +19,7 @@ use crate::Shared;
 use crate::access::Caller;
 use crate::cluster::{Peer, refuse};
 use crate::pki::{self, Subject};
+use crate::view::Upstream;
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, Request, State};
@@ -85,7 +86,7 @@ async fn take(mut request: Request) -> Result<(Spec, OnUpgrade), (StatusCode, St
 /// The node to run on, and where to reach it (`None`: this one). `on` is a node's name, or
 /// `key=value[,key=value]`: the first Node, by name, that is ready and has all these labels.
 // ponytail: labels by equality only; no set-based selectors, no choosing by load.
-fn resolve(shared: &Shared, on: &str) -> Result<(String, Option<String>), ApiError> {
+fn resolve(shared: &Shared, on: &str) -> Result<(String, Option<Upstream>), ApiError> {
     let me = shared.cluster.as_ref().map_or("local", |c| c.me.name.as_str());
     let state = shared.store.lock().expect("a handler panicked holding the store");
     let ready = |node: &Resource| node.status.as_ref().is_some_and(|s| s["state"] == "ready");
@@ -118,8 +119,8 @@ fn resolve(shared: &Shared, on: &str) -> Result<(String, Option<String>), ApiErr
     if name == me {
         return Ok((name, None));
     }
-    match node.status.as_ref().and_then(|s| s["address"].as_str()) {
-        Some(address) => Ok((name, Some(address.into()))),
+    match Upstream::of(node) {
+        Some(there) => Ok((name, Some(there))),
         None => Err(invalid(format!("node {name} has no address"))),
     }
 }
@@ -151,22 +152,22 @@ pub async fn run(
     if let Err(refused) = permit(&shared, &caller, Verb::Exec, |_| vec![("Node".into(), None)]) {
         return refused.into_response();
     }
-    let (node, address) = match resolve(&shared, &spec.on) {
+    let (node, there) = match resolve(&shared, &spec.on) {
         Ok(found) => found,
         Err(e) => return e.into_response(),
     };
-    let Some(address) = address else {
+    let Some(there) = there else {
         return start(&shared, &caller, &node, spec, upgrade);
     };
-    forward(&shared, &caller, &node, &address, spec, upgrade).await
+    forward(&shared, &caller, &node, &there, spec, upgrade).await
 }
 
-/// Passes the tunnel to `address`'s `run-hop`, as this node.
+/// Passes the tunnel to the node `there`'s `run-hop`, as this node: that node, and no other at its address.
 async fn forward(
     shared: &Arc<Shared>,
     caller: &Caller,
     node: &str,
-    address: &str,
+    there: &Upstream,
     spec: Spec,
     upgrade: OnUpgrade,
 ) -> Response {
@@ -184,16 +185,24 @@ async fn forward(
         via: spec.via.clone(),
         argv: spec.argv.clone(),
     };
-    let send = cluster
-        .client
-        .post(format!("https://{address}/v1/run-hop"))
+    let client = match cluster.to(there) {
+        Ok(client) => client,
+        Err(why) => return failed(StatusCode::BAD_GATEWAY, why),
+    };
+    let send = client
+        .post(format!("https://{}/v1/run-hop", there.address))
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, PROTOCOL)
         .json(&hop)
         .send();
     let reply = match tokio::time::timeout(HOP, send).await {
         Ok(Ok(reply)) => reply,
-        Ok(Err(e)) => return failed(StatusCode::BAD_GATEWAY, format!("node {node} did not answer: {e}")),
+        Ok(Err(e)) => {
+            return failed(
+                StatusCode::BAD_GATEWAY,
+                format!("node {node} did not answer: {}", crate::cluster::why(&e)),
+            );
+        }
         Err(_) => {
             return failed(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -870,11 +879,17 @@ spec: {role: other-jobber, subjects: [carol]}
         world.node("aa", "role: display", None);
         world.node("c", "role: display, zone: x", Some(1));
         let said = |on: &str| resolve(&world.a, on).map_err(|e| e.into_response().status().as_u16());
-        let at = |port: u16| Some(format!("127.0.0.1:{port}"));
-        assert_eq!(said("role=display"), Ok(("b".into(), at(world.b_port))));
-        assert_eq!(said("role=display,zone=x"), Ok(("c".into(), at(1))));
+        let at = |name: &str, port: u16| {
+            Some(crate::cluster::pinned_peer::at(
+                name,
+                &format!("127.0.0.1:{port}"),
+                None,
+            ))
+        };
+        assert_eq!(said("role=display"), Ok(("b".into(), at("b", world.b_port))));
+        assert_eq!(said("role=display,zone=x"), Ok(("c".into(), at("c", 1))));
         assert_eq!(said("a"), Ok(("a".into(), None)));
-        assert_eq!(said("b"), Ok(("b".into(), at(world.b_port))));
+        assert_eq!(said("b"), Ok(("b".into(), at("b", world.b_port))));
         assert_eq!(said("role=nothing"), Err(404));
         assert_eq!(said("nobody"), Err(404));
         assert_eq!(said("aa"), Err(422));
