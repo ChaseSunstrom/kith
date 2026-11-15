@@ -80,6 +80,10 @@ def free_port():
         return s.getsockname()[1]
 
 
+class NotHere(Exception):
+    """A timed path that this machine cannot run (no container starts on it), and what kithd said."""
+
+
 class Daemon:
     """A kithd of its own: state and socket under dir, its log beside them."""
 
@@ -104,6 +108,11 @@ class Daemon:
         with open(path, "w") as f:
             json.dump(doc, f)
         return self.kith("apply", "-f", path)
+
+    def said(self):
+        """The last lines of its log, on one line."""
+        with open(self.log.name) as log:
+            return " | ".join(log.read().splitlines()[-6:])
 
     def stop(self):
         self.proc.send_signal(signal.SIGTERM)
@@ -132,7 +141,11 @@ def apply_to_running(bins, dir):
     try:
         began = time.monotonic()
         node.apply("workload", WORKLOAD)
-        wait_until(lambda: running(node, "timing") == 1, "the container to run")
+        deadline = began + 20
+        while running(node, "timing") != 1:
+            if time.monotonic() > deadline:
+                raise NotHere(node.said())
+            time.sleep(0.005)
         return time.monotonic() - began
     finally:
         node.stop()
@@ -215,9 +228,13 @@ def medians(bins, tmp, runs):
     found = {}
     for name, measure in TIMED.items():
         times = []
-        for i in range(runs):
-            dir = os.path.join(tmp, f"{name.split()[0]}-{i}")
-            times.append(measure(bins, dir))
+        try:
+            for i in range(runs):
+                dir = os.path.join(tmp, f"{name.split()[0]}-{i}")
+                times.append(measure(bins, dir))
+        except NotHere as said:
+            print(f"skip {name}: it cannot be run here: {said}")
+            continue
         found[name] = (statistics.median(times), times)
     return found
 
@@ -308,9 +325,15 @@ def main():
             results.append(check(name, "peak RSS", rss, 1 if self_test else limit))
         rss = idle_rss(os.path.join(bin_dir, "kithd"), tmp)
         results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
-        for name, (median, _) in medians(bin_dir, tmp, 1 if self_test else RUNS).items():
+        timed = medians(bin_dir, tmp, 1 if self_test else RUNS)
+        for name in TIMED:
             budget = 0.001 if self_test else TIME_BUDGETS[name]
-            results.append(check_time(name, median, budget))
+            if name in timed:
+                results.append(check_time(name, timed[name][0], budget))
+            elif not self_test and budget is not None:
+                # (A path with a budget is held to it: where it cannot be run, that is a failure.)
+                print(f"FAIL {name}: it has a budget and could not be run here")
+                results.append(False)
     if self_test:
         # With 1-byte and 1 ms budgets every check must fail; otherwise the checks check nothing.
         if any(results):
