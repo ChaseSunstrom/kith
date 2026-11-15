@@ -265,24 +265,32 @@ fn stop(id: &str, slot: &mut Slot) {
         return;
     };
     slot.tried = Some(Instant::now());
-    if let Err(undeleted) = handle.delete() {
-        slot.handle = undeleted.handle.map(|handle| *handle);
-        if slot.handle.is_some() {
-            slot.probes = None;
-            if slot.state == "running" {
-                slot.state = "stopping";
+    match handle.delete() {
+        Ok(()) => {
+            // Gone: the "stopping" message of an earlier pass is over.
+            if slot.message.as_deref().is_some_and(|m| m.starts_with("stopping: ")) {
+                slot.message = None;
             }
-            let message = format!(
-                "stopping: {}; its devices and name are held until it is gone",
-                undeleted.error
-            );
-            // Said once, not on every pass while it stays stuck.
-            if slot.message.as_ref() != Some(&message) {
+        }
+        Err(undeleted) => {
+            slot.handle = undeleted.handle.map(|handle| *handle);
+            if slot.handle.is_some() {
+                slot.probes = None;
+                if slot.state == "running" {
+                    slot.state = "stopping";
+                }
+                let message = format!(
+                    "stopping: {}; its devices and name are held until it is gone",
+                    undeleted.error
+                );
+                // Said once, not on every pass while it stays stuck.
+                if slot.message.as_ref() != Some(&message) {
+                    eprintln!("kithd: {id}: {}", undeleted.error);
+                }
+                slot.message = Some(message);
+            } else {
                 eprintln!("kithd: {id}: {}", undeleted.error);
             }
-            slot.message = Some(message);
-        } else {
-            eprintln!("kithd: {id}: {}", undeleted.error);
         }
     }
     slot.leaving = slot.handle.is_some();
@@ -312,18 +320,41 @@ fn kept_once_gone(drop: bool) -> bool {
 /// refused is tried again at the next pass, and the unit keeps running.
 fn plugs_in_place(slot: &Slot, new: &Slot) -> bool {
     let running = slot.handle.is_some() && !slot.leaving && matches!(slot.run, Run::Container(_));
+    running && devices_in_place(slot, new)
+}
+
+/// Whether `new` differs from `slot` in input devices alone, all of which the container takes as it
+/// runs (see `in_place`). Only a running container can be given them (see `plugs_in_place`).
+fn devices_in_place(slot: &Slot, new: &Slot) -> bool {
     let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
         (slot.devices.iter().collect(), new.devices.iter().collect());
     let gone: Vec<&PathBuf> = was.difference(&now).copied().filter(|path| !path.exists()).collect();
-    running && in_place(&was, &now, &gone)
+    in_place(&was, &now, &gone)
 }
 
-/// Why a unit `id` with the device nodes `devices` waits: a unit still stopping has its id, and
-/// the device nodes it had (its processes may still hold them). `None` when nothing is held.
-fn held_by_leaving(id: &str, devices: &[PathBuf], leaving: &[(String, Vec<PathBuf>)]) -> Option<String> {
-    leaving.iter().find_map(|(other, held)| {
+/// What a refused change of a running container's devices does to the unit. A refused removal
+/// replaces it: the container may still hold a node the kernel gives to another device. A refused
+/// plug alone keeps it running, and it is tried again at the next pass. (`plugged`: the plugs went in.)
+fn refusal_replaces(plugged: bool) -> bool {
+    plugged
+}
+
+/// Why a unit `id` of `owner`, with the device nodes `devices`, waits: a unit still stopping has its
+/// id, and the device nodes it had (its processes may still hold them). Units of one owner share one
+/// set of devices, so a sibling's hold is the owner's own and does not hold it back. `None` when
+/// nothing is held.
+fn held_by_leaving(
+    id: &str,
+    owner: &str,
+    devices: &[PathBuf],
+    leaving: &[(String, String, Vec<PathBuf>)],
+) -> Option<String> {
+    leaving.iter().find_map(|(other, other_owner, held)| {
         if other == id {
             return Some(format!("waiting: {other} is still stopping: its processes remain"));
+        }
+        if other_owner == owner {
+            return None;
         }
         devices
             .iter()
@@ -759,7 +790,8 @@ impl Controller {
             {
                 continue;
             }
-            stop_unit(&mut self.slots, id, false);
+            // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
+            stop_unit(&mut self.slots, id, !wanted.contains_key(id));
         }
         let mut stale: Vec<String> = Vec::new();
         fn of(slot: &Slot) -> (&str, u32) {
@@ -849,12 +881,14 @@ impl Controller {
         // The input devices of running units, given or taken as they run. After the stops above: a
         // device a unit still stopping holds (one stopped this pass that did not go included) is not
         // given to another, and what waits for it says so in its status.
-        let leaving_now: Vec<(String, Vec<PathBuf>)> = self
+        let leaving_now: Vec<(String, String, Vec<PathBuf>)> = self
             .slots
             .iter()
             .filter(|(_, s)| s.leaving)
-            .map(|(id, s)| (id.clone(), s.devices.clone()))
+            .map(|(id, s)| (id.clone(), s.owner.clone(), s.devices.clone()))
             .collect();
+        // Units whose removal was refused: replaced below, once the borrows of the loop are over.
+        let mut replace: Vec<String> = Vec::new();
         for (id, slot) in &mut self.slots {
             let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
                 continue;
@@ -865,25 +899,32 @@ impl Controller {
             let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
                 (slot.devices.iter().collect(), new.devices.iter().collect());
             let added: Vec<PathBuf> = now.difference(&was).map(|path| (*path).clone()).collect();
-            if let Some(why) = held_by_leaving(id, &added, &leaving_now) {
+            if let Some(why) = held_by_leaving(id, &slot.owner, &added, &leaving_now) {
                 slot.message = Some(why);
                 continue;
             }
-            let given = now.difference(&was).try_for_each(|path| handle.plug(path));
-            let taken = given.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
+            let plugged = now.difference(&was).try_for_each(|path| handle.plug(path));
+            let plugged_ok = plugged.is_ok();
+            let taken = plugged.and_then(|()| was.difference(&now).try_for_each(|path| handle.unplug(path)));
             match taken {
                 Ok(()) => {
                     eprintln!("kithd: {id}: its input devices changed, and it has them as it runs");
                     slot.devices = new.devices.clone();
                     slot.message = None;
                 }
-                // Still running: the comparison above does not replace it for this, so the plug is
-                // tried again at the next pass.
+                // Still running: the comparison above does not replace it for this, so the change is
+                // tried again at the next pass. A refused removal replaces it (see refusal_replaces).
                 Err(e) => {
                     eprintln!("kithd: {id}: {e}");
                     slot.message = Some(format!("waiting: {e}"));
+                    if refusal_replaces(plugged_ok) {
+                        replace.push(id.clone());
+                    }
                 }
             }
+        }
+        for id in replace {
+            stop_unit(&mut self.slots, &id, true);
         }
         let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
@@ -949,11 +990,11 @@ impl Controller {
         }
         // The units still stopping, with their devices: what is due waits for them (see
         // held_by_leaving). One that starts stopping in this pass is added as it does.
-        let mut leaving: Vec<(String, Vec<PathBuf>)> = self
+        let mut leaving: Vec<(String, String, Vec<PathBuf>)> = self
             .slots
             .iter()
             .filter(|(_, slot)| slot.leaving)
-            .map(|(id, slot)| (id.clone(), slot.devices.clone()))
+            .map(|(id, slot)| (id.clone(), slot.owner.clone(), slot.devices.clone()))
             .collect();
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
@@ -1000,7 +1041,7 @@ impl Controller {
                 job_moved |= self.jobs.contains_key(&slot.owner) || slot.init;
                 if slot.leaving {
                     // Its processes remain: it is stopping, and what is due waits for it.
-                    leaving.push((id.clone(), slot.devices.clone()));
+                    leaving.push((id.clone(), slot.owner.clone(), slot.devices.clone()));
                     slot.held = true;
                     continue;
                 }
@@ -1013,7 +1054,7 @@ impl Controller {
                     false => "waiting for its init containers".into(),
                 });
             } else if slot.start_at.is_some_and(|at| at <= Instant::now()) {
-                if let Some(why) = held_by_leaving(id, &slot.devices, &leaving) {
+                if let Some(why) = held_by_leaving(id, &slot.owner, &slot.devices, &leaving) {
                     slot.held = true;
                     slot.message = Some(why);
                     continue;
@@ -1048,7 +1089,7 @@ impl Controller {
                         slot.failures += 1;
                         job_moved |= self.jobs.contains_key(&slot.owner);
                         if slot.leaving {
-                            leaving.push((id.clone(), slot.devices.clone()));
+                            leaving.push((id.clone(), slot.owner.clone(), slot.devices.clone()));
                             slot.held = true;
                         }
                     }
@@ -1735,60 +1776,122 @@ mod tests {
         assert!(!fits(&[key], &[key, card], &[]));
     }
 
-    /// A unit whose stop failed while processes remain is leaving: nothing with its id, or with
-    /// a device node it holds, starts until it is gone. A device it does not hold is no hold.
+    /// A slot of `owner`, with the device nodes `devices`, that runs the container `name`.
+    fn slot_of(owner: &str, devices: &[&str], name: &str) -> Slot {
+        let container: Container = serde_json::from_value(json!({ "name": name, "image": "img" })).unwrap();
+        Slot {
+            owner: owner.into(),
+            revision: None,
+            replica: 0,
+            run: Run::Container(container),
+            policy: RestartPolicy::Always,
+            env: Ok(Vec::new()),
+            rolling: false,
+            probes: None,
+            pod: None,
+            notes: BTreeMap::new(),
+            devices: devices.iter().map(PathBuf::from).collect(),
+            seat: None,
+            volumes: Vec::new(),
+            files: Ok(Vec::new()),
+            init: false,
+            after: 0,
+            held: false,
+            leaving: false,
+            drop: false,
+            tried: None,
+            accounted: false,
+            tuned: None,
+            handle: None,
+            state: "pending",
+            restarts: 0,
+            failures: 0,
+            exit_code: None,
+            message: None,
+            started: Instant::now(),
+            start_at: None,
+        }
+    }
+
+    /// A unit whose stop failed while processes remain is leaving: nothing with its id, or with a
+    /// device node it holds, starts until it is gone. A device it does not hold is no hold. Units of
+    /// one owner share its devices, so a sibling's hold is no hold for the others.
     #[test]
     fn leaving_units_hold_back_their_id_and_their_device_nodes() {
-        let leaving = vec![("w_a_b_0_x".to_string(), vec![PathBuf::from("/dev/dri/card0")])];
         let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
-        let same_id = held_by_leaving("w_a_b_0_x", &[], &leaving).expect("the same id is held");
+        let leaving = vec![(
+            "w_a_b_0_x".to_string(),
+            "Workload/a/b".to_string(),
+            paths(&["/dev/dri/card0"]),
+        )];
+        let same_id = held_by_leaving("w_a_b_0_x", "Workload/a/b", &[], &leaving).expect("the same id is held");
         assert!(same_id.contains("still stopping"), "{same_id}");
-        let same_device =
-            held_by_leaving("w_a_b_0_y", &paths(&["/dev/dri/card0"]), &leaving).expect("a device it holds is held");
+        let same_device = held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/dri/card0"]), &leaving)
+            .expect("a device it holds is held");
         assert!(same_device.contains("/dev/dri/card0"), "{same_device}");
         assert_eq!(
-            held_by_leaving("w_a_b_0_y", &paths(&["/dev/input/event0"]), &leaving),
+            held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/input/event0"]), &leaving),
             None
         );
-        assert_eq!(held_by_leaving("w_a_b_0_y", &paths(&["/dev/dri/card0"]), &[]), None);
+        assert_eq!(
+            held_by_leaving("w_a_b_0_y", "Workload/c/d", &paths(&["/dev/dri/card0"]), &[]),
+            None
+        );
+        assert_eq!(
+            held_by_leaving("w_a_b_1_x", "Workload/a/b", &paths(&["/dev/dri/card0"]), &leaving),
+            None,
+            "a sibling of the same owner shares the devices"
+        );
     }
 
     /// A unit that ended on its own, with processes left, is kept once they are gone: its state, exit
-    /// code and restarts stay and it is not run again. One stopped to be replaced or dropped is removed.
+    /// code and restarts stay, and it is not run again. One stopped to be replaced is removed.
     #[test]
     fn leaving_exit_is_not_run_again() {
-        assert!(kept_once_gone(false), "an exit is kept, not run again");
+        let id = "w_a_b_0_app";
+        let mut ended = slot_of("Workload/a/b", &[], "app");
+        (ended.leaving, ended.state, ended.exit_code) = (true, "exited", Some(0));
+        let mut slots = BTreeMap::from([(id.to_string(), ended)]);
+        stop_unit(&mut slots, id, false);
+        let kept = slots.get(id).expect("an exit is kept");
+        assert_eq!(
+            (kept.state, kept.exit_code, kept.leaving, kept.start_at.is_none()),
+            ("exited", Some(0), false, true),
+            "kept as it ended, with nothing to start"
+        );
+        stop_unit(&mut slots, id, true);
         assert!(
-            !kept_once_gone(true),
+            !slots.contains_key(id),
             "a replaced unit goes, and what is wanted starts afresh"
         );
     }
 
-    /// A plug of an input device into a running container is no reason to start it over: a plug that
-    /// is refused keeps the unit running, and it is tried again at the next pass. A device that cannot
-    /// be plugged (a DRI node, or an input device the unit did not start with) still restarts it.
+    /// An input device plugged into a running container is no reason to start it over, so the device
+    /// alone does not make the slot differ. Only a container that runs takes them so; a DRI node, or
+    /// an input device the unit did not start with, still restarts it.
     #[test]
-    fn refused_plug_keeps_running() {
-        let (input, other, card) = (
-            PathBuf::from("/dev/input/event0"),
-            PathBuf::from("/dev/input/event1"),
-            PathBuf::from("/dev/dri/card0"),
+    fn input_devices_alone_do_not_replace_a_running_container() {
+        let slot = slot_of("Workload/a/b", &["/dev/input/event0"], "app");
+        let plugged = slot_of("Workload/a/b", &["/dev/input/event0", "/dev/input/event1"], "app");
+        let card = slot_of("Workload/a/b", &["/dev/dri/card0"], "app");
+        assert!(devices_in_place(&slot, &plugged), "a plug is taken in place");
+        assert!(!devices_in_place(&slot, &card), "a DRI node is not");
+        // Without a handle nothing runs: the unit is replaced, not plugged.
+        assert!(
+            !plugs_in_place(&slot, &plugged),
+            "a unit that is not running is replaced"
         );
-        assert!(in_place(
-            &[&input].into_iter().collect(),
-            &[&input, &other].into_iter().collect(),
-            &[]
-        ));
-        assert!(!in_place(
-            &[&input].into_iter().collect(),
-            &[&input, &card].into_iter().collect(),
-            &[]
-        ));
-        assert!(!in_place(
-            &[&card].into_iter().collect(),
-            &[&input, &other].into_iter().collect(),
-            &[]
-        ));
+    }
+
+    /// A refused removal replaces the unit, since the container may still hold the node it lost. A
+    /// refused plug alone keeps it running, and it is tried again at the next pass.
+    #[test]
+    fn refused_unplug_replaces_the_unit() {
+        assert!(
+            refusal_replaces(true),
+            "the plugs went in, so the refusal is the removal"
+        );
+        assert!(!refusal_replaces(false), "a refused plug alone is tried again");
     }
 
     #[test]

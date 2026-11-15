@@ -94,11 +94,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   A device node a unit was given (an exclusive Device's, most of all) is not given to another
   unit while the unit that had it still runs: a unit whose stop failed with processes left
   keeps its devices and its name, its stop is retried at a later pass and no more often than
-  every 2 s, and a unit that wants those devices waits until the unit is gone. A device
-  plugged into a running unit that is refused keeps that unit running, and is tried again at
-  the next pass. Its id is refused at create and exec while its last run still has processes,
-  and the next start of kithd, whose cleanup kills and removes what it finds with errors
-  ignored, clears it. Only a real path under /dev counts (a link or an alias is refused where
+  every 2 s, and a unit that wants those devices waits until the unit is gone (a unit of the
+  same Workload has the same devices, and waits for nothing of its own). A device plugged into
+  or pulled from a running unit is refused: a refused plug keeps the unit running and is tried
+  again at the next pass, and a refused pull replaces it, as the container may still hold the
+  node. Its id is refused at create and exec while its last run still has processes (those of
+  its child cgroups too), and the next start of kithd, whose cleanup kills and removes what it
+  finds with errors ignored, clears it. Only a real path under /dev counts (a link or an alias is refused where
   a device is given or plugged), so one node has one path. What is left: kithd holds this in
   memory, so a restart of kithd forgets the devices held; a process that moved out of the
   unit's cgroup is not counted; a cgroup whose processes cannot be read is taken to still

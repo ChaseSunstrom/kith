@@ -738,12 +738,17 @@ fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl Fn
     Ok(())
 }
 
-/// Whether a cgroup still has processes. A cgroup that is gone has none; one whose
-/// `cgroup.procs` cannot be read may have some.
+/// Whether a cgroup still has processes, its child cgroups' included (`populated` in `cgroup.events`,
+/// which a unit's `nested` cgroups set too). A cgroup that is gone has none; one whose events cannot be
+/// read may have some. Without `cgroup.events` its own `cgroup.procs` says.
 fn has_processes(cgroup: &Path) -> bool {
-    match fs::read_to_string(cgroup.join("cgroup.procs")) {
-        Ok(procs) => !procs.trim().is_empty(),
-        Err(e) => e.kind() != io::ErrorKind::NotFound,
+    match fs::read_to_string(cgroup.join("cgroup.events")) {
+        Ok(events) => events.lines().any(|line| line.trim() == "populated 1"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::read_to_string(cgroup.join("cgroup.procs")) {
+            Ok(procs) => !procs.trim().is_empty(),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        },
+        Err(_) => true,
     }
 }
 
@@ -1941,5 +1946,21 @@ mod tests {
             "its last run is gone: the id is free"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A unit's processes may sit in its child cgroups (`nested`): `populated` in `cgroup.events`
+    /// counts them, where its own `cgroup.procs` is empty.
+    #[test]
+    fn has_processes_counts_child_cgroups() {
+        let cgroup = std::env::temp_dir().join(format!("kith-populated-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cgroup);
+        fs::create_dir_all(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.procs"), "").unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(has_processes(&cgroup), "a child cgroup has processes");
+        fs::write(cgroup.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert!(!has_processes(&cgroup), "nothing is left in it or below");
+        let _ = fs::remove_dir_all(&cgroup);
+        assert!(!has_processes(&cgroup), "a cgroup that is gone has none");
     }
 }
