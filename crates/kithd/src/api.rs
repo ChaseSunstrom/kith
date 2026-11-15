@@ -71,6 +71,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))
         .route("/v1/seats/{name}/activity", post(crate::seats::activity))
+        .route("/v1/drain/{name}", get(drain_plan).post(drain_set))
         // (The network boot file is 40 MB.)
         .route(
             "/v1/netboot",
@@ -367,6 +368,53 @@ pub(crate) async fn applied(
         Done::Changes(changes) => Ok(veiled(shared, caller, changes)),
         _ => Err(odd()),
     }
+}
+
+#[derive(Deserialize)]
+struct DrainOptions {
+    /// `drain` or `undrain`.
+    #[serde(rename = "do")]
+    step: String,
+}
+
+/// What `kith node drain` would do to what runs on the node (`GET /v1/drain/NAME`): one line
+/// per Workload, Job and NodeWorkload with a copy there, for whoever may get those kinds.
+async fn drain_plan(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+) -> Reply<Vec<serde_json::Value>> {
+    permit(&shared, &caller, Verb::Get, |_| vec![("Node".to_string(), None)])?;
+    let seen = crate::sched::seen_at(&shared, std::time::Instant::now());
+    let grace = shared.lost_after;
+    read(&shared, |store| {
+        let grants = Grants::of(&caller, store);
+        let lines = crate::sched::drain_lines(store, &seen, grace, &name);
+        let may = |line: &serde_json::Value| {
+            let kind = line["kind"].as_str().unwrap_or_default();
+            grants.may(&Verb::Get, kind, line["namespace"].as_str())
+        };
+        Ok(lines.into_iter().filter(may).collect())
+    })
+}
+
+/// Drains or undrains the node (`POST /v1/drain/NAME?do=drain|undrain`): an apply of the Node
+/// through `applied()`, so whoever may apply Nodes may drain them, and it is audited as one.
+async fn drain_set(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Path(name): Path<String>,
+    Query(options): Query<DrainOptions>,
+) -> Reply<Vec<Change>> {
+    permit(&shared, &caller, Verb::Apply, |_| vec![("Node".to_string(), None)])?;
+    let key = format!("Node/{name}");
+    let Json(mut node) = read(&shared, |store| store.get(&key).cloned().ok_or(Error::NotFound(key.clone())))?;
+    match options.step.as_str() {
+        "drain" => crate::sched::drain_on(&mut node.spec),
+        "undrain" => crate::sched::drain_off(&mut node.spec),
+        other => return Err(ApiError::Store(Error::Invalid(format!("do is drain or undrain, not {other}")))),
+    }
+    applied(&shared, &caller, vec![node]).await.map(Json)
 }
 
 #[derive(Deserialize)]
@@ -691,7 +739,7 @@ mod tests {
     #[tokio::test]
     async fn a_share_or_a_backup_reaches_no_further_than_its_writer_may() {
         let dir = std::env::temp_dir().join(format!("kithd-reach-{}", std::process::id()));
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         let roles = "
 apiVersion: kith.dev/v1
 kind: Role
@@ -757,7 +805,7 @@ spec: {}
     #[tokio::test]
     async fn a_watch_ends_when_its_identity_no_longer_stands() {
         let dir = std::env::temp_dir().join(format!("kithd-watch-identity-{}", std::process::id()));
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         let ca = crate::pki::Ca::create().unwrap();
         let (_, _, public) = ca.issue_user("alice").unwrap();
         let (_, _, given) = ca.issue_user("alice").unwrap();
@@ -862,7 +910,7 @@ spec: {role: reader, subjects: [alice]}
     #[tokio::test]
     async fn dry_runs_wait_for_one_of_four() {
         let dir = std::env::temp_dir().join(format!("kithd-dry-{}", std::process::id()));
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         let resource = serde_json::from_value::<Resource>(serde_json::json!({
             "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": "c" }, "spec": {}
         }))

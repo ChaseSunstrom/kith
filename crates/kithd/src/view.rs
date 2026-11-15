@@ -880,7 +880,7 @@ spec: {}
         };
         let (a, w, taken) = (node("a"), node("w"), node("x"));
         let cluster = crate::cluster::Cluster::new(w, None).unwrap();
-        let shared = crate::replica(Some(cluster), &dir).await.unwrap();
+        let shared = crate::replica(Some(cluster), &dir, std::time::Duration::from_secs(300)).await.unwrap();
         // Until its first view it keeps what Raft keeps.
         assert!(dir.join("raft").exists() && shared.view.borrow().is_none());
         let whole = Sent::Whole {

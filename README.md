@@ -832,6 +832,61 @@ certificates last ten years and cannot be renewed (a node's stops being taken wh
 an Identity's when the Identity is), and `kith` itself
 only talks to the kithd on its own machine.
 
+## Restarting a node on purpose
+
+To restart or upgrade a node without losing its work, drain it first. A drain
+cordons the node and puts the `kith.dev/drain` taint on it (`NoExecute`).
+Replicas that can run elsewhere are started on other nodes. A replica pinned to
+the node (by a Volume, a Device, or its placement) stays, and so does a running
+Job: a drain never stops one. A replica no other node can take stays too, and
+the plan says why, before anything is changed.
+
+```sh
+kith node drain n1 --dry-run   # says what moves and what stays, and why; changes nothing
+kith node drain n1             # cordons n1 and starts the movable replicas elsewhere
+# restart n1 here
+kith node undrain n1           # takes the drain off; replicas that moved are not moved back
+```
+
+- The dry run and the drain print the same plan: one line per Workload,
+  NodeWorkload and Job on the node, with where it moves to, or why it stays and
+  what happens if the node is lost (it waits for the node, or starts over).
+- Undrain removes only what the drain put on the node: a cordon its owner set
+  earlier stays. A replica placed on the node after undrain may go back there.
+- A drain and an undrain are applies of the Node, so they go in the audit log,
+  and only who may apply Nodes may drain. The plan can be read by whoever may
+  read Nodes and what runs on them.
+
+### Checkpointing a long GPU Job
+
+A Job runs to its end on one node, and a drain never stops it. Keep a Job's
+state on a Volume, which is a directory on that node: when the Job starts, its
+program reads the last checkpoint in that directory and carries on from it. If
+the node is lost, the Job waits for the node (its Volume is there), and starts
+again from the last checkpoint when it returns.
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: train-state }
+spec: { node: n1, path: train }
+---
+apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: train }
+spec:
+  template:
+    containers:
+      - name: run
+        image: example/train
+        command: [sh, -c, 'exec train --checkpoint-dir /state']
+        volumeMounts: [{ volume: train-state, path: /state }]
+```
+
+The GPU itself is a `DeviceClaim` on the container, as in [Hardware](#hardware).
+The checkpointing is the program's: kith keeps the directory and starts the
+Job on the node that has it, not the checkpoint format.
+
 ## DNS
 
 ```sh

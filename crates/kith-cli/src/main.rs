@@ -393,6 +393,16 @@ enum NodeCommand {
     },
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
+    /// Move what runs on NAME to other nodes, and keep new replicas off it: each replica that
+    /// cannot move is said first. A running Job and a replica pinned to NAME stay where they are
+    Drain {
+        name: String,
+        /// Say what would happen, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Let NAME take replicas again: takes off what `kith node drain` put on it
+    Undrain { name: String },
     /// Have this node install machines that start from the network (PXE): each erases its disk and joins
     ///
     /// For an hour at most, and only the machines whose network cards are named. Without
@@ -780,6 +790,61 @@ impl Read for Piped {
             return Err(std::io::Error::other("tar did not read all of it (it says why above)"));
         }
         Ok(n)
+    }
+}
+
+/// What `kith node drain` says before it changes anything: one line per copy kithd's plan
+/// (`GET /v1/drain/NAME`) puts on the node, and what happens to it.
+fn drain_text(name: &str, plan: &[serde_json::Value]) -> Vec<String> {
+    if plan.is_empty() {
+        return vec![format!("nothing runs on {name}: nothing moves")];
+    }
+    plan.iter()
+        .map(|line| {
+            let key = line["key"].as_str().unwrap_or_default();
+            let who = match line["replica"].as_str() {
+                Some(replica) => format!("{key}#{replica}"),
+                None => key.to_string(),
+            };
+            let why = line["why"].as_str().unwrap_or_default();
+            let if_lost = line["if_lost"].as_str().unwrap_or_default();
+            match line["outcome"].as_str().unwrap_or_default() {
+                "moves" => format!("  {who} moves to {}", line["to"].as_str().unwrap_or_default()),
+                "stays" => format!("  {who} stays on {name}: {why}; if {name} is lost, {if_lost}"),
+                "removed" => format!("  {who} comes off {name}: {why}; {if_lost}"),
+                _ => format!("  {who} cannot be placed on any node: {why}"),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::drain_text;
+    use serde_json::json;
+
+    #[test]
+    fn drain_says_what_moves_stays_and_what_is_lost_before_anything_changes() {
+        let plan = [
+            json!({"key": "Workload/web", "replica": "0", "outcome": "moves", "to": "b", "why": "",
+                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
+            json!({"key": "Job/default/train", "replica": "0", "outcome": "stays", "to": null,
+                   "why": "running here: a drain leaves it to finish",
+                   "if_lost": "starts over on another node once the node is lost, if one can take it"}),
+            json!({"key": "Workload/data", "replica": "0", "outcome": "stays", "to": null,
+                   "why": "no other node can take it: 0/2 nodes can take it: 1 cordoned, 1 not enough cpu",
+                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
+            json!({"key": "NodeWorkload/agent", "replica": null, "outcome": "removed", "to": null,
+                   "why": "another NoExecute taint is on the node", "if_lost": "its copy comes back when the node does"}),
+        ];
+        let text = drain_text("a", &plan);
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert_eq!(text[0], "  Workload/web#0 moves to b", "{text:?}");
+        assert!(text[1].contains("Job/default/train#0 stays on a: running here"), "{text:?}");
+        // The last node that can run it: the drain keeps it, and says why.
+        assert!(text[2].contains("stays on a: no other node can take it"), "{text:?}");
+        assert!(text[3].starts_with("  NodeWorkload/agent comes off a:"), "{text:?}");
+        assert_eq!(drain_text("a", &[]), ["nothing runs on a: nothing moves"]);
     }
 }
 
@@ -1285,6 +1350,33 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     _ => format!("{name} is wiped: the cluster has forgotten the key of its state"),
                 }
             );
+        }
+        Command::Node {
+            command: NodeCommand::Drain { name, dry_run },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("drains are planned by kithd: leave out --store");
+            };
+            // kithd works out what the drain does; this only says it, before anything changes.
+            let plan: Vec<serde_json::Value> = request(&kithd, "GET", &format!("/v1/drain/{name}"), b"")?;
+            for line in drain_text(&name, &plan) {
+                println!("{line}");
+            }
+            if dry_run {
+                println!("dry run: nothing changed");
+            } else {
+                let _: serde_json::Value = request(&kithd, "POST", &format!("/v1/drain/{name}?do=drain"), b"")?;
+                println!("{name} is drained: its replicas above move, and nothing new is placed on it");
+            }
+        }
+        Command::Node {
+            command: NodeCommand::Undrain { name },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("drains are set by kithd: leave out --store");
+            };
+            let _: serde_json::Value = request(&kithd, "POST", &format!("/v1/drain/{name}?do=undrain"), b"")?;
+            println!("{name} takes replicas again: the replicas that moved off it are not moved back");
         }
         Command::Node {
             command: NodeCommand::Passphrase { name, off },

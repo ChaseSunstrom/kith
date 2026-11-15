@@ -759,7 +759,7 @@ mod tests {
     async fn the_routes_are_for_who_may_mount_the_volume_and_carry_its_files() {
         let dir = std::env::temp_dir().join(format!("kithd-volume-files-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let shared = crate::replica(None, &dir).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
         let me = shared.members.me().to_string();
         let volume = |namespace: &str, path: &str| {
             let volume = json!({
