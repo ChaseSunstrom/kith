@@ -302,7 +302,9 @@ spec:
   numbers: it needs `unconfined`.
 - **No sandbox of its own inside, unless it asks.** Steam's runtime, Flatpak and a
   browser start what they run in a user namespace they make themselves (bubblewrap), and
-  do not start without. `userNamespaces: true` lets the calls for namespaces (`unshare`,
+  do not start without (bubblewrap's own words for it:
+  `bwrap: Unexpected capabilities but not setuid, old file caps config?`).
+  `userNamespaces: true` lets the calls for namespaces (`unshare`,
   `setns`, `clone`, `clone3`) and those that mount (`mount` to `mount_setattr` in the
   list above; not `open_by_handle_at`) through the filter and covers nothing in the
   container's `/proc` and `/sys/firmware` (the kernel gives a namespace made inside no
@@ -2911,7 +2913,10 @@ the partition table reads right; the spare table is written at the disk's new
 end before the first one is touched, so a power cut in the middle leaves one of
 them whole, and the next start finishes from that one. `kith.grow=off` on the
 kernel command line keeps the disk as it is. A node that ran an older kith OS grows its state the first time it starts
-a release with this in it.
+a release with this in it. A state partition that has not grown (a VM's disk
+left as long as the image, or `kith.grow=off`) has room for almost nothing: a
+first pull of a large image onto it fails with `No space left`. One trial, a
+Flatpak runtime in a pod, needed about 4.3 GB of state.
 
 ### Installing from the network
 
