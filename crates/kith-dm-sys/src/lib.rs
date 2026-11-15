@@ -210,6 +210,18 @@ pub fn connect_filter(cgroup: &File, program: &[u8]) -> Result<()> {
     cgroup_program(cgroup, program, 18, 11)
 }
 
+/// The last lines of what the verifier wrote in `log` (to its first NUL), to follow the
+/// error: none where it wrote nothing, and said to be cut short where it filled the room.
+fn verifier_said(log: &[u8], cut: bool) -> String {
+    let said = String::from_utf8_lossy(&log[..log.iter().position(|&b| b == 0).unwrap_or(log.len())]);
+    let lines: Vec<&str> = said.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = lines[lines.len().saturating_sub(6)..].join(" / ");
+    format!(": the verifier: {tail}{}", if cut { " (cut short)" } else { "" })
+}
+
 /// Load `program` as a `kind` of program for `attach`, and put it on `cgroup` as that.
 fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
@@ -234,13 +246,13 @@ fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Resu
             load[24..28].copy_from_slice(&1u32.to_ne_bytes());
             load[28..32].copy_from_slice(&(log.len() as u32).to_ne_bytes());
             load[32..40].copy_from_slice(&(log.as_mut_ptr() as u64).to_ne_bytes());
-            if let Ok(loaded) = bpf(5, &load) {
-                loaded
-            } else {
-                let said = String::from_utf8_lossy(&log[..log.iter().position(|&b| b == 0).unwrap_or(log.len())]);
-                let lines: Vec<&str> = said.lines().filter(|line| !line.trim().is_empty()).collect();
-                let tail = lines[lines.len().saturating_sub(6)..].join(" / ");
-                return Err(Error::new(refused.kind(), format!("{refused}: the verifier: {tail}")));
+            match bpf(5, &load) {
+                Ok(loaded) => loaded,
+                // (ENOSPC: what it had to say did not fit.)
+                Err(again) => {
+                    let said = verifier_said(&log, again.raw_os_error() == Some(libc::ENOSPC));
+                    return Err(Error::new(refused.kind(), format!("{refused}{said}")));
+                }
             }
         }
     };
@@ -334,6 +346,23 @@ mod tests {
         assert!(device_filter(&here, &[]).is_err() && device_filter(&here, &[0; 7]).is_err());
         // r0 = 1, and no exit.
         assert!(device_filter(&here, &[0xb7, 0, 0, 0, 1, 0, 0, 0]).is_err());
+    }
+
+    /// Of what the verifier wrote: its last lines, said to be cut short where it filled
+    /// the room, and nothing where it wrote nothing.
+    #[test]
+    fn the_verifier_says_why_in_its_last_lines() {
+        let log = b"0: (b7) r0 = 1\n\n1: (95) exit\nR0 !read_ok\n\0\0junk";
+        assert_eq!(
+            verifier_said(log, false),
+            ": the verifier: 0: (b7) r0 = 1 / 1: (95) exit / R0 !read_ok"
+        );
+        assert_eq!(
+            verifier_said(b"a\nb\nc\nd\ne\nf\ng\n\0", true),
+            ": the verifier: b / c / d / e / f / g (cut short)"
+        );
+        assert_eq!(verifier_said(b"\0\0\0", false), "");
+        assert_eq!(verifier_said(b" \n\n", false), "");
     }
 
     /// What is no ext4 file system is not grown, and says so (a loop device and a real
