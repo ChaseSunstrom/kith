@@ -83,6 +83,10 @@ struct Args {
     /// Bytes of output kept per unit and stream before the file is moved aside (one old copy is kept)
     #[arg(long, env = "KITH_LOG_CAP", value_name = "BYTES", default_value_t = 10 << 20)]
     log_cap: u64,
+    /// Bytes the state disk keeps free: under them the pod that wrote the most outside its volumes
+    /// is replaced, one each count. 0 for none [default: 5% of the disk, at most 1 GiB, as root; 0 otherwise]
+    #[arg(long, env = "KITH_STORAGE_RESERVE", value_name = "BYTES")]
+    storage_reserve: Option<u64>,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -773,7 +777,13 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let releases = releases::run(shared.clone(), stopping.clone());
             let poll = std::time::Duration::from_secs(args.repository_poll);
             let repositories = registry::run(shared.clone(), poll, stopping.clone());
-            let units = controller::run(shared.clone(), runtime, args.log_cap, stopping.clone());
+            let units = controller::run(
+                shared.clone(),
+                runtime,
+                args.log_cap,
+                args.storage_reserve,
+                stopping.clone(),
+            );
             let sources = sources::run(shared.clone(), state.clone(), args.local_sources, stopping.clone());
             let controllers = controllers::run(shared.clone(), stopping.clone());
             let plans = update::run(shared.clone(), stopping.clone());

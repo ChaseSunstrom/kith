@@ -287,7 +287,7 @@ async fn sync(
             // volume itself then, in use, and stays. (The store is held for the two renames.)
             let store = shared.store.lock().expect("a handler panicked holding the store");
             if !replica(&store.store, &dir, shared.members.me()) {
-                let _ = std::fs::remove_dir_all(&new);
+                crate::backups::remove_unpacked(&new);
                 return Err("this node is not a replica of it any more".to_string());
             }
             // (No marker while the two are changing places: a crash there starts over.)
@@ -546,7 +546,7 @@ mod tests {
     fn a_replica_swaps_in_what_it_was_sent_and_sets_aside_what_it_was_not() {
         let root = std::env::temp_dir().join(format!("kith-replica-swap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let (dir, new) = (root.join("d"), root.join("d.restoring"));
+        let (dir, new) = (root.join("d"), root.join(".d.restoring"));
         let fill = |at: &Path, text: &str| {
             std::fs::create_dir_all(at).unwrap();
             std::fs::write(at.join("file"), text).unwrap();
@@ -589,7 +589,7 @@ mod tests {
         assert!(refused.contains("more than 98303 bytes"), "{refused}");
         // The copy as it was, nothing beside it and no archive left.
         assert_eq!(std::fs::read_to_string(into.join("old")).unwrap(), "before");
-        assert!(!root.join("d.restoring").exists() && !root.join("d.old").exists());
+        assert!(!root.join(".d.restoring").exists() && !root.join("d.old").exists());
         assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
         // As much as the volume holds: the copy.
         place(sent(&temp, 98_304), &temp, &into, 98_304, swapped).unwrap();

@@ -1,4 +1,7 @@
 [toolchain]
-channel = "stable"
+# One compiler, not a channel: crates/kithd/kithd.order is of this one (another names a
+# tenth of kithd's start-up functions otherwise, and kithd idles in half as much memory
+# again). After changing it: python3 ci/order.py, then build and python3 ci/site_numbers.py.
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-unknown-linux-musl"]

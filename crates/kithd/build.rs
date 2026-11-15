@@ -30,10 +30,11 @@ fn main() {
         Some(lld) => {
             // (lld takes no `INSERT` with a discard: it has the script's own form, and the
             // order is in it, a line for each function's section.)
-            // (A function the compiler thinks seldom runs is in `.text.unlikely.NAME`.)
+            // (A function the compiler thinks seldom runs is in `.text.unlikely.NAME`. Each
+            // line of the file is a name as a pattern: ci/order.py says of what.)
             let hot: String = include_str!("kithd.order")
                 .lines()
-                .map(|name| format!("    *(.text.{0} .text.unlikely.{0})\n", loose(name)))
+                .map(|name| format!("    *(.text.{name} .text.unlikely.{name})\n"))
                 .collect();
             let (template, place) = (include_str!("no-unwind-lld.ld"), "    /* kithd.order */\n");
             assert!(
@@ -57,24 +58,6 @@ fn main() {
     arg(format!("-Wl,-T,{}", script.display()));
     arg("-Wl,--no-eh-frame-hdr".into());
     arg("-Wl,-z,pack-relative-relocs".into());
-}
-
-/// A function's name as the pattern of its section: what Rust writes before each crate's
-/// name (`Cs…_`, made from the crate's version, its dependencies' and the compiler's) is any
-/// letters, so the order outlives a `cargo update` and a new compiler. (ci/order.py's check
-/// reads names the same way.)
-fn loose(name: &str) -> String {
-    let (mut pattern, mut rest) = (String::new(), name);
-    while let Some(at) = rest.find("Cs").filter(|_| name.starts_with("_R")) {
-        pattern.push_str(&rest[..at + 2]);
-        rest = &rest[at + 2..];
-        let made = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
-        if made > 0 && rest[made..].starts_with('_') {
-            pattern.push('*');
-            rest = &rest[made..];
-        }
-    }
-    pattern + rest
 }
 
 /// The directory of the toolchain's `ld.lld` (the one rustc itself links with where lld is

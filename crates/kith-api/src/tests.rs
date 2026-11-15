@@ -1440,3 +1440,76 @@ fn an_encrypted_volume_and_a_confidential_template_are_checked() {
         assert!(refused.contains(why), "{bad}: {refused}");
     }
 }
+
+/// `resources.storage` on a container: how much its pod may write outside its Volumes, a
+/// whole number of bytes, checked when applied. An exec unit and a VM have no root of their
+/// own to count, and are refused one.
+#[test]
+fn storage_limit_is_bytes_a_container_may_write() {
+    let job = |template: &str| {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Job\nmetadata: {{ name: j }}\nspec:\n  template: {template}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map_err(|e| e.msg)
+    };
+    let read = job("{ containers: [{ name: c, image: i, resources: { storage: 1Gi } }] }").unwrap();
+    assert_eq!(
+        read[0].spec["template"]["containers"][0]["resources"],
+        json!({ "storage": "1Gi" })
+    );
+    for good in [
+        "{ containers: [{ name: c, image: i, resources: { storage: 500M, memory: 1Gi } }] }",
+        "{ initContainers: [{ name: f, image: i, resources: { storage: 1Gi } }], containers: [{ name: c, image: i }] }",
+    ] {
+        job(good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    for (bad, why) in [
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: 500m } }] }",
+            "container `c`: resources.storage: `500m` is not a whole number of bytes",
+        ),
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: 0 } }] }",
+            "`0` is not a whole number of bytes from 1 to 2^53 - 1",
+        ),
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: 9007199254740992 } }] }",
+            "from 1 to 2^53 - 1",
+        ),
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: lots } }] }",
+            "invalid quantity `lots`",
+        ),
+        (
+            "{ exec: [{ name: e, command: [a], resources: { storage: 1Gi } }] }",
+            "exec `e`: resources.storage: an exec unit has no root of its own to count",
+        ),
+        (
+            "{ vms: [{ name: v, kernel: /k, memory: 1Gi, resources: { storage: 1Gi } }] }",
+            "vm `v`: resources.storage: a VM writes to its disks, not to a root of its own",
+        ),
+    ] {
+        let refused = job(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    // Resources is shared with what a node keeps back, a namespace's quota and a seat's
+    // reserve: none of them reads storage, so none takes it.
+    let read = |kind: &str, spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: n }}\nspec: {spec}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map_err(|e| e.msg)
+    };
+    for (kind, spec, field) in [
+        ("Node", "{ reserved: { storage: 1Gi } }", "reserved"),
+        ("Namespace", "{ quota: { storage: 1Gi } }", "quota"),
+        ("Seat", "{ node: a, reserve: { storage: 1Gi } }", "reserve"),
+    ] {
+        let refused = read(kind, spec).unwrap_err();
+        assert!(
+            refused.contains(&format!("{field}.storage: is not read here")),
+            "{kind}: {refused}"
+        );
+        let without = spec.replace("storage", "memory");
+        read(kind, &without).unwrap_or_else(|e| panic!("{kind} {without}: {e}"));
+    }
+}
