@@ -327,6 +327,13 @@ fn default_state() -> Option<PathBuf> {
     }
 }
 
+/// Why a node that makes or holds a cluster's CA cannot be reached, when it listens on every
+/// address and was not told where it is.
+fn unreachable_listen(listen: std::net::SocketAddr, advertised: bool, holds_ca: bool) -> Option<String> {
+    (listen.ip().is_unspecified() && !advertised && holds_ca)
+        .then(|| format!("other nodes cannot reach {listen}: say where this node is with --advertise ADDR:PORT"))
+}
+
 /// This node's place in a cluster, and the port it serves other nodes on: made on the
 /// first start with `--listen` or `--join`, read back from the state directory after that.
 async fn membership(
@@ -347,6 +354,13 @@ async fn membership(
         std::net::Ipv4Addr::UNSPECIFIED.into()
     };
     let listen = args.listen.unwrap_or((anywhere, 7443).into());
+    // As the first process the address is waited for from the network, and said below.
+    let holds_ca = known.as_ref().map_or(args.join.is_none(), |(_, ca)| ca.is_some());
+    if !init::is_init() {
+        if let Some(why) = unreachable_listen(listen, args.advertise.is_some(), holds_ca) {
+            return Err(why);
+        }
+    }
     let tcp = tokio::net::TcpListener::bind(listen).await;
     let tcp = tcp.map_err(|e| format!("listening on {listen}: {e}"))?;
     if let Some((me, ca)) = known {
@@ -719,10 +733,10 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 }
                 advertise = init::ADDRESS.get().map(|ip| format!("{ip}:{}", address.port()));
             }
-            if address.ip().is_unspecified() && advertise.is_none() && cluster.ca.is_some() {
-                return Err(format!(
-                    "other nodes cannot reach {address}: say where this node is with --advertise ADDR:PORT"
-                ));
+            if let Some(why) = unreachable_listen(address, advertise.is_some(), cluster.ca.is_some()) {
+                // (As the first process it stops now: the rest would run for a node nobody can reach.)
+                shared.stop.send_replace(true);
+                return Err(why);
             }
             if args.claim {
                 cluster::offer_claim(&shared);
@@ -962,6 +976,43 @@ mod tests {
 
     use super::*;
     use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn unreachable_listen_is_refused_for_a_cluster_maker_on_an_unspecified_address_without_advertise() {
+        let any: std::net::SocketAddr = "0.0.0.0:7443".parse().unwrap();
+        let some: std::net::SocketAddr = "10.0.0.5:7443".parse().unwrap();
+        let why = unreachable_listen(any, false, true).expect("refused");
+        assert!(
+            why.contains("cannot reach 0.0.0.0:7443") && why.contains("--advertise"),
+            "{why}"
+        );
+        assert!(unreachable_listen("[::]:7443".parse().unwrap(), false, true).is_some());
+        // Said where it is, a specific address, or a node that joined (it said where it is by joining).
+        assert!(unreachable_listen(any, true, true).is_none());
+        assert!(unreachable_listen(some, false, true).is_none());
+        assert!(unreachable_listen(any, false, false).is_none());
+    }
+
+    #[test]
+    fn unreachable_listen_ends_the_start_before_a_cluster_is_made_or_a_port_is_bound() {
+        let dir = std::env::temp_dir().join(format!("kith-unreachable-listen-{}", std::process::id()));
+        let state = dir.join("state");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let args = |more: &[&str]| {
+            let mut all = vec!["kithd", "--state", state.to_str().unwrap(), "--listen"];
+            all.extend(more);
+            Args::try_parse_from(all)
+        };
+        let refused = rt.block_on(membership(&args(&["0.0.0.0:0"]).unwrap(), &state)).err();
+        assert!(refused.is_some_and(|e| e.contains("--advertise")));
+        assert!(!state.join("pki").exists(), "no cluster was made");
+        let said = args(&["0.0.0.0:0", "--advertise", "10.0.0.5:7443"]).unwrap();
+        assert!(rt.block_on(membership(&said, &state)).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn serves_says_the_dns_port_and_ingress_and_is_null_when_neither_flag_is_given() {
