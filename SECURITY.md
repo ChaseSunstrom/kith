@@ -142,6 +142,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
   signed only by keys it was checked against there.
+- **An image under a rule of the cluster's** (a `Cluster`'s `spec.images`: a registry or
+  a path of one, and its keys) is run only if one of the rule's keys signed it, whether
+  or not its template names keys; a template's keys narrow the rule's and never replace
+  them. Each node reads the rule at every start, a worker that runs from a view too (it
+  is sent every `Cluster`). Rights over the whole cluster write one, and so does whoever
+  may write a Source in `kith-system` (its files are applied as the node): they can add
+  a rule with a longer prefix and a key of their own. A node on a build from before
+  rules reads none.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
@@ -304,10 +312,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   device (a GPU's render node is a kernel driver's whole interface). There is no AppArmor
   or SELinux profile. Run such a program in a VM (`vms`).
 - **An image is whoever's its registry says**, unless its template names keys
-  (`signedBy`). Nothing makes a template name them: there is no rule for a cluster or a
-  registry yet. A signature is checked against keys only: no certificate, no
-  transparency log, so a signing key that leaks signs until it is taken out of every
-  template.
+  (`signedBy`) or a rule of the cluster's has it (`spec.images`). A rule for a prefix
+  holds that name only: whoever may apply a workload can name an image under no rule
+  (another registry, or the same one by a name kithd does not know to be it: a
+  registry's usual port and Docker Hub's own names are read as one, an address or an
+  alias in DNS is not), so only a rule with no prefix makes every pulled image a signed
+  one. A cluster Image is under no rule and signed by no one: whoever may apply an
+  Image and write a Volume in a namespace runs what they packed. Containers already
+  running when a rule is applied are not stopped. A signature is checked against keys
+  only: no certificate, no transparency log, so a signing key that leaks signs until
+  it is taken out of every rule and template.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of

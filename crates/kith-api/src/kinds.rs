@@ -146,6 +146,20 @@ spec! {
         /// Cluster-wide package values.
         #[serde(default, skip_serializing_if = "Values::is_empty")]
         pub values: Values,
+        /// Whose signatures images are taken by: an image under a rule's `prefix` is run only
+        /// if one of the rule's keys signed it, whatever its template says. The rule with the
+        /// longest prefix an image is under is the one it is held to.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub images: Vec<ImageRule>,
+    }
+
+    pub struct ImageRule {
+        /// A registry (`ghcr.io`) or a registry and a path under it (`ghcr.io/acme`), matched
+        /// by whole parts; empty, or left out, for every image a node pulls.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        pub prefix: String,
+        /// Public keys, as a container's `signedBy` takes them: at least one.
+        pub signed_by: Vec<String>,
     }
 
     pub struct UpdatePolicy {
@@ -1193,9 +1207,77 @@ macro_rules! no_checks {
     ($($spec:ty),* $(,)?) => { $(impl Spec for $spec {})* };
 }
 
+/// Why `keys` are not ones an image can be said to be signed by (a container's `signedBy`, or a
+/// Cluster's rule's): too many, or one that is not a public key's text.
+fn not_keys(keys: &[String]) -> Option<String> {
+    if keys.len() > 16 {
+        return Some("signedBy: at most 16 keys".into());
+    }
+    keys.iter().find_map(|key| {
+        // The two kinds of key there are start their files the same way each: told
+        // here by that and their length, and read in full by the node that pulls.
+        let lines = key.lines().filter(|line| !line.trim_start().starts_with("-----"));
+        let text: String = lines.flat_map(str::chars).filter(|c| !c.is_whitespace()).collect();
+        let kinds = [("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE", 124), ("MCowBQYDK2VwAyEA", 60)];
+        let known = |(start, len): &(&str, usize)| text.starts_with(start) && text.len() == *len;
+        let shown: String = key.trim().chars().take(40).collect();
+        (!kinds.iter().any(known)).then(|| {
+            format!(
+                "signedBy: `{shown}` is not a public key kith can check: an ECDSA P-256 or Ed25519 key, as its PEM file's text or the base64 in it"
+            )
+        })
+    })
+}
+
+impl Spec for ClusterSpec {
+    fn check(&self) -> Result<(), String> {
+        if self.images.len() > 32 {
+            return Err("spec.images: at most 32 rules".into());
+        }
+        for (n, rule) in self.images.iter().enumerate() {
+            let at = format!("spec.images[{n}]");
+            let prefix = &rule.prefix;
+            // What a reference's registry and path are once read: lower case, parts between
+            // slashes, a port only on the registry, no tag and no digest.
+            let part = |part: &str| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_'))
+            };
+            let (registry, path) = prefix.split_once('/').unwrap_or((prefix, ""));
+            let (host, port) = registry.split_once(':').unwrap_or((registry, "0"));
+            let port = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+            let shaped = part(host) && port && (!prefix.contains('/') || path.split('/').all(part));
+            if !prefix.is_empty() && !shaped {
+                return Err(format!(
+                    "{at}: prefix: `{prefix}` is not a registry or a registry and a path (`ghcr.io`, `ghcr.io/acme`, `registry.example:5000/team`), in lower case and with no tag"
+                ));
+            }
+            // (As a reference is read: a first part with no dot and no port is a path of docker.io.)
+            if !prefix.is_empty() && !(registry.contains(['.', ':']) || registry == "localhost") {
+                return Err(format!(
+                    "{at}: prefix: `{prefix}` starts with no registry: a prefix starts with a registry (`docker.io/{prefix}`)"
+                ));
+            }
+            if self.images[..n].iter().any(|earlier| earlier.prefix == *prefix) {
+                return Err(format!("{at}: prefix: `{prefix}` is named twice"));
+            }
+            if rule.signed_by.is_empty() {
+                return Err(format!(
+                    "{at}: signedBy names no key: a rule names the keys that sign what is under it"
+                ));
+            }
+            if let Some(why) = not_keys(&rule.signed_by) {
+                return Err(format!("{at}: {why}"));
+            }
+        }
+        Ok(())
+    }
+}
+
 no_checks!(
     BlobSpec,
-    ClusterSpec,
     NodeSpec,
     NetworkPolicySpec,
     VolumeClaimSpec,
@@ -1736,25 +1818,8 @@ impl Template {
                     u32::MAX
                 ));
             }
-            if c.signed_by.len() > 16 {
-                return Err(format!("{at}, container `{}`: signedBy: at most 16 keys", c.name));
-            }
-            for key in &c.signed_by {
-                // The two kinds of key there are start their files the same way each: told
-                // here by that and their length, and read in full by the node that pulls.
-                let lines = key.lines().filter(|line| !line.trim_start().starts_with("-----"));
-                let text: String = lines.flat_map(str::chars).filter(|c| !c.is_whitespace()).collect();
-                let kinds = [("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE", 124), ("MCowBQYDK2VwAyEA", 60)];
-                if !kinds
-                    .iter()
-                    .any(|(start, len)| text.starts_with(start) && text.len() == *len)
-                {
-                    let shown: String = key.trim().chars().take(40).collect();
-                    return Err(format!(
-                        "{at}, container `{}`: signedBy: `{shown}` is not a public key kith can check: an ECDSA P-256 or Ed25519 key, as its PEM file's text or the base64 in it",
-                        c.name
-                    ));
-                }
+            if let Some(why) = not_keys(&c.signed_by) {
+                return Err(format!("{at}, container `{}`: {why}", c.name));
             }
             let allowed = c.seccomp.iter().flat_map(|seccomp| &seccomp.allow);
             if let Some(unknown) = allowed.clone().find(|name| !REFUSED_CALLS.contains(&name.as_str())) {

@@ -1663,9 +1663,19 @@ async fn start(
             if let Some(why) = not_its_image(runtime.images.local.as_ref(), &slot.owner, &c.image) {
                 return Err(why);
             }
+            // (An Image of the cluster is made on a node from a Volume, by whoever may apply an
+            // Image in its namespace: no one signs it, and no rule has it.)
+            let own = |local: &kith_runtime::Local| local.namespace(&c.image).is_some();
+            let signed_by = match runtime.images.local.as_ref().is_some_and(own) {
+                true => c.signed_by.clone(),
+                false => {
+                    let rules = image_rules(&shared.store.lock().expect("a handler panicked holding the store").store);
+                    signers(&rules, &c.image, &c.signed_by)?
+                }
+            };
             let image = runtime
                 .images
-                .pull_signed(&c.image, policy, &c.signed_by)
+                .pull_signed(&c.image, policy, &signed_by)
                 .await
                 .map_err(|e| e.to_string())?;
             runtime.create(id, &image, &unit, log("out")?, log("err")?)
@@ -1705,9 +1715,204 @@ fn not_its_image(local: Option<&kith_runtime::Local>, owner: &str, image: &str) 
     })
 }
 
+/// The Cluster's rules for whose signatures images are taken by (`spec.images` of every
+/// Cluster there is): each a prefix and the keys that sign what is under it.
+fn image_rules(store: &kith_api::store::Store) -> Vec<(String, Vec<String>)> {
+    let rules = store
+        .list(Some("Cluster"))
+        .filter_map(|cluster| cluster.spec["images"].as_array());
+    let rule = |rule: &Value| {
+        let keys = rule["signedBy"].as_array().into_iter().flatten();
+        let keys = keys.filter_map(Value::as_str).map(String::from).collect();
+        // (A rule's registry by its one name, as an image's is read: `ghcr.io:443/acme` is `ghcr.io/acme`.)
+        let prefix = rule["prefix"].as_str().unwrap_or_default();
+        let prefix = match prefix.split_once('/') {
+            _ if prefix.is_empty() => String::new(),
+            Some((registry, path)) => format!("{}/{path}", kith_runtime::registry(registry)),
+            None => kith_runtime::registry(prefix),
+        };
+        (prefix, keys)
+    };
+    rules.flatten().map(rule).collect()
+}
+
+/// The keys one of which must have signed `image` for a unit to run it: those of the rule
+/// with the longest prefix the image is under (by whole parts: `ghcr.io/acme` has
+/// `ghcr.io/acme/tool` and not `ghcr.io/acmex`), narrowed to the ones its template's `signedBy`
+/// names too where it names any; the template's alone where no rule has the image. A template
+/// cannot widen a rule or leave it: where the lists have no key in common nothing is run. (Two
+/// Clusters' rules for one prefix narrow each other the same way.)
+fn signers(rules: &[(String, Vec<String>)], image: &str, template: &[String]) -> Result<Vec<String>, String> {
+    // (What is no reference is under no rule: the pull refuses it.)
+    let Some(name) = kith_runtime::repository(image) else {
+        return Ok(template.to_vec());
+    };
+    let under = |prefix: &str| {
+        let rest = name.strip_prefix(prefix);
+        prefix.is_empty() || rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    };
+    let held = rules.iter().filter(|(prefix, _)| under(prefix));
+    let Some(longest) = held.clone().map(|(prefix, _)| prefix.len()).max() else {
+        return Ok(template.to_vec());
+    };
+    // (A key is the same key as its PEM file's text and as the base64 in it.)
+    let id = |key: &String| kith_runtime::signed::key(key).ok().map(|key| key.id);
+    let lists = held
+        .filter(|(prefix, _)| prefix.len() == longest)
+        .map(|(_, keys)| keys.as_slice());
+    let mut lists = lists.chain((!template.is_empty()).then_some(template));
+    let mut keys = lists.next().unwrap_or_default().to_vec();
+    for list in lists {
+        keys.retain(|key| id(key).is_some_and(|key| list.iter().any(|other| id(other).as_ref() == Some(&key))));
+    }
+    if keys.is_empty() {
+        let prefix = rules
+            .iter()
+            .find(|(prefix, _)| under(prefix) && prefix.len() == longest);
+        let rule = match prefix {
+            Some((prefix, _)) if !prefix.is_empty() => format!("rule for `{prefix}`"),
+            _ => "rule for every image".to_string(),
+        };
+        return Err(format!(
+            "image `{image}` is under the Cluster's {rule} (spec.images), and no key that rule names is among its \
+             template's signedBy: a template's keys narrow a rule's, they do not replace them"
+        ));
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
+    fn signing_key(n: u8) -> String {
+        format!("MCowBQYDK2VwAyEA{}{}=", (b'B' + n) as char, "A".repeat(42))
+    }
+
+    /// An image is held to the Cluster's rule with the longest prefix it is under, by whole
+    /// parts and as a pull reads its reference; one under no rule is its template's alone.
+    #[test]
+    fn image_rules_hold_an_image_to_the_longest_prefix_it_is_under() {
+        let [every, registry, acme, other] = [0, 1, 2, 3].map(signing_key);
+        let rule =
+            |prefix: &str, keys: &[&String]| (prefix.to_string(), keys.iter().map(|key| key.to_string()).collect());
+        let rules: Vec<(String, Vec<String>)> = vec![
+            rule("", &[&every]),
+            rule("ghcr.io", &[&registry]),
+            rule("ghcr.io/acme", &[&acme, &every]),
+            rule("docker.io/library", &[&other]),
+        ];
+        let keys = |image: &str| signers(&rules, image, &[]).unwrap();
+        assert_eq!(keys("ghcr.io/acme/tool:1"), [acme.clone(), every.clone()]);
+        assert_eq!(keys("ghcr.io/acme"), [acme.clone(), every.clone()]);
+        // (What is no reference is held to nothing here: the pull, which reads it the same way, refuses it.)
+        assert_eq!(keys("ghcr.io/acme/tool@sha256:"), Vec::<String>::new());
+        // (By whole parts, and whatever the case of the registry or the tag.)
+        assert_eq!(keys("ghcr.io/acmex/tool"), vec![registry.clone()]);
+        assert_eq!(keys("GHCR.IO/acme/tool:latest"), [acme.clone(), every.clone()]);
+        // (And by the port a pull uses anyway, and Docker Hub by any of its names; another port
+        // is another registry.)
+        assert_eq!(keys("ghcr.io:443/acme/tool"), [acme.clone(), every.clone()]);
+        assert_eq!(keys("ghcr.io:8443/acme/tool"), vec![every.clone()]);
+        assert_eq!(keys("ghcr.io:80/acme/tool"), vec![every.clone()]);
+        for image in [
+            "index.docker.io/library/nginx",
+            "registry-1.docker.io/library/nginx:1",
+            "docker.io:443/library/nginx",
+        ] {
+            assert_eq!(keys(image), vec![other.clone()], "{image}");
+        }
+        // (As a pull reads it: a bare name is docker.io's library.)
+        for image in [
+            "nginx",
+            "nginx:1.27",
+            "library/nginx",
+            "docker.io/nginx",
+            "docker.io/library/nginx",
+        ] {
+            assert_eq!(keys(image), vec![other.clone()], "{image}");
+        }
+        assert_eq!(keys("docker.io/acme/tool"), vec![every.clone()]);
+        assert_eq!(keys("quay.io/acme/tool"), vec![every.clone()]);
+        // With no rule for every image, what is under none is its template's alone, as before.
+        let some = &rules[1..];
+        assert_eq!(signers(some, "quay.io/acme/tool", &[]), Ok(vec![]));
+        assert_eq!(
+            signers(some, "quay.io/acme/tool", std::slice::from_ref(&other)),
+            Ok(vec![other.clone()])
+        );
+        assert_eq!(signers(&[], "ghcr.io/acme/tool", &[]), Ok(vec![]));
+    }
+
+    /// A template's own keys narrow a rule's and cannot replace or widen them; a key is the
+    /// same key as its PEM text; two Clusters' rules for one prefix narrow each other.
+    #[test]
+    fn image_rules_are_narrowed_by_a_template_and_never_replaced() {
+        let [a, b, c] = [0, 1, 2].map(signing_key);
+        let rules = vec![("ghcr.io/acme".to_string(), vec![a.clone(), b.clone()])];
+        let with = |template: &[String]| signers(&rules, "ghcr.io/acme/tool:1", template);
+        assert_eq!(with(&[]), Ok(vec![a.clone(), b.clone()]));
+        assert_eq!(with(std::slice::from_ref(&b)), Ok(vec![b.clone()]));
+        assert_eq!(with(&[c.clone(), a.clone()]), Ok(vec![a.clone()]));
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{b}\n-----END PUBLIC KEY-----\n");
+        assert_eq!(with(&[pem]), Ok(vec![b.clone()]));
+        let refused = with(std::slice::from_ref(&c)).unwrap_err();
+        assert!(
+            refused.contains("rule for `ghcr.io/acme`") && refused.contains("narrow a rule's"),
+            "{refused}"
+        );
+        // A second Cluster's rule for the same prefix: a key both name.
+        let mut two = rules.clone();
+        two.push(("ghcr.io/acme".to_string(), vec![b.clone(), c.clone()]));
+        assert_eq!(signers(&two, "ghcr.io/acme/tool", &[]), Ok(vec![b.clone()]));
+        assert!(signers(&two, "ghcr.io/acme/tool", std::slice::from_ref(&a)).is_err());
+        // A rule with no key (none can be applied) runs nothing, and says it is every image's.
+        let none = vec![(String::new(), vec![])];
+        let refused = signers(&none, "nginx", std::slice::from_ref(&a)).unwrap_err();
+        assert!(refused.contains("rule for every image"), "{refused}");
+    }
+
+    /// The rules are those of every Cluster in the store.
+    #[test]
+    fn image_rules_are_read_from_the_store() {
+        let [a, b] = [0, 1].map(signing_key);
+        let cluster = |name: &str, images: Value| -> Resource {
+            let cluster = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": name },
+                "spec": { "images": images },
+            });
+            serde_json::from_value(cluster).unwrap()
+        };
+        let mut store = kith_api::store::Store::default();
+        assert!(image_rules(&store).is_empty());
+        store
+            .apply(cluster(
+                "home",
+                json!([{ "signedBy": [a] }, { "prefix": "ghcr.io", "signedBy": [a, b] }]),
+            ))
+            .unwrap();
+        store
+            .apply(cluster("more", json!([{ "prefix": "quay.io:443", "signedBy": [b] }])))
+            .unwrap();
+        let hub = json!([{ "prefix": "index.docker.io/library", "signedBy": [b] }]);
+        store.apply(cluster("hub", hub)).unwrap();
+        store.apply(cluster("none", json!([]))).unwrap();
+        let mut rules = image_rules(&store);
+        rules.sort();
+        // (Each registry by its one name.)
+        let expected = [
+            ("", vec![&a]),
+            ("docker.io/library", vec![&b]),
+            ("ghcr.io", vec![&a, &b]),
+            ("quay.io", vec![&b]),
+        ];
+        let expected: Vec<(String, Vec<String>)> = expected
+            .into_iter()
+            .map(|(prefix, keys)| (prefix.to_string(), keys.into_iter().cloned().collect()))
+            .collect();
+        assert_eq!(rules, expected);
+    }
 
     /// A store change wakes the controller's loop before its tick: a pass does not wait the
     /// 10 s TICK for a change it is told of (the wait stops at the change, and not at the tick).

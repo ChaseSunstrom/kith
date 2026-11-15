@@ -1050,6 +1050,84 @@ fn handover_names_keys_and_carries_two_signatures() {
     }
 }
 
+/// The Cluster's rules for whose signatures images are taken by: a prefix that is a registry
+/// or a registry and a path, keys of the shape a template's are, and no more than 32 rules.
+#[test]
+fn image_rules_are_checked_when_a_cluster_is_applied() {
+    let cluster = |images: &str| {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  images: {images}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let p256 = format!("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE{}==", "A".repeat(86));
+    let ed = format!("MCowBQYDK2VwAyEA{}=", "A".repeat(43));
+    let rule = |prefix: &str| format!("{{ prefix: \"{prefix}\", signedBy: [{ed}] }}");
+    for good in [
+        "[]".to_string(),
+        format!("[{}]", rule("")),
+        format!("[{{ signedBy: [{p256}, {ed}] }}]"),
+        format!(
+            "[{}, {}, {}]",
+            rule("ghcr.io"),
+            rule("ghcr.io/acme"),
+            rule("ghcr.io/acme/tools")
+        ),
+        format!("[{}, {}]", rule("registry.example:5000/team"), rule("localhost:5000")),
+    ] {
+        cluster(&good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    }
+    let many: Vec<String> = (0..33).map(|n| rule(&format!("r{n}.example"))).collect();
+    for (bad, why) in [
+        ("[{ prefix: ghcr.io, signedBy: [] }]".to_string(), "names no key"),
+        ("[{ prefix: ghcr.io }]".to_string(), "signedBy"),
+        (
+            "[{ prefix: ghcr.io, signedBy: [cosign.pub] }]".to_string(),
+            "is not a public key kith can check",
+        ),
+        (
+            format!("[{{ prefix: ghcr.io, signedBy: [{}] }}]", [ed.as_str(); 17].join(", ")),
+            "at most 16 keys",
+        ),
+        (format!("[{}]", many.join(", ")), "at most 32 rules"),
+        (format!("[{}, {}]", rule("ghcr.io/acme"), rule("ghcr.io/acme")), "twice"),
+        // (A path alone is under no registry: `library/nginx` is `docker.io/library/nginx`.)
+        (format!("[{}]", rule("library")), "starts with a registry"),
+        (format!("[{}]", rule("acme/tools")), "starts with a registry"),
+        (
+            format!("[{}]", rule("ghcr.io/")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("/ghcr.io")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("ghcr.io//acme")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("GHCR.io/acme")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("ghcr.io/acme:1")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("ghcr.io/acme@sha256")),
+            "is not a registry or a registry and a path",
+        ),
+        (
+            format!("[{}]", rule("ghcr.io/ac*")),
+            "is not a registry or a registry and a path",
+        ),
+    ] {
+        let refused = cluster(&bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+}
+
 /// A container's user and what its filter lets through: said by the template, and checked
 /// when it is applied.
 #[test]

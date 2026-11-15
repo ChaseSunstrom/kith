@@ -48,6 +48,30 @@ pub struct Local {
     pub certificate: Arc<dyn Fn() -> std::result::Result<Vec<u8>, String> + Send + Sync>,
 }
 
+/// The registry and the repository `reference` names, as a pull reads it (`nginx` is
+/// `docker.io/library/nginx`), with no tag or digest: what a rule for a prefix of images is
+/// matched against. The registry is in lower case, without the port a pull would use anyway
+/// (`ghcr.io:443` is `ghcr.io`), and Docker Hub by its one name. Another name that only
+/// happens to reach the same machine (an address, an alias in DNS) stays another registry.
+/// None for what is no reference.
+pub fn repository(reference: &str) -> Option<String> {
+    let reference: Reference = reference.parse().ok()?;
+    Some(format!("{}/{}", registry(reference.registry()), reference.repository()))
+}
+
+/// A registry's one name, of the ones it is written by (see [`repository`]).
+pub fn registry(registry: &str) -> String {
+    let registry = registry.to_ascii_lowercase();
+    let usual = match protocol(&registry) {
+        oci_client::client::ClientProtocol::Http => ":80",
+        _ => ":443",
+    };
+    match registry.strip_suffix(usual).unwrap_or(&registry) {
+        "index.docker.io" | "registry-1.docker.io" => "docker.io".to_string(),
+        registry => registry.to_string(),
+    }
+}
+
 impl Local {
     /// Whether `registry` (the `host:port` of a reference) is that registry: one of its
     /// two names at its very port, said just so. Nothing else is sent the password.
@@ -224,7 +248,7 @@ impl ImageStore {
             return err(match here {
                 None => format!("image `{reference}` is not here and its pull policy is `never`"),
                 Some(_) => format!(
-                    "image `{reference}` is here, but has not been checked for a signature by a key its template names, and its pull policy is `never`"
+                    "image `{reference}` is here, but has not been checked for a signature by a key its template or the Cluster's rule for it names, and its pull policy is `never`"
                 ),
             });
         }

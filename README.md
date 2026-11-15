@@ -329,8 +329,40 @@ spec:
   or Ed25519: the text of the `.pub` file, or the base64 in it. An image already on the
   node counts as signed only by the keys a signature of it was found by; `pullPolicy:
   never` with a key the node has not checked it against does not start. With no
-  `signedBy`, an image is run whoever made it. Whatever its `pullPolicy`, a cluster
-  Image of this node's own registry is asked for again before it starts (see above).
+  `signedBy` and no rule of the cluster's (next), an image is run whoever made it.
+  Whatever its `pullPolicy`, a cluster Image of this node's own registry is asked for
+  again before it starts (see above).
+- **Keys named once, for the cluster.** A `Cluster`'s `spec.images` says which keys
+  sign the images under a registry or a path of one, whatever a template says:
+
+  ```yaml
+  apiVersion: kith.dev/v1
+  kind: Cluster
+  metadata: { name: home }
+  spec:
+    images:
+      - prefix: ghcr.io/acme        # ghcr.io/acme/tool, not ghcr.io/acmex
+        signedBy: [MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=]
+      - signedBy:                   # no prefix: every other image a node pulls
+          - MCowBQYDK2VwAyEAPN3lqZV4Lw1d2sZ0c3gW5vQy8Tn6uJ7kR9xB1mD4hFA=
+  ```
+
+  An image is held to the rule with the longest prefix it is under, read as a pull
+  reads it (`nginx` is `docker.io/library/nginx`, so Docker Hub's official images are
+  under `docker.io/library`; `ghcr.io:443` is `ghcr.io`), and is run only if one of
+  that rule's keys signed it. A template's own `signedBy` can then only narrow: the image
+  must be signed by a key both name, and where they name none in common it is not
+  run. An image under no rule runs as before, so a rule for a prefix holds that name
+  and not what a workload's writer may choose to run instead: for that, give a rule
+  with no prefix. Only someone with rights over the whole cluster can apply a
+  `Cluster` (a Role that names namespaces gives none), or who may write a Source in
+  `kith-system`, whose files are applied cluster-wide. Every node must run a build
+  that reads rules: an older one runs an image as before. Up to 32 rules, 16 keys each;
+  a rule by mistake stops new containers under it from starting (the refusal names
+  the rule), and taking it out of the `Cluster` is the way back. Not under any rule:
+  a cluster Image (packed from a Volume on a node, signed by no one). Not read: cosign's
+  keyless signatures (certificates), a transparency log, and signatures kept as OCI
+  referrers; `spec.images` is all kithd reads of a `Cluster` today.
 - **What it still reaches.** The node's network (and so every port on its loopback, and
   the sockets programs of the node listen on by name alone, without a file), the
   kernel through every call the filter lets by, and the devices it claims: a GPU's render

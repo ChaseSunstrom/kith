@@ -1448,6 +1448,13 @@
           "type": "object",
           "additionalProperties": true,
           "description": "Cluster-wide package values."
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ImageRule"
+          },
+          "description": "Whose signatures images are taken by: an image under a rule's `prefix` is run only\nif one of the rule's keys signed it, whatever its template says. The rule with the\nlongest prefix an image is under is the one it is held to."
         }
       }
     },
@@ -2220,6 +2227,26 @@
           }
         }
       }
+    },
+    "ImageRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prefix": {
+          "type": "string",
+          "description": "A registry (`ghcr.io`) or a registry and a path under it (`ghcr.io/acme`), matched\nby whole parts; empty, or left out, for every image a node pulls."
+        },
+        "signedBy": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Public keys, as a container's `signedBy` takes them: at least one."
+        }
+      },
+      "required": [
+        "signedBy"
+      ]
     },
     "ImageSpec": {
       "type": "object",
