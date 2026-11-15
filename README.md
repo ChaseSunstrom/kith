@@ -3373,7 +3373,7 @@ the two differ in what they do, the numbers are not of the same thing:
 | `examples/` | Resources to apply as they are |
 | `ci/` | The budgets, the benchmark, the VM tests (`vm.sh`), and what measures and photographs the website (`site_numbers.py`, `site_shots.py`) |
 | `dist/` | A systemd user unit for agent mode |
-| `docs/` | The website (GitHub Pages serves this folder: `index.html`, `site.css`, `site.js`, its numbers and typeface), and the pictures this file shows |
+| `docs/` | The website (GitHub Pages serves this folder: `index.html`, `site.css`, `site.js`, its numbers and typeface), the pictures this file shows, and `adr-workers.md`, the design for worker nodes that is not built yet |
 
 ## Development
 
