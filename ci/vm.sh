@@ -199,8 +199,9 @@ if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 vms='' web=''
-# (What a test left running goes with it.)
-trap 'kill $vms $web 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
+# (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
+# names a directory, for a failure that does not come again.)
+trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; rm -rf "$work"' EXIT INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }
 
@@ -1959,8 +1960,13 @@ with open(sys.argv[1], "r+b") as disk:
                 up beta3
                 # Its key deleted from the store: the running machine gives it again, and has not restarted.
                 api DELETE /v1/resources/NodeKey/kith-000902 >/dev/null
-                sleep 5
-                api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the machine did not give its key again once it was deleted"
+                tries=0
+                until api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"'; do
+                    tries=$((tries + 1))
+                    [ "$tries" -lt 150 ] || fail "the machine did not give its key again once it was deleted"
+                    sleep 0.2
+                done
+                echo "vm.sh: the machine gave its key again after $tries tries of 0.2 s"
                 ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
                 # A passphrase, given through the other node (which keeps none of it): too short
                 # a one is refused; taken away, the disk has no line of it; given again, it has.

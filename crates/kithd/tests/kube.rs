@@ -1157,3 +1157,56 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
     cluster.kith(&["delete", "identity/bob"]);
     bob.refused(&["get", "deployments", "-n", "team"], &[]);
 }
+
+/// Server-side apply by two managers: each keeps its own fields, a field one has is not
+/// taken by the other without `--force-conflicts`, and what a manager leaves out of its
+/// next apply is taken out when no other manager has it.
+#[test]
+fn two_field_managers_keep_their_own_fields_and_conflict_on_each_others() {
+    let Some(cluster) = Cluster::start("kube-managers") else {
+        return;
+    };
+    let apply = |manager: &str, file: &str, force: bool| {
+        let mut args = vec!["apply", "--server-side", "--field-manager", manager, "-f", file];
+        args.extend(force.then_some("--force-conflicts"));
+        cluster.kubectl(&args)
+    };
+    let map =
+        |data: &str| format!("apiVersion: v1\nkind: ConfigMap\nmetadata: {{ name: shared }}\ndata: {{ {data} }}\n");
+    let data = || cluster.got(&["configmap", "shared"])["data"].clone();
+    cluster.write("a.yaml", &map("x: '1', gone: g"));
+    cluster.write("b.yaml", &map("w: '2'"));
+    assert!(apply("a", "a.yaml", false).0);
+    // b's apply does not name a's fields, so they stay, and are a's.
+    assert!(apply("b", "b.yaml", false).0);
+    assert_eq!(data(), serde_json::json!({ "x": "1", "gone": "g", "w": "2" }));
+    // b wants what a has, differently: Kubernetes's words, and nothing is changed.
+    cluster.write("b9.yaml", &map("x: '9', w: '2'"));
+    let (ok, _, err) = apply("b", "b9.yaml", false);
+    assert!(!ok);
+    says(
+        &err,
+        &["Apply failed with 1 conflict: conflict with \"a\" using v1: .data.x"],
+    );
+    assert_eq!(data()["x"], "1");
+    // The same value is not a conflict: both manage it then.
+    cluster.write("b1.yaml", &map("x: '1', w: '2'"));
+    assert!(apply("b", "b1.yaml", false).0);
+    // With force the field is b's; a, applying its own, is the one in conflict now.
+    assert!(apply("b", "b9.yaml", true).0);
+    assert_eq!(data()["x"], "9");
+    let (ok, _, err) = apply("a", "a.yaml", false);
+    assert!(!ok);
+    says(&err, &["conflict with \"b\" using v1: .data.x"]);
+    // a leaves out what it set, and no one else has: it is taken out. What b has stays.
+    cluster.write("a2.yaml", &map("keep: k"));
+    assert!(apply("a", "a2.yaml", false).0);
+    assert_eq!(data(), serde_json::json!({ "x": "9", "w": "2", "keep": "k" }));
+    // Who has what is said as Kubernetes says it, and is not something a client may send.
+    let shown = cluster.ok(&["get", "configmap", "shared", "-o", "json", "--show-managed-fields"]);
+    let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    let entries = shown["metadata"]["managedFields"].as_array().unwrap();
+    let managers: Vec<&str> = entries.iter().map(|m| m["manager"].as_str().unwrap()).collect();
+    assert_eq!(managers, ["a", "b"]);
+    assert_eq!(entries[0]["fieldsV1"]["f:data"]["f:keep"], serde_json::json!({}));
+}

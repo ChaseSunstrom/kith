@@ -330,6 +330,8 @@ spec:
         assert!(crate::access::for_identities("/v1/blobs/default/abc") && crate::access::for_identities("/v1/blobs"));
         assert!(crate::access::for_identities("/v1/volumes/default/data/files"));
         assert!(!crate::access::for_identities("/v1/blob-copy/abc"));
+        // (`kith node duress --all` is an admin's, by a certificate: T-0186's VM test.)
+        assert!(crate::access::for_identities("/v1/duress") && !crate::access::for_identities("/v1/forget"));
         let stranger = Caller::Identity("mallory".into());
         assert_eq!(ask(stranger, "a-seat0", "idle").await.status(), StatusCode::FORBIDDEN);
         assert_eq!(said(&shared), Some(json!({ "activity": "fullscreen" })));

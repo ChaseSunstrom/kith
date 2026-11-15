@@ -329,7 +329,7 @@ impl Record {
         bytes.resize(ROOM, 0);
         let mut back = vec![0; ROOM];
         let wrote = disk.write_all_at(&bytes, at).and_then(|()| disk.sync_all());
-        let read = wrote.and_then(|()| disk.read_exact_at(&mut back, at));
+        let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
         read.map_err(|e| format!("writing the lock record: {e}"))?;
         (back == bytes)
             .then_some(())
@@ -451,15 +451,27 @@ async fn forgotten(client: &reqwest::Client, peer: &str, id: &str, pair: &ring::
     taken.await.is_some()
 }
 
+/// `disk`, with what the kernel holds in memory of the record `at` this place let go:
+/// what is read next is what the disk gives back, not what was just written to it.
+/// (After a sync: only then is nothing of it waiting to be written, and so nothing
+/// kept. The kernel lets whole pages go: the pages the record lies in, to their ends.)
+fn from_disk(disk: &File, at: u64) -> &File {
+    let gone = nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED;
+    let (first, end) = (at & !4095, (at + ROOM as u64 + 4095) & !4095);
+    let fd = std::os::fd::AsRawFd::as_raw_fd(disk);
+    let _ = nix::fcntl::posix_fadvise(fd, first as i64, (end - first) as i64, gone);
+    disk
+}
+
 /// The lock record of the config partition `config`, erased: the disk's secret and every
-/// wrapped key with it. Read back: a disk that took the write and kept the record is not
-/// erased.
+/// wrapped key with it. Read back from the disk: one that took the write and kept the
+/// record is not erased.
 fn erase(config: &Path) -> std::io::Result<()> {
     let disk = File::options().read(true).write(true).open(config)?;
     let mut back = [1; ROOM];
     disk.write_all_at(&[0; ROOM], AT)?;
     disk.sync_all()?;
-    disk.read_exact_at(&mut back, AT)?;
+    from_disk(&disk, AT).read_exact_at(&mut back, AT)?;
     match back == [0; ROOM] {
         true => Ok(()),
         false => Err(std::io::Error::other("the lock record is still on the disk")),
@@ -907,11 +919,18 @@ pub async fn keep(
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             _ = stopping.changed() => return,
             Some((change, done)) = chosen_here.recv() => match change {
+                // (Whoever asked has gone already: no key is made for nobody to see.)
+                Change::Recovery if done.is_closed() => {}
                 Change::Recovery => {
                     let (with, recovery) = renewed(&record, &opened);
-                    let wrote = write(&with).then(|| record = with);
-                    let wrote = wrote.ok_or("the lock record could not be written".to_string());
-                    let _ = done.send(wrote.map(|()| Some(recovery)));
+                    let wrote = write(&with);
+                    let said = wrote.then_some(Some(recovery));
+                    let shown = done.send(said.ok_or("the lock record could not be written".to_string())).is_ok();
+                    // (Whoever asked is gone, and nobody was shown the new key: the one
+                    // somebody has is put back. Where that fails, the new one stays.)
+                    if wrote && (shown || !write(&record)) {
+                        record = with;
+                    }
                 }
                 Change::Passphrase(passphrase) => {
                     let pass = match passphrase {
@@ -1319,17 +1338,26 @@ fn forgetting(store: &kith_api::store::Store, id: &str, nonce: &[u8], signature:
         public.is_some_and(|public| public.verify(&text, signature).is_ok())
     };
     // (The disk the code was typed at erased its record: wiped. Another node under the
-    // cluster's code has its record still, and its recovery key: forgotten.)
-    let without = |key: &kith_api::Resource| kith_api::Resource {
-        spec: match key.spec["id"] == id {
-            true => json!({ "id": key.spec["id"], "wiped": true }),
-            false => json!({ "id": key.spec["id"], "forgotten": true }),
-        },
-        ..key.clone()
+    // cluster's code has its record still, and its recovery key: forgotten. Its own
+    // code stays with it: typed at it later, that still erases its record.)
+    let without = |key: &kith_api::Resource| {
+        let mut spec = json!({ "id": key.spec["id"] });
+        match key.spec["id"] == id {
+            true => spec["wiped"] = true.into(),
+            false => {
+                spec["forgotten"] = true.into();
+                if let Some(own) = key.spec.get("duress") {
+                    spec["duress"] = own.clone();
+                }
+            }
+        }
+        kith_api::Resource { spec, ..key.clone() }
     };
     let live = || store.list(Some("NodeKey")).filter(|key| !gone(key));
-    // (Every NodeKey of that id is asked: one written beside it hides no code.)
-    let asking: Vec<&kith_api::Resource> = live().filter(|key| key.spec["id"] == id).collect();
+    // (Every NodeKey of that id is asked: one written beside it hides no code. A
+    // forgotten one too, for its node's own code.)
+    let kept = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
+    let asking: Vec<&kith_api::Resource> = kept.filter(|key| key.spec["id"] == id).collect();
     let all = asking.iter().find(|key| signed(&key.spec["duressAll"]));
     match (all, asking.iter().find(|key| signed(&key.spec["duress"]))) {
         (Some(under), _) => live()
@@ -1585,6 +1613,11 @@ mod tests {
         assert!(Record::read(Path::new(&path)).is_err());
         disk.write_all_at(&[0; ROOM], AT).unwrap();
         assert_eq!(Record::read(Path::new(&path)), Ok(None));
+        // Erased: a record that was there is zeros, as read back.
+        many.write(&disk, AT).unwrap();
+        assert!(Record::read(Path::new(&path)).unwrap().is_some());
+        erase(Path::new(&path)).unwrap();
+        assert_eq!(Record::read(Path::new(&path)), Ok(None));
     }
 
     #[test]
@@ -1755,13 +1788,15 @@ mod tests {
             key.spec["duressAll"] = public.clone().into();
         }
         plain[0].spec["duress"] = own_public.into();
+        let (_, bs, bs_public) = code();
+        plain[1].spec["duress"] = bs_public.clone().into();
         let store = stored(&plain);
         // a's own code forgets a's key alone; the cluster's, typed at a, every key under it:
         // a's record is erased (wiped), b has its record and its recovery key (forgotten).
         let wiped = ("a".to_string(), json!({ "id": "aa", "wiped": true }));
         assert_eq!(keys(&store, "aa", &own), std::slice::from_ref(&wiped));
-        let forgotten = ("b".to_string(), json!({ "id": "bb", "forgotten": true }));
-        assert_eq!(keys(&store, "aa", &pair), [wiped, forgotten]);
+        let forgotten = json!({ "id": "bb", "forgotten": true, "duress": bs_public });
+        assert_eq!(keys(&store, "aa", &pair), [wiped, ("b".to_string(), forgotten)]);
         // (Signed for another disk than the one asked for, or by a's code for b: nothing.)
         let other = forgetting(&store, "bb", &nonce, signed(&pair, "aa").as_ref());
         assert!(other.is_empty() && keys(&store, "bb", &own).is_empty());
@@ -1774,6 +1809,10 @@ mod tests {
         assert_eq!(handed_out(&store, "cc"), Some(("c", "0102")));
         // And a code that was used forgets nothing more.
         assert!(keys(&store, "aa", &pair).is_empty() && keys(&store, "bb", &pair).is_empty());
+        // b, forgotten, has its own code still: typed at b, its record goes too (wiped).
+        let gone = ("b".to_string(), json!({ "id": "bb", "wiped": true }));
+        assert_eq!(keys(&store, "bb", &bs), [gone]);
+        assert!(keys(&store, "aa", &own).is_empty());
 
         // No code for all while a node under it has a recovery key nobody was shown.
         let unseen = node_key(
