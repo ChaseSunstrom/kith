@@ -675,11 +675,37 @@ impl Hold<'_> {
     fn room(&mut self) -> bool {
         if self.place.is_none() {
             self.place = self.relaying.take(self.caller);
-            if self.place.is_some() {
-                self.spare = None;
+            match self.place {
+                Some(_) => self.spare = None,
+                None => over_limit(self.caller),
             }
         }
         self.place.is_some()
+    }
+}
+
+/// A node that is over its limit of relayed connections says so in its log, and no more often
+/// than once a minute: whether it is said at `now` (seconds), `last` being when it last was.
+fn said_now(last: &AtomicU64, now: u64) -> bool {
+    let was = last.load(Ordering::Relaxed);
+    // (Two at once: one of them says it.)
+    now >= was + 60
+        && last
+            .compare_exchange(was, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+}
+
+/// Says that `caller` was told no for want of a place ([`said_now`]).
+fn over_limit(caller: IpAddr) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    static BEGUN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    // (From 60 on, so that the first is said.)
+    let now = 60 + BEGUN.get_or_init(Instant::now).elapsed().as_secs();
+    if said_now(&LAST, now) {
+        eprintln!(
+            "kithd: services: over the limit of connections relayed for other nodes: {caller} is told no \
+             (said once a minute at most)"
+        );
     }
 }
 
@@ -694,7 +720,10 @@ where
     let place = relaying.take(caller);
     let spare = match place.is_some() {
         true => None,
-        false => Some(spares.take(caller)?),
+        false => {
+            over_limit(caller);
+            Some(spares.take(caller)?)
+        }
     };
     taken(
         from,
@@ -1257,6 +1286,13 @@ pub fn thread(name: String) -> std::io::Result<tokio::runtime::Handle> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn over_the_limit_is_said_once_a_minute() {
+        let last = AtomicU64::new(0);
+        let said: Vec<bool> = [60, 61, 119, 120, 121, 500].map(|now| said_now(&last, now)).to_vec();
+        assert_eq!(said, [true, false, false, true, false, true]);
+    }
 
     const HOME: &str = "
 apiVersion: kith.dev/v1
