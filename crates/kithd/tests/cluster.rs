@@ -634,6 +634,8 @@ fn relays_reach_the_node_they_name() {
     let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: beta, path: d }\n";
     std::fs::write(alpha.dir.join("volume.yaml"), yaml).unwrap();
     alpha.ok(&["apply", "-f", "volume.yaml"]);
+    // (Beta is asked about the Volume by alpha's relay: it has to have heard of it.)
+    wait_for("beta to have the Volume", || beta.kith(&["get", "Volume/data"]).0 == 0);
     let src = alpha.dir.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("file"), b"for beta and no other").unwrap();
