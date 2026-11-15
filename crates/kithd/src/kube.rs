@@ -193,16 +193,38 @@ const DEFAULTS: &[(&str, &str, &str)] = &[
 ];
 
 /// The lists a strategic merge patch merges item by item, and the field that names an
-/// item (Kubernetes's types say which; `ports` is by `containerPort` in a container and by
-/// `port` in a Service). Any other list is replaced whole.
+/// item: every field Kubernetes's types tag `patchMergeKey`, by its JSON name, in the
+/// order `python3 ci/kube_proto.py --merge-keys` gives (a test says when they differ).
+/// `ports` is by `containerPort` in a container and by `port` in a Service: [`merge_key`]
+/// takes the one an item has. Any other list is replaced whole.
 const MERGED: &[(&str, &str)] = &[
+    ("addresses", "type"),
+    ("allocatedResourcesStatus", "name"),
+    ("conditions", "type"),
     ("containers", "name"),
-    ("initContainers", "name"),
     ("env", "name"),
-    ("volumes", "name"),
-    ("volumeMounts", "mountPath"),
-    ("imagePullSecrets", "name"),
+    ("ephemeralContainers", "name"),
+    ("evictionResponders", "name"),
+    ("healthConditions", "status"),
     ("hostAliases", "ip"),
+    ("hostIPs", "ip"),
+    ("imagePullSecrets", "name"),
+    ("initContainers", "name"),
+    ("mapping", "name"),
+    ("nodeAllocatableResourceClaimStatuses", "resourceClaimName"),
+    ("overhead", "name"),
+    ("ownerReferences", "uid"),
+    ("podIPs", "ip"),
+    ("ports", "containerPort"),
+    ("ports", "port"),
+    ("resourceClaimStatuses", "name"),
+    ("resourceClaims", "name"),
+    ("schedulingGates", "name"),
+    ("secrets", "name"),
+    ("topologySpreadConstraints", "topologyKey"),
+    ("volumeDevices", "devicePath"),
+    ("volumeMounts", "mountPath"),
+    ("volumes", "name"),
 ];
 
 pub fn router() -> Router<Arc<Shared>> {
@@ -1192,11 +1214,9 @@ fn table(kind: &Kind, objects: &[Value], at: u64) -> Value {
 
 /// The field that names an item of the list `list`, where a strategic patch merges it.
 fn merge_key(list: &str, item: &Value) -> Option<&'static str> {
-    match list {
-        "ports" if item.get("containerPort").is_some() => Some("containerPort"),
-        "ports" => Some("port"),
-        list => MERGED.iter().find(|(of, _)| *of == list).map(|(_, by)| *by),
-    }
+    // (Of a list that two keys name, the item's own; an item with neither is by the last.)
+    let keys: Vec<&str> = MERGED.iter().filter(|(of, _)| *of == list).map(|(_, by)| *by).collect();
+    keys.iter().find(|by| item.get(**by).is_some()).or(keys.last()).copied()
 }
 
 /// `patch` laid over `live`: a JSON merge patch, or with `strategic` Kubernetes's own (the
@@ -2577,6 +2597,35 @@ spec: {role: writer, subjects: [carol]}
             assert_eq!((code, said.as_str()), (StatusCode::OK, wrote), "{pod}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lists a strategic patch merges by a key are the ones Kubernetes's types tag with
+    /// `patchMergeKey`: what ci/kube_proto.py reads of them is the table in this file. It
+    /// fails, and does not skip, where that source is not there (run ci/kube_proto.py once to
+    /// have it); nothing is fetched here.
+    #[test]
+    fn merge_keys_are_those_of_the_kubernetes_types() {
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ci/kube_proto.py");
+        let read = std::process::Command::new("python3")
+            .arg(script)
+            .arg("--merge-keys")
+            .output()
+            .expect("python3 is there to read the Kubernetes types");
+        let err = String::from_utf8_lossy(&read.stderr);
+        assert!(read.status.success(), "ci/kube_proto.py --merge-keys: {err}");
+        let read = String::from_utf8(read.stdout).unwrap();
+        let ours: Vec<String> = MERGED.iter().map(|(list, by)| format!("{list} {by}")).collect();
+        assert_eq!(
+            ours,
+            read.lines().collect::<Vec<_>>(),
+            "the table is not what the types say"
+        );
+        // What each does with an item: a list of two keys goes by the one the item has.
+        let by = |list, item: Value| merge_key(list, &item);
+        assert_eq!(by("ports", json!({ "containerPort": 80 })), Some("containerPort"));
+        assert_eq!(by("ports", json!({ "port": 80 })), Some("port"));
+        assert_eq!(by("conditions", json!({ "type": "Ready" })), Some("type"));
+        assert_eq!(by("args", json!("x")), None);
     }
 
     /// `kubectl get namespaces` and `get nodes` print an AGE: the object's creationTimestamp

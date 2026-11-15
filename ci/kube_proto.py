@@ -61,11 +61,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TABLE = os.path.join(ROOT, "crates/kithd/src/kubeproto.txt")
 
 
-def sources():
+def sources(fetch=True):
     cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "kith-kube", "types-" + TAG)
-    os.makedirs(cache, exist_ok=True)
+    if fetch:
+        os.makedirs(cache, exist_ok=True)
     for package, where, sha256 in FILES:
         path = os.path.join(cache, package + ".go")
+        if not os.path.exists(path) and not fetch:
+            sys.exit("kube_proto.py: %s is not there: run ci/kube_proto.py once to fetch it" % path)
         if not os.path.exists(path):
             repo, rest = (where % TAG).split("/", 2)[1], (where % TAG).split("/", 2)[2]
             url = "https://raw.githubusercontent.com/kubernetes/%s/%s" % (repo, rest)
@@ -103,7 +106,24 @@ def parse(text):
     return structs, aliases
 
 
+def merge_keys():
+    """The lists a strategic merge patch merges item by item, as `LIST KEY` lines: each field
+    of the types that has a `patchMergeKey` tag, by its JSON name. Nothing is fetched here
+    (a test reads this and must not touch the network)."""
+    found = set()
+    for _, text in sources(fetch=False):
+        for line in text.splitlines():
+            field = re.match(r"\s+\w+\s+\S+\s+`(.*)`", line)  # (a comment that shows a field is not one)
+            json = field and re.search(r'json:"(\w+)', field.group(1))
+            key = field and re.search(r'patchMergeKey:"(\w+)"', field.group(1))
+            if json and key:
+                found.add("%s %s" % (json.group(1), key.group(1)))
+    return "".join(line + "\n" for line in sorted(found))
+
+
 def main():
+    if "--merge-keys" in sys.argv:
+        return print(merge_keys(), end="")
     packages = {package: parse(text) for package, text in sources()}
     wanted, order, lines = list(ROOTS), [], {}
 
