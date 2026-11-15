@@ -41,6 +41,9 @@ pub struct Pods {
     made: BTreeMap<String, Pod>,
     /// Told once the node is ready for pods: its DNS for them starts then.
     up: Arc<Notify>,
+    /// Told when a pod is made or let go (its address may be given to the next): the
+    /// Services' round, which keeps the kernel from passing to a pod gone, wakes.
+    pub moved: Arc<Notify>,
 }
 
 /// Where the node keeps that it guards what it passes on, until it restarts.
@@ -91,6 +94,7 @@ impl Pods {
                 dir,
             };
             self.made.insert(id.into(), pod);
+            self.moved.notify_one();
         }
         let pod = &self.made[id];
         let netns = format!("/proc/{}/fd/{}", std::process::id(), pod.namespace.as_raw_fd());
@@ -103,6 +107,7 @@ impl Pods {
 
     /// Let go of every pod `wanted` does not name: its namespace goes with its last process.
     pub fn keep(&mut self, wanted: impl Fn(&str) -> bool) {
+        let before = self.made.len();
         self.made.retain(|id, pod| {
             let kept = wanted(id);
             if !kept {
@@ -110,10 +115,26 @@ impl Pods {
             }
             kept
         });
+        if self.made.len() < before {
+            self.moved.notify_one();
+        }
     }
 
     pub fn address(&self, id: &str) -> Option<IpAddr> {
         self.made.get(id).map(|pod| pod.address)
+    }
+
+    /// The pod's addresses: on the mesh where there is one, and its IPv4 one.
+    pub fn addresses(&self, id: &str) -> Vec<IpAddr> {
+        let Some(pod) = self.made.get(id) else {
+            return Vec::new();
+        };
+        let v4 = IpAddr::V4(kith_mesh::pod::addresses(None, pod.number).0);
+        if pod.address == v4 {
+            vec![v4]
+        } else {
+            vec![pod.address, v4]
+        }
     }
 }
 

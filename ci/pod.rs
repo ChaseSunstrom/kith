@@ -28,7 +28,8 @@
 //!   pod check HOST PORT        send `pod echo` there, over many connections, small and large,
 //!                              one after another and side by side, closed at once, half
 //!                              closed, reset by either end and kept for many small turns; say
-//!                              each byte that did not come back in order, and how it went
+//!                              the address a connection there reached, each byte that did
+//!                              not come back in order, and how it went
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -357,7 +358,9 @@ fn main() {
             }
         }
         ["echo"] => {
-            let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
+            // (On IPv6 and IPv4 both, where the pod has IPv6: the kernel sends a connection
+            // on the node's own network to a replica's IPv6 address only.)
+            let listener = TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).expect("port 80");
             for stream in listener.incoming().flatten() {
                 std::thread::spawn(move || echo(stream));
             }
@@ -371,6 +374,10 @@ fn main() {
                 assert!(tries < 120, "check: {host} {port} never answered: {e}");
                 std::thread::sleep(Duration::from_millis(500));
             }
+            // What a connection there is to, as the client sees it: the Service's address
+            // where kithd passes it on, the replica's where the kernel sent it straight there.
+            let reached = TcpStream::connect(to).and_then(|stream| stream.peer_addr());
+            println!("check: reached {}", reached.map_or_else(|e| e.to_string(), |at| at.to_string()));
             let mut failed = Vec::new();
             let mut connections = 0;
             // One after another, each closed as soon as all is sent: nothing, a byte, less

@@ -179,11 +179,12 @@ pub fn remove(name: &str) -> Result<()> {
 /// `bpf(2)`: `command` with `request` as its `union bpf_attr`, as far as it is filled in
 /// (the kernel takes what is past the request's end as zeros). What the kernel answers.
 ///
-/// For the two commands of [`device_filter`] only: neither has the kernel write through
-/// the request, and what the request points at is alive for the call.
+/// For the two commands of [`cgroup_program`] only: the kernel writes only to the log
+/// room a load may point at, and what the request points at is alive for the call.
 fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
     // SAFETY: `request` is `request.len()` readable bytes, and the pointers in it (see
-    // `device_filter`) are to memory its caller holds until this returns.
+    // `cgroup_program`) are to memory its caller holds until this returns, the log room
+    // writable and as big as the request says.
     let said = unsafe { libc::syscall(libc::SYS_bpf, command, request.as_ptr(), request.len()) };
     if said < 0 {
         Err(Error::last_os_error())
@@ -197,28 +198,97 @@ fn bpf(command: libc::c_int, request: &[u8]) -> Result<libc::c_long> {
 /// the kernel checks the program before it takes it. It takes the place of the one put
 /// there this way before; the cgroup keeps it, and it goes with the cgroup.
 pub fn device_filter(cgroup: &File, program: &[u8]) -> Result<()> {
+    // BPF_PROG_TYPE_CGROUP_DEVICE, as BPF_CGROUP_DEVICE.
+    cgroup_program(cgroup, program, 15, 6)
+}
+
+/// Make `program` what `cgroup` asks at every connect() of an IPv6 socket by a process
+/// in it, before the kernel looks at the address: the program may write another address
+/// and port in its place. As [`device_filter`]: it takes the place of the one before.
+pub fn connect_filter(cgroup: &File, program: &[u8]) -> Result<()> {
+    // BPF_PROG_TYPE_CGROUP_SOCK_ADDR, as BPF_CGROUP_INET6_CONNECT.
+    cgroup_program(cgroup, program, 18, 11)
+}
+
+/// The last lines of what the verifier wrote in `log` (to its first NUL), to follow the
+/// error: none where it wrote nothing, and said to be cut short where it filled the room.
+fn verifier_said(log: &[u8], cut: bool) -> String {
+    let said = String::from_utf8_lossy(&log[..log.iter().position(|&b| b == 0).unwrap_or(log.len())]);
+    let lines: Vec<&str> = said.lines().filter(|line| !line.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let tail = lines[lines.len().saturating_sub(6)..].join(" / ");
+    format!(": the verifier: {tail}{}", if cut { " (cut short)" } else { "" })
+}
+
+/// Load `program` as a `kind` of program for `attach`, and put it on `cgroup` as that.
+fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Result<()> {
     use std::os::fd::{FromRawFd, OwnedFd};
     if program.is_empty() || !program.len().is_multiple_of(8) {
         return Err(Error::other("not a program of whole instructions"));
     }
     let license = b"Apache-2.0\0";
-    // BPF_PROG_LOAD: the kind of program (BPF_PROG_TYPE_CGROUP_DEVICE), how many
-    // instructions, where they are, where the licence's name is.
-    let mut load = [0u8; 48];
-    load[0..4].copy_from_slice(&15u32.to_ne_bytes());
+    // BPF_PROG_LOAD: the kind of program, how many instructions, where they are, where
+    // the licence's name is; and (at 68) what it is to be attached as.
+    let mut load = [0u8; 72];
+    load[0..4].copy_from_slice(&kind.to_ne_bytes());
     load[4..8].copy_from_slice(&((program.len() / 8) as u32).to_ne_bytes());
     load[8..16].copy_from_slice(&(program.as_ptr() as u64).to_ne_bytes());
     load[16..24].copy_from_slice(&(license.as_ptr() as u64).to_ne_bytes());
-    let loaded = bpf(5, &load)?;
+    load[68..72].copy_from_slice(&attach.to_ne_bytes());
+    let loaded = match bpf(5, &load) {
+        Ok(loaded) => loaded,
+        Err(refused) => {
+            // Loaded once more with room for what the verifier says (at 24: how much, how
+            // big the room is, where it is), whose last lines say why.
+            let mut log = vec![0u8; 1 << 16];
+            load[24..28].copy_from_slice(&1u32.to_ne_bytes());
+            load[28..32].copy_from_slice(&(log.len() as u32).to_ne_bytes());
+            load[32..40].copy_from_slice(&(log.as_mut_ptr() as u64).to_ne_bytes());
+            match bpf(5, &load) {
+                Ok(loaded) => loaded,
+                // (ENOSPC: what it had to say did not fit.)
+                Err(again) => {
+                    let said = verifier_said(&log, again.raw_os_error() == Some(libc::ENOSPC));
+                    return Err(Error::new(refused.kind(), format!("{refused}{said}")));
+                }
+            }
+        }
+    };
     // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
     let loaded = unsafe { OwnedFd::from_raw_fd(loaded as libc::c_int) };
-    // BPF_PROG_ATTACH: to which cgroup, which program, as what (BPF_CGROUP_DEVICE), and
-    // with no flags: the one program of this cgroup, replaced by the next.
-    let mut attach = [0u8; 16];
-    attach[0..4].copy_from_slice(&cgroup.as_raw_fd().to_ne_bytes());
-    attach[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
-    attach[8..12].copy_from_slice(&6u32.to_ne_bytes());
-    bpf(8, &attach).map(drop)
+    // BPF_PROG_ATTACH: to which cgroup, which program, as what, and with no flags: the
+    // one program of this cgroup, replaced by the next.
+    let mut request = [0u8; 16];
+    request[0..4].copy_from_slice(&cgroup.as_raw_fd().to_ne_bytes());
+    request[4..8].copy_from_slice(&loaded.as_raw_fd().to_ne_bytes());
+    request[8..12].copy_from_slice(&attach.to_ne_bytes());
+    bpf(8, &request).map(drop)
+}
+
+/// The cookie of the network namespace this process is in: what a program's
+/// bpf_get_netns_cookie() says for a socket made in it.
+pub fn netns_cookie() -> Result<u64> {
+    let socket = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .or_else(|_| std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
+    let mut cookie = 0u64;
+    let mut size = std::mem::size_of::<u64>() as libc::socklen_t;
+    // SAFETY: SO_NETNS_COOKIE writes at most `size` bytes to `cookie`, which is that big.
+    let said = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            71,
+            (&raw mut cookie).cast(),
+            &raw mut size,
+        )
+    };
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(cookie)
+    }
 }
 
 #[cfg(test)]
@@ -276,6 +346,23 @@ mod tests {
         assert!(device_filter(&here, &[]).is_err() && device_filter(&here, &[0; 7]).is_err());
         // r0 = 1, and no exit.
         assert!(device_filter(&here, &[0xb7, 0, 0, 0, 1, 0, 0, 0]).is_err());
+    }
+
+    /// Of what the verifier wrote: its last lines, said to be cut short where it filled
+    /// the room, and nothing where it wrote nothing.
+    #[test]
+    fn the_verifier_says_why_in_its_last_lines() {
+        let log = b"0: (b7) r0 = 1\n\n1: (95) exit\nR0 !read_ok\n\0\0junk";
+        assert_eq!(
+            verifier_said(log, false),
+            ": the verifier: 0: (b7) r0 = 1 / 1: (95) exit / R0 !read_ok"
+        );
+        assert_eq!(
+            verifier_said(b"a\nb\nc\nd\ne\nf\ng\n\0", true),
+            ": the verifier: b / c / d / e / f / g (cut short)"
+        );
+        assert_eq!(verifier_said(b"\0\0\0", false), "");
+        assert_eq!(verifier_said(b" \n\n", false), "");
     }
 
     /// What is no ext4 file system is not grown, and says so (a loop device and a real
