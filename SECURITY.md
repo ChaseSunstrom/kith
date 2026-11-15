@@ -71,7 +71,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   it is held to a certificate whose name gives that id, which is weaker: any name of the
   CA that hashes to the id is taken for the voter. A join is refused a name whose id
   another Node or a member of the cluster has, so a joining node cannot be taken for a
-  voter by choosing its name.
+  voter by choosing its name. A voter whose Node was deleted but who is still in Raft's
+  membership goes on being sent the log at its address, held by its id alone, and the
+  deleted node's own certificate (signed by the CA) still answers there until the
+  membership change is through: seconds, longer with no leader or majority. A node's
+  certificate outlives its Node, and nothing revokes it.
   Not pinned: joining (the joining node has no store, and checks the CA by its hash
   from the token); a blob fetched by its digest (what comes is checked against the
   digest); and a locked disk's key asked at boot, before there is a store (only a key

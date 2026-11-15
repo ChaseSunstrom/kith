@@ -114,8 +114,9 @@ impl Cluster {
     }
 
     /// Forget the clients of nodes that are no more (`is_node` says which are), so what [`Cluster::to`]
-    /// holds is as big as the nodes there are, whatever Nodes came and went. (A voter's, by id,
-    /// stay: as many as the ids Raft has had as members, which only an admin's changes make.)
+    /// holds is as big as the nodes there are, whatever Nodes came and went. (The clients of a
+    /// voter, by id, are left as they are: one for each id Raft has ever had as a member, which
+    /// only an admin's changes make.)
     pub fn forget_but(&self, is_node: impl Fn(&str) -> bool) {
         let mut made = self.pinned.lock().expect("nothing panics holding the pinned clients");
         made.retain(|key, _| key.starts_with('#') || is_node(key));
@@ -902,24 +903,20 @@ fn taken_raft_id(shared: &Shared, name: &str) -> Option<String> {
             .find(has)
             .map(|node| node.metadata.name.clone())
     };
-    let by = match other {
-        Some(other) => format!("node `{other}`"),
-        None if shared
-            .raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .nodes()
-            .any(|(member, _)| *member == id) =>
-        {
-            "a member of the cluster".into()
-        }
-        None => return None,
-    };
-    Some(format!(
-        "the name `{name}` gives the Raft id {id}, which {by} has: pick another --name"
-    ))
+    if let Some(other) = other {
+        return Some(format!(
+            "the name `{name}` gives the Raft id {id}, which node `{other}` has: pick another --name"
+        ));
+    }
+    let metrics = shared.raft.metrics().borrow().clone();
+    let member = metrics
+        .membership_config
+        .membership()
+        .nodes()
+        .any(|(member, _)| *member == id);
+    // A member with no Node of that name is the node of this name, deleted and not yet out of the
+    // membership (the id is the name's): a rejoin right after `kith delete node/X`.
+    member.then(|| format!("the node `{name}` that was deleted has not left the cluster yet: try again in a moment"))
 }
 
 async fn join(
@@ -1309,11 +1306,19 @@ pub(crate) mod pinned_peer {
             "the refusal spent the token"
         );
         assert!(shared.store.lock().unwrap().store.get("Node/joiner").is_none());
-        // A free id passes this check (it goes on, and fails later on what the test does not have).
-        let other = join("someone-else").await.err().map(|(_, Json(said))| said.to_string());
+        // A member of Raft with no Node of its name (this node's own, here) is a node deleted and not
+        // yet out: the same name is told to wait, not to pick another.
+        let (status, Json(said)) = join("a").await.err().expect("a member's id is refused");
+        let said = said["error"].as_str().unwrap();
         assert!(
-            other.as_ref().is_none_or(|said| !said.contains("gives the Raft id")),
-            "{other:?}"
+            status == StatusCode::CONFLICT && said.contains("has not left the cluster yet"),
+            "{said}"
+        );
+        // A free id is let in.
+        let other = join("someone-else").await.map(drop);
+        assert_eq!(
+            other.map_err(|(status, Json(said))| format!("{status}: {said}")),
+            Ok(())
         );
     }
 
