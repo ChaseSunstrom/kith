@@ -256,12 +256,17 @@ fn unpack(archive: &Path, dir: &Path, cap: u64) -> Result<(), String> {
     })
 }
 
+/// What a file, a directory or a link takes of a disk at least, and the unit an unpack counts in.
+const BLOCK: u64 = 4096;
+
 /// The tar at `archive` unpacked into a new directory beside `dir`: where it is. Nothing is
 /// left there if it fails, nor what an unpack that was killed left.
 ///
 /// `cap` is how many bytes it may unpack to (a Volume with no size: `u64::MAX`). Each entry
-/// counts at the size it unpacks to, before it is unpacked, and the one that passes `cap` is
-/// the error. A GNU sparse entry says its whole length (the tar crate gives that as
+/// counts at the size it unpacks to rounded up to `BLOCK` and at least that (a directory, a
+/// link and an empty file take a block), before it is unpacked, and the one that passes `cap`
+/// is the error. (The directories are held, as entries, until the end: one per block of `cap`
+/// at most.) A GNU sparse entry says its whole length (the tar crate gives that as
 /// `size()`, and unpacks it as a hole that takes next to no disk): it counts whole, as
 /// the next archive of the Volume reads it whole.
 pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32, cap: u64) -> Result<PathBuf, String> {
@@ -288,7 +293,8 @@ pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32, cap: u64) -> 
         let (mut held, mut dirs) = (0u64, Vec::new());
         for entry in tar.entries()? {
             let mut entry = entry?;
-            held = held.saturating_add(entry.size());
+            // (In blocks, as the disk has it: a directory, a link and a file of a byte take 4 KiB.)
+            held = held.saturating_add(entry.size().div_ceil(BLOCK).max(1) * BLOCK);
             if held > cap {
                 return Err(std::io::Error::other(format!(
                     "the archive unpacks to more than {cap} bytes, more than the Volume may hold"
@@ -732,7 +738,9 @@ pub async fn restore(
                 let blobs = crate::blobs::dir(&shared);
                 let mut incoming = Incoming::new(&blobs).map_err(|e| e.to_string())?;
                 let said = |e: String| format!("the bucket: {e}");
-                receive(&mut answer, &mut incoming, QUIET, download_cap(cap)).await.map_err(said)?;
+                receive(&mut answer, &mut incoming, QUIET, download_cap(cap))
+                    .await
+                    .map_err(said)?;
                 let kept = tokio::task::spawn_blocking(move || incoming.keep(None)).await;
                 blobs.join(kept.map_err(|e| e.to_string())??.0)
             }
@@ -1144,14 +1152,15 @@ mod tests {
         let root = temp("capped");
         let (blobs, into) = (root.join("blobs"), root.join("into"));
         std::fs::create_dir_all(&into).unwrap();
+        // (Each file counts in blocks of 4 KiB: 61,440 bytes.)
         let archive = tar_of(&blobs, &[("a", 60_000), ("b/c", 60_000)]);
         // Over by a byte: an error, the volume empty and nothing beside it.
-        let refused = unpack(&archive, &into, 119_999).unwrap_err();
-        assert!(refused.contains("more than 119999 bytes"), "{refused}");
+        let refused = unpack(&archive, &into, 122_879).unwrap_err();
+        assert!(refused.contains("more than 122879 bytes"), "{refused}");
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
         assert!(!root.join("into.restoring").exists());
         // As much as it may hold: restored. (A volume with no size is `u64::MAX`.)
-        unpack(&archive, &into, 120_000).unwrap();
+        unpack(&archive, &into, 122_880).unwrap();
         assert_eq!(std::fs::metadata(into.join("b/c")).unwrap().len(), 60_000);
         // What a killed kithd left beside the volume does not count, and is gone.
         let empty = root.join("empty");
@@ -1183,6 +1192,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn unpack_meters_in_blocks_what_a_directory_or_a_file_of_a_byte_takes() {
+        // 300 directories and 300 files of one byte are a few KB of tar, and 600 blocks on a disk.
+        let root = temp("blocks");
+        let (blobs, into) = (root.join("blobs"), root.join("into"));
+        std::fs::create_dir_all(&into).unwrap();
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        for n in 0..300 {
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_size(0);
+            dir.set_mode(0o755);
+            tar.append_data(&mut dir, format!("d{n}/"), &[][..]).unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(1);
+            file.set_mode(0o644);
+            tar.append_data(&mut file, format!("d{n}/f"), &[1u8][..]).unwrap();
+        }
+        let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let refused = unpack(&archive, &into, 1 << 20).unwrap_err();
+        assert!(refused.contains("more than 1048576 bytes"), "{refused}");
+        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+        assert!(!root.join("into.restoring").exists());
+        unpack(&archive, &into, 4 << 20).unwrap();
+        assert_eq!(std::fs::metadata(into.join("d299/f")).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// What a peer or a bucket does that sends without end: `bytes` of them, in chunks and
     /// with no length said first. On 127.0.0.1.
     async fn endless(bytes: usize) -> String {
@@ -1210,7 +1247,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
         // The same, from a bucket that says its length: refused before a byte is taken.
         let (bucket, kept) = fake_s3().await;
-        kept.lock().unwrap().insert("/examplebucket/big.tar".into(), vec![3u8; 300_000]);
+        kept.lock()
+            .unwrap()
+            .insert("/examplebucket/big.tar".into(), vec![3u8; 300_000]);
         let mut answer = s3(&bucket, reqwest::Method::GET, "big.tar", None).await.unwrap();
         let mut incoming = Incoming::new(&blobs).unwrap();
         let said = receive(&mut answer, &mut incoming, QUIET, 100_000).await.unwrap_err();

@@ -119,13 +119,21 @@ Only the newest version is fixed. There are no security releases of older ones.
   could point elsewhere meanwhile. When one is unpacked, no entry writes outside the
   volume; a restored Backup has no setuid or setgid file (a replica's copy keeps them
   as its volume had them). A restore, a replica's first copy and each sync unpack no more
-  than the Volume's `size`, where it says one: the entries are counted as they come, a GNU
-  sparse entry at the whole length it says (what the next archive of the Volume reads;
-  the tar crate gives it as its size and unpacks it as a hole), and the unpack stops, with
-  the Volume empty (or a replica's old copy as it was) and nothing beside it, at the entry
-  that passes it. What is downloaded from a bucket or a primary stops at twice the `size`
-  and 1 MiB, before any of it is unpacked. There is no quota on the directory, no count of
-  files, and no cap where the Volume has no `size`.
+  than the Volume's `size`, where it says one: the entries are counted as they come, each
+  file, directory and link at the blocks it takes (4 KiB at least, so a Volume of very many
+  small files counts as more than the sum of their lengths, and one that takes more than its
+  `size` this way cannot be restored from its own Backup), a GNU sparse entry at the whole
+  length it says (what the next archive of the Volume reads; the tar crate gives it as its
+  size and unpacks it as a hole), and the unpack stops, with the Volume empty (or a
+  replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
+  downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
+  it is unpacked. An unpack keeps each directory of the archive in memory until the end
+  (well under 1 KiB each): bounded by the cap at one directory per 4 KiB of the Volume's
+  `size`, and by nothing for a Volume with no `size`, which is not capped at all. There is
+  no quota on the directory and no count of inodes. A restore from S3 that is refused
+  leaves the downloaded archive (up to twice the `size` and 1 MiB) in the node's blob
+  store until blobs are next cleaned up. A sync of a Volume that is gone from the store
+  (or whose spec does not parse) takes nothing and says so.
 - **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
   apply a Volume and a Workload in its namespace, checked on the node that is asked; the
   node that has the Volume takes the request from that node as it takes any other node's.
@@ -287,9 +295,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   before a certificate is shown. A firewall in front of the port is the answer to that.
 - **Backup buckets and S3 endpoints may be on the node's own network** on purpose, and a
   restore, a replica's copy and its sync take no more than the Volume's `size` says
-  (below), but a Volume with no `size` is not capped: a bucket someone else writes can
-  fill a node's disk through a restore into such a Volume, and so can a primary that is
-  sent to a replica of one. (T-0230.)
+  (above), but a Volume with no `size` is not capped: a bucket someone else writes can
+  fill a node's disk through a restore into such a Volume. The primary's copy route builds
+  its archive with no cap of its own; the replica that takes it is what stops at the
+  size (and a replica of a Volume with no `size` stops at nothing). (T-0230.)
 - **A node started with no `--release-key` trusts the key of the first OSRelease it
   takes.** Give the key when installing. (T-0231.) What a taken admin credential can
   still do with OSRelease and UpdatePlan is restart nodes into releases their keys
@@ -357,7 +366,7 @@ Severity:
 | 4 | Medium | An Identity allowed to push a package could have the node send it to an address only the node reaches (its loopback, its networks), by naming such a registry or one that sends the upload on to there. | Fixed: when an Identity asks, every request of the push goes only to an address that was checked, as a Source's fetch does. |
 | 5 | Medium | The node's own registry answers every local process with every namespace's Images. | Fixed: the registry speaks TLS under a certificate made for each start and answers 401 without that start's password, both held in kithd's memory and given to its own pull only; kithd pulls an Image only for its own namespace. `docker pull` on a node no longer works. Not checked: who can read kithd's memory. |
 | 6 | Medium | A Release (and a Source) is rendered and applied with the node's rights, not its writer's. | Open: T-0229, T-0227. Said above. |
-| 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Open: T-0230. |
+| 7 | Low | A restore, a replica's copy and its sync have no cap on size; sparse entries in an archive may not be counted (suspected, not traced). | Fixed: each is capped by the Volume's `size` (files, directories and links counted in 4 KiB blocks, a sparse entry at its whole length; the download at twice the size and 1 MiB). Stays: a Volume with no `size` is not capped, and there is no quota on the directory. |
 | 8 | Low | A node with no `--release-key` pins the first OSRelease's key; an OSRelease's image address is not vetted (what comes back is thrown away unless signed). | Open: T-0231. |
 | 9 | Low | ACME answers had no size cap, redirects were followed, and a certificate's names were not compared with the host. | Fixed: an authority's answer is read to a cap (64 KiB, 256 KiB for a chain) and a larger one refused; the directory's redirects are not followed; a chain whose leaf does not name the host, or is not good now (run out, or not yet started), is refused and the stored certificate stays in use; an order has ten minutes in all. Not checked: that the URLs a directory gives are on the directory's own host (the operator names the authority, and ACME does not oblige one host). (T-0232.) |
 

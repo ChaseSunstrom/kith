@@ -1936,11 +1936,12 @@ spec:
   node); moving a volume back is done by hand.
 - A restore of a Backup and a replica's first copy and each sync unpack no more than the
   Volume's `size`, and stop with an error (the Volume left empty, or the replica's old copy
-  as it was) when what arrives passes it: the files are counted as they come, a sparse
-  file at its whole length, and what is downloaded stops at twice the `size` and 1 MiB. A
-  Volume with no `size` is not capped, and nothing limits the directory itself (no quota,
-  no count of files): a Volume that holds more than its `size` cannot be restored from its
-  own Backup.
+  as it was) when what arrives passes it: each file, directory and link is counted at the
+  blocks it takes (4 KiB at least, so a Volume of very many small files counts as more than
+  the sum of their lengths), a sparse file at its whole length, and what is downloaded stops
+  at twice the `size` and 1 MiB. A Volume with no `size` is not capped, and nothing limits
+  the directory itself (no quota, no count of inodes): a Volume that takes more than its
+  `size` this way cannot be restored from its own Backup.
 
 ### Encrypted volumes
 

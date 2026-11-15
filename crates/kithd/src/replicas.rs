@@ -195,6 +195,13 @@ fn replica(store: &Store, dir: &Dir, me: &str) -> bool {
     now.is_some_and(|now| now.node != me) && replicas.is_some_and(|replicas| replicas.iter().any(|r| r == me))
 }
 
+/// How many bytes a sync of `dir` may take: its Volume's size, or no end where it says none.
+/// A Volume that is gone, or whose spec does not parse, is not synced at all.
+fn cap_of(store: &Store, dir: &Dir) -> Result<u64, String> {
+    let size = crate::volumes::size_of(store, &dir.namespace, &dir.name).map_err(|e| format!("{e}: not synced"))?;
+    Ok(size.unwrap_or(u64::MAX))
+}
+
 /// What was taken in, unpacked beside `into` (to at most `cap` bytes) and then given to
 /// `finish`, which puts it in its place: the archive's hash. The archive does not stay, and
 /// when it unpacks to more than `cap` the copy in `into` is as it was.
@@ -242,7 +249,7 @@ async fn sync(
     // (No more than the Volume may hold, where it says: what is sent is another node's say.)
     let cap = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        crate::volumes::size(&state.store, &dir.namespace, &dir.name).unwrap_or(u64::MAX)
+        cap_of(&state.store, dir)?
     };
     let mut incoming = Incoming::new(&temp).map_err(|e| e.to_string())?;
     crate::backups::receive(&mut answer, &mut incoming, QUIET, crate::backups::download_cap(cap)).await?;
@@ -527,17 +534,39 @@ mod tests {
         std::fs::create_dir_all(&into).unwrap();
         std::fs::write(into.join("old"), "before").unwrap();
         let swapped = |new: PathBuf| swap(&new, &into, None).map_err(|e| e.to_string());
-        let refused = place(sent(&temp, 100_000), &temp, &into, 99_999, swapped).unwrap_err();
-        assert!(refused.contains("more than 99999 bytes"), "{refused}");
+        let refused = place(sent(&temp, 98_304), &temp, &into, 98_303, swapped).unwrap_err();
+        assert!(refused.contains("more than 98303 bytes"), "{refused}");
         // The copy as it was, nothing beside it and no archive left.
         assert_eq!(std::fs::read_to_string(into.join("old")).unwrap(), "before");
         assert!(!root.join("d.restoring").exists() && !root.join("d.old").exists());
         assert_eq!(std::fs::read_dir(&temp).unwrap().count(), 0);
         // As much as the volume holds: the copy.
-        place(sent(&temp, 100_000), &temp, &into, 100_000, swapped).unwrap();
-        assert_eq!(std::fs::metadata(into.join("big")).unwrap().len(), 100_000);
+        place(sent(&temp, 98_304), &temp, &into, 98_304, swapped).unwrap();
+        assert_eq!(std::fs::metadata(into.join("big")).unwrap().len(), 98_304);
         assert!(!into.join("old").exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replica_capped_does_not_sync_a_volume_that_is_gone_or_unreadable() {
+        let mut store = store(json!({}));
+        let dir = |name: &str| Dir {
+            namespace: "default".into(),
+            name: name.into(),
+            path: String::new(),
+            node: "a".into(),
+            encrypted: false,
+        };
+        // No size: no cap, as before.
+        assert_eq!(cap_of(&store, &dir("data")), Ok(u64::MAX));
+        let gone = cap_of(&store, &dir("nope")).unwrap_err();
+        assert!(gone.contains("Volume default/nope is gone"), "{gone}");
+        // (A spec that does not parse cannot be applied, so only a gone one is tried.)
+        let sized = json!({ "apiVersion": "kith.dev/v1", "kind": "Volume", "metadata": { "name": "sized" },
+            "spec": { "node": "a", "path": "f", "size": "1Mi" } });
+        let resources = vec![serde_json::from_value(sized).unwrap()];
+        kith_store::run(&mut store, Command::Apply { resources, at: 0 }).unwrap();
+        assert_eq!(cap_of(&store, &dir("sized")), Ok(1 << 20));
     }
 
     #[tokio::test]

@@ -464,6 +464,17 @@ pub fn size(store: &Store, namespace: &str, name: &str) -> Option<u64> {
     vol.size.map(|size| size as u64)
 }
 
+/// As `size`, but a Volume that is not in the store, or whose spec does not parse, is an error
+/// (`None` is then only a Volume that says no size).
+pub fn size_of(store: &Store, namespace: &str, name: &str) -> Result<Option<u64>, String> {
+    let vol = store
+        .get(&format!("Volume/{namespace}/{name}"))
+        .ok_or(format!("Volume {namespace}/{name} is gone"))?;
+    let spec: VolumeSpec =
+        serde_json::from_value(vol.spec.clone()).map_err(|e| format!("Volume {namespace}/{name}: {e}"))?;
+    Ok(spec.size.map(|size| size.value() as u64))
+}
+
 /// The encrypted Volumes whose data is on `me`, and how big each is to be (bytes).
 pub fn encrypted(store: &Store, me: &str) -> Vec<(Dir, u64)> {
     let mine = |vol: Vol| {
