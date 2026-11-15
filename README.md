@@ -932,8 +932,10 @@ kith get dnsrecord                   # each one says `served`, or why not
 - A host a Service exposes (`expose.host`, see [More than one node](#more-than-one-node))
   under a zone's domain is answered at the LAN address of each node that serves
   ingress, for that zone's TTL and clients: one A record per node, IPv4 only
-  (no AAAA for the LAN). A host under two zones is the longer zone's; a DNSRecord of
-  the same name is answered instead. A host its Namespace does not keep for it,
+  (no AAAA for the LAN). A host under two zones is the longer zone's. A DNSRecord
+  of the same name that is an A or a CNAME is answered instead; a TXT or other
+  record beside it does not stop the addresses. An exposed host is answered before
+  a `*.apps` wildcard DNSRecord, which answers the other names. A host its Namespace does not keep for it,
   one that is refused, and one under no zone are not answered here. Roaming,
   unreachable and LAN-less nodes are left out. The table is rebuilt when a
   Namespace's hosts or a node's `serves` or state changes.
@@ -996,18 +998,27 @@ DNS node (`192.0.2.10`). Run kithd with `--dns 192.0.2.10:53`, and with
 so a name kithd does not know goes out and does not come back to it.
 
 The setting for each resolver, from what its documentation says the menu or file
-is called; none of them was tried on a device for this guide, so check the name
-against your version:
+is called. None of them was tried on a device for this guide, so each line says
+"not tried" and the name is to be checked against your version:
 
-- AdGuard Home: Settings, DNS settings, Upstream DNS servers: add the line
-  `[/apps.example.test/]192.0.2.10:53` above the other upstreams.
-- dnsmasq: `server=/apps.example.test/192.0.2.10#53` in the config (or a file in
-  `/etc/dnsmasq.d/`), then restart dnsmasq.
-- Technitium: Zones, Add Conditional Forwarder Zone: zone `apps.example.test`,
-  forwarder `192.0.2.10`.
-- UniFi: the gateway's forward domain setting (Forward Domain in Network's
-  settings; where it sits depends on the version). Clients keep the gateway
-  as their resolver.
+- AdGuard Home (not tried): Settings, DNS settings, Upstream DNS servers: add the
+  line `[/apps.example.test/]192.0.2.10:53` above the other upstreams.
+- dnsmasq (not tried): `server=/apps.example.test/192.0.2.10#53` in the config (or
+  a file in `/etc/dnsmasq.d/`), then restart dnsmasq.
+- Technitium (not tried): Zones, Add Zone, type "Conditional Forwarder Zone": zone
+  `apps.example.test`, forwarder `192.0.2.10`.
+- UniFi (not tried): the gateway's forward domain setting (Forward Domain in
+  Network's settings; where it sits depends on the version). Clients keep the
+  gateway as their resolver.
+
+Once the house resolver forwards the zone, kithd sees the house resolver's address
+as the client, not each device's. The zone's `clients` must then include that
+address (`clients: [192.0.2.1/32]` for a resolver at 192.0.2.1), and the zone no
+longer tells one device from another.
+
+dnsmasq with rebind protection drops answers that are private addresses, which
+the LAN addresses kithd answers with are. Allow the zone with
+`rebind-domain-ok=/apps.example.test/` (not tried).
 
 Then `dig @<house resolver> www.apps.example.test` should give kithd's answer,
 and `dig @<house resolver> www.example.org` the same answer as before. Only one

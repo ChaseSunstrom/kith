@@ -219,7 +219,8 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             Some((host.clone(), domain.to_string()))
         })
         .collect();
-    // The LAN addresses of the nodes that serve ingress: the IPv4 ones (AAAA is not answered).
+    // The LAN addresses of the nodes that serve ingress: the IPv4 ones (AAAA is not answered), and
+    // not link-local, multicast or broadcast ones, which no client can reach a host at.
     let ingress_ips: BTreeSet<Ipv4Addr> = store
         .serving()
         .into_iter()
@@ -229,7 +230,7 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
                 .is_some_and(|status| status["serves"]["ingress"] == true)
         })
         .filter_map(|node| match node.lan_address() {
-            Some(IpAddr::V4(ip)) => Some(ip),
+            Some(IpAddr::V4(ip)) if !(ip.is_link_local() || ip.is_multicast() || ip.is_broadcast()) => Some(ip),
             _ => None,
         })
         .collect();
@@ -257,10 +258,13 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             let _ = records.add(record);
         }
         // An exposed host is answered where its zone is shown, at each ingress address, for the
-        // zone's TTL; a record of the same name (a DNSRecord) is the answer instead.
+        // zone's TTL. A DNSRecord of that name answers instead when it is an A or a CNAME; a TXT
+        // or other type beside it does not stop the addresses.
         let names: BTreeSet<String> = shown
             .iter()
-            .flat_map(|zone| zone.records.iter().map(|record| record.name.to_ascii_lowercase()))
+            .flat_map(|zone| zone.records.iter())
+            .filter(|record| matches!(record.data, Rdata::A(_) | Rdata::Cname(_)))
+            .map(|record| record.name.to_ascii_lowercase())
             .collect();
         for (host, domain) in &exposed {
             let Some(zone) = shown.iter().find(|zone| zone.domain == *domain) else {
@@ -271,7 +275,11 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             }
             for ip in &ingress_ips {
                 let (name, ttl, data) = (host.clone(), zone.ttl, Rdata::A(*ip));
-                let _ = records.add(Record { name, ttl, data });
+                // Refused past the RRset limit (100 addresses for one name): logged, not silent.
+                if let Err(error) = records.add(Record { name, ttl, data }) {
+                    eprintln!("kithd: dns: exposed host {host} is not answered at every ingress address: {error}");
+                    break;
+                }
             }
         }
         records
@@ -367,7 +375,7 @@ pub async fn run(
     let feed = async {
         let mut generation = shared.generation.subscribe();
         // What the zones were last built from: most changes to the store are not about DNS.
-        // ponytail: finding that out reads three kinds on every change; index them if stores get large.
+        // ponytail: finding that out reads five kinds on every change; index them if stores get large.
         let mut built_from = None;
         loop {
             let reports = {
@@ -787,6 +795,203 @@ spec: {}
         assert_ne!(zones_made_of(&store), built);
         let (zones, _) = zones_of(&store, None);
         assert_eq!(ask(&zones, OUTSIDE, "www.example.test"), Err(Some(3)));
+    }
+
+    /// `EXPOSED` with more documents after it.
+    fn exposed_plus(docs: &str) -> String {
+        format!("{EXPOSED}{docs}")
+    }
+
+    /// One DNSRecord (named `extra`) whose spec is `spec`, as a document for `exposed_plus`.
+    fn record_doc(spec: &str) -> String {
+        format!("---\napiVersion: kith.dev/v1\nkind: DNSRecord\nmetadata: {{ name: extra }}\nspec: {{ {spec} }}\n")
+    }
+
+    #[test]
+    fn an_exposed_host_keeps_its_lan_addresses_beside_a_txt_at_its_name() {
+        let mut store = store(&exposed_plus(&record_doc(
+            "zone: apps, name: web, type: TXT, values: ['hello']",
+        )));
+        expose_nodes(&mut store);
+        let (zones, _) = zones_of(&store, None);
+        assert_eq!(
+            answers_of(&zones, OUTSIDE, "web.apps.example.test"),
+            ["192.0.2.10", "192.0.2.11"]
+        );
+        // The TXT is still answered beside them.
+        assert!(
+            zones
+                .lookup(OUTSIDE.parse().unwrap(), "web.apps.example.test", 16)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_dnsrecord_a_or_cname_at_an_exposed_host_wins_over_it() {
+        let mut store = store(&exposed_plus(&record_doc(
+            "zone: apps, name: web, type: A, values: [198.51.100.9]",
+        )));
+        expose_nodes(&mut store);
+        let (zones, _) = zones_of(&store, None);
+        assert_eq!(answers_of(&zones, OUTSIDE, "web.apps.example.test"), ["198.51.100.9"]);
+    }
+
+    #[test]
+    fn a_cname_at_an_exposed_host_wins_over_it() {
+        let mut store = store(&exposed_plus(&record_doc(
+            "zone: apps, name: web, type: CNAME, values: [elsewhere.example.test]",
+        )));
+        expose_nodes(&mut store);
+        let (zones, _) = zones_of(&store, None);
+        // The CNAME is the answer: no LAN address beside it.
+        assert!(
+            ask(&zones, OUTSIDE, "web.apps.example.test")
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            zones
+                .lookup(OUTSIDE.parse().unwrap(), "web.apps.example.test", 5)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_exposed_host_is_answered_before_a_wildcard_dnsrecord() {
+        let mut store = store(&exposed_plus(&record_doc(
+            "zone: apps, name: '*', type: A, values: [198.51.100.7]",
+        )));
+        expose_nodes(&mut store);
+        let (zones, _) = zones_of(&store, None);
+        // The wildcard answers the other names under the zone; the exposed host has its own answer.
+        assert_eq!(
+            answers_of(&zones, OUTSIDE, "web.apps.example.test"),
+            ["192.0.2.10", "192.0.2.11"]
+        );
+        assert_eq!(
+            answers_of(&zones, OUTSIDE, "nothing.apps.example.test"),
+            ["198.51.100.7"]
+        );
+    }
+
+    #[test]
+    fn a_host_equal_to_a_zones_apex_is_answered_beside_its_soa() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: DNSZone
+metadata: { name: home }
+spec: { domain: home.example.test, ttl: 45 }
+---
+apiVersion: kith.dev/v1
+kind: Namespace
+metadata: { name: shop }
+spec: { hosts: [home.example.test] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  selector: { app: web }
+  ports: [{ port: 8080 }]
+  expose: { host: home.example.test, via: edge }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: edge-a }
+spec: {}
+",
+        );
+        store
+            .set_status(
+                "Node/edge-a",
+                Some(json!({ "address": "192.0.2.10:7443", "serves": { "ingress": true } })),
+            )
+            .unwrap();
+        let (zones, _) = zones_of(&store, None);
+        assert_eq!(answers_of(&zones, OUTSIDE, "home.example.test"), ["192.0.2.10"]);
+        assert_eq!(ttl_of(&zones, OUTSIDE, "home.example.test"), 45);
+        // The zone's SOA is still answered at its apex.
+        assert!(zones.lookup(OUTSIDE.parse().unwrap(), "home.example.test", 6).is_some());
+    }
+
+    #[test]
+    fn a_host_under_two_zones_is_the_longer_zones_and_not_answered_to_the_shorter_zones_clients() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: DNSZone
+metadata: { name: example }
+spec: { domain: example.test, ttl: 60 }
+---
+apiVersion: kith.dev/v1
+kind: DNSZone
+metadata: { name: inside }
+spec: { domain: apps.example.test, ttl: 120, clients: [192.168.0.0/16] }
+---
+apiVersion: kith.dev/v1
+kind: Namespace
+metadata: { name: shop }
+spec: { hosts: [web.apps.example.test] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web, namespace: shop }
+spec:
+  selector: { app: web }
+  ports: [{ port: 8080 }]
+  expose: { host: web.apps.example.test, via: edge }
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: edge-a }
+spec: {}
+",
+        );
+        store
+            .set_status(
+                "Node/edge-a",
+                Some(json!({ "address": "192.0.2.10:7443", "serves": { "ingress": true } })),
+            )
+            .unwrap();
+        let (zones, _) = zones_of(&store, None);
+        // The longer zone's clients get the host, at its TTL.
+        assert_eq!(answers_of(&zones, INSIDE, "web.apps.example.test"), ["192.0.2.10"]);
+        assert_eq!(ttl_of(&zones, INSIDE, "web.apps.example.test"), 120);
+        // Outside the longer zone's clients, the shorter zone is shown but the host is not answered.
+        assert!(
+            ask(&zones, OUTSIDE, "web.apps.example.test")
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ingress_addresses_leave_out_link_local_multicast_and_broadcast() {
+        let extra: String = ["linked", "group", "all"]
+            .iter()
+            .map(|name| format!("---\napiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n"))
+            .collect();
+        let mut store = store(&exposed_plus(&extra));
+        expose_nodes(&mut store);
+        for (name, ip) in [
+            ("linked", "169.254.1.5"),
+            ("group", "224.0.0.251"),
+            ("all", "255.255.255.255"),
+        ] {
+            store
+                .set_status(
+                    &format!("Node/{name}"),
+                    Some(json!({ "address": format!("{ip}:7443"), "serves": { "ingress": true } })),
+                )
+                .unwrap();
+        }
+        let (zones, _) = zones_of(&store, None);
+        // Only the two ordinary ingress addresses of EXPOSED are answered.
+        assert_eq!(
+            answers_of(&zones, OUTSIDE, "web.apps.example.test"),
+            ["192.0.2.10", "192.0.2.11"]
+        );
     }
 
     #[test]
