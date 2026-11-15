@@ -208,12 +208,19 @@ Only the newest version is fixed. There are no security releases of older ones.
   size and unpacks it as a hole), and the unpack stops, with the Volume empty (or a
   replica's old copy as it was) and nothing beside it, at the entry that passes it. What is
   downloaded from a bucket or a primary stops at twice the `size` and 1 MiB, before any of
-  it is unpacked. An unpack keeps each directory of the archive in memory until the end
-  (well under 1 KiB each): bounded by the cap at one directory per 4 KiB of the Volume's
-  `size`, and by nothing for a Volume with no `size`, which is not capped at all. There is
-  no quota on the directory and no count of inodes. A restore from S3 that is refused
-  leaves the downloaded archive (up to twice the `size` and 1 MiB) in the node's blob
-  store until blobs are next cleaned up. A sync of a Volume that is gone from the store
+  it is unpacked. An unpack holds only the directories the archive is inside of, a path,
+  a mode and a time each, and refuses an archive more than 128 directories deep: its
+  memory does not grow with the archive. Each directory is made when it comes, stays open
+  to its owner while the archive is inside it, and is given its mode and time when the
+  archive leaves it, through no link: one whose path leads elsewhere by then is left as
+  it is. An archive in depth-first order (kith's own, GNU tar's) unpacks with every
+  directory's mode, owner and time; one that is not leaves its directories' times as the
+  unpack left them, and where kithd is not root, an entry that comes after the archive
+  left a directory that shuts its owner out is refused. A restore unpacks into a
+  directory beside the Volume and renames it over the Volume's empty one: a move that
+  fails leaves the Volume's directory as it was, mode and owner too. There is no quota on
+  the directory and no count of inodes. A restore from S3 unpacks from its download, which
+  is removed once the unpack is done or refused. A sync of a Volume that is gone from the store
   (or whose spec does not parse) takes nothing and says so.
 - **A Volume's files over the API** (`kith volume put` and `get`) are for whoever may
   apply a Volume and a Workload in its namespace, checked on the node that is asked; the
@@ -565,7 +572,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   (above), but a Volume with no `size` is not capped: a bucket someone else writes can
   fill a node's disk through a restore into such a Volume. The primary's copy route builds
   its archive with no cap of its own; the replica that takes it is what stops at the
-  size (and a replica of a Volume with no `size` stops at nothing). (T-0230.)
+  size (and a replica of a Volume with no `size` stops at nothing). (T-0230.) An archive
+  that is not in depth-first order, which kith does not make, is restored with its
+  directories' times as the unpack left them, and where kithd is not root one whose
+  directory shuts its owner out before all of it is unpacked is refused. A restored
+  Volume's directory is the one the unpack made beside it, with kithd's mode and owner,
+  not the empty one it took the place of. (T-0380.)
 - **A node with no release key trusts the key of the first OSRelease it takes.** Build
   the image with one (`KITH_RELEASE_KEY`, kept in the signed root) or give it at
   install (`releaseKey`), and that first release must be signed by it. A node with
