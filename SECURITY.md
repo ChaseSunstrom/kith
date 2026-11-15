@@ -261,7 +261,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   what the last wrote is gone. A fast writer is not stopped between two counts: at the
   disk's speed it can write past its limit, or fill the disk, before a count sees it, and
   then kithd's store, logs and other replicas' writes fail until it is replaced. A count
-  starts 10 seconds after the last ended and counts the replicas one after another, each
+  starts at least 10 seconds after the last ended and counts the replicas one after another, each
   in 5 seconds at most: on a slow disk 20 replicas take up to 110 seconds between a
   write and its replica's replacement. A count walks every file by directory handle, not following links, each file
   once however many names it has, and adds each removed file a process of the replica
@@ -273,7 +273,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   that replica, not its writer. A limited replica whose count does not end in 5 seconds,
   or reaches 128 directories deep, two counts in a row, is replaced (once may be a slow
   disk, slow for every replica): one with millions of small files is, though under its
-  limit. An unlimited one so counted counts what was walked. An empty
+  limit. One whose counts end so every other time is not replaced for that, though what
+  each walked counts against its limit. An unlimited one so counted counts what was walked.
+  A count or removal runs on a thread that cannot be killed: one stuck on a disk that does
+  not answer is said after a minute, and until it ends no replica is limited (a count) or
+  replaced for the reserve (a removal). An empty
   file costs the disk an inode and the count nothing, and a directory kithd cannot read
   (where it is not root) is passed over, as is a held-open file it cannot look at. A file
   removed from a Volume on the state disk but held open counts against the replica (more
@@ -281,7 +285,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   its replica's replacement waiting, and no replica is replaced for the reserve meanwhile.
   A count can count a file twice (moved between the walk and the look at open files) and
   counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
-  is left: what was set aside is removed at its replica's next count. A limit held at
+  gives up between files, and kithd waits 2 seconds for it so the state disk can be
+  unmounted; one directory set aside is removed in one call, which a stop does not cut
+  short. What is left is removed at its replica's next count. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload

@@ -13,6 +13,7 @@
 mod storage;
 
 use crate::Shared;
+use futures_util::FutureExt;
 use kith_api::Resource;
 use kith_api::kinds::{
     ConfigMapSpec, Container, EnvVar, ExecUnit, Field, JobSpec, NodeWorkloadSpec, PullPolicy, Resources, RestartPolicy,
@@ -24,6 +25,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, watch};
@@ -181,44 +183,74 @@ struct Controller {
     /// Bytes the state disk keeps free: under them the pod that wrote the most is replaced.
     /// `None` for the default (`storage::default_reserve`); 0 for none.
     reserve: Option<u64>,
-    /// The count of what pods wrote outside their volumes, on its way, and when it began.
-    count: Option<(Instant, Waiting<Counted>)>,
+    /// The count of what pods wrote outside their volumes, on its way.
+    count: Option<Job<Counted>>,
     /// When the last count ended.
     counted: Option<Instant>,
     /// The state disk is under its reserve with no pod to replace for it, and it was said.
     low: bool,
     /// The pods replaced for what they wrote, when, and the removal of what they wrote once no run
     /// from before is left: till it is done they are not counted and none is replaced for the reserve.
-    replacing: BTreeMap<String, (Instant, Option<Waiting<()>>)>,
+    replacing: BTreeMap<String, (Instant, Option<Job<()>>)>,
     /// The limited pods whose last count did not finish (`storage::missed`).
     missed: BTreeSet<String>,
+    /// Set as kithd stops: a count or removal under way gives up, so the state disk can go.
+    stop: std::sync::Arc<AtomicBool>,
 }
 
-/// What a count found: the state disk's free bytes, its reserve, and each pod counted.
 /// Free bytes on the state disk, its reserve, and the pods as counted.
 type Counted = (u64, u64, Vec<storage::Pod>);
 
-/// What a thread of its own is doing, to be had once it is done.
-type Waiting<T> = tokio::sync::oneshot::Receiver<T>;
+/// What a thread of its own is doing (a blocking walk of the disk), to be had once it is done.
+struct Job<T> {
+    began: Instant,
+    waiting: tokio::sync::oneshot::Receiver<T>,
+    /// It was said to have run a minute.
+    slow: bool,
+}
 
-/// Runs `work` on a thread of its own (a blocking walk of the disk), waking the loop when it is
-/// done; `None` when the system gives no thread, to be tried again the next pass.
-fn off_thread<T: Send + 'static>(
-    name: &str,
-    changed: &std::sync::Arc<tokio::sync::Notify>,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Option<Waiting<T>> {
-    let (done, waiting) = tokio::sync::oneshot::channel();
-    let changed = changed.clone();
-    let run = move || {
-        let _ = done.send(work());
-        changed.notify_one();
-    };
-    match std::thread::Builder::new().name(name.into()).spawn(run) {
-        Ok(_) => Some(waiting),
-        Err(e) => {
-            eprintln!("kithd: no thread for {name}, tried again next pass: {e}");
-            None
+/// How long a job runs before it is said not to have ended: a thread cannot be killed.
+const HUNG: Duration = Duration::from_secs(60);
+
+impl<T> Job<T> {
+    /// Runs `work` on a thread of its own, waking the loop when it is done; `None` when the
+    /// system gives no thread, to be tried again the next pass.
+    fn start(name: &str, changed: &std::sync::Arc<Notify>, work: impl FnOnce() -> T + Send + 'static) -> Option<Self>
+    where
+        T: Send + 'static,
+    {
+        let (done, waiting) = tokio::sync::oneshot::channel();
+        let changed = changed.clone();
+        let run = move || {
+            let _ = done.send(work());
+            changed.notify_one();
+        };
+        match std::thread::Builder::new().name(name.into()).spawn(run) {
+            Ok(_) => Some(Job {
+                began: Instant::now(),
+                waiting,
+                slow: false,
+            }),
+            Err(e) => {
+                eprintln!("kithd: no thread for {name}, tried again next pass: {e}");
+                None
+            }
+        }
+    }
+
+    /// What it came to once it is done (`None` within when its thread ended without it); still
+    /// on its way, `None`, and `hung` is said once it has been for `HUNG`.
+    fn done(&mut self, hung: impl FnOnce() -> String) -> Option<Option<T>> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        match self.waiting.try_recv() {
+            Err(TryRecvError::Empty) => {
+                if !self.slow && self.began.elapsed() >= HUNG {
+                    eprintln!("kithd: {}", hung());
+                    self.slow = true;
+                }
+                None
+            }
+            done => Some(done.ok()),
         }
     }
 }
@@ -292,6 +324,7 @@ pub async fn run(
         low: false,
         replacing: BTreeMap::new(),
         missed: BTreeSet::new(),
+        stop: std::sync::Arc::new(AtomicBool::new(false)),
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -299,8 +332,20 @@ pub async fn run(
             break;
         }
     }
-    for (id, mut slot) in controller.slots {
-        stop(&id, &mut slot);
+    controller.stop.store(true, Ordering::Relaxed);
+    for (id, slot) in &mut controller.slots {
+        stop(id, slot);
+    }
+    // A count or removal holds directories of the state disk open: it is waited for, a little,
+    // so the disk can be unmounted once kithd is gone.
+    let jobs = controller.count.into_iter().map(|job| job.waiting.map(drop).boxed());
+    let removals = controller.replacing.into_values().filter_map(|(_, job)| job);
+    let all = jobs.chain(removals.map(|job| job.waiting.map(drop).boxed()));
+    if tokio::time::timeout(Duration::from_secs(2), futures_util::future::join_all(all))
+        .await
+        .is_err()
+    {
+        eprintln!("kithd: a storage count or removal had not given up in 2 s: the state disk may be busy");
     }
 }
 
@@ -1463,10 +1508,9 @@ impl Controller {
     /// ended, one count at a time and off the async threads; replaces what the last count says
     /// must go (`storage::choose`).
     fn tend_storage(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
-        use tokio::sync::oneshot::error::TryRecvError;
         let replicas = state.join(crate::files::REPLICAS);
         // A replaced pod's old runs gone, what they wrote outside the scratch made anew goes.
-        let slots = &self.slots;
+        let (slots, stop) = (&self.slots, &self.stop);
         self.replacing.retain(|pod, (at, removal)| {
             let runs: Vec<(bool, Instant)> = slots
                 .values()
@@ -1477,19 +1521,19 @@ impl Controller {
                 return true;
             }
             if removal.is_none() {
-                let replica = replicas.join(pod);
-                *removal = off_thread("storage", &shared.changed, move || storage::sweep(&replica));
+                let (replica, stop) = (replicas.join(pod), stop.clone());
+                *removal = Job::start("storage", &shared.changed, move || storage::sweep(&replica, &stop));
             }
             // (No thread for it: tried again next pass.)
-            removal
-                .as_mut()
-                .is_none_or(|removal| removal.try_recv() == Err(TryRecvError::Empty))
+            removal.as_mut().is_none_or(|removal| {
+                let hung = || format!("{pod}: removing what it wrote outside its volumes has not ended in 60 s: no pod is replaced for the reserve until it does");
+                removal.done(hung).is_none()
+            })
         });
-        let done = match self.count.as_mut().map(|(_, job)| job.try_recv()) {
-            None | Some(Err(TryRecvError::Empty)) => None,
-            Some(counted) => self.count.take().map(|(began, _)| (began, counted.ok())),
-        };
+        let hung = || "the storage count has not ended in 60 s: no pod's storage is limited until it does".to_string();
+        let done = self.count.as_mut().and_then(|job| Some((job.began, job.done(hung)?)));
         if let Some((began, counted)) = done {
+            self.count = None;
             self.counted = Some(Instant::now());
             if let Some((free, reserve, mut pods)) = counted {
                 for i in storage::missed(&mut pods, &mut self.missed) {
@@ -1561,18 +1605,21 @@ impl Controller {
         if pods.is_empty() {
             return;
         }
-        let began = Instant::now();
         let state = state.to_path_buf();
-        let job = off_thread("storage", &shared.changed, move || {
+        let stop = self.stop.clone();
+        self.count = Job::start("storage", &shared.changed, move || {
             let pods: Vec<storage::Pod> = pods
                 .into_iter()
                 .map(|(mut pod, roots, cgroups)| {
                     // (A scratch set aside and not removed, by a kithd that stopped first, goes now.)
-                    storage::sweep(&replicas.join(&pod.id));
-                    let until = Instant::now() + storage::SPELL;
-                    let stop = pod.limit.unwrap_or(u64::MAX);
-                    (pod.bytes, pod.finished) = storage::count(&roots, stop, until);
-                    if pod.finished && pod.bytes <= stop {
+                    storage::sweep(&replicas.join(&pod.id), &stop);
+                    let until = storage::Until {
+                        at: Instant::now() + storage::SPELL,
+                        stop: &stop,
+                    };
+                    let limit = pod.limit.unwrap_or(u64::MAX);
+                    (pod.bytes, pod.finished) = storage::count(&roots, limit, until);
+                    if pod.finished && pod.bytes <= limit {
                         let mut pids = Vec::new();
                         for cgroup in &cgroups {
                             let (more, all) = storage::pids(cgroup, until);
@@ -1591,7 +1638,6 @@ impl Controller {
             (free, reserve, pods)
         });
         // Done, it wakes the loop to act on it; no thread for it, the next pass tries again.
-        self.count = job.map(|job| (began, job));
     }
 
     /// Kills every running unit of the pod `pod`, saying `why`, and sets its disk scratch aside,
@@ -1607,6 +1653,8 @@ impl Controller {
             return;
         }
         eprintln!("kithd: {pod}: {why}");
+        // Started again, it starts with no count missed.
+        self.missed.remove(pod);
         let mut killed = true;
         for (id, slot) in &mut units {
             (slot.message, slot.replaced) = (Some(why.to_string()), true);

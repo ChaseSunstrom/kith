@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// One pod as it was counted.
@@ -40,6 +41,20 @@ const LINKED: usize = 65536;
 
 /// The most cgroups, and processes, of one pod read a count; past them it did not finish.
 const CGROUPS: usize = 100_000;
+
+/// When a count gives up: at `at`, or once `stop` is set, by a kithd stopping, so that nothing
+/// it has open on the state disk keeps that from being unmounted.
+#[derive(Clone, Copy)]
+pub struct Until<'a> {
+    pub at: Instant,
+    pub stop: &'a AtomicBool,
+}
+
+impl Until<'_> {
+    fn passed(self) -> bool {
+        Instant::now() >= self.at || self.stop.load(Ordering::Relaxed)
+    }
+}
 
 /// The reserve a node keeps when its flag does not say: 5% of its state disk, at most 1 GiB; none
 /// for a kithd that is not root, which cannot read all a pod writes and shares its disk with a desk.
@@ -78,7 +93,7 @@ fn open_dir(parent: Option<&OwningIter>, name: &(impl nix::NixPath + ?Sized), de
 //
 // ponytail: the files a pod made are walked one by one, so millions of small ones make a slow
 // count; an ext4 project quota on each root would hold the line at the write instead.
-pub fn count(roots: &[PathBuf], stop: u64, until: Instant) -> (u64, bool) {
+pub fn count(roots: &[PathBuf], stop: u64, until: Until) -> (u64, bool) {
     let mut linked = BTreeSet::new();
     let (mut bytes, mut finished) = (0u64, true);
     for root in roots {
@@ -95,7 +110,7 @@ pub fn count(roots: &[PathBuf], stop: u64, until: Instant) -> (u64, bool) {
             if bytes > stop {
                 return (bytes, true);
             }
-            if Instant::now() >= until {
+            if until.passed() {
                 return (bytes, false);
             }
             // (A directory that fails to read on is left where it failed.)
@@ -136,13 +151,13 @@ fn first(seen: &mut BTreeSet<(u64, u64)>, meta: &FileStat) -> bool {
 
 /// The processes in the cgroup `cgroup` and the cgroups under it, and whether all were read
 /// before `until` and within `CGROUPS`.
-pub fn pids(cgroup: &Path, until: Instant) -> (Vec<u32>, bool) {
+pub fn pids(cgroup: &Path, until: Until) -> (Vec<u32>, bool) {
     let mut pids = Vec::new();
     let mut cgroups = vec![(cgroup.to_path_buf(), 0)];
     let mut read = 0;
     while let Some((cgroup, depth)) = cgroups.pop() {
         read += 1;
-        if Instant::now() >= until || read > CGROUPS || pids.len() > CGROUPS {
+        if until.passed() || read > CGROUPS || pids.len() > CGROUPS {
             return (pids, false);
         }
         let procs = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap_or_default();
@@ -151,6 +166,9 @@ pub fn pids(cgroup: &Path, until: Instant) -> (Vec<u32>, bool) {
             for entry in std::fs::read_dir(&cgroup).into_iter().flatten().flatten() {
                 if entry.file_type().is_ok_and(|t| t.is_dir()) {
                     cgroups.push((entry.path(), depth + 1));
+                }
+                if cgroups.len() > CGROUPS {
+                    return (pids, false);
                 }
             }
         }
@@ -168,7 +186,7 @@ fn deleted(link: &Path) -> bool {
 /// Bytes on disk of the files the processes `pids` keep open, or mapped, after they were deleted
 /// (they have no name left to walk to), on the filesystem of one of `roots` or the one each
 /// process sees as `/`; each file once. Whether it got to its end before `until`.
-pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Instant) -> (u64, bool) {
+pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Until) -> (u64, bool) {
     let devices: BTreeSet<u64> = roots
         .iter()
         .filter_map(|root| std::fs::symlink_metadata(root).ok())
@@ -182,7 +200,7 @@ pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Instant) -> (u64, bool) 
         devices.extend(std::fs::metadata(process.join("root")).map(|m| m.dev()));
         for held in ["fd", "map_files"] {
             for entry in std::fs::read_dir(process.join(held)).into_iter().flatten().flatten() {
-                if Instant::now() >= until {
+                if until.passed() {
                     return (bytes, false);
                 }
                 // (Followed, once it names a deleted file: the link is the open file itself.)
@@ -213,9 +231,15 @@ pub fn aside(scratch: &Path) -> bool {
     std::fs::rename(scratch, gone).is_ok()
 }
 
-/// Removes every scratch moved aside in the replica directory `replica`.
-pub fn sweep(replica: &Path) {
+/// Removes every scratch moved aside in the replica directory `replica`, till `stop` is set.
+//
+// ponytail: each scratch goes in one `remove_dir_all`, which a stop does not cut short; one of
+// millions of files can outlast kithd's stop. A walk of its own that checks `stop` if it does.
+pub fn sweep(replica: &Path, stop: &AtomicBool) {
     for entry in std::fs::read_dir(replica).into_iter().flatten().flatten() {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if entry.file_name().to_string_lossy().starts_with("scratch.")
             && let Err(e) = std::fs::remove_dir_all(entry.path())
             && e.kind() != std::io::ErrorKind::NotFound
@@ -319,8 +343,21 @@ mod tests {
         }
     }
 
-    fn later() -> Instant {
-        Instant::now() + Duration::from_secs(600)
+    /// A flag never set: no test's count is stopped but the one that sets its own.
+    static GOING: AtomicBool = AtomicBool::new(false);
+
+    fn later() -> Until<'static> {
+        Until {
+            at: Instant::now() + Duration::from_secs(600),
+            stop: &GOING,
+        }
+    }
+
+    fn now() -> Until<'static> {
+        Until {
+            at: Instant::now(),
+            stop: &GOING,
+        }
     }
 
     const MIB: u64 = 1 << 20;
@@ -392,8 +429,43 @@ mod tests {
         // Out of time before it began: unfinished.
         let shallow = dir("shallow");
         std::fs::create_dir(shallow.join("d")).unwrap();
-        assert!(!count(std::slice::from_ref(&shallow), u64::MAX, Instant::now()).1);
+        assert!(!count(std::slice::from_ref(&shallow), u64::MAX, now()).1);
         for d in [root, shallow] {
+            std::fs::remove_dir_all(d).unwrap();
+        }
+    }
+
+    #[test]
+    fn storage_limit_a_count_and_a_removal_end_once_kithd_stops() {
+        // A wide, deep tree: a count of it is well under way when kithd stops.
+        let root = dir("stopped");
+        let mut at = root.clone();
+        for _ in 0..DEEP - 1 {
+            at = at.join("d");
+            for i in 0..50 {
+                std::fs::create_dir_all(at.join(i.to_string())).unwrap();
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let until = Until {
+            at: Instant::now() + Duration::from_secs(600),
+            stop: &stop,
+        };
+        let began = Instant::now();
+        let (bytes, finished) = std::thread::scope(|s| {
+            let counting = s.spawn(|| count(std::slice::from_ref(&root), u64::MAX, until));
+            stop.store(true, Ordering::Relaxed);
+            counting.join().unwrap()
+        });
+        assert!(!finished && began.elapsed() < Duration::from_secs(1), "{bytes}");
+        // Stopped, the processes, the open files and the removal give up too.
+        assert!(!pids(Path::new("/proc/self"), until).1);
+        assert!(!unlinked(&[std::process::id()], std::slice::from_ref(&root), until).1);
+        let replica = dir("stopped-replica");
+        std::fs::create_dir_all(replica.join("scratch.1")).unwrap();
+        sweep(&replica, &stop);
+        assert!(replica.join("scratch.1").exists());
+        for d in [root, replica] {
             std::fs::remove_dir_all(d).unwrap();
         }
     }
@@ -460,7 +532,7 @@ mod tests {
         all.sort();
         assert!(all == [1, 2, 3] && finished, "{all:?}");
         // Out of time: not all were read, and it says so.
-        assert!(!pids(&top, Instant::now()).1);
+        assert!(!pids(&top, now()).1);
         std::fs::remove_dir_all(top).unwrap();
     }
 
@@ -517,6 +589,10 @@ mod tests {
         let mut slow = [unfinished("slow", Some(10 * MIB))];
         assert_eq!(missed(&mut slow, &mut last), [0]);
         assert!(choose(&slow, u64::MAX, MIB).is_empty());
+        // So does a replacement, whatever it was for (`Controller::replace` forgets the miss).
+        last.remove("slow");
+        let mut slow = [unfinished("slow", Some(10 * MIB))];
+        assert_eq!(missed(&mut slow, &mut last), [0]);
     }
 
     #[test]
@@ -541,7 +617,7 @@ mod tests {
         // Swept: every scratch set aside goes, what is not one stays.
         std::fs::create_dir_all(replica.join("scratch.1")).unwrap();
         std::fs::create_dir_all(scratch.join("new")).unwrap();
-        sweep(&replica);
+        sweep(&replica, &GOING);
         let left: Vec<_> = std::fs::read_dir(&replica)
             .unwrap()
             .flatten()
