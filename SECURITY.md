@@ -589,6 +589,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.
+  - A deleted node does not put itself back, the one the cluster started on included: that one
+    makes its own Node only while the store holds no Node at all, so on a restart with its
+    Node gone it writes nothing and says so (a cluster of that one node, deleted, is the
+    exception: no Node is left to tell it apart from a start that ended too early). It joins
+    again with a token.
   - A request that was already running when the Node was deleted (a `kith run` in
     progress, a copy of a blob or a volume) runs to its end. A watch is told no more.
   - A node answers by the store it has: one that is cut off from the others, or
