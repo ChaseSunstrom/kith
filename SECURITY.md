@@ -502,11 +502,35 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     it was away, and nobody else would send it the store. A certificate from a join
     names an index of the store by which its Node was there, so a node whose store is
     past that index knows the Node was deleted and refuses these too. One whose store
-    is not that far (a node that has just joined, one that has been away since before
-    the deleted node joined, one whose store was wiped while its certificate was kept)
-    cannot know, and whoever
-    holds a deleted node's key can send it a store of their making until it has caught
-    up with the real one. Do not start a node on a wiped store: join it again.
+    is not that far (one that has been away since before the sender joined) cannot know
+    by itself, and asks the voters it last knew (its own store's members, itself and
+    the sender not counted), each over a link held to that voter's key: it takes the
+    three things once one says the sender's Node stands with that key and none says it
+    does not, and refuses them otherwise (403, before Raft sees them). A voter answers
+    only a node that stands in its own store, and says only yes, no, or "not yet" (it
+    is behind too); "not yet", no answer in two seconds, and a build without the
+    question are no word. A yes is kept until the asking node's store is past the
+    sender's index, and thirty seconds at most; a no thirty seconds, no word five; each
+    sender is asked once whatever it sends meanwhile, and answers for sixteen senders at
+    most are kept at once (a seventeenth is refused until one lapses). What that leaves:
+    - Sixteen senders of the CA it has not heard of fill those places: then the node
+      that really leads is refused too, as long as they keep sending (a no is kept
+      thirty seconds, no word five), and the node stays behind. That takes sixteen
+      distinct names (or keys), each a certificate of the CA: sixteen deleted nodes'
+      keys, or sixteen join tokens. No kind of answer has places of its own.
+    - Whoever holds the key of a voter it last knew that has been deleted since can
+      say yes for a deleted node, when every voter that would say no is out of reach.
+      With that key they could already send it a store by themselves: the asking node
+      has not heard that this one was deleted either.
+    - A node that reaches none of the voters it last knew takes nothing from a node it
+      has not heard of meanwhile. It asks again five seconds later, so once one that was
+      down is back it catches up by itself; only when every voter it knew was replaced
+      while it was away does it stay behind: join it again.
+    - A node that knows of no voter at all (one that has just joined, one whose store
+      was wiped while its certificate was kept) has nobody to ask and takes these from
+      any node of the CA, as before: whoever holds a deleted node's key can send it a
+      store of their making until it has caught up with the real one. Do not start a
+      node on a wiped store: join it again.
   - A Node written by a kithd from before this check names no key and stands by its
     name, and that node's certificate names no index: once its Node is deleted, only a
     node that has not heard of itself takes those three things from it. The node the
