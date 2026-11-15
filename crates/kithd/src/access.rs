@@ -32,6 +32,9 @@ pub enum Caller {
     Identity(String),
     /// Someone who asked the node named, which passed their request on: by that node's word.
     Via(String, Box<Caller>),
+    /// The same, on a worker that runs from a view: it has no Identity and no Role to ask
+    /// again by, and takes the control node's word for what they may do as well.
+    Checked(String, Box<Caller>),
 }
 
 /// The header by which a node that passes a request on says who asked it.
@@ -58,7 +61,7 @@ impl Caller {
     /// The node this came from, where it came from one: by itself, or for someone.
     pub fn node(&self) -> Option<&str> {
         match self {
-            Caller::Node(node) | Caller::Via(node, _) => Some(node),
+            Caller::Node(node) | Caller::Via(node, _) | Caller::Checked(node, _) => Some(node),
             _ => None,
         }
     }
@@ -71,7 +74,7 @@ impl std::fmt::Display for Caller {
             Caller::Admin => f.write_str("local socket"),
             Caller::Node(node) => write!(f, "node {node}"),
             Caller::Identity(name) => f.write_str(name),
-            Caller::Via(node, who) => write!(f, "{who} via node {node}"),
+            Caller::Via(node, who) | Caller::Checked(node, who) => write!(f, "{who} via node {node}"),
         }
     }
 }
@@ -88,7 +91,7 @@ fn names(kinds: &[String], kind: &str) -> bool {
 impl Grants {
     pub fn of(caller: &Caller, store: &Store) -> Grants {
         let name = match caller {
-            Caller::Admin => return Grants(None),
+            Caller::Admin | Caller::Checked(..) => return Grants(None),
             // A node has no right of its own here: what it does for the cluster goes by the
             // node routes, and what it passes on is asked as whoever asked it.
             Caller::Node(_) => return Grants(Some(Vec::new())),
@@ -238,6 +241,21 @@ pub fn control_stays(store: &Store, after: &[(&str, Option<&serde_json::Value>)]
             "node {name} holds the cluster's CA key: it stays a control node"
         ));
     }
+    // A worker that runs from a view erased its copy of the store, and its kithd takes no part
+    // in Raft: it does not become a control node by a change to its Node.
+    let views = |name: &str| {
+        let status = store.get(&format!("Node/{name}")).and_then(|node| node.status.as_ref());
+        status.is_some_and(|status| status["view"] == true)
+    };
+    let made_control = |(name, spec): &&(&str, Option<&serde_json::Value>)| {
+        spec.is_some_and(|spec| spec["trust"] != "worker") && views(name)
+    };
+    if let Some((name, _)) = after.iter().find(made_control) {
+        return Err(format!(
+            "node {name} is a worker that keeps a view of the store, not the store: delete it \
+             (`kith delete node/{name}`) and join it again to make it a control node"
+        ));
+    }
     let touched = |name: &str| after.iter().any(|(node, _)| *node == name);
     let rest = store.list(Some("Node")).filter(|node| !touched(&node.metadata.name));
     let specs = rest
@@ -257,9 +275,33 @@ pub fn withheld(store: &Store, me: Option<&str>, key: &str, spec: &serde_json::V
     kept.then(|| format!("{key} is for control nodes (`trust: control`), and this node is a worker"))
 }
 
+/// Whoever the control node `node` says asked it (`who`), as this node takes them: by its own
+/// store, or, on a worker that runs from a view, by that node's word alone ([`Caller::Checked`]).
+pub fn passed(shared: &Shared, node: String, who: Caller) -> Caller {
+    match shared.view.borrow().is_some() {
+        true => Caller::Checked(node, Box::new(who)),
+        false => Caller::Via(node, Box::new(who)),
+    }
+}
+
 /// Why a worker's word for who asked does nothing.
 pub fn not_taken(node: &str) -> String {
     format!("node {node} is a worker: its word for who asked is not taken")
+}
+
+/// Where the control nodes this node knows of are, to say to someone who asked a worker.
+fn control_nodes(shared: &Shared) -> String {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    let control = state
+        .store
+        .list(Some("Node"))
+        .filter(|node| node.spec["trust"] != "worker");
+    let at = |node: &kith_api::Resource| Some(node.status.as_ref()?["address"].as_str()?.to_string());
+    let addresses: Vec<String> = control.filter_map(at).collect();
+    match addresses.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", addresses.join(", ")),
+    }
 }
 
 /// Who a request on the TLS port is from, or why it is refused (and with what status). A
@@ -287,7 +329,7 @@ pub fn who(
             } else {
                 // Whoever the node says asked it: the handler asks what that caller may do.
                 let why = match named.map(|named| (named, Caller::named(named))) {
-                    Some((_, Some(who))) => return Ok(Caller::Via(node.clone(), Box::new(who))),
+                    Some((_, Some(who))) => return Ok(passed(shared, node.clone(), who)),
                     Some((named, None)) => format!("{FOR}: {named:?} is no caller a node passes on"),
                     // (A kithd from before nodes said who asked: nothing is done on its word alone.)
                     None => format!(
@@ -316,6 +358,20 @@ pub fn who(
         }
     };
     let caller = Caller::Identity(name.clone());
+    // A worker that runs from a view has no Identity and no Role: it answers no one by their
+    // rights, reads included (a list read from a view would be short without saying so).
+    if shared.view.borrow().is_some() {
+        let why = format!(
+            "this node is a worker and answers no one by their rights: ask a control node{}",
+            control_nodes(shared)
+        );
+        if shared.audit.stranger() {
+            shared
+                .audit
+                .record(&caller, method, vec![path.into()], Err(why.clone()));
+        }
+        return Err((StatusCode::FORBIDDEN, why));
+    }
     if !stands(shared, name, key) {
         let why = format!(
             "this certificate does not stand for an Identity {name}: there is none, or it has been given another"

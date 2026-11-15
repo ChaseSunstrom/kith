@@ -20,6 +20,54 @@ pub struct State {
     pub store: Store,
     applied: Option<LogId<u64>>,
     membership: StoredMembership<u64, BasicNode>,
+    /// (Not in a snapshot: a node that starts, or is sent one, knows of no change before it.)
+    #[serde(skip)]
+    touched: Touched,
+}
+
+/// How many changed keys are kept: a reader further behind than that reads everything.
+const TOUCHED: usize = 4096;
+
+/// The keys the last commands changed, oldest first, each with the index of the log it
+/// was changed at: what a reader that follows the store reads, instead of all of it.
+#[derive(Debug, Default, Clone)]
+struct Touched {
+    /// Nothing is known of what changed at this index or before.
+    floor: u64,
+    keys: std::collections::VecDeque<(u64, String)>,
+}
+
+impl State {
+    /// How far into the log this state is.
+    pub fn index(&self) -> u64 {
+        self.applied.map_or(0, |id| id.index)
+    }
+
+    /// The keys changed after the index `after`: what a reader that saw this state at `after`
+    /// has to read again. `None` when that is further back than is kept, or the store was
+    /// replaced since: it reads everything.
+    pub fn touched(&self, after: u64) -> Option<std::collections::BTreeSet<&str>> {
+        let since = self.touched.keys.iter().filter(|(at, _)| *at > after);
+        (after >= self.touched.floor).then(|| since.map(|(_, key)| key.as_str()).collect())
+    }
+
+    /// Keep the keys the command at `index` changes; `None`: it replaced the store.
+    fn note(&mut self, index: u64, keys: Option<Vec<String>>) {
+        let Some(keys) = keys else { return self.forget() };
+        self.touched.keys.extend(keys.into_iter().map(|key| (index, key)));
+        while self.touched.keys.len() > TOUCHED {
+            let gone = self.touched.keys.pop_front().expect("it is longer than that");
+            self.touched.floor = gone.0;
+        }
+    }
+
+    /// Nothing is known of what changed up to here.
+    fn forget(&mut self) {
+        self.touched = Touched {
+            floor: self.index(),
+            keys: Default::default(),
+        };
+    }
 }
 
 /// The snapshot file: a state and the description Raft keeps of it.
@@ -64,11 +112,12 @@ impl Machine {
     /// Start from the snapshot in `dir`, or empty.
     pub fn open(dir: &Path, changed: Arc<dyn Fn() + Send + Sync>) -> Result<Machine, String> {
         let file = dir.join("snapshot.json");
-        let state = match std::fs::read(&file) {
+        let mut state = match std::fs::read(&file) {
             Ok(bytes) => read(&bytes, &file)?.state,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
             Err(e) => return Err(format!("reading {}: {e}", file.display())),
         };
+        state.forget();
         Ok(Machine {
             saved: Arc::new(Mutex::new(state.applied)),
             state: Arc::new(Mutex::new(state)),
@@ -167,7 +216,13 @@ impl RaftStateMachine<TypeConfig> for Machine {
                 state.applied = Some(entry.log_id);
                 replies.push(match entry.payload {
                     EntryPayload::Blank => Ok(crate::Done::Nothing),
-                    EntryPayload::Normal(command) => run(&mut state.store, command),
+                    EntryPayload::Normal(command) => {
+                        let keys = crate::keys(&command);
+                        let reply = run(&mut state.store, command);
+                        let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
+                        state.note(entry.log_id.index, keys);
+                        reply
+                    }
                     EntryPayload::Membership(membership) => {
                         state.membership = StoredMembership::new(Some(entry.log_id), membership);
                         Ok(crate::Done::Nothing)
@@ -207,6 +262,7 @@ impl RaftStateMachine<TypeConfig> for Machine {
         self.save(&saved)?;
         let mut state = self.state();
         *state = saved.state;
+        state.forget();
         (self.changed)();
         Ok(())
     }

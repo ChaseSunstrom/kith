@@ -52,8 +52,13 @@ pub struct Cluster {
 type Fallible<T> = Result<T, String>;
 
 fn client(ca: &str, me: Option<&Identity>) -> Fallible<reqwest::Client> {
+    client_for(ca, me, None)
+}
+
+/// A client that calls one node as `me`: no other node's certificate is taken at its address.
+pub(crate) fn client_for(ca: &str, me: Option<&Identity>, pin: Option<pki::Pin>) -> Fallible<reqwest::Client> {
     let builder = reqwest::Client::builder()
-        .use_preconfigured_tls(pki::client_config(ca, me)?)
+        .use_preconfigured_tls(pki::client_config(ca, me, pin)?)
         .connect_timeout(Duration::from_secs(5))
         .no_proxy();
     builder.build().map_err(|e| format!("setting up the node client: {e}"))
@@ -347,7 +352,7 @@ const RUN_HOP: &str = "/v1/run-hop";
 /// from a worker for as long as it does (it hands its vote over itself, `raft::next_change`):
 /// refusing them the moment a voter is made a worker would cut a store's only voter off from
 /// the others, with nothing left that could agree on putting it right.
-fn votes(shared: &Shared, name: &str) -> bool {
+pub(crate) fn votes(shared: &Shared, name: &str) -> bool {
     // (Its id in Raft is made from the name its certificate has: nothing a node can write.)
     let id = kith_store::node_id(name);
     let metrics = shared.raft.metrics().borrow().clone();
@@ -365,6 +370,12 @@ async fn members_only(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
+    // A worker that runs from a view keeps no store: nothing of Raft's is its to take.
+    let viewing = shared.view.borrow().is_some();
+    if viewing && path.starts_with("/v1/raft/") {
+        let why = "this node is a worker: it keeps a view of the store and takes no part in it";
+        return refuse(StatusCode::FORBIDDEN, why).into_response();
+    }
     let (status, why) = match &peer.subject {
         Some(pki::Subject::Node(name, key, born))
             if admitted(&shared, name, key) || catching_up(&shared, path, name, *born) =>
@@ -423,6 +434,7 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
     // (The second hop of `kith run`: the caller was checked on the first node.)
     let hop = Router::new()
         .route("/v1/run-hop", post(api::run::hop))
+        .route("/v1/view", get(crate::view::serve))
         .route("/v1/blob-copy/{name}", get(crate::blobs::copy))
         .route("/v1/volume-copy/{namespace}/{name}", get(crate::replicas::copy))
         .route(
@@ -514,7 +526,7 @@ pub fn offer_claim(shared: &Shared) {
     if claimed(shared) {
         return;
     }
-    match claims.mint(&ca.cert, false) {
+    match claims.mint(&ca.cert, pki::Lets::Control) {
         Ok(token) => eprintln!(
             "kithd: nobody administers this cluster from outside yet. For an hour, whoever sends this token to /v1/claim does: {token}"
         ),
@@ -564,6 +576,7 @@ async fn issue(
         cert,
         key,
         peers: Vec::new(),
+        view: None,
     }))
 }
 
@@ -593,6 +606,15 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
         names
     };
     let learners = membership.nodes().map(|(id, _)| *id).filter(|id| !voters.contains(id));
+    // A worker that runs from a view: the index its view is at, and whom it is sent by.
+    if let Some(at) = *shared.view.borrow() {
+        let upstream = shared.upstream.lock().expect("nothing panics holding the upstream");
+        return Json(serde_json::json!({
+            "node": me,
+            "view": { "applied": at, "from": upstream.as_ref().map(|(address, _)| address) },
+            "mesh": shared.mesh.lock().expect("nothing panics holding the mesh").clone(),
+        }));
+    }
     Json(serde_json::json!({
         "node": name(metrics.id),
         "leader": metrics.current_leader.map(name),
@@ -628,16 +650,22 @@ pub async fn token(
     if let Err(refused) = api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, node) {
         return refused.into_response();
     }
-    // `?trust=worker`: the node it lets in is one (`spec.trust`), from its first moment.
-    let worker = match asked.get("trust").map(String::as_str) {
-        None | Some("control") => false,
-        Some("worker") => true,
-        Some(other) => {
-            let why = format!("trust is `control` or `worker`, not `{other}`");
+    // `?trust=worker`: the node it lets in is one (`spec.trust`), from its first moment, and
+    // is sent a view of the store; `&store=whole`: the store all the same (it serves ingress).
+    let said = |field: &str| asked.get(field).map(String::as_str);
+    let lets = match (said("trust"), said("store")) {
+        (None | Some("control"), None) => pki::Lets::Control,
+        (Some("worker"), None) => pki::Lets::Worker,
+        (Some("worker"), Some("whole")) => pki::Lets::WorkerWhole,
+        (trust, store) => {
+            let (trust, store) = (trust.unwrap_or("control"), store.unwrap_or_default());
+            let why = format!(
+                "trust is `control` or `worker` (not `{trust}`), and store is `whole` for a worker or left out (not `{store}`)"
+            );
             return refuse(StatusCode::UNPROCESSABLE_ENTITY, why).into_response();
         }
     };
-    let minted = mint(&shared, worker);
+    let minted = mint(&shared, lets);
     let said = minted.as_ref().map(drop).map_err(|_| "no token".to_string());
     shared.audit.record(&caller, "token", vec!["Node".into()], said);
     minted.into_response()
@@ -693,7 +721,7 @@ pub async fn netboot(
             let disk = asked.get("disk").map_or("only", String::as_str);
             let encrypt = asked.get("encrypt").is_some_and(|encrypt| encrypt == "true");
             netboot::on(image.to_vec(), machines, minutes, disk, encrypt, || {
-                cluster.tokens.mint(&ca.cert, false)
+                cluster.tokens.mint(&ca.cert, pki::Lets::Control)
             })
             .await
         }
@@ -712,12 +740,12 @@ pub async fn netboot(
     }
 }
 
-fn mint(shared: &Shared, worker: bool) -> Result<Json<serde_json::Value>, Refusal> {
+fn mint(shared: &Shared, lets: pki::Lets) -> Result<Json<serde_json::Value>, Refusal> {
     let cluster = cluster(shared)?;
     let Some(ca) = &cluster.ca else {
         return Err(refuse(StatusCode::CONFLICT, CA_ELSEWHERE));
     };
-    let token = cluster.tokens.mint(&ca.cert, worker);
+    let token = cluster.tokens.mint(&ca.cert, lets);
     let token = token.map_err(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(serde_json::json!({ "token": token, "expiresInSeconds": 3600 })))
 }
@@ -731,6 +759,10 @@ struct JoinRequest {
     /// From a node that roams: it is to be reached on the mesh, and this is its key there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mesh: Option<OnMesh>,
+    /// It can run from a view if it is let in as a worker (a kithd from before views says
+    /// nothing; one that serves ingress says no). What it is sent is its token's to say.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    view: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -749,6 +781,9 @@ pub struct Joined {
     /// before it has the store.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<serde_json::Value>,
+    /// For a worker that runs from a view: the node that let it in, which it asks for its first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<pki::Pin>,
 }
 
 fn node_key(name: &str) -> String {
@@ -759,15 +794,15 @@ fn node_key(name: &str) -> String {
 /// every JSON reader keeps 64 bits), and holding the certificate whose key's print is
 /// `print` ([`admitted`]), with what it says of itself on the mesh if it joined there, all
 /// in one entry: no entry makes it half a node. The leader then starts sending it the store.
-/// `ca`: it is the node that holds the CA key, which no change may make a worker.
+/// `more` is what else its status says from the start: `ca` (it is the node that holds the CA
+/// key, which no change may make a worker), `view` (a worker that is sent a view instead).
 pub async fn register(
     shared: &Shared,
     name: &str,
     address: &str,
     id: u64,
     print: &str,
-    mesh: Option<serde_json::Value>,
-    ca: bool,
+    more: serde_json::Value,
 ) -> Result<(), kith_api::store::Error> {
     let node = serde_json::json!({
         "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": {},
@@ -785,8 +820,9 @@ pub async fn register(
     let serde_json::Value::Object(mut status) = status else {
         unreachable!("an object")
     };
-    status.extend(mesh.map(|mesh| ("mesh".to_string(), mesh)));
-    status.extend(ca.then(|| ("ca".to_string(), true.into())));
+    if let serde_json::Value::Object(more) = more {
+        status.extend(more);
+    }
     let statuses = vec![(node_key(name), status)];
     shared.submit(Command::Patch { statuses }).await.map(drop)
 }
@@ -806,12 +842,22 @@ async fn join(
     // One join at a time: a token is checked here and spent at the end, and is good once.
     let _one = cluster.joining.lock().await;
     // The token first: someone without one learns nothing about the cluster.
-    let Some(worker) = cluster.tokens.good(&request.token, false) else {
+    let Some(lets) = cluster.tokens.good(&request.token, false) else {
         return Err(refuse(
             StatusCode::FORBIDDEN,
             "the join token is wrong, already used, or older than an hour",
         ));
     };
+    // Whether a worker is sent the store is its token's maker's to say: a node that cannot run
+    // from a view (it serves ingress, or its kithd is from before views) is not let in by a
+    // token that does not say so.
+    let (worker, view) = (lets != pki::Lets::Control, lets == pki::Lets::Worker);
+    if view && !request.view {
+        let why = "this token lets in a worker that runs from a view of the store, and this node cannot \
+                   (it serves ingress, or its kithd is older): ask for a token with `kith node token --worker --ingress` \
+                   (the node is then sent the whole store), or join it without --ingress";
+        return Err(refuse(StatusCode::CONFLICT, why));
+    }
     pki::valid_name(&request.name).map_err(|e| refuse(StatusCode::UNPROCESSABLE_ENTITY, e))?;
     let taken = {
         let store = shared.store.lock().expect("a handler panicked holding the store");
@@ -902,16 +948,22 @@ async fn join(
     let print = pki::print_of(&cert).map_err(failed)?;
     // (What a roaming node says of itself on the mesh goes in with the rest: the other
     // nodes take it as a peer by this key, and it calls them.)
-    let (address, mesh) = match &request.mesh {
-        None => (SocketAddr::new(peer.addr.ip(), request.port), None),
+    let mut more = serde_json::Map::new();
+    let address = match &request.mesh {
+        None => SocketAddr::new(peer.addr.ip(), request.port),
         Some(said) => {
             let mesh = serde_json::json!({ "key": said.key, "address": mesh_address.to_string(), "port": said.port });
-            (SocketAddr::new(mesh_address.into(), request.port), Some(mesh))
+            more.insert("mesh".into(), mesh);
+            SocketAddr::new(mesh_address.into(), request.port)
         }
     };
+    // A worker that runs from a view is never sent the store: its Node says so from the start.
+    if view {
+        more.insert("view".into(), true.into());
+    }
     let address = address.to_string();
     let id = kith_store::node_id(&request.name);
-    register(&shared, &request.name, &address, id, &print, mesh, false)
+    register(&shared, &request.name, &address, id, &print, more.into())
         .await
         .map_err(unavailable)?;
     cluster.tokens.good(&request.token, true);
@@ -925,11 +977,20 @@ async fn join(
         cert,
         key,
         peers,
+        view: view.then(|| (cluster.me.name.clone(), pki::print_of(&cluster.me.cert).ok())),
     }))
 }
 
 /// Trade a join token for an identity, at the node `address`.
-pub async fn request_join(address: &str, token: &str, name: &str, port: u16, mesh: Option<OnMesh>) -> Fallible<Joined> {
+/// `view`: let in as a worker, it will run from a view.
+pub async fn request_join(
+    address: &str,
+    token: &str,
+    name: &str,
+    port: u16,
+    mesh: Option<OnMesh>,
+    view: bool,
+) -> Fallible<Joined> {
     pki::valid_name(name)?;
     let (_, pinned) = pki::token_parts(token)?;
     let failed = |what: &str, e: reqwest::Error| format!("{what} {address}: {e}");
@@ -968,6 +1029,7 @@ pub async fn request_join(address: &str, token: &str, name: &str, port: u16, mes
         name: name.into(),
         port,
         mesh,
+        view,
     };
     let member = client(&ca, None)?
         .post(format!("https://{address}/v1/join"))

@@ -285,6 +285,24 @@ fn apply_keeps_status_and_validates() {
 }
 
 #[test]
+fn a_view_keeps_a_resource_as_it_was_sent() {
+    let mut theirs = Store::default();
+    for n in 1..=3 {
+        theirs.apply(one(&workload(&format!("  replicas: {n}\n")))).unwrap();
+    }
+    let key = "Workload/default/web";
+    theirs.set_status(key, Some(json!({ "ready": 3 }))).unwrap();
+    let sent = theirs.get(key).unwrap().clone();
+    // Its revision and status as they were, one revision of it and no history.
+    let mut view = Store::default();
+    view.put(sent.clone());
+    view.put(sent.clone());
+    assert_eq!(view.get(key), Some(&sent));
+    assert_eq!(view.history(key).unwrap().len(), 1);
+    assert!(view.remove(key) && !view.remove(key) && view.get(key).is_none());
+}
+
+#[test]
 fn history_is_bounded() {
     let mut store = Store::default();
     for n in 0..HISTORY_LIMIT + 5 {

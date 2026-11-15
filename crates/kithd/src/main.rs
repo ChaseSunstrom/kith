@@ -50,6 +50,7 @@ mod sources;
 mod tpm;
 mod ui;
 mod update;
+mod view;
 mod vm;
 mod volume_files;
 mod volumes;
@@ -190,6 +191,12 @@ pub struct Shared {
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
+    /// On a worker that runs from a view (`view`): the index of the store its view is at.
+    /// `None` on every other node, which keeps the store.
+    pub view: watch::Sender<Option<u64>>,
+    /// On such a worker: where the control node it follows is, and the client that calls it
+    /// and no other.
+    pub upstream: Mutex<Option<(String, reqwest::Client)>>,
 }
 
 /// How many dry runs at once.
@@ -327,9 +334,10 @@ async fn membership(
     let (me, ca) = match &args.join {
         Some(address) => {
             // Its store would be another cluster's: nothing of it could be kept.
-            if state.join("raft").exists() || state.join("store.json").exists() {
+            let held = [state.join("raft"), state.join("store.json"), view::path(state)];
+            if held.iter().any(|held| held.exists()) {
                 return Err(format!(
-                    "{} already holds a store, which joining would discard: join with an empty --state",
+                    "{} already holds a store or a view of one, which joining would discard: join with an empty --state",
                     state.display()
                 ));
             }
@@ -351,7 +359,16 @@ async fn membership(
                 }
                 None => None,
             };
-            let joined = cluster::request_join(address, token, &name, port, mesh).await?;
+            // (A node that serves ingress reads Secrets a view does not have: it is sent the store.)
+            let joined = cluster::request_join(address, token, &name, port, mesh, !args.ingress).await?;
+            if let Some((through, certificate)) = joined.view.clone() {
+                let first = view::Upstream {
+                    name: through,
+                    address: address.clone(),
+                    certificate,
+                };
+                view::begin(state, &first)?;
+            }
             if let Some(options) = &options {
                 let peers = serde_json::to_vec(&joined.peers).expect("JSON values");
                 let path = mesh::first_peers(&options.key);
@@ -397,6 +414,18 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
     };
     let name = cluster.as_ref().map_or("local", |cluster| &cluster.me.name);
     let network = raft::Network(cluster.as_ref().map(|cluster| cluster.client.clone()));
+    // A worker that runs from a view keeps no store: what Raft kept here before is erased
+    // (a kithd that stopped between its first view and the erasing left it).
+    let view = view::load(state)?;
+    if view.is_some() {
+        let raft = state.join("raft");
+        match std::fs::remove_dir_all(&raft) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("erasing {}: {e}", raft.display()));
+            }
+            _ => {}
+        }
+    }
     let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
@@ -412,7 +441,17 @@ async fn replica(cluster: Option<cluster::Cluster>, state: &std::path::Path) -> 
         stop: watch::channel(false).0,
         pods: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
+        view: watch::channel(None).0,
+        upstream: Mutex::default(),
     });
+    // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
+    // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
+    if let Some((store, at, _)) = view {
+        let _ = shared.raft.shutdown().await;
+        shared.store.lock().expect("nothing panics holding the store").store = store;
+        shared.view.send_replace(Some(at));
+        return Ok(shared);
+    }
     // A node that joined waits to be sent the store; any other is where a cluster starts.
     if shared.cluster.as_ref().is_some_and(|cluster| cluster.ca.is_none()) {
         return Ok(shared);
@@ -559,6 +598,14 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         }
     })?;
     let shared = rt.block_on(replica(membership, &state))?;
+    if args.ingress && shared.view.borrow().is_some() {
+        return Err(
+            "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \
+             Secret a view does not have: serve ingress on a control node, or delete this node and join it again \
+             with --ingress (it is then sent the whole store)"
+                .into(),
+        );
+    }
 
     let served = rt.block_on(async {
         // ponytail: bound, then made owner-only. The directory kithd creates for it is
@@ -632,9 +679,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                     let id = shared.raft.metrics().borrow().id;
                     // Not fatal: the address the cluster has for this node is the one from last time.
                     let registered = match pki::print_of(&cluster.me.cert) {
-                        Ok(print) => cluster::register(&shared, &cluster.me.name, &reachable, id, &print, None, true)
-                            .await
-                            .map_err(|e| e.to_string()),
+                        Ok(print) => {
+                            let more = serde_json::json!({ "ca": true });
+                            let registered = cluster::register(&shared, &cluster.me.name, &reachable, id, &print, more);
+                            registered.await.map_err(|e| e.to_string())
+                        }
                         Err(e) => Err(e),
                     };
                     if let Err(e) = registered {
@@ -645,7 +694,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let pings = members::run(shared.clone(), stopping.clone());
             let lost_after = std::time::Duration::from_secs(args.lost_after);
             let scheduler = sched::run(shared.clone(), lost_after, stopping.clone());
-            let (served, (), (), (), ()) = tokio::join!(served, members, registered, pings, scheduler);
+            let view = view::follow(shared.clone(), state.clone(), args.ingress, stopping.clone());
+            let (served, (), (), (), (), ()) = tokio::join!(served, members, registered, pings, scheduler, view);
             served.map_err(|e| fail("serving other nodes", &e))
         };
         let work = async {

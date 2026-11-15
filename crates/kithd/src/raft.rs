@@ -188,7 +188,8 @@ async fn write(
                 None => return Json(None),
                 Some(false) => command,
                 Some(true) => match from_worker(&shared, name, command) {
-                    Ok(Some(command)) => command,
+                    // (Through this node to whichever leads: a worker asks one control node.)
+                    Ok(Some(command)) => return Json(passed(&shared, command).await),
                     Ok(None) => return Json(None),
                     Err(why) => {
                         let who = crate::access::Caller::Node(name.clone());
@@ -207,6 +208,16 @@ async fn write(
         Ok(Ok(written)) => Some((written.data, written.log_id.index)),
         _ => None,
     })
+}
+
+/// A worker's change that was held to its list, made as this node's own: asked again
+/// (`None`) while the store takes no change.
+async fn passed(shared: &Shared, command: Command) -> Option<(Reply, u64)> {
+    match shared.write_at(command).await {
+        Ok((done, index)) => Some((Ok(done), index)),
+        Err(Error::Io(_)) => None,
+        Err(refused) => Some((Err(refused), 0)),
+    }
 }
 
 /// How long a change waits for a leader and a majority.
@@ -251,6 +262,11 @@ impl Shared {
             }
             other => other,
         };
+        // A worker that runs from a view has no Raft: the control node it follows is asked.
+        let viewing = self.view.borrow().is_some();
+        if viewing {
+            return crate::view::write(self, &command).await;
+        }
         let deadline = Instant::now() + PATIENCE;
         loop {
             let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
@@ -319,10 +335,15 @@ pub async fn tend_members(shared: Arc<Shared>, mut stopping: watch::Receiver<boo
     }
 }
 
-/// The Raft id and address of every Node in `store` that has reported them.
+/// The Raft id and address of every Node in `store` that has reported them and is sent the
+/// store: not a worker that runs from a view (`status.view`, which a control node writes as
+/// it sends the first, `view::serve`).
 fn nodes_of(store: &kith_api::store::Store) -> BTreeMap<NodeId, BasicNode> {
     let member = |node: &kith_api::Resource| {
         let status = node.status.as_ref()?;
+        if node.spec["trust"] == "worker" && status["view"] == true {
+            return None;
+        }
         let id = status["raftId"].as_str()?.parse().ok()?;
         Some((id, BasicNode::new(status["address"].as_str()?)))
     };

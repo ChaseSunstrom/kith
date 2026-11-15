@@ -774,14 +774,24 @@ fn ca_key_stays_with_the_control_nodes_and_a_worker_never_votes() {
         leads && said(&alpha, "voters:").is_some_and(|voters| !voters.contains(&leader))
     });
     // A change still goes through, and the worker still has it.
-    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: after }\nspec: { data: { a: b } }\n";
-    std::fs::write(alpha.dir.join("cm.yaml"), config).unwrap();
+    // (A kind a worker is sent whole: it runs from a view of the store now.)
+    let config = "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: { name: after }\nspec: {}\n";
+    std::fs::write(alpha.dir.join("ns.yaml"), config).unwrap();
     wait_for("a change to go through", || {
-        alpha.kith(&["apply", "-f", "cm.yaml"]).0 == 0
+        alpha.kith(&["apply", "-f", "ns.yaml"]).0 == 0
     });
     let demoted = if leader == "delta" { &delta } else { &epsilon };
     wait_for("the worker to have the change", || {
-        demoted.kith(&["get", "ConfigMap/after"]).0 == 0
+        demoted.kith(&["get", "Namespace/after"]).0 == 0
+    });
+    // It was sent the whole store until it was made a worker: that copy is erased, and the
+    // node that leads sends it no more of it.
+    wait_for("the worker to run from a view", || {
+        demoted.dir.join("state/view.json").exists() && !demoted.dir.join("state/raft/snapshot.json").exists()
+    });
+    wait_for("the store to be sent to control nodes only", || {
+        let sent = |what: &str| said(&alpha, what).is_some_and(|nodes| nodes.contains(&leader));
+        said(&alpha, "receiving:").is_some() && !sent("receiving:") && !sent("voters:")
     });
 }
 
@@ -886,6 +896,162 @@ fn a_worker_writes_only_what_it_says_of_itself() {
         audit.contains("beta") && audit.contains("a worker writes only"),
         "{audit}"
     );
+}
+
+/// Every file under `dir` that has `text` in it.
+fn files_with(dir: &Path, text: &str) -> Vec<PathBuf> {
+    let (mut found, mut dirs) = (Vec::new(), vec![dir.to_path_buf()]);
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => dirs.push(path),
+                Ok(kind) if kind.is_file() => {
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    if bytes.windows(text.len()).any(|window| window == text.as_bytes()) {
+                        found.push(path);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// A worker keeps a view of the store, not the store: the Secret of what is placed on it and
+/// no other, on its disk and in what it answers; it lets go of that Secret when the Workload
+/// leaves, comes back up from its view with no control node in reach, and follows another
+/// control node when the one it followed is gone.
+#[test]
+fn worker_holds_no_secret_that_nothing_placed_on_it_names() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "view";
+    let (mine, other) = ("the-word-of-what-runs-on-the-worker", "the-word-of-what-runs-elsewhere");
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    // Whether a worker is sent the store is its token's maker's to say, never the node's:
+    // one that says it cannot run from a view (it serves ingress) is not let in.
+    let token = alpha.ok(&["node", "token", "--worker"]);
+    let (address, token) = (alpha.address(), token.trim());
+    let args = [
+        "--name",
+        "refused",
+        "--join",
+        &address,
+        "--token",
+        token,
+        "--ingress",
+        "--mesh",
+    ];
+    // (With nothing an earlier run left: a node with a certificate does not join again.)
+    let refused = alpha.dir.with_file_name("refused");
+    let _ = std::fs::remove_dir_all(&refused);
+    let said = kithd_fails(&refused, &args);
+    assert!(said.contains("kith node token --worker --ingress"), "{said}");
+    assert_eq!(alpha.nodes().len(), 1, "a node that was refused is no Node");
+    let apply = |node: &Node, text: &str| {
+        std::fs::write(node.dir.join("apply.yaml"), text).unwrap();
+        node.ok(&["apply", "-f", "apply.yaml"]);
+    };
+    let workload = |name: &str, trust: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ word: {} }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: {name} }}\nspec:\n  \
+             placement: {{ require: {{ kith.dev/trust: {trust} }} }}\n  template:\n    exec:\n      \
+             - name: run\n        command: [sh, -c, 'echo said $WORD; exec sleep 300']\n        \
+             env: [{{ name: WORD, secret: {{ name: {name}, key: word }} }}]\n",
+            if name == "mine" { mine } else { other }
+        )
+    };
+    // Both Secrets are in the store before the worker joins: it is never sent the store.
+    apply(&alpha, &workload("other", "control"));
+    apply(&alpha, &workload("mine", "worker"));
+    let token = alpha.ok(&["node", "token", "--worker"]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("the worker to have its view", || beta.nodes().len() == 2);
+    // Its Node says so, the store is not sent to it, and it says whom it follows.
+    let node: serde_json::Value = serde_json::from_str(&alpha.ok(&["get", "node/beta", "-o", "json"])).unwrap();
+    assert_eq!(node["status"]["view"], true, "{node}");
+    let status = alpha.ok(&["node", "status"]);
+    assert!(status.contains("receiving: \n"), "{status}");
+    let status = beta.ok(&["node", "status"]);
+    let follows = "a worker: its view of the store is at change";
+    assert!(
+        status.contains(follows) && status.contains(&alpha.address()),
+        "{status}"
+    );
+
+    // What is placed on it runs with its Secret, and its output is read through a control node.
+    wait_for("the worker's unit to say its word", || {
+        alpha.kith(&["logs", "workload/mine"]).1.contains(mine)
+    });
+    wait_for("the other to run on the control node", || {
+        alpha.kith(&["logs", "workload/other"]).1.contains(other)
+    });
+    // The Secret of what runs elsewhere is nowhere on the worker, and it does not answer with it.
+    assert_eq!(files_with(&beta.dir, other), Vec::<PathBuf>::new());
+    assert!(files_with(&beta.dir, mine).contains(&beta.dir.join("state/view.json")));
+    assert_eq!(beta.kith(&["get", "secret/mine"]).0, 0);
+    let (code, _, err) = beta.kith(&["get", "secret/other"]);
+    assert!(code != 0 && err.contains("not found"), "{err}");
+    // Nothing of Raft's is its to take, and it sends no view itself.
+    let alphas = alpha.dir.join("state/pki");
+    let (code, said) = ask_as_node(&beta.address(), &alphas, "POST", "/v1/raft/vote", Some("{}"));
+    assert!(code == "403" && said.contains("takes no part in it"), "{code} {said}");
+    let (code, said) = ask_as_node(&beta.address(), &alphas, "GET", "/v1/view", None);
+    assert!(
+        code == "403" && said.contains("ask a control node for a view"),
+        "{code} {said}"
+    );
+    // A control node is sent no view, and a person is answered by a control node.
+    let (code, said) = ask_as_node(&alpha.address(), &alphas, "GET", "/v1/view", None);
+    assert!(code == "403" && said.contains("it keeps the store"), "{code} {said}");
+    std::fs::create_dir_all(alpha.dir.join("alice")).unwrap();
+    alpha.ok(&["identity", "cert", "alice", "--out", "alice"]);
+    for (from, to) in [("alice.crt", "node.crt"), ("alice.key", "node.key")] {
+        std::fs::copy(alpha.dir.join("alice").join(from), alpha.dir.join("alice").join(to)).unwrap();
+    }
+    let alice = alpha.dir.join("alice");
+    let (code, said) = ask_as_node(&beta.address(), &alice, "GET", "/v1/resources/Node", None);
+    let why = format!(
+        "answers no one by their rights: ask a control node ({})",
+        alpha.address()
+    );
+    assert!(code == "403" && said.contains(&why), "{code} {said}");
+
+    // The Workload leaves the worker: its Secret is taken back, off the worker's disk too.
+    alpha.ok(&["delete", "workload/mine"]);
+    wait_for("the worker to let go of the Secret", || {
+        beta.kith(&["get", "secret/mine"]).0 != 0 && files_with(&beta.dir.join("state"), mine).is_empty()
+    });
+
+    // With no control node in reach it comes back up from its view.
+    beta.stop();
+    alpha.stop();
+    beta.child = Node::spawn(&beta.dir, "beta", beta.port, &[]);
+    wait_for("the worker to answer from its view", || {
+        beta.kith(&["get", "node"]).0 == 0 && beta.nodes().len() == 2
+    });
+    assert_eq!(files_with(&beta.dir.join("state"), other), Vec::<PathBuf>::new());
+    // The control node is back, and a second one joins: the worker hears of it.
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
+    let token = alpha.ok(&["node", "token"]);
+    let gamma = Node::start(test, "gamma", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("the worker to hear of the new control node", || beta.nodes().len() == 3);
+    wait_for("gamma to have the store", || gamma.nodes().len() == 3);
+    // The one it follows goes away: it follows the other.
+    alpha.stop();
+    wait_for("the worker to follow the other control node", || {
+        beta.kith(&["node", "status"]).1.contains(&gamma.address())
+    });
+    assert_eq!(files_with(&beta.dir.join("state"), other), Vec::<PathBuf>::new());
 }
 
 #[test]

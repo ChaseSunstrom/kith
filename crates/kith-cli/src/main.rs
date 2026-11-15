@@ -386,6 +386,10 @@ enum NodeCommand {
         /// store, and nothing that asks for control nodes is placed on it
         #[arg(long)]
         worker: bool,
+        /// That worker serves ingress (`kithd --ingress`): it is sent the whole store, every
+        /// Secret in it, where a worker is sent only what is placed on it
+        #[arg(long, requires = "worker")]
+        ingress: bool,
     },
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
@@ -1195,15 +1199,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
         }
         Command::Node {
-            command: NodeCommand::Token { worker },
+            command: NodeCommand::Token { worker, ingress },
         } => {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("tokens are made by kithd: leave out --store");
             };
-            let route = if worker {
-                "/v1/tokens?trust=worker"
-            } else {
-                "/v1/tokens"
+            let route = match (worker, ingress) {
+                (true, true) => "/v1/tokens?trust=worker&store=whole",
+                (true, false) => "/v1/tokens?trust=worker",
+                _ => "/v1/tokens",
             };
             let reply: serde_json::Value = request(&kithd, "POST", route, b"")?;
             println!("{}", reply["token"].as_str().unwrap_or_default());
@@ -1411,14 +1415,24 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 let names = value.as_array().into_iter().flatten().filter_map(|name| name.as_str());
                 names.collect::<Vec<_>>().join(", ")
             };
-            println!("leader:    {}", reply["leader"].as_str().unwrap_or("none"));
-            println!("voters:    {}", names(&reply["voters"]));
-            println!("receiving: {}", names(&reply["learners"]));
-            println!(
-                "this node: {}, change {}",
-                reply["node"].as_str().unwrap_or_default(),
-                reply["applied"]
-            );
+            if let Some(view) = reply.get("view") {
+                // A worker keeps no store: it leads nothing and has no vote to speak of.
+                println!(
+                    "this node: {}, a worker: its view of the store is at change {}, sent by {}",
+                    reply["node"].as_str().unwrap_or_default(),
+                    view["applied"],
+                    view["from"].as_str().unwrap_or("no control node yet")
+                );
+            } else {
+                println!("leader:    {}", reply["leader"].as_str().unwrap_or("none"));
+                println!("voters:    {}", names(&reply["voters"]));
+                println!("receiving: {}", names(&reply["learners"]));
+                println!(
+                    "this node: {}, change {}",
+                    reply["node"].as_str().unwrap_or_default(),
+                    reply["applied"]
+                );
+            }
             for peer in reply["mesh"].as_array().into_iter().flatten() {
                 let shook = match peer["handshake"].as_u64() {
                     Some(ago) => format!("handshake {ago} s ago"),

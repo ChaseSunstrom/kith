@@ -1,11 +1,12 @@
 # A worker keeps no Secret that nothing placed on it names
 
-Status: the first part is built (T-0184 step 5.1): the list a worker's writes are held to
-("Writes") and what the other node routes hand a worker. The view is not: a worker still
-keeps the whole store. The rest is the plan, written so it can be argued with before
-there is code. It was reviewed three times (the first
-draft was found not sound as written); what each pass found is decided below, and listed
-at the end.
+Status: built (T-0184 step 5): the list a worker's writes are held to ("Writes"), what the
+other node routes hand a worker, and the view (`crates/kithd/src/view.rs`). Ingress on a
+worker is not ("Open"): a worker let in by a token made with `--worker --ingress` is still
+sent the whole store.
+The design was reviewed three times before there was code (the first draft was found not
+sound as written); what each pass found is decided below, and listed at the end. Where
+the code differs from the plan is in "As built".
 
 ## The problem
 
@@ -308,8 +309,12 @@ another node in a ping; each refused or dropped, and written down with who sent 
 One connection per worker on one control node, and the ring of changed keys (a key and an
 index each; a few hundred entries). A round for a worker reads the resources whose keys
 changed and sends those that are in its view; a placement change reads that worker's
-templates again. Measured in step 5 against kithd's idle budget (9.00 MB, not raised)
-with one worker connected and a store that reports status ten times a second.
+templates again (only on a round that touches a template, a Backup, a Volume, a block list
+or a Secret). Measured in step 5 with the release binaries: kithd alone with nothing to run
+is 8.50 MB (the idle budget, 9.00 MB, not raised); a control node of a cluster of one is
+9.78 MB, 10.82 MB with one idle worker following its view, and 10.99 MB with a second
+control node instead; the worker is 10.05 MB where that second control node is 10.90 MB.
+Not measured: a store whose units report ten times a second.
 
 ## Step 5, in order
 
@@ -327,6 +332,34 @@ with one worker connected and a store that reports status ten times a second.
    its disk, loses the Secret when the Workload leaves, comes back up with no control
    node in reach, and follows a control node that goes away.
 4. A cluster of one older control node and one newer: the worker says which is too old.
+
+## As built
+
+- **`status.view` on a Node.** "No field is added to a kind" holds for specs. A control node
+  writes `view: true` into a worker's status when it sends it its first view (or lets it in
+  as one that asked for a view), and the node that leads sends the store to no worker whose
+  status says so. A worker cannot write it (its own Node's `os` and `mesh` are all it may).
+  A node whose status says it does not become a control node again by a change to its Node.
+- **A worker says at the join that it can run from a view**, and is told the name and key of
+  the node that let it in. Whether it is sent a view or the store is not its to choose (the
+  sixth review found that it was): a worker's token lets in only a node that says it can,
+  and a kithd from before views, or one started with `--ingress`, is refused unless the
+  token was made with `kith node token --worker --ingress` (`/v1/tokens?trust=worker&store=whole`).
+- **One control node, by name and key.** The worker's client takes no other node's
+  certificate at the address it calls: the name, and the key that node's Node names in the
+  view. Another node of the cluster on the path cannot answer in its place.
+- **A write goes to the control node the view comes from**, which passes it to the node that
+  leads as its own once it is held to the list, and answers with the index; the worker waits
+  for its view to reach that index.
+- **Raft on a worker** is opened empty and ended at once: what reads who leads and who votes
+  finds a node that leads nothing, with no second path. Nothing of the store is in its files.
+- **`view.json` is written whole**: at once for a change to a spec, a deletion or a new whole
+  view; at most every 30 seconds while only statuses change.
+- **Which Secrets a worker is sent is worked out on every round**, by reading every template:
+  cheap in a home's store, to be narrowed to the rounds that touch a template when a store
+  is large.
+- Not built: a worker that knows of a control node older than views does not skip to the
+  next by version, it asks each in turn and says which answered 404.
 
 ## Open
 

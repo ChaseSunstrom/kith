@@ -19,7 +19,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | Who | How kith knows them | What they can do |
 | --- | --- | --- |
 | The admin of a node | Whoever can open kithd's unix socket (mode 0600, kithd's user) | Everything in the cluster |
-| A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | Everything in the cluster: nodes replicate the whole store, Secrets included, and run what they are told. **Every node is trusted as much as the admin.** |
+| A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | A control node (what a node is unless its Node says `trust: worker`): everything in the cluster. Control nodes replicate the whole store, Secrets included, and run what they are told: **a control node is trusted as much as the admin.** A worker: what is placed on it, what every node reads to run a cluster, and to write what it says of itself (see "A node that is taken") |
 | An Identity | A certificate for `NAME.user.kith` whose key is the one in its `Identity` | What its Roles say, by kind, verb and namespace |
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
@@ -239,8 +239,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   registry yet. A signature is checked against keys only: no certificate, no
   transparency log, so a signing key that leaks signs until it is taken out of every
   template.
-- **A node that is taken is the cluster taken, until its Node is deleted.** It has the
-  whole store, every Secret in it, and a node's rights. `kith delete node/NAME` ends
+- **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
+  whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of
   the store at every request, on the API and on the node-to-node routes, and refuses
   one whose Node is gone, was only made by hand (it never joined), or names another
@@ -249,7 +249,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - Until its Node is deleted it can do everything: it can name the local socket as the
     one who asked on what nodes pass on to each other, and the node that leads writes to
     the store whatever a node of the cluster sends it to write, unasked.
-  - **A worker that is taken reads the whole cluster, and writes only about itself.** A node whose Node
+  - **A worker that is taken reads what is placed on it and what every node needs, and
+    writes only about itself.** A node whose Node
     says `spec.trust: worker` (said by whoever made its join token, `kith node token
     --worker`, or by whoever may apply a Node; the machine that joins does not say it)
     never votes on the store, is refused Raft's own messages by the other nodes (so it
@@ -280,7 +281,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     the audit log under the worker's name: a template, a Secret, a Role, a Node's
     spec (its own `trust` too), another node's status or Device, a report in another
     node's name. So a change asked of a worker's own API is refused as well (`ask a
-    control node`); it still answers reads. The other things nodes do among themselves
+    control node`). The other things nodes do among themselves
     are narrowed with it. A worker is sent a blob's bytes only where the status of an
     Image or a Backup names it and that one's Volume is on the worker, or it is an
     Image that a template placed on the worker runs; it is never one of the nodes
@@ -292,13 +293,73 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     is taken. A worker's replica takes over a lost Volume only when no control node
     has one, whatever time it says it synced.
 
-    What a taken worker still has: **the whole store with every Secret in it**
-    (those that say `trust: control` too: that rule is its own kithd's, and a taken
-    node does not run its own kithd), so change the Secrets; the files of every
-    Volume on it or that it is a replica of, and their backups and images. And within
-    its list it can lie: about its own units and its own Node; about its Devices, so
-    it can say it has a card a claim in any namespace selects and have that Workload
-    placed on it (a selector alone keeps nothing off a worker: `trust: control` on
+    A worker keeps a view of the store, not the store (`docs/adr-workers.md`). A
+    control node sends it, by the name in the worker's certificate: every Node,
+    Namespace, Workload, NodeWorkload, Job, Service, NetworkPolicy, Volume,
+    VolumeClaim, Share, Blob, Image, Device, Seat, DeviceClaim, DNSZone, DNSRecord,
+    DNSBlockList, OSRelease and UpdatePlan, with its status (the proxy, the claims, the
+    mesh and the resolver read every node's); the Secrets and ConfigMaps that a
+    template placed on the worker names in `env`, `envFrom` or as files; the Backups
+    of the Volumes on it, with the Secret each names for its bucket; the ConfigMaps
+    block lists name; and its own NodeKey. Nothing else: no other Secret or ConfigMap,
+    no Identity, Role or RoleBinding, no Release, Package, Repository, Source or
+    CronJob, no kind someone defined, and never a Secret that says `trust: control`,
+    whatever names it. The control node decides, from its own store; the worker is
+    not asked what it wants. The view is in `view.json` in the worker's state
+    directory (mode 0600: encrypt the state partition of a machine that can be
+    carried off). When a Workload leaves the worker, the Secrets only it named are
+    taken out of what kithd reads and the file is written again without them, at
+    once; the blocks the old file had are the disk's to forget, and kithd's memory
+    is not wiped. The worker calls one control node, by its name and the key its Node
+    names, so no other node of the cluster can answer in its place (a Node that
+    names no key, one from a kithd before node keys were written down, is held to
+    its name alone); when that one is gone it calls another and is sent everything
+    again. With no control node in
+    reach it runs on from the view it has and starts nothing new: **a Secret that
+    was changed meanwhile is the old one there** until it is back, and a Node that
+    was deleted or made a worker meanwhile is still a control node to it. A worker
+    that starts again meanwhile runs nothing until a control node answers (what
+    was moved off it while it was away is not known to it), as any node that
+    starts with no leader in reach. Its API
+    port answers no person, reads included: it has no Identity and no Role to answer
+    by (`this node is a worker and answers no one by their rights: ask a control
+    node`). What a control node passes on to it for someone (a unit's output, `kith
+    run`, a Volume's files, a restore) it does on that control node's word that the
+    caller may; a worker's word for that is taken by nobody. Whoever is root on the
+    worker reads its view at the local socket.
+
+    A node that was sent the whole store (a control node made a worker, a worker
+    from before views) asks for a view, writes the first one down, ends its part in
+    Raft and erases its copy of the store (`raft/` in its state directory); its
+    Node's status then says `view`, which only a control node writes, and the node
+    that leads sends it no more. What it copied before, it has, and what its kithd's
+    memory held is there until kithd starts again. Such a node does not become a
+    control node again by a change to its Node: delete it and join it again. **A
+    worker that serves ingress (`--ingress`) is still sent the whole store**, every
+    Secret in it: it reads the hosts' `tls-` Secrets and the ACME account. The node
+    the internet reaches holds no less as a worker, until ingress is built for
+    views. Which of the two a new worker is, is its token's maker's to say, not the
+    node's: `kith node token --worker` lets in only a node that runs from a view,
+    and one that says it cannot is refused; `kith node token --worker --ingress`
+    lets in one that is sent the store. **A worker from before views that never
+    asks for a view goes on being sent the store**: `kith get node NAME -o yaml`
+    shows `view: true` in the status of one that is not, and a worker without it
+    that should have it is deleted and joined again. A worker told to follow only control nodes older than views says so
+    (`this control node is older than workers: update it`) and, if it has the store,
+    keeps it.
+
+    What a taken worker still has: every Node's address and mesh key; the Cluster's
+    and every Namespace's settings and `values` (a password written into values is
+    in them); every template (image names, commands, `env` written in place); every
+    Service, NetworkPolicy, Volume, Device and claim, with its status; the Secrets
+    and ConfigMaps of what is placed on it, and of what was placed on it before, so
+    change those Secrets; on every worker a NodeWorkload selects, that one's
+    Secrets; the files of every Volume on it or that it is a replica of, and their
+    backups and images. And within its list it can lie: about its own units and its
+    own Node; about its Devices, so
+    it can say it has a card a claim in any namespace selects and have that Workload,
+    **with its Secrets**, placed on it and sent to it (a selector alone keeps nothing
+    off a worker: `trust: control` on
     the Secret or in the template's placement does), and a claim whose selector
     names no node and came to one node's Devices then matches two nodes' and is
     refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it,
@@ -307,9 +368,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     often it writes within its list: its reports can fill the store's log. For the round (3 seconds) in which another node still has the file
     of a Blob just deleted, a worker that knew its name can make a Blob of it and ask
     for the bytes. A worker that still votes when it is taken (it was a control node
-    a moment ago) is still followed, and what it writes as the node that leads is
-    held to no list: delete its Node. A worker that is sent only what is placed on it
-    is not built yet (`docs/adr-workers.md`).
+    a moment ago) is still followed, still has the store, and what it writes as the
+    node that leads is held to no list: delete its Node. It cannot read a Secret
+    nothing placed on it names, or one that says `trust: control`; it is not sent a
+    Volume it is no replica of, a Blob nothing on it names, or the key of an
+    encrypted Volume.
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.
@@ -345,7 +408,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     brings no deleted Node back: a node deleted by mistake joins again. A deleted
     worker's certificate is taken there as a control node's (nothing says it was a
     worker any more), but for a change to the store: that is taken from no node the
-    asked node has no Node for.
+    asked node has no Node for. On a worker that runs from a view and is started
+    with the flag, that includes the deleted node's word for who asked: do not
+    start a worker with it.
   Certificates still last ten years; nothing but the Node's deletion ends one.
 - **A Release is the right to apply whatever its packages render**, with the node's
   rights and not the writer's; the same for a Source. (T-0229, T-0227.)

@@ -5,6 +5,8 @@
 //!                              port 80 (as HTTP) with this pod's name, what GREETING and
 //!                              PASSWORD say where it is told them, and, given a FILE it
 //!                              adds a line to at each start, how many lines that has
+//!   pod say                    answer every connection on port 80 (as HTTP) with what
+//!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
 //!                              and last line once, to /dev/stdout opened by that name
 //!   pod seen DIR [SOCKET]      for as long as it runs, say the names in DIR each time they
@@ -220,6 +222,17 @@ fn main() {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                 let _ = stream.read(&mut [0; 512]);
                 let _ = stream.write_all(name.as_bytes());
+            }
+        }
+        // What it was given (PASSWORD), to whoever asks on port 80: for a container on its
+        // node's own network, whose root takes no file.
+        ["say"] => {
+            let said = format!("HTTP/1.0 200 OK\r\n\r\n{}", std::env::var("PASSWORD").unwrap_or_default());
+            let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = stream.read(&mut [0; 512]);
+                let _ = stream.write_all(said.as_bytes());
             }
         }
         ["ask", pairs @ ..] if !pairs.is_empty() && pairs.len() % 2 == 0 => {

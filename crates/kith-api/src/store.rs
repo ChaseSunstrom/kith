@@ -291,6 +291,18 @@ impl Store {
             .ok_or_else(|| Error::NotFound(key.into()))
     }
 
+    /// Keep `resource` as it is given, as its only revision: how a view of another node's
+    /// store is kept. It was checked where it was applied, and its history is not sent.
+    pub fn put(&mut self, resource: Resource) {
+        let at = self.clock.unwrap_or_else(now);
+        self.resources.insert(resource.key(), vec![Revision { at, resource }]);
+    }
+
+    /// Let go of `key`, whatever else is there. Was it there?
+    pub fn remove(&mut self, key: &str) -> bool {
+        self.resources.remove(key).is_some()
+    }
+
     pub fn history(&self, key: &str) -> Result<&[Revision], Error> {
         self.resources
             .get(key)

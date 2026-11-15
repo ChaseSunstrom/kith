@@ -1828,7 +1828,7 @@ mod tests {
             .unwrap()
             .insert("shop.example.org".into(), certified);
         web.hosts.lock().unwrap().insert("shop.example.org".into(), of);
-        let tls = tokio_rustls::TlsConnector::from(Arc::new(crate::pki::client_config(&ca.cert, None).unwrap()));
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(crate::pki::client_config(&ca.cert, None, None).unwrap()));
         let connect = move || {
             let tls = tls.clone();
             async move {

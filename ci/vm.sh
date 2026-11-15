@@ -22,6 +22,8 @@
 #                               and by the kernel from the node's own network
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
+#   sh ci/vm.sh --test worker   two nodes, one a worker: it runs what is placed on it with its Secret, its
+#                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
 #
@@ -130,6 +132,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    with --wait, and nothing left when all is deleted. Skipped
                    without kubectl. With KITH_E2E=1 also nginx as it is shipped,
                    pulled from mirror.gcr.io
+  --test worker    instead: two nodes on the mesh, the second let in as a worker
+                   (it is sent a view of the store). Expected: its Node says `view`;
+                   a Workload placed on it runs with its Secret; the worker's disk
+                   has that Secret and never the Secret of what runs on the control
+                   node; its API answers no person; with the control node paused it
+                   runs on, started again it runs nothing until the control node is
+                   back, and then what it ran; a Workload that is deleted leaves it
   --test chaos     instead: three nodes as for rollout, and three writers on this
                    machine, one through each node. Each node in turn has its card on
                    the cluster's network unplugged, then plugged back; each node in
@@ -160,7 +169,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | services | kube | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, services, kube, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | share | pods | services | kube | worker | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, share, pods, services, kube, worker, chaos" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -194,7 +203,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -210,13 +219,15 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         port=$((20000 + $$ % 20000))
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
-        # (rollout and chaos: three nodes and nothing more said to kithd; share, pods and kube: two,
-        # on the mesh; services: one, on the mesh.)
-        others='2 3' more=''
+        # (rollout and chaos: three nodes and nothing more said to kithd; share, pods, kube and
+        # worker: two, on the mesh; services: one, on the mesh.)
+        others='2 3' more='' inside=2049
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
+        # (worker: this machine asks what listens on port 80 of a node's own network.)
+        [ "$test" != worker ] || inside=80
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -291,13 +302,13 @@ if [ -n "$test" ] && [ "$test" != init ]; then
 
         # Each node: a card on a network the three share (QEMU passes it over multicast on
         # this machine's loopback), with a fixed address, and one out to this machine (which
-        # reaches the node's API through it, and tries its NFS port).
+        # reaches the node's API through it, and tries its NFS port, or port $inside).
         node() { # N [kithd's further arguments]
             [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && seed "$work/n$1.raw"; }
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:2049" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
@@ -365,7 +376,10 @@ EOF
             printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
         done
         for n in $others; do
-            join=$(api 1 POST /v1/tokens | field token) || fail "no join token over TLS"
+            # (worker: the node it lets in is one, and is sent a view of the store, never the store.)
+            asks=/v1/tokens
+            [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
+            join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
             node "$n" "--join 10.9.0.1:7443 --token $join"
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
@@ -387,6 +401,102 @@ for r in found:
         print(ready, status.get("state", "-"), *sorted(u.get("address", "none") for u in units), *said)
 ' "$1" "$2"
         }
+        if [ "$test" = worker ]; then
+            monitor() { echo "$2" | socat - "unix-connect:$work/keys$1" >/dev/null; } # N COMMAND
+            # What listens on port 80 of node N's own network says (the word of the Secret it
+            # was given): this machine asks it through the node's card out, and no node's API.
+            hears() { curl -s --max-time 5 "http://127.0.0.1:$((port + 4 + $1))/"; } # N
+            until_hears() { # N WORD WHAT
+                waited=0
+                until hears "$1" | grep -q "$2"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 180 ] || fail "waited for this: $3; n$1 answers on port 80: '$(hears "$1" | head -c 200)'; the Workloads say: mine: $(units Workload mine); other: $(units Workload other)"
+                    sleep 1
+                done
+                echo "vm.sh: $3" >&2
+            }
+            console_says() { # N PATTERN HOW-OFTEN WHAT: node N's console has said it that often
+                waited=0
+                until [ "$(grep -ac "$2" "$work/n$1.log")" -ge "$3" ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for n$1 to say: $4"
+                    sleep 1
+                done
+            }
+            mine=the-word-of-what-runs-on-the-worker other=the-word-of-what-runs-elsewhere
+            # The worker's Node says worker (its token's maker said so) and that it is sent a
+            # view (the control node wrote that when it let it in).
+            waited=0
+            until api 1 GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+node = next(r for r in found if r["kind"] == "Node" and r["metadata"]["name"] == "n2")
+status = node.get("status") or {}
+sys.exit(0 if node["spec"].get("trust") == "worker" and status.get("view") is True and status.get("address") else 1)
+' 2>/dev/null; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "the Node n2 did not come to say that it is a worker sent a view"
+                sleep 1
+            done
+            # A Secret and a Workload that reads it for each kind of node: on the node's own
+            # network, answering on port 80 with the word it was given.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Secret","metadata":{"name":"mine"},"spec":{"data":{"word":"$mine"}}},
+ {"apiVersion":"kith.dev/v1","kind":"Secret","metadata":{"name":"other"},"spec":{"data":{"word":"$other"}}},
+ {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"mine"},"spec":{"placement":{"require":{"kith.dev/trust":"worker"}},"template":{"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","say"],"env":[{"name":"PASSWORD","secret":{"name":"mine","key":"word"}}]}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"other"},"spec":{"placement":{"require":{"kith.dev/trust":"control"}},"template":{"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","say"],"env":[{"name":"PASSWORD","secret":{"name":"other","key":"word"}}]}]}}}]
+EOF
+            api 1 POST /v1/apply "$work/apply.json" >/dev/null || fail "the two Secrets and their Workloads were not applied"
+            until_hears 2 "$mine" "the worker runs what is placed on it, with its Secret"
+            until_hears 1 "$other" "the control node runs the other, with its Secret"
+            # A person is answered by a control node: the worker has no Identity to know one by.
+            code=$(curl -s -o "$work/refused" -w '%{http_code}' --max-time 10 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" \
+                --resolve "kith:$((port + 2)):127.0.0.1" "https://kith:$((port + 2))/v1/resources") || true
+            { [ "$code" = 403 ] && grep -q 'answers no one by their rights' "$work/refused"; } || fail "the worker answered the cluster's admin: $code $(cat "$work/refused")"
+            # Each node's disk, as this machine has it in a file: the control node's has both
+            # words (so looking finds what is on a disk), the worker's has its own, and the
+            # word of what runs elsewhere was never written to it.
+            waited=0
+            until grep -aqF "$other" "$work/n1.raw" && grep -aqF "$mine" "$work/n1.raw" && grep -aqF "$mine" "$work/n2.raw"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "a Secret is not on the disk of a node that keeps it: looking at the disks finds nothing"
+                sleep 1
+            done
+            ! grep -aqF "$other" "$work/n2.raw" || fail "the Secret of what runs on the control node is on the worker's disk"
+
+            # The control node is paused (nobody answers for it): the worker says so, and goes
+            # on running what it runs.
+            monitor 1 stop
+            console_says 2 'sends no view' 1 "that its control node sends no view"
+            hears 2 | grep -q "$mine" || fail "the worker stopped what it ran when its control node went silent"
+            echo "vm.sh: the control node paused: the worker says it is sent no view, and runs on" >&2
+            # The worker loses power meanwhile: started again from the view it kept, it runs
+            # nothing until a control node answers (what was moved off it while it was away
+            # is not known to it), as any node that starts with no leader in reach.
+            monitor 2 system_reset
+            console_says 2 'Kernel command line' 2 "that it starts again"
+            console_says 2 'workloads start once this node has' 1 "that it waits for a control node before it runs anything"
+            sleep 10
+            ! hears 2 | grep -q . || fail "the worker, started with no control node in reach, runs what it ran: $(hears 2)"
+            echo "vm.sh: the worker started again with the control node paused: it waits, and runs nothing" >&2
+            monitor 1 cont
+            until_hears 2 "$mine" "the control node back: the worker follows it again and runs what is placed on it, with its Secret"
+            ! grep -aqF "$other" "$work/n2.raw" || fail "the Secret of what runs on the control node is on the worker's disk after it started again"
+            # What is deleted leaves the worker.
+            api 1 DELETE /v1/resources/Workload/default/mine >/dev/null || fail "the Workload mine was not deleted"
+            waited=0
+            while hears 2 | grep -q .; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Workload that was deleted still answers on the worker"
+                sleep 1
+            done
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: two nodes, one let in as a worker: its Node says it is sent a view; a Workload placed on it ran with its Secret; its disk has that Secret and never had the Secret of what runs on the control node; its API answered no person; with the control node paused it said so and ran on; started again meanwhile it ran nothing until the control node was back, then what it ran; a deleted Workload left it"
+            exit 0
+        fi
         if [ "$test" = services ]; then
             # A pod that sends back what it is sent, and its Service.
             cat >"$work/apply.json" <<EOF

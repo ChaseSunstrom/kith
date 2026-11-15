@@ -404,3 +404,43 @@ fn format_newer_than_this_build_is_refused_and_no_number_is_the_first() {
     refusal(Log::open(&path).err().unwrap());
     assert_eq!(format(), Some(newer.to_string()));
 }
+
+#[test]
+fn the_keys_commands_changed_are_kept_for_a_reader_that_is_behind() {
+    use openraft::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
+    let scratch = Scratch::new();
+    let mut machine = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+    block(async { machine.apply(fixture_entries()).await.unwrap() });
+    let (a, b) = ("ConfigMap/default/a", "ConfigMap/default/b");
+    {
+        let state = machine.state.lock().unwrap();
+        assert_eq!(state.index(), 11);
+        let keys = |after| state.touched(after).map(|keys| keys.into_iter().collect::<Vec<_>>());
+        // From before the store was replaced (the Import at index 3): everything is read again.
+        assert_eq!(keys(2), None);
+        assert_eq!(keys(3), Some(vec![a, b]));
+        assert_eq!(keys(8), Some(vec![a, b]));
+        assert_eq!(keys(9), Some(vec![b]));
+        assert_eq!(keys(11), Some(vec![]));
+    }
+    // More changes than are kept: a reader that far behind reads everything, a near one does not.
+    let entry = |index: u64| openraft::Entry {
+        log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(3, 7), index),
+        payload: openraft::EntryPayload::Normal(Command::Status {
+            statuses: vec![(a.to_string(), None)],
+        }),
+    };
+    block(async { machine.apply((12..6000).map(entry)).await.unwrap() });
+    {
+        let state = machine.state.lock().unwrap();
+        assert_eq!(state.touched(11), None);
+        assert_eq!(state.touched(5990).map(|keys| keys.len()), Some(1));
+    }
+    // A node that starts again knows nothing of what changed before it did.
+    block(async { machine.build_snapshot().await.unwrap() });
+    let again = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
+    let state = again.state.lock().unwrap();
+    assert_eq!((state.index(), state.touched(5990)), (5999, None));
+    assert_eq!(state.touched(5999).map(|keys| keys.len()), Some(0));
+}

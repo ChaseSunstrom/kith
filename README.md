@@ -577,7 +577,8 @@ kith node status                                   # who leads the store, who vo
   is there:
 
   ```sh
-  kith node token --worker        # on alpha: the node this token lets in is a worker
+  kith node token --worker             # on alpha: the node this token lets in is a worker
+  kith node token --worker --ingress   # a worker that serves ingress: it is sent the whole store
   ```
 
   ```yaml
@@ -639,9 +640,12 @@ kith node status                                   # who leads the store, who vo
   the Volumes that are on it. The control node it writes to checks each write and
   refuses the rest, in the audit log under the worker's name (`kith audit`). So run
   `kith` on a control node, and point a kubeconfig, `curl` and the web UI at one: a
-  worker answers reads, and a change asked of it is refused (`ConfigMap/default/app:
-  it is not a worker's to apply: ask a control node: a worker writes only what it
-  says of itself`).
+  worker's port answers no person (`this node is a worker and answers no one by
+  their rights: ask a control node (ADDRESS)`), and a change asked at its own
+  socket is refused (`ConfigMap/default/app: it is not a worker's to apply: ask a
+  control node: a worker writes only what it says of itself`). `kith logs`, `kith
+  run`, `kith volume put` and a restore for something on a worker are asked of a
+  control node as for any node, and passed on.
 
   A worker holds no blob but one it is using, is given no encrypted Volume's key to
   keep, and its copy of a replicated Volume takes over only when no control node has
@@ -650,13 +654,37 @@ kith node status                                   # who leads the store, who vo
   `DNSRecord` or `DNSBlockList` status (a worker answers and leaves the status to
   the control nodes).
 
-  What a worker is **not** yet: it still keeps the whole store, every Secret in it.
-  So today `trust: worker` narrows what a worker is asked to run, whose word is
-  taken and what a worker that is taken can change, not what it can read; see
-  SECURITY.md, "A node that is taken", and `docs/adr-workers.md` for the rest of the
-  design. Say `trust` only once every node runs a kithd that knows it: an older kithd
-  does not read a Node or a Secret that has it, and an older control node writes
-  whatever a worker sends it.
+  A worker keeps no copy of the store. A control node sends it a view: what every
+  node reads to run a cluster (Nodes, Namespaces, templates, Services,
+  NetworkPolicies, Volumes, Devices, DNS) and, of Secrets and ConfigMaps, only those
+  that something placed on it names. It keeps that in `view.json` in its state
+  directory, and lets go of a Secret when the Workload that named it leaves:
+
+  ```console
+  $ kith node status                       # on the worker
+  this node: beta, a worker: its view of the store is at change 41, sent by 10.0.0.1:7443
+  $ kith get secret/other                  # on the worker: a Secret of what runs elsewhere
+  error: Secret/default/other not found
+  ```
+
+  With no control node in reach a worker runs on from the view it has and starts
+  nothing new; it follows another control node when the one it followed is gone.
+  One that starts again meanwhile runs nothing until a control node answers, as
+  any node that starts with no leader in reach. Tested in VMs (`sh ci/vm.sh --test
+  worker`). A
+  control node, or a worker from before views, that is made a worker erases its
+  copy of the store once its first view is written down; to make it a control node
+  again, delete its Node and join it again. A worker that serves ingress is still
+  sent the whole store (it reads the hosts' certificates), so the node the internet
+  reaches holds no less as a worker yet; it is let in only by a token that says so,
+  `kith node token --worker --ingress`, and a plain worker's token refuses a kithd
+  started with `--ingress`. What a worker that is taken still
+  has is in SECURITY.md, "A node that is taken"; the design is `docs/adr-workers.md`.
+  Say `trust` only once every node runs a kithd that knows it: an older kithd
+  does not read a Node or a Secret that has it, an older control node writes
+  whatever a worker sends it, and a worker that finds only control nodes older than
+  views says `this control node is older than workers: update it` and is sent the
+  store as before.
 - On the mesh a `Service` has an address of its own, the same on every node
   (`kith get service/NAME -o yaml` shows it and the number of ready replicas
   behind it), and the name `<service>.<namespace>.kith` where kithd answers

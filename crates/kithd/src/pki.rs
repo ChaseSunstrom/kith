@@ -323,8 +323,20 @@ pub fn ingress_config(certificates: Arc<dyn rustls::server::ResolvesServerCert>)
 }
 
 /// Checks a server like any other, but for the name every node has rather than the address dialled.
+/// With a pin, it has to be that node besides: its name, and the key its Node names if it names one.
 #[derive(Debug)]
-struct AnyNode(Arc<WebPkiServerVerifier>);
+struct AnyNode(Arc<WebPkiServerVerifier>, Option<Pin>);
+
+/// The one node a client will talk to: its name, and the print of its key ([`key_print`]).
+pub type Pin = (String, Option<String>);
+
+/// Is the certificate `cert` the node's that `pin` names?
+fn pinned(cert: &CertificateDer<'_>, pin: &Pin) -> bool {
+    let Some(Subject::Node(name, key, _)) = subject_of(cert) else {
+        return false;
+    };
+    name == pin.0 && pin.1.as_ref().is_none_or(|print| *print == key_print(&key))
+}
 
 impl ServerCertVerifier for AnyNode {
     fn verify_server_cert(
@@ -336,7 +348,12 @@ impl ServerCertVerifier for AnyNode {
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let name = ServerName::try_from(ANY_NODE).expect("a DNS name");
-        self.0.verify_server_cert(end_entity, intermediates, &name, ocsp, now)
+        let verified = self.0.verify_server_cert(end_entity, intermediates, &name, ocsp, now)?;
+        if self.1.as_ref().is_some_and(|pin| !pinned(end_entity, pin)) {
+            let why = "this is another node of the cluster than the one that was called";
+            return Err(rustls::Error::General(why.into()));
+        }
+        Ok(verified)
     }
 
     fn verify_tls12_signature(
@@ -363,14 +380,15 @@ impl ServerCertVerifier for AnyNode {
 }
 
 /// TLS for calling a node: its certificate must be from `ca`. With `me`, ours is presented.
-pub fn client_config(ca: &str, me: Option<&Identity>) -> Fallible<ClientConfig> {
+/// With `pin`, only the node it names is called, whoever answers at the address.
+pub fn client_config(ca: &str, me: Option<&Identity>, pin: Option<Pin>) -> Fallible<ClientConfig> {
     let verifier = WebPkiServerVerifier::builder_with_provider(roots(ca)?, provider()).build();
     let builder = tls(
         "setting up TLS",
         ClientConfig::builder_with_provider(provider()).with_safe_default_protocol_versions(),
     )?
     .dangerous()
-    .with_custom_certificate_verifier(Arc::new(AnyNode(tls("setting up TLS", verifier)?)));
+    .with_custom_certificate_verifier(Arc::new(AnyNode(tls("setting up TLS", verifier)?, pin)));
     match me {
         None => Ok(builder.with_no_client_auth()),
         Some(me) => {
@@ -426,10 +444,20 @@ pub fn same_key(pem: &str, der: &[u8]) -> bool {
 
 /// Join tokens: `kith1.<secret>.<CA fingerprint>`. The secret is good once, for an hour,
 /// on the node that made it; the fingerprint lets the joiner check who it is talking to
-/// before it sends the secret. Whoever made it says whether the node it lets in is a worker
-/// (`spec.trust`): the node that joins does not.
+/// before it sends the secret. Whoever made it says what the node it lets in is ([`Lets`]):
+/// the node that joins does not.
 #[derive(Default)]
-pub struct Tokens(Mutex<Vec<([u8; 32], Instant, bool)>>);
+pub struct Tokens(Mutex<Vec<([u8; 32], Instant, Lets)>>);
+
+/// What a join token's maker said of the node it lets in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Lets {
+    Control,
+    /// A worker (`spec.trust`): it is sent a view of the store, never the store.
+    Worker,
+    /// A worker that is sent the whole store all the same: it serves ingress.
+    WorkerWhole,
+}
 
 fn digest(secret: &str) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
@@ -446,31 +474,31 @@ pub fn token_parts(token: &str) -> Fallible<(&str, &str)> {
 }
 
 impl Tokens {
-    pub fn mint(&self, ca: &str, worker: bool) -> Fallible<String> {
+    pub fn mint(&self, ca: &str, lets: Lets) -> Fallible<String> {
         let mut secret = [0u8; 32];
         let filled = ring::rand::SystemRandom::new().fill(&mut secret);
         filled.map_err(|_| "no random bytes from the system")?;
         let secret = hex(&secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
         tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
-        tokens.push((digest(&secret), Instant::now(), worker));
+        tokens.push((digest(&secret), Instant::now(), lets));
         Ok(format!("kith1.{secret}.{}", fingerprint(ca)?))
     }
 
-    /// Whether `token` is good, and then whether it is a worker's; with `spend`, it is not
-    /// good again.
+    /// Whether `token` is good, and then what its maker said of its node; with `spend`, it is
+    /// not good again.
     // Digests are compared, so how long the comparison takes says nothing about the secret.
-    pub fn good(&self, token: &str, spend: bool) -> Option<bool> {
+    pub fn good(&self, token: &str, spend: bool) -> Option<Lets> {
         let (secret, _) = token_parts(token).ok()?;
         let wanted = digest(secret);
         let mut tokens = self.0.lock().expect("nothing panics holding the tokens");
         tokens.retain(|(_, made, _)| made.elapsed() < TOKEN_LIFE);
         let found = tokens.iter().position(|(digest, ..)| *digest == wanted)?;
-        let worker = tokens[found].2;
+        let lets = tokens[found].2;
         if spend {
             tokens.remove(found);
         }
-        Some(worker)
+        Some(lets)
     }
 }
 
@@ -508,24 +536,24 @@ mod tests {
             key,
         };
         server_config(&me).unwrap();
-        client_config(&ca.cert, Some(&me)).unwrap();
+        client_config(&ca.cert, Some(&me), None).unwrap();
         // The cluster's verifier takes it for `kith`; another cluster's CA does not.
         let verify = |trusted: &str| {
             let verifier = WebPkiServerVerifier::builder_with_provider(roots(trusted).unwrap(), provider());
             let dialled = ServerName::try_from("10.0.0.7").unwrap();
-            AnyNode(verifier.build().unwrap()).verify_server_cert(&der, &[], &dialled, &[], UnixTime::now())
+            AnyNode(verifier.build().unwrap(), None).verify_server_cert(&der, &[], &dialled, &[], UnixTime::now())
         };
         assert!(verify(&ca.cert).is_ok());
         let verifier = WebPkiServerVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider());
         let dialled = ServerName::try_from("kith").unwrap();
         let as_server =
-            AnyNode(verifier.build().unwrap()).verify_server_cert(&user, &[], &dialled, &[], UnixTime::now());
+            AnyNode(verifier.build().unwrap(), None).verify_server_cert(&user, &[], &dialled, &[], UnixTime::now());
         assert!(as_server.is_err());
         assert!(verify(&Ca::create().unwrap().cert).is_err());
 
         // Two CAs in one text are not a CA: the second would be trusted unpinned.
         let two = format!("{}{}", ca.cert, Ca::create().unwrap().cert);
-        assert!(fingerprint(&two).is_err() && client_config(&two, None).is_err());
+        assert!(fingerprint(&two).is_err() && client_config(&two, None, None).is_err());
 
         assert!(ca.issue("Not A Name").is_err());
         assert!(valid_name("-x").is_err() && valid_name("").is_err() && valid_name("node-1").is_ok());
@@ -549,7 +577,7 @@ mod tests {
         // The reloaded CA key still signs certificates the old CA certificate vouches for.
         let (cert, _) = loaded_ca.unwrap().issue("beta").unwrap();
         let verifier = WebPkiServerVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider());
-        let verified = AnyNode(verifier.build().unwrap()).verify_server_cert(
+        let verified = AnyNode(verifier.build().unwrap(), None).verify_server_cert(
             &certs(&cert).unwrap()[0],
             &[],
             &ServerName::try_from("x").unwrap(),
@@ -567,17 +595,22 @@ mod tests {
     fn tokens_are_good_once() {
         let ca = Ca::create().unwrap();
         let tokens = Tokens::default();
-        let token = tokens.mint(&ca.cert, false).unwrap();
+        let token = tokens.mint(&ca.cert, Lets::Control).unwrap();
         assert_eq!(token_parts(&token).unwrap().1, fingerprint(&ca.cert).unwrap());
         assert_eq!(tokens.good("kith1.nope.nope", true), None);
-        let other = tokens.mint(&ca.cert, false).unwrap().replace("kith1.", "kith1.0");
+        let other = tokens
+            .mint(&ca.cert, Lets::Control)
+            .unwrap()
+            .replace("kith1.", "kith1.0");
         assert_eq!(tokens.good(&other, true), None);
-        assert_eq!(tokens.good(&token, false), Some(false));
-        assert_eq!(tokens.good(&token, true), Some(false));
+        assert_eq!(tokens.good(&token, false), Some(Lets::Control));
+        assert_eq!(tokens.good(&token, true), Some(Lets::Control));
         assert_eq!(tokens.good(&token, true), None);
-        // Whether its node is a worker is what its maker said, kept here and not in the token.
-        let worker = tokens.mint(&ca.cert, true).unwrap();
-        assert_eq!(tokens.good(&worker, true), Some(true));
+        // What its node is is what its maker said, kept here and not in the token.
+        for lets in [Lets::Worker, Lets::WorkerWhole] {
+            let worker = tokens.mint(&ca.cert, lets).unwrap();
+            assert_eq!(tokens.good(&worker, true), Some(lets));
+        }
     }
 
     #[test]

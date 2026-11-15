@@ -52,7 +52,7 @@ fn has_volume(store: &Store, namespace: &str, volume: &str, node: &str) -> bool 
 }
 
 /// Is `resource` an Image or a Backup of a Volume that is on `node`?
-fn of_its_volume(store: &Store, resource: &Resource, node: &str) -> bool {
+pub(crate) fn of_its_volume(store: &Store, resource: &Resource, node: &str) -> bool {
     let volume = resource.spec["volume"].as_str();
     volume.is_some_and(|volume| has_volume(store, namespace(resource), volume, node))
 }
@@ -66,7 +66,7 @@ fn its_blob(store: &Store, namespace: &str, blob: &str, node: &str, before: &[&s
 }
 
 /// Is a replica (or a copy, or the run) of the template `template` placed on `node`?
-fn on(template: &Resource, node: &str) -> bool {
+pub(crate) fn on(template: &Resource, node: &str) -> bool {
     let placed = template.status.as_ref().and_then(|status| status["nodes"].as_object());
     placed.is_some_and(|placed| placed.values().any(|on| on == node))
 }

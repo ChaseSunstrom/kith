@@ -1616,6 +1616,19 @@ impl Template {
         containers.chain(self.exec.iter().flat_map(|e| &e.env).filter_map(named))
     }
 
+    /// The names of the ConfigMaps it names, in the same places.
+    pub fn config_maps(&self) -> impl Iterator<Item = &String> {
+        fn named(var: &EnvVar) -> Option<&String> {
+            var.config_map.as_ref().map(|key| &key.name)
+        }
+        let containers = self.containers().flat_map(move |c| {
+            let from = c.env_from.iter().filter_map(|from| from.config_map.as_ref());
+            let mounted = c.volume_mounts.iter().filter_map(|mount| mount.config_map.as_ref());
+            c.env.iter().filter_map(named).chain(from).chain(mounted)
+        });
+        containers.chain(self.exec.iter().flat_map(|e| &e.env).filter_map(named))
+    }
+
     /// The names of its units, in the order they are numbered: containers, exec units, VMs.
     pub fn units(&self) -> impl Iterator<Item = &String> {
         let containers = self.containers.iter().map(|c| &c.name);

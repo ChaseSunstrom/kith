@@ -150,6 +150,30 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
     }
 }
 
+/// The keys `command` changes that it names itself (those of a status), or `None` for the
+/// one that replaces the store. What an apply, a delete or a rollback changed is read from
+/// its answer ([`changed`]): a resource that names no namespace is kept under the default one.
+pub fn keys(command: &Command) -> Option<Vec<String>> {
+    let named = |statuses: &mut dyn Iterator<Item = &String>| statuses.cloned().collect();
+    Some(match command {
+        Command::Import { .. } => return None,
+        Command::Status { statuses } | Command::Report { statuses, .. } => {
+            named(&mut statuses.iter().map(|(key, _)| key))
+        }
+        Command::Patch { statuses } => named(&mut statuses.iter().map(|(key, _)| key)),
+        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } => Vec::new(),
+    })
+}
+
+/// The keys an answer says were changed (none where the command was refused).
+pub fn changed(reply: &Reply) -> Vec<String> {
+    match reply {
+        Ok(Done::Changes(changes)) => changes.iter().map(|change| change.after.key()).collect(),
+        Ok(Done::Deleted(gone)) => vec![gone.key()],
+        Ok(Done::Nothing) | Err(_) => Vec::new(),
+    }
+}
+
 /// The status of a resource after `node` said `said` of it. Several nodes run replicas of
 /// one Workload: each node's `containers` are kept apart by their `node` and replaced only
 /// by that node, `ready` is counted over all of them, and what the scheduler wrote (`nodes`,

@@ -239,12 +239,13 @@ pub async fn hop(
         .map_or("local", |c| c.me.name.as_str())
         .to_string();
     // The first node checked the caller, and so does this one, in its own store: it takes a
-    // node's word for who asked, not for what they may do.
+    // node's word for who asked, not for what they may do. (A worker that runs from a view has
+    // no store to ask: there the control node's word is all there is, `access::passed`.)
     let Some(who) = Caller::named(&spec.caller) else {
         let why = format!("caller: {:?} is no caller a node passes on", spec.caller);
         return say(StatusCode::BAD_REQUEST, why);
     };
-    let who = Caller::Via(from, Box::new(who));
+    let who = crate::access::passed(&shared, from, who);
     if let Err(refused) = permit(&shared, &who, Verb::Exec, |_| vec![("Node".into(), None)]) {
         return refused.into_response();
     }
@@ -553,7 +554,7 @@ spec: {role: other-jobber, subjects: [carol]}
                 cert,
                 key,
             };
-            Self::client(pki::client_config(&me.ca, Some(&me)).unwrap())
+            Self::client(pki::client_config(&me.ca, Some(&me), None).unwrap())
         }
 
         fn client(config: rustls::ClientConfig) -> reqwest::Client {
@@ -705,7 +706,7 @@ spec: {role: other-jobber, subjects: [carol]}
             .unwrap_err();
         assert_eq!((status, why.contains("not for an Identity")), (403, true), "{why}");
         // Nor can a certificate that is no one's, or none.
-        let none = World::client(pki::client_config(&world.ca.cert, None).unwrap());
+        let none = World::client(pki::client_config(&world.ca.cert, None, None).unwrap());
         let (status, _) = tunnel(&none, world.b_port, "/v1/run-hop", spec).await.unwrap_err();
         assert_eq!(status, 401);
         assert!(

@@ -1994,7 +1994,7 @@ impl Watch {
             (Caller::Node(name), Some(Certificate(der))) => crate::cluster::admitted(&self.call.shared, name, der),
             (Caller::Admin, _) => true,
             // (A node shows its certificate, and nothing is passed on to a watch.)
-            (Caller::Node(_), None) | (Caller::Via(..), _) => false,
+            (Caller::Node(_), None) | (Caller::Via(..) | Caller::Checked(..), _) => false,
         }
     }
 }
