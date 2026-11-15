@@ -235,12 +235,19 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   (cron's five fields, or a name such as `@hourly`; read in UTC), the node that
   leads makes a Job of its `job`,
   called `<name>-<minute>`. `concurrency: forbid` waits for one that is still
-  running, `replace` removes it first. The last three that finished are kept, and
-  all of them go when the CronJob does. A minute in which no node led is not
-  made up for. A CronJob that names a `timezone` other than `UTC`, whose
-  schedule cannot be read, or whose name is longer than 54 characters (a Job's
-  name is its and the minute) is not run, and its status says why. Whoever applies
-  a CronJob must be allowed to apply a Job.
+  running, `replace` removes it first. The last three Jobs that succeeded and the
+  last three that failed are kept (`successfulJobsHistoryLimit` and
+  `failedJobsHistoryLimit` say how many instead), and all of them go when the
+  CronJob does. A minute in which no node led (or kithd was down) is skipped,
+  unless the CronJob says `startingDeadlineSeconds`: then the latest minute its
+  schedule named since its last run (`status.last`) that is no older than that is
+  run, once (never more than a week back; a CronJob that has not run yet has
+  nothing to catch up from). A CronJob that names a `timezone` other than
+  `UTC` (kith has no table of time zones: their rules measure 207 kB as compiled,
+  more than the 150 kB kithd's size budget was to give them, and kith OS ships
+  none), whose schedule cannot be read, or whose name is longer than 54 characters
+  (a Job's name is its and the minute) is not run, and its status says why.
+  Whoever applies a CronJob must be allowed to apply a Job.
 - Keeps each unit's output: `kith logs KIND/NAME` prints it, with `--unit`,
   `--replica` (or the run of a Job), `--stderr`, `--tail LINES` and `-f` to
   follow until the unit is done. A log file that passes 10 MiB (`kithd
@@ -1407,7 +1414,7 @@ helm install site ./chart --wait
 |---|---|
 | Deployment, StatefulSet | a Workload whose replicas are pods (`pod: true`: [a pod](#a-replica-as-a-pod)) |
 | DaemonSet | a NodeWorkload |
-| Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC; the last three that finished are kept) |
+| Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC, a missed minute made up within `startingDeadlineSeconds`; the last three that succeeded and three that failed are kept, or `successfulJobsHistoryLimit` and `failedJobsHistoryLimit`) |
 | Service | a Service |
 | Ingress | `expose` on the Service behind each host, its `Prefix` and `Exact` paths as `paths`; the Ingress itself is kept to be read back. Refused by name: a path that is a pattern, an annotation that rewrites or matches by pattern, and one that keeps clients out (`auth-*`, an allow or deny list, a snippet, middlewares), which kith's edge would not honour |
 | ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
@@ -1496,7 +1503,7 @@ installed `helm template` and translates what it prints (no helm: pipe
 | Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
 | PersistentVolumeClaim | VolumeClaim, with `provision: true` unless it says `storageClassName: ""` |
-| Job, CronJob | Job, CronJob (a `timeZone` other than UTC is refused) |
+| Job, CronJob | Job, CronJob (`startingDeadlineSeconds`, `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` are kept to; a `timeZone` other than UTC is refused) |
 
 Nothing is dropped silently. Every field that is not carried over is named on
 stderr by path: one that kith has nothing for (`hostNetwork`, an unknown kind, an

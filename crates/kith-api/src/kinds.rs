@@ -596,6 +596,16 @@ spec! {
         pub timezone: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub concurrency: Option<Concurrency>,
+        /// How late a minute the schedule named may still be run, where no node led in it
+        /// (or kithd was down): the latest missed one only. Without it a missed minute is skipped.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub starting_deadline_seconds: Option<u32>,
+        /// Finished Jobs that succeeded and are kept (3 unless said).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub successful_jobs_history_limit: Option<u32>,
+        /// Finished Jobs that failed and are kept (3 unless said).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub failed_jobs_history_limit: Option<u32>,
         pub job: JobSpec,
     }
 
