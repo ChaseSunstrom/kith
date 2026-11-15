@@ -2172,6 +2172,55 @@ mod tests {
         assert!(!changes_access(&Command::Status { statuses: vec![] }));
     }
 
+    /// What the leader asks again of a rollback, a delete and anything else: the kind's own
+    /// right, what the kind reaches into besides, and nothing past an apply, delete or rollback.
+    #[test]
+    fn rechecked_rollback_delete_and_the_rest() {
+        let mut store = kith_api::store::Store::default();
+        let access = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: carol}\nspec: {}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {name: dave}\nspec: {}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: kinds}\n\
+                      spec: {rules: [{kinds: [Share, Backup, Release, ConfigMap], verbs: [apply]}]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: files}\n\
+                      spec: {rules: [{kinds: [Volume, Secret], verbs: [get, apply]}]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: carol-kinds}\n\
+                      spec: {role: kinds, subjects: [carol, dave]}\n---\n\
+                      apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: dave-files}\n\
+                      spec: {role: files, subjects: [dave]}\n";
+        for resource in kith_api::Resource::from_source(access).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let (carol, dave) = (Caller::Identity("carol".into()), Caller::Identity("dave".into()));
+        let back = |key: &str| Command::Rollback {
+            key: key.into(),
+            to: 1,
+            at: kith_api::store::now(),
+        };
+        let refused = crate::api::refused;
+        // Apply on a Share or a Backup is not enough: what it reaches into is asked too.
+        let why = refused(&store, &carol, &back("Share/default/s")).expect("a Share without Volume");
+        assert!(why.contains("apply Volume") && why.contains("decided again"), "{why}");
+        let why = refused(&store, &carol, &back("Backup/default/b")).expect("a Backup without Volume");
+        assert!(why.contains("get Volume"), "{why}");
+        // With it, both go back.
+        assert_eq!(refused(&store, &dave, &back("Share/default/s")), None);
+        assert_eq!(refused(&store, &dave, &back("Backup/default/b")), None);
+        // A Release goes back while its binding stands, and not once it is gone.
+        assert_eq!(refused(&store, &carol, &back("Release/default/r")), None);
+        // A delete asks Delete, which Apply is not.
+        let delete = Command::Delete {
+            key: "ConfigMap/default/m".into(),
+        };
+        let why = refused(&store, &carol, &delete).expect("a delete without Delete");
+        assert!(why.contains("delete ConfigMap"), "{why}");
+        // Nothing but an apply, a delete or a rollback is an Identity's to write.
+        let why = refused(&store, &dave, &Command::Status { statuses: vec![] }).expect("a Status");
+        assert!(why.contains("not an apply, a delete or a rollback"), "{why}");
+        store.delete("RoleBinding/carol-kinds").unwrap();
+        let why = refused(&store, &carol, &back("Release/default/r")).expect("a Release, unbound");
+        assert!(why.contains("apply Release"), "{why}");
+    }
+
     /// Neither wait is past [`PATIENCE`]: an Identity's write behind an access change that
     /// never finishes, and an access change behind an Identity's write that never finishes, are
     /// each refused, to be tried again.

@@ -312,8 +312,16 @@ fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>
 
 /// Why `caller` may not write `command`, as the store now stands: the asking of [`applied`],
 /// [`deleted`] and `rollback` made again where the write is put in the log (`raft.rs`), so
-/// that a Role taken away while the write was on its way still stops it. A command none of
-/// those writes is refused: an Identity writes nothing else through the log's door it guards.
+/// that a Role taken away while the write was on its way still stops it. Any other command
+/// with an Identity's name on it is refused.
+///
+/// Not every route an Identity reaches is decided here. Seat activity (`seats.rs`), `/v1/lock`
+/// and the duress routes (`crypt.rs`), blobs, volume files, backups and the node routes of
+/// `cluster.rs` ask [`permit`] as the request arrives and then `submit` or `write` with no
+/// caller: they are decided once, and a Role taken away meanwhile does not stop them (T-0555).
+/// Before a caller is passed with them, this must learn their commands: seat activity writes a
+/// Status, which it would refuse, and `unlock` of a forgotten NodeKey sends a Delete after
+/// `permit` asked for Apply, which it would ask as Delete.
 pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Option<String> {
     let asks = match command {
         Command::Apply { resources, .. } => takes(store, resources),
