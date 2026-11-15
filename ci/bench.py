@@ -3,7 +3,8 @@
 
   - a container whose image is cached starts in under 150 ms (apply -> first output);
   - 20 containers run, and kithd stays under 30 MB RSS with them;
-  - kithd (one thread) answers the API within 100 ms while it starts 20 containers.
+  - kithd (one thread) answers the API within 100 ms while it starts 20 containers,
+    and while it stops them.
 
 Opt-in, like the e2e tests: it pulls an image and needs a delegated cgroup.
 
@@ -162,6 +163,28 @@ def main():
             listing = subprocess.run([os.path.join(bins, "kith"), "--socket", socket, "get", "-o", "json"], check=True, capture_output=True)
             running = sum(w["status"]["ready"] for w in json.loads(listing.stdout))
             total = sum(w["spec"].get("replicas", 1) for w in json.loads(listing.stdout))
+
+            # And while it stops those 20: a unit's stop kills it and removes its cgroup.
+            def units():
+                # (kithd adopts its containers: each one's first process is its child.)
+                count = 0
+                for stat in glob.glob("/proc/[0-9]*/stat"):
+                    try:
+                        with open(stat) as f:
+                            count += f.read().rsplit(")", 1)[1].split()[1] == str(daemon.pid)
+                    except OSError:
+                        pass
+                return count
+
+            before = units()
+            subprocess.run([*kith, "delete", "Workload/burst"], check=True, stdout=subprocess.DEVNULL)
+            halt, stopping, until = 0, 0, time.monotonic() + 3
+            while time.monotonic() < until:
+                began = time.monotonic()
+                subprocess.run([*kith, "get", "ConfigMap"], check=True, stdout=subprocess.DEVNULL)
+                halt = max(halt, time.monotonic() - began)
+                stopping += 1
+            stopped = before - units()
         finally:
             daemon.send_signal(signal.SIGTERM)
             daemon.wait()
@@ -173,6 +196,11 @@ def main():
             "slowest API call while 20 containers start",
             during >= 3 and stall <= API_BUDGET,
             f"{stall * 1000:.0f} ms over {during} calls during the burst (budget {API_BUDGET * 1000:.0f} ms, at least 3 calls)",
+        ),
+        (
+            "slowest API call while 20 containers stop",
+            stopped == 20 and stopping >= 3 and halt <= API_BUDGET,
+            f"{halt * 1000:.0f} ms over {stopping} calls in the 3 s after the delete, {stopped} of 20 stopped in them (budget {API_BUDGET * 1000:.0f} ms, at least 3 calls)",
         ),
         (f"kithd peak RSS with {total} containers", rss <= RSS_BUDGET, f"{rss / 2**20:.1f} MB (budget {RSS_BUDGET / 2**20:.0f} MB)"),
     ]

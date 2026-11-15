@@ -147,7 +147,7 @@ macro_rules! kinds {
 }
 
 kinds! {
-    Cluster: ClusterSpec, cluster, "Cluster-wide settings: domain, voter set, update policy, mesh settings";
+    Cluster: ClusterSpec, cluster, "Cluster-wide settings: the keys that sign images (the other fields are kept and not acted on)";
     Node: NodeSpec, cluster, "One machine: roles, taints, OS version, system extensions, resource reservations";
     Namespace: NamespaceSpec, cluster, "Grouping, quotas, default policies";
     Workload: WorkloadSpec, namespaced, "Long-running replicas";
@@ -348,6 +348,20 @@ impl Resource {
         match self.spec.is_object() {
             true => Ok(self),
             false => Err("spec: must be a mapping".into()),
+        }
+    }
+
+    /// The fields of its spec that are set and that nothing acts on: kept, and no rule in
+    /// force for them. Whoever reads a file says them, so that nobody takes one for a rule.
+    /// (Today a Cluster's, of which kithd reads `images` alone.)
+    pub fn not_acted_on(&self) -> Vec<&'static str> {
+        let cluster = ["domain", "voters", "updatePolicy", "mesh", "values"];
+        match self.kind.as_str() {
+            "Cluster" => cluster
+                .into_iter()
+                .filter(|field| self.spec.get(field).is_some())
+                .collect(),
+            _ => Vec::new(),
         }
     }
 

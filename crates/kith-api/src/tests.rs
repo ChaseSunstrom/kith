@@ -1050,6 +1050,28 @@ fn handover_names_keys_and_carries_two_signatures() {
     }
 }
 
+/// A Cluster's fields that nothing reads are named, each one that is set; `images`, which
+/// is read, is not, and no other kind is named for anything.
+#[test]
+fn cluster_fields_nothing_reads_are_named() {
+    let read = |text: &str| Resource::from_source(text).unwrap().remove(0).unwrap();
+    let cluster = |spec: &str| {
+        read(&format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {spec}\n"
+        ))
+    };
+    let all = "{ domain: example.org, voters: [a], updatePolicy: { windows: [Sat 02:00-05:00] }, \
+               mesh: { port: 51820 }, values: { a: 1 }, images: [] }";
+    let named = ["domain", "voters", "updatePolicy", "mesh", "values"];
+    assert_eq!(cluster(all).not_acted_on(), named);
+    assert_eq!(cluster("{ voters: [a] }").not_acted_on(), ["voters"]);
+    for none in ["{}", "{ images: [] }", "{ voters: [] }"] {
+        assert!(cluster(none).not_acted_on().is_empty(), "{none}");
+    }
+    let other = "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: { name: values }\n";
+    assert!(read(other).not_acted_on().is_empty());
+}
+
 /// The Cluster's rules for whose signatures images are taken by: a prefix that is a registry
 /// or a registry and a path, keys of the shape a template's are, and no more than 32 rules.
 #[test]

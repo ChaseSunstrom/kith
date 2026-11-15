@@ -137,17 +137,20 @@ spec! {
     // ---- Cluster, Node, Namespace ----
 
     pub struct ClusterSpec {
-        /// DNS domain for public names.
+        /// DNS domain for public names. Kept and not acted on: nothing reads it.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub domain: Option<String>,
-        /// Names of the nodes that vote in Raft.
+        /// Names of the nodes that vote in Raft. Kept and not acted on: who votes is said
+        /// when a node joins (`kith node token`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub voters: Vec<String>,
+        /// Kept and not acted on: an update is an `OSRelease`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub update_policy: Option<UpdatePolicy>,
+        /// Kept and not acted on: the mesh is set by kithd's flags.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub mesh: Option<MeshSpec>,
-        /// Cluster-wide package values.
+        /// Cluster-wide package values. Kept and not acted on: a package takes its own.
         #[serde(default, skip_serializing_if = "Values::is_empty")]
         pub values: Values,
         /// Whose signatures images are taken by: an image under a rule's `prefix` is run only

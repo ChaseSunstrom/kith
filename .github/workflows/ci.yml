@@ -39,6 +39,11 @@ jobs:
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --self-test
       - name: Binary-size and RSS budgets
         run: systemd-run --user --scope --quiet python3 ci/budgets.py
+      # kithd's idle memory is low because the code it runs at start is linked together, in the
+      # order of a file: one that names little of today's kithd orders little (and a toolchain
+      # with no lld of its own orders nothing: this fails then too, saying so).
+      - name: kithd's order file still names its functions
+        run: python3 ci/order.py --check
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
       - name: Times on the CI runner (printed, not enforced)
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --times

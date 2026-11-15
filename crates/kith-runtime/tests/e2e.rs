@@ -206,6 +206,63 @@ async fn writable_root() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
+/// What a container does to its image's files, whatever its root, never reaches the image's
+/// own inodes: they may be one file shared with every other image that holds the same.
+#[tokio::test]
+async fn image_tree_is_never_written() {
+    use std::os::unix::fs::MetadataExt;
+    let Some((rt, image, dir)) = rig("never-written").await else {
+        return;
+    };
+    let files = ["etc/passwd", "etc/group", "bin/busybox", "bin/sh"];
+    let look = || -> Vec<_> {
+        files
+            .iter()
+            .map(|file| {
+                let path = image.rootfs.join(file);
+                let meta = fs::symlink_metadata(&path).unwrap();
+                let bytes = fs::read(&path).unwrap();
+                (
+                    meta.ino(),
+                    meta.mode(),
+                    meta.uid(),
+                    meta.gid(),
+                    meta.mtime(),
+                    meta.nlink(),
+                    bytes,
+                )
+            })
+            .collect()
+    };
+    let before = look();
+    let changes = "echo x >> /etc/passwd; chmod 4777 /etc/group; chown 0:0 /etc/group; \
+                   touch /bin/busybox; cp /etc/passwd /bin/sh; echo done";
+    let mut ran = 0;
+    for (id, writable) in [("read-only", false), ("writable", true)] {
+        let unit = Unit {
+            user: Some(0),
+            writable,
+            ..script(changes)
+        };
+        let (out, err) = (dir.join("o"), dir.join("e"));
+        let (o, e) = (File::create(&out).unwrap(), File::create(&err).unwrap());
+        // (Not every kernel lets a user namespace mount an overlay: where kithd is root it can.)
+        match rt.create(id, &image, &unit, o, e) {
+            Ok(made) => made.delete().map_err(|e| e.error).unwrap(),
+            Err(e) => {
+                eprintln!("skipped {id}: {e}");
+                continue;
+            }
+        }
+        let (_, out, err) = sh(&rt, &image, &dir, id, unit);
+        assert!(out.ends_with("done\n"), "{id}: {out} {err}");
+        ran += 1;
+        assert_eq!(look(), before, "{id} reached the image's files");
+    }
+    assert!(ran > 0, "no container ran");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A container's output is its own by name too: an image that opens /dev/stdout writes there.
 #[tokio::test]
 async fn output_by_name() {

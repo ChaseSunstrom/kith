@@ -184,7 +184,12 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   how you follow a tag that moves. A cluster Image of this node's own registry is
   always asked, whatever its policy: one deleted, or made again under its name, is
   not started from the copy kept here (asking for an unchanged one takes about 22 ms
-  here). Memory and CPU limits, a limit on what a replica writes (`resources.storage`,
+  here). A file that several unpacked images hold alike (bytes, mode, owner, time, and
+  no extended attribute) is one file on the node, hard-linked into each: three nginx
+  images of one Alpine base took 44% less disk here, and unpacked 4 to 6% slower (each
+  file is read once more to find its equals, on up to four threads; on one thread it
+  was a quarter slower).
+  Memory and CPU limits, a limit on what a replica writes (`resources.storage`,
   [below](#a-replica-as-a-pod)), `command`/`args`, and `env`
   from values, `ConfigMap`s and `Secret`s are honoured; containers that exit are
   restarted according to `restartPolicy`: at once the first time (and whenever it
@@ -226,7 +231,11 @@ web.yaml:7:13: invalid type: string "yes", expected u32
   its first replica and the status says where. `strategy: recreate` replaces
   everything at once. A container or exec unit is replaced the same way when a
   `ConfigMap` or `Secret` value in its `env` changes.
-- On SIGTERM it stops everything it started.
+- On SIGTERM it stops everything it started, and goes on answering the
+  requests it has for 3 seconds at most: a longer one (a large `kith volume
+  put`, a followed log) is cut there. Told a second time while it
+  stops, it ends at once and its next start stops what was left (on kith OS
+  the second signal changes nothing: the node still unmounts its disks).
 
 Not yet: `exec` probes are accepted but do nothing (the status says so), a
 container's `ports` only name them for probes and Services (nothing is opened or
@@ -363,7 +372,9 @@ spec:
   the rule), and taking it out of the `Cluster` is the way back. Not under any rule:
   a cluster Image (packed from a Volume on a node, signed by no one). Not read: cosign's
   keyless signatures (certificates), a transparency log, and signatures kept as OCI
-  referrers; `spec.images` is all kithd reads of a `Cluster` today.
+  referrers. `spec.images` is all kithd reads of a `Cluster` today: its `domain`, `voters`,
+  `updatePolicy`, `mesh` and `values` are kept and not acted on, and `kith lint`, `kith
+  diff` and `kith apply` say so of each one a file sets.
 - **What it still reaches.** The node's network (and so every port on its loopback, and
   the sockets programs of the node listen on by name alone, without a file), the
   kernel through every call the filter lets by, and the devices it claims: a GPU's render
@@ -3683,6 +3694,22 @@ Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
 has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on
 Debian/Ubuntu, or point `CC_x86_64_unknown_linux_musl` at a `zig cc -target
 x86_64-linux-musl` wrapper.
+
+kithd is linked by the Rust toolchain's own lld, with the functions it runs from its
+start until it has idled a while first in its code, in the order
+`crates/kithd/kithd.order` lists them. The kernel keeps in memory the pages around each
+one a process touches: with that code where the compiler put it, all over the binary,
+kithd with nothing to do held 8.91 MB, 7 of them its code; with it together it holds
+3.81 MB (`python3 ci/budgets.py`; the budget stays 9.00 MB), and is 11.22 MB where it
+was 11.21. `python3 ci/order.py` writes the file again from a run of the kithd it
+builds: a breakpoint on every function, taken off the first time it is hit, so each one
+that runs is seen once and in order (x86_64 Linux). A name is matched whatever a
+`cargo update` or a new compiler makes of the letters Rust writes before each crate's
+name, so the file outlives most of those; code written since is not in it, and
+`python3 ci/order.py --check`, which CI runs, fails once under four fifths of its
+names are still in kithd, or are not together where its code starts. A toolchain with
+no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
+again (the check then fails, saying there is no lld).
 
 ### Testing on several nodes
 

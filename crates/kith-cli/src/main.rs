@@ -2003,6 +2003,12 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
         }
     }
     if errors.is_empty() {
+        for resource in &resources {
+            for field in resource.not_acted_on() {
+                let key = resource.key();
+                eprintln!("note: {key}: spec.{field} is kept and not acted on (nothing in kith reads it)");
+            }
+        }
         Ok(resources)
     } else {
         Err(errors.join("\n"))

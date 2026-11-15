@@ -272,7 +272,14 @@ def peak_rss(argv, env):
 
 
 def idle_rss(kithd, tmp):
-    """Resident set size of a kithd that serves its socket and has nothing to run."""
+    """Resident set size of a kithd that serves its socket and has nothing to run.
+
+    With the whole binary in the page cache, as it is right after a build: the kernel maps
+    the cached pages around each page kithd touches, so a binary the machine had partly
+    dropped from its cache measured up to 0.9 MB less than the same one freshly built."""
+    with open(kithd, "rb") as binary:
+        while binary.read(1 << 20):
+            pass
     socket = os.path.join(tmp, "kithd.sock")
     daemon = subprocess.Popen([kithd, "--state", os.path.join(tmp, "state"), "--socket", socket], stderr=subprocess.DEVNULL)
     try:
