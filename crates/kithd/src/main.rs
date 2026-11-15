@@ -604,7 +604,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             None => Ok(None),
         }
     })?;
-    let shared = rt.block_on(replica(membership, &state, std::time::Duration::from_secs(args.lost_after)))?;
+    let shared = rt.block_on(replica(
+        membership,
+        &state,
+        std::time::Duration::from_secs(args.lost_after),
+    ))?;
     if args.ingress && shared.view.borrow().is_some() {
         return Err(
             "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \

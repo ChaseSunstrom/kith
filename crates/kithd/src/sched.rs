@@ -95,7 +95,9 @@ type Seen<'a> = &'a dyn Fn(&str) -> (Option<(f64, f64)>, Option<Duration>);
 
 /// The keys of the Secrets that are for control nodes only.
 fn guarded(store: &Store) -> BTreeSet<String> {
-    let secrets = store.list(Some("Secret")).filter(|secret| secret.spec["trust"] == "control");
+    let secrets = store
+        .list(Some("Secret"))
+        .filter(|secret| secret.spec["trust"] == "control");
     secrets.map(Resource::key).collect()
 }
 
@@ -135,10 +137,10 @@ pub(crate) fn drain_off(spec: &mut Value) {
     };
     let taint = taints.remove(at);
     spec["taints"] = Value::Array(taints);
-    if taint["value"] != "owner" {
-        if let Some(spec) = spec.as_object_mut() {
-            spec.remove("unschedulable");
-        }
+    if taint["value"] != "owner"
+        && let Some(spec) = spec.as_object_mut()
+    {
+        spec.remove("unschedulable");
     }
 }
 
@@ -321,7 +323,11 @@ pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str
         let (outcome, to, why) = match after {
             Some(to) if to == node => ("stays", None, made.stays.get(&r.id).cloned().unwrap_or_default()),
             Some(to) => ("moves", Some(to.to_string()), String::new()),
-            None => ("unplaced", None, made.unschedulable.get(&r.id).cloned().unwrap_or_default()),
+            None => (
+                "unplaced",
+                None,
+                made.unschedulable.get(&r.id).cloned().unwrap_or_default(),
+            ),
         };
         let if_lost = if r.node.is_some() {
             "waits for the node: pinned by its Volume or Device"
@@ -344,9 +350,17 @@ pub(crate) fn drain_lines(store: &Store, seen: Seen, grace: Duration, node: &str
             continue;
         }
         let (outcome, why, if_lost) = if kept {
-            ("stays", "one copy runs on each node its selector matches", "its copy waits for the node")
+            (
+                "stays",
+                "one copy runs on each node its selector matches",
+                "its copy waits for the node",
+            )
         } else {
-            ("removed", "another NoExecute taint is on the node", "its copy comes back when the node does")
+            (
+                "removed",
+                "another NoExecute taint is on the node",
+                "its copy comes back when the node does",
+            )
         };
         lines.push(line(resource.key(), None, outcome, None, why.into(), if_lost));
     }
@@ -931,16 +945,32 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
             &[
                 ("Workload/default/web", json!({ "nodes": { "0": "a", "1": "a" } })),
                 ("Workload/default/pinned", json!({ "nodes": { "0": "a" } })),
-                ("Job/default/batch", json!({ "state": "running", "nodes": { "0": "a" } })),
+                (
+                    "Job/default/batch",
+                    json!({ "state": "running", "nodes": { "0": "a" } }),
+                ),
             ],
         );
         let there = |_: &str| (Some((4.0, 8e9)), None);
         let (fields, _) = plan(&store, &there, Duration::from_secs(300));
         // (Only the `nodes` field is looked at: a drain changes where a thing runs, not its count.)
-        let nodes = |key: &str| fields.iter().find(|(of, _)| of == key).and_then(|(_, f)| f.get("nodes").cloned());
+        let nodes = |key: &str| {
+            fields
+                .iter()
+                .find(|(of, _)| of == key)
+                .and_then(|(_, f)| f.get("nodes").cloned())
+        };
         assert_eq!(nodes("Workload/default/web"), Some(json!({ "0": "b", "1": "b" })));
-        assert_eq!(nodes("Workload/default/pinned"), None, "pinned by its Device: stays on a");
-        assert_eq!(nodes("Job/default/batch"), None, "a running Job is not moved by a drain");
+        assert_eq!(
+            nodes("Workload/default/pinned"),
+            None,
+            "pinned by its Device: stays on a"
+        );
+        assert_eq!(
+            nodes("Job/default/batch"),
+            None,
+            "a running Job is not moved by a drain"
+        );
     }
 
     #[test]
@@ -965,7 +995,10 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf], resources: { cpu:
         let store = drained_store(source, &[("Workload/default/big", json!({ "nodes": { "0": "a" } }))]);
         let there = |_: &str| (Some((4.0, 8e9)), None);
         let (fields, _) = plan(&store, &there, Duration::from_secs(300));
-        let moved = fields.iter().find(|(key, _)| key == "Workload/default/big").and_then(|(_, f)| f.get("nodes"));
+        let moved = fields
+            .iter()
+            .find(|(key, _)| key == "Workload/default/big")
+            .and_then(|(_, f)| f.get("nodes"));
         assert!(moved.is_none(), "{fields:?}");
     }
 
@@ -991,7 +1024,10 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
         let store = drained_store(source, &[("NodeWorkload/default/each", json!({ "nodes": copies }))]);
         let there = |_: &str| (Some((4.0, 8e9)), None);
         let (fields, _) = plan(&store, &there, Duration::from_secs(300));
-        let moved = fields.iter().find(|(key, _)| key == "NodeWorkload/default/each").and_then(|(_, f)| f.get("nodes"));
+        let moved = fields
+            .iter()
+            .find(|(key, _)| key == "NodeWorkload/default/each")
+            .and_then(|(_, f)| f.get("nodes"));
         assert!(moved.is_none(), "{fields:?}");
     }
 
@@ -1013,10 +1049,19 @@ kind: Job
 metadata: { name: batch }
 spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
 ";
-        let store = drained_store(source, &[("Job/default/batch", json!({ "state": "running", "nodes": { "0": "a" } }))]);
+        let store = drained_store(
+            source,
+            &[(
+                "Job/default/batch",
+                json!({ "state": "running", "nodes": { "0": "a" } }),
+            )],
+        );
         let there = |_: &str| (Some((4.0, 8e9)), None);
         let (fields, _) = plan(&store, &there, Duration::from_secs(300));
-        let nodes = fields.iter().find(|(of, _)| of == "Job/default/batch").map(|(_, f)| f["nodes"].clone());
+        let nodes = fields
+            .iter()
+            .find(|(of, _)| of == "Job/default/batch")
+            .map(|(_, f)| f["nodes"].clone());
         assert_eq!(nodes, Some(json!({ "0": "b" })));
     }
 
@@ -1046,7 +1091,10 @@ spec:
         let store = drained_store(source, &[]);
         let there = |_: &str| (Some((4.0, 8e9)), None);
         let (fields, _) = plan(&store, &there, Duration::from_secs(300));
-        let nodes = fields.iter().find(|(of, _)| of == "Workload/default/gpu-work").map(|(_, f)| f["nodes"].clone());
+        let nodes = fields
+            .iter()
+            .find(|(of, _)| of == "Workload/default/gpu-work")
+            .map(|(_, f)| f["nodes"].clone());
         assert_eq!(nodes, Some(json!({ "0": "a" })));
     }
 }

@@ -2152,7 +2152,9 @@ mod tests {
     #[tokio::test]
     async fn a_write_is_asked_for_before_anything_is_said_of_what_is_there() {
         let dir = std::env::temp_dir().join(format!("kithd-kube-write-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         let held = "
 apiVersion: kith.dev/v1
 kind: Role

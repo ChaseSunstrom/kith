@@ -176,12 +176,18 @@ fn reject(n: &Node, r: &Replica, used: Amount) -> Option<&'static str> {
 
 /// A NoExecute taint other than the drain's: it leaves every replica.
 fn other_eviction(n: &Node) -> bool {
-    n.spec.taints.iter().any(|t| t.effect == TaintEffect::NoExecute && t.key != DRAIN)
+    n.spec
+        .taints
+        .iter()
+        .any(|t| t.effect == TaintEffect::NoExecute && t.key != DRAIN)
 }
 
 /// Is `n` drained (its NoExecute drain taint is on)?
 fn drained(n: &Node) -> bool {
-    n.spec.taints.iter().any(|t| t.effect == TaintEffect::NoExecute && t.key == DRAIN)
+    n.spec
+        .taints
+        .iter()
+        .any(|t| t.effect == TaintEffect::NoExecute && t.key == DRAIN)
 }
 
 /// Is `r` pinned to `n` by its hardware, or may it run on any node its placement allows?
@@ -283,7 +289,8 @@ pub fn schedule(nodes: &[Node], replicas: &[Replica], grace: Duration) -> Plan {
                 match home {
                     Some(n) if drained(n) && !other_eviction(n) && !gone(n, grace) && pin_and_placement_fit(n, r) => {
                         state.put(&mut plan, n, r);
-                        plan.stays.insert(r.id.clone(), format!("no other node can take it: {why}"));
+                        plan.stays
+                            .insert(r.id.clone(), format!("no other node can take it: {why}"));
                     }
                     _ => {
                         plan.unschedulable

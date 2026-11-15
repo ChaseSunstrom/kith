@@ -224,6 +224,17 @@ fn main() {
                 let _ = stream.write_all(name.as_bytes());
             }
         }
+        // A long task that keeps its place: the step it reached is in DIR/step, and run again
+        // (after its node was drained, or started again) it goes on from there.
+        ["count", dir] => {
+            let file = format!("{dir}/step");
+            let was: u32 = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            std::fs::write(&file, format!("{}\n", was + 1)).expect("its step, written down");
+            match was {
+                0 => println!("began: step 1"),
+                _ => println!("went on from step {was}: step {}", was + 1),
+            }
+        }
         // What it was given (PASSWORD), to whoever asks on port 80: for a container on its
         // node's own network, whose root takes no file.
         ["say"] => {

@@ -377,6 +377,17 @@ struct DrainOptions {
     step: String,
 }
 
+/// A worker runs from a view of the store: it has neither every Workload nor the other nodes'
+/// load, so its plan would be short without saying so. A control node plans and drains.
+fn drains_here(shared: &Shared) -> Result<(), ApiError> {
+    match shared.view.borrow().is_some() {
+        true => Err(ApiError::Refused(
+            "this node is a worker and runs from a view of the store: ask a control node to drain a node".into(),
+        )),
+        false => Ok(()),
+    }
+}
+
 /// What `kith node drain` would do to what runs on the node (`GET /v1/drain/NAME`): one line
 /// per Workload, Job and NodeWorkload with a copy there, for whoever may get those kinds.
 async fn drain_plan(
@@ -385,9 +396,13 @@ async fn drain_plan(
     Path(name): Path<String>,
 ) -> Reply<Vec<serde_json::Value>> {
     permit(&shared, &caller, Verb::Get, |_| vec![("Node".to_string(), None)])?;
+    drains_here(&shared)?;
     let seen = crate::sched::seen_at(&shared, std::time::Instant::now());
     let grace = shared.lost_after;
     read(&shared, |store| {
+        // A name that is no node's is not a node with nothing on it.
+        let key = format!("Node/{name}");
+        store.get(&key).ok_or(Error::NotFound(key))?;
         let grants = Grants::of(&caller, store);
         let lines = crate::sched::drain_lines(store, &seen, grace, &name);
         let may = |line: &serde_json::Value| {
@@ -407,12 +422,19 @@ async fn drain_set(
     Query(options): Query<DrainOptions>,
 ) -> Reply<Vec<Change>> {
     permit(&shared, &caller, Verb::Apply, |_| vec![("Node".to_string(), None)])?;
+    drains_here(&shared)?;
     let key = format!("Node/{name}");
-    let Json(mut node) = read(&shared, |store| store.get(&key).cloned().ok_or(Error::NotFound(key.clone())))?;
+    let Json(mut node) = read(&shared, |store| {
+        store.get(&key).cloned().ok_or(Error::NotFound(key.clone()))
+    })?;
     match options.step.as_str() {
         "drain" => crate::sched::drain_on(&mut node.spec),
         "undrain" => crate::sched::drain_off(&mut node.spec),
-        other => return Err(ApiError::Store(Error::Invalid(format!("do is drain or undrain, not {other}")))),
+        other => {
+            return Err(ApiError::Store(Error::Invalid(format!(
+                "do is drain or undrain, not {other}"
+            ))));
+        }
     }
     applied(&shared, &caller, vec![node]).await.map(Json)
 }
@@ -739,7 +761,9 @@ mod tests {
     #[tokio::test]
     async fn a_share_or_a_backup_reaches_no_further_than_its_writer_may() {
         let dir = std::env::temp_dir().join(format!("kithd-reach-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         let roles = "
 apiVersion: kith.dev/v1
 kind: Role
@@ -805,7 +829,9 @@ spec: {}
     #[tokio::test]
     async fn a_watch_ends_when_its_identity_no_longer_stands() {
         let dir = std::env::temp_dir().join(format!("kithd-watch-identity-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         let ca = crate::pki::Ca::create().unwrap();
         let (_, _, public) = ca.issue_user("alice").unwrap();
         let (_, _, given) = ca.issue_user("alice").unwrap();
@@ -910,7 +936,9 @@ spec: {role: reader, subjects: [alice]}
     #[tokio::test]
     async fn dry_runs_wait_for_one_of_four() {
         let dir = std::env::temp_dir().join(format!("kithd-dry-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         let resource = serde_json::from_value::<Resource>(serde_json::json!({
             "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": "c" }, "spec": {}
         }))
@@ -955,6 +983,108 @@ spec: {role: reader, subjects: [alice]}
         std::fs::write(&path, [b'a', 0xC3]).unwrap();
         assert_eq!(chunk(None, None), ("a".into(), 1));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A drain is an apply of the Node: who may not apply Nodes drains none, who may only
+    /// read sees the plan and changes nothing, both are in the audit log; a node that does
+    /// not exist is not an empty node, and a worker's view is not asked for a plan.
+    #[tokio::test]
+    async fn drain_is_an_apply_of_the_node_by_who_may_and_is_audited() {
+        let dir = std::env::temp_dir().join(format!("kithd-drain-may-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: n1}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: looker}
+spec:
+  rules:
+    - {kinds: [Node], verbs: [get]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: bob-looker}
+spec: {role: looker, subjects: [bob]}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: bob}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: eve}
+spec: {}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(source).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let who = |name: &str| Extension(Caller::Identity(name.into()));
+        let plan =
+            |caller: Extension<Caller>, node: &str| drain_plan(State(shared.clone()), caller, Path(node.to_string()));
+        let set = |caller: Extension<Caller>, step: &str| {
+            let options = Query(DrainOptions { step: step.into() });
+            drain_set(State(shared.clone()), caller, Path("n1".to_string()), options)
+        };
+        let status = |e: ApiError| e.into_response().status().as_u16();
+        let spec = || shared.store.lock().unwrap().store.get("Node/n1").unwrap().spec.clone();
+
+        // Who has no right on Nodes: neither the plan nor the drain.
+        assert_eq!(plan(who("eve"), "n1").await.map(drop).map_err(status), Err(403));
+        assert_eq!(set(who("eve"), "drain").await.map(drop).map_err(status), Err(403));
+        // Who may read Nodes: the plan, not the drain.
+        assert!(plan(who("bob"), "n1").await.is_ok());
+        assert_eq!(set(who("bob"), "drain").await.map(drop).map_err(status), Err(403));
+        assert!(
+            spec()["taints"].is_null() && spec()["unschedulable"].is_null(),
+            "{}",
+            spec()
+        );
+        // A node that is not there is not a node with nothing on it.
+        assert_eq!(
+            plan(Extension(Caller::Admin), "n2").await.map(drop).map_err(status),
+            Err(404)
+        );
+        // Who may apply Nodes: drained, then undrained, each written down.
+        assert!(set(Extension(Caller::Admin), "drain").await.is_ok());
+        assert_eq!(spec()["unschedulable"], true);
+        assert!(spec()["taints"].to_string().contains("kith.dev/drain"), "{}", spec());
+        assert!(set(Extension(Caller::Admin), "undrain").await.is_ok());
+        assert!(!spec().to_string().contains("kith.dev/drain"), "{}", spec());
+        let entries = shared.audit.tail(20).unwrap();
+        let about = |ok: bool, who: &str| {
+            let is = |e: &&serde_json::Value| e["ok"] == ok && e["who"] == who && e.to_string().contains("Node");
+            entries.iter().filter(is).count()
+        };
+        assert!(about(false, "eve") >= 2 && about(false, "bob") >= 1, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .filter(|e| e["ok"] == true && e.to_string().contains("Node/n1"))
+                .count()
+                >= 2,
+            "{entries:?}"
+        );
+        // A worker runs from a view: what it has of the store is short, so it plans nothing.
+        shared.view.send_replace(Some(1));
+        assert_eq!(
+            plan(Extension(Caller::Admin), "n1").await.map(drop).map_err(status),
+            Err(403)
+        );
+        assert_eq!(
+            set(Extension(Caller::Admin), "drain").await.map(drop).map_err(status),
+            Err(403)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

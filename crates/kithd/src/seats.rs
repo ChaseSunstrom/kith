@@ -300,7 +300,9 @@ spec:
     #[tokio::test]
     async fn seat_activity_is_for_who_may_apply_seats_and_is_audited() {
         let dir = std::env::temp_dir().join(format!("kithd-seat-activity-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         for resource in Resource::from_source(SEATED).unwrap() {
             let (resources, at) = (vec![resource.unwrap()], kith_api::store::now());
             shared.submit(Command::Apply { resources, at }).await.unwrap();

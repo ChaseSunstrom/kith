@@ -853,9 +853,19 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
   what happens if the node is lost (it waits for the node, or starts over).
 - Undrain removes only what the drain put on the node: a cordon its owner set
   earlier stays. A replica placed on the node after undrain may go back there.
-- A drain and an undrain are applies of the Node, so they go in the audit log,
-  and only who may apply Nodes may drain. The plan can be read by whoever may
-  read Nodes and what runs on them.
+- A drain and an undrain are applies of the Node, so they go in the audit log
+  (as an apply of `Node/NAME`), and only who may apply Nodes may drain. The
+  plan (`GET /v1/drain/NAME`) is read by whoever may read Nodes, and shows
+  them the lines of the kinds and namespaces they may read. A worker runs from
+  a view of the store and plans no drain: ask a control node.
+- What a line says happens if the node is lost is worked out from what pins
+  the replica there, as a hint: the scheduler decides when it happens.
+- The cordon is one switch, and a drain does not own it: a drain of a node
+  that was cordoned already leaves it cordoned at undrain, also when it was an
+  OS update that had cordoned it (take `unschedulable` off the Node then); a cordon put on
+  during a drain goes with the drain; and an update that finishes during a
+  drain takes the cordon off while the drain's taint still keeps new replicas
+  away.
 
 ### Checkpointing a long GPU Job
 
@@ -885,7 +895,10 @@ spec:
 
 The GPU itself is a `DeviceClaim` on the container, as in [Hardware](#hardware).
 The checkpointing is the program's: kith keeps the directory and starts the
-Job on the node that has it, not the checkpoint format.
+Job on the node that has it, not the checkpoint format. A Job of this shape is
+run twice around a drain in a VM (`sh ci/vm.sh --test pods`): asked for again
+while its node is drained it waits, and once the drain is off it says it went
+on from the step the first one left.
 
 ## DNS
 

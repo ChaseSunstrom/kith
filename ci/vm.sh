@@ -725,6 +725,33 @@ units = [u for r in found if r["kind"] == "Workload" and r["metadata"]["name"] =
 print(len(units), sum(u.get("restarts", 0) for u in units))' "$work/found.json")
             [ "$again" = '1 0' ] || fail "the session was started again for its keyboard (units, restarts): $again"
 
+            # A long Job keeps its place on a Volume of the node it runs on (README, "Restarting
+            # a node on purpose"). The node is drained: the plan is answered, and the Job asked
+            # for again is not started there. The drain taken off, it runs and goes on from
+            # the step the first one left.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"train-state"},"spec":{"node":"n2","path":"train"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Volume of the Job's state was not applied"
+            train='"image":"kith.test/pod:1","command":["/bin/pod","count","/state"],"volumeMounts":[{"volume":"train-state","path":"/state"}]'
+            job train '' "$train" '^[0-9]+ succeeded'
+            grep -q 'began: step 1' "$work/train.out" || fail "the Job that keeps its step did not begin at the first: $(cat "$work/train.out" "$work/train.err")"
+            api 1 GET /v1/drain/n2 >"$work/plan.json" || fail "the plan of a drain of n2 was not answered"
+            python3 -c 'import json, sys; assert isinstance(json.load(open(sys.argv[1])), list)' "$work/plan.json" || fail "the plan of a drain is not a list: $(cat "$work/plan.json")"
+            api 1 POST '/v1/drain/n2?do=drain' >/dev/null || fail "n2 was not drained"
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"train-again"},"spec":{"retries":0,"template":{"containers":[{"name":"box",$train}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job train-again was not applied"
+            sleep 15
+            line=$(units Job train-again)
+            ! printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)' || fail "a Job was started on a drained node: $line"
+            echo "vm.sh: n2 drained: a Job whose Volume is there waits ($line)" >&2
+            api 1 POST '/v1/drain/n2?do=undrain' >/dev/null || fail "the drain was not taken off n2"
+            job train-again '' "$train" '^[0-9]+ succeeded'
+            grep -q 'went on from step 1: step 2' "$work/train-again.out" || fail "the Job run again after the drain did not go on from the first's step: $(cat "$work/train-again.out" "$work/train-again.err")"
+            echo "vm.sh: the drain off: the Job ran and went on from the step the first left on its Volume" >&2
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in"
             exit 0

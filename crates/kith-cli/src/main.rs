@@ -812,40 +812,12 @@ fn drain_text(name: &str, plan: &[serde_json::Value]) -> Vec<String> {
                 "moves" => format!("  {who} moves to {}", line["to"].as_str().unwrap_or_default()),
                 "stays" => format!("  {who} stays on {name}: {why}; if {name} is lost, {if_lost}"),
                 "removed" => format!("  {who} comes off {name}: {why}; {if_lost}"),
-                _ => format!("  {who} cannot be placed on any node: {why}"),
+                "unplaced" => format!("  {who} cannot be placed on any node: {why}"),
+                // A word a newer kithd says: shown as it is, not as one of the above.
+                other => format!("  {who}: {other}: {why}"),
             }
         })
         .collect()
-}
-
-#[cfg(test)]
-mod drain_tests {
-    use super::drain_text;
-    use serde_json::json;
-
-    #[test]
-    fn drain_says_what_moves_stays_and_what_is_lost_before_anything_changes() {
-        let plan = [
-            json!({"key": "Workload/web", "replica": "0", "outcome": "moves", "to": "b", "why": "",
-                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
-            json!({"key": "Job/default/train", "replica": "0", "outcome": "stays", "to": null,
-                   "why": "running here: a drain leaves it to finish",
-                   "if_lost": "starts over on another node once the node is lost, if one can take it"}),
-            json!({"key": "Workload/data", "replica": "0", "outcome": "stays", "to": null,
-                   "why": "no other node can take it: 0/2 nodes can take it: 1 cordoned, 1 not enough cpu",
-                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
-            json!({"key": "NodeWorkload/agent", "replica": null, "outcome": "removed", "to": null,
-                   "why": "another NoExecute taint is on the node", "if_lost": "its copy comes back when the node does"}),
-        ];
-        let text = drain_text("a", &plan);
-        assert_eq!(text.len(), 4, "{text:?}");
-        assert_eq!(text[0], "  Workload/web#0 moves to b", "{text:?}");
-        assert!(text[1].contains("Job/default/train#0 stays on a: running here"), "{text:?}");
-        // The last node that can run it: the drain keeps it, and says why.
-        assert!(text[2].contains("stays on a: no other node can take it"), "{text:?}");
-        assert!(text[3].starts_with("  NodeWorkload/agent comes off a:"), "{text:?}");
-        assert_eq!(drain_text("a", &[]), ["nothing runs on a: nothing moves"]);
-    }
 }
 
 /// One HTTP request to kithd over its unix socket.
@@ -2028,5 +2000,38 @@ fn print_rows(header: &[&str], rows: &[Vec<String>]) {
     line(header.to_vec());
     for row in rows {
         line(row.iter().map(String::as_str).collect());
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::drain_text;
+    use serde_json::json;
+
+    #[test]
+    fn drain_says_what_moves_stays_and_what_is_lost_before_anything_changes() {
+        let plan = [
+            json!({"key": "Workload/web", "replica": "0", "outcome": "moves", "to": "b", "why": "",
+                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
+            json!({"key": "Job/default/train", "replica": "0", "outcome": "stays", "to": null,
+                   "why": "running here: a drain leaves it to finish",
+                   "if_lost": "starts over on another node once the node is lost, if one can take it"}),
+            json!({"key": "Workload/data", "replica": "0", "outcome": "stays", "to": null,
+                   "why": "no other node can take it: 0/2 nodes can take it: 1 cordoned, 1 not enough cpu",
+                   "if_lost": "moves to another node once the node is lost, if one can take it"}),
+            json!({"key": "NodeWorkload/agent", "replica": null, "outcome": "removed", "to": null,
+                   "why": "another NoExecute taint is on the node", "if_lost": "its copy comes back when the node does"}),
+        ];
+        let text = drain_text("a", &plan);
+        assert_eq!(text.len(), 4, "{text:?}");
+        assert_eq!(text[0], "  Workload/web#0 moves to b", "{text:?}");
+        assert!(
+            text[1].contains("Job/default/train#0 stays on a: running here"),
+            "{text:?}"
+        );
+        // The last node that can run it: the drain keeps it, and says why.
+        assert!(text[2].contains("stays on a: no other node can take it"), "{text:?}");
+        assert!(text[3].starts_with("  NodeWorkload/agent comes off a:"), "{text:?}");
+        assert_eq!(drain_text("a", &[]), ["nothing runs on a: nothing moves"]);
     }
 }

@@ -487,7 +487,12 @@ spec: {role: other-jobber, subjects: [carol]}
                     cert,
                     key,
                 };
-                let shared = crate::replica(Some(Cluster::new(me.clone(), None).unwrap()), &dir.join(name), std::time::Duration::from_secs(300)).await;
+                let shared = crate::replica(
+                    Some(Cluster::new(me.clone(), None).unwrap()),
+                    &dir.join(name),
+                    std::time::Duration::from_secs(300),
+                )
+                .await;
                 let shared = shared.unwrap();
                 let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let port = tcp.local_addr().unwrap().port();

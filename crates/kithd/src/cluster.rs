@@ -1112,7 +1112,9 @@ mod tests {
     #[tokio::test]
     async fn netboot_refuses_a_roleless_identity_before_reading_its_body() {
         let dir = std::env::temp_dir().join(format!("kithd-netboot-refused-{}", std::process::id()));
-        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await.unwrap();
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
         let read = Arc::new(AtomicBool::new(false));
         let said = read.clone();
         let image = Body::from_stream(stream::poll_fn(move |_| {
