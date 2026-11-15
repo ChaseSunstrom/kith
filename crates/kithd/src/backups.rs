@@ -197,9 +197,46 @@ fn put<W: std::io::Write>(
     Ok(())
 }
 
+/// What a Volume that says its size may be sent, as an archive: the size, doubled (a tar
+/// spends 512 bytes on a header and pads each file to 512) and a megabyte. What the archive
+/// unpacks to is counted by [`unpack_beside`], which is what fills the disk: this stops a
+/// download that never ends. (No size: no end.)
+pub(crate) fn download_cap(size: u64) -> u64 {
+    size.saturating_mul(2).saturating_add(1 << 20)
+}
+
+/// What `answer` sends into `incoming`, as long as it is no more than `most` bytes: more
+/// is an error, said before a byte is taken when the length is said, and as soon as the
+/// last byte that may come has.
+pub(crate) async fn receive(
+    answer: &mut reqwest::Response,
+    incoming: &mut Incoming,
+    quiet: Duration,
+    most: u64,
+) -> Result<(), String> {
+    let over = || format!("it sends more than {most} bytes, more than the Volume may hold");
+    if answer.content_length().is_some_and(|length| length > most) {
+        return Err(over());
+    }
+    let mut got = 0u64;
+    loop {
+        let chunk = tokio::time::timeout(quiet, answer.chunk()).await;
+        let chunk = chunk.map_err(|_| format!("nothing came for {} s", quiet.as_secs()))?;
+        let Some(chunk) = chunk.map_err(|e| e.to_string())? else {
+            return Ok(());
+        };
+        got += chunk.len() as u64;
+        if got > most {
+            return Err(over());
+        }
+        incoming.write(&chunk).map_err(|e| e.to_string())?;
+    }
+}
+
 /// The tar at `archive` into `dir`, which must have nothing in it. Unpacked beside it and
 /// moved into its place when all of it is there: a restore that fails leaves `dir` as it was.
-fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
+/// `cap`: how many bytes it may unpack to (see [`unpack_beside`]).
+fn unpack(archive: &Path, dir: &Path, cap: u64) -> Result<(), String> {
     let failed = |e: std::io::Error| format!("restoring into {}: {e}", dir.display());
     let full = || "the volume has files in it: a backup is restored into an empty volume".to_string();
     if std::fs::read_dir(dir).map_err(failed)?.next().is_some() {
@@ -207,7 +244,7 @@ fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
     }
     // (An archive may come from a bucket others can write: nothing in it becomes a program
     // that runs as its owner.)
-    unpack_beside(archive, dir, 0o6000).and_then(|beside| {
+    unpack_beside(archive, dir, 0o6000, cap).and_then(|beside| {
         // (`remove_dir` takes only a directory that is still empty.)
         let moved = std::fs::remove_dir(dir).map_err(|_| full());
         let moved = moved.and_then(|()| std::fs::rename(&beside, dir).map_err(failed));
@@ -219,9 +256,20 @@ fn unpack(archive: &Path, dir: &Path) -> Result<(), String> {
     })
 }
 
+/// What a file, a directory or a link takes of a disk at least, and the unit an unpack counts in.
+const BLOCK: u64 = 4096;
+
 /// The tar at `archive` unpacked into a new directory beside `dir`: where it is. Nothing is
-/// left there if it fails.
-pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32) -> Result<PathBuf, String> {
+/// left there if it fails, nor what an unpack that was killed left.
+///
+/// `cap` is how many bytes it may unpack to (a Volume with no size: `u64::MAX`). Each entry
+/// counts at the size it unpacks to rounded up to `BLOCK` and at least that (a directory, a
+/// link and an empty file take a block), before it is unpacked, and the one that passes `cap`
+/// is the error. (The directories are held, as entries, until the end: one per block of `cap`
+/// at most.) A GNU sparse entry says its whole length (the tar crate gives that as
+/// `size()`, and unpacks it as a hole that takes next to no disk): it counts whole, as
+/// the next archive of the Volume reads it whole.
+pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32, cap: u64) -> Result<PathBuf, String> {
     let failed = |e: std::io::Error| format!("unpacking for {}: {e}", dir.display());
     let mut beside = dir.as_os_str().to_owned();
     beside.push(".restoring");
@@ -239,8 +287,27 @@ pub(crate) fn unpack_beside(archive: &Path, dir: &Path, mask: u32) -> Result<Pat
             me.uid() == 0
         }));
         // (The tar crate lets no entry out of where it unpacks: no `..`, no absolute path,
-        // no way through a link.)
-        tar.unpack(&beside)
+        // no way through a link.) As `Archive::unpack` does it, with the count: directories
+        // last, deepest first, so that a mode that shuts one does not shut out what is in it.
+        let to = beside.canonicalize()?;
+        let (mut held, mut dirs) = (0u64, Vec::new());
+        for entry in tar.entries()? {
+            let mut entry = entry?;
+            // (In blocks, as the disk has it: a directory, a link and a file of a byte take 4 KiB.)
+            held = held.saturating_add(entry.size().div_ceil(BLOCK).max(1) * BLOCK);
+            if held > cap {
+                return Err(std::io::Error::other(format!(
+                    "the archive unpacks to more than {cap} bytes, more than the Volume may hold"
+                )));
+            }
+            if entry.header().entry_type().is_dir() {
+                dirs.push(entry);
+            } else {
+                entry.unpack_in(&to)?;
+            }
+        }
+        dirs.sort_by(|a, b| b.path_bytes().cmp(&a.path_bytes()));
+        dirs.into_iter().try_for_each(|mut dir| dir.unpack_in(&to).map(drop))
     })();
     if unpacked.is_err() {
         let _ = std::fs::remove_dir_all(&beside);
@@ -601,7 +668,7 @@ pub async fn restore(
     let invalid = |why: String| ApiError::Store(Error::Invalid(why));
     let io = |why: String| ApiError::Store(Error::Io(why));
     let me = shared.members.me();
-    let (spec, dir, entry, address) = {
+    let (spec, dir, entry, address, cap) = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let backup = state
             .store
@@ -621,7 +688,9 @@ pub async fn restore(
             .ok_or_else(|| invalid(format!("{key} has no such backup")))?;
         let there = state.store.get(&format!("Node/{}", dir.node));
         let address = there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()));
-        (spec, dir, entry, address)
+        // (What the Volume holds, where it says: no more than that is restored into it.)
+        let cap = crate::volumes::size(&state.store, &namespace, &spec.volume).unwrap_or(u64::MAX);
+        (spec, dir, entry, address, cap)
     };
     let what = vec![format!(
         "{key} at {} into Volume/{namespace}/{}",
@@ -668,20 +737,16 @@ pub async fn restore(
                 let mut answer = s3(&bucket, reqwest::Method::GET, object, None).await?;
                 let blobs = crate::blobs::dir(&shared);
                 let mut incoming = Incoming::new(&blobs).map_err(|e| e.to_string())?;
-                loop {
-                    let chunk = tokio::time::timeout(QUIET, answer.chunk()).await;
-                    let chunk = chunk.map_err(|_| format!("the bucket sent nothing for {} s", QUIET.as_secs()))?;
-                    let Some(chunk) = chunk.map_err(|e| e.to_string())? else {
-                        break;
-                    };
-                    incoming.write(&chunk).map_err(|e| e.to_string())?;
-                }
+                let said = |e: String| format!("the bucket: {e}");
+                receive(&mut answer, &mut incoming, QUIET, download_cap(cap))
+                    .await
+                    .map_err(said)?;
                 let kept = tokio::task::spawn_blocking(move || incoming.keep(None)).await;
                 blobs.join(kept.map_err(|e| e.to_string())??.0)
             }
             _ => return Err("the backup says neither which blob nor which object it is".to_string()),
         };
-        let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, &into)).await;
+        let unpacked = tokio::task::spawn_blocking(move || unpack(&archive, &into, cap)).await;
         unpacked.map_err(|e| e.to_string())?
     };
     let restored: Result<(), String> = restored.await;
@@ -718,7 +783,7 @@ mod tests {
 
         let (name, size) = archive(&from, &blobs).unwrap();
         assert!(crate::blobs::named(&name) && size > 100_000);
-        unpack(&blobs.join(&name), &into).unwrap();
+        unpack(&blobs.join(&name), &into, u64::MAX).unwrap();
         assert_eq!(std::fs::read(into.join("a")).unwrap(), b"one");
         assert_eq!(std::fs::read(into.join("deep/er/b")).unwrap(), vec![7u8; 100_000]);
         assert_eq!(
@@ -731,7 +796,7 @@ mod tests {
         );
 
         // Not over what is there.
-        let refused = unpack(&blobs.join(&name), &into).unwrap_err();
+        let refused = unpack(&blobs.join(&name), &into, u64::MAX).unwrap_err();
         assert!(refused.contains("restored into an empty volume"), "{refused}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -836,7 +901,7 @@ mod tests {
         header.set_cksum();
         tar.append(&header, &b"out!"[..]).unwrap();
         let (name, _) = tar.into_inner().unwrap().keep(None).unwrap();
-        let _ = unpack(&blobs.join(name), &into);
+        let _ = unpack(&blobs.join(name), &into, u64::MAX);
         assert!(!root.join("escaped").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -897,7 +962,7 @@ mod tests {
         std::fs::write(from.join("tool"), b"#!/bin/sh").unwrap();
         std::fs::set_permissions(from.join("tool"), std::fs::Permissions::from_mode(0o6755)).unwrap();
         let (name, _) = archive(&from, &blobs).unwrap();
-        unpack(&blobs.join(&name), &into).unwrap();
+        unpack(&blobs.join(&name), &into, u64::MAX).unwrap();
         assert_eq!(
             std::fs::metadata(into.join("tool")).unwrap().permissions().mode() & 0o7777,
             0o755
@@ -906,10 +971,10 @@ mod tests {
         let empty = root.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         std::fs::write(root.join("junk"), vec![0xffu8; 4096]).unwrap();
-        assert!(unpack(&root.join("junk"), &empty).is_err());
+        assert!(unpack(&root.join("junk"), &empty, u64::MAX).is_err());
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
         assert!(!root.join("empty.restoring").exists());
-        unpack(&blobs.join(&name), &empty).unwrap();
+        unpack(&blobs.join(&name), &empty, u64::MAX).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1049,6 +1114,154 @@ mod tests {
             .layer(axum::extract::DefaultBodyLimit::disable());
         tokio::spawn(async move { axum::serve(listener, app).await });
         (bucket, kept)
+    }
+
+    /// A tar of files of these sizes (`/` in a name makes a directory of what is before it).
+    fn tar_of(blobs: &Path, files: &[(&str, usize)]) -> PathBuf {
+        let mut tar = tar::Builder::new(Incoming::new(blobs).unwrap());
+        for (name, size) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(*size as u64);
+            header.set_mode(0o644);
+            tar.append_data(&mut header, name, &vec![9u8; *size][..]).unwrap();
+        }
+        blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0)
+    }
+
+    /// A tar with one GNU sparse entry `hole`: 512 bytes of data at the end of `real` bytes
+    /// that say they are all there.
+    fn sparse_tar(blobs: &Path, real: u64) -> PathBuf {
+        let mut tar = tar::Builder::new(Incoming::new(blobs).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_mode(0o644);
+        header.set_size(512);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(real);
+        gnu.sparse[0].set_offset(real - 512);
+        gnu.sparse[0].set_length(512);
+        let path = b"hole";
+        header.as_old_mut().name[..path.len()].copy_from_slice(path);
+        header.set_cksum();
+        tar.append(&header, &[7u8; 512][..]).unwrap();
+        blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0)
+    }
+
+    #[test]
+    fn restore_capped_stops_where_the_archive_unpacks_past_the_volumes_size() {
+        let root = temp("capped");
+        let (blobs, into) = (root.join("blobs"), root.join("into"));
+        std::fs::create_dir_all(&into).unwrap();
+        // (Each file counts in blocks of 4 KiB: 61,440 bytes.)
+        let archive = tar_of(&blobs, &[("a", 60_000), ("b/c", 60_000)]);
+        // Over by a byte: an error, the volume empty and nothing beside it.
+        let refused = unpack(&archive, &into, 122_879).unwrap_err();
+        assert!(refused.contains("more than 122879 bytes"), "{refused}");
+        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+        assert!(!root.join("into.restoring").exists());
+        // As much as it may hold: restored. (A volume with no size is `u64::MAX`.)
+        unpack(&archive, &into, 122_880).unwrap();
+        assert_eq!(std::fs::metadata(into.join("b/c")).unwrap().len(), 60_000);
+        // What a killed kithd left beside the volume does not count, and is gone.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(root.join("empty.restoring")).unwrap();
+        std::fs::write(root.join("empty.restoring/junk"), vec![0u8; 5000]).unwrap();
+        std::fs::create_dir_all(&empty).unwrap();
+        unpack(&archive, &empty, u64::MAX).unwrap();
+        assert!(!root.join("empty.restoring").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_meters_an_entry_that_says_it_is_larger_than_its_bytes() {
+        // Real: the tar crate gives a GNU sparse entry its whole length as `size()`, and
+        // unpacks it as a hole (a file of that length that takes next to no disk), so
+        // the meter counts what an archive of the volume afterwards reads, not the tar's bytes.
+        let root = temp("sparse");
+        let (blobs, into) = (root.join("blobs"), root.join("into"));
+        std::fs::create_dir_all(&into).unwrap();
+        let real = 64 << 20;
+        let archive = sparse_tar(&blobs, real);
+        assert!(std::fs::metadata(&archive).unwrap().len() < 4096);
+        let refused = unpack(&archive, &into, 1 << 20).unwrap_err();
+        assert!(refused.contains("more than 1048576 bytes"), "{refused}");
+        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+        assert!(!root.join("into.restoring").exists());
+        unpack(&archive, &into, real).unwrap();
+        assert_eq!(std::fs::metadata(into.join("hole")).unwrap().len(), real);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unpack_meters_in_blocks_what_a_directory_or_a_file_of_a_byte_takes() {
+        // 300 directories and 300 files of one byte are a few KB of tar, and 600 blocks on a disk.
+        let root = temp("blocks");
+        let (blobs, into) = (root.join("blobs"), root.join("into"));
+        std::fs::create_dir_all(&into).unwrap();
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        for n in 0..300 {
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_size(0);
+            dir.set_mode(0o755);
+            tar.append_data(&mut dir, format!("d{n}/"), &[][..]).unwrap();
+            let mut file = tar::Header::new_gnu();
+            file.set_size(1);
+            file.set_mode(0o644);
+            tar.append_data(&mut file, format!("d{n}/f"), &[1u8][..]).unwrap();
+        }
+        let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let refused = unpack(&archive, &into, 1 << 20).unwrap_err();
+        assert!(refused.contains("more than 1048576 bytes"), "{refused}");
+        assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
+        assert!(!root.join("into.restoring").exists());
+        unpack(&archive, &into, 4 << 20).unwrap();
+        assert_eq!(std::fs::metadata(into.join("d299/f")).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What a peer or a bucket does that sends without end: `bytes` of them, in chunks and
+    /// with no length said first. On 127.0.0.1.
+    async fn endless(bytes: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let serve = move || async move {
+            let chunks = (0..bytes / 10_000).map(|_| Ok::<_, std::io::Error>(vec![1u8; 10_000]));
+            axum::body::Body::from_stream(futures_util::stream::iter(chunks))
+        };
+        tokio::spawn(async move { axum::serve(listener, axum::Router::new().fallback(serve)).await });
+        url
+    }
+
+    #[tokio::test]
+    async fn restore_capped_stops_a_download_past_the_size_and_leaves_nothing() {
+        let root = temp("download");
+        let blobs = root.join("blobs");
+        // Chunked, no length said: counted as it comes.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut answer = reqwest::get(endless(300_000).await).await.unwrap();
+        let mut incoming = Incoming::new(&blobs).unwrap();
+        let said = receive(&mut answer, &mut incoming, QUIET, 100_000).await.unwrap_err();
+        assert!(said.contains("more than 100000 bytes"), "{said}");
+        drop(incoming);
+        assert_eq!(std::fs::read_dir(&blobs).unwrap().count(), 0);
+        // The same, from a bucket that says its length: refused before a byte is taken.
+        let (bucket, kept) = fake_s3().await;
+        kept.lock()
+            .unwrap()
+            .insert("/examplebucket/big.tar".into(), vec![3u8; 300_000]);
+        let mut answer = s3(&bucket, reqwest::Method::GET, "big.tar", None).await.unwrap();
+        let mut incoming = Incoming::new(&blobs).unwrap();
+        let said = receive(&mut answer, &mut incoming, QUIET, 100_000).await.unwrap_err();
+        assert!(said.contains("more than 100000 bytes"), "{said}");
+        // As much as it may: taken whole.
+        let mut answer = s3(&bucket, reqwest::Method::GET, "big.tar", None).await.unwrap();
+        receive(&mut answer, &mut incoming, QUIET, 300_000).await.unwrap();
+        assert_eq!(incoming.keep(None).unwrap().1, 300_000);
+        // A tar's own overhead is let through: the size, doubled and a megabyte.
+        assert_eq!(download_cap(100), 1_048_776);
+        assert_eq!(download_cap(u64::MAX), u64::MAX);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
