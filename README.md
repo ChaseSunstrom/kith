@@ -409,17 +409,20 @@ spec:
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
   replica writes outside its Volumes: its containers' roots and its scratch on the state
-  disk, counted together against the sum of their limits, with a file it removed and
-  still holds open. kithd counts about every 10 seconds, and a replica past it is
-  replaced: each container is started again from an empty root and an empty scratch,
-  and its status says how much it wrote. A limited replica whose files cannot all be
-  counted in 5 seconds, or that nests directories 128 deep, is replaced too, and says
-  so. A node keeps part of its state disk free (`--storage-reserve BYTES`; where kithd
-  is root, 5% of the disk and at most 1 GiB unless said; 0 for none, and where it is
-  not): under it, the replica that wrote the most is replaced, limit or none, one a
-  count, once what the last one replaced wrote is gone. The limit is counted, not held
-  at the write: between two counts a fast writer can pass it, and a kithd that is not
-  root counts only what it can read (SECURITY.md). (`storage` limits a container only:
+  disk, counted together against the sum of their limits, with a file it removed that
+  one of its processes still holds open. kithd counts about every 10 seconds, and a
+  replica past it is replaced: each container is started again from an empty root and
+  an empty scratch, and its status says how much it wrote. A limited replica whose files
+  cannot all be counted in 5 seconds, or that nests directories 128 deep, two counts in
+  a row, is replaced too, and says so. A node keeps part of its state disk free
+  (`--storage-reserve BYTES`; where kithd is root, 5% of the disk and at most 1 GiB
+  unless said; 0 for none, and where it is not): under it, the replica that wrote the
+  most (a tenth of the reserve at least) is replaced, limit or none, one a count, once
+  what the last one replaced wrote is gone, even when what filled the disk is no
+  replica's root: kithd's own store, logs and Images, and Volumes, count against no
+  replica. The limit is counted, not held at the write: between two counts a fast writer
+  can pass it, a removed file held only by a descriptor in flight on a socket counts
+  nothing, and a kithd that is not root counts only what it can read (SECURITY.md). (`storage` limits a container only:
   a Node's `reserved`, a seat's `reserve` and a Namespace's `quota` refuse it.)
 - **The image's user.** Each container is the user its image names, root included,
   with the capabilities a container runtime gives root and no more, in namespaces
@@ -508,7 +511,7 @@ spec:
   starts, with the reason in its status. **`dropCapabilities`** takes capabilities
   (`NET_RAW`, without `CAP_`) from whatever the container would have had: a pod's root
   has fourteen, root on kith OS three, anyone else none or one.
-- Not yet: `subPath` of a volume or of a scratch; a size limit for a scratch; a mode
+- Not yet: `subPath` of a volume or of a scratch; a mode
   for one file among the others. Where kithd is not root, the files of a map are your
   user's, which is the one user its containers have.
 

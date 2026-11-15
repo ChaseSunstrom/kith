@@ -255,20 +255,33 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   limit, and every pod while the disk has less than twice its reserve free) and replaces
   a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
   5% of it and at most 1 GiB unless said where kithd is root, none where it is not), the
-  one that wrote the most. A fast writer is not stopped between two counts: at the disk's
-  speed it can write past its limit, or fill the disk, before the next count sees it (10
-  to 20 seconds), and then kithd's store, logs and other replicas' writes fail until it is
-  replaced. A count walks every file by directory handle, not following links, each file
+  one that wrote the most, if that is a tenth of the reserve or more. That one goes even
+  when the disk is low for a cause that is no replica's root (kithd's own store, logs and
+  Images, and Volumes, count against no replica), and then the next, one a count, once
+  what the last wrote is gone. A fast writer is not stopped between two counts: at the
+  disk's speed it can write past its limit, or fill the disk, before a count sees it, and
+  then kithd's store, logs and other replicas' writes fail until it is replaced. A count
+  starts 10 seconds after the last ended and counts the replicas one after another, each
+  in 5 seconds at most: on a slow disk 20 replicas take up to 110 seconds between a
+  write and its replica's replacement. A count walks every file by directory handle, not following links, each file
   once however many names it has, and adds each removed file a process of the replica
-  still holds open (or maps) on those disks. A limited replica whose count does not end in
-  5 seconds, or reaches 128 directories deep, is replaced: one with millions of small files
-  is, though under its limit. An unlimited one so counted counts what was walked. An empty
+  still holds open (or maps) on those disks. A removed file held only by a descriptor in
+  flight (sent over a socket with SCM_RIGHTS, then closed) is open in no process and
+  counts nothing, against the limit or the reserve: nothing in kithd stops a replica
+  filling the disk so, only the blocks the filesystem keeps for root. One whose
+  descriptor another replica's process holds (a socket in a shared Volume) counts against
+  that replica, not its writer. A limited replica whose count does not end in 5 seconds,
+  or reaches 128 directories deep, two counts in a row, is replaced (once may be a slow
+  disk, slow for every replica): one with millions of small files is, though under its
+  limit. An unlimited one so counted counts what was walked. An empty
   file costs the disk an inode and the count nothing, and a directory kithd cannot read
   (where it is not root) is passed over, as is a held-open file it cannot look at. A file
   removed from a Volume on the state disk but held open counts against the replica (more
   than it wrote outside its Volumes, never less). A process that cannot be killed keeps
   its replica's replacement waiting, and no replica is replaced for the reserve meanwhile.
-  kithd's stop waits for a count under way (5 seconds a replica at most). A limit held at
+  A count can count a file twice (moved between the walk and the look at open files) and
+  counts a root on tmpfs, not on the disk. A count or removal under way when kithd stops
+  is left: what was set aside is removed at its replica's next count. A limit held at
   the write (an ext4 project quota on each root) is not done.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload

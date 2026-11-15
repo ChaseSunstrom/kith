@@ -21,6 +21,8 @@ pub struct Pod {
     pub bytes: u64,
     /// The count got to its end, or past the limit: not stopped by `SPELL` or `DEEP`.
     pub finished: bool,
+    /// Its last count did not finish either (`missed`).
+    pub again: bool,
 }
 
 /// How the message of a unit replaced for what its pod wrote begins.
@@ -35,6 +37,9 @@ pub const DEEP: usize = 128;
 /// Files with several links (or deleted, held open) remembered a count to be counted once; past
 /// that many each is counted at every link: more, never less.
 const LINKED: usize = 65536;
+
+/// The most cgroups, and processes, of one pod read a count; past them it did not finish.
+const CGROUPS: usize = 100_000;
 
 /// The reserve a node keeps when its flag does not say: 5% of its state disk, at most 1 GiB; none
 /// for a kithd that is not root, which cannot read all a pod writes and shares its disk with a desk.
@@ -129,11 +134,17 @@ fn first(seen: &mut BTreeSet<(u64, u64)>, meta: &FileStat) -> bool {
     seen.len() >= LINKED || seen.insert((meta.st_dev, meta.st_ino))
 }
 
-/// The processes in the cgroup `cgroup` and the cgroups under it.
-pub fn pids(cgroup: &Path) -> Vec<u32> {
+/// The processes in the cgroup `cgroup` and the cgroups under it, and whether all were read
+/// before `until` and within `CGROUPS`.
+pub fn pids(cgroup: &Path, until: Instant) -> (Vec<u32>, bool) {
     let mut pids = Vec::new();
     let mut cgroups = vec![(cgroup.to_path_buf(), 0)];
+    let mut read = 0;
     while let Some((cgroup, depth)) = cgroups.pop() {
+        read += 1;
+        if Instant::now() >= until || read > CGROUPS || pids.len() > CGROUPS {
+            return (pids, false);
+        }
         let procs = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap_or_default();
         pids.extend(procs.lines().filter_map(|pid| pid.parse::<u32>().ok()));
         if depth < 16 {
@@ -144,7 +155,14 @@ pub fn pids(cgroup: &Path) -> Vec<u32> {
             }
         }
     }
-    pids
+    (pids, true)
+}
+
+/// Whether the open file `link` (under `/proc/PID/fd` or `map_files`) names a deleted one. Its
+/// link is read, not followed: nothing is asked of the filesystem it is on, which may not answer.
+fn deleted(link: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_link(link).is_ok_and(|to| to.as_os_str().as_bytes().ends_with(b" (deleted)"))
 }
 
 /// Bytes on disk of the files the processes `pids` keep open, or mapped, after they were deleted
@@ -167,7 +185,10 @@ pub fn unlinked(pids: &[u32], roots: &[PathBuf], until: Instant) -> (u64, bool) 
                 if Instant::now() >= until {
                     return (bytes, false);
                 }
-                // (Followed: the link is the open file itself.)
+                // (Followed, once it names a deleted file: the link is the open file itself.)
+                if !deleted(&entry.path()) {
+                    continue;
+                }
                 let Ok(meta) = std::fs::metadata(entry.path()) else {
                     continue;
                 };
@@ -216,8 +237,28 @@ pub fn replacing(runs: &[(bool, Instant)], at: Instant) -> bool {
     runs.iter().any(|(stopping, started)| *stopping || *started <= at)
 }
 
+/// Notes which limited pods' counts did not finish, in `last` (this count's, for the next):
+/// each that did not the last time either is `again`. The ones that did not for the first time,
+/// to be said.
+pub fn missed(pods: &mut [Pod], last: &mut BTreeSet<String>) -> Vec<usize> {
+    let mut first = Vec::new();
+    let mut now = BTreeSet::new();
+    for (i, pod) in pods.iter_mut().enumerate() {
+        if pod.finished || pod.limit.is_none() {
+            continue;
+        }
+        pod.again = last.contains(&pod.id);
+        if !pod.again {
+            first.push(i);
+        }
+        now.insert(pod.id.clone());
+    }
+    *last = now;
+    first
+}
+
 /// The pods to replace, by index into `pods`, and why. Every pod past its limit, or with one whose
-/// count did not finish; while `free` is under `reserve` and none is, the one that wrote the most
+/// count did not finish twice in a row (once may be a slow disk, slow for all); while `free` is under `reserve` and none is, the one that wrote the most
 /// (one a count), if what it wrote is a tenth of the reserve or more: replacing a pod that wrote
 /// less frees nothing much.
 pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
@@ -232,8 +273,9 @@ pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
                     pod.bytes
                 ),
                 true => return None,
+                false if !pod.again => return None,
                 false => format!(
-                    "replaced: its pod's files outside its volumes could not all be counted in {} s or {DEEP} directories deep, to hold its limit of {limit}",
+                    "replaced: its pod's files outside its volumes could not all be counted twice in a row, in {} s or {DEEP} directories deep, to hold its limit of {limit}",
                     SPELL.as_secs()
                 ),
             };
@@ -273,6 +315,7 @@ mod tests {
             limit,
             bytes,
             finished: true,
+            again: false,
         }
     }
 
@@ -390,6 +433,38 @@ mod tests {
     }
 
     #[test]
+    fn storage_limit_only_a_deleted_files_descriptor_is_looked_through() {
+        let root = dir("deleted");
+        let fds = Path::new("/proc/self/fd");
+        // A live file and a pipe are known by their link alone: nothing on their filesystem is asked.
+        let live = std::fs::File::create(root.join("live")).unwrap();
+        let (read, write) = nix::unistd::pipe().unwrap();
+        assert!(!deleted(&fds.join(live.as_raw_fd().to_string())));
+        assert!(!deleted(&fds.join(read.as_raw_fd().to_string())));
+        let gone = std::fs::File::create(root.join("gone")).unwrap();
+        std::fs::remove_file(root.join("gone")).unwrap();
+        assert!(deleted(&fds.join(gone.as_raw_fd().to_string())));
+        // What is not there is not deleted.
+        assert!(!deleted(&fds.join("999999")));
+        drop((live, read, write, gone));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn storage_limit_a_pods_processes_are_read_from_its_cgroups_in_time() {
+        let top = dir("cgroups");
+        std::fs::create_dir_all(top.join("a").join("b")).unwrap();
+        std::fs::write(top.join("cgroup.procs"), "1\n2\n").unwrap();
+        std::fs::write(top.join("a").join("b").join("cgroup.procs"), "3\n").unwrap();
+        let (mut all, finished) = pids(&top, later());
+        all.sort();
+        assert!(all == [1, 2, 3] && finished, "{all:?}");
+        // Out of time: not all were read, and it says so.
+        assert!(!pids(&top, Instant::now()).1);
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    #[test]
     fn storage_limit_a_pod_over_its_limit_is_replaced_and_says_by_how_much() {
         let pods = [
             pod("a", Some(10 * MIB), 12 * MIB),
@@ -411,24 +486,37 @@ mod tests {
         // Two past their limits: both go.
         let two = [pod("a", Some(MIB), 2 * MIB), pod("b", Some(MIB), 3 * MIB)];
         assert_eq!(choose(&two, u64::MAX, MIB).len(), 2);
-        // One whose count did not finish cannot be held to its limit: it goes, and says why.
-        // Without a limit, what was counted stands.
-        let unfinished = [
-            Pod {
-                finished: false,
-                ..pod("slow", Some(10 * MIB), MIB)
-            },
-            Pod {
-                finished: false,
-                ..pod("free", None, MIB)
-            },
-        ];
-        let chosen = choose(&unfinished, u64::MAX, MIB);
+    }
+
+    #[test]
+    fn storage_limit_a_pod_whose_count_did_not_finish_twice_in_a_row_is_replaced() {
+        let unfinished = |id: &str, limit| Pod {
+            finished: false,
+            ..pod(id, limit, MIB)
+        };
+        let mut last = BTreeSet::new();
+        // Once (a slow disk slows every count together): nothing goes, and it is said once.
+        let mut pods = [unfinished("slow", Some(10 * MIB)), unfinished("free", None)];
+        assert_eq!(missed(&mut pods, &mut last), [0]);
+        assert!(choose(&pods, u64::MAX, MIB).is_empty());
+        // Twice in a row it cannot be held to its limit: it goes, and says why. Without a
+        // limit, what was counted stands.
+        let mut pods = [unfinished("slow", Some(10 * MIB)), unfinished("free", None)];
+        assert!(missed(&mut pods, &mut last).is_empty());
+        let chosen = choose(&pods, u64::MAX, MIB);
         assert_eq!(chosen.len(), 1);
         assert!(
             chosen[0].0 == 0 && chosen[0].1.contains("could not all be counted"),
             "{chosen:?}"
         );
+        // A count that finished in between starts it over.
+        let mut last = BTreeSet::new();
+        let mut slow = [unfinished("slow", Some(10 * MIB))];
+        missed(&mut slow, &mut last);
+        missed(&mut [pod("slow", Some(10 * MIB), MIB)], &mut last);
+        let mut slow = [unfinished("slow", Some(10 * MIB))];
+        assert_eq!(missed(&mut slow, &mut last), [0]);
+        assert!(choose(&slow, u64::MAX, MIB).is_empty());
     }
 
     #[test]

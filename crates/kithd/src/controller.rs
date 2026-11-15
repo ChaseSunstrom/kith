@@ -182,18 +182,46 @@ struct Controller {
     /// `None` for the default (`storage::default_reserve`); 0 for none.
     reserve: Option<u64>,
     /// The count of what pods wrote outside their volumes, on its way, and when it began.
-    count: Option<(Instant, tokio::task::JoinHandle<Counted>)>,
+    count: Option<(Instant, Waiting<Counted>)>,
     /// When the last count ended.
     counted: Option<Instant>,
-    /// The last count found the state disk under its reserve with no pod to replace for it.
+    /// The state disk is under its reserve with no pod to replace for it, and it was said.
     low: bool,
     /// The pods replaced for what they wrote, when, and the removal of what they wrote once no run
     /// from before is left: till it is done they are not counted and none is replaced for the reserve.
-    replacing: BTreeMap<String, (Instant, Option<tokio::task::JoinHandle<()>>)>,
+    replacing: BTreeMap<String, (Instant, Option<Waiting<()>>)>,
+    /// The limited pods whose last count did not finish (`storage::missed`).
+    missed: BTreeSet<String>,
 }
 
 /// What a count found: the state disk's free bytes, its reserve, and each pod counted.
-type Counted = Result<(u64, u64, Vec<storage::Pod>), tokio::task::JoinError>;
+/// Free bytes on the state disk, its reserve, and the pods as counted.
+type Counted = (u64, u64, Vec<storage::Pod>);
+
+/// What a thread of its own is doing, to be had once it is done.
+type Waiting<T> = tokio::sync::oneshot::Receiver<T>;
+
+/// Runs `work` on a thread of its own (a blocking walk of the disk), waking the loop when it is
+/// done; `None` when the system gives no thread, to be tried again the next pass.
+fn off_thread<T: Send + 'static>(
+    name: &str,
+    changed: &std::sync::Arc<tokio::sync::Notify>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<Waiting<T>> {
+    let (done, waiting) = tokio::sync::oneshot::channel();
+    let changed = changed.clone();
+    let run = move || {
+        let _ = done.send(work());
+        changed.notify_one();
+    };
+    match std::thread::Builder::new().name(name.into()).spawn(run) {
+        Ok(_) => Some(waiting),
+        Err(e) => {
+            eprintln!("kithd: no thread for {name}, tried again next pass: {e}");
+            None
+        }
+    }
+}
 
 pub async fn run(
     shared: std::sync::Arc<Shared>,
@@ -263,6 +291,7 @@ pub async fn run(
         counted: None,
         low: false,
         replacing: BTreeMap::new(),
+        missed: BTreeSet::new(),
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -1434,7 +1463,7 @@ impl Controller {
     /// ended, one count at a time and off the async threads; replaces what the last count says
     /// must go (`storage::choose`).
     fn tend_storage(&mut self, shared: &std::sync::Arc<Shared>, state: &Path) {
-        use futures_util::FutureExt;
+        use tokio::sync::oneshot::error::TryRecvError;
         let replicas = state.join(crate::files::REPLICAS);
         // A replaced pod's old runs gone, what they wrote outside the scratch made anew goes.
         let slots = &self.slots;
@@ -1447,27 +1476,42 @@ impl Controller {
             if storage::replacing(&runs, *at) {
                 return true;
             }
-            let removal = removal.get_or_insert_with(|| {
+            if removal.is_none() {
                 let replica = replicas.join(pod);
-                tokio::task::spawn_blocking(move || storage::sweep(&replica))
-            });
-            !removal.is_finished()
+                *removal = off_thread("storage", &shared.changed, move || storage::sweep(&replica));
+            }
+            // (No thread for it: tried again next pass.)
+            removal
+                .as_mut()
+                .is_none_or(|removal| removal.try_recv() == Err(TryRecvError::Empty))
         });
-        if self.count.as_ref().is_some_and(|(_, job)| job.is_finished())
-            && let Some((began, job)) = self.count.take()
-        {
+        let done = match self.count.as_mut().map(|(_, job)| job.try_recv()) {
+            None | Some(Err(TryRecvError::Empty)) => None,
+            Some(counted) => self.count.take().map(|(began, _)| (began, counted.ok())),
+        };
+        if let Some((began, counted)) = done {
             self.counted = Some(Instant::now());
-            if let Some(Ok(Ok((free, reserve, pods)))) = job.now_or_never() {
+            if let Some((free, reserve, mut pods)) = counted {
+                for i in storage::missed(&mut pods, &mut self.missed) {
+                    eprintln!(
+                        "kithd: {}: its files outside its volumes could not all be counted in {} s or {} directories deep: replaced if the next count cannot either",
+                        pods[i].id,
+                        storage::SPELL.as_secs(),
+                        storage::DEEP
+                    );
+                }
                 // While what a replaced pod wrote is not gone yet, none is replaced for the reserve.
-                let reserve = if self.replacing.is_empty() { reserve } else { 0 };
-                let chosen = storage::choose(&pods, free, reserve);
-                let low = free < reserve && chosen.is_empty();
-                if low && !self.low {
+                let waiting = !self.replacing.is_empty();
+                let chosen = storage::choose(&pods, free, if waiting { 0 } else { reserve });
+                // Said once for each spell the disk is under its reserve.
+                if free >= reserve {
+                    self.low = false;
+                } else if chosen.is_empty() && !waiting && !self.low {
                     eprintln!(
                         "kithd: the state disk has {free} bytes free, under its reserve of {reserve}, and no pod wrote enough outside its volumes to free it"
                     );
+                    self.low = true;
                 }
-                self.low = low;
                 for (i, why) in chosen {
                     self.replace(&pods[i].id, began, &why, state);
                 }
@@ -1509,6 +1553,7 @@ impl Controller {
                     limit,
                     bytes: 0,
                     finished: true,
+                    again: false,
                 };
                 (pod, roots, cgroups)
             })
@@ -1517,9 +1562,8 @@ impl Controller {
             return;
         }
         let began = Instant::now();
-        let changed = shared.changed.clone();
         let state = state.to_path_buf();
-        let job = tokio::task::spawn_blocking(move || {
+        let job = off_thread("storage", &shared.changed, move || {
             let pods: Vec<storage::Pod> = pods
                 .into_iter()
                 .map(|(mut pod, roots, cgroups)| {
@@ -1529,9 +1573,14 @@ impl Controller {
                     let stop = pod.limit.unwrap_or(u64::MAX);
                     (pod.bytes, pod.finished) = storage::count(&roots, stop, until);
                     if pod.finished && pod.bytes <= stop {
-                        let pids: Vec<u32> = cgroups.iter().flat_map(|cgroup| storage::pids(cgroup)).collect();
+                        let mut pids = Vec::new();
+                        for cgroup in &cgroups {
+                            let (more, all) = storage::pids(cgroup, until);
+                            pids.extend(more);
+                            pod.finished &= all;
+                        }
                         let (held, finished) = storage::unlinked(&pids, &roots, until);
-                        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), finished);
+                        (pod.bytes, pod.finished) = (pod.bytes.saturating_add(held), pod.finished && finished);
                     }
                     pod
                 })
@@ -1541,13 +1590,8 @@ impl Controller {
             let free = disk.map_or(free, |d| d.blocks_available() * d.fragment_size());
             (free, reserve, pods)
         });
-        // Done, it wakes the loop to act on it.
-        let job = tokio::spawn(async move {
-            let counted = job.await;
-            changed.notify_one();
-            counted
-        });
-        self.count = Some((began, job));
+        // Done, it wakes the loop to act on it; no thread for it, the next pass tries again.
+        self.count = job.map(|job| (began, job));
     }
 
     /// Kills every running unit of the pod `pod`, saying `why`, and sets its disk scratch aside,
