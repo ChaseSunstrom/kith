@@ -924,6 +924,11 @@ spec! {
         /// scheduler counts against the Device's `vram` label. Nothing enforces it (see the README).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub share: Option<DeviceShare>,
+        /// With an exclusive claim: the workload (`Workload/NAME` or `Job/NAME`, of this claim's
+        /// namespace) that takes the Device ahead of the others who want it, from whoever holds
+        /// it. `kith switch` sets it to hand a GPU over. A shared or client claim has no holder.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub holder: Option<String>,
     }
 
     pub enum Access { Exclusive, Shared, Client }
@@ -2095,6 +2100,19 @@ impl Spec for DeviceClaimSpec {
         )?;
         if self.access == Some(Access::Client) && self.seat.is_none() {
             return Err("spec.access: client is of a seat: name one with `seat`".into());
+        }
+        if let Some(holder) = &self.holder {
+            if matches!(self.access, Some(Access::Shared | Access::Client)) {
+                return Err("spec.holder: a holder is of an exclusive claim: leave `access` unsaid".into());
+            }
+            let named = holder.split_once('/').is_some_and(|(kind, name)| {
+                matches!(kind, "Workload" | "Job") && !name.is_empty() && !name.contains('/')
+            });
+            if !named {
+                return Err(format!(
+                    "spec.holder: {holder} is not a workload of this namespace: say `Workload/NAME` or `Job/NAME`"
+                ));
+            }
         }
         if let Some(share) = &self.share {
             if self.access != Some(Access::Shared) {

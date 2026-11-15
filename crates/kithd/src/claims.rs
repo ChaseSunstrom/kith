@@ -53,7 +53,17 @@ fn list(names: &BTreeSet<&str>) -> String {
 struct Known {
     shared: bool,
     share: Option<u64>,
+    /// The key of the workload it names as holder (of its own namespace), if it names one.
+    holder: Option<String>,
     found: Result<Held, String>,
+}
+
+/// The key of the workload a claim's `holder` names: `Workload/NAME` of the claim's namespace
+/// is `Workload/{namespace}/NAME`.
+fn holder_key(claim: &str, holder: &str) -> Option<String> {
+    let namespace = claim.split('/').nth(1)?;
+    let (kind, name) = holder.split_once('/')?;
+    Some(format!("{kind}/{namespace}/{name}"))
 }
 
 /// The vram a `Device` counts its shares against: its `vram` label in bytes. None when it has no
@@ -139,8 +149,9 @@ fn claimants(store: &Store) -> Vec<(String, String, Vec<String>)> {
 ///
 /// A claim is `Exclusive` unless it says `Shared`: one workload holds a Device at a time, whichever
 /// claim it comes through. The holder is the workload the claim's status already names, then the
-/// first by key; a workload holds all its claims or none, so two that want each other's never
-/// wait for ever.
+/// first by key; but a workload that a claim names as `holder` goes before them all, so it takes
+/// the claim from whoever holds it. A workload holds all its claims or none, so two that want each
+/// other's never wait for ever.
 pub fn resolve(store: &Store) -> Claims {
     let known: BTreeMap<String, Known> = store
         .list(Some("DeviceClaim"))
@@ -152,11 +163,32 @@ pub fn resolve(store: &Store) -> Claims {
                 .ok()
                 .filter(|_| shared)
                 .and_then(|spec| spec.share.as_ref()?.vram.bytes());
+            let key = claim.key();
+            let holder = spec
+                .as_ref()
+                .ok()
+                .filter(|spec| !matches!(spec.access, Some(Access::Shared | Access::Client)))
+                .and_then(|spec| holder_key(&key, spec.holder.as_deref()?));
             let found = spec
                 .map_err(|e| e.to_string())
                 .and_then(|spec| resolve_one(store, &spec));
-            (claim.key(), Known { shared, share, found })
+            (
+                key,
+                Known {
+                    shared,
+                    share,
+                    holder,
+                    found,
+                },
+            )
         })
+        .collect();
+    // The workloads named as holder by a claim that resolves: they go before the others who want
+    // the claim, so one that is named takes it from whoever holds it now.
+    let switched: BTreeSet<String> = known
+        .values()
+        .filter(|known| known.found.is_ok())
+        .filter_map(|known| known.holder.clone())
         .collect();
     // Who each claim's status says holds it, and the share it was admitted with: a holder keeps its
     // share while it asks for no more than that, even where the Device has less vram than it asks
@@ -183,7 +215,12 @@ pub fn resolve(store: &Store) -> Claims {
         names.iter().filter_map(of).any(is)
     };
     wanting.sort_by_key(|(key, namespace, names)| {
-        (!recorded.contains(key.as_str()), client(namespace, names), key.clone())
+        (
+            !switched.contains(key),
+            !recorded.contains(key.as_str()),
+            client(namespace, names),
+            key.clone(),
+        )
     });
     // The seats that are held, and the namespaces of who holds each: its sessions'.
     let mut sessions: BTreeSet<(String, String)> = BTreeSet::new();
@@ -202,8 +239,9 @@ pub fn resolve(store: &Store) -> Claims {
             let mut seat: Option<(String, bool)> = None;
             for name in &names {
                 let claim = format!("DeviceClaim/{namespace}/{name}");
-                let Known { shared, share, found } =
-                    known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
+                let Known {
+                    shared, share, found, ..
+                } = known.get(&claim).ok_or(format!("there is no DeviceClaim {name}"))?;
                 let held = found.as_ref().map_err(|why| format!("DeviceClaim {name}: {why}"))?;
                 if let Some(other) = node.filter(|other| *other != held.node) {
                     return Err(format!(
@@ -1066,6 +1104,81 @@ spec: { node: a, devices: [a-gpu-card0, a-display-card0-hdmi-a-1] }
                 .unwrap_err()
                 .to_string();
             assert!(refused.contains(names), "{spec}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_claim_holder_takes_it_from_the_recorded_holder_and_gives_it_back() {
+        let source = [
+            claim("gpu", "{ device: a-gpu-card0 }"),
+            workload("one", "[gpu]"),
+            workload("two", "[gpu]"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        assert!(settle(&mut store).owners["Workload/default/one"].is_ok());
+        // Named as holder, each takes the claim from the other, which waits and says so.
+        for (holder, other) in [("two", "one"), ("one", "two")] {
+            let mut named = store.get("DeviceClaim/default/gpu").unwrap().clone();
+            named.metadata.revision = None;
+            named.spec["holder"] = format!("Workload/{holder}").into();
+            store.apply(named).unwrap();
+            let claims = settle(&mut store);
+            assert!(claims.owners[&format!("Workload/default/{holder}")].is_ok());
+            assert_eq!(
+                claims.owners[&format!("Workload/default/{other}")],
+                Err(format!(
+                    "waiting for DeviceClaim gpu, held by Workload/default/{holder}"
+                ))
+            );
+            let status = store.get("DeviceClaim/default/gpu").unwrap().status.clone().unwrap();
+            assert_eq!(status["holders"], json!([format!("Workload/default/{holder}")]));
+        }
+    }
+
+    /// What a node runs is what `granted` gives: the holder gets the device, and the workload it
+    /// takes the claim from gets nothing, so the controller stops that one and starts the other.
+    #[test]
+    fn a_switched_claim_is_granted_to_its_holder_and_not_to_the_one_it_takes_it_from() {
+        let source = [
+            claim("gpu", "{ device: a-gpu-card0, holder: Workload/two }"),
+            workload("one", "[gpu]"),
+            workload("two", "[gpu]"),
+        ]
+        .concat();
+        let store = store(&source);
+        let root = sys("switch");
+        let on_a = granted(&store, "a", &root);
+        assert!(on_a.contains_key("Workload/default/two"));
+        assert!(!on_a.contains_key("Workload/default/one"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_holder_is_a_workload_or_job_of_the_claims_own_namespace_on_an_exclusive_claim() {
+        for spec in [
+            "{ device: a-gpu-card0, holder: Workload/one }",
+            "{ device: a-gpu-card0, holder: Job/one }",
+        ] {
+            assert!(
+                Resource::from_source(&claim("ok", spec)).unwrap().remove(0).is_ok(),
+                "{spec}"
+            );
+        }
+        for spec in [
+            "{ device: a-gpu-card0, holder: Workload/other/one }",
+            "{ device: a-gpu-card0, holder: one }",
+            "{ device: a-gpu-card0, holder: Seat/one }",
+            "{ device: a-gpu-card0, holder: Workload/ }",
+            "{ device: a-gpu-card0, access: shared, holder: Workload/one }",
+            "{ seat: a-seat0, access: client, holder: Workload/one }",
+        ] {
+            let refused = Resource::from_source(&claim("x", spec))
+                .unwrap()
+                .remove(0)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("holder"), "{spec}: {refused}");
         }
     }
 }
