@@ -22,6 +22,7 @@ since is not in the file, and lands wherever the compiler put it (a function kit
 start that is left there keeps the 64 kB around it in memory). A pattern that names nothing
 any more orders nothing, so an old file is never wrong, only less use.
 """
+import argparse
 import ctypes
 import glob
 import os
@@ -186,11 +187,15 @@ def self_test():
 
 
 def main():
-    if "--self-test" in sys.argv:
+    parser = argparse.ArgumentParser(description="Trace kithd at start and idle and write kithd.order, the order the linker lays its code out in.")
+    parser.add_argument("--self-test", action="store_true", help="run the name-pattern assertions and nothing else")
+    parser.add_argument("--check", action="store_true", help="write nothing: fail if kithd.order is not in effect in the built kithd")
+    args = parser.parse_args()
+    if args.self_test:
         return self_test()
     kithd, map_file = built()
     known = functions(map_file)
-    if "--check" in sys.argv:
+    if args.check:
         with open(ORDER) as file:
             names = file.read().split()
         # (The lowest address a pattern names: the first of them is where the linker starts.)

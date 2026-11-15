@@ -17,6 +17,7 @@ What cannot be measured now (no image built, no comparison run) keeps the value 
 In the page, `<b data-n="KEY">` is given the number as its text, and the block
 `<script id="measured">` the whole file, which the charts are drawn from.
 """
+import argparse
 import datetime
 import json
 import pathlib
@@ -151,7 +152,9 @@ def filled(page, n):
 
 
 def main():
-    check = sys.argv[1:] == ["--check"]
+    parser = argparse.ArgumentParser(description="Measure the numbers the site shows and write docs/numbers.json, the page and the charts.")
+    parser.add_argument("--check", action="store_true", help="measure nothing: fail if the page or charts differ from docs/numbers.json")
+    check = parser.parse_args().check
     old = json.loads(FILE.read_text()) if FILE.exists() else {}
     n = old if check else measured(old)
     page, missing = filled(PAGE.read_text(), n)
