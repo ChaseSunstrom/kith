@@ -564,18 +564,21 @@ json.dump([
             sleep 2
             https=1
             node 2 --ingress
-            # It answers the host over TLS with that certificate, and no other host.
+            # It answers the host over TLS with that certificate, and no other host. (s_client
+            # says "Verify return code: 0 (ok)" after a handshake that failed too: a certificate
+            # sent, and one that verified, is what says it answered.)
             handshake() { # HOST
                 openssl s_client -connect "127.0.0.1:$((port + 12))" -servername "$1" -CAfile "$work/shop.crt" \
-                    -verify_hostname "$1" </dev/null 2>/dev/null
+                    -verify_hostname "$1" -verify_return_error </dev/null 2>/dev/null
             }
+            answers() { handshake "$1" | grep -q 'BEGIN CERTIFICATE' && handshake "$1" | grep -q 'Verify return code: 0 (ok)'; } # HOST
             waited=0
-            until handshake shop.example.test | grep -q 'Verify return code: 0 (ok)'; do
+            until answers shop.example.test; do
                 waited=$((waited + 1))
                 [ "$waited" -lt 300 ] || fail "the ingress worker did not answer shop.example.test over TLS: $(handshake shop.example.test | tail -n 5)"
                 sleep 1
             done
-            ! handshake other.example.test | grep -q 'Verify return code: 0 (ok)' || fail "the ingress worker answered a host nothing exposes"
+            ! answers other.example.test || fail "the ingress worker answered a host nothing exposes"
             echo "vm.sh: the ingress worker answers its host over TLS with the certificate it was sent" >&2
             # Its disk has no Secret that is neither a tls- one nor placed on it.
             ! grep -aqF "$unplaced" "$work/n2.raw" || fail "a Secret nothing places is on the ingress worker's disk"
