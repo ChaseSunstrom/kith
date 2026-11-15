@@ -583,7 +583,7 @@ pub async fn token(
     axum::Extension(caller): axum::Extension<crate::access::Caller>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if matches!(caller, crate::access::Caller::Node(_)) {
+    if caller.node().is_some() {
         return refuse(StatusCode::FORBIDDEN, "a node may not make join tokens").into_response();
     }
     let node = |_: &_| {
@@ -612,7 +612,7 @@ pub async fn netboot(
     image: axum::body::Body,
 ) -> Response {
     use crate::netboot;
-    if matches!(caller, crate::access::Caller::Node(_)) {
+    if caller.node().is_some() {
         return refuse(StatusCode::FORBIDDEN, "a node may not turn netboot on or off").into_response();
     }
     let node = |_: &_| {

@@ -627,7 +627,11 @@ pub async fn restore(
         "{key} at {} into Volume/{namespace}/{}",
         entry["at"], spec.volume
     )];
-    // The volume is another node's: it is asked, as this node (which has just checked the caller).
+    // (Asked by a node, it was sent here as the node that has the volume: never sent on again.)
+    if caller.node().is_some() && dir.node != me {
+        return Err(invalid(format!("node {} has that volume, not this node", dir.node)));
+    }
+    // The volume is another node's: it is asked, for the caller (whom it checks as this node did).
     if dir.node != me {
         let (Some(cluster), Some(address)) = (&shared.cluster, address) else {
             return Err(io(format!("node {} that has the volume has no address yet", dir.node)));
@@ -637,7 +641,8 @@ pub async fn restore(
             entry["at"]
         );
         // (As long as a volume takes to unpack, and no longer than an hour.)
-        let asked = cluster.client.post(url).timeout(Duration::from_secs(3600)).send().await;
+        let asked = cluster.client.post(url).timeout(Duration::from_secs(3600));
+        let asked = asked.header(crate::access::FOR, caller.to_string()).send().await;
         let failed = |e: reqwest::Error| io(format!("asking node {} to restore: {e}", dir.node));
         let answer = asked.map_err(failed)?;
         let (fine, status) = (answer.status().is_success(), answer.status());

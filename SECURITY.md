@@ -37,6 +37,17 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **The API** is behind a layer that works out who calls (the socket, a node, an
   Identity) and refuses what their Roles do not allow. A token is shown once, kept only
   as a hash, good for an hour, and spent by its first use.
+- **A node's certificate has no right of its own on the API**: it reads nothing and
+  writes nothing there. What a node does there is pass on what someone asked it, to the
+  node that has the thing: a unit's output, a Volume's files, a node's passphrase, a
+  backup's restore. It names who asked (a header, `x-kith-for`), and the node that gets
+  the request asks its own store what that caller may do, and writes both in its audit
+  log (`alice via node a`). The header is read on those four requests and from a node
+  only: sent by an Identity, or anywhere else, it changes nothing. `kith run` is passed
+  to the node the app is for on the node-to-node routes, with who asked in the request,
+  and checked the same way there.
+  **The node's word for who asked is taken**: a node that is taken can name the local
+  socket, so this narrows nothing for it yet (see "A node that is taken").
 - **Node-to-node routes** (Raft, copies of blobs and volumes, a volume's key, running a
   command on another node) take a node's certificate only, and, like the API, only
   while that node's Node is in the store: each request is asked again.
@@ -218,6 +229,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one whose Node is gone, was only made by hand (it never joined), or names another
   key (the name joined again); the mesh drops its key in the same moment. What that
   does not undo:
+  - Until its Node is deleted it can do everything: it can name the local socket as the
+    one who asked on what nodes pass on to each other, and the node that leads writes to
+    the store whatever a node of the cluster sends it to write, unasked. (Nodes with
+    less trust than that, whose word is not taken, are not built yet.)
   - What the node copied, it has: every Secret that was in the store, the keys of
     encrypted volumes it was handed, the CA key if it was the node the cluster started
     on (then make a new cluster). Change the Secrets.

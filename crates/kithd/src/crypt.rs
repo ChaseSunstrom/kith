@@ -824,12 +824,14 @@ pub async fn pass(
             // (Asked by a node, this is the node it meant, or nobody is.)
             let address = {
                 let state = shared.store.lock().expect("a handler panicked holding the store");
-                let there = state.store.get(&format!("Node/{name}")).filter(|_| !matches!(caller, Caller::Node(_)));
+                let there = state.store.get(&format!("Node/{name}")).filter(|_| caller.node().is_none());
                 there.and_then(|node| Some(node.status.as_ref()?["address"].as_str()?.to_string()))
             };
             let address = address.ok_or(format!("{name} is not a node known here with an address"))?;
             let ask = cluster.client.post(format!("https://{address}/v1/lock/{name}/passphrase"));
             let ask = ask.timeout(Duration::from_secs(60)).json(&json!({ "passphrase": passphrase }));
+            // (For whoever asked this node: the node the passphrase is of asks what they may.)
+            let ask = ask.header(crate::access::FOR, caller.to_string());
             let unreached = |e: reqwest::Error| format!("{name} cannot be reached, and a passphrase is its own to keep ({e})");
             let answer = ask.send().await.map_err(unreached)?;
             let fine = answer.status().is_success();

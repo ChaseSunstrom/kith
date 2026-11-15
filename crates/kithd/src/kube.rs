@@ -1992,7 +1992,9 @@ impl Watch {
             (Caller::Identity(name), Some(Certificate(der))) => access::stands(&self.call.shared, name, der),
             (Caller::Identity(_), None) => false,
             (Caller::Node(name), Some(Certificate(der))) => crate::cluster::admitted(&self.call.shared, name, der),
-            _ => true,
+            (Caller::Admin, _) => true,
+            // (A node shows its certificate, and nothing is passed on to a watch.)
+            (Caller::Node(_), None) | (Caller::Via(..), _) => false,
         }
     }
 }
@@ -2056,6 +2058,7 @@ fn watch(call: Call, kind: &'static Kind, namespace: Option<String>) -> Result<R
 /// A reading of what a pod's units wrote, and where in each file it has come to.
 struct Reading {
     shared: Arc<Shared>,
+    caller: Caller,
     /// The resource that runs the pod, and which replica of it the pod is.
     key: String,
     replica: u32,
@@ -2077,7 +2080,7 @@ impl Reading {
                 tail: self.tail.filter(|_| self.at[stream].is_none()),
                 ..LogOptions::default()
             };
-            let Json(read) = api::output(&self.shared, &self.key, &options).await?;
+            let Json(read) = api::output(&self.shared, &self.caller, &self.key, &options).await?;
             text.push_str(read["data"].as_str().unwrap_or_default());
             self.at[stream] = read["next"].as_u64();
             more |= read["more"] == true;
@@ -2113,6 +2116,7 @@ async fn log(call: &Call, namespace: &str, pod: &str) -> Result<Response, No> {
     let follow = call.asked.get("follow").is_some_and(|follow| follow == "true");
     let mut reading = Reading {
         shared: call.shared.clone(),
+        caller: call.caller.clone(),
         key,
         replica,
         unit: call.asked.get("container").cloned(),

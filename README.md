@@ -2212,8 +2212,10 @@ by name, that has them. `--via` names the program that carries the window (defau
   `kinds: [Node]` and no `namespaces` (`admin` has it). The app runs as kithd's user on
   the node, outside any container, so a right in one namespace is never enough. It is
   checked on the node you ask, before anything starts or is forwarded. The other node
-  accepts the hop only from a cluster node, never from a client token, and writes its own
-  audit entry (`GET /v1/audit`) with the name of the caller who asked.
+  accepts the hop only from a cluster node, never from a client token, asks its own
+  store whether the caller that node names may, and writes its own audit entry
+  (`GET /v1/audit`) with both names (`alice via node a`). It takes the first node's word
+  for who asked (see SECURITY.md).
 - **How:** the `kith` command asks its kithd for a tunnel (`POST /v1/run`); kithd runs the app
   there with `waypipe --socket S server -- APP…`, S in a private (0700) directory with a name
   nobody can guess, and joins it to the tunnel; `kith` runs `waypipe --socket L client` and
@@ -2423,6 +2425,14 @@ A node's copy of the cluster's resources is two files in its state,
 Not numbered yet: what nodes say to each other (a snapshot one node sends
 another is written down by the node that takes it, in its own format), and
 the other files in a node's state (its keys, blobs and volumes).
+
+One thing nodes say to each other changed after 1.0: a node that passes a request on to
+the node that has the thing (`kith logs` of a replica elsewhere, `kith volume put` and
+`get`, `kith node passphrase`, a backup's restore) now says who asked, and a node that
+is told nothing refuses with `node NAME passed this on without saying who asked: its
+kithd is older than this node's`. So while a cluster is half way through such an
+update, ask the node that has the thing, or wait until both run the new kithd. Nothing
+else between nodes is affected: the store, the mesh, Services and `kith run` go on.
 
 ### Rolling a release through the cluster
 

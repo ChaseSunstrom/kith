@@ -520,12 +520,17 @@ async fn logs(
 ) -> Reply<serde_json::Value> {
     // What a unit wrote is read by who may read the resource that runs it.
     permit(&shared, &caller, Verb::Get, |_| vec![place_of(&key)])?;
-    output(&shared, &key, &options).await
+    output(&shared, &caller, &key, &options).await
 }
 
 /// A chunk of what a unit of the resource at `key` wrote, from whichever node it runs on.
-/// (Whether the caller may read it is asked before.)
-pub(crate) async fn output(shared: &Arc<Shared>, key: &str, options: &LogOptions) -> Reply<serde_json::Value> {
+/// (Whether `caller` may read it is asked before, and by the other node of the one it is passed to.)
+pub(crate) async fn output(
+    shared: &Arc<Shared>,
+    caller: &Caller,
+    key: &str,
+    options: &LogOptions,
+) -> Reply<serde_json::Value> {
     // A replica that runs on another node: its output is there.
     let elsewhere = shared.cluster.as_ref().filter(|_| !options.here).and_then(|cluster| {
         let state = shared.store.lock().expect("a handler panicked holding the store");
@@ -554,6 +559,7 @@ pub(crate) async fn output(shared: &Arc<Shared>, key: &str, options: &LogOptions
         let asked = cluster
             .client
             .get(url)
+            .header(crate::access::FOR, caller.to_string())
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await;
@@ -919,7 +925,7 @@ async fn push(
     };
     let what = vec![format!("{name}:{version} to {}", asked.to)];
     // (As a pull: an Identity names only registries outside this node and its networks.)
-    let outward = matches!(caller, Caller::Identity(_));
+    let outward = !matches!(caller, Caller::Admin);
     let pushed = crate::registry::push(&asked.to, &name, &version, blob, asked.signature, outward).await;
     shared
         .audit
@@ -945,7 +951,7 @@ async fn pull(
 ) -> Reply<std::collections::BTreeMap<String, String>> {
     permit(&shared, &caller, Verb::Apply, |_| vec![("Package".into(), None)])?;
     // (An Identity names any registry it likes: only outside ones, as a namespace's Source.)
-    let outward = matches!(caller, Caller::Identity(_));
+    let outward = !matches!(caller, Caller::Admin);
     let fetched = crate::registry::pull(&asked.from, &asked.name, &asked.version, outward).await;
     let (blob, signature) = fetched.map_err(|e| ApiError::Store(Error::Io(e)))?;
     let package = crate::registry::checked(

@@ -274,7 +274,8 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     let api = || status_as_node(&address, &taken, "GET", "/v1/resources");
     // (A node route: what is posted is not a write, and a member is told so.)
     let route = || status_as_node(&address, &taken, "POST", "/v1/raft/write");
-    assert_eq!(api(), "200");
+    // (403, not 401: it is taken for the node it is, and a node has no right of its own on the API.)
+    assert_eq!(api(), "403");
     assert!(!["401", "403"].contains(&route().as_str()), "{}", route());
 
     // Deleted: refused by the next request, with alpha never restarted.
@@ -294,7 +295,7 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     wait_for("the new beta to have the store", || beta.nodes().len() == 2);
     assert_eq!(
         status_as_node(&address, &beta.dir.join("state/pki"), "GET", "/v1/resources"),
-        "200"
+        "403"
     );
     assert_eq!((api(), route()), ("401".to_string(), "401".to_string()));
     assert!(beta.ok(&["get", "ConfigMap/shared"]).contains("shared"));
@@ -306,7 +307,7 @@ fn an_evicted_nodes_certificate_is_refused_at_once_and_stays_refused() {
     alpha.stop();
     alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &["--admit-deleted-nodes"]);
     wait_for("alpha to answer again", || alpha.kith(&["get", "node"]).0 == 0);
-    wait_for("the old certificate to be taken", || api() == "200");
+    wait_for("the old certificate to be taken", || api() == "403");
 }
 
 #[test]
