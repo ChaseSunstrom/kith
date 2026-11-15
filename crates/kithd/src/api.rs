@@ -220,7 +220,8 @@ async fn change(
 ) -> Result<Done, ApiError> {
     let (shared, caller) = (shared.clone(), caller.clone());
     let done = tokio::spawn(async move {
-        let done = shared.submit(command).await;
+        // Who asked goes with the write: an Identity's is decided again where it is put in the log.
+        let done = shared.submit_as(command, Some(&caller)).await;
         let said = done.as_ref().map(drop).map_err(Error::to_string);
         shared.audit.record(&caller, verb, what, said);
         done
@@ -259,22 +260,79 @@ fn reach(shared: &Shared, caller: &Caller, resources: &[Resource]) -> Result<(),
 
 /// [`reach`], of resources known by kind and namespace alone (a revision gone back to).
 fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
-    let of = |kind: &str, into: &[&str]| -> Vec<(String, Option<String>)> {
-        let of = written.iter().filter(|(written, _)| written == kind);
-        of.flat_map(|(_, place)| into.iter().map(|kind| (kind.to_string(), place.clone())))
-            .collect()
+    for (verb, kind, place) in reached(written) {
+        permit(shared, caller, verb, |_| vec![(kind, place)])?;
+    }
+    Ok(())
+}
+
+/// What writing resources of these kinds and places asks besides: a verb on a kind, there.
+fn reached(written: &[(String, Option<String>)]) -> Vec<(Verb, String, Option<String>)> {
+    let into = |kind: &str| -> &[(Verb, &str)] {
+        match kind {
+            // A Backup sends a Volume's files where it says, signed with a Secret's keys:
+            // whoever writes one must be allowed to read both.
+            "Backup" => &[(Verb::Get, "Volume"), (Verb::Get, "Secret")],
+            // A CronJob's Jobs are made for it by the cluster, as it says them: whoever
+            // writes one must be allowed to write a Job.
+            "CronJob" => &[(Verb::Apply, "Job")],
+            // An Image is a Volume's files, for every process of every node to read.
+            "Image" => &[(Verb::Get, "Volume")],
+            // A Share gives a Volume's files, to read and to write, to whom it names:
+            // whoever writes one must be allowed to write the Volume.
+            "Share" => &[(Verb::Apply, "Volume")],
+            _ => &[],
+        }
     };
-    // A Backup sends a Volume's files where it says, signed with a Secret's keys: whoever
-    // writes one must be allowed to read both.
-    permit(shared, caller, Verb::Get, |_| of("Backup", &["Volume", "Secret"]))?;
-    // A CronJob's Jobs are made for it by the cluster, as it says them: whoever writes
-    // one must be allowed to write a Job.
-    permit(shared, caller, Verb::Apply, |_| of("CronJob", &["Job"]))?;
-    // An Image is a Volume's files, for every process of every node to read.
-    permit(shared, caller, Verb::Get, |_| of("Image", &["Volume"]))?;
-    // A Share gives a Volume's files, to read and to write, to whom it names: whoever
-    // writes one must be allowed to write the Volume.
-    permit(shared, caller, Verb::Apply, |_| of("Share", &["Volume"]))
+    let reached = |(kind, place): &(String, Option<String>)| {
+        let to = |(verb, kind): &(Verb, &str)| (verb.clone(), kind.to_string(), place.clone());
+        into(kind).iter().map(to).collect::<Vec<_>>()
+    };
+    written.iter().flat_map(reached).collect()
+}
+
+/// Why `caller` may not write `command`, as the store now stands: the asking of [`applied`],
+/// [`deleted`] and `rollback` made again where the write is put in the log (`raft.rs`), so
+/// that a Role taken away while the write was on its way still stops it. A command none of
+/// those writes is refused: an Identity writes nothing else through the log's door it guards.
+pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Option<String> {
+    let mut asks = vec![];
+    let written = match command {
+        Command::Apply { resources, .. } => {
+            let provisioned =
+                |resource: &&Resource| resource.kind == "VolumeClaim" && resource.spec["provision"] == true;
+            let made = resources.iter().filter(provisioned);
+            asks.extend(made.map(|resource| (Verb::Apply, "Volume".to_string(), place(store, resource))));
+            let placed = |resource: &Resource| (resource.kind.clone(), place(store, resource));
+            resources.iter().map(placed).collect()
+        }
+        Command::Rollback { key, .. } => vec![place_of(key)],
+        Command::Delete { key } => {
+            let (kind, namespace) = place_of(key);
+            asks.push((Verb::Delete, kind, namespace));
+            vec![]
+        }
+        _ => {
+            return Some(format!(
+                "{caller} may not write this to the store: it is not an apply, a delete or a rollback"
+            ));
+        }
+    };
+    asks.extend(
+        written
+            .iter()
+            .map(|(kind, place)| (Verb::Apply, kind.clone(), place.clone())),
+    );
+    asks.extend(reached(&written));
+    let grants = Grants::of(caller, store);
+    let (verb, kind, namespace) = asks
+        .into_iter()
+        .find(|(verb, kind, namespace)| !grants.may(verb, kind, namespace.as_deref()))?;
+    let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
+    let verb = word(&verb);
+    Some(format!(
+        "{caller} may not {verb} {kind}{place} (decided again as the write was put in the log): no Role bound to it allows that now"
+    ))
 }
 
 /// What applying `resources` would do, if `caller` may: a dry run.
