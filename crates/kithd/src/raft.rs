@@ -220,20 +220,24 @@ async fn snapshot(
 /// The empty writes (the controller's barrier before it starts a unit) each worker last sent.
 static BARRIERS: Mutex<BTreeMap<String, Instant>> = Mutex::new(BTreeMap::new());
 
+/// Whether worker `name` may send a barrier at `now`: one a second, `last` being when each last did.
+fn barrier_due(last: &mut BTreeMap<String, Instant>, name: &str, now: Instant) -> bool {
+    let soon = |at: &Instant| now.duration_since(*at) < Duration::from_secs(1);
+    if last.get(name).is_some_and(soon) {
+        return false;
+    }
+    // (What is older holds nobody back: the map is as long as the workers of the last second.)
+    last.retain(|_, at| soon(at));
+    last.insert(name.to_string(), now);
+    true
+}
+
 /// What a worker's write becomes, held to what a worker may write (`crate::worker`):
 /// `Ok(None)` for a barrier that comes too soon after its last (asked again in a moment).
 fn from_worker(shared: &Shared, name: &str, command: Command) -> Result<Option<Command>, String> {
     if matches!(&command, Command::Patch { statuses } if statuses.is_empty()) {
         let mut last = BARRIERS.lock().expect("nothing panics holding the barriers");
-        let now = Instant::now();
-        if last
-            .get(name)
-            .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(1))
-        {
-            return Ok(None);
-        }
-        last.insert(name.to_string(), now);
-        return Ok(Some(command));
+        return Ok(barrier_due(&mut last, name, Instant::now()).then_some(command));
     }
     let blobs = crate::blobs::dir(shared);
     let held = |blob: &str| blobs.join(blob).exists();
@@ -665,6 +669,22 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker is held to one barrier a second, and the map keeps no name whose second is over
+    /// (a deleted worker's, or one of many names that came and went).
+    #[test]
+    fn barrier_map_is_bounded() {
+        let (mut last, begun) = (BTreeMap::new(), Instant::now());
+        for worker in 0..100 {
+            assert!(barrier_due(&mut last, &format!("w{worker}"), begun));
+        }
+        assert!(
+            !barrier_due(&mut last, "w0", begun + Duration::from_millis(999)),
+            "one a second"
+        );
+        assert!(barrier_due(&mut last, "w0", begun + Duration::from_secs(1)));
+        assert_eq!(last.len(), 1, "the others' second is over");
+    }
 
     /// [`super::next_change`] of a cluster with no worker.
     fn next_change(
