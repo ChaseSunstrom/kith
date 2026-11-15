@@ -704,7 +704,8 @@ kith node status                                   # who leads the store, who vo
   own (one for each core, started with the first Service) and DNS answers on
   one more, so a busy Service holds up neither the API nor a lookup. A node
   over its limit for relaying says no to the others' asks, which try their
-  next replica. Only TCP; a `targetPort` by name is a container port of that name.
+  next replica (past 64 such connections from one node it hangs up instead,
+  and a client that had already spoken is then closed). Only TCP; a `targetPort` by name is a container port of that name.
 - A `NetworkPolicy` says who may connect to the Workloads it selects through
   a Service: the first ingress rule that fits decides, and when a policy
   selects a Workload and no rule fits, the connection is refused. A peer is

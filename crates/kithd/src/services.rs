@@ -1723,6 +1723,7 @@ spec:
         let full = Limits::new(1, 1);
         let held = full.take(local).unwrap();
         let spares = Limits::new(2, 2);
+        let spare = spares.clone();
         let finds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = finds.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1743,6 +1744,9 @@ spec:
         assert!(!ask(&mut relay, "kept 8080 web 1\n", b"said").await.unwrap());
         drop(held);
         assert!(ask(&mut relay, "kept 8080 web 1\n", b"more").await.unwrap());
+        // (The spare it said no from is given back once it has a place.)
+        let both = (spare.take(local), spare.take(local));
+        assert!(both.0.is_some() && both.1.is_some(), "the spare was kept");
         assert_eq!(finds.load(Ordering::Relaxed), 1);
         assert_eq!(replicas.load(Ordering::Relaxed), 1);
     }

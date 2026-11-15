@@ -477,15 +477,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   out, and the address of a pod that was let go may by then be the next pod's, of any
   namespace, for at most the rest of the round in progress (its probes, 3 seconds
   together, and on the node that leads its status write) and one load of the program.
-- **A node over its limit of relayed Service connections** says no to up to 64 kept
-  connections from one other node (256 in all) and hangs up on the rest at once, reading
-  nothing from them. A kept connection that was said no to looks for a place again at its
-  next asking, and is passed on once one is free.
   A NetworkPolicy does not come into it: a Service a policy names is never the
   kernel's. Units run with `exec` and containers on the node's network share the one
   cgroup the program is on. A kithd that is killed leaves its program where it is
   until kithd starts again, passing to what was there when it stopped; one kithd
   cannot empty is tried again each round and said.
+- **A node over its limit of relayed Service connections** says no to up to 64 kept
+  connections from one other node (256 in all, told apart by their mesh address) and
+  hangs up on the rest at once, reading nothing from them: a client whose first bytes had
+  gone with such an asking is closed, not tried at the next replica. A kept connection
+  that was said no to looks for a place again at its next asking, and is passed on once
+  one is free; while it keeps asking it keeps its place among the 64, so four nodes that
+  keep asking hold all 256.
 - **Backup buckets and S3 endpoints may be on the node's own network** on purpose, and a
   restore, a replica's copy and its sync take no more than the Volume's `size` says
   (above), but a Volume with no `size` is not capped: a bucket someone else writes can
