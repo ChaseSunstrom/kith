@@ -3519,7 +3519,7 @@ enforced.
 | apply to a running container | 74 ms | 74 ms (budget to be set from CI) |
 | a status change reaching a second kithd | 3.6 ms | 3.6 ms (budget to be set from CI) |
 | one DNS answer from kithd | 2.1 ms | 2.1 ms (budget to be set from CI) |
-| boot to ready | not measured here: no VM runs in CI | `python3 ci/budgets.py --boot LOG`, from the serial log of `ci/vm.sh`; not budgeted |
+| boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](ci/compare.txt)) | not budgeted: no VM runs in CI |
 
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
 has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on

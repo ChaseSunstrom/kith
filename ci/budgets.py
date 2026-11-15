@@ -192,9 +192,9 @@ def dns_answer(bins, dir):
                     return b""
 
             wait_until(lambda: reply("warm.home.example") != b"", "kithd to answer")
-            address = socket.inet_aton("192.168.1.20")
+            address = socket.inet_aton("192.0.2.20")
             record = {"apiVersion": "kith.dev/v1", "kind": "DNSRecord", "metadata": {"name": "nas"},
-                      "spec": {"zone": "home", "name": "nas", "type": "A", "values": ["192.168.1.20"]}}
+                      "spec": {"zone": "home", "name": "nas", "type": "A", "values": ["192.0.2.20"]}}
             began = time.monotonic()
             node.apply("record", record)
             wait_until(lambda: address in reply("nas.home.example"), "the answer to carry the record", limit=30)
@@ -280,29 +280,9 @@ def musl_cc(env):
     return {**env, var: wrapper}
 
 
-def boot_to_ready(log):
-    """Seconds from the kernel's start to kithd's "serving" line in a VM's serial log.
-
-    ci/vm.sh keeps the serial console as its log file. Printed, not budgeted: no VM runs
-    in CI. None when no such line has a kernel time in front of it.
-    """
-    with open(log, errors="replace") as lines:
-        for line in lines:
-            if "kithd: serving" in line:
-                stamp = re.search(r"\[\s*(\d+\.\d+)\]", line)
-                return float(stamp.group(1)) if stamp else None
-    return None
-
-
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
-    if "--boot" in sys.argv:
-        seconds = boot_to_ready(sys.argv[sys.argv.index("--boot") + 1])
-        if seconds is None:
-            sys.exit("boot to ready: no kithd 'serving' line with a kernel time in that log")
-        print(f"boot to ready: {seconds:.2f} s (from the VM's log; not budgeted)")
-        return
     self_test = "--self-test" in sys.argv
     bin_dir = os.path.join(os.environ.get("CARGO_TARGET_DIR", "target"), TARGET, "release")
     with tempfile.TemporaryDirectory() as tmp:
