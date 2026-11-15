@@ -504,9 +504,10 @@ fn unpack_to(archive: &Path, to: &Path, mask: u32, cap: u64) -> std::io::Result<
         if entry.unpack_in(to)? && is_dir {
             let mode = entry.header().mode().ok().map(|mode| mode & 0o7777 & !mask);
             if mode.is_some_and(|mode| mode & 0o700 != 0o700) {
-                // (Made a moment ago by the tar crate, through the same path, as a directory.)
+                // (Made a moment ago by the tar crate, as a directory: opened as one, and not
+                // through a link in its place, whatever the crate makes of one there.)
                 let open = std::fs::Permissions::from_mode(mode.unwrap_or(0) | 0o700);
-                std::fs::set_permissions(to.join(&path), open)?;
+                open_dir(&to.join(&path))?.set_permissions(open)?;
             }
             let time = entry.header().mtime().ok();
             // (A time past what the clock holds, which a base-256 header can say, is no time.)
@@ -1657,6 +1658,16 @@ mod tests {
             let _ = unpack(&archive, &into, u64::MAX);
             assert_eq!((mode_and_time(&outside), mode_and_time(&outside.join("d"))), before);
         }
+        // A link first, then a directory entry of its name that is shut to its owner (the
+        // one the unpack opens again): refused, and what the link names keeps its mode.
+        let mut tar = tar::Builder::new(Incoming::new(&blobs).unwrap());
+        link(&mut tar, "d");
+        dir_entry(&mut tar, "d/", 0o500);
+        let archive = blobs.join(tar.into_inner().unwrap().keep(None).unwrap().0);
+        let into = root.join("into-first");
+        std::fs::create_dir_all(&into).unwrap();
+        assert!(unpack(&archive, &into, u64::MAX).is_err());
+        assert_eq!((mode_and_time(&outside), mode_and_time(&outside.join("d"))), before);
         // Where the tar crate's own refusal is not what stops it: a directory the unpack is in,
         // swapped for a link before it is given its mode and time, is left as it is.
         let to = root.join("to");
