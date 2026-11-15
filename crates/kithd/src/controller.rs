@@ -103,6 +103,11 @@ struct Slot {
     after: u32,
     /// Not started yet for that: waiting, with no time to be woken at.
     held: bool,
+    /// Its handle could not be deleted while processes remain: it is still stopping, and its
+    /// id and device nodes are held back from new units until a later pass finds it gone.
+    leaving: bool,
+    /// Its job run was counted as ended (a run stopped by its revision is counted once).
+    accounted: bool,
     /// What its cgroup was last told for its node's seats (memory guaranteed, CPU limit), if
     /// anything; none again each time it starts.
     tuned: Option<(Option<u64>, Option<u64>)>,
@@ -120,6 +125,9 @@ struct Slot {
 
 impl Slot {
     fn ready(&self) -> bool {
+        if self.leaving {
+            return false;
+        }
         match self.init {
             // (What ran first and ended well holds nothing back.)
             true => self.done(),
@@ -220,8 +228,8 @@ pub async fn run(
             break;
         }
     }
-    for (id, slot) in controller.slots {
-        stop(&id, slot.handle);
+    for (id, mut slot) in controller.slots {
+        stop(&id, &mut slot);
     }
 }
 
@@ -241,10 +249,52 @@ async fn until_woken(
     }
 }
 
-fn stop(id: &str, handle: Option<Handle>) {
-    if let Some(Err(e)) = handle.map(Handle::delete) {
-        eprintln!("kithd: {id}: {e}");
+/// Deletes a unit's handle. One whose processes remain keeps it: the slot is `leaving` (its id
+/// and devices held back) until a later pass finds it gone. A cleanup-only failure holds nothing.
+fn stop(id: &str, slot: &mut Slot) {
+    let Some(handle) = slot.handle.take() else {
+        slot.leaving = false;
+        return;
+    };
+    if let Err(undeleted) = handle.delete() {
+        eprintln!("kithd: {id}: {}", undeleted.error);
+        slot.handle = undeleted.handle;
+        if slot.handle.is_some() {
+            slot.probes = None;
+            if slot.state == "running" {
+                slot.state = "stopping";
+            }
+            slot.message = Some(format!(
+                "stopping: {}; its devices and name are held until it is gone",
+                undeleted.error
+            ));
+        }
     }
+    slot.leaving = slot.handle.is_some();
+}
+
+/// Stops the unit `id` if it has one, and keeps its slot only while it is still `leaving`.
+fn stop_unit(slots: &mut BTreeMap<String, Slot>, id: &str) {
+    if let Some(mut slot) = slots.remove(id) {
+        stop(id, &mut slot);
+        if slot.leaving {
+            slots.insert(id.to_string(), slot);
+        }
+    }
+}
+
+/// Why a unit `id` with the device nodes `devices` waits: a unit still stopping has its id, and
+/// the device nodes it had (its processes may still hold them). `None` when nothing is held.
+fn held_by_leaving(id: &str, devices: &[PathBuf], leaving: &[(String, Vec<PathBuf>)]) -> Option<String> {
+    leaving.iter().find_map(|(other, held)| {
+        if other == id {
+            return Some(format!("waiting: {other} is still stopping: its processes remain"));
+        }
+        devices
+            .iter()
+            .find(|path| held.contains(path))
+            .map(|path| format!("waiting: {other} is still stopping and has {}", path.display()))
+    })
 }
 
 /// May a container that was given the device nodes `was` be given `now` as it runs, with
@@ -619,6 +669,8 @@ impl Controller {
                             init: at < inits,
                             after: at.min(inits) as u32,
                             held: false,
+                            leaving: false,
+                            accounted: false,
                             tuned: None,
                             handle: None,
                             state: "pending",
@@ -642,8 +694,19 @@ impl Controller {
         // or taken from, a container as it runs: a session is not started over for that.
         // (One that is still on the node and no longer the container's is another matter:
         // what the container has open stays open until it is stopped.)
+        // A unit still stopping is asked again first: once it is gone (and removed), what waits
+        // for its id or its devices is started in this same pass.
+        let stopping_now: Vec<String> = self
+            .slots
+            .iter()
+            .filter(|(_, s)| s.leaving)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stopping_now {
+            stop_unit(&mut self.slots, id);
+        }
         for (id, slot) in &mut self.slots {
-            let (Some(new), Some(handle)) = (wanted.get(id), &slot.handle) else {
+            let (Some(new), Some(handle), false) = (wanted.get(id), &slot.handle, slot.leaving) else {
                 continue;
             };
             let (was, now): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) =
@@ -682,6 +745,9 @@ impl Controller {
                 || new_values
         };
         for (id, slot) in &self.slots {
+            if slot.leaving {
+                continue;
+            }
             let Some(new) = wanted.get(id) else {
                 stale.push(id.clone());
                 continue;
@@ -722,7 +788,10 @@ impl Controller {
             };
             let ids = self.slots.iter().filter(|(id, slot)| {
                 let new = wanted.get(*id);
-                slot.owner == owner && go.contains(&slot.replica) && new.is_some_and(|new| differs(new, slot))
+                slot.owner == owner
+                    && !slot.leaving
+                    && go.contains(&slot.replica)
+                    && new.is_some_and(|new| differs(new, slot))
             });
             stale.extend(ids.map(|(id, _)| id.clone()));
         }
@@ -731,18 +800,19 @@ impl Controller {
         let first = self
             .slots
             .iter()
-            .filter(|(_, slot)| slot.init && anew.contains(&of(slot)));
+            .filter(|(_, slot)| slot.init && !slot.leaving && anew.contains(&of(slot)));
         let first: Vec<String> = first
             .map(|(id, _)| id.clone())
             .filter(|id| !stale.contains(id))
             .collect();
         stale.extend(first);
         for id in stale {
-            stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+            stop_unit(&mut self.slots, &id);
         }
         let state = self.logs.parent().unwrap_or(&self.logs).to_path_buf();
         for (id, new) in wanted {
             match self.slots.get_mut(&id) {
+                Some(slot) if slot.leaving => {}
                 Some(slot) if !differs(&new, slot) => {
                     (slot.revision, slot.init, slot.after) = (new.revision, new.init, new.after);
                     // A ConfigMap or a Secret that changed: written again where it is mounted,
@@ -801,9 +871,22 @@ impl Controller {
         for slot in self.slots.values().filter(|slot| slot.done()) {
             *first.entry((slot.owner.clone(), slot.replica)).or_default() += 1;
         }
+        // The units still stopping, with their devices: what is due waits for them (see
+        // held_by_leaving). One that starts stopping in this pass is added as it does.
+        let mut leaving: Vec<(String, Vec<PathBuf>)> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| slot.leaving)
+            .map(|(id, slot)| (id.clone(), slot.devices.clone()))
+            .collect();
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
                 return TICK; // the caller stops everything
+            }
+            if slot.leaving {
+                // Asked again by step 2, not here: it has no process left to watch.
+                slot.held = true;
+                continue;
             }
             if let Some(handle) = &mut slot.handle {
                 if slot.probes.as_ref().is_some_and(|p| !p.health.borrow().live) {
@@ -823,7 +906,7 @@ impl Controller {
                         -1
                     }
                 };
-                stop(id, slot.handle.take());
+                stop(id, slot);
                 slot.probes = None;
                 slot.exit_code = Some(code);
                 slot.failures = if slot.started.elapsed() >= SETTLED {
@@ -839,6 +922,12 @@ impl Controller {
                 }
                 // (What waited for an init container starts in the pass after this one.)
                 job_moved |= self.jobs.contains_key(&slot.owner) || slot.init;
+                if slot.leaving {
+                    // Its processes remain: it is stopping, and what is due waits for it.
+                    leaving.push((id.clone(), slot.devices.clone()));
+                    slot.held = true;
+                    continue;
+                }
             }
             let ended = first.get(&(slot.owner.clone(), slot.replica)).copied().unwrap_or(0);
             slot.held = slot.start_at.is_some() && ended < slot.after;
@@ -848,6 +937,11 @@ impl Controller {
                     false => "waiting for its init containers".into(),
                 });
             } else if slot.start_at.is_some_and(|at| at <= Instant::now()) {
+                if let Some(why) = held_by_leaving(id, &slot.devices, &leaving) {
+                    slot.held = true;
+                    slot.message = Some(why);
+                    continue;
+                }
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
                     started = start(shared, &self.runtime, &self.logs, mesh, id, slot) => started,
@@ -869,10 +963,18 @@ impl Controller {
                         job_moved = true;
                     }
                     Err(message) => {
+                        let message = match slot.leaving {
+                            true => format!("{message}; its devices and name are held until it is gone"),
+                            false => message,
+                        };
                         (slot.state, slot.message) = ("failed", Some(message));
                         slot.start_at = Some(Instant::now() + backoff(slot.failures));
                         slot.failures += 1;
                         job_moved |= self.jobs.contains_key(&slot.owner);
+                        if slot.leaving {
+                            leaving.push((id.clone(), slot.devices.clone()));
+                            slot.held = true;
+                        }
                     }
                 }
             }
@@ -882,7 +984,9 @@ impl Controller {
         // CPU for who yields while the seat is busy. Said again only when it changes; a unit
         // never told anything is left as the runtime made it.
         for (id, slot) in self.slots.iter_mut() {
-            let Some(handle) = &slot.handle else { continue };
+            let Some(handle) = slot.handle.as_ref().filter(|_| !slot.leaving) else {
+                continue;
+            };
             let asked = tunes.get(&slot.owner).copied();
             if asked.is_none() && slot.tuned.is_none() {
                 continue;
@@ -1031,7 +1135,7 @@ impl Controller {
         if job.revision != revision {
             // Applied again with changes: it runs again.
             for id in mine(&self.slots, None) {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id);
             }
             *job = Progress {
                 revision,
@@ -1058,6 +1162,10 @@ impl Controller {
         for run in runs {
             let ids = mine(&self.slots, Some(run));
             let slots = || ids.iter().map(|id| &self.slots[id]);
+            // A run whose units are still stopping was counted when it ended: not again.
+            if slots().any(|s| s.accounted) {
+                continue;
+            }
             let failed = slots().find(|s| s.state == "failed" || (s.state == "exited" && s.exit_code != Some(0)));
             if let Some(culprit) = failed {
                 job.failed += 1;
@@ -1070,8 +1178,13 @@ impl Controller {
             } else {
                 continue; // still going
             }
+            for id in &ids {
+                if let Some(slot) = self.slots.get_mut(id) {
+                    slot.accounted = true;
+                }
+            }
             for id in ids {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id);
             }
         }
         let timeout = spec.timeout_seconds.map(|s| Duration::from_secs(s.into()));
@@ -1085,7 +1198,7 @@ impl Controller {
         }
         if job.outcome.is_some() {
             for id in mine(&self.slots, None) {
-                stop(&id, self.slots.remove(&id).and_then(|slot| slot.handle));
+                stop_unit(&mut self.slots, &id);
             }
             return (Vec::new(), Instant::now());
         }
@@ -1263,7 +1376,7 @@ async fn start(
     logs: &Path,
     mesh: Option<(std::net::Ipv6Addr, &str)>,
     id: &str,
-    slot: &Slot,
+    slot: &mut Slot,
 ) -> Result<Handle, String> {
     let resources = match &slot.run {
         Run::Container(c) => &c.resources,
@@ -1422,7 +1535,9 @@ async fn start(
     match handle.start() {
         Ok(()) => Ok(handle),
         Err(e) => {
-            stop(id, Some(handle));
+            // It never ran; what processes it left are the slot's to hold until they are gone.
+            slot.handle = Some(handle);
+            stop(id, slot);
             Err(e.to_string())
         }
     }
@@ -1540,6 +1655,24 @@ mod tests {
         assert!(!fits(&[key], &[key], &[]));
         assert!(!fits(&[card], &[card, pad], &[]));
         assert!(!fits(&[key], &[key, card], &[]));
+    }
+
+    /// A unit whose stop failed while processes remain is leaving: nothing with its id, or with
+    /// a device node it holds, starts until it is gone. A device it does not hold is no hold.
+    #[test]
+    fn leaving_units_hold_back_their_id_and_their_device_nodes() {
+        let leaving = vec![("w_a_b_0_x".to_string(), vec![PathBuf::from("/dev/dri/card0")])];
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let same_id = held_by_leaving("w_a_b_0_x", &[], &leaving).expect("the same id is held");
+        assert!(same_id.contains("still stopping"), "{same_id}");
+        let same_device =
+            held_by_leaving("w_a_b_0_y", &paths(&["/dev/dri/card0"]), &leaving).expect("a device it holds is held");
+        assert!(same_device.contains("/dev/dri/card0"), "{same_device}");
+        assert_eq!(
+            held_by_leaving("w_a_b_0_y", &paths(&["/dev/input/event0"]), &leaving),
+            None
+        );
+        assert_eq!(held_by_leaving("w_a_b_0_y", &paths(&["/dev/dri/card0"]), &[]), None);
     }
 
     #[test]

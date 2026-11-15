@@ -91,6 +91,12 @@ Only the newest version is fixed. There are no security releases of older ones.
   a device does once open, and nothing of an `exec` unit, which is a process of the host.
   Where kithd is not root there is none: the user namespace a container is in there
   makes no device nodes.
+  A device node a unit was given (an exclusive Device's, most of all) is not given to another
+  unit while the unit that had it still runs: a unit whose stop failed with processes left
+  keeps its devices and its name, and a unit that wants them waits until a later pass finds
+  its cgroup empty. What is left: kithd holds this in memory, so a restart of kithd forgets
+  it; a process that moved out of the unit's cgroup is not counted; and a cgroup whose
+  processes cannot be read is taken to still run.
 - **A pod** (a template that says `pod: true`, and so every Deployment, StatefulSet,
   DaemonSet and Job sent through the Kubernetes API) is a container with three of those
   taken off, as Kubernetes has them: it is the user its image names, root included; root

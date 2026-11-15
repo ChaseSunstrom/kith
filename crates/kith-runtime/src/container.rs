@@ -628,8 +628,9 @@ impl Handle {
         }
     }
 
-    /// Kill it if it still runs, then remove its cgroup, state and bundle.
-    pub fn delete(mut self) -> Result<()> {
+    /// Kill it if it still runs, then remove its cgroup, state and bundle. A failure while the
+    /// unit still has processes gives the handle back, and keeps the bundle (see [`Undeleted`]).
+    pub fn delete(mut self) -> std::result::Result<(), Undeleted> {
         // A helper still waiting for the word to go ends when its input does.
         drop(self.go.take());
         let deleted = match &mut self.container {
@@ -641,12 +642,42 @@ impl Handle {
                     .ctx("deleting the exec unit")
             }
         };
-        // It was killed just now: collect it, or it stays a zombie for as long as we live.
-        if deleted.is_ok() && !self.reaped {
-            let _ = waitpid(self.pid, None);
+        self.finish(deleted)
+    }
+
+    /// What a delete leaves once its removal was tried with `deleted`.
+    fn finish(self, deleted: Result<()>) -> std::result::Result<(), Undeleted> {
+        match deleted {
+            Err(error) if has_processes(&self.cgroup) => Err(Undeleted {
+                error,
+                handle: Some(self),
+            }),
+            deleted => {
+                // It was killed just now: collect it, or it stays a zombie for as long as we live.
+                if deleted.is_ok() && !self.reaped {
+                    let _ = waitpid(self.pid, None);
+                }
+                let removed = fs::remove_dir_all(&self.bundle).ctx("deleting the container");
+                deleted.and(removed).map_err(|error| Undeleted { error, handle: None })
+            }
         }
-        fs::remove_dir_all(&self.bundle).ctx("deleting the container")?;
-        deleted
+    }
+}
+
+/// A [`Handle::delete`] that failed. `handle` is the unit's handle back while its cgroup still
+/// has processes: the unit is not gone, and it can be asked again. `None` means the processes
+/// are gone and only the cleanup failed: nothing of the unit runs.
+pub struct Undeleted {
+    pub error: crate::Error,
+    pub handle: Option<Handle>,
+}
+
+/// Whether a cgroup still has processes. A cgroup that is gone has none; one whose
+/// `cgroup.procs` cannot be read may have some.
+fn has_processes(cgroup: &Path) -> bool {
+    match fs::read_to_string(cgroup.join("cgroup.procs")) {
+        Ok(procs) => !procs.trim().is_empty(),
+        Err(e) => e.kind() != io::ErrorKind::NotFound,
     }
 }
 
@@ -1751,5 +1782,41 @@ mod tests {
         // Nor over a mount the container already has, nor twice on one path.
         assert!(mounted(vec![bind("/srv/data", "/tmp", false)]).is_err());
         assert!(mounted(vec![bind("/srv/a", "/data", false), bind("/srv/b", "/data", false)]).is_err());
+    }
+
+    /// A failed delete hands the handle back only while the unit's cgroup still has processes:
+    /// then the bundle stays too. A failure with the processes gone holds nothing back.
+    #[test]
+    fn failed_delete_keeps_the_handle_only_while_processes_remain() {
+        let root = std::env::temp_dir().join(format!("kith-failed-delete-{}", std::process::id()));
+        let (bundle, cgroup) = (root.join("bundle"), root.join("cgroup"));
+        let fresh = |procs: Option<&str>| {
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&bundle).unwrap();
+            fs::create_dir_all(&cgroup).unwrap();
+            if let Some(procs) = procs {
+                fs::write(cgroup.join("cgroup.procs"), procs).unwrap();
+            }
+            Handle {
+                container: None,
+                go: None,
+                pid: Pid::from_raw(0),
+                reaped: true,
+                bundle: bundle.clone(),
+                cgroup: cgroup.clone(),
+            }
+        };
+        // Processes still listed: the handle comes back and the bundle is kept.
+        let still = fresh(Some("4242\n")).finish(err("removing the cgroup"));
+        let still = still.expect_err("a unit with processes is not gone");
+        assert!(still.handle.is_some() && bundle.exists(), "{}", still.error);
+        // Only the cleanup failed (no processes): nothing is held back, and the bundle goes.
+        let cleanup = fresh(Some("")).finish(err("removing the cgroup"));
+        let cleanup = cleanup.expect_err("the removal failed");
+        assert!(cleanup.handle.is_none() && !bundle.exists(), "{}", cleanup.error);
+        // A cgroup that is gone has no processes either; a deleted unit is deleted.
+        let gone = fresh(None).finish(Ok(()));
+        assert!(gone.is_ok() && !bundle.exists());
+        let _ = fs::remove_dir_all(&root);
     }
 }
