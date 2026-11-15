@@ -76,8 +76,9 @@ fn is_dir(meta: &FileStat) -> bool {
 }
 
 /// The directory `name` under `parent` (or the path `name`), opened without following a
-/// symlink, and what it is, if it is a directory on `device`.
-fn open_dir(parent: Option<&OwningIter>, name: &(impl nix::NixPath + ?Sized), device: u64) -> Option<OwningIter> {
+/// symlink, and what it is, if it is a directory on `device`. (Not `backups::open_dir`, which
+/// opens a path and holds it to no filesystem.)
+fn open_dir_on(parent: Option<&OwningIter>, name: &(impl nix::NixPath + ?Sized), device: u64) -> Option<OwningIter> {
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
     let dir = Dir::openat(parent.map(|p| p.as_raw_fd()), name, flags, Mode::empty()).ok()?;
     // (What was looked at before it was opened may have been swapped since.)
@@ -103,7 +104,7 @@ pub fn count(roots: &[PathBuf], stop: u64, until: Until) -> (u64, bool) {
         let device = top.st_dev;
         bytes = bytes.saturating_add(top.st_blocks as u64 * 512);
         let mut open: Vec<OwningIter> = match is_dir(&top) {
-            true => open_dir(None, root.as_path(), device).into_iter().collect(),
+            true => open_dir_on(None, root.as_path(), device).into_iter().collect(),
             false => Vec::new(),
         };
         while let Some(at) = open.last_mut() {
@@ -137,7 +138,7 @@ pub fn count(roots: &[PathBuf], stop: u64, until: Until) -> (u64, bool) {
                 finished = false;
                 continue;
             }
-            let below = open_dir(open.last(), name, device);
+            let below = open_dir_on(open.last(), name, device);
             open.extend(below);
         }
     }
@@ -407,8 +408,8 @@ mod tests {
         std::os::unix::fs::symlink(&b, b.join("loop")).unwrap();
         assert!(count(&[a.clone(), b.clone()], u64::MAX, later()).0 < alone + MIB);
         // A directory swapped for a symlink after it was looked at is not opened through it.
-        let parent = open_dir(None, b.as_path(), std::fs::metadata(&b).unwrap().dev()).unwrap();
-        assert!(open_dir(Some(&parent), c"dir", std::fs::metadata(&outside).unwrap().dev()).is_none());
+        let parent = open_dir_on(None, b.as_path(), std::fs::metadata(&b).unwrap().dev()).unwrap();
+        assert!(open_dir_on(Some(&parent), c"dir", std::fs::metadata(&outside).unwrap().dev()).is_none());
         for d in [root, outside] {
             std::fs::remove_dir_all(d).unwrap();
         }
