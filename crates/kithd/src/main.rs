@@ -606,7 +606,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     }
     // Its port is taken now: the controller's first pass may ask it before it is served.
     let door = door.map(|door| {
-        let tcp = images::bind(door.local.port);
+        let tcp = door.bind();
         (door, tcp)
     });
 

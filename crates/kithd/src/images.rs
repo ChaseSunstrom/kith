@@ -341,6 +341,8 @@ pub struct Door {
     tls: Arc<OnceLock<Tls>>,
     /// SHA-256 of the `authorization` a request must carry.
     wanted: [u8; 32],
+    /// Why the registry's port is not this kithd's, where it could not be taken.
+    shut: Arc<OnceLock<String>>,
 }
 
 impl Door {
@@ -350,21 +352,37 @@ impl Door {
             .map_err(|_| "no random bytes from the system")?;
         let password = hex(&secret);
         let tls = Arc::new(OnceLock::new());
-        let made = tls.clone();
-        let certificate = move || match Door::made(&made) {
-            Ok((certificate, _)) => Ok(certificate.clone()),
-            Err(e) => Err(e.clone()),
+        let shut = Arc::new(OnceLock::<String>::new());
+        let (made, why) = (tls.clone(), shut.clone());
+        // (No port, no certificate: the pull stops here, with the reason, and asks no one.)
+        let certificate = move || match why.get() {
+            Some(why) => Err(why.clone()),
+            None => Door::made(&made).clone().map(|(certificate, _)| certificate),
         };
         let said = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, format!("kithd:{password}"));
         Ok(Door {
             wanted: Sha256::digest(format!("Basic {said}")).into(),
             tls,
+            shut,
             local: kith_runtime::Local {
                 port,
                 password,
                 certificate: Arc::new(certificate),
             },
         })
+    }
+
+    /// Take the registry's port ([`bind`]). Where it cannot be taken, every pull of an own
+    /// Image from now on is told why.
+    pub fn bind(&self) -> std::io::Result<std::net::TcpListener> {
+        let port = self.local.port;
+        let taken = bind(port);
+        if let Err(e) = &taken {
+            let _ = self.shut.set(format!(
+                "127.0.0.1:{port} could not be taken ({e}): this node serves no Image"
+            ));
+        }
+        taken
     }
 
     fn made(tls: &OnceLock<Tls>) -> &Tls {
@@ -873,6 +891,36 @@ mod tests {
             let pulled = stranger.pull(&format!("localhost:{port}/team/hello:1"), always).await;
             assert!(pulled.is_err(), "a pull with {name} of the door's was served");
         }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Where something else has the registry's port, a start from an own Image says so: the
+    /// port and why it could not be taken, not that a connection was refused or not trusted.
+    #[tokio::test]
+    async fn registry_port_taken() {
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = other.local_addr().unwrap().port();
+        let door = Door::new(port).unwrap();
+        let bind = door.bind().unwrap_err().to_string();
+        let root = std::env::temp_dir().join(format!("kith-port-taken-{}", std::process::id()));
+        let mut store = kith_runtime::ImageStore::new(root.clone()).unwrap();
+        store.local = Some(door.local.clone());
+        let own = format!("localhost:{port}/team/hello:1");
+        let pull = store.pull(&own, kith_runtime::PullPolicy::Always);
+        // (Whoever has the port here never answers: a pull that asked it would wait.)
+        let pull = tokio::time::timeout(Duration::from_secs(5), pull).await;
+        let why = pull
+            .expect("the pull asked whoever has the port")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains(&format!("127.0.0.1:{port}")) && why.contains(&bind),
+            "{why}"
+        );
+        assert!(
+            door.tls.get().is_none(),
+            "a key was made for a registry that is not served"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
