@@ -3570,18 +3570,18 @@ python3 ci/bench.py              # the plan's numbers for one node: cached start
 Time budgets sit beside the size and memory ones. Three times are measured on one
 machine with no VM: `kith apply` until a container of a local image runs, a status
 change written on one of two kithds until the other has it, and one DNS answer from
-kithd. `python3 ci/budgets.py --times` prints the median of five runs of each; the
-build's `python3 ci/budgets.py` prints each once. The table's numbers were measured on
-a loaded 16-CPU machine, not the CI runner's, so they are not budgets: each budget is
-set from the CI runner's own medians (twice the slowest of three runs on main) and is a
-ceiling for a regression, not a claim of speed. Until then a time is printed and not
-enforced.
+kithd. Each time is the median of five runs: `python3 ci/budgets.py --times` prints
+them, and the build's `python3 ci/budgets.py` holds each to its budget. Each budget is
+twice the slowest of three such medians on main on the CI runner, rounded up: a ceiling for a
+regression, not a claim of speed. Each is printed as `ok   one DNS answer from kithd:
+2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1. A machine where a path cannot be run (no
+cgroup of its own for a container, say) fails that path, since it has a budget.
 
-| Time | Measured here: median of 5 (load 64 on 16 CPUs) | Printed as |
+| Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|
-| apply to a running container | 74 ms | 74 ms (budget to be set from CI) |
-| a status change reaching a second kithd | 3.6 ms | 3.6 ms (budget to be set from CI) |
-| one DNS answer from kithd | 2.1 ms | 2.1 ms (budget to be set from CI) |
+| apply to a running container | 85.3, 88.1, 78.3 ms | 180 ms |
+| a status change reaching a second kithd | 4.7, 4.8, 4.8 ms | 10 ms |
+| one DNS answer from kithd | 2.9, 3.1, 3.5 ms | 7 ms |
 | boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](ci/compare.txt)) | not budgeted: no VM runs in CI |
 
 Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
