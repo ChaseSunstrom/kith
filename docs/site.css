@@ -246,8 +246,10 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 }
 .versus, .where { margin-top: 64px; }
 .versus h3, .where h3 { font-size: var(--head); letter-spacing: -0.02em; margin-bottom: 12px; }
-.versus .panel { display: grid; gap: 22px; margin-block: 16px; padding-top: 18px; }
-.vs { display: grid; grid-template-columns: 44px 1fr 110px; align-items: center; gap: 6px 14px; font-size: var(--note); }
+.versus .panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 36px 48px; margin-block: 16px; padding-top: 18px; }
+.versus section { display: grid; gap: 20px; align-content: start; }
+.versus h4 { font-size: var(--small); letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--dim); padding-bottom: 6px; }
+.vs { display: grid; grid-template-columns: 44px 1fr 132px; align-items: center; gap: 6px 14px; font-size: var(--note); }
 .vs p { grid-column: 1 / -1; font-weight: 700; }
 .vs b { text-align: right; white-space: nowrap; }
 .where .row { grid-template-columns: 150px 1fr 210px; }

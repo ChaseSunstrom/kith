@@ -40,20 +40,41 @@ for (const row of $$(".row[data-v]")) row.style.setProperty("--v", Math.min(1, N
 
 // Beside k3s: drawn only when the comparison's runs are in the numbers.
 const versus = [
-  ["Memory in use on an idle node: the first node, or the server", "control", "MB"],
-  ["Memory in use on an idle node: another node, or an agent", "worker", "MB"],
-  ["From apply to a ready container, its image on the node", "apply", "s"],
-  ["A node lost: until its replica is ready on another, as each system comes", "lost", "s"],
-  ["The same, each told to wait about a minute", "lost60", "s"],
-].filter(([, what]) => N[`cmp.kith.${what}`] != null && N[`cmp.k3s.${what}`] != null);
+  ["At rest", [
+    ["Memory in use on an idle node: the first node, or the server", "control", "MB"],
+    ["Memory in use on an idle node: another node, or an agent", "worker", "MB"],
+    ["CPU in use on an idle node: the first node, or the server", "cpu", "% of a CPU"],
+    ["CPU in use on an idle node: another node, or an agent", "cpu2", "% of a CPU"],
+    ["On the first node's disk at the end", "disk", "MB"],
+  ]],
+  ["Starting and changing", [
+    ["From switching a machine on to a node that is ready", "ready", "s"],
+    ["From apply to a ready container, its image on the node", "apply", "s"],
+    ["One workload of 30 replicas: until all are ready", "scale", "s"],
+    ["20 workloads at once: until all are ready", "burst", "s"],
+    ["A change to a workload of 6 replicas: until all 6 run it", "roll", "s"],
+    ["A container that exits: until it runs again", "crash", "s"],
+    ["A Job that does nothing: until it has succeeded", "job", "s"],
+  ]],
+  ["When a node is lost", [
+    ["Until its replica is ready on another, as each system comes", "lost", "s"],
+    ["The same, each told to wait about a minute", "lost60", "s"],
+  ]],
+  ["Through a Service to 3 web servers", [
+    ["Requests a second, a connection each (more is better)", "rps", "a second"],
+    ["Requests a second over connections that are kept (more is better)", "kept", "a second"],
+    ["Of those requests, half took under", "p50", "ms"],
+    ["and 99 in 100 under", "p99", "ms"],
+  ]],
+].map(([group, rows]) => [group, rows.filter(([, what]) => N[`cmp.kith.${what}`] != null && N[`cmp.k3s.${what}`] != null)]).filter(([, rows]) => rows.length);
 if (versus.length) {
-  $("#versus-said").textContent = `kith ${N.version} and k3s ${N["cmp.k3s.version"]} as it comes (on Alpine, which alone has ${N["cmp.k3s.before"]} MB in use before k3s starts), three QEMU machines each. The middle of ${N["cmp.runs"]} runs (the last pair: one run each), on a machine that was doing other work; shorter is less.`;
+  $("#versus-said").textContent = `kith ${N.version} and k3s ${N["cmp.k3s.version"]} as it comes (on Alpine, which alone has ${N["cmp.k3s.before"]} MB in use before k3s starts), three QEMU machines each, the same workloads on both. The middle of ${N["cmp.runs"]} runs (a node lost and told to wait a minute: one run each), on a machine that was doing other work. Each pair has its own scale; a shorter bar is less, which is better in every row but the two that say otherwise.`;
   // Only this file's own words and numbers from #measured go in: nothing a reader typed.
-  $("#versus-chart").innerHTML = versus.map(([name, what, unit]) => {
+  $("#versus-chart").innerHTML = versus.map(([group, rows]) => `<section><h4>${group}</h4>` + rows.map(([name, what, unit]) => {
     const kith = N[`cmp.kith.${what}`], k3s = N[`cmp.k3s.${what}`], most = Math.max(kith, k3s);
-    const bar = (who, n, other) => `<span>${who}</span><div class="track"><i class="${other}" style="--v:${n / most}"></i></div><b>${n} <small>${unit}</small></b>`;
+    const bar = (who, n, other) => `<span>${who}</span><div class="track"><i class="${other}" style="--v:${n / most}"></i></div><b>${n.toLocaleString("en")} <small>${unit}</small></b>`;
     return `<div class="vs"><p>${name}</p>${bar("kith", kith, "")}${bar("k3s", k3s, "other")}</div>`;
-  }).join("");
+  }).join("") + "</section>").join("");
   $("#versus").hidden = false;
 }
 
