@@ -1876,9 +1876,12 @@ went. A certificate that no longer stands for its Identity is a refusal too,
 and so is no certificate at all (one line a minute of those). Refusals past
 sixty a minute are counted rather than written. A watch ends when its
 Identity is deleted or given another certificate. `Audit` is not a name a
-custom kind may take. Permission is asked when a request arrives, not again
-when its write is committed: a Role removed in between does not stop a write
-already under way. `kith audit` shows the last of it,
+custom kind may take. Permission is asked when a request arrives, and an
+Identity's apply, delete or rollback is asked again on the leader as it is put
+in the log: a RoleBinding deleted before then stops it, even when the node it
+reached had not heard of the deletion yet. A write already in the log before
+the deletion stays (SECURITY.md says what else is decided once, where it
+arrives). `kith audit` shows the last of it,
 as does `GET /v1/audit` for an Identity with `get` on `Audit`.
 
 ```
@@ -3925,6 +3928,7 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
 sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)
