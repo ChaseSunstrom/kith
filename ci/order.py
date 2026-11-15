@@ -14,6 +14,9 @@ is: the binary is stripped), taken off the first time it is hit. Each function s
 once, so it runs at nearly its own speed, and every one that runs is seen, the ones that
 run once at start too (a sampling profiler misses most of those). x86_64 Linux only.
 
+The order is of one compiler (rust-toolchain.toml names it): another gives a tenth of the
+functions other names, so run this again after changing it there.
+
 Run it again when idle memory (ci/budgets.py) has crept up or the check fails: code written
 since is not in the file, and lands wherever the compiler put it (a function kithd runs at
 start that is left there keeps the 64 kB around it in memory). A pattern that names nothing

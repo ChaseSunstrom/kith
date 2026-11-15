@@ -3695,7 +3695,10 @@ the compiler ends a copy of a function with. So the file outlives most changes; 
 written since is not in it, and each function kithd runs at start that is left where
 the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
 --check`, which CI runs, fails once under 95 in 100 of its names are still in kithd,
-or under four fifths of those are together where its code starts. A toolchain with
+or under four fifths of those are together where its code starts. The order is of
+one compiler, the one `rust-toolchain.toml` names (rustup installs it by itself):
+Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held
+5.96 MB. After naming another there, run `python3 ci/order.py` again. A toolchain with
 no lld links kithd in the compiler's order, with a warning, and it holds the 8.91 MB
 again (the check then fails, saying there is no lld).
 
