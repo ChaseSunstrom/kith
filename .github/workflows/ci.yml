@@ -25,13 +25,20 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # A container of a kithd that is not root goes beside kithd's own cgroup, which has to be the
+      # user's: the runner's is the system's, so the budget steps run in a scope of the user's systemd.
+      - name: A systemd session of the runner's user, for the containers the time checks start
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          for _ in $(seq 50); do [ -S "/run/user/$(id -u)/systemd/private" ] && break; sleep 0.2; done
       - name: Budget checks can fail
-        run: python3 ci/budgets.py --self-test
+        run: systemd-run --user --scope --quiet python3 ci/budgets.py --self-test
       - name: Binary-size and RSS budgets
-        run: python3 ci/budgets.py
+        run: systemd-run --user --scope --quiet python3 ci/budgets.py
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
       - name: Times on the CI runner (printed, not enforced)
-        run: python3 ci/budgets.py --times
+        run: systemd-run --user --scope --quiet python3 ci/budgets.py --times
       # Compares files only: the page, docs/numbers.json, ci/compare.txt and the README's drawings.
       - name: The website shows the numbers that were measured
         run: python3 ci/site_numbers.py --check
