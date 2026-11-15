@@ -12,10 +12,11 @@
 //! `resourceVersion`: of a list, the store's generation; of an object, its kith revision
 //! and what its status hashes to. A watch starts from a list's version or is told `410`
 //! (the client lists again): the store keeps no log of what changed between two generations.
+//!
+//! `metadata.managedFields`: who set which field, kept in the object as it was sent, for
+//! server-side apply (a second manager's different value is a 409 unless forced). Only
+//! `Apply` writes make a manager; a replace or a patch takes a field from whoever had it.
 //
-// ponytail: one field manager. A server-side apply replaces what was sent before, whoever
-// sent it; managedFields, and a conflict between two managers, would be a table of who
-// set which field.
 // ponytail: a watch keeps the name and version of every object it has told of, and looks
 // at them all on each change of the store. A log of changes per kind would make that one read.
 
@@ -23,7 +24,7 @@ use crate::Shared;
 use crate::access::{self, Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path as Route, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -240,7 +241,7 @@ pub fn router() -> Router<Arc<Shared>> {
         .route("/api/v1", get(|| async { resources("") }))
         .route(
             "/apis/{group}/v1",
-            get(|Path(group): Path<String>| async move { resources(&group) }),
+            get(|Route(group): Route<String>| async move { resources(&group) }),
         )
         .route("/openapi/v3", get(openapi))
         // (What kubectl checks a kind against that the server does not check for it: of a
@@ -338,7 +339,7 @@ async fn openapi() -> Json<Value> {
 /// What kubectl and helm ask before they send an object: whether the server checks the
 /// fields itself (`fieldValidation`). It does (what is not carried over is said, or refused),
 /// so they need no schema of every kind to check them against: none is served.
-async fn checked(Path(of): Path<String>) -> Response {
+async fn checked(Route(of): Route<String>) -> Response {
     let group = match of.split('/').collect::<Vec<_>>()[..] {
         ["api", "v1"] => "",
         ["apis", group, "v1"] => group,
@@ -359,6 +360,7 @@ async fn checked(Path(of): Path<String>) -> Response {
 }
 
 /// A refusal, as Kubernetes says one: kubectl prints `why`, and reads `reason`.
+#[derive(Debug)]
 struct No {
     code: StatusCode,
     reason: &'static str,
@@ -1293,6 +1295,323 @@ fn merged(have: &mut Value, items: Vec<Value>, by: &str) {
     }
 }
 
+// ---- Who set which field: server-side apply ----
+
+/// A field's place in an object, a step at a time as Kubernetes's `fieldsV1` spells it:
+/// `f:name` for a field of a mapping, `k:{"name":"web"}` for the item of a list a merge key names.
+type Path = Vec<String>;
+
+/// The most field managers one object has, and the longest a manager's name is (Kubernetes's).
+const MANAGERS: usize = 64;
+const MANAGER_NAME: usize = 128;
+
+/// One entry of `metadata.managedFields`: a manager, and the fields its last apply set.
+struct Manager {
+    name: String,
+    version: String,
+    time: String,
+    fields: BTreeSet<Path>,
+}
+
+/// The merge key that names the items of `list`, if every item has one and no two share it:
+/// a list of any other kind is one field, set whole.
+fn keyed(list: &str, items: &[Value]) -> Option<&'static str> {
+    let by = merge_key(list, items.first()?)?;
+    let mut seen = BTreeSet::new();
+    let unique = items
+        .iter()
+        .all(|item| !item[by].is_null() && seen.insert(item[by].to_string()));
+    unique.then_some(by)
+}
+
+fn item_key(by: &str, item: &Value) -> String {
+    Value::Object([(by.to_string(), item[by].clone())].into_iter().collect()).to_string()
+}
+
+/// The fields `value` sets, each by its path: a field with a value of its own (a scalar, an
+/// empty mapping, a list no key names) is one, and a mapping or a keyed list is its parts.
+fn leaves(at: &mut Path, list: &str, value: &Value, out: &mut BTreeMap<Path, Value>) {
+    let items = value.as_array().and_then(|items| Some((items, keyed(list, items)?)));
+    if let Some((items, by)) = items {
+        for item in items {
+            at.push(format!("k:{}", item_key(by, item)));
+            leaves(at, "", item, out);
+            at.pop();
+        }
+    } else if let Some(map) = value.as_object().filter(|map| !map.is_empty()) {
+        for (field, value) in map {
+            at.push(format!("f:{field}"));
+            leaves(at, field, value, out);
+            at.pop();
+        }
+    } else if !value.is_null() {
+        out.insert(at.clone(), value.clone());
+    }
+}
+
+/// What nobody manages: who the object is, what it is, and what kithd says of it.
+const UNMANAGED: [&[&str]; 6] = [
+    &["f:apiVersion"],
+    &["f:kind"],
+    &["f:status"],
+    &["f:metadata", "f:name"],
+    &["f:metadata", "f:namespace"],
+    &["f:metadata", "f:managedFields"],
+];
+
+/// Every field of `object` that can be managed, by its path, with its value.
+fn fields_of(object: &Value) -> BTreeMap<Path, Value> {
+    let mut out = BTreeMap::new();
+    leaves(&mut Vec::new(), "", object, &mut out);
+    let under =
+        |at: &Path, skip: &[&str]| at.len() >= skip.len() && at.iter().zip(skip.iter().copied()).all(|(a, b)| a == b);
+    out.retain(|at, _| !UNMANAGED.iter().any(|skip| under(at, skip)));
+    out
+}
+
+/// A set of paths as `fieldsV1` has it: a mapping of mappings, an empty one at each field.
+fn fields_v1(fields: &BTreeSet<Path>) -> Value {
+    let mut root = json!({});
+    for path in fields {
+        let mut at = &mut root;
+        for step in path {
+            let Some(map) = at.as_object_mut() else { break };
+            at = map.entry(step.clone()).or_insert_with(|| json!({}));
+        }
+    }
+    root
+}
+
+fn owned(tree: &Value, at: &mut Path, out: &mut BTreeSet<Path>) {
+    match tree.as_object().filter(|map| !map.is_empty()) {
+        Some(map) => {
+            // (`.` says the mapping itself is managed too: no field of ours is that.)
+            for (step, below) in map.iter().filter(|(step, _)| *step != ".") {
+                at.push(step.clone());
+                owned(below, at, out);
+                at.pop();
+            }
+        }
+        None if !at.is_empty() => drop(out.insert(at.clone())),
+        None => {}
+    }
+}
+
+/// The managers an object names.
+fn managers(object: &Value) -> Vec<Manager> {
+    let entries = object.pointer("/metadata/managedFields").and_then(Value::as_array);
+    let entry = |entry: &Value| {
+        let text = |field: &str| entry[field].as_str().unwrap_or_default().to_string();
+        let mut fields = BTreeSet::new();
+        owned(&entry["fieldsV1"], &mut Vec::new(), &mut fields);
+        let (name, version, time) = (entry["manager"].as_str()?.to_string(), text("apiVersion"), text("time"));
+        Some(Manager {
+            name,
+            version,
+            time,
+            fields,
+        })
+    };
+    entries.into_iter().flatten().filter_map(entry).collect()
+}
+
+/// `object` told to be managed by these (it names none when none manages a field).
+fn managed(object: &mut Value, managers: Vec<Manager>) {
+    let entries: Vec<Value> = managers
+        .into_iter()
+        .filter(|manager| !manager.fields.is_empty())
+        .map(|manager| {
+            json!({
+                "manager": manager.name, "operation": "Apply", "apiVersion": manager.version,
+                "time": manager.time, "fieldsType": "FieldsV1", "fieldsV1": fields_v1(&manager.fields),
+            })
+        })
+        .collect();
+    if let Some(meta) = object.get_mut("metadata").and_then(Value::as_object_mut) {
+        match entries.is_empty() {
+            true => drop(meta.remove("managedFields")),
+            false => drop(meta.insert("managedFields".into(), entries.into())),
+        }
+    }
+}
+
+/// A path as Kubernetes says it in a conflict: `.spec.template.spec.containers[name="web"].image`.
+fn shown(path: &Path) -> String {
+    let step = |step: &String| match step.split_once(':') {
+        Some(("f", field)) => format!(".{field}"),
+        Some(("k", key)) => {
+            let key: Value = serde_json::from_str(key).unwrap_or_default();
+            let parts: Vec<String> = key
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(by, is)| format!("{by}={is}"))
+                .collect();
+            format!("[{}]", parts.join(","))
+        }
+        _ => step.clone(),
+    };
+    path.iter().map(step).collect()
+}
+
+/// Kubernetes's words for fields another manager has and the apply would change.
+fn conflicts(found: &[(String, String, Path)]) -> No {
+    let mut by_manager: Vec<(&str, &str, Vec<String>)> = Vec::new();
+    for (name, version, path) in found {
+        match by_manager.iter_mut().find(|(has, ..)| has == name) {
+            Some((.., paths)) => paths.push(shown(path)),
+            None => by_manager.push((name, version, vec![shown(path)])),
+        }
+    }
+    let mut why = match (found.len(), &by_manager[..]) {
+        (1, [(name, version, paths)]) => {
+            format!(
+                "Apply failed with 1 conflict: conflict with \"{name}\" using {version}: {}",
+                paths[0]
+            )
+        }
+        (many, _) => format!("Apply failed with {many} conflicts:"),
+    };
+    if found.len() > 1 {
+        for (name, version, paths) in &by_manager {
+            why.push_str(&format!("\nconflicts with \"{name}\" using {version}:"));
+            for path in paths {
+                why.push_str(&format!("\n- {path}"));
+            }
+        }
+    }
+    status(StatusCode::CONFLICT, "Conflict", why)
+}
+
+/// Takes the field at `path` out of `value`, and what it leaves empty with it; whether `value`
+/// is itself empty then.
+fn unset(value: &mut Value, path: &[String]) -> bool {
+    let Some((step, rest)) = path.split_first() else {
+        return true;
+    };
+    match (value, step.split_once(':')) {
+        (Value::Object(map), Some(("f", field))) => {
+            if let Some(child) = map.get_mut(field)
+                && unset(child, rest)
+            {
+                map.remove(field);
+            }
+            map.is_empty()
+        }
+        (Value::Array(items), Some(("k", key))) => {
+            let key: Value = serde_json::from_str(key).unwrap_or_default();
+            let named = |item: &Value| {
+                key.as_object()
+                    .is_some_and(|key| key.iter().all(|(by, is)| item.get(by) == Some(is)))
+            };
+            if let Some(at) = items.iter().position(named)
+                && unset(&mut items[at], rest)
+            {
+                items.remove(at);
+            }
+            items.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Whether `at` is the key of an item that other managers still have fields of: the item
+/// is theirs, and without its key they could not find it.
+fn shielded(at: &Path, others: &[&Manager]) -> bool {
+    let [parent @ .., last] = at.as_slice() else {
+        return false;
+    };
+    let key = parent.last().and_then(|step| step.strip_prefix("k:"));
+    let key: Value = key.and_then(|key| serde_json::from_str(key).ok()).unwrap_or_default();
+    let is_key = last.strip_prefix("f:").is_some_and(|field| key.get(field).is_some());
+    is_key
+        && others
+            .iter()
+            .any(|other| other.fields.iter().any(|theirs| theirs.starts_with(parent)))
+}
+
+/// What `live` (none: not there) comes to when `who` applies `config` to it: the fields `who`
+/// sets, over what is there; the fields `who` set before and leaves out of it taken out, where
+/// no other manager has them. Another manager's field `who` would change is a conflict, but
+/// with `force`, when it is `who`'s.
+fn apply(live: Option<Value>, config: Value, who: &str, version: &str, force: bool) -> Result<Value, No> {
+    let mut live = live.unwrap_or_else(|| json!({}));
+    let mut all = managers(&live);
+    if let Some(meta) = live.get_mut("metadata").and_then(Value::as_object_mut) {
+        meta.remove("managedFields");
+    }
+    let (held, sets) = (fields_of(&live), fields_of(&config));
+    let mut found = Vec::new();
+    for (at, value) in &sets {
+        for other in all.iter().filter(|other| other.name != who) {
+            if other.fields.contains(at) && held.get(at) != Some(value) {
+                found.push((other.name.clone(), other.version.clone(), at.clone()));
+            }
+        }
+    }
+    if !found.is_empty() && !force {
+        return Err(conflicts(&found));
+    }
+    for (name, _, at) in &found {
+        for other in all.iter_mut().filter(|other| other.name == *name) {
+            other.fields.remove(at);
+        }
+    }
+    let before = all.iter().position(|manager| manager.name == who);
+    let mine = before.map(|at| all[at].fields.clone()).unwrap_or_default();
+    let others: Vec<&Manager> = all.iter().filter(|other| other.name != who).collect();
+    let mut gone: Vec<&Path> = mine
+        .iter()
+        .filter(|at| !sets.contains_key(*at) && !others.iter().any(|other| other.fields.contains(*at)))
+        .filter(|at| !shielded(at, &others))
+        .collect();
+    gone.sort_by_key(|at| std::cmp::Reverse(at.len()));
+    let mut object = live.clone();
+    patched(&mut object, config, true);
+    for at in gone {
+        unset(&mut object, at);
+    }
+    let fields: BTreeSet<Path> = sets.into_keys().collect();
+    // (Kubernetes dates a manager by its last change: a repeat of an apply is not one.)
+    let time = match before {
+        Some(at) if object == live && fields == mine => all[at].time.clone(),
+        _ => rfc3339(now()),
+    };
+    let (name, version) = (who.to_string(), version.to_string());
+    let me = Manager {
+        name,
+        version,
+        time,
+        fields,
+    };
+    match before {
+        Some(at) => all[at] = me,
+        None => all.push(me),
+    }
+    all.retain(|manager| !manager.fields.is_empty());
+    if all.len() > MANAGERS {
+        return Err(invalid(format!(
+            "metadata.managedFields: more than {MANAGERS} managers have fields of this object"
+        )));
+    }
+    managed(&mut object, all);
+    Ok(object)
+}
+
+/// `after`, an object changed by something other than an apply, told what is managed: a field
+/// it changed is no apply manager's any more, and the others are as they were.
+fn updated(live: &Value, after: &mut Value) {
+    let mut all = managers(live);
+    if all.is_empty() {
+        return;
+    }
+    let (before, now) = (fields_of(live), fields_of(after));
+    for manager in &mut all {
+        manager.fields.retain(|at| before.get(at) == now.get(at));
+    }
+    managed(after, all);
+}
+
 type Asked = HashMap<String, String>;
 
 /// One request: who asks, and what its query says.
@@ -1321,7 +1640,7 @@ enum How {
 async fn core(
     State(shared): State<Arc<Shared>>,
     parts: Parts,
-    Path(rest): Path<String>,
+    Route(rest): Route<String>,
     Query(asked): Query<Asked>,
     body: Bytes,
 ) -> Response {
@@ -1332,7 +1651,7 @@ async fn core(
 async fn grouped(
     State(shared): State<Arc<Shared>>,
     parts: Parts,
-    Path((group, rest)): Path<(String, String)>,
+    Route((group, rest)): Route<(String, String)>,
     Query(asked): Query<Asked>,
     body: Bytes,
 ) -> Response {
@@ -1788,6 +2107,34 @@ async fn write(
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
+    // An apply says who applies, as Kubernetes asks; and one to what is there is answered with
+    // all of it (merged, and a conflict names whose field it is): for who may read it. Whether
+    // it is there is told to who may write (a create says), so asking after that is no leak.
+    let manager = call.asked.get("fieldManager").map(String::as_str).unwrap_or_default();
+    let mut there = false;
+    if how == How::Apply {
+        if manager.is_empty() {
+            let why =
+                "PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: is required for apply patch";
+            return Err(invalid(why.into()));
+        }
+        if manager.len() > MANAGER_NAME {
+            return Err(invalid(format!(
+                "fieldManager: must be no more than {MANAGER_NAME} characters"
+            )));
+        }
+        there = call
+            .shared
+            .store
+            .lock()
+            .expect("a handler panicked holding the store")
+            .store
+            .get(&primary)
+            .is_some();
+        if there {
+            call.allowed(kind, namespace, Verb::Get)?;
+        }
+    }
     let exists = || {
         status(
             StatusCode::CONFLICT,
@@ -1799,6 +2146,11 @@ async fn write(
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
         let before = live.and_then(raw).filter(|(of, _)| std::ptr::eq(*of, kind));
+        if live.is_some() && !there && how == How::Apply {
+            let why = format!("{primary} was made since: apply it again");
+            return Err(status(StatusCode::CONFLICT, "Conflict", why));
+        }
+        let was = before.as_ref().map(|(_, object)| object.clone());
         // What is there and was not made here, or not as this kind, is not written over.
         if live.is_some() && before.is_none() {
             let why = format!(
@@ -1861,14 +2213,25 @@ async fn write(
                 None => meta.remove(field),
             };
         }
+        // Who set which field: an apply is laid over what is there, a change by anything else
+        // takes the fields it changes from the managers.
+        match (how, was) {
+            (How::Apply, was) => {
+                let force = call.asked.get("force").is_some_and(|force| force == "true");
+                sent = apply(was, sent, manager, &version_of(kind.group), force)?;
+            }
+            (How::Replace | How::Patch { .. }, Some(was)) => updated(&was, &mut sent),
+            _ => {}
+        }
         held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision))
     };
     let ((mut resources, hints), revision) = read.map_err(|refused| invalid(refused.join("; ")))?;
-    // Made only if it is not there, changed only as it was read: the store holds to that.
+    // Made only if it is not there, changed only as it was read: the store holds to that
+    // (an apply is laid over what is there, so it is read from that revision too).
     for resource in resources.iter_mut().filter(|resource| resource.key() == primary) {
         resource.metadata.revision = match how {
             How::Create => Some(0),
-            How::Apply => None,
+            How::Apply if !there => Some(0),
             _ => revision,
         };
     }
@@ -2690,5 +3053,116 @@ spec: {role: writer, subjects: [carol]}
         let hashed = kept_name(roles, "system:reader");
         assert!(hashed.len() == 45 && !hashed.contains(':'), "{hashed}");
         assert_ne!(hashed, kept_name(roles, "system:writer"));
+    }
+
+    fn map(data: Value) -> Value {
+        json!({ "apiVersion": "v1", "kind": "ConfigMap", "metadata": { "name": "m" }, "data": data })
+    }
+
+    fn who(object: &Value) -> Vec<(String, Vec<String>)> {
+        managers(object)
+            .into_iter()
+            .map(|m| (m.name, m.fields.iter().map(|at| at.join("/")).collect()))
+            .collect()
+    }
+
+    /// Two managers keep their own fields; a different value for one of another's is a 409 in
+    /// Kubernetes's words, and with force it is the forcer's; what a manager leaves out of its
+    /// next apply goes when no one else has it.
+    #[test]
+    fn apply_keeps_each_managers_fields_and_conflicts_on_the_others() {
+        let a = apply(None, map(json!({ "x": "1", "gone": "g" })), "a", "v1", false).unwrap();
+        let ab = apply(Some(a), map(json!({ "w": "2" })), "b", "v1", false).unwrap();
+        assert_eq!(ab["data"], json!({ "x": "1", "gone": "g", "w": "2" }));
+        let no = apply(Some(ab.clone()), map(json!({ "x": "9" })), "b", "v1", false).unwrap_err();
+        assert_eq!(no.code, StatusCode::CONFLICT);
+        assert_eq!(
+            no.why,
+            "Apply failed with 1 conflict: conflict with \"a\" using v1: .data.x"
+        );
+        // The same value is no conflict; both then have it.
+        let same = apply(Some(ab.clone()), map(json!({ "x": "1" })), "b", "v1", false).unwrap();
+        assert!(
+            who(&same)
+                .iter()
+                .all(|(_, fields)| fields.contains(&"f:data/f:x".to_string()))
+        );
+        // With force the field is b's, and a is now the one in conflict.
+        let forced = apply(Some(ab), map(json!({ "x": "9", "w": "2" })), "b", "v1", true).unwrap();
+        assert_eq!(forced["data"]["x"], "9");
+        let no = apply(
+            Some(forced.clone()),
+            map(json!({ "x": "1", "gone": "g" })),
+            "a",
+            "v1",
+            false,
+        )
+        .unwrap_err();
+        assert!(no.why.contains("conflict with \"b\" using v1: .data.x"), "{}", no.why);
+        // a leaves out what it set, and no other has: gone. What b has stays.
+        let a2 = apply(Some(forced), map(json!({ "keep": "k" })), "a", "v1", false).unwrap();
+        assert_eq!(a2["data"], json!({ "x": "9", "w": "2", "keep": "k" }));
+        assert_eq!(who(&a2).len(), 2);
+    }
+
+    /// An apply that changes nothing is not a change: not of the object, and not of the time
+    /// the manager is dated by. Many managers are refused past the cap.
+    #[test]
+    fn a_repeat_of_an_apply_changes_nothing() {
+        let mut once = apply(None, map(json!({ "x": "1" })), "a", "v1", false).unwrap();
+        // (A manager's time is a second's; make it one a second can differ from.)
+        once["metadata"]["managedFields"][0]["time"] = json!("2001-01-01T00:00:00Z");
+        let twice = apply(Some(once.clone()), map(json!({ "x": "1" })), "a", "v1", false).unwrap();
+        assert_eq!(once, twice);
+        let mut object = once;
+        let mut taken = 1; // (a is one)
+        loop {
+            let (key, name) = (format!("k{taken}"), format!("m{taken}"));
+            match apply(Some(object.clone()), map(json!({ key: "v" })), &name, "v1", false) {
+                Ok(next) => object = next,
+                Err(no) => {
+                    assert_eq!(no.code, StatusCode::UNPROCESSABLE_ENTITY);
+                    break;
+                }
+            }
+            taken += 1;
+        }
+        assert_eq!(taken, MANAGERS, "one manager more than {MANAGERS} is refused");
+    }
+
+    /// What is managed survives what is stored (FieldsV1, in the object as it was sent) and
+    /// keyed list items are told apart by their key, not by their place.
+    #[test]
+    fn managed_fields_round_trip_and_list_items_are_named_by_key() {
+        let deployment = |names: &[&str]| {
+            let containers: Vec<Value> = names.iter().map(|name| json!({ "name": name, "image": "i" })).collect();
+            json!({
+                "apiVersion": "apps/v1", "kind": "Deployment", "metadata": { "name": "web" },
+                "spec": { "replicas": 1, "template": { "spec": { "containers": containers } } },
+            })
+        };
+        let applied = apply(None, deployment(&["a", "b"]), "m", "apps/v1", false).unwrap();
+        let fields = who(&applied).remove(0).1;
+        assert!(
+            fields.contains(&r#"f:spec/f:template/f:spec/f:containers/k:{"name":"b"}/f:image"#.to_string()),
+            "{fields:?}"
+        );
+        let again = managers(&applied);
+        assert_eq!(again.len(), 1);
+        // An update of a field takes it from its manager; the rest stays.
+        let mut changed = applied.clone();
+        changed["spec"]["replicas"] = json!(3);
+        updated(&applied, &mut changed);
+        let left = who(&changed).remove(0).1;
+        assert!(
+            !left.contains(&"f:spec/f:replicas".to_string()) && left.len() == fields.len() - 1,
+            "{left:?}"
+        );
+        // What it costs: the managedFields of one Deployment, against the object.
+        let (with, without) = (
+            serde_json::to_vec(&applied).unwrap().len(),
+            serde_json::to_vec(&deployment(&["a", "b"])).unwrap().len(),
+        );
+        eprintln!("managedFields: {} bytes on {} of the object", with - without, without);
     }
 }
