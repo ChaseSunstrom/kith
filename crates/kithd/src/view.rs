@@ -624,6 +624,16 @@ pub async fn write(shared: &Shared, command: &Command) -> Result<(Done, u64), Er
                         return reply.map(|done| (done, index));
                     }
                 }
+                // This worker wrote more than a worker may for now: sent again once it may.
+                Ok(reply) if reply.status() == StatusCode::TOO_MANY_REQUESTS => {
+                    let wait = crate::raft::wait_of(&reply);
+                    if Instant::now() + wait > deadline {
+                        let refusal: serde_json::Value = reply.json().await.unwrap_or_default();
+                        return Err(unavailable(refusal["error"].as_str().unwrap_or("it asked to wait")));
+                    }
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
                 Ok(reply) => {
                     let refusal: serde_json::Value = reply.json().await.unwrap_or_default();
                     return Err(unavailable(refusal["error"].as_str().unwrap_or("it refused")));

@@ -334,6 +334,55 @@ mod tests {
         assert!(POLICY.contains("font-src 'self'"));
     }
 
+    /// What a worker reports (a unit's message, a Workload's notes) is a taken node's to say:
+    /// the page shows it as text. No script parses markup, `h` makes every string a text node,
+    /// and the words of a status come out of `summary` as they went in.
+    #[test]
+    fn ui_escapes_what_nodes_say() {
+        for (name, _, content) in FILES.iter().filter(|(name, ..)| name.ends_with(".js")) {
+            let content = std::str::from_utf8(content).unwrap();
+            for sink in [
+                "innerHTML",
+                "outerHTML",
+                "insertAdjacentHTML",
+                "document.write",
+                "srcdoc",
+                "createContextualFragment",
+                "DOMParser",
+                "parseFromString",
+                "javascript:",
+                "new Function",
+            ] {
+                assert!(!content.contains(sink), "{name} has {sink}");
+            }
+        }
+        let app = std::str::from_utf8(FILES[2].2).unwrap();
+        assert!(
+            app.contains("el.append(...children.flat(3)"),
+            "h's children are not appended as text"
+        );
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+        let check = "const { pathToFileURL } = await import('node:url');\n\
+            const { summary } = await import(pathToFileURL(process.argv[1]).href);\n\
+            const said = '<img src=x onerror=alert(1)>&amp;<b>';\n\
+            const unit = { ready: false, state: 'failed', message: `${said}\\nmore` };\n\
+            const workload = { status: { ready: 0, replicas: 1, containers: [unit], notes: [said] } };\n\
+            if (summary(workload) !== `0/1 ready: ${said}`) throw new Error(summary(workload));\n\
+            const node = { status: { state: 'error', message: said } };\n\
+            if (summary(node) !== `error: ${said}`) throw new Error(summary(node));\n\
+            console.log('ok');";
+        let run = std::process::Command::new("node")
+            .args(["--input-type=module", "-e", check])
+            .arg(dir.join("forms.js"))
+            .output();
+        let Ok(run) = run else {
+            eprintln!("skipped: no node to run forms.js with");
+            return;
+        };
+        let said = String::from_utf8_lossy(&run.stderr);
+        assert!(run.status.success() && run.stdout.starts_with(b"ok"), "{said}");
+    }
+
     #[test]
     fn ui_yaml_goes_to_json_and_back() {
         let ask = |asked: Value| converted(serde_json::from_value(asked).unwrap());

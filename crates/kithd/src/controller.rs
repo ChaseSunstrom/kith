@@ -1331,9 +1331,12 @@ impl Controller {
         // wait that long. What is not reported now still differs on the next pass.
         if !statuses.is_empty() && self.report.as_ref().is_none_or(|report| report.is_finished()) {
             let (shared, node) = (shared.clone(), node.to_string());
+            // In parts a control node takes from a worker, the largest report too.
             self.report = Some(tokio::spawn(async move {
-                if let Err(e) = shared.submit(kith_store::Command::Report { node, statuses }).await {
-                    eprintln!("kithd: saving status: {e}");
+                for report in crate::raft::in_parts(&node, statuses) {
+                    if let Err(e) = shared.submit(report).await {
+                        eprintln!("kithd: saving status: {e}");
+                    }
                 }
             }));
         }
