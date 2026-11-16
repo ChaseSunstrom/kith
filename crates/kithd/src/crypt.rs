@@ -102,6 +102,9 @@ pub struct Record {
     key: Option<Vec<u8>>,
     /// The key as this machine's TPM sealed it (tpm.rs).
     tpm: Option<Vec<u8>>,
+    /// The name of the TPM's storage key it was sealed under (34 bytes); empty when the
+    /// line cannot be read, which still counts as one: the seal is then not opened.
+    parent: Option<Vec<u8>>,
     pass: Option<Pass>,
     /// Whether somebody was shown this disk's recovery key, or typed it.
     seen: bool,
@@ -148,7 +151,7 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     rest.is_empty().then(|| bytes.collect())?
 }
 
-fn random<const N: usize>() -> [u8; N] {
+pub(crate) fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
     let filled = ring::rand::SystemRandom::new().fill(&mut bytes);
     filled.expect("the kernel gives random bytes");
@@ -261,6 +264,7 @@ impl Record {
                 "recovery" => record.recovery = unhex(value)?,
                 "key" => record.key = Some(unhex(value)?),
                 "tpm" => record.tpm = Some(unhex(value)?),
+                "tpm-parent" => record.parent = Some(unhex(value).filter(|name| name.len() == 34).unwrap_or_default()),
                 // (One that cannot be read opens nothing: the node asks as if it had none.)
                 "passphrase" => record.pass = Pass::parse(value),
                 "seen" => record.seen = true,
@@ -284,9 +288,11 @@ impl Record {
         if let Some(key) = &self.key {
             text += &format!("key: {}\n", hex(key));
         }
-        // (Before the peers: what does not fit the record's room is cut from its end.)
         if let Some(sealed) = &self.tpm {
             text += &format!("tpm: {}\n", hex(sealed));
+        }
+        if let Some(name) = &self.parent {
+            text += &format!("tpm-parent: {}\n", hex(name));
         }
         if let Some(pass) = &self.pass {
             text += &format!("passphrase: {}\n", pass.text());
@@ -299,8 +305,18 @@ impl Record {
                 text += &format!("{name}: {}\n", hex(key));
             }
         }
-        if !self.peers.is_empty() {
-            text += &format!("peers: {}\n", self.peers.join(" "));
+        // (Last, with as many whole peers as fit the room and its ending zero: the rest are
+        // left out, as a node finds its peers again.)
+        let mut line = "peers:".to_string();
+        for peer in &self.peers {
+            if text.len() + line.len() + peer.len() + 2 >= ROOM {
+                break;
+            }
+            line += &format!(" {peer}");
+        }
+        if line.len() > "peers:".len() {
+            text += &line;
+            text += "\n";
         }
         text
     }
@@ -321,11 +337,25 @@ impl Record {
     }
 
     /// Write it `at` this place of `disk` (a config partition's start and [`AT`]), over
-    /// all of what was there, and read it back.
+    /// all of what was there, and read it back. One that would not fit its room but by
+    /// peers left out is not written: the line it would cut is named.
     fn write(&self, disk: &File, at: u64) -> Result<(), String> {
         let mut bytes = self.text().into_bytes();
-        // (A zero ends it, so one byte less than the room; peers past it are left out.)
-        bytes.truncate(ROOM - 1);
+        // (A zero ends it, so one byte less than the room.)
+        if bytes.len() >= ROOM {
+            let mut end = 0;
+            let cut = bytes.split(|b| *b == b'\n').find(|line| {
+                end += line.len() + 1;
+                end >= ROOM
+            });
+            let cut = cut
+                .and_then(|line| line.split(|b| *b == b':').next())
+                .unwrap_or_default();
+            return Err(format!(
+                "the lock record would not fit its {ROOM} bytes: its {}: line would be cut, so it is not written",
+                String::from_utf8_lossy(cut)
+            ));
+        }
         bytes.resize(ROOM, 0);
         let mut back = vec![0; ROOM];
         let wrote = disk.write_all_at(&bytes, at).and_then(|()| disk.sync_all());
@@ -398,6 +428,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         recovery: wrap(&recovery, &key),
         key: Some(key.to_vec()),
         tpm: None,
+        parent: None,
         pass: None,
         peers: Vec::new(),
         seen: false,
@@ -652,7 +683,16 @@ pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Resu
     let sectors = sectors.ok().and_then(|size| size.trim().parse::<u64>().ok());
     let sectors = sectors.ok_or(format!("{}: how long is it?", device.display()))?;
     // (The TPM is asked first: it answers at once, and where no node is in reach.)
-    let own = |sealed: &Vec<u8>| crate::tpm::open().and_then(|mut tpm| tpm.unseal(sealed));
+    let own = |sealed: &Vec<u8>| {
+        match &record.parent {
+            Some(name) if name.len() != 34 => return Err(UNREAD.to_string()),
+            None => eprintln!(
+                "kithd: init: this machine's TPM seal is of the old form (no tpm-parent: line): which storage key answers is not checked; once open, it is sealed again with its name"
+            ),
+            Some(_) => {}
+        }
+        crate::tpm::open().and_then(|mut tpm| tpm.unseal(sealed, record.parent.as_deref()))
+    };
     let sealed = record.tpm.as_ref().filter(|_| record.key.is_none());
     let (key, by) = match (&record.key, sealed.map(own)) {
         (Some(key), _) => {
@@ -690,6 +730,63 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
         ..record.clone()
     };
     (with, shown(&recovery))
+}
+
+/// What a `tpm-parent:` line that cannot be read is: present, so the seal beside it is not
+/// opened without the check it stands for.
+const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
+
+/// `opened` sealed by this machine's TPM again (under the storage key whose name `record`
+/// keeps, if it keeps one), written in place of `record`'s seal in one write, read back,
+/// and unsealed from what was read: the record as it now is. When that does not open,
+/// `record` is written back as it was.
+fn sealed_anew<T: std::io::Read + std::io::Write>(
+    tpm: &mut crate::tpm::Tpm<T>,
+    record: &Record,
+    opened: &[u8],
+    config: &Path,
+) -> Result<Record, String> {
+    if record.parent.as_ref().is_some_and(|name| name.len() != 34) {
+        return Err(UNREAD.into());
+    }
+    let (sealed, parent) = tpm.seal(opened, record.parent.as_deref())?;
+    let with = Record {
+        tpm: Some(sealed),
+        parent: Some(parent),
+        ..record.clone()
+    };
+    let disk = File::options().read(true).write(true).open(config);
+    let disk = disk.map_err(|e| format!("writing the lock record: {e}"))?;
+    let back = with.write(&disk, AT).and_then(|()| Record::read(config));
+    // (As written but for peers that did not fit, which are left out.)
+    let back = back.and_then(|back| {
+        back.filter(|back| {
+            *back
+                == Record {
+                    peers: back.peers.clone(),
+                    ..with.clone()
+                }
+        })
+        .ok_or("the lock record did not read back as written".into())
+    });
+    let opens = back.and_then(|back| {
+        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref());
+        key.map(|key| (key, back))
+    });
+    match opens {
+        Ok((key, back)) if key == opened => Ok(back),
+        opens => {
+            let why = opens.err().unwrap_or("the TPM gave another key back".into());
+            match record.write(&disk, AT) {
+                Ok(()) => Err(format!(
+                    "the new seal did not open as written ({why}): the old one stays"
+                )),
+                Err(e) => Err(format!(
+                    "the new seal did not open as written ({why}), and the old record could not be put back ({e})"
+                )),
+            }
+        }
+    }
 }
 
 /// What its owner asks of this node's record: a passphrase to give its state (none: to take
@@ -798,6 +895,7 @@ pub async fn keep(
                 let public = |field: &str| spec[field].as_str().and_then(unhex).filter(|key| key.len() == 32);
                 let left = Record {
                     tpm: record.tpm.clone().filter(|_| seal),
+                    parent: record.parent.clone().filter(|_| seal),
                     pass: record.pass.clone().filter(|_| !shut),
                     duress: public("duress"),
                     duress_all: public("duressAll"),
@@ -812,7 +910,7 @@ pub async fn keep(
                             "kithd: the cluster no longer hands this node's key out: its passphrase no longer opens its state"
                         );
                     }
-                    (record.tpm, record.pass) = (left.tpm, left.pass);
+                    (record.tpm, record.parent, record.pass) = (left.tpm, left.parent, left.pass);
                     (record.duress, record.duress_all) = (left.duress, left.duress_all);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
@@ -853,19 +951,12 @@ pub async fn keep(
                     record.peers = peers;
                     write(&record);
                 }
-                // (Once the key is off the disk: beside it, a seal keeps nothing.)
-                let due = seal && record.key.is_none() && !(fits && record.tpm.is_some());
+                // (Once the key is off the disk: beside it, a seal keeps nothing. A seal of
+                // the old form, with no storage key's name, is made again with it.)
+                let due = seal && record.key.is_none() && !(fits && record.tpm.is_some() && record.parent.is_some());
                 if due && unsealed.is_none() {
-                    let sealed = crate::tpm::open().and_then(|mut tpm| tpm.seal(&opened));
-                    let kept = sealed.and_then(|sealed| {
-                        let with = Record {
-                            tpm: Some(sealed),
-                            ..record.clone()
-                        };
-                        write(&with)
-                            .then_some(with)
-                            .ok_or("the lock record could not be written".into())
-                    });
+                    let tpm = crate::tpm::open();
+                    let kept = tpm.and_then(|mut tpm| sealed_anew(&mut tpm, &record, &opened, &config));
                     match kept {
                         Ok(with) => {
                             eprintln!(
@@ -1544,6 +1635,96 @@ mod tests {
         assert_eq!(Record::parse(record).map(|record| record.pass), Some(None));
     }
 
+    /// Against a software TPM: a seal of the old form (no tpm-parent:) is sealed again with
+    /// the storage key's name, written, read back and opened; a name kept is sealed to
+    /// again, another one is not, and a line that cannot be read is not.
+    #[test]
+    fn tpm_parent_is_kept_when_an_old_seal_is_sealed_again() {
+        use crate::tpm::{ANOTHER, Tpm, tests};
+        let Some((_software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        let key = vec![3; 64]; // pragma: allowlist secret
+        let (old, name) = tpm.seal(&key, None).unwrap();
+        let path = std::env::temp_dir().join(format!("kith-crypt-tpm-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(old),
+            ..Record::default()
+        };
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+        let with = sealed_anew(&mut tpm, &record, &key, &path).unwrap();
+        assert_eq!(with.parent.as_ref(), Some(&name));
+        assert_ne!(with.tpm, record.tpm);
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        let again = sealed_anew(&mut tpm, &with, &key, &path).unwrap();
+        assert_eq!(again.parent, with.parent);
+        let other = Record {
+            parent: Some(vec![0; 34]),
+            ..again.clone()
+        };
+        assert_eq!(sealed_anew(&mut tpm, &other, &key, &path), Err(ANOTHER.to_string()));
+        let unread = Record {
+            parent: Some(vec![]),
+            ..again.clone()
+        };
+        assert_eq!(sealed_anew(&mut tpm, &unread, &key, &path), Err(UNREAD.to_string()));
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        // A new seal that does not open as written (its answer changed on the bus): the old
+        // record is put back, and the error says why.
+        tpm.0.flip = Some((crate::tpm::UNSEAL, 16, 1));
+        let refused = sealed_anew(&mut tpm, &again, &key, &path).unwrap_err();
+        assert!(
+            refused.contains(crate::tpm::FORGED) && refused.contains("the old one stays"),
+            "{refused}"
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        // More peers than the room holds: sealed anew all the same, with those that fit.
+        let crowded = Record {
+            peers: (0..400).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..again
+        };
+        let kept = sealed_anew(&mut tpm, &crowded, &key, &path).unwrap();
+        assert!(kept.peers.len() > 100 && kept.peers.len() < 400);
+        assert_eq!(Record::read(&path), Ok(Some(kept)));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A record that would not fit its room is refused, naming the line that would be cut;
+    /// only whole `peers:` entries are left out to make it fit.
+    #[test]
+    fn crypt_record_too_long_is_refused_not_cut() {
+        let path = std::env::temp_dir().join(format!("kith-crypt-long-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            ..Record::default()
+        };
+        record.write(&disk, AT).unwrap();
+        let long = Record {
+            tpm: Some(vec![5; 2100]),
+            ..record.clone()
+        };
+        let refused = long.write(&disk, AT).unwrap_err();
+        assert!(refused.contains("tpm:"), "{refused}");
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+        let many = Record {
+            peers: (0..400).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..record
+        };
+        many.write(&disk, AT).unwrap();
+        let read = Record::read(&path).unwrap().unwrap();
+        assert!(read.peers.len() > 100 && read.peers.len() < 400);
+        assert_eq!(read.peers[..], many.peers[..read.peers.len()]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn crypt_records_are_read_as_written() {
         let record = Record {
@@ -1551,6 +1732,7 @@ mod tests {
             recovery: vec![1, 2, 3],
             key: Some(vec![9; 64]),
             tpm: Some(vec![5; 300]),
+            parent: Some(vec![6; 34]),
             pass: Some(Pass {
                 cost: COST,
                 salt: vec![3; 16],
@@ -1566,7 +1748,13 @@ mod tests {
         let old =
             b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\nduress: 0606\n"; // pragma: allowlist secret
         let old = Record::parse(old).unwrap();
-        assert_eq!((old.seen, old.duress, old.duress_all), (false, None, None));
+        assert_eq!(
+            (old.seen, old.duress, old.duress_all, old.parent),
+            (false, None, None, None)
+        );
+        // A tpm-parent: that cannot be read is left out, but counts as there.
+        let unread = b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\ntpm: 00\ntpm-parent: 000b06\n"; // pragma: allowlist secret
+        assert_eq!(Record::parse(unread).map(|record| record.parent), Some(Some(vec![])));
         let path = std::env::temp_dir().join(format!("kith-crypt-record-{}", std::process::id()));
         let disk = File::options()
             .read(true)
