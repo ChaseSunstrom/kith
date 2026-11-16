@@ -1849,6 +1849,14 @@ kept in history and rolled back like the rest of the cluster's state.
   call starts from a fresh instance: nothing is remembered between calls.
 - Whoever may write KindDefinitions may run code in every namespace through
   them: grant that as you would grant admin.
+- A controller acts as whoever applied its KindDefinition (kith writes that one
+  down, name and key, on the KindDefinition), not as whoever applied a resource
+  of the kind: what it answers is made, and what it no longer answers removed,
+  only where that one may apply and delete it in the resource's namespace, and the
+  resource's status says whose right fell short. So the right to apply a custom
+  kind's resources is the right to what its controller makes of them in that
+  namespace. A KindDefinition applied before this makes nothing new until it is
+  applied again.
 
 Things to know: a rollback is asked of admission too (what it refuses does
 not come back; what it would change comes back as it was); a delete is not

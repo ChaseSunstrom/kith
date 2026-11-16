@@ -12,7 +12,8 @@
 //!   `{resource, owned}`, it answers `{status, resources}`. The resources are applied
 //!   as the resource's own (in its namespace, annotated like a Release's, removed when
 //!   no longer answered and when their owner goes) and the status fields are recorded,
-//!   with `resources` (what it owns) and `controller` (how the last run went).
+//!   with `resources` (what it owns) and `controller` (how the last run went). The
+//!   controller acts as whoever applied its `KindDefinition` ([`releases::writer_may`]).
 //
 // ponytail: a delete is not asked about; a rollback is asked, but comes back as it was. A module sees one resource and what it owns: one that has
 // to look further is a Workload on the watch API.
@@ -254,6 +255,11 @@ fn step(store: &Store, key: &str, answered: Result<Value, String>) -> Option<Ste
     let done = answered.and_then(|answer| {
         let resources = desired(store, owner, &answer)?;
         let done = releases::reconcile(store, key, &releases::recorded(owner), &resources, true)?;
+        // The controller acts as whoever applied its KindDefinition, asked on every run.
+        let definition = store
+            .definition(&owner.kind)
+            .ok_or_else(|| format!("no KindDefinition makes a {}", owner.kind))?;
+        releases::writer_may(store, definition, &resources, &done.delete)?;
         Ok((answer, done))
     });
     let revision = owner.metadata.revision;
@@ -375,7 +381,9 @@ mod tests {
         store
     }
 
-    const KIND: &str = "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: { name: gameserver }\n\
+    // (As the API writes it for the local socket.)
+    const KIND: &str = "apiVersion: kith.dev/v1\nkind: KindDefinition\n\
+        metadata: { name: gameserver, annotations: { 'kith.dev/written-by': 'local socket' } }\n\
         spec: { group: games.example.com, version: v1, kind: GameServer, schema: { type: object } }\n---\n\
         apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: { name: one, namespace: play }\nspec: { map: dust }\n";
 
@@ -440,6 +448,124 @@ mod tests {
         let said = said.status.unwrap()["controller"]["message"].to_string();
         assert!(said.contains("is there already"), "{said}");
         assert!(step(&store, "GameServer/play/gone", Err("x".into())).is_none());
+    }
+
+    /// bob, who may apply `kinds` (a YAML list's insides) in play, and delete them when `delete`;
+    /// the GameServer's KindDefinition applied by him, with his first key.
+    fn bob_defines(kinds: &str, delete: bool) -> Store {
+        let verbs = if delete { "apply, delete" } else { "apply" };
+        let role = format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: play }}\n\
+             spec: {{ rules: [{{ kinds: [{kinds}], verbs: [{verbs}], namespaces: [play] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-play }}\nspec: {{ role: play, subjects: [bob] }}\n"
+        );
+        let mut store = store(&role);
+        releases::bob_is(&mut store, 0);
+        for resource in Resource::from_source(&releases::by_bob(KIND, 0)).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        store
+    }
+
+    fn answers(kind: &str, name: &str) -> Value {
+        let spec = if kind == "Secret" {
+            json!({ "data": { "k": "v" } })
+        } else {
+            json!({ "data": {} })
+        };
+        json!({ "resources": [{ "apiVersion": "kith.dev/v1", "kind": kind,
+            "metadata": { "name": name }, "spec": spec }] })
+    }
+
+    fn message(step: &Step) -> String {
+        step.status.as_ref().unwrap()["controller"]["message"].to_string()
+    }
+
+    /// A controller makes what whoever applied its KindDefinition may make in that namespace,
+    /// and takes away what that one may delete: no Secret by way of a GameServer for one who
+    /// may not apply Secrets. What was made stays; the status says whose right fell short.
+    #[test]
+    fn controller_rights_a_controller_makes_nothing_the_definitions_writer_may_not() {
+        let key = "GameServer/play/one";
+        let store = bob_defines("ConfigMap", true);
+        let ok = step(&store, key, Ok(answers("ConfigMap", "c"))).unwrap();
+        assert_eq!(ok.apply.len(), 1, "{ok:?}");
+        assert_eq!(ok.status.as_ref().unwrap()["controller"]["state"], "ok");
+
+        let refused = step(&store, key, Ok(answers("Secret", "s"))).unwrap();
+        let said = message(&refused);
+        assert!(refused.apply.is_empty() && refused.delete.is_empty(), "{said}");
+        assert!(
+            said.contains("Secret/play/s: ")
+                && said.contains("KindDefinition/gameserver was applied by bob")
+                && said.contains("bob may not apply Secret in namespace play"),
+            "{said}"
+        );
+        assert_eq!(refused.status.as_ref().unwrap()["controller"]["state"], "error");
+
+        // Taking away is asked too: a stray goes only where its writer may delete.
+        let mut store = bob_defines("ConfigMap", false);
+        let mut stray = answers("ConfigMap", "c")["resources"][0].clone();
+        stray["metadata"]["namespace"] = "play".into();
+        stray["metadata"]["annotations"] = json!({ OWNER: key });
+        store.apply(serde_json::from_value(stray).unwrap()).unwrap();
+        let owns = json!({ "resources": ["ConfigMap/play/c"] });
+        store.set_status(key, Some(owns.clone())).unwrap();
+        let held = step(&store, key, Ok(json!({ "resources": [] }))).unwrap();
+        let said = message(&held);
+        assert!(held.delete.is_empty() && held.apply.is_empty(), "{said}");
+        assert!(
+            said.contains("bob may not delete ConfigMap in namespace play"),
+            "{said}"
+        );
+        // (And a writer who may delete takes it away.)
+        let mut store = bob_defines("ConfigMap", true);
+        let stray = serde_json::from_value(json!({ "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+            "metadata": { "name": "c", "namespace": "play", "annotations": { OWNER: key } }, "spec": { "data": {} } }));
+        store.apply(stray.unwrap()).unwrap();
+        store.set_status(key, Some(owns)).unwrap();
+        let gone = step(&store, key, Ok(json!({ "resources": [] }))).unwrap();
+        assert_eq!(gone.delete, ["ConfigMap/play/c"]);
+    }
+
+    /// A KindDefinition applied through the local socket works as before. One with nobody
+    /// written down, one that kithd does not act as, one whose writer is gone, and one whose
+    /// writer was made again under the name make nothing new; applied again, they do.
+    #[test]
+    fn controller_writer_a_definition_is_acted_on_only_for_the_writer_it_had() {
+        let key = "GameServer/play/one";
+        let answer = || Ok(answers("ConfigMap", "c"));
+        let made = |store: &Store| step(store, key, answer()).unwrap();
+        assert_eq!(made(&store(KIND)).apply.len(), 1);
+
+        for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
+            let kind = KIND.replace(", annotations: { 'kith.dev/written-by': 'local socket' }", written);
+            let step = made(&store(&kind));
+            let said = message(&step);
+            assert!(step.apply.is_empty() && said.contains("apply it again"), "{said}");
+        }
+
+        let mut store = bob_defines("ConfigMap", true);
+        assert_eq!(made(&store).apply.len(), 1);
+        store.delete("Identity/bob").unwrap();
+        let said = message(&made(&store));
+        assert!(
+            said.contains("there is no Identity bob") && made(&store).apply.is_empty(),
+            "{said}"
+        );
+        // Made again under the name, with another key: not the one that applied it.
+        releases::bob_is(&mut store, 1);
+        let again = made(&store);
+        let said = message(&again);
+        assert!(
+            again.apply.is_empty() && said.contains("an earlier Identity named bob"),
+            "{said}"
+        );
+        // Applied again by the new one: on it goes.
+        for resource in Resource::from_source(&releases::by_bob(KIND, 1)).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        assert_eq!(made(&store).apply.len(), 1);
     }
 
     #[test]

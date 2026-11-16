@@ -710,7 +710,7 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
             let mut resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
             // What a Source makes that makes more is the Source writer's too (its name and its
             // key's print), whatever the repository says of it.
-            let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source");
+            let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source" | "KindDefinition");
             if resources.iter().any(makes) {
                 for resource in resources.to_mut().iter_mut().filter(|resource| makes(resource)) {
                     let annotations = &mut resource.metadata.annotations;
@@ -1408,6 +1408,11 @@ mod tests {
         )]);
         settle(&mut store, &system);
         assert!(store.get("GameServer/kith-system/one").is_some() && store.get("Realm/north").is_some());
+        // A definition it brings is acted on as the Source's writer too (its controller's rights).
+        assert_eq!(
+            writer(&store, "KindDefinition/gameserver").as_deref(),
+            Some("local socket")
+        );
 
         apply(&mut store, SOURCE);
         let mut both = system.clone();

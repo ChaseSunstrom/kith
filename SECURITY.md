@@ -215,6 +215,15 @@ Only the newest version is fixed. There are no security releases of older ones.
   by the API; an Identity given a new certificate, or made again under the same name,
   has another key, and its Releases and Sources make nothing new and fetch nothing
   until it applies them again. The local socket's have no key.
+- **A custom kind's controller acts as whoever applied its KindDefinition.** The API
+  writes that one down on the KindDefinition as on a Release (name and key print,
+  whatever the body said, a rollback being whoever rolls back), and at each run what
+  the controller's module answered is asked for as that writer would be asked if they
+  applied it, and what it no longer answers, for leave to delete it; where the writer
+  may not, nothing new is made, what was made stays, and the resource's status names
+  the resource, the right and the writer. The controller does not act as whoever applied
+  the custom resource it runs for, so a custom kind lets someone ask for a thing without
+  the right to make its parts, as an operator does.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -870,7 +879,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - During an upgrade, a node from before this check neither writes the writer down nor
     checks it; and each Release and Source from before it makes nothing new until it is
     applied again.
-  - A WebAssembly controller still applies what it returns with the node's rights.
+  - A custom kind's WebAssembly controller acts as whoever applied its KindDefinition,
+    with what is said above of a Release's writer (name and key print written down by
+    the API, a Source that makes a KindDefinition writing its own, nothing new for a
+    writer gone or made again, a KindDefinition from before this check making nothing
+    new until it is applied again). So the right to apply a custom kind's resources is
+    the right to what its controller makes of them in that namespace, as far as the
+    definition's writer may make it: whoever may apply the kind in a namespace gets
+    there any ConfigMap, Workload or Secret the definition's writer could apply, and
+    the answer of a module the writer set is the writer's. Admission modules still run
+    on every write of their kind, whoever writes it.
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
   Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
