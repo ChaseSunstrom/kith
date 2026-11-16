@@ -683,6 +683,66 @@ fn forgotten_key_is_in_no_snapshot_or_log_entry() {
     });
 }
 
+/// Asked to drop the log at any index, openraft neither panics nor stops. Its `unwrap` of the
+/// log id at the clamped index (engine_impl.rs, `trigger_purge_log`) always finds one: an index
+/// under what was already dropped returns first, one past the snapshot is cut down to the
+/// snapshot's last index, and the list of log ids answers for every index from the last purged
+/// one to the last log id, which a snapshot built here or installed from a leader never passes.
+#[test]
+fn purge_asked_at_any_index_leaves_raft_running() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = Scratch::new();
+        let net = Net::default();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        net.0.lock().unwrap().insert(1, replica.raft.clone());
+        let members = [(1, openraft::BasicNode::default())];
+        replica
+            .raft
+            .initialize(members.into_iter().collect::<std::collections::BTreeMap<_, _>>())
+            .await
+            .unwrap();
+        let mut at = 0;
+        for n in 1..=5 {
+            at = write(
+                &net,
+                Command::Apply {
+                    resources: vec![config("a", &n.to_string())],
+                    at: n,
+                },
+            )
+            .await;
+        }
+        let raft = &replica.raft;
+        raft.trigger().snapshot().await.unwrap();
+        let wait = raft.wait(Some(std::time::Duration::from_secs(20)));
+        let snapped = |m: &openraft::RaftMetrics<u64, openraft::BasicNode>| m.snapshot.is_some_and(|s| s.index >= at);
+        wait.metrics(snapped, "snapshot built").await.unwrap();
+        let snapshot = raft.metrics().borrow().snapshot.unwrap().index;
+
+        let mut asks = vec![u64::MAX / 2, snapshot + 1, snapshot, 0, 0, 1, snapshot, u64::MAX / 2];
+        asks.push(raft.metrics().borrow().purged.map_or(0, |p| p.index));
+        for index in asks {
+            raft.trigger().purge_log(index).await.unwrap();
+        }
+        // The core takes these and the write in order: a panic would fail the write.
+        write(
+            &net,
+            Command::Apply {
+                resources: vec![config("b", "1")],
+                at: 6,
+            },
+        )
+        .await;
+        let state = raft.metrics().borrow().running_state.clone();
+        assert!(state.is_ok(), "raft stopped: {state:?}");
+        raft.shutdown().await.unwrap();
+    });
+}
+
 /// Put in `store` (as JSON) an earlier revision of NodeKey/n1 that holds [`WRAPPED`]: what a
 /// build from before the one-revision limit kept.
 fn keep_the_old_way(store: &mut serde_json::Value) {
