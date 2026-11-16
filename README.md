@@ -505,9 +505,16 @@ spec:
   most (a tenth of the reserve at least) is replaced, limit or none, one a count, once
   what the last one replaced wrote is gone, even when what filled the disk is no
   replica's root: kithd's own store, logs and Images, and Volumes, count against no
-  replica. The limit is counted, not held at the write: between two counts a fast writer
+  replica. On a kith OS state disk made since this was added (project quotas, kithd
+  root) the limit is held at the write instead: each pod is a project of its own, a write
+  past its limit fails (EDQUOT), in its root (a copy-up of an image's file too) and its
+  scratch, with the node's users or its own; only what kithd itself writes there is
+  counted (SECURITY.md); its units say it reached it, and kithd says at start and
+  in the Node's status which way it holds limits. Elsewhere it is counted, not held at
+  the write: between two counts a fast writer
   can pass it, a removed file held only by a descriptor in flight on a socket counts
-  nothing, and a kithd that is not root counts only what it can read (SECURITY.md). (`storage` limits a container only:
+  nothing, and a kithd that is not root counts only what it can read (SECURITY.md). A
+  limit under 64Ki is refused. (`storage` limits a container only:
   a Node's `reserved`, a seat's `reserve` and a Namespace's `quota` refuse it.)
 - **The image's user.** Each container is the user its image names, root included,
   with the capabilities a container runtime gives root and no more, in namespaces
@@ -582,7 +589,7 @@ spec:
   the state disk it counts toward its replica's `resources.storage` (and the reserve);
   in memory, what is written counts as the memory of the container that wrote it. (A
   disk `emptyDir`'s `sizeLimit` is added to the storage of the first container that
-  mounts it; a memory one's limits nothing.)
+  mounts it, raised to 64Ki where it is less; a memory one's limits nothing.)
 - **`envFrom`** gives every key of a ConfigMap or a Secret as a variable (one that
   cannot name a variable, with a `=` in it, is passed over); a variable in `env` of the
   same name wins. As with `env`, a changed value replaces the container.
@@ -1627,7 +1634,8 @@ Not answered, each refused in words:
   commonly says is carried, as [kith's own fields](#what-a-container-is-given):
   volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
   `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage`
-  with a disk `emptyDir`'s `sizeLimit` as `resources.storage`.
+  with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised
+  to it).
 - A StatefulSet with a claim template and more than one replica; a CronJob in a
   time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
 - `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
@@ -4050,6 +4058,7 @@ sh ci/vm.sh --test update                               # and its two slots: an 
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
 sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
+sh ci/vm.sh --test quota                                # pods' storage limits held at the write, across a restart
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
 sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)
 KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real DHCP server (dnsmasq)

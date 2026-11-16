@@ -753,12 +753,13 @@ fn quantities(cx: &mut Cx, mut res: Map, at: &str) -> Option<Value> {
     // What it may write outside its volumes is a limit, not an amount it is placed by: the
     // request is only said.
     let storage = cx.text(&mut limits, "ephemeral-storage", &lp);
-    let storage = storage.filter(|q| match whole_bytes(q) {
-        Some(_) => true,
+    let storage = storage.and_then(|q| match whole_bytes(&q) {
+        Some(bytes) if bytes < STORAGE_FLOOR => Some(STORAGE_FLOOR.to_string()),
+        Some(_) => Some(q),
         None => {
             let at = join(&lp, "ephemeral-storage");
             cx.note(&at, &format!("not translated: `{q}` is not a whole number of bytes"));
-            false
+            None
         }
     });
     cx.rest(requests, &rp);
@@ -771,6 +772,10 @@ fn quantities(cx: &mut Cx, mut res: Map, at: &str) -> Option<Value> {
         ("storage", some(storage)),
     ]))
 }
+
+/// kith's least `resources.storage`: what a pod's own directories hold. A limit under it,
+/// as an `ephemeral-storage` or an emptyDir's `sizeLimit`, is raised to it.
+const STORAGE_FLOOR: u64 = 64 << 10;
 
 fn whole_bytes(q: &str) -> Option<u64> {
     Quantity::try_from(q.to_string()).ok()?.bytes()
@@ -790,6 +795,7 @@ fn add_storage(units: &mut [Value], scratch: &str, size: &str) -> Option<(String
     let own = c["resources"]["storage"].as_str().and_then(whole_bytes);
     c["resources"]["storage"] = match (own, whole_bytes(size)) {
         (Some(own), Some(bytes)) => json!(own.saturating_add(bytes).to_string()),
+        (None, Some(bytes)) if bytes < STORAGE_FLOOR => json!(STORAGE_FLOOR.to_string()),
         _ => json!(size),
     };
     Some((c["name"].as_str().unwrap_or_default().to_string(), own.is_none()))
@@ -2540,6 +2546,50 @@ spec:
                 .any(|line| line.contains("limits.ephemeral-storage") && line.contains("whole number of bytes")),
             "{said:?}"
         );
+    }
+
+    /// A sizeLimit under kith's least `resources.storage` (64Ki), on a container with no limit
+    /// of its own, is raised to it rather than refused.
+    #[test]
+    fn import_size_limit_under_64ki_is_raised() {
+        let chart = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tiny }
+spec:
+  selector: { matchLabels: { app: tiny } }
+  template:
+    metadata: { labels: { app: tiny } }
+    spec:
+      containers:
+        - name: web
+          image: nginx
+          volumeMounts: [{ name: work, mountPath: /work }]
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 1Ki }
+"#;
+        let (all, said) = run(chart);
+        for r in &all {
+            r.clone()
+                .validated()
+                .unwrap_or_else(|e| panic!("{}: {e}: {said:?}", r.key()));
+        }
+        let containers = &find(&all, "Workload", "tiny").spec["template"]["containers"];
+        assert_eq!(containers[0]["resources"], json!({ "storage": "65536" }));
+        // The same for a container's own `limits.ephemeral-storage`.
+        let chart = chart.replace("emptyDir: { sizeLimit: 1Ki }", "emptyDir: {}").replace(
+            "image: nginx",
+            "image: nginx\n          resources: { limits: { ephemeral-storage: 1Ki } }",
+        );
+        let (all, said) = run(&chart);
+        for r in &all {
+            r.clone()
+                .validated()
+                .unwrap_or_else(|e| panic!("{}: {e}: {said:?}", r.key()));
+        }
+        let containers = &find(&all, "Workload", "tiny").spec["template"]["containers"];
+        assert_eq!(containers[0]["resources"], json!({ "storage": "65536" }));
     }
 
     #[test]
