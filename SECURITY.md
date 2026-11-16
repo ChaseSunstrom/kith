@@ -416,7 +416,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   or a stolen certificate that reaches a hole there, is not held back by this. That is
   the split's job (`docs/adr-privilege.md`, T-0334). Nor does it say an effect is impossible: root
   without `SYS_PTRACE` can still trace root's own processes (the same user), and root can
-  write `/proc/sys` with file permissions alone; neither is covered by the cut. A pod on a hardened node can still be root inside
+  write `/proc/sys` with file permissions alone; neither is covered by the cut. Untried on
+  a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off already leaves
+  no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a memlock limit,
+  which the list does not have); no VM test runs either. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container that keeps the node's
   users and is not root is still the node's user of its number, with whatever files on
   the node that user owns; one that would be of root's group (its image says `1001:0`,

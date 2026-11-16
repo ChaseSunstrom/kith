@@ -186,7 +186,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    thread's) is that and its CapEff is not cut, the pod that is
                    root has that CapBnd, and a pod
                    that is root, a container with no system call filter and a
-                   sandbox inside a container (bubblewrap) all run; needs what
+                   sandbox inside a container (bubblewrap) all run, and so do
+                   a volume of each node written and read back, a shared volume
+                   of the first written from the second, a pod of a user who is
+                   not root, and three pods behind a Service; needs what
                    --test pods needs, less socat
   --help          this text
 
@@ -1119,8 +1122,89 @@ EOF
             job boxed n1 '"image":"kith.test/sandbox:1","userNamespaces":true,"command":["/bin/bwrap","--unshare-user","--uid","0","--gid","0","--unshare-pid","--ro-bind","/","/","--proc","/proc","--dev","/dev","/bin/pod","self"]'
             grep -q 'nested: pid 2, uid 0' "$work/boxed.out" || fail "the sandbox did not say where it found itself: $(cat "$work/boxed.out" "$work/boxed.err")"
 
+            # What the node is for still runs on the cut node. Every unit starts through the
+            # shim kithd execs (a container's volumes, its network, its user), whose own sets are
+            # the fourteen.
+            # (a) A volume of the node's own, on each node: one pod writes it, the next reads it.
+            for node in n1 n2; do
+                job "keep-a-$node" "$node" '"image":"kith.test/pod:1","command":["/bin/pod","count","/state"]'
+                job "keep-b-$node" "$node" '"image":"kith.test/pod:1","command":["/bin/pod","count","/state"]'
+                grep -q 'began: step 1' "$work/keep-a-$node.out" || fail "the pod on $node wrote nothing to its node's volume: $(cat "$work/keep-a-$node.out" "$work/keep-a-$node.err")"
+                grep -q 'went on from step 1: step 2' "$work/keep-b-$node.out" || fail "the next pod on $node did not read what the first wrote to the volume: $(cat "$work/keep-b-$node.out" "$work/keep-b-$node.err")"
+                echo "vm.sh: a volume of node $node: $(cat "$work/keep-a-$node.out"); then: $(cat "$work/keep-b-$node.out")" >&2
+            done
+            # (b) A volume of the first node, shared, mounted by a container on the second (what
+            # --test share does of it): written there, seen on the first.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"data"},"spec":{"node":"n1","path":"all","shared":true}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on1"},"spec":{"node":"n1","path":"own"}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on2"},"spec":{"node":"n2","path":"own"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the shared volume was not applied"
+            keygen() { # NAME NODE FILE: a Job that makes FILE in the shared volume (kith's own keygen, which refuses one that is there), on NODE
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/kith:1","command":["/bin/kith","package","keygen","/data/$3"],
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"on${2#n}","path":"/here"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+                waited=0
+                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 180 ] || fail "waited for the Job $1; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
+            }
+            # (The first mount asks the other node for 2 seconds only; on a loaded machine the
+            # first packet over the mesh may take longer, so a Job that was refused for that is
+            # made again, a few times, and each refusal is said.)
+            for attempt in 1 2 3 4 5; do
+                keygen "shared-write-$attempt" n2 from-n2
+                case $line in *'does not serve it'*) echo "vm.sh: attempt $attempt: $line" >&2 ;; *) break ;; esac
+                sleep 10
+            done
+            printf '%s\n' "$line" | grep -Eq '^[0-9]+ succeeded' || fail "the container on n2 made nothing in the first node's shared volume: $line: $(cat "$work/shared-write-$attempt.err")"
+            grep -aq 'kithd: mounted volume default/data from node n1' "$work/n2.log" || fail "the second node did not say it mounted the first node's volume"
+            grep -aq 'kithd: serving [0-9]* shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
+            keygen shared-again n1 from-n2
+            printf '%s\n' "$line" | grep -Eq '^[0-9]+ failed' || fail "the container on n1 made a file that the one on n2 made: $line"
+            grep -q '/data/from-n2: File exists' "$work/shared-again.err" || fail "the container on n1 did not find what the one on n2 wrote: $(cat "$work/shared-again.err")"
+            echo "vm.sh: a shared volume of n1, written from n2 and seen on n1: $(grep -a 'File exists' "$work/shared-again.err" | head -n 1)" >&2
+            # (c) A pod whose container is not root. (kith has no command that runs in a
+            # running pod, and the probe that would, `exec`, is not run yet: what kithd does in
+            # a pod's namespaces for itself is the network a pod joins as it starts, which each
+            # pod here did, and the /proc/PID/root of a pod that is given an input device as
+            # it is plugged, which no VM here has.)
+            job lowly n2 '"image":"kith.test/pod:user","command":["/bin/pod","tell"]'
+            grep -q 'tell: started uid 1000 ' "$work/lowly.out" || fail "the pod of a user who is not root did not start as that user: $(cat "$work/lowly.out" "$work/lowly.err")"
+            grep -m1 'tell: started uid 1000 ' "$work/lowly.out" | sed 's/^/vm.sh: the pod that is not root: /' >&2
+            # (d) Three pods of one Workload on the two nodes, each listening on port 80 at an
+            # address of its own on the mesh, and a Service: a pod on the second node asks the
+            # Service's name and is answered by each.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"web","labels":{"app":"web"}},"spec":{"replicas":3,"template":{"pod":true,"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","serve"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}}}]}}},
+ {"apiVersion":"kith.dev/v1","kind":"Service","metadata":{"name":"web"},"spec":{"selector":{"app":"web"},"ports":[{"port":80}]}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pods of web were not applied"
+            waited=0
+            until line=$(units Workload web) && [ "${line%% *}" = 3 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "waited for three pods of web to be ready; the Workload says: $line"
+                sleep 1
+            done
+            [ "$(printf '%s\n' $line | grep : | sort -u | grep -c :)" = 3 ] || fail "the three pods of web do not have an address each on the mesh: $line"
+            webs=$line
+            job asker n2 '"image":"kith.test/pod:user","command":["/bin/pod","ask","web.default.svc.cluster.local","80"]'
+            for heard in web-0 web-1 web-2; do
+                grep -q "$heard" "$work/asker.out" || fail "the pod that asked the Service did not hear $heard: $(cat "$work/asker.out" "$work/asker.err")"
+            done
+            ! grep -q 'failed: ' "$work/asker.out" || fail "the pod that asked was not always answered: $(cat "$work/asker.out")"
+            echo "vm.sh: three pods of web ready ($webs); a pod on n2 asked the Service and heard: $(tr '\n' ' ' <"$work/asker.out")" >&2
+
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh whose policy turns off exec units, VM paths and /v1/run cut their bounding set (kithd's own CapBnd, and a later thread's, was the fourteen a root pod keeps and its CapEff was not cut; each node's status named what was kept; the pod that is root had the same CapBnd) and ran a pod that is root (on the joined node), a container with no filter on its system calls and a sandbox inside a container"
+            echo "vm.sh: ok: two nodes on the mesh whose policy turns off exec units, VM paths and /v1/run cut their bounding set (kithd's own CapBnd, and a later thread's, was the fourteen a root pod keeps and its CapEff was not cut; each node's status named what was kept; the pod that is root had the same CapBnd) and ran a pod that is root (on the joined node), a container with no filter on its system calls and a sandbox inside a container; a volume of each node's own was written by one pod and read by the next, a shared volume of the first node was written from the second and seen on the first, a pod of a user who is not root started, and three pods of a Workload on both nodes were answered through their Service by a pod on the second"
             exit 0
         fi
         if [ "$test" = kube ]; then

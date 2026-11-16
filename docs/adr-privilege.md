@@ -351,6 +351,9 @@ before any of the split:
   **a hole inside kithd is not held back by this**: that is the split's job ("Order of
   work after Step A" below, T-0334). Neither is every effect covered: root without `SYS_PTRACE` can still
   trace root's own processes, and root can write `/proc/sys` with file permissions alone.
+  Untried on a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off
+  already leaves no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a
+  memlock limit, which the list does not have); no VM test runs either.
   kithd execs itself only as the exec shim, which serves nothing (it waits for a byte and
   execs the unit's command), so no serving process has the bounding set for its permitted set:
   `Handle::in_dev` (`/proc/PID/root` of a container), `storage::unlinked` (`/proc/PID/fd`)
