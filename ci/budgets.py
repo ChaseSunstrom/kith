@@ -412,6 +412,13 @@ def main():
         results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
         print(f"     kithd: of it {own / MB:.2f} MB its own, {(rss - own) / MB:.2f} MB pages of its binary; three starts: {', '.join(f'{r / MB:.2f}' for r, _ in starts)} MB")
         results.extend(relro_sealed(bin_dir, tmp, -1 if self_test else 0))
+        # And what it runs is in the order it is linked by (ci/order.py --stale): held here,
+        # where the file is traced. A CI runner's kithd is not the traced one (33 functions
+        # the file does not name ran there: its errors' texts, its C library's), so a count
+        # that passed there would miss what it is for; CI prints it in a step of its own.
+        if not self_test and not os.environ.get("CI"):
+            order = os.path.join(os.path.dirname(os.path.abspath(__file__)), "order.py")
+            results.append(subprocess.run([sys.executable, order, "--stale"]).returncode == 0)
         timed = medians(bin_dir, tmp, 1 if self_test else RUNS)
         for name in TIMED:
             budget = 0.001 if self_test else TIME_BUDGETS[name]

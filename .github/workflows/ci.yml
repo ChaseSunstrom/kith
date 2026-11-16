@@ -46,7 +46,9 @@ jobs:
         run: python3 ci/order.py --self-test && python3 ci/order.py --check
       # ... and names what kithd runs today: code written since the last trace that runs at start
       # or idle is linked wherever the compiler put it (43 such functions once cost 2 MB).
-      # Printed, not enforced, until a run here says how many another CPU's own functions are.
+      # Printed, not enforced: a runner's kithd is not the traced one (33 functions the file
+      # does not name ran here: its errors' texts, its C library's). It is held where the file
+      # is traced: ci/budgets.py runs it off CI.
       - name: kithd's order file names what kithd runs (printed, not enforced)
         run: python3 ci/order.py --stale || true
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
