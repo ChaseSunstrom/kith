@@ -653,7 +653,8 @@ async fn rollback(
     permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
     reach_of(&shared, &caller, &[place_of(&key)])?;
     let (to, at) = (options.to, kith_api::store::now());
-    // (What the cluster has forgotten or wiped is in the versions before it.)
+    // (A NodeKey keeps no earlier version, and one control node may still hold some a
+    // store from before that kept, where another has cut them: a rollback would differ.)
     if key.starts_with("NodeKey/") {
         let why = "a NodeKey is not rolled back: `kith node lock`, `unlock`, `seal` and `wipe` change it";
         return Err(ApiError::Store(Error::Invalid(why.into())));

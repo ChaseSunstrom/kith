@@ -683,13 +683,33 @@ fn forgotten_key_is_in_no_snapshot_or_log_entry() {
     });
 }
 
-/// A node that stopped after its snapshot took in a forget, but before it dropped its log:
-/// nothing applies that write again, so the store drops the log as it is opened.
-#[test]
-fn forgotten_key_left_in_the_log_is_dropped_at_open() {
+/// Put in `store` (as JSON) an earlier revision of NodeKey/n1 that holds [`WRAPPED`]: what a
+/// build from before the one-revision limit kept.
+fn keep_the_old_way(store: &mut serde_json::Value) {
+    let mut earlier = node_key(WRAPPED);
+    earlier.metadata.revision = Some(1);
+    let revision = serde_json::json!({ "at": 1, "resource": earlier });
+    store["resources"]["NodeKey/n1"]
+        .as_array_mut()
+        .unwrap()
+        .insert(0, revision);
+}
+
+/// A store with NodeKey/n1 forgotten, its key in an earlier revision still.
+fn old_store() -> Store {
+    let mut store = Store::default();
+    store.apply(node_key(WRAPPED)).unwrap();
+    store.apply(node_key("")).unwrap();
+    let mut old = serde_json::to_value(&store).unwrap();
+    keep_the_old_way(&mut old);
+    serde_json::from_value(old).unwrap()
+}
+
+/// A node stopped where its snapshot (at index 3) has the key forgotten and its log has the
+/// write of the key (index 2) still; `old_way`: that snapshot keeps the key's earlier revision.
+fn stopped_before_the_log_was_dropped(dir: &std::path::Path, old_way: bool) {
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
     use openraft::{BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, RaftSnapshotBuilder};
-    let dir = Scratch::new();
     let apply = |resources| EntryPayload::Normal(Command::Apply { resources, at: 1 });
     let members = std::collections::BTreeMap::from([(1, BasicNode::default())]);
     // (As `initialize` writes it: who is in the cluster at index 0, then the first leader's blank.)
@@ -707,26 +727,136 @@ fn forgotten_key_left_in_the_log_is_dropped_at_open() {
         payload,
     };
     let entries: Vec<_> = payloads.into_iter().enumerate().map(entry).collect();
+    block(async {
+        let mut log = Log::open(&dir.join("log.redb")).unwrap();
+        let mut machine = Machine::open(dir, Arc::new(|| {})).unwrap();
+        log.put(entries.clone()).unwrap();
+        log.save_vote(&openraft::Vote::new_committed(1, 1)).await.unwrap();
+        log.save_committed(Some(entries[3].log_id)).await.unwrap();
+        machine.apply(entries).await.unwrap();
+        machine.build_snapshot().await.unwrap();
+    });
+    if old_way {
+        let file = dir.join("snapshot.json");
+        let mut snapshot: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        keep_the_old_way(&mut snapshot["state"]["store"]);
+        std::fs::write(&file, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    }
+}
+
+/// A node that stopped after its snapshot took in a forget, but before it dropped its log:
+/// nothing applies that write again, so the store drops the log as it is opened. Opened
+/// again, with nothing left to drop, it drops nothing: the entries kept for a follower stay.
+#[test]
+fn forgotten_key_left_in_the_log_is_dropped_at_open() {
+    let dir = Scratch::new();
+    stopped_before_the_log_was_dropped(&dir.0, false);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        {
-            let mut log = Log::open(&dir.0.join("log.redb")).unwrap();
-            let mut machine = Machine::open(&dir.0, Arc::new(|| {})).unwrap();
-            log.put(entries.clone()).unwrap();
-            log.save_vote(&openraft::Vote::new_committed(1, 1)).await.unwrap();
-            log.save_committed(Some(entries[3].log_id)).await.unwrap();
-            machine.apply(entries).await.unwrap();
-            machine.build_snapshot().await.unwrap();
-        }
         assert!(
             holds(&dir.0, WRAPPED).await,
             "the log holds the key, as a node that stopped there left it"
         );
+        let net = Net::default();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        net.0.lock().unwrap().insert(1, replica.raft.clone());
+        caught_up(&replica.raft, 3, 3).await;
+        // Entries past the snapshot, then one taken at the last of them, which keeps them.
+        let last = write(
+            &net,
+            Command::Apply {
+                resources: vec![config("a", "1")],
+                at: 2,
+            },
+        )
+        .await;
+        replica.raft.trigger().snapshot().await.unwrap();
+        let wait = replica.raft.wait(Some(std::time::Duration::from_secs(20)));
+        let built = |m: &openraft::RaftMetrics<u64, openraft::BasicNode>| m.snapshot.is_some_and(|s| s.index >= last);
+        wait.metrics(built, "a snapshot").await.unwrap();
+        replica.raft.shutdown().await.unwrap();
+        net.0.lock().unwrap().clear();
+        drop(replica);
+        assert!(!holds(&dir.0, WRAPPED).await);
+
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        caught_up(&replica.raft, last, 3).await;
+        // (What is not done can only be waited for: a drop at open is asked for at once.)
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let purged = replica.raft.metrics().borrow().purged.map(|at| at.index);
+        assert_eq!(purged, Some(3), "a second open dropped the log up to {purged:?}");
+        replica.raft.shutdown().await.unwrap();
+    });
+}
+
+/// A snapshot written before a NodeKey kept one revision, with the forgotten key in an
+/// earlier one: the store cuts it as it opens, and drops the log that has it.
+#[test]
+fn forgotten_key_kept_from_before_is_cut_at_open() {
+    let dir = Scratch::new();
+    stopped_before_the_log_was_dropped(&dir.0, true);
+    let snapshot = std::fs::read_to_string(dir.0.join("snapshot.json")).unwrap();
+    assert!(snapshot.contains(WRAPPED));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
         let replica = crate::open(&dir.0, 1, Net::default(), Arc::new(|| {})).await.unwrap();
         caught_up(&replica.raft, 3, 3).await;
+        replica.raft.shutdown().await.unwrap();
+        drop(replica);
+        assert!(!holds(&dir.0, WRAPPED).await);
+    });
+}
+
+/// The same of a snapshot another node sends, and of a store brought in whole.
+#[test]
+fn forgotten_key_kept_from_before_is_cut_as_it_comes_in() {
+    use openraft::storage::RaftStateMachine;
+    let dir = Scratch::new();
+    block(async {
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {})).unwrap();
+        let mut state = serde_json::to_value(crate::State::default()).unwrap();
+        state["store"] = serde_json::to_value(old_store()).unwrap();
+        let meta = openraft::SnapshotMeta {
+            last_log_id: Some(openraft::LogId::new(openraft::CommittedLeaderId::new(1, 1), 3)),
+            last_membership: Default::default(),
+            snapshot_id: "sent".into(),
+        };
+        let sent = std::io::Cursor::new(serde_json::to_vec(&state).unwrap());
+        machine.install_snapshot(&meta, Box::new(sent)).await.unwrap();
+        assert!(!holds(&dir.0, WRAPPED).await);
+        assert!(
+            !serde_json::to_string(&machine.state.lock().unwrap().store)
+                .unwrap()
+                .contains(WRAPPED)
+        );
+    });
+    let dir = Scratch::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let net = Net::default();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        net.0.lock().unwrap().insert(1, replica.raft.clone());
+        let alone = std::collections::BTreeMap::from([(1, openraft::BasicNode::default())]);
+        replica.raft.initialize(alone).await.unwrap();
+        let index = write(&net, Command::Import { store: old_store() }).await;
+        caught_up(&replica.raft, index, index).await;
+        let history = replica
+            .state
+            .lock()
+            .unwrap()
+            .store
+            .history("NodeKey/n1")
+            .map(<[_]>::len);
+        assert_eq!(history.ok(), Some(1));
         replica.raft.shutdown().await.unwrap();
         drop(replica);
         assert!(!holds(&dir.0, WRAPPED).await);

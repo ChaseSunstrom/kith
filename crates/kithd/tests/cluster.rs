@@ -416,7 +416,9 @@ fn log_entries(file: &Path) -> Result<String, String> {
 }
 
 /// The same of a running node, read from a copy of its log (kithd holds the file's lock):
-/// `None` while the copy, taken in the middle of a write, does not read.
+/// `None` while the copy, taken in the middle of a write, does not read. A copy of a live
+/// file can be torn, so a wait on this is retried and proves nothing alone: the proof is
+/// [`store_holds`], read once the nodes have stopped.
 fn running_log_entries(node: &Node) -> Option<String> {
     let copy = node.dir.join("log-copy.redb");
     let _ = std::fs::remove_file(&copy);

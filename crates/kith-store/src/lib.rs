@@ -145,6 +145,7 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         }
         Command::Import { store: imported } => {
             *store = imported;
+            store.cut_node_key_histories();
             Ok(Done::Nothing)
         }
     }
@@ -175,44 +176,70 @@ pub fn changed(reply: &Reply) -> Vec<String> {
 }
 
 /// The wrapped key a NodeKey holds; `None` for one that holds none (wiped, forgotten), or
-/// another kind.
-fn wrapped(key: &Resource) -> Option<&str> {
+/// another kind. Public so that what writes a NodeKey can be held to what this reads.
+pub fn wrapped(key: &Resource) -> Option<&str> {
     let wrapped = key.spec["wrapped"].as_str().filter(|wrapped| !wrapped.is_empty());
     wrapped.filter(|_| key.kind == "NodeKey")
 }
 
-/// Whether `command` writes a NodeKey: refused, its entry in the log still holds the
-/// wrapped key it was sent with.
-fn names_a_key(command: &Command) -> bool {
-    matches!(command, Command::Apply { resources, .. } if resources.iter().any(|r| r.kind == "NodeKey"))
-}
-
-/// Whether an answer says a NodeKey's wrapped key went out of the store (wiped, forgotten,
-/// replaced or deleted): the store keeps no earlier revision of one, and the node that
-/// applied it then snapshots and drops its log up to there ([`scrub`]).
-fn drops_a_key(reply: &Reply) -> bool {
-    match reply {
-        Ok(Done::Changes(changes)) => changes.iter().any(|change| {
-            let before = change.before.as_ref().and_then(wrapped);
-            before.is_some() && before != wrapped(&change.after)
-        }),
-        Ok(Done::Deleted(gone)) => wrapped(gone).is_some(),
-        Ok(Done::Nothing) | Err(_) => false,
+/// The wrapped keys `command` carries in the log (`(NodeKey, wrapped key)`): those of the
+/// NodeKeys it applies, and of every revision of every NodeKey in a store it brings in.
+fn carried(command: &Command) -> Vec<(String, String)> {
+    let pair = |key: &Resource| wrapped(key).map(|wrapped| (key.key(), wrapped.to_string()));
+    match command {
+        Command::Apply { resources, .. } => resources.iter().filter_map(pair).collect(),
+        Command::Import { store } => store
+            .list(Some("NodeKey"))
+            .flat_map(|live| store.history(&live.key()).unwrap_or_default())
+            .filter_map(|revision| pair(&revision.resource))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Snapshot the store at the log's `index` or later, then drop the log up to there: a key
-/// the write at `index` took out of the store is then in no file Raft keeps on this node.
-/// openraft drops a follower's log at once and a leader's once no replication still reads
-/// it: it is asked again while it has not. A node that stops first does it at its next
-/// start: as it applies that write again or, the snapshot having it already, as it opens
-/// a store with a NodeKey that holds no key. What is done already is not done again.
-async fn scrub(raft: &Raft, index: u64) {
+/// The first NodeKey of `carried` whose wrapped key `store` no longer has: a refused write,
+/// a revision cut, or one replaced since.
+fn left(store: &Store, carried: &[(String, String)]) -> Option<String> {
+    let held = |key: &str| store.list(Some("NodeKey")).any(|live| wrapped(live) == Some(key));
+    carried.iter().find(|(_, key)| !held(key)).map(|(name, _)| name.clone())
+}
+
+/// The NodeKey whose wrapped key an answer says went out of the store (wiped, forgotten,
+/// replaced or deleted): the store keeps no earlier revision of one, and the node that
+/// applied it then snapshots and drops its log up to there ([`scrub`]).
+fn drops_a_key(reply: &Reply) -> Option<String> {
+    match reply {
+        Ok(Done::Changes(changes)) => changes
+            .iter()
+            .find(|change| {
+                let before = change.before.as_ref().and_then(wrapped);
+                before.is_some() && before != wrapped(&change.after)
+            })
+            .map(|change| change.after.key()),
+        Ok(Done::Deleted(gone)) => wrapped(gone).map(|_| gone.key()),
+        Ok(Done::Nothing) | Err(_) => None,
+    }
+}
+
+/// Snapshot the store at the log's `index` or later, then drop the log up to there: the
+/// wrapped key of `key` that the write at `index` took out of the store (or that it carried,
+/// refused) is then in no file Raft keeps on this node. openraft drops a follower's log at
+/// once and a leader's once no replication still reads it: it is asked again until it has,
+/// or Raft stops. (Never given up: a drop still asked for when a later snapshot is built
+/// would be moved back by openraft's own, which a debug build stops on.) A node that stops
+/// first does it at its next start: as it applies that write again or, the snapshot having
+/// it already, as it finds the log holds a key the store does not ([`open`]).
+async fn scrub(raft: &Raft, index: u64, key: &str) {
     type Metrics = openraft::RaftMetrics<NodeId, openraft::BasicNode>;
     let built = |m: &Metrics| m.snapshot.is_some_and(|s| s.index >= index);
     let purged = |m: &Metrics| m.purged.is_some_and(|p| p.index >= index);
     let wait = || raft.wait(Some(std::time::Duration::from_secs(10)));
-    for _ in 0..10 {
+    for round in 1.. {
+        if round == 11 {
+            eprintln!(
+                "kith-store: the log up to {index}, which holds a key of {key} the cluster forgot, is not dropped yet"
+            );
+        }
         let has = built(&raft.metrics().borrow());
         // (An error: Raft has stopped.)
         if !has && raft.trigger().snapshot().await.is_err() {
@@ -226,10 +253,10 @@ async fn scrub(raft: &Raft, index: u64) {
             return;
         }
         if wait().metrics(purged, "the log dropped").await.is_ok() {
+            eprintln!("kith-store: dropped the log up to {index}, which held a key of {key} the store no longer has");
             return;
         }
     }
-    eprintln!("kith-store: the log up to {index}, which holds a key the cluster forgot, could not be dropped");
 }
 
 /// The status of a resource after `node` said `said` of it. Several nodes run replicas of
@@ -358,15 +385,23 @@ where
             id
         }
     };
-    let log = Log::open(&dir.join("log.redb"))?;
+    let mut log = Log::open(&dir.join("log.redb"))?;
     let machine = Machine::open(dir, changed)?;
     let mut forgotten = machine.forgot.subscribe();
     let state = machine.state.clone();
-    // The snapshot may have a forget in it whose log this node stopped before dropping.
+    // The snapshot may have a forget in it (or have cut a key from before) whose log this
+    // node stopped before dropping. (Entries past it are applied again, and seen then.)
     let started = {
+        use openraft::storage::RaftLogReader;
+        let index = state.lock().expect("nothing runs on it yet").index();
+        let entries = log.try_get_log_entries(..=index).await;
+        let entries = entries.map_err(|e| format!("reading the log in {}: {e}", dir.display()))?;
         let state = state.lock().expect("nothing runs on it yet");
-        let gone = state.store.list(Some("NodeKey")).any(|key| wrapped(key).is_none());
-        gone.then(|| state.index())
+        let left = entries.iter().find_map(|entry| match &entry.payload {
+            openraft::EntryPayload::Normal(command) => left(&state.store, &carried(command)),
+            _ => None,
+        });
+        left.map(|key| (index, key))
     };
     let config = Arc::new(settings().validate().map_err(|e| format!("raft settings: {e}"))?);
     let raft = Raft::new(id, config, network, log, machine).await;
@@ -374,12 +409,12 @@ where
     let scrubbing = raft.clone();
     // (Ends when Raft drops the machine, which holds the sender.)
     tokio::spawn(async move {
-        if let Some(index) = started {
-            scrub(&scrubbing, index).await;
+        if let Some((index, key)) = started {
+            scrub(&scrubbing, index, &key).await;
         }
         while forgotten.changed().await.is_ok() {
-            let index = *forgotten.borrow_and_update();
-            scrub(&scrubbing, index).await;
+            let (index, key) = forgotten.borrow_and_update().clone();
+            scrub(&scrubbing, index, &key).await;
         }
     });
     Ok(Replica { raft, state, id })

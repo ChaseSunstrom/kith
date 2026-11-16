@@ -969,7 +969,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   off does so as it catches up; a leader drops its log once no node it sends to still
   reads that part, and asks again until then. A node stopped between the snapshot and
   the drop drops its log as it starts, and a write the cluster refused that carried a
-  NodeKey (in its log as sent) is dropped the same way. What stays: a backup or a copy of a
+  NodeKey (in its log as sent) is dropped the same way: whoever may apply NodeKeys can
+  so make every control node snapshot as often as they write, with no limit but that
+  permission. A store kept before this held earlier versions too: a control node cuts
+  them as it starts on this version or takes such a store in (a snapshot sent to it, an
+  import), and drops its log if that held them. Each drop says so on kithd's standard error, with
+  the log's index and the NodeKey. What stays: a backup or a copy of a
   control node's state taken before (kith's own backups are of Volumes and hold no
   store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
   hears of the change, and on a control node's disk the freed pages of the log file and

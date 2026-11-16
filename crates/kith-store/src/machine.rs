@@ -108,28 +108,38 @@ pub struct Machine {
     /// snapshot while it installs another, and the older must not replace the newer.
     saved: Arc<Mutex<Option<LogId<u64>>>>,
     changed: Arc<dyn Fn() + Send + Sync>,
-    /// The index of the last write applied here that took a NodeKey's wrapped key out of
-    /// the store (see [`crate::scrub`]).
-    pub(crate) forgot: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The index of the last write applied here whose log entry holds a wrapped key the
+    /// store no longer has, and that key's NodeKey (see [`crate::scrub`]).
+    pub(crate) forgot: Arc<tokio::sync::watch::Sender<(u64, String)>>,
 }
 
 impl Machine {
-    /// Start from the snapshot in `dir`, or empty.
+    /// Start from the snapshot in `dir`, or empty. One from before a NodeKey kept one
+    /// revision is cut, and written so at once.
     pub fn open(dir: &Path, changed: Arc<dyn Fn() + Send + Sync>) -> Result<Machine, String> {
         let file = dir.join("snapshot.json");
-        let mut state = match std::fs::read(&file) {
-            Ok(bytes) => read(&bytes, &file)?.state,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::default(),
+        let mut saved = match std::fs::read(&file) {
+            Ok(bytes) => Some(read(&bytes, &file)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("reading {}: {e}", file.display())),
         };
+        let cut = saved
+            .as_mut()
+            .is_some_and(|saved| saved.state.store.cut_node_key_histories());
+        let mut state = saved.as_ref().map_or_else(State::default, |saved| saved.state.clone());
         state.forget();
-        Ok(Machine {
+        let machine = Machine {
             saved: Arc::new(Mutex::new(state.applied)),
             state: Arc::new(Mutex::new(state)),
             file,
             changed,
-            forgot: Arc::new(tokio::sync::watch::Sender::new(0)),
-        })
+            forgot: Arc::new(tokio::sync::watch::Sender::new((0, String::new()))),
+        };
+        if let Some(mut saved) = saved.filter(|_| cut) {
+            saved.format = crate::FORMAT;
+            machine.save(&saved).map_err(|e| e.to_string())?;
+        }
+        Ok(machine)
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -225,13 +235,15 @@ impl RaftStateMachine<TypeConfig> for Machine {
                     EntryPayload::Blank => Ok(crate::Done::Nothing),
                     EntryPayload::Normal(command) => {
                         let keys = crate::keys(&command);
-                        let names_a_key = crate::names_a_key(&command);
+                        let carried = crate::carried(&command);
                         let reply = run(&mut state.store, command);
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);
-                        // (A refused one is in the log as it was sent, its wrapped key too.)
-                        if crate::drops_a_key(&reply) || (names_a_key && reply.is_err()) {
-                            forgot = Some(entry.log_id.index);
+                        // (The entry is in the log as it was sent: refused, or a revision of
+                        // what it brought in cut, its wrapped key is there still.)
+                        let dropped = crate::drops_a_key(&reply);
+                        if let Some(key) = dropped.or_else(|| crate::left(&state.store, &carried)) {
+                            forgot = Some((entry.log_id.index, key));
                         }
                         reply
                     }
@@ -243,8 +255,8 @@ impl RaftStateMachine<TypeConfig> for Machine {
             }
             (self.changed)();
         }
-        if let Some(index) = forgot {
-            self.forgot.send_replace(index);
+        if let Some(forgot) = forgot {
+            self.forgot.send_replace(forgot);
         }
         Ok(replies)
     }
@@ -266,6 +278,8 @@ impl RaftStateMachine<TypeConfig> for Machine {
             StorageIOError::read_snapshot(Some(meta.signature()), AnyError::error(e)).into()
         };
         let mut state: State = serde_json::from_slice(snapshot.get_ref()).map_err(failed)?;
+        // (From a node on a build from before a NodeKey kept one revision.)
+        state.store.cut_node_key_histories();
         // The description is what Raft agreed on; the state has to say the same.
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
