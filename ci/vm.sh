@@ -232,6 +232,14 @@ skip() { echo "skipped: $1"; exit 0; }
 command -v qemu-system-x86_64 >/dev/null 2>&1 || skip "no qemu-system-x86_64"
 if ! [ -r /dev/kvm ] || ! [ -w /dev/kvm ]; then skip "no usable /dev/kvm"; fi
 
+# One VM test at a time for a user on a machine: two at once starve each other into waits
+# that run out, which reads as a failure. KITH_VM_LOCK names another file; empty, no wait.
+lock=${KITH_VM_LOCK-/tmp/kith-vm-$(id -u).lock}
+if [ -n "$lock" ] && command -v flock >/dev/null 2>&1; then
+    exec 8>>"$lock"
+    flock -w 7200 8 || { echo "vm.sh: another VM test has held $lock for two hours" >&2; exit 1; }
+fi
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 vms='' web=''
