@@ -235,7 +235,12 @@ impl RaftStateMachine<TypeConfig> for Machine {
                     EntryPayload::Blank => Ok(crate::Done::Nothing),
                     EntryPayload::Normal(command) => {
                         let keys = crate::keys(&command);
-                        let carried = crate::carried(&command);
+                        let mut carried = crate::carried(&command);
+                        // (A store brought in replaces this one: the keys this one holds are
+                        // in the log's earlier entries, and count like the ones it carries.)
+                        if matches!(command, crate::Command::Import { .. }) {
+                            carried.extend(crate::held(&state.store));
+                        }
                         let reply = run(&mut state.store, command);
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);

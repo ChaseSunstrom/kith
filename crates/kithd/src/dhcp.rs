@@ -142,15 +142,65 @@ pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
     let mut xid = [0; 4];
     std::io::Read::read_exact(&mut std::fs::File::open("/dev/urandom")?, &mut xid)?;
     let xid = u32::from_be_bytes(xid);
-    let everyone = (Ipv4Addr::BROADCAST, 67);
-    socket
-        .send_to(&message(DISCOVER, xid, card.mac, hostname, None), everyone)
-        .await?;
+    broadcast(card, &message(DISCOVER, xid, card.mac, hostname, None))?;
     let offer = hear(&socket, xid, card.mac, OFFER).await?;
-    socket
-        .send_to(&message(REQUEST, xid, card.mac, hostname, Some(&offer)), everyone)
-        .await?;
+    broadcast(card, &message(REQUEST, xid, card.mac, hostname, Some(&offer)))?;
     hear(&socket, xid, card.mac, ACK).await
+}
+
+/// Send `message` to every server on `card`'s network, from no address: as a frame of its
+/// own, since the kernel would send it from an address of another card's (a pod's gateway,
+/// say) while this one has none.
+fn broadcast(card: &Card, message: &[u8]) -> Result<()> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, bind, send, socket};
+    use std::os::fd::AsRawFd;
+    // (The card's own link address, as the kernel gives it, names it to bind to.)
+    let link = nix::ifaddrs::getifaddrs()?
+        .filter(|a| a.interface_name == card.name)
+        .find_map(|a| a.address.and_then(|a| a.as_link_addr().copied()))
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no card {}", card.name)))?;
+    // (No protocol: it hears nothing.)
+    let fd = socket(AddressFamily::Packet, SockType::Raw, SockFlag::SOCK_CLOEXEC, None)?;
+    bind(fd.as_raw_fd(), &link)?;
+    send(
+        fd.as_raw_fd(),
+        &frame(card.mac, message),
+        nix::sys::socket::MsgFlags::empty(),
+    )?;
+    Ok(())
+}
+
+/// The Ethernet frame of a client's DHCP `message`: from `mac` and 0.0.0.0:68 to everyone's
+/// port 67.
+fn frame(mac: [u8; 6], message: &[u8]) -> Vec<u8> {
+    let sum = |bytes: &[u8]| {
+        let words = bytes
+            .chunks(2)
+            .map(|w| u32::from(w[0]) << 8 | u32::from(*w.get(1).unwrap_or(&0)));
+        let total = words.sum::<u32>();
+        let total = (total >> 16) + (total & 0xFFFF);
+        !((total + (total >> 16)) as u16)
+    };
+    let length = 8 + message.len() as u16;
+    let mut udp = [68u16.to_be_bytes(), 67u16.to_be_bytes(), length.to_be_bytes(), [0; 2]].concat();
+    udp.extend(message);
+    // (UDP's checksum is of a pseudo header too: both addresses, the protocol, the length.)
+    let pseudo = [
+        &[0, 0, 0, 0, 255, 255, 255, 255, 0, 17][..],
+        &length.to_be_bytes(),
+        &udp,
+    ]
+    .concat();
+    let checksum = match sum(&pseudo) {
+        0 => 0xFFFF,
+        checksum => checksum,
+    };
+    udp[6..8].copy_from_slice(&checksum.to_be_bytes());
+    let mut ip = [0x45, 0, 0, 0, 0, 0, 0, 0, 64, 17, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255];
+    ip[2..4].copy_from_slice(&(20 + length).to_be_bytes());
+    let checksum = sum(&ip);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    [&[255; 6][..], &mac, &[8, 0], &ip, &udp].concat()
 }
 
 /// Keep `card` addressed for as long as this process lives: ask, put the address on it
@@ -243,6 +293,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn init_dhcp_frames_go_from_no_address() {
+        let mac = [0x52, 0x54, 0, 1, 2, 3];
+        for message in [message(DISCOVER, 7, mac, "alpha", None), vec![1, 2, 3]] {
+            let frame = frame(mac, &message);
+            assert_eq!(
+                (&frame[..6], &frame[6..12], &frame[12..14]),
+                (&[255; 6][..], &mac[..], &[8, 0][..])
+            );
+            let (ip, udp) = frame[14..].split_at(20);
+            assert_eq!((&ip[12..16], &ip[16..20], ip[9]), (&[0; 4][..], &[255; 4][..], 17));
+            assert_eq!(usize::from(u16::from_be_bytes([ip[2], ip[3]])), 20 + udp.len());
+            assert_eq!((&udp[..4], &udp[8..]), (&[0, 68, 0, 67][..], &message[..]));
+            // A checksum is right when all its words, with it, sum (ones' complement) to all ones.
+            let ones = |bytes: &[u8]| {
+                let mut total: u32 = bytes
+                    .chunks(2)
+                    .map(|w| u32::from(w[0]) << 8 | u32::from(*w.get(1).unwrap_or(&0)))
+                    .sum();
+                while total > 0xFFFF {
+                    total = (total >> 16) + (total & 0xFFFF);
+                }
+                total
+            };
+            assert_eq!(ones(ip), 0xFFFF);
+            let length = (udp.len() as u16).to_be_bytes();
+            let pseudo = [&[0, 0, 0, 0, 255, 255, 255, 255, 0, 17][..], &length, udp].concat();
+            assert_eq!(ones(&pseudo), 0xFFFF);
+        }
+    }
+
     /// Against a real server (dnsmasq) at the other end of a veth pair, in a network
     /// namespace of this test's own: the card is given an address of the server's range.
     #[tokio::test]
@@ -321,6 +402,11 @@ mod tests {
             .into_iter()
             .find(|card| card.name == "ks")
             .unwrap();
+        // Every frame of this namespace's, seen: what a client asks goes from no address
+        // (RFC 2131 4.1), though the other card has one.
+        use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
+        let flags = SockFlag::SOCK_CLOEXEC | SockFlag::SOCK_NONBLOCK;
+        let seen = nix::sys::socket::socket(AddressFamily::Packet, SockType::Raw, flags, SockProtocol::EthAll).unwrap();
         let mut lease = None;
         for _ in 0..10 {
             let (ours, theirs) = tokio::join!(ask(&card, "tester"), ask(&other, "other"));
@@ -331,6 +417,20 @@ mod tests {
             }
         }
         let lease = lease.expect("no lease in ten tries");
+        let (mut frame, mut asked) = ([0; 1600], Vec::new());
+        while let Ok(length) = nix::sys::socket::recv(
+            std::os::fd::AsRawFd::as_raw_fd(&seen),
+            &mut frame,
+            nix::sys::socket::MsgFlags::empty(),
+        ) {
+            let (kind, ip) = (&frame[12..14], &frame[14..length]);
+            let udp = &ip[usize::from(ip[0] & 15) * 4..];
+            if kind == [8, 0] && ip[9] == 17 && udp[..4] == [0, 68, 0, 67] {
+                asked.push(Ipv4Addr::from(<[u8; 4]>::try_from(&ip[12..16]).unwrap()));
+            }
+        }
+        assert!(!asked.is_empty(), "no DHCP client's frame seen");
+        assert!(asked.iter().all(Ipv4Addr::is_unspecified), "asked from: {asked:?}");
         let range = u32::from(Ipv4Addr::new(10, 9, 0, 50))..=u32::from(Ipv4Addr::new(10, 9, 0, 60));
         assert!(range.contains(&u32::from(lease.address)), "{lease:?}");
         assert_eq!(

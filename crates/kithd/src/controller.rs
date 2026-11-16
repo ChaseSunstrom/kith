@@ -90,6 +90,8 @@ struct Slot {
     probes: Option<crate::probe::Probes>,
     /// The pod it is of, where its template says `pod`: the pod's id (`pod_of`) and its host name.
     pod: Option<(String, String)>,
+    /// The Exit its pod leaves by, where its template names one.
+    exit: Option<String>,
     /// Its template's notes: a unit whose notes changed is replaced, as one whose definition changed.
     notes: BTreeMap<String, String>,
     /// The device nodes its DeviceClaims give it (a changed set replaces the unit, like a changed value).
@@ -799,6 +801,22 @@ impl Controller {
             } else if mounts && me.is_none() {
                 note.push("volumes need a node with a name in a cluster: this one runs nothing".into());
             }
+            // And a pod that leaves by an exit starts only with its tunnel up here (fail closed).
+            let ready = template
+                .exit
+                .as_deref()
+                .map(|name| crate::exits::ready(shared, name, &namespace));
+            if let Some(Err(why)) = &ready {
+                let mut nodes = resource
+                    .status
+                    .iter()
+                    .flat_map(|s| s["nodes"].as_object())
+                    .flat_map(|n| n.values());
+                if me.is_none() || nodes.any(|node| *node == *me.unwrap_or_default()) {
+                    note.push(why.clone());
+                }
+            }
+            let allowed = allowed && !matches!(ready, Some(Err(_)));
             let here = |replica: u32| {
                 let bound = |status: &Value| status["nodes"][replica.to_string()] == *me.unwrap_or_default();
                 allowed && (me.is_none() || resource.status.as_ref().is_some_and(bound))
@@ -941,6 +959,7 @@ impl Controller {
                                 let name = &resource.metadata.name;
                                 (pod_of(&key, replica), format!("{name}-{replica}"))
                             }),
+                            exit: template.exit.clone().filter(|_| template.pod == Some(true)),
                             notes: template.annotations.clone(),
                             devices: devices.clone(),
                             seat: seat.clone(),
@@ -1021,6 +1040,7 @@ impl Controller {
             let devices = new.devices != slot.devices && !plugs_in_place(slot, new);
             new.run != slot.run
                 || new.pod != slot.pod
+                || new.exit != slot.exit
                 || new.notes != slot.notes
                 || new.policy != slot.policy
                 || devices
@@ -2196,12 +2216,19 @@ async fn start(
     let mut address = mesh.map(|(prefix, me)| std::net::IpAddr::from(kith_mesh::node_address(prefix, me)));
     if let Some((pod, hostname)) = &slot.pod {
         unit.as_image = true;
+        let namespace = slot.owner.split('/').nth(1).unwrap_or_default();
+        // An exit's pod: asked again here, as it starts (`ready` refuses all but root).
+        let exit = slot
+            .exit
+            .as_deref()
+            .map(|name| crate::exits::ready(shared, name, namespace))
+            .transpose()?;
         // (Only root can make a network: elsewhere the pod shares the node's.)
         if nix::unistd::getuid().is_root() {
             let net = mesh.map(|(prefix, me)| kith_mesh::node_net(prefix, me));
-            let namespace = slot.owner.split('/').nth(1).unwrap_or_default();
             let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
-            let given = pods.given(state, pod, namespace, hostname, net)?;
+            let exit = exit.as_ref().map(|(tunnel, dns)| (*tunnel, dns.as_slice()));
+            let given = pods.given(state, pod, namespace, hostname, net, exit)?;
             unit.netns = Some(given.netns);
             unit.hostname = Some(given.hostname);
             address = pods.address(pod).or(address);
@@ -2654,6 +2681,7 @@ mod tests {
             rolling: false,
             probes: None,
             pod: None,
+            exit: None,
             notes: BTreeMap::new(),
             devices: devices.iter().map(PathBuf::from).collect(),
             seat: None,

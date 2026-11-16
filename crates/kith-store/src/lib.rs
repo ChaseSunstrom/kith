@@ -197,6 +197,12 @@ fn carried(command: &Command) -> Vec<(String, String)> {
     }
 }
 
+/// The wrapped keys `store` holds now (`(NodeKey, wrapped key)`).
+fn held(store: &Store) -> Vec<(String, String)> {
+    let pair = |key: &Resource| wrapped(key).map(|wrapped| (key.key(), wrapped.to_string()));
+    store.list(Some("NodeKey")).filter_map(pair).collect()
+}
+
 /// The first NodeKey of `carried` whose wrapped key `store` no longer has: a refused write,
 /// a revision cut, or one replaced since.
 fn left(store: &Store, carried: &[(String, String)]) -> Option<String> {

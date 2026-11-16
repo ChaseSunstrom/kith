@@ -413,6 +413,8 @@ pub(crate) async fn plan(
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let put = crate::blobs::put_first(&state.store, &resources);
         put.and_then(|()| crate::releases::claims(&state.store, &resources))
+            .and_then(|()| crate::exits::admitted(&state.store, &resources))
+            .and_then(|()| crate::pods::unshared(&state.store, &resources))
     };
     claimed.map_err(|why| ApiError::Store(Error::Invalid(why)))?;
     // (Admission is asked as it would be: a dry run that passes where the apply is refused says nothing.)
@@ -473,7 +475,10 @@ pub(crate) async fn applied(
         let nodes: Vec<_> = nodes
             .map(|node| (node.metadata.name.as_str(), Some(&node.spec)))
             .collect();
-        access::control_stays(&state.store, &nodes).and_then(|()| crate::releases::claims(&state.store, &resources))
+        access::control_stays(&state.store, &nodes)
+            .and_then(|()| crate::releases::claims(&state.store, &resources))
+            .and_then(|()| crate::exits::admitted(&state.store, &resources))
+            .and_then(|()| crate::pods::unshared(&state.store, &resources))
     };
     if let Err(why) = claimed {
         shared.audit.record(caller, "apply", keys, Err(why.clone()));

@@ -11,6 +11,7 @@
 // ponytail: direct paths and one relay hop through an edge node. No hole punching: two
 // nodes that are both behind NAT talk through an edge node for good.
 
+pub mod exit;
 mod netlink;
 pub mod pod;
 

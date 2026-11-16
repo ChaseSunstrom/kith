@@ -23,6 +23,7 @@ mod devices;
 mod dhcp;
 mod dns;
 mod encrypted;
+mod exits;
 mod files;
 mod gpt;
 mod images;
@@ -176,6 +177,18 @@ struct Args {
     acme: Option<String>,
 }
 
+/// The ports kithd serves on at this node, and what for: none of them is published for a pod.
+fn own_ports(args: &Args) -> Vec<(u16, &'static str)> {
+    let mut own = vec![(args.listen.map_or(7443, |at| at.port()), "API")];
+    own.extend(args.dns.map(|at| (at.port(), "DNS")));
+    own.extend((args.registry_port != 0).then_some((args.registry_port, "registry")));
+    own.extend(args.mesh.map(|port| (port, "mesh")));
+    if args.ingress {
+        own.extend([(80, "ingress"), (443, "ingress")]);
+    }
+    own
+}
+
 fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Options {
     mesh::Options {
         interface: args.mesh_interface.clone(),
@@ -211,6 +224,8 @@ pub struct Shared {
     pub stop: watch::Sender<bool>,
     /// The pods of this node, and their networks.
     pub pods: Mutex<pods::Pods>,
+    /// The tunnels of the Exits this node holds.
+    pub exits: Mutex<exits::Exits>,
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
@@ -496,6 +511,9 @@ async fn replica(
     state: &std::path::Path,
     lost_after: std::time::Duration,
 ) -> Result<Arc<Shared>, String> {
+    // One kept by an earlier version holds the NodeKeys of its day, and so does one a crash left
+    // between the rename and the cut: every start cuts, on any node.
+    cut_or_say(&state.join("store.json.imported"));
     let changed = Arc::new(Notify::new());
     let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     let generation = watch::channel(clock.map_or(0, |d| d.as_millis() as u64)).0;
@@ -535,6 +553,7 @@ async fn replica(
         cluster,
         stop: watch::channel(false).0,
         pods: Mutex::default(),
+        exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
         view: watch::channel(None).0,
@@ -562,7 +581,7 @@ async fn replica(
         shared.raft.initialize(alone).await.map_err(|e| failed(&e))?;
     }
     // The store of a kithd from before replication comes in once, into an empty store.
-    let old = state.join("store.json");
+    let (old, kept) = (state.join("store.json"), state.join("store.json.imported"));
     if old.exists() {
         let empty = shared.store.lock().expect("nothing panics holding the store").store == Default::default();
         if empty {
@@ -570,7 +589,7 @@ async fn replica(
             let imported = shared.submit(kith_store::Command::Import { store }).await;
             imported.map_err(|e| format!("bringing in {}: {e}", old.display()))?;
             // Left in place it would come in again, should the store ever be empty.
-            std::fs::rename(&old, state.join("store.json.imported")).map_err(|e| {
+            keep_imported(&old, &kept).map_err(|e| {
                 format!(
                     "{} was brought in but cannot be moved aside ({e}): remove it",
                     old.display()
@@ -586,6 +605,37 @@ async fn replica(
         }
     }
     Ok(shared)
+}
+
+/// Keep the store from before replication aside, as `kept`, with no NodeKey in it: the
+/// replicated store holds them, and forgets or wipes them, which a copy here would outlive.
+fn keep_imported(old: &std::path::Path, kept: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(old, kept)?;
+    // (A cut that fails is said, not an error: it is tried again at each start.)
+    cut_or_say(kept);
+    Ok(())
+}
+
+fn cut_or_say(kept: &std::path::Path) {
+    if let Err(e) = strip_node_keys(kept) {
+        eprintln!(
+            "kithd: {} may hold NodeKeys and could not be cut ({e}); it is left as it is",
+            kept.display()
+        );
+    }
+}
+
+/// Rewrite the kept file without its NodeKeys (and their history), if it has any: a temporary
+/// file beside it, synced, renamed over it. A file that is not a store is left as it is.
+fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
+    if !kept.exists() {
+        return Ok(());
+    }
+    let mut file = kith_api::store::FileStore::read(kept).map_err(|e| e.to_string())?;
+    if file.store.drop_node_keys() {
+        file.save().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
@@ -730,6 +780,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         &state,
         std::time::Duration::from_secs(args.lost_after),
     ))?;
+    // (An exit's pods pass on to the mesh by its link alone.)
+    shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
     // A viewed worker serves ingress only where its Node says so (as the join of a token for
     // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
     // Node not in the view yet: its first view is still to come, and says.)
@@ -891,7 +943,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             };
             let hardware = devices::run(shared.clone(), stopping.clone());
             let crons = cron::run(shared.clone(), stopping.clone());
+            let exits = exits::run(shared.clone(), stopping.clone());
+            let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
+                apart(exits),
+                apart(published),
                 apart(units),
                 apart(releases),
                 apart(repositories),
@@ -1060,6 +1116,26 @@ mod tests {
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
     }
 
+    /// The ports this node serves on are the ones a pod may not publish here.
+    #[test]
+    fn the_ports_kithd_serves_on_are_its_own() {
+        use clap::Parser;
+        let own = |extra: &[&str]| {
+            let args = ["kithd"].iter().chain(extra).copied();
+            super::own_ports(&super::Args::try_parse_from(args).unwrap())
+        };
+        assert_eq!(own(&[]), [(7443, "API"), (5000, "registry")]);
+        let said = own(&[
+            "--listen=0.0.0.0:8443",
+            "--dns=0.0.0.0:5353",
+            "--registry-port=0",
+            "--mesh=51999",
+            "--ingress",
+        ]);
+        let ports: Vec<u16> = said.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports, [8443, 5353, 51999, 80, 443]);
+    }
+
     #[test]
     fn a_clash_of_the_pods_range_ends_the_start_only_for_one_named_outside_init() {
         let (default, named) = (kith_mesh::pod::Range::default(), "10.77.0.0/20".parse().unwrap());
@@ -1220,6 +1296,81 @@ spec: {}
         // A port of 0 is any port: not said.
         let any: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
         assert_eq!(serves(Some(any), false), serde_json::Value::Null);
+    }
+
+    /// A store with a NodeKey that has an earlier revision (as one written before the limit of one
+    /// holds), and a Workload beside it, as text.
+    fn old_store_text(wrapped: &str) -> String {
+        let key = |wrapped: &str| {
+            let id = "ab".repeat(32);
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata:\n  name: n1\nspec:\n  id: \"{id}\"\n  wrapped: \"{wrapped}\"\n"
+            );
+            kith_api::Resource::from_source(&text).unwrap().pop().unwrap().unwrap()
+        };
+        let mut store = kith_api::store::Store::default();
+        store.apply(key(wrapped)).unwrap();
+        let web = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: web\nspec:\n  template:\n    containers:\n      - name: web\n        image: nginx:1.27\n";
+        store
+            .apply(kith_api::Resource::from_source(web).unwrap().pop().unwrap().unwrap())
+            .unwrap();
+        let mut old = serde_json::to_value(&store).unwrap();
+        let first = old["resources"]["NodeKey/n1"][0].clone();
+        old["resources"]["NodeKey/n1"].as_array_mut().unwrap().insert(0, first);
+        old["resources"]["NodeKey/n1"][0]["resource"]["spec"]["wrapped"] = "deadbeef".repeat(8).into();
+        old.to_string()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kithd-imported-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What the kept file holds is the store as it was, less every NodeKey and its history.
+    fn assert_kept_without_node_keys(kept: &std::path::Path, wrapped: &str) {
+        let text = std::fs::read_to_string(kept).unwrap();
+        for leaked in ["NodeKey", wrapped, "deadbeef"] {
+            assert!(!text.contains(leaked), "{leaked} is still in the kept file");
+        }
+        let store = kith_api::store::FileStore::read(kept).unwrap().store;
+        assert_eq!(
+            store.history("Workload/default/web").unwrap().len(),
+            1,
+            "the rest is as it was"
+        );
+    }
+
+    #[test]
+    fn imported_store_holds_no_node_key() {
+        let dir = scratch("import");
+        let (old, kept) = (dir.join("store.json"), dir.join("store.json.imported"));
+        let wrapped = "c0ffee".repeat(10); // pragma: allowlist secret
+        std::fs::write(&old, old_store_text(&wrapped)).unwrap();
+        keep_imported(&old, &kept).unwrap();
+        assert!(!old.exists());
+        assert_kept_without_node_keys(&kept, &wrapped);
+    }
+
+    #[test]
+    fn imported_store_from_an_earlier_version_is_rewritten_at_start_and_a_bad_one_left_alone() {
+        let dir = scratch("start");
+        let kept = dir.join("store.json.imported");
+        let wrapped = "c0ffee".repeat(10); // pragma: allowlist secret
+        std::fs::write(&kept, old_store_text(&wrapped)).unwrap();
+        strip_node_keys(&kept).unwrap();
+        assert_kept_without_node_keys(&kept, &wrapped);
+        assert!(!dir.join("store.json.imported.tmp").exists());
+        // A second start finds nothing to cut, and does not write.
+        let before = std::fs::metadata(&kept).unwrap().modified().unwrap();
+        strip_node_keys(&kept).unwrap();
+        assert_eq!(std::fs::metadata(&kept).unwrap().modified().unwrap(), before);
+        // A file that is not a store stays as it is; a missing one is nothing.
+        std::fs::write(&kept, "not json, a NodeKey wrapped").unwrap();
+        assert!(strip_node_keys(&kept).is_err());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "not json, a NodeKey wrapped");
+        assert!(strip_node_keys(&dir.join("absent")).is_ok());
     }
 
     #[test]
