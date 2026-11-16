@@ -344,8 +344,9 @@ before any of the split:
   **What this does and does not do.** The bounding set limits only what an exec gives a
   child (a root child's permitted set becomes the bounding set); `PR_CAPBSET_DROP` does
   not touch kithd's own permitted and effective sets. So nothing kithd starts by an exec
-  can hold a capability outside the list, whatever its spec asks and whatever bug let it
-  ask: not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
+  can hold a capability outside the list in the node's own user namespace, whatever its
+  spec asks and whatever bug let it ask (a pod with `userNamespaces` has a full bounding
+  set inside its own namespace, over that namespace's resources only): not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
   `BPF`, `SYS_NICE`, `IPC_LOCK`, `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `PERFMON`... But
   kithd's own threads keep every capability (the VM test reads `CapEff` and says so), so
   **a hole inside kithd is not held back by this**: that is the split's job ("Order of
@@ -354,11 +355,14 @@ before any of the split:
   Untried on a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off
   already leaves no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a
   memlock limit, which the list does not have); no VM test runs either.
-  kithd execs itself only as the exec shim, which serves nothing (it waits for a byte and
-  execs the unit's command), so no serving process has the bounding set for its permitted set:
-  `Handle::in_dev` (`/proc/PID/root` of a container), `storage::unlinked` (`/proc/PID/fd`)
-  and `setns` into a container that is not root's, which need `SYS_PTRACE`, run in
-  kithd's own threads;
+  kithd execs itself only as the exec shim, for exec units (which the policy that cuts has
+  off); a container is not started through it: libcontainer forks, clones and execs it, and
+  sets the container's own sets from its spec (the fourteen of a root pod, three for a root
+  that is not one, one for a user) over the cut's, so no container reads the cut. No serving
+  process has the bounding set for its permitted set, and what needs `SYS_PTRACE`
+  (`storage::unlinked` reads `/proc/PID/fd`; `setns` into a container that is not root's)
+  runs in kithd's own threads, which keep it. (`Handle::in_dev` only plugs an input device
+  into a container.)
 - the node's status says what it kept (`status.policy.capabilities`; `all` where it was
   not cut, which includes a kithd that is not root). A kithd that cannot cut as root
   does not start;

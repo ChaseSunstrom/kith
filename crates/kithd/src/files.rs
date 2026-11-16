@@ -138,14 +138,26 @@ pub fn one(dir: &Path, path: &str) -> io::Result<PathBuf> {
     }
 }
 
-/// Remove the directory of every replica that is not in `keep`, under each of `bases`.
+/// Remove the directory of every replica that is not in `keep`, under each of `bases`; and
+/// the limit of its project (on a disk that keeps them), once nothing is left in it.
 pub fn sweep(bases: &[&Path], keep: &BTreeSet<String>) {
     for base in bases {
         for entry in std::fs::read_dir(base.join(REPLICAS)).into_iter().flatten().flatten() {
-            if !keep.contains(&*entry.file_name().to_string_lossy())
-                && let Err(e) = std::fs::remove_dir_all(entry.path())
-            {
-                eprintln!("kithd: removing {}: {e}", entry.path().display());
+            if keep.contains(&*entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            let id = kith_dm_sys::project(&entry.path()).map_or(0, |(id, _)| id);
+            match std::fs::remove_dir_all(entry.path()) {
+                Err(e) => eprintln!("kithd: removing {}: {e}", entry.path().display()),
+                // (A container's root may be left in it a while: then the limit stays, and the
+                // next pod given the id sets its own first.)
+                Ok(())
+                    if id != 0
+                        && kith_dm_sys::project_usage(base, id).is_ok_and(|(bytes, files)| bytes + files == 0) =>
+                {
+                    let _ = kith_dm_sys::set_project_limit(base, id, 0);
+                }
+                Ok(()) => {}
             }
         }
     }

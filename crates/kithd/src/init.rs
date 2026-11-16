@@ -387,14 +387,12 @@ fn state() {
 /// Mount the state's file system from `device`: the partition, or what it is under its key.
 pub fn mount_state(device: &std::path::Path) {
     let _ = std::fs::create_dir_all(STATE);
-    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    match mount(
-        Some(device),
-        STATE,
-        Some("ext4"),
-        flags | MsFlags::MS_NOATIME,
-        None::<&str>,
-    ) {
+    let flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME;
+    // Holding each project to its limit, where the file system keeps projects (made since
+    // kith OS does); one from before, which keeps none, mounts as it did, its pods counted.
+    let mounted = mount(Some(device), STATE, Some("ext4"), flags, Some("prjquota"))
+        .or_else(|_| mount(Some(device), STATE, Some("ext4"), flags, None::<&str>));
+    match mounted {
         Ok(()) => {
             // (The kernel's own lines about growing first, then this one whole.)
             let grown = grow(device);

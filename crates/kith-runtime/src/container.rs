@@ -113,6 +113,9 @@ pub struct Unit {
     /// It is the node's own users where kithd is root, as a NodeWorkload is: no user namespace
     /// of its own (see `shifts`).
     pub host_users: bool,
+    /// The project its writable root's layers are put in (ext4's, `chattr -p`), whose quota
+    /// holds what it writes there at the write: its pod's. `None`: they keep their parent's.
+    pub project: Option<u32>,
 }
 
 /// How many ids a container's user namespace has where kithd is root: 0 to 65535, all an
@@ -521,6 +524,11 @@ impl Runtime {
                 // (Its own layer is its root's: the first id of its range.)
                 for layer in shift.iter().flat_map(|_| ["upper", "work"]) {
                     std::os::unix::fs::chown(bundle.join(layer), shift, shift).ctx(&what)?;
+                }
+                // (Before any process: all it writes there, a copy-up too, is its pod's.)
+                for (layer, project) in unit.project.iter().flat_map(|p| [("upper", *p), ("work", *p)]) {
+                    kith_dm_sys::set_project(&bundle.join(layer), project, true)
+                        .ctx(format!("{what}: putting its {layer} in its pod's project"))?;
                 }
             }
             // (From here the bundle names its range: no other container takes it. Written beside
@@ -1249,7 +1257,10 @@ impl Executor for Entry {
                 .flat_map(|said| said.split_whitespace())
                 .map(String::from)
                 .collect();
-            crate::seccomp::filters(&allowed)
+            // (The node's users are those of a container with no user namespace of its own.)
+            let linux = spec.linux().as_ref();
+            let node_users = linux.and_then(|linux| linux.uid_mappings().as_ref()).is_none();
+            crate::seccomp::filters(&allowed, node_users)
                 .and_then(|filters| crate::seccomp::install(&filters))
                 .map_err(|e| {
                     let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("kith: {e}\n").as_bytes());
@@ -1400,7 +1411,7 @@ fn spec_shifted(
         let nested = NESTED.iter().filter(|_| unit.nested).map(|call| call.to_string());
         let allow: Vec<String> = unit.allow.iter().cloned().chain(nested).collect();
         // (Made here once to find a wrong name before anything is started.)
-        crate::seccomp::filters(&allow)?;
+        crate::seccomp::filters(&allow, false)?;
         allow.join(" ")
     };
     let mut notes = std::collections::HashMap::from([(CALLS.to_string(), calls)]);

@@ -80,7 +80,7 @@ impl Daemon {
         let out = Command::new(&self.kith)
             .args(args)
             .current_dir(&self.dir)
-            .env("KITH_SOCKET", self.dir.join("kithd.sock"))
+            .env("KITH_SOCKET", "kithd.sock")
             .env_remove("KITH_STORE")
             .output()
             .unwrap();
@@ -2427,7 +2427,7 @@ fn web_ui_is_served_and_asks_as_its_caller() {
     let mut forwarder = Command::new(&daemon.kith)
         .args(["ui"])
         .current_dir(&daemon.dir)
-        .env("KITH_SOCKET", daemon.dir.join("kithd.sock"))
+        .env("KITH_SOCKET", "kithd.sock")
         .env_remove("KITH_STORE")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

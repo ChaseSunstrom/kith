@@ -24,10 +24,140 @@ pub struct Pod {
     pub finished: bool,
     /// Its last count did not finish either (`missed`).
     pub again: bool,
+    /// It is held to its limit as it writes (`Projects`): its bytes are its project's, read
+    /// and not counted, and a write past its limit fails rather than it being replaced.
+    pub held: bool,
 }
 
 /// How the message of a unit replaced for what its pod wrote begins.
 pub const REPLACED: &str = "replaced: ";
+
+/// How the message of a running unit whose pod holds all its limit lets it begins.
+pub const REACHED: &str = "reached its storage limit: ";
+
+/// How near its limit a held pod is said to have reached it (a write stops short of it by
+/// less than a block), and how far past it it may be before it is replaced all the same:
+/// a past it is what no write of the pod's makes, but kithd's own (a new container's root
+/// directories, put in the project as they are made) may.
+const NEAR: u64 = 64 << 10;
+
+/// Whether this node holds each pod to its limit as it writes: its state disk keeps projects
+/// and is mounted to hold them (`-O quota,project`, `prjquota`), and kithd is root, who puts
+/// a pod's directories in its project. Elsewhere what a pod wrote is counted every 10 s.
+pub fn held_at_write(state: &Path) -> bool {
+    nix::unistd::getuid().is_root() && kith_dm_sys::projects_held(state)
+}
+
+/// How a node holds pods' storage limits, as kithd says it once at its start and its Node's
+/// status says it.
+pub fn how(held: bool) -> &'static str {
+    match held {
+        true => "at the write, by the state disk's project quota",
+        false => "by a count every 10 s of what each pod wrote",
+    }
+}
+
+/// What a held pod's running units say while it holds all its limit lets it, if it does.
+pub fn reached(pod: &Pod) -> Option<String> {
+    let limit = pod
+        .limit
+        .filter(|limit| pod.held && pod.bytes.saturating_add(NEAR) >= *limit)?;
+    Some(format!(
+        "{REACHED}its pod holds {} bytes outside its volumes, of its limit of {limit}: a write past it fails",
+        pod.bytes
+    ))
+}
+
+/// Each pod's project on the state disk, which holds it to its limit as it writes: its
+/// replica directory names it (in it, and kept with it however kithd starts again), its
+/// scratch and its containers' roots are in it and so is all made in them.
+pub struct Projects {
+    state: PathBuf,
+    /// The id the next pod is given: past every one on the disk when kithd started.
+    next: u32,
+}
+
+/// The id given after `ids`, never 0 (what is in no project).
+fn next_of(ids: impl Iterator<Item = u32>) -> u32 {
+    ids.max().unwrap_or(0).saturating_add(1)
+}
+
+impl Projects {
+    /// The projects of the pods whose directories are on `state`.
+    pub fn read(state: &Path) -> Projects {
+        let dirs = std::fs::read_dir(state.join(crate::files::REPLICAS))
+            .into_iter()
+            .flatten();
+        let ids = dirs.flatten().filter_map(|dir| kith_dm_sys::project(&dir.path()).ok());
+        Projects {
+            state: state.to_path_buf(),
+            next: next_of(ids.map(|(id, _)| id)),
+        }
+    }
+
+    /// The project of the pod `pod`, given it if it has none (ids are never given twice
+    /// while a file of the last one to have it is left, anywhere on the disk), held to
+    /// `limit` (none: no limit) before anything is put in it, with its scratch in it if that
+    /// holds nothing yet. Done before each of its containers starts, so what it starts with
+    /// is held.
+    pub fn give(&mut self, pod: &str, limit: Option<u64>) -> std::io::Result<u32> {
+        let dir = crate::files::of(&self.state, pod)?;
+        let had = kith_dm_sys::project(&dir)?.0;
+        let id = match had {
+            0 => {
+                // ponytail: ids past u32::MAX are not wrapped round; 4 billion pods first.
+                while kith_dm_sys::project_usage(&self.state, self.next).is_ok_and(|(bytes, files)| bytes + files > 0) {
+                    self.next = self.next.saturating_add(1);
+                }
+                self.next
+            }
+            id => id,
+        };
+        // Its limit first: an id given before may still hold the last pod's.
+        kith_dm_sys::set_project_limit(&self.state, id, limit.unwrap_or(0))?;
+        if had == 0 {
+            // (The directory alone: its maps' files, which kithd writes, are in no project.)
+            kith_dm_sys::set_project(&dir, id, false)?;
+        }
+        self.next = self.next.max(id.saturating_add(1));
+        let scratch = dir.join("scratch");
+        std::fs::create_dir_all(&scratch)?;
+        if kith_dm_sys::project(&scratch)? == (id, true) {
+            return Ok(id);
+        }
+        // A scratch that holds files from before (a kithd that gave no projects) would keep
+        // them in none, where no quota counts them: it is left as it is, and its pod counted
+        // every 10 s ([`Projects::usage`]) till it is replaced with an empty one ([`aside`]).
+        let empty = |path: &Path| std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_none());
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&scratch)? {
+            let entry = entry?;
+            match entry.file_type()?.is_dir() && empty(&entry.path()) {
+                true => names.push(entry.path()),
+                false => return Ok(id),
+            }
+        }
+        // The scratch itself last: in its project, all in it is.
+        for dir in names.iter().chain([&scratch]) {
+            kith_dm_sys::set_project(dir, id, true)?;
+        }
+        Ok(id)
+    }
+
+    /// What the pod `pod` holds of the state disk, if it is held to its limit as it writes:
+    /// it has a project, and its scratch is in it.
+    pub fn usage(state: &Path, pod: &str) -> Option<u64> {
+        let dir = state.join(crate::files::REPLICAS).join(pod);
+        let id = kith_dm_sys::project(&dir)
+            .ok()
+            .map(|(id, _)| id)
+            .filter(|id| *id != 0)?;
+        if kith_dm_sys::project(&dir.join("scratch")).ok()? != (id, true) {
+            return None;
+        }
+        kith_dm_sys::project_usage(state, id).ok().map(|(bytes, _)| bytes)
+    }
+}
 
 /// The longest one pod is counted, each count.
 pub const SPELL: Duration = Duration::from_secs(5);
@@ -579,8 +709,9 @@ pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
         .enumerate()
         .filter_map(|(i, pod)| {
             let limit = pod.limit?;
+            let past = if pod.held { NEAR } else { 0 };
             let why = match pod.finished {
-                true if pod.bytes > limit => format!(
+                true if pod.bytes > limit.saturating_add(past) => format!(
                     "replaced: its pod wrote {} bytes outside its volumes, over its limit of {limit}",
                     pod.bytes
                 ),
@@ -628,7 +759,164 @@ mod tests {
             bytes,
             finished: true,
             again: false,
+            held: false,
         }
+    }
+
+    /// A pod held to its limit as it writes stops short of it: it is said to have reached
+    /// it, never replaced for it; past it by more than kithd's own writes make (what none of
+    /// the pod's can), it is replaced as a counted one is. One counted never says it reached
+    /// it: past it, it is replaced.
+    #[test]
+    fn storage_projects_a_held_pod_says_it_reached_its_limit_and_is_not_replaced() {
+        let held = |bytes| Pod {
+            held: true,
+            ..pod("p", Some(64 * MIB), bytes)
+        };
+        let said = reached(&held(64 * MIB - 4096)).unwrap();
+        assert!(
+            said.starts_with(REACHED) && said.contains("of its limit of 67108864"),
+            "{said}"
+        );
+        assert!(reached(&held(32 * MIB)).is_none());
+        assert!(reached(&pod("p", Some(64 * MIB), 64 * MIB)).is_none());
+        assert!(
+            reached(&Pod {
+                held: true,
+                ..pod("p", None, 64 * MIB)
+            })
+            .is_none()
+        );
+        assert!(choose(&[held(64 * MIB), held(64 * MIB + 8192)], u64::MAX, 0).is_empty());
+        assert_eq!(choose(&[held(65 * MIB)], u64::MAX, 0).len(), 1);
+        assert_eq!(
+            choose(&[pod("p", Some(64 * MIB), 64 * MIB + 8192)], u64::MAX, 0).len(),
+            1
+        );
+        // For the reserve a held pod is chosen as any other.
+        assert_eq!(choose(&[held(32 * MIB)], 0, 8 * MIB).len(), 1);
+    }
+
+    /// The next project given is past every one there, and never 0 (no project); with no
+    /// project anywhere (a state disk that never kept them), and at the end of the ids, it is
+    /// what it can be.
+    #[test]
+    fn storage_projects_the_next_id_is_past_every_one_there() {
+        assert_eq!(next_of([3, 9, 4].into_iter()), 10);
+        assert_eq!(next_of(std::iter::empty()), 1);
+        assert_eq!(next_of([0, 0].into_iter()), 1);
+        assert_eq!(next_of([u32::MAX].into_iter()), u32::MAX);
+        // A pod's directory in no project (from a node that kept none) is given none and
+        // counts none: it is given one at its next start.
+        let state = dir("projects");
+        std::fs::create_dir_all(state.join(crate::files::REPLICAS).join("default.web-0")).unwrap();
+        assert_eq!(Projects::read(&state).next, 1);
+        assert!(Projects::usage(&state, "default.web-0").is_none());
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// Where the state disk holds projects (as root: ci/vm.sh --test quota), a pod's
+    /// directory is given one, kept as kithd starts again, its scratch and one from before
+    /// are put in it, and its limit holds; skipped by name elsewhere.
+    #[test]
+    fn storage_projects_a_pod_is_given_one_kept_across_starts() {
+        let state = dir("given");
+        if !held_at_write(&state) {
+            eprintln!("storage_projects_a_pod_is_given_one_kept_across_starts: skipped: {state:?} holds no projects");
+            return std::fs::remove_dir_all(state).unwrap();
+        }
+        let older = state
+            .join(crate::files::REPLICAS)
+            .join("default.b-0")
+            .join("scratch")
+            .join("old");
+        std::fs::create_dir_all(&older).unwrap();
+        let mut projects = Projects::read(&state);
+        let a = projects.give("default.a-0", Some(MIB)).unwrap();
+        let b = projects.give("default.b-0", None).unwrap();
+        assert!(a != 0 && b != a, "{a} {b}");
+        assert_eq!(kith_dm_sys::project(&older).unwrap(), (b, true));
+        let files = state.join(crate::files::REPLICAS).join("default.a-0");
+        assert_eq!(kith_dm_sys::project(&files).unwrap(), (a, false));
+        // kithd started again: the same ids, and a new pod's is past both.
+        let mut again = Projects::read(&state);
+        assert_eq!(
+            (
+                again.give("default.a-0", Some(MIB)).unwrap(),
+                again.give("default.b-0", None).unwrap()
+            ),
+            (a, b)
+        );
+        assert!(again.give("default.c-0", None).unwrap() > a.max(b));
+        // What is written in its scratch is its (root, who writes it here, is held to no
+        // limit: a pod's write past it is the VM test's to show).
+        let scratch = files.join("scratch");
+        std::fs::write(scratch.join("some"), vec![1u8; MIB as usize]).unwrap();
+        std::fs::File::open(scratch.join("some")).unwrap().sync_all().unwrap();
+        assert!(Projects::usage(&state, "default.a-0").unwrap() >= MIB);
+        for id in [a, b, a.max(b) + 1] {
+            kith_dm_sys::set_project_limit(&state, id, 0).unwrap();
+        }
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    /// Where the state disk holds projects: an id a pod gone left held to its limit is given
+    /// again with the new pod's limit, set before anything is put in it; one with a file left
+    /// anywhere on the disk is not given again; a pod's limit goes with its directory once
+    /// nothing is left in its project; a scratch holding files from before stays in none, its
+    /// pod counted, till it is made anew. Skipped by name elsewhere.
+    #[test]
+    fn storage_projects_an_id_is_given_again_only_with_nothing_left_in_it() {
+        let state = dir("again");
+        if !held_at_write(&state) {
+            eprintln!(
+                "storage_projects_an_id_is_given_again_only_with_nothing_left_in_it: skipped: {state:?} holds no projects"
+            );
+            return std::fs::remove_dir_all(state).unwrap();
+        }
+        // (Ids of its own, far past what other tests on the disk give.)
+        let first = 0x4000_0000 + (std::process::id() & 0xffff) * 16;
+        kith_dm_sys::set_project_limit(&state, first, 4096).unwrap();
+        let mut projects = Projects {
+            state: state.clone(),
+            next: first,
+        };
+        assert_eq!(projects.give("default.a-0", Some(64 * MIB)).unwrap(), first);
+        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), 64 * MIB);
+
+        // A container's root left in it outside the pod's directory: its id is not given again,
+        // and its limit stays.
+        let root = state.join("root");
+        std::fs::create_dir(&root).unwrap();
+        kith_dm_sys::set_project(&root, first, true).unwrap();
+        crate::files::sweep(&[&state], &std::collections::BTreeSet::new());
+        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), 64 * MIB);
+        let mut again = Projects {
+            state: state.clone(),
+            next: first,
+        };
+        let b = again.give("default.b-0", Some(MIB)).unwrap();
+        assert!(b > first, "{b}");
+        std::fs::remove_dir(&root).unwrap();
+        crate::files::sweep(&[&state], &std::collections::BTreeSet::new());
+        assert_eq!(kith_dm_sys::project_limit(&state, b).unwrap(), 0);
+
+        // A scratch with a file from before is left as it is, its pod counted; made anew, held.
+        let scratch = state.join(crate::files::REPLICAS).join("default.c-0").join("scratch");
+        std::fs::create_dir_all(scratch.join("work")).unwrap();
+        std::fs::write(scratch.join("work/old"), b"x").unwrap();
+        let c = again.give("default.c-0", Some(MIB)).unwrap();
+        assert_eq!(kith_dm_sys::project(&scratch).unwrap(), (0, false));
+        assert_eq!(kith_dm_sys::project(&scratch.join("work")).unwrap(), (0, false));
+        assert!(Projects::usage(&state, "default.c-0").is_none());
+        assert!(aside(&scratch));
+        assert_eq!(again.give("default.c-0", Some(MIB)).unwrap(), c);
+        assert_eq!(kith_dm_sys::project(&scratch).unwrap(), (c, true));
+        assert!(Projects::usage(&state, "default.c-0").is_some());
+        for id in [first, b, c] {
+            kith_dm_sys::set_project_limit(&state, id, 0).unwrap();
+        }
+        std::fs::remove_dir_all(state).unwrap();
     }
 
     /// A flag never set: no test's count is stopped but the one that sets its own.

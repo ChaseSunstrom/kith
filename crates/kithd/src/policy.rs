@@ -152,9 +152,13 @@ pub fn cut(policy: &Policy) -> Result<(), String> {
     let later = std::thread::spawn(|| capabilities("/proc/thread-self/status"))
         .join()
         .unwrap_or_default();
-    eprintln!(
-        "kithd: capability bounding set cut: CapBnd {} CapEff {}; a later thread: CapBnd {} CapEff {}",
-        own.0, own.1, later.0, later.1
+    // (Not `eprintln!`: it panics when stderr cannot be written, and PID 1 may not.)
+    let _ = std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!(
+            "kithd: capability bounding set cut: CapBnd {} CapEff {}; a later thread: CapBnd {} CapEff {}\n",
+            own.0, own.1, later.0, later.1
+        ),
     );
     Ok(())
 }
@@ -459,7 +463,11 @@ mod tests {
     }
 
     /// The bounding set is a thread's own: one made here is cut and read, and the others are not.
+    /// Needs CAP_SETPCAP, which a plain run lacks: `unshare -Ur cargo test -p kithd --bin kithd
+    /// bounding_set -- --ignored` has it in a user namespace, and `ci/vm.sh --test policy` reads
+    /// the same of kithd itself.
     #[test]
+    #[ignore = "needs root: run in the VM"]
     fn bounding_set_is_cut_to_what_is_kept() {
         let status = |thread: &str| {
             let text = std::fs::read_to_string(format!("/proc/{thread}/status")).unwrap();
@@ -473,25 +481,22 @@ mod tests {
         let mask = kept_mask(&Policy::hardened()).unwrap();
         let cut = std::thread::spawn(move || {
             let (bounding, effective) = status("thread-self");
-            if effective >> 8 & 1 == 0 {
-                return None; // not root: no CAP_SETPCAP to drop with
-            }
+            assert_eq!(
+                effective >> 8 & 1,
+                1,
+                "no CAP_SETPCAP to drop with: this test needs root"
+            );
             drop_to(mask).unwrap();
-            Some((bounding, status("thread-self").0))
+            (bounding, status("thread-self").0)
         });
-        let cut = cut.join().unwrap();
-        if cut.is_none() {
-            eprintln!("SKIPPED bounding_set_is_cut_to_what_is_kept: not root (no CAP_SETPCAP), nothing was cut");
+        let (was, now) = cut.join().unwrap();
+        assert_eq!(now, was & mask);
+        for gone in [16, 17, 19, 25] {
+            // SYS_MODULE, SYS_RAWIO, SYS_PTRACE, SYS_TIME
+            assert_eq!(now >> gone & 1, 0, "{gone}");
         }
-        if let Some((was, now)) = cut {
-            assert_eq!(now, was & mask);
-            for gone in [16, 17, 19, 25] {
-                // SYS_MODULE, SYS_RAWIO, SYS_PTRACE, SYS_TIME
-                assert_eq!(now >> gone & 1, 0, "{gone}");
-            }
-            // (Another thread's, here the test's, is as it was.)
-            assert_eq!(status("self").0, before);
-        }
+        // (Another thread's, here the test's, is as it was.)
+        assert_eq!(status("self").0, before);
     }
 
     #[test]
