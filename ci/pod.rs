@@ -52,7 +52,8 @@
 //!                              `>A:B` renames A to B; `&A:B` links B to A; `?FILE` says its
 //!                              project; `0FILE` sets that to 0 by ioctl, `!FILE` by
 //!                              file_setattr(2); `#DIR` says size, used and free bytes there
-//!                              (statfs); `sN` sleeps N seconds
+//!                              (statfs); `=FILE` says its size; `@` says the first line of
+//!                              its uid_map; `sN` sleeps N seconds
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -327,6 +328,12 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
             std::thread::sleep(Duration::from_secs(a.parse().expect("seconds")));
             "ok".to_string()
         }
+        "=" => std::fs::metadata(a).map_or_else(|e| e.to_string(), |meta| format!("size {}", meta.len())),
+        // Whose users it has: the first line of its uid_map ("0 0 4294967295", the node's).
+        "@" => match std::fs::read_to_string("/proc/self/uid_map") {
+            Ok(map) => map.lines().next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" "),
+            Err(e) => e.to_string(),
+        },
         _ => panic!("pod quota: no step {step}"),
     }
 }

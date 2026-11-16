@@ -152,7 +152,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    own limit, not that one's; a pod of 64 MiB writing 200 MiB
                    is stopped at its limit by the kernel, in its root, its scratch
                    and a file it removed and holds open, and is not replaced, while
-                   one beside it loses no write; a pod cannot move its files out of
+                   one beside it loses no write; a pod with the node's users is
+                   stopped in its root too, and in both kinds a file of the image
+                   copied up near the limit is refused whole, the file unchanged;
+                   a pod cannot move its files out of
                    its project (in a user namespace the kernel refuses, as the node's
                    root its filter does; unconfined it can, and is counted and
                    replaced); what it changes of its image is charged to it. Needs
@@ -860,6 +863,11 @@ for r in found:
             # and is removed; kithd starts again, and gives the next pod the lowest id with nothing
             # in it, the same. That pod, whose image and scratch it changes are past 64Ki, starts
             # and is held to its own limit, not the one before.
+            # What this does not show: that the stale limit is cleared. kithd sets a project's
+            # limit before anything is put in it, but kithd is root with CAP_SYS_RESOURCE, and
+            # the kernel lets such a writer past a hard limit (dquot.c, ignore_hardlimit): with
+            # the 64Ki left on the id, the pod's start passes all the same. (Run against a kithd
+            # that left it, this case held too.) It shows an id given again, and its new limit.
             quota Workload tiny ',"resources":{"storage":"64Ki"}' '?/' '+/fill:131072'
             done_ Workload tiny
             stopped tiny '+/fill:131072' 65536
@@ -904,7 +912,9 @@ for r in found:
 
             # A pod of 64 MiB writing 200 MiB, in its root and then its scratch, beside one writing
             # 32 MiB: the first is stopped at the write, the second loses none, and the disk loses
-            # no more than both their limits let them (and 4 MiB of kithd's own).
+            # no more than both their limits let them (and 4 MiB of kithd's own). It is in a user
+            # namespace of its own (a Workload's pod, with a network of its own), so its root's
+            # overlay was mounted by that namespace's root; its scratch it writes itself.
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"free"},"spec":{"node":"n1","path":"free"}}]
 EOF
@@ -914,11 +924,12 @@ EOF
                 to=/fill more=$storage
                 [ "$case" = write ] || { to=/work/fill more="$storage,\"volumeMounts\":[{\"scratch\":\"work\",\"path\":\"/work\"}]"; }
                 before=$(free "before-$case")
-                quota Workload "big-$case" "$more" "+$to:209715200" "#${to%/fill}/"
+                quota Workload "big-$case" "$more" '@' "+$to:209715200" "#${to%/fill}/"
                 quota Workload "small-$case" "$more" "+$to:33554432"
                 done_ Workload "big-$case"
                 done_ Workload "small-$case"
                 after=$(free "after-$case")
+                expect "big-$case" '@' '0 [1-9][0-9]* [0-9]+' "a Workload's pod with a network of its own has the node's users"
                 stopped "big-$case" "+$to:209715200" "$limit"
                 used "big-$case" "#${to%/fill}/" "$limit"
                 expect "small-$case" "+$to:33554432" 'wrote 33554432' "a pod beside one at its limit lost a write"
@@ -946,6 +957,39 @@ EOF
             stopped unlinked "~/fill:209715200" "$limit"
             gone Workload unlinked
             ok unlinked
+
+            # The root of a pod with the node's users (a NodeWorkload's): its overlay was mounted
+            # by the node's root with every capability, CAP_SYS_RESOURCE too, which lets a writer
+            # past a project's hard limit. The kernel leaves that one out of the credentials an
+            # overlay writes its upper layer with (fs/overlayfs/super.c, "Never override disk
+            # quota limits"), so it is held all the same: a new file past its limit, and, in both
+            # kinds of pod, a file of its image copied up near its limit (12 MiB with 8 of 16
+            # written), refused whole and left as the image has it.
+            quota NodeWorkload nodewrite "$storage" '@' '+/fill:209715200' '#/'
+            copy=',"resources":{"storage":"16Mi"}'
+            quota Workload copyup "$copy" '+/pad:8388608' '^/big' '=/big' '+/fill:16777216' '#/'
+            quota NodeWorkload nodecopyup "$copy" '@' '+/pad:8388608' '^/big' '=/big' '+/fill:16777216' '#/'
+            done_ NodeWorkload nodewrite
+            expect nodewrite '@' '0 0 4294967295' "a NodeWorkload's pod does not have the node's users"
+            stopped nodewrite '+/fill:209715200' "$limit"
+            used nodewrite '#/' "$limit"
+            echo "vm.sh: nodewrite: the node's root stopped at $wrote bytes of 200 MiB in its root" >&2
+            gone NodeWorkload nodewrite
+            ok nodewrite
+            for name in copyup nodecopyup; do
+                kind=Workload
+                [ "$name" = copyup ] || kind=NodeWorkload
+                done_ "$kind" "$name"
+                [ "$kind" = Workload ] || expect "$name" '@' '0 0 4294967295' "a NodeWorkload's pod does not have the node's users"
+                expect "$name" '+/pad:8388608' 'wrote 8388608' "a pod of 16 MiB could not write 8 MiB"
+                expect "$name" '^/big' '.* \(os error 122\)' "a file of its image of 12 MiB was copied up with 8 MiB of 16 written"
+                expect "$name" '=/big' 'size 12582912' "a copy-up refused at its limit changed the file of its image"
+                stopped "$name" '+/fill:16777216' 16777216
+                used "$name" '#/' 16777216
+                echo "vm.sh: $name: the copy-up of 12 MiB failed: $(result "$name" '^/big'); /big $(result "$name" '=/big'); then stopped at $wrote" >&2
+                gone "$kind" "$name"
+                ok "$name"
+            done
 
             # Moving its files out of its project: in a user namespace the kernel refuses; as the
             # node's root (a NodeWorkload's pod) its filter does; unconfined nothing does, and
@@ -1006,11 +1050,11 @@ EOF
             gone Workload image
             ok image
 
-            for case in said again write scratch unlinked userns noderoot unconfined elsewhere image; do
+            for case in said again write scratch unlinked nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image; do
                 grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
             done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
+            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; a pod with the node's users was stopped in its root too, and in both kinds a file of the image copied up near the limit was refused whole and left unchanged; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
             exit 0
         fi
         if [ "$test" = pods ]; then

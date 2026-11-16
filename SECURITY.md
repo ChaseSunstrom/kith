@@ -394,13 +394,20 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   quotas and is counted as before. A pod whose scratch held files from before projects is
   counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
   a pod's own directories hold). The quota holds bytes, not files: there is no limit on
-  how many files a pod makes (T-0605), and each costs the disk an inode. kithd itself is
-  not held by the quota (it is root, whose writes the kernel lets past a hard limit): what
-  it writes into a pod's project (a new container's root directories, and what the
-  kernel writes with its credentials, as an overlay's copy-up of an image's file may be)
-  can take the pod past its limit: 64 KiB past it is let be, and further the pod is
-  replaced at the next count (about every 10 seconds, its project's usage read, not
-  walked), as a counted pod is. A project id is given again once nothing on the disk is
+  how many files a pod makes (T-0605), and each costs the disk an inode. **Stopped at the
+  limit:** every write a pod's own processes make outside its Volumes: a new file or an
+  append in its container's root, a file of its image copied up to be changed (refused
+  whole, the image's file left as it was), its disk scratch, and a file it removed and
+  holds open; in a pod with a user namespace of its own and in one with the node's users
+  alike. (The root is an overlay that libcontainer's first process mounts, as the node's
+  root with every capability for a pod with the node's users; the kernel leaves
+  CAP_SYS_RESOURCE out of the credentials an overlay writes with, so they are held too.
+  `sh ci/vm.sh --test quota` shows each.) **Only counted:** what kithd itself writes into
+  a pod's project (a new container's root directories: kithd is root, whose writes the
+  kernel lets past a hard limit: 64 KiB past the limit is let be, and further the pod is
+  replaced at the next count, about every 10 seconds, its project's usage read, not
+  walked), an unconfined pod's file moved out of its project, and a scratch from before
+  projects (both walked and replaced as on a disk with no quotas, below). A project id is given again once nothing on the disk is
   left in it, its new limit set first. Elsewhere,
   with no quota, kithd counts them about every 10 seconds (each pod with a `resources.storage`
   limit, and every pod while the disk has less than twice its reserve free) and replaces

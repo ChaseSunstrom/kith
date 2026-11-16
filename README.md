@@ -507,7 +507,9 @@ spec:
   replica's root: kithd's own store, logs and Images, and Volumes, count against no
   replica. On a kith OS state disk made since this was added (project quotas, kithd
   root) the limit is held at the write instead: each pod is a project of its own, a write
-  past its limit fails (EDQUOT), its units say it reached it, and kithd says at start and
+  past its limit fails (EDQUOT), in its root (a copy-up of an image's file too) and its
+  scratch, with the node's users or its own; only what kithd itself writes there is
+  counted (SECURITY.md); its units say it reached it, and kithd says at start and
   in the Node's status which way it holds limits. Elsewhere it is counted, not held at
   the write: between two counts a fast writer
   can pass it, a removed file held only by a descriptor in flight on a socket counts
@@ -1570,8 +1572,8 @@ Not answered, each refused in words:
   commonly says is carried, as [kith's own fields](#what-a-container-is-given):
   volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
   `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage`
-  with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (a `sizeLimit` under 64Ki
-  raised to it).
+  with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised
+  to it).
 - A StatefulSet with a claim template and more than one replica; a CronJob in a
   time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
 - `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
