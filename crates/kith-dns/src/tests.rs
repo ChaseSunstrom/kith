@@ -1049,6 +1049,18 @@ fn the_chase_slot_log_speaks_once_a_minute() {
 }
 
 #[test]
+fn a_silent_upstream_is_named_with_why() {
+    let up = "192.0.2.1:53".parse().unwrap();
+    let slow = crate::server::unanswered(up, None);
+    assert!(
+        slow.contains("192.0.2.1:53") && slow.contains("no answer in 2 s"),
+        "{slow}"
+    );
+    let refused = crate::server::unanswered(up, Some(std::io::ErrorKind::ConnectionRefused.into()));
+    assert!(refused.contains("connection refused"), "{refused}");
+}
+
+#[test]
 fn upstream_replies_cut_or_corrupted_anywhere_never_panic() {
     let mut records = rr("example.com", CNAME, 120, b"\x04edge\x07example\x03net\x00");
     records.extend(rr("edge.example.net", A, 300, &[9, 9, 9, 9]));

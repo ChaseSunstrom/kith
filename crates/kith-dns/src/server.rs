@@ -326,12 +326,29 @@ async fn forward(query: &[u8], upstreams: &[SocketAddr], tcp: bool) -> Vec<u8> {
                 ask_udp(&sent, up).await
             }
         };
-        if let Ok(Ok(mut reply)) = timeout(UPSTREAM_TIMEOUT, ask).await {
-            reply[..2].copy_from_slice(&query[..2]);
-            return reply;
+        match timeout(UPSTREAM_TIMEOUT, ask).await {
+            Ok(Ok(mut reply)) => {
+                reply[..2].copy_from_slice(&query[..2]);
+                return reply;
+            }
+            failed if SILENT.ready(Instant::now()) => {
+                eprintln!("{}", unanswered(up, failed.ok().and_then(Result::err)));
+            }
+            _ => {}
         }
     }
     servfail(query)
+}
+
+/// Holds the line about an upstream that gave nothing to one a minute, all upstreams together.
+static SILENT: Throttle = Throttle(Mutex::new(None));
+
+/// What is said (on stderr) of an upstream that gave no answer: which one, and why.
+pub(crate) fn unanswered(up: SocketAddr, why: Option<io::Error>) -> String {
+    let why = why.map_or(format!("no answer in {} s", UPSTREAM_TIMEOUT.as_secs()), |e| {
+        e.to_string()
+    });
+    format!("kith-dns: upstream {up}: {why}: the next is asked, or the answer is SERVFAIL (said once a minute)")
 }
 
 /// The zone's answer with what the upstreams say for its CNAME's target (one question, over TCP
