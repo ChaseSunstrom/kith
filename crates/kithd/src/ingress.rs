@@ -134,9 +134,11 @@ impl Exposed {
 // ponytail: two Namespaces that keep the same host both expose it (the older Service
 // has it): the people who write Namespaces are the cluster's own. Refuse the second
 // Namespace when it is applied if that is ever not so.
-// ponytail: "older" is the time of the oldest revision the store still keeps of the
-// Service (all nodes agree on it), so a Service edited more than `HISTORY_LIMIT` times
-// looks as new as its oldest kept edit. A creation time in the metadata would fix that.
+// "Older" is by when the store says a Service was first made (`Store::born`: the log's
+// entry, so every node agrees and no clock says it), whatever is edited or trimmed after.
+// In a store not marked yet (a member's kithd is from before), and for a Service there was
+// before the mark, it is the time of the oldest revision kept, as it was: one edited more
+// than `HISTORY_LIMIT` times before the mark looked as new as its oldest kept edit then.
 pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
     exposed_in(store, prefix, false)
 }
@@ -146,8 +148,12 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
     let mut hosts: BTreeMap<String, Exposed> = BTreeMap::new();
     let mut refused = BTreeMap::new();
     let born = |service: &Resource| {
-        let kept = store.history(&service.key()).ok();
-        kept.and_then(|kept| kept.first()).map_or(u64::MAX, |first| first.at)
+        let key = service.key();
+        let oldest = || {
+            let kept = store.history(&key).ok();
+            (0, kept.and_then(|kept| kept.first()).map_or(u64::MAX, |first| first.at))
+        };
+        store.born(&key).unwrap_or_else(oldest)
     };
     let kept = store.list(Some("Namespace")).filter_map(|namespace| {
         let spec = serde_json::from_value::<NamespaceSpec>(namespace.spec.clone()).ok()?;
@@ -1722,6 +1728,74 @@ mod tests {
             refused,
             BTreeMap::from([("Service/default/a".to_string(), said.to_string())])
         );
+    }
+
+    /// The Service made first has a host two name, however often it is edited after and
+    /// whatever of its history is trimmed: the store says when each was first made.
+    #[test]
+    fn exposed_host_stays_with_the_service_made_first_after_150_edits_and_a_restart() {
+        use kith_store::Command;
+        let host = "shop.example.org";
+        let service = |name: &str, port: u16| {
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: {port} }}]\n  expose: {{ host: {host}, via: edge }}\n"
+            );
+            Resource::from_source(&source).unwrap().remove(0).unwrap()
+        };
+        // The log: "z" is made, then "a" names its host, then "z" is edited 150 times.
+        let written = |marked: bool| {
+            let mut store = Store::default();
+            let mut index = 0;
+            let mut run = |store: &mut Store, command: Command| {
+                index += 1;
+                store.entry(index);
+                kith_store::run(store, command).unwrap();
+            };
+            let apply = |service: Resource, at: u64| Command::Apply {
+                resources: vec![service],
+                at,
+            };
+            if marked {
+                run(&mut store, Command::Mark);
+            }
+            run(&mut store, apply(service("z", 80), 100));
+            run(&mut store, apply(service("a", 80), 200));
+            for edit in 1..=150 {
+                run(&mut store, apply(service("z", 80 + edit), 300 + u64::from(edit)));
+            }
+            store
+        };
+        let holder = |store: &Store| {
+            let (hosts, refused) = exposed(store, kith_mesh::prefix(b"ca"));
+            (hosts[host].service.clone(), refused)
+        };
+        let refused = |loser: &str, holder: &str| {
+            let said = format!("the host {host} is already exposed by Service/default/{holder}");
+            BTreeMap::from([(format!("Service/default/{loser}"), said)])
+        };
+        let store = written(true);
+        // (All the store keeps of "z" is newer than "a" by now.)
+        assert!(store.history("Service/default/z").unwrap()[0].at > 200);
+        assert_eq!(holder(&store), ("Service/default/z".to_string(), refused("a", "z")));
+        // Every node started again reads the store from its snapshot: the same.
+        let read: Store = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(holder(&read), ("Service/default/z".to_string(), refused("a", "z")));
+        // Deleted, "z" gives the host up, and made again it is the newer one.
+        let mut gone = read.clone();
+        gone.delete("Service/default/z").unwrap();
+        gone.entry(1000);
+        gone.at(Some(50));
+        gone.apply(service("z", 80)).unwrap();
+        assert_eq!(holder(&gone), ("Service/default/a".to_string(), refused("z", "a")));
+
+        // A store not marked (a member's kithd is from before) orders as it did: by the
+        // oldest revision kept, so there "a" has the host after those edits. Marked then,
+        // what there was keeps that order: SECURITY.md says to keep such a host by its Namespace.
+        let mut before = written(false);
+        assert_eq!(holder(&before), ("Service/default/a".to_string(), refused("z", "a")));
+        kith_store::run(&mut before, Command::Mark).unwrap();
+        assert_eq!(holder(&before), ("Service/default/a".to_string(), refused("z", "a")));
     }
 
     /// Whoever may write a Service in one namespace could otherwise take a host another

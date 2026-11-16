@@ -255,6 +255,54 @@ fn fixture_entries() -> Vec<openraft::Entry<TypeConfig>> {
     payloads.into_iter().enumerate().map(entry).collect()
 }
 
+/// A state as format 2's builds wrote it: format 1's log, then the mark, and a resource
+/// made after it. Its snapshot goes that far, so both files hold what format 1 has not.
+const FIXTURE_2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/format-2");
+const SNAPSHOT_2: usize = 13;
+
+fn fixture_2_entries() -> Vec<openraft::Entry<TypeConfig>> {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let mut entries = fixture_entries();
+    let made = Command::Apply {
+        resources: vec![config("c", "1")],
+        at: 400,
+    };
+    for payload in [
+        EntryPayload::Normal(Command::Mark),
+        EntryPayload::Normal(made),
+        EntryPayload::Blank,
+    ] {
+        let log_id = LogId::new(CommittedLeaderId::new(3, 7), entries.len() as u64 + 1);
+        entries.push(Entry { log_id, payload });
+    }
+    entries
+}
+
+/// Every command of `entries` run in turn, each as its place in the log.
+fn whole(entries: Vec<openraft::Entry<TypeConfig>>) -> Store {
+    let mut whole = Store::default();
+    for entry in entries {
+        if let openraft::EntryPayload::Normal(command) = entry.payload {
+            whole.entry(entry.log_id.index);
+            run(&mut whole, command).unwrap();
+        }
+    }
+    whole.entry(0);
+    whole
+}
+
+/// The format the files in `dir` say they are in: the log's, the snapshot's.
+fn formats(dir: &std::path::Path) -> (u32, u32) {
+    let meta: redb::TableDefinition<&str, &[u8]> = redb::TableDefinition::new("meta");
+    let db = redb::Database::create(dir.join("log.redb")).unwrap();
+    let txn = redb::ReadableDatabase::begin_read(&db).unwrap();
+    let log = txn.open_table(meta).unwrap().get("format").unwrap().unwrap();
+    let log = serde_json::from_slice(log.value()).unwrap();
+    let snapshot = std::fs::read(dir.join("snapshot.json")).unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).unwrap();
+    (log, snapshot["format"].as_u64().unwrap() as u32)
+}
+
 /// Writes the fixture: `cargo test -p kith-store -- --ignored format_fixture`. Once per
 /// format: it is what that format's builds wrote, so one that is there is never written again.
 #[test]
@@ -262,19 +310,19 @@ fn fixture_entries() -> Vec<openraft::Entry<TypeConfig>> {
 fn format_fixture_is_written() {
     use openraft::RaftSnapshotBuilder;
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
-    let dir = std::path::Path::new(FIXTURE);
+    let dir = std::path::Path::new(FIXTURE_2);
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::create_dir(dir).expect("this format's fixture is there already, and stays as it was written");
     let mut log = Log::open(&dir.join("log.redb")).unwrap();
     let mut machine = Machine::open(dir, Arc::new(|| {})).unwrap();
-    let entries = fixture_entries();
+    let entries = fixture_2_entries();
     log.put(entries.clone()).unwrap();
     block(async {
         log.save_vote(&fixture_vote()).await.unwrap();
         log.save_committed(entries.last().map(|entry| entry.log_id))
             .await
             .unwrap();
-        machine.apply(entries[..SNAPSHOT].to_vec()).await.unwrap();
+        machine.apply(entries[..SNAPSHOT_2].to_vec()).await.unwrap();
         machine.build_snapshot().await.unwrap();
         log.purge(entries[PURGED - 1].log_id).await.unwrap();
     });
@@ -282,15 +330,47 @@ fn format_fixture_is_written() {
 
 #[test]
 fn format_1_state_is_read_whole_by_this_build() {
+    let (read, dir) = read_whole(FIXTURE, fixture_entries(), SNAPSHOT);
+    let a = read.get("ConfigMap/default/a").unwrap();
+    let status = a.status.as_ref().unwrap();
+    assert_eq!(
+        (&status["ready"], &status["containers"][0]["node"]),
+        (&1.into(), &"n1".into())
+    );
+    assert_eq!(read.history("ConfigMap/default/a").unwrap().last().unwrap().at, 300);
+    assert!(read.get("ConfigMap/default/old").is_some() && read.get("ConfigMap/default/b").is_none());
+    // And left as it was: nothing of this build is in it, so the kithd that wrote it reads it still.
+    assert!(!read.marked() && read.born("ConfigMap/default/a").is_none());
+    assert_eq!(formats(&dir.0), (1, 1));
+}
+
+#[test]
+fn format_2_state_is_read_whole_by_this_build() {
+    let (read, dir) = read_whole(FIXTURE_2, fixture_2_entries(), SNAPSHOT_2);
+    // What there was at the mark: of entry 0, at its oldest kept revision. What was made
+    // after: of the entry that made it.
+    assert_eq!(read.born("ConfigMap/default/a"), Some((0, 100)));
+    assert_eq!(read.born("ConfigMap/default/old"), Some((0, 50)));
+    assert_eq!(read.born("ConfigMap/default/c"), Some((13, 400)));
+    assert_eq!(read.born("ConfigMap/default/b"), None);
+    // Both files say so: a kithd from before reads up to format 1, and refuses a file that
+    // says more by that number (the rule `format_newer_than_this_build…` holds this build to).
+    assert_eq!(formats(&dir.0), (2, 2));
+}
+
+/// A copy of the state in `fixture`, opened by this build: the log reads as `entries`,
+/// and the snapshot (which goes `snapshot` entries in) with the log after it ends where
+/// running every command does. The store that gives, and the copy.
+fn read_whole(fixture: &str, entries: Vec<openraft::Entry<TypeConfig>>, snapshot: usize) -> (Store, Scratch) {
     use openraft::RaftLogReader;
+    use openraft::RaftSnapshotBuilder;
     use openraft::storage::{RaftLogStorage, RaftStateMachine};
     let scratch = Scratch::new();
     for file in ["log.redb", "snapshot.json"] {
-        std::fs::copy(std::path::Path::new(FIXTURE).join(file), scratch.0.join(file)).unwrap();
+        std::fs::copy(std::path::Path::new(fixture).join(file), scratch.0.join(file)).unwrap();
     }
     let mut log = Log::open(&scratch.0.join("log.redb")).unwrap();
     let mut machine = Machine::open(&scratch.0, Arc::new(|| {})).unwrap();
-    let entries = fixture_entries();
     let index = |id: Option<openraft::LogId<u64>>| id.map(|id| id.index as usize);
     block(async {
         assert_eq!(log.read_vote().await.unwrap(), Some(fixture_vote()));
@@ -301,7 +381,7 @@ fn format_1_state_is_read_whole_by_this_build() {
             (Some(PURGED), Some(entries.len()))
         );
         let (applied, membership) = machine.applied_state().await.unwrap();
-        assert_eq!(index(applied), Some(SNAPSHOT));
+        assert_eq!(index(applied), Some(snapshot));
         assert_eq!(
             membership
                 .nodes()
@@ -315,24 +395,123 @@ fn format_1_state_is_read_whole_by_this_build() {
         let json = |entries: &[openraft::Entry<TypeConfig>]| serde_json::to_value(entries).unwrap();
         assert_eq!(json(&kept), json(&entries[PURGED..]));
         // The log after the snapshot, run by this build, ends where running every command does.
-        machine.apply(kept[SNAPSHOT - PURGED..].to_vec()).await.unwrap();
+        machine.apply(kept[snapshot - PURGED..].to_vec()).await.unwrap();
+        // (Written again by this build: in the format the store is in, not this build's newest.)
+        machine.build_snapshot().await.unwrap();
     });
-    let mut whole = Store::default();
-    for entry in entries {
-        if let openraft::EntryPayload::Normal(command) = entry.payload {
-            run(&mut whole, command).unwrap();
-        }
-    }
     let read = machine.state.lock().unwrap().store.clone();
-    assert_eq!(read, whole);
-    let a = read.get("ConfigMap/default/a").unwrap();
-    let status = a.status.as_ref().unwrap();
-    assert_eq!(
-        (&status["ready"], &status["containers"][0]["node"]),
-        (&1.into(), &"n1".into())
-    );
-    assert_eq!(read.history("ConfigMap/default/a").unwrap().last().unwrap().at, 300);
-    assert!(read.get("ConfigMap/default/old").is_some() && read.get("ConfigMap/default/b").is_none());
+    assert_eq!(read, whole(entries));
+    (read, scratch)
+}
+
+/// The mark is in the log, so replicas agree on it: one entry at a time, two give the same
+/// store; what a resource is first made of outlives its history's trimming, a snapshot and
+/// a restart; and a replica that has not come to the mark orders as before it.
+#[test]
+fn born_is_the_same_on_every_replica_and_kept_through_a_snapshot_and_a_restart() {
+    use openraft::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let apply = |name: &str, value: String, at| Command::Apply {
+        resources: vec![config(name, &value)],
+        at,
+    };
+    let mut commands = vec![
+        apply("first", "0".into(), 100),
+        Command::Mark,
+        apply("held", "0".into(), 200),
+    ];
+    // (Edited past what a history keeps.)
+    let edits = kith_api::store::HISTORY_LIMIT as u64 + 50;
+    commands.extend((1..=edits).map(|n| apply("held", n.to_string(), 200 + n)));
+    commands.push(apply("late", "0".into(), 150));
+    commands.push(Command::Delete {
+        key: "ConfigMap/default/first".into(),
+    });
+    commands.push(apply("first", "1".into(), 900));
+    let entry = |(index, command)| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index as u64 + 1),
+        payload: EntryPayload::Normal(command),
+    };
+    let entries: Vec<Entry<TypeConfig>> = commands.into_iter().enumerate().map(entry).collect();
+    let (one, two, behind) = (Scratch::new(), Scratch::new(), Scratch::new());
+    let open = |dir: &Scratch| Machine::open(&dir.0, Arc::new(|| {})).unwrap();
+    let store = |machine: &Machine| machine.state.lock().unwrap().store.clone();
+    let (mut a, mut b, mut c) = (open(&one), open(&two), open(&behind));
+    block(async {
+        c.apply(entries[..1].to_vec()).await.unwrap();
+        for entry in &entries {
+            a.apply([entry.clone()]).await.unwrap();
+            b.apply([entry.clone()]).await.unwrap();
+            assert_eq!(store(&a), store(&b), "at {}", entry.log_id.index);
+        }
+        a.build_snapshot().await.unwrap();
+        c.build_snapshot().await.unwrap();
+    });
+    let held = "ConfigMap/default/held";
+    let checked = |store: &Store| {
+        // Made by the log's third entry, whatever its history says now.
+        assert_eq!(store.born(held), Some((3, 200)));
+        assert!(store.history(held).unwrap().first().unwrap().at > 250);
+        // Made later in the log, though its clock said earlier: the log's order is the order.
+        assert!(store.born("ConfigMap/default/late").unwrap() > store.born(held).unwrap());
+        // Deleted and made again, it is new.
+        assert_eq!(store.born("ConfigMap/default/first"), Some((entries.len() as u64, 900)));
+    };
+    checked(&store(&a));
+    // After a restart (the snapshot file), and on a replica sent the snapshot.
+    drop(a);
+    checked(&store(&open(&one)));
+    let sent = std::fs::read(one.0.join("snapshot.json")).unwrap();
+    let sent: serde_json::Value = serde_json::from_slice(&sent).unwrap();
+    assert_eq!(sent["format"], 2);
+    let meta = serde_json::from_value(sent["meta"].clone()).unwrap();
+    let state = serde_json::to_vec(&sent["state"]).unwrap();
+    block(async {
+        let taken = b.install_snapshot(&meta, Box::new(std::io::Cursor::new(state)));
+        taken.await.unwrap();
+    });
+    checked(&store(&b));
+    // The one that stopped before the mark keeps none, writes format 1, and so orders by
+    // the oldest revision kept: what the marked ones say of what there was then.
+    let before = store(&c);
+    assert!(!before.marked() && before.born("ConfigMap/default/first").is_none());
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(behind.0.join("snapshot.json")).unwrap()).unwrap();
+    assert_eq!(written["format"], 1);
+    let mut marked = before.clone();
+    run(&mut marked, Command::Mark).unwrap();
+    let oldest = before.history("ConfigMap/default/first").unwrap()[0].at;
+    assert_eq!(marked.born("ConfigMap/default/first"), Some((0, oldest)));
+}
+
+/// The log file says format 2 from the entry that marks the store, and not before: a
+/// kithd started on a format 1 state leaves a file the kithd before it reads.
+#[test]
+fn format_of_the_log_is_2_with_the_mark_and_not_before() {
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let scratch = Scratch::new();
+    let path = scratch.0.join("log.redb");
+    std::fs::write(scratch.0.join("snapshot.json"), r#"{"format":1}"#).unwrap();
+    let entry = |index, command| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+        payload: EntryPayload::Normal(command),
+    };
+    let made = Command::Apply {
+        resources: vec![config("a", "1")],
+        at: 100,
+    };
+    let log = Log::open(&path).unwrap();
+    log.put([entry(1, made)]).unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 1);
+    let log = Log::open(&path).unwrap();
+    log.put([entry(2, Command::Mark)]).unwrap();
+    drop(log);
+    assert_eq!(formats(&scratch.0).0, 2);
+    // And stays: opened again, it is not put back.
+    drop(Log::open(&path).unwrap());
+    assert_eq!(formats(&scratch.0).0, 2);
 }
 
 #[test]
@@ -398,7 +577,7 @@ fn format_newer_than_this_build_is_refused_and_no_number_is_the_first() {
     let mut old = Log::open(&path).ok().unwrap();
     assert_eq!(block(old.read_vote()).unwrap(), Some(fixture_vote()));
     drop(old);
-    assert_eq!(format(), Some(crate::FORMAT.to_string()));
+    assert_eq!(format(), Some("1".to_string()));
     // A newer one is refused, and left as it was.
     put(Some(newer));
     refusal(Log::open(&path).err().unwrap());

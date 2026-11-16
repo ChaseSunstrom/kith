@@ -316,6 +316,57 @@ fn history_is_bounded() {
     );
 }
 
+/// When a resource was first made is kept once the store is marked: set by the change
+/// that makes it, the same after its history is trimmed, gone with it, new when it is made
+/// again; and a batch that is refused leaves no mark of what it would have made.
+#[test]
+fn born_is_set_once_and_outlives_the_history() {
+    let key = "Workload/default/web";
+    let web = |n: usize| one(&workload(&format!("  replicas: {n}\n")));
+    let mut store = Store::default();
+    store.at(Some(100));
+    store.apply(web(0)).unwrap();
+    assert!(!store.marked() && store.born(key).is_none());
+    let unmarked = serde_json::to_string(&store).unwrap();
+    assert!(!unmarked.contains("born"), "{unmarked}");
+    // What was there when it is marked: the time of the oldest revision kept, of entry 0.
+    store.mark();
+    assert_eq!(store.born(key), Some((0, 100)));
+    store.at(Some(200));
+    for n in 1..HISTORY_LIMIT + 50 {
+        store.entry(n as u64);
+        store.apply(web(n)).unwrap();
+    }
+    assert_eq!(store.history(key).unwrap().first().unwrap().at, 200);
+    assert_eq!(store.born(key), Some((0, 100)));
+    store.mark();
+    assert_eq!(store.born(key), Some((0, 100)));
+    // It is read back as it was written.
+    let read: Store = serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+    assert_eq!(read.born(key), Some((0, 100)));
+    // Deleted and made again: new, of the entry that made it.
+    store.delete(key).unwrap();
+    assert_eq!(store.born(key), None);
+    store.entry(900);
+    store.at(Some(300));
+    store.apply(web(0)).unwrap();
+    assert_eq!(store.born(key), Some((900, 300)));
+    store.entry(901);
+    store.rollback(key, 1).unwrap();
+    assert_eq!(store.born(key), Some((900, 300)));
+    // A batch that is refused, and one only tried, make nothing.
+    let other = || one(&workload("  replicas: 1\n").replace("name: web", "name: other"));
+    // (Based on a revision it is not at.)
+    let mut refused = one(&workload("  replicas: 1\n").replace("name: web", "name: third"));
+    refused.metadata.revision = Some(7);
+    assert!(store.apply_all(vec![other(), refused]).is_err());
+    store.dry_run(vec![other()]).unwrap();
+    assert_eq!(store.born("Workload/default/other"), None);
+    store.apply_all(vec![other()]).unwrap();
+    assert_eq!(store.born("Workload/default/other"), Some((901, 300)));
+    assert!(store.remove("Workload/default/other") && store.born("Workload/default/other").is_none());
+}
+
 #[test]
 fn package_history() {
     let package = |n: usize| {

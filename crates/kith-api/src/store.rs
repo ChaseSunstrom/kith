@@ -96,6 +96,14 @@ pub struct Store {
     /// When the next changes happen, if not now: replicas replaying a change must agree on it.
     #[serde(skip)]
     clock: Option<u64>,
+    /// When each resource was first made ([`Store::born`]), kept apart from its history,
+    /// which is trimmed. `None` until [`Store::mark`]: a store from before has none, and is
+    /// written as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    born: Option<BTreeMap<String, (u64, u64)>>,
+    /// Where in the log the next changes are ([`Store::entry`]).
+    #[serde(skip)]
+    entry: u64,
 }
 
 impl Store {
@@ -135,6 +143,35 @@ impl Store {
         self.clock = at;
     }
 
+    /// The changes that follow are those of the log's entry `index`: replicas replaying it
+    /// agree on that too, and no clock says it.
+    pub fn entry(&mut self, index: u64) {
+        self.entry = index;
+    }
+
+    /// Keep from here on when each resource is first made; of those there are, the time of
+    /// the oldest revision kept (all that is left to say it). Done once: again, nothing.
+    pub fn mark(&mut self) {
+        if self.born.is_none() {
+            let oldest = |(key, history): (&String, &Vec<Revision>)| Some((key.clone(), (0, history.first()?.at)));
+            self.born = Some(self.resources.iter().filter_map(oldest).collect());
+        }
+    }
+
+    /// Whether [`Store::mark`] was done.
+    pub fn marked(&self) -> bool {
+        self.born.is_some()
+    }
+
+    /// When `key` was first made: the log's entry that made it, and the time that entry
+    /// says. Set once, whatever is changed or trimmed after, and gone when it is deleted
+    /// (made again, it is new). One there was before [`Store::mark`] is of entry 0, at the
+    /// time of the oldest revision kept then: before all made after. `None`: not marked, or
+    /// no such resource.
+    pub fn born(&self, key: &str) -> Option<(u64, u64)> {
+        self.born.as_ref()?.get(key).copied()
+    }
+
     pub fn apply(&mut self, desired: Resource) -> Result<Change, Error> {
         self.apply_logged(desired, &mut Undo::new())
     }
@@ -146,11 +183,13 @@ impl Store {
             let key = change.after.key();
             undo.entry(key.clone())
                 .or_insert_with(|| self.resources.get(&key).cloned());
+            let at = self.clock.unwrap_or_else(now);
+            if let (Action::Created, Some(born)) = (change.action, &mut self.born) {
+                born.insert(key.clone(), (self.entry, at));
+            }
             let history = self.resources.entry(key).or_default();
-            history.push(Revision {
-                at: self.clock.unwrap_or_else(now),
-                resource: change.after.clone(),
-            });
+            let resource = change.after.clone();
+            history.push(Revision { at, resource });
             // A Package carries its files (up to 4 MB), so it keeps few revisions. A NodeKey
             // keeps its live one alone: a key the cluster forgot is in no earlier revision
             // (and [`Store::cut_node_key_histories`] cuts what a store from before kept).
@@ -186,6 +225,10 @@ impl Store {
         let before = self.resources.len();
         self.resources
             .retain(|_, history| !history.iter().any(|r| r.resource.kind == "NodeKey"));
+        let resources = &self.resources;
+        if let Some(born) = &mut self.born {
+            born.retain(|key, _| resources.contains_key(key));
+        }
         self.resources.len() != before
     }
 
@@ -210,7 +253,7 @@ impl Store {
             for (key, history) in undo {
                 match history {
                     Some(history) => self.resources.insert(key, history),
-                    None => self.resources.remove(&key),
+                    None => self.forget(&key),
                 };
             }
         }
@@ -323,7 +366,7 @@ impl Store {
                 )));
             }
         }
-        let mut history = self.resources.remove(key).ok_or_else(|| Error::NotFound(key.into()))?;
+        let mut history = self.forget(key).ok_or_else(|| Error::NotFound(key.into()))?;
         // A hand-edited store can hold an empty history.
         history
             .pop()
@@ -340,7 +383,15 @@ impl Store {
 
     /// Let go of `key`, whatever else is there. Was it there?
     pub fn remove(&mut self, key: &str) -> bool {
-        self.resources.remove(key).is_some()
+        self.forget(key).is_some()
+    }
+
+    /// Take `key` out, and when it was first made with it.
+    fn forget(&mut self, key: &str) -> Option<Vec<Revision>> {
+        if let Some(born) = &mut self.born {
+            born.remove(key);
+        }
+        self.resources.remove(key)
     }
 
     pub fn history(&self, key: &str) -> Result<&[Revision], Error> {

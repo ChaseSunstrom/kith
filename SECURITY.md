@@ -1059,9 +1059,19 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     on every write of their kind, whoever writes it.
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
-  Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
-  kept revision is oldest, so a holder can lose a host after a hundred edits or a
-  delete. (T-0233.)
+  Namespace's `hosts`. Where none is kept, the first Service is the one the store says
+  was made first: the log's entry that made it, which every node agrees on, no clock
+  says, no edit changes and no trimming of its history loses. Deleting a Service gives
+  its host up: made again it is the newer one, so only a Namespace's `hosts` keep a
+  host for good. That order is in force once the store is in format 2, which the
+  leader switches to when every member's kithd reads it (README, "What an update
+  keeps"); until then, and for what there was at the switch, first is by the oldest
+  revision kept, so a holder edited more than a hundred times before the switch may
+  already have lost its host to a later Service, and keeps it only by its Namespace.
+  A control node that is down or never updated holds the switch back for the whole
+  cluster (the leader's log names it); what says a node reads the format is its own
+  answer to the leader over the node API, so no write to the store can say it for
+  another. (T-0233.)
 - **Someone on the network can still keep others from connecting** with many addresses
   at once, and eight connections from one address keep out whoever shares that address
   with them (a node behind the same NAT, or in the same IPv6 /64): the count is taken

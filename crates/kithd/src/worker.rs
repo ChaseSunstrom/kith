@@ -516,6 +516,7 @@ pub fn checked(store: &Store, who: &Worker, command: Command) -> Result<Command,
         Command::Delete { key } => delete(store, who, &key).map(|()| Command::Delete { key }),
         Command::Rollback { key, .. } => Err(refused(key, "a rollback is asked of a control node")),
         Command::Import { .. } => Err(refused("a whole store", "only a control node brings one in")),
+        Command::Mark => Err(refused("the store's format", "only the leader changes it")),
     }
 }
 
@@ -772,6 +773,12 @@ spec: { volume: there, every: 1d }
         // `view` is a control node's to write, as its address is.
         let view = patch_of("Node/w", json!({ "view": true }));
         assert!(try_as(&store, "w", view).unwrap_err().contains("view"));
+        // The store's format is the leader's to change.
+        assert!(
+            try_as(&store, "w", Command::Mark)
+                .unwrap_err()
+                .contains("only the leader")
+        );
         // The ACME account's thumbprint its view holds (the leader orders once each ingress
         // worker says it has it): a thumbprint's shape, or null; on its own Node only.
         let print = |said: Value| patch_of("Node/w", json!({ "thumbprint": said }));

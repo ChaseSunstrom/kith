@@ -136,7 +136,7 @@ impl Machine {
             forgot: Arc::new(tokio::sync::watch::Sender::new((0, String::new()))),
         };
         if let Some(mut saved) = saved.filter(|_| cut) {
-            saved.format = crate::FORMAT;
+            saved.format = crate::format_of(&saved.state.store);
             machine.save(&saved).map_err(|e| e.to_string())?;
         }
         Ok(machine)
@@ -203,7 +203,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Machine {
             snapshot_id: id,
         };
         let saved = Saved {
-            format: crate::FORMAT,
+            format: crate::format_of(&state.store),
             meta,
             state,
         };
@@ -241,7 +241,9 @@ impl RaftStateMachine<TypeConfig> for Machine {
                         if matches!(command, crate::Command::Import { .. }) {
                             carried.extend(crate::held(&state.store));
                         }
+                        state.store.entry(entry.log_id.index);
                         let reply = run(&mut state.store, command);
+                        state.store.entry(0);
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);
                         // (The entry is in the log as it was sent: refused, or a revision of
@@ -289,7 +291,7 @@ impl RaftStateMachine<TypeConfig> for Machine {
         state.applied = meta.last_log_id;
         state.membership = meta.last_membership.clone();
         let saved = Saved {
-            format: crate::FORMAT,
+            format: crate::format_of(&state.store),
             meta: meta.clone(),
             state,
         };

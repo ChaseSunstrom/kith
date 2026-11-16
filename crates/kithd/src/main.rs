@@ -1013,7 +1013,10 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             ("serves", serves(args.dns, args.ingress)),
             ("policy", policy::get().status()),
         ];
-        let saying = say_serves(shared.clone(), says, stopping.clone());
+        let saying = async {
+            let format = raft::tend_format(shared.clone(), stopping.clone());
+            tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
+        };
         let (served, nodes, (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
