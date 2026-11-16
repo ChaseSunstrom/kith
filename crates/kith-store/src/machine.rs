@@ -225,10 +225,12 @@ impl RaftStateMachine<TypeConfig> for Machine {
                     EntryPayload::Blank => Ok(crate::Done::Nothing),
                     EntryPayload::Normal(command) => {
                         let keys = crate::keys(&command);
+                        let names_a_key = crate::names_a_key(&command);
                         let reply = run(&mut state.store, command);
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);
-                        if crate::drops_a_key(&reply) {
+                        // (A refused one is in the log as it was sent, its wrapped key too.)
+                        if crate::drops_a_key(&reply) || (names_a_key && reply.is_err()) {
                             forgot = Some(entry.log_id.index);
                         }
                         reply

@@ -399,13 +399,29 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
 
 /// Whether a stopped node's store holds `text` anywhere: its snapshot or a log entry.
 fn store_holds(node: &Node, text: &str) -> bool {
-    use kith_store::openraft::RaftLogReader;
     let raft = node.dir.join("state/raft");
     let snapshot = std::fs::read_to_string(raft.join("snapshot.json")).unwrap_or_default();
+    snapshot.contains(text) || log_entries(&raft.join("log.redb")).unwrap().contains(text)
+}
+
+/// The entries the Raft log in `file` gives back, as JSON.
+fn log_entries(file: &Path) -> Result<String, String> {
+    use kith_store::openraft::RaftLogReader;
     let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-    let mut log = kith_store::Log::open(&raft.join("log.redb")).unwrap();
-    let entries = runtime.block_on(log.try_get_log_entries(..)).unwrap();
-    snapshot.contains(text) || serde_json::to_string(&entries).unwrap().contains(text)
+    let mut log = kith_store::Log::open(file)?;
+    let entries = runtime
+        .block_on(log.try_get_log_entries(..))
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::to_string(&entries).unwrap())
+}
+
+/// The same of a running node, read from a copy of its log (kithd holds the file's lock):
+/// `None` while the copy, taken in the middle of a write, does not read.
+fn running_log_entries(node: &Node) -> Option<String> {
+    let copy = node.dir.join("log-copy.redb");
+    let _ = std::fs::remove_file(&copy);
+    std::fs::copy(node.dir.join("state/raft/log.redb"), &copy).ok()?;
+    log_entries(&copy).ok()
 }
 
 /// The cluster's duress code typed at one disk: no control node keeps either key it held,
@@ -475,6 +491,10 @@ fn forgotten_key_is_on_no_control_nodes_disk() {
         wait_for("a snapshot with the keys forgotten", || {
             let held = std::fs::read_to_string(&snapshot).unwrap_or_default();
             held.contains("forgotten") && !held.contains(&first) && !held.contains(&second)
+        });
+        // And drops its log up to there (a leader once no node it sends to reads it still).
+        wait_for("the log dropped up to the forget", || {
+            running_log_entries(node).is_some_and(|log| !log.contains(&first) && !log.contains(&second))
         });
     }
     assert!(!handed(&nodes[2], &other).contains(&second));

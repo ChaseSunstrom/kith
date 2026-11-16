@@ -967,7 +967,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   dropped the key, snapshots the store and drops its Raft log up to that write: the key
   is then in no control node's snapshot (`snapshot.json`) or log entry. A node that was
   off does so as it catches up; a leader drops its log once no node it sends to still
-  reads that part, and asks again until then. What stays: a backup or a copy of a
+  reads that part, and asks again until then. A node stopped between the snapshot and
+  the drop drops its log as it starts, and a write the cluster refused that carried a
+  NodeKey (in its log as sent) is dropped the same way. What stays: a backup or a copy of a
   control node's state taken before (kith's own backups are of Volumes and hold no
   store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
   hears of the change, and on a control node's disk the freed pages of the log file and
