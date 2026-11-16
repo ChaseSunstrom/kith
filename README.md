@@ -449,6 +449,8 @@ spec:
   (`--mesh`), so every node reaches it and Services send to it. What it asks outside
   the cluster leaves from behind its node's address. It is told this node's DNS, with
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+  A pod's names outside the cluster are asked of its node's resolvers: they need a resolver
+  on the node (in `/etc/resolv.conf`) or `--dns-upstream`, and `--dns` is not needed for them.
   The IPv4 address only its node knows is taken from `100.88.0.0/16` unless that node's
   kithd is told another with `--pod-range ADDRESS/BITS` (or `KITH_POD_RANGE`; on kith OS
   after ` -- ` on the kernel command line or in `boot.args` of the config partition), for a
