@@ -379,9 +379,30 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
-- **What a replica writes outside its Volumes is counted, not held at the write.** Its
-  containers' writable roots and its disk scratch share the node's state disk, with no
-  quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`
+- **What a replica writes outside its Volumes is held at the write where the state disk
+  keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
+  disk scratch share the node's state disk. Where the state disk keeps project quotas (a
+  kith OS state disk made since T-0598, mounted with `prjquota`, and kithd root), each pod
+  is given a project of its own, its limit set to its `resources.storage` before anything
+  is put in it, and its replica directory, scratch and roots in it: a write past
+  `resources.storage` fails at once (EDQUOT), and its units say it reached its limit.
+  kithd says at start, and in the Node's status, which way it holds limits. A pod cannot
+  move its files out of its project; an unconfined pod can, and is counted every 10 s as
+  before. A container that keeps the node's users can no longer change file flags or
+  projects (chattr, FS_IOC_SETFLAGS/FSSETXATTR, file_setattr fail with EPERM). The x32
+  system call refusal applies to every container. A state disk from before has no project
+  quotas and is counted as before. A pod whose scratch held files from before projects is
+  counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
+  a pod's own directories hold). The quota holds bytes, not files: there is no limit on
+  how many files a pod makes (T-0605), and each costs the disk an inode. kithd itself is
+  not held by the quota (it is root, whose writes the kernel lets past a hard limit): what
+  it writes into a pod's project (a new container's root directories, and what the
+  kernel writes with its credentials, as an overlay's copy-up of an image's file may be)
+  can take the pod past its limit: 64 KiB past it is let be, and further the pod is
+  replaced at the next count (about every 10 seconds, its project's usage read, not
+  walked), as a counted pod is. A project id is given again once nothing on the disk is
+  left in it, its new limit set first. Elsewhere,
+  with no quota, kithd counts them about every 10 seconds (each pod with a `resources.storage`
   limit, and every pod while the disk has less than twice its reserve free) and replaces
   a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
   5% of it and at most 1 GiB unless said where kithd is root, none where it is not), the
@@ -433,8 +454,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one may end early at what the other took, for the next count to go on with. When the pod
   is gone its replica directory is removed whole, in one call that is none of the above: a
   stop does not cut it short, and it keeps a directory open for each level it is deep in, so
-  a chain of directories deeper than kithd may have files open is not removed by it. A limit held at
-  the write (an ext4 project quota on each root) is not done.
+  a chain of directories deeper than kithd may have files open is not removed by it.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
   that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound

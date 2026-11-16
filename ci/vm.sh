@@ -147,14 +147,16 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    x86_64-unknown-linux-musl
   --test quota     instead: one node as for services, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
-                   pods' storage limits at the write; a pod of 64 MiB writing 200 MiB
+                   pods' storage limits at the write; a pod of 64Ki removed and the
+                   node started again, the pod given its id after it is held to its
+                   own limit, not that one's; a pod of 64 MiB writing 200 MiB
                    is stopped at its limit by the kernel, in its root, its scratch
                    and a file it removed and holds open, and is not replaced, while
                    one beside it loses no write; a pod cannot move its files out of
                    its project (in a user namespace the kernel refuses, as the node's
                    root its filter does; unconfined it can, and is counted and
                    replaced); what it changes of its image is charged to it. Needs
-                   rustc for x86_64-unknown-linux-musl
+                   rustc for x86_64-unknown-linux-musl, and socat
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
                    the one on PATH) asking the first as the cluster's admin: the
@@ -253,6 +255,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         kubectl=${KITH_KUBECTL:-$(command -v kubectl || true)}
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
+        [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
             bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
@@ -853,6 +856,52 @@ for r in found:
             [ "$storage" = "at the write, by the state disk's project quota" ] || fail "the Node n1 says its pods' limits are held $storage"
             ok said
 
+            # An id given again: a pod of 64Ki (the first given a project, so the lowest id) runs
+            # and is removed; kithd starts again, and gives the next pod the lowest id with nothing
+            # in it, the same. That pod, whose image and scratch it changes are past 64Ki, starts
+            # and is held to its own limit, not the one before.
+            quota Workload tiny ',"resources":{"storage":"64Ki"}' '?/' '+/fill:131072'
+            done_ Workload tiny
+            stopped tiny '+/fill:131072' 65536
+            was=$(result tiny '?/')
+            printf '%s\n' "$was" | grep -Eqx 'project [1-9][0-9]*' || fail "tiny: its root is in no project of its own: $was"
+            gone Workload tiny
+            # (Its replica directory goes at kithd's next pass once its unit has; a kithd that
+            # starts with it there gives ids past it.)
+            waited=0
+            while [ -n "$(units Workload tiny)" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Workload tiny was not removed: $(units Workload tiny)"
+                sleep 1
+            done
+            sleep 10
+            # Started again as a machine is when its power button is pressed: kithd stops, and
+            # the node comes back up from its disk.
+            echo 'sendkey ctrl-alt-delete' | socat - "unix-connect:$work/keys1" >/dev/null || fail "QEMU's monitor of n1 did not answer"
+            waited=0
+            until [ "$(grep -ac "kithd: pods' storage limits are held at the write" "$work/n1.log")" -ge 2 ] && any GET /v1/resources >/dev/null 2>&1; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "n1 did not start again holding pods' limits at the write: $(grep -a 'storage limits\|reboot:' "$work/n1.log")"
+                sleep 1
+            done
+            grep -aq 'reboot: Restarting system' "$work/n1.log" || fail "n1 did not restart: its console says no 'reboot: Restarting system'"
+            quota Workload again ',"resources":{"storage":"64Mi"},"volumeMounts":[{"scratch":"work","path":"/work"}]' '?/' '^/big' '+/work/fill:1048576' '+/fill:209715200' '#/'
+            done_ Workload again
+            expect again '?/' "$was" "the pod after kithd started again was not given the removed pod's id, so no id was given again"
+            expect again '^/big' ok "a file of its image past the last limit of its id was not copied up"
+            expect again '+/work/fill:1048576' 'wrote 1048576' "its scratch was held to the last limit of its id"
+            stopped again '+/fill:209715200' 67108864
+            used again '#/' 67108864
+            waited=0
+            until line=$(units Workload again) && [ "${line%% *}" = 1 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the Workload again is not ready: $line"
+                sleep 1
+            done
+            gone Workload again
+            echo "vm.sh: again: $was given again after kithd started again; held to 64 MiB, not 64Ki" >&2
+            ok again
+
             # A pod of 64 MiB writing 200 MiB, in its root and then its scratch, beside one writing
             # 32 MiB: the first is stopped at the write, the second loses none, and the disk loses
             # no more than both their limits let them (and 4 MiB of kithd's own).
@@ -957,11 +1006,11 @@ EOF
             gone Workload image
             ok image
 
-            for case in said write scratch unlinked userns noderoot unconfined elsewhere image; do
+            for case in said again write scratch unlinked userns noderoot unconfined elsewhere image; do
                 grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
             done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
+            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
             exit 0
         fi
         if [ "$test" = pods ]; then

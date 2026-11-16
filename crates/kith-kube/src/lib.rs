@@ -787,9 +787,12 @@ fn add_storage(units: &mut [Value], scratch: &str, size: &str) -> Option<(String
         mounts.is_some_and(|mounts| mounts.iter().any(|m| m["scratch"] == scratch))
     };
     let c = units.iter_mut().find(mounts)?;
+    // kith's least `resources.storage`: what a pod's own directories hold.
+    const FLOOR: u64 = 64 << 10;
     let own = c["resources"]["storage"].as_str().and_then(whole_bytes);
     c["resources"]["storage"] = match (own, whole_bytes(size)) {
         (Some(own), Some(bytes)) => json!(own.saturating_add(bytes).to_string()),
+        (None, Some(bytes)) if bytes < FLOOR => json!(FLOOR.to_string()),
         _ => json!(size),
     };
     Some((c["name"].as_str().unwrap_or_default().to_string(), own.is_none()))
@@ -2540,6 +2543,37 @@ spec:
                 .any(|line| line.contains("limits.ephemeral-storage") && line.contains("whole number of bytes")),
             "{said:?}"
         );
+    }
+
+    /// A sizeLimit under kith's least `resources.storage` (64Ki), on a container with no limit
+    /// of its own, is raised to it rather than refused.
+    #[test]
+    fn import_size_limit_under_64ki_is_raised() {
+        let chart = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: tiny }
+spec:
+  selector: { matchLabels: { app: tiny } }
+  template:
+    metadata: { labels: { app: tiny } }
+    spec:
+      containers:
+        - name: web
+          image: nginx
+          volumeMounts: [{ name: work, mountPath: /work }]
+      volumes:
+        - name: work
+          emptyDir: { sizeLimit: 1Ki }
+"#;
+        let (all, said) = run(chart);
+        for r in &all {
+            r.clone()
+                .validated()
+                .unwrap_or_else(|e| panic!("{}: {e}: {said:?}", r.key()));
+        }
+        let containers = &find(&all, "Workload", "tiny").spec["template"]["containers"];
+        assert_eq!(containers[0]["resources"], json!({ "storage": "65536" }));
     }
 
     #[test]
