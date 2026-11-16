@@ -1306,8 +1306,12 @@ spec:
   message such as `Secret/store/db: Release/store/shop was applied by alice,
   and alice may not apply Secret in namespace store: no Role bound to it
   allows that`. A writer who loses a right, or whose Identity is deleted,
-  stops the next render, not what is installed. A Release from before kithd
-  wrote this down makes nothing new until it is applied again.
+  stops the next render, not what is installed. A Release (and a Source) acts
+  as the Identity that applied it only while that Identity has the key it had
+  then: kithd writes the print of the key down beside the name
+  (`kith.dev/written-key`). After a new certificate for the Identity, or an
+  Identity made again under the same name, it makes nothing new and says to
+  apply it again; so does a Release from before kithd wrote this down.
 - `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
   any version that is not a pre-release. A Release goes on the newest
   package that fits and stays on it; with `autoUpgrade: true` it follows

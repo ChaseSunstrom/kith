@@ -12,7 +12,7 @@
 // is followed and no hook runs. No signed-commit check yet.
 
 use crate::Shared;
-use crate::releases::{OWNER, Step, WRITER, carry_out, owner, reconcile, recorded, writer_may};
+use crate::releases::{KEY, OWNER, Step, WRITER, carry_out, owner, reconcile, recorded, writer_may};
 use kith_api::Resource;
 use kith_api::kinds::{Approval, SourceSpec};
 use kith_api::store::Store;
@@ -708,8 +708,8 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
         let done = fetched.as_ref().map_err(String::clone).and_then(|fetched| {
             let resources = fetched.resources.get_or_init(|| desired(&key, fetched));
             let mut resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
-            // What a Source makes that makes more is the Source writer's too, whatever the
-            // repository says of it.
+            // What a Source makes that makes more is the Source writer's too (its name and its
+            // key's print), whatever the repository says of it.
             let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source");
             if resources.iter().any(makes) {
                 for resource in resources.to_mut().iter_mut().filter(|resource| makes(resource)) {
@@ -717,6 +717,10 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
                     match source.metadata.annotations.get(WRITER) {
                         Some(writer) => annotations.insert(WRITER.into(), writer.clone()),
                         None => annotations.remove(WRITER),
+                    };
+                    match source.metadata.annotations.get(KEY) {
+                        Some(print) => annotations.insert(KEY.into(), print.clone()),
+                        None => annotations.remove(KEY),
                     };
                 }
             }
@@ -923,6 +927,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, local: bool, mut stopping:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::releases::{bobs_note, by_bob};
 
     #[test]
     fn what_a_source_may_name() {
@@ -1455,12 +1460,12 @@ mod tests {
         apply(
             store,
             &format!(
-                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
-                 apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
+                "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
                  spec: {{ rules: [{{ kinds: [{kinds}], verbs: [apply, delete], namespaces: [shop] }}] }}\n---\n\
                  apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-shop }}\nspec: {{ role: shop, subjects: [bob] }}\n"
             ),
         );
+        crate::releases::bob_is(store, 0);
     }
 
     fn writer(store: &Store, key: &str) -> Option<String> {
@@ -1475,7 +1480,7 @@ mod tests {
         let mut store = Store::default();
         let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
         bob(&mut store, "Source, ConfigMap, Release");
-        apply(&mut store, &SOURCE.replace("local socket", "bob"));
+        apply(&mut store, &by_bob(SOURCE, 0));
         let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: s }\nspec: { data: { k: v } }\n";
         settle(
             &mut store,
@@ -1510,7 +1515,7 @@ mod tests {
         let mut store = Store::default();
         let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
         bob(&mut store, "Source, ConfigMap");
-        let as_bob = SOURCE.replace("local socket", "bob");
+        let as_bob = by_bob(SOURCE, 0);
         apply(&mut store, &as_bob);
         settle(
             &mut store,
@@ -1548,13 +1553,106 @@ mod tests {
         assert!(store.get("ConfigMap/shop/b").is_some());
 
         for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
-            let source = as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written);
+            let source = as_bob.replace(&format!(", {}", bobs_note(0)), written);
             apply(&mut store, &source);
             settle(&mut store, &at("r2", &[("a.yaml", map("a", "blue"))]));
             let message = status(&store)["message"].to_string();
             assert!(message.contains("apply it again"), "{message}");
             assert!(store.get("ConfigMap/shop/b").is_some());
         }
+    }
+
+    /// A Source's writer is held to the key it had: an Identity made again under the name
+    /// (another key, wider Roles) gets nothing new of the old one's Source, and what was
+    /// made stays; applied again by the new one it goes on (T-0551).
+    #[test]
+    fn writer_key_a_source_is_not_acted_on_for_an_identity_made_again_under_its_name() {
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
+        bob(&mut store, "Source, ConfigMap");
+        apply(&mut store, &by_bob(SOURCE, 0));
+        settle(&mut store, &at("r1", &[("a.yaml", map("a", "red"))]));
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+
+        store.delete("Identity/bob").unwrap();
+        crate::releases::bob_is(&mut store, 1);
+        settle(
+            &mut store,
+            &at("r2", &[("a.yaml", map("a", "blue")), ("b.yaml", map("b", "blue"))]),
+        );
+        let message = status(&store)["message"].to_string();
+        assert_eq!(status(&store)["state"], "error", "{message}");
+        assert!(
+            message.contains("an earlier Identity named bob") && message.contains("apply it again"),
+            "{message}"
+        );
+        assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "red");
+        assert!(store.get("ConfigMap/shop/b").is_none());
+
+        apply(&mut store, &by_bob(SOURCE, 1));
+        settle(
+            &mut store,
+            &at("r2", &[("a.yaml", map("a", "blue")), ("b.yaml", map("b", "blue"))]),
+        );
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "blue");
+        assert!(store.get("ConfigMap/shop/b").is_some());
+    }
+
+    /// What a Source makes that makes more carries the Source's writer's print with its
+    /// name, whatever the repository says of either; the local socket's has no print; a
+    /// Source with a name and no print, or the print of a key since replaced, makes
+    /// nothing new and says to apply it again (T-0551).
+    #[test]
+    fn writer_print_what_a_source_makes_that_makes_more_carries_the_sources_print() {
+        let print = |store: &Store| {
+            store
+                .get("Release/shop/mine")
+                .unwrap()
+                .metadata
+                .annotations
+                .get(KEY)
+                .cloned()
+        };
+        let release = "apiVersion: kith.dev/v1\nkind: Release\n\
+                       metadata: { name: mine, annotations: { 'kith.dev/written-by': 'local socket', \
+                       'kith.dev/written-key': 'forged' } }\n\
+                       spec: { package: { name: maps } }\n";
+        let files = |rev: &str| at(rev, &[("a.yaml", map("a", "red")), ("r.yaml", release.to_string())]);
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/shop/repo").unwrap().status.clone().unwrap();
+        bob(&mut store, "Source, ConfigMap, Release");
+        apply(&mut store, &by_bob(SOURCE, 0));
+        settle(&mut store, &files("r1"));
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        assert_eq!(writer(&store, "Release/shop/mine").as_deref(), Some("bob"));
+        assert_eq!(print(&store), Some(crate::releases::bobs_key(0).1));
+
+        // The local socket's: no print, and the repository's is not taken.
+        apply(&mut store, SOURCE);
+        settle(&mut store, &files("r2"));
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        assert_eq!(writer(&store, "Release/shop/mine").as_deref(), Some("local socket"));
+        assert_eq!(print(&store), None);
+
+        // A name and no print (from before), and a print of a key the Identity has no more.
+        let changed = |rev: &str| at(rev, &[("a.yaml", map("a", "blue"))]);
+        apply(&mut store, &SOURCE.replace("'local socket'", "'bob'"));
+        settle(&mut store, &changed("r3"));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            status(&store)["state"] == "error" && message.contains("apply it again"),
+            "{message}"
+        );
+        crate::releases::bob_is(&mut store, 1);
+        apply(&mut store, &by_bob(SOURCE, 0));
+        settle(&mut store, &changed("r3"));
+        let message = status(&store)["message"].to_string();
+        assert!(
+            status(&store)["state"] == "error" && message.contains("apply it again"),
+            "{message}"
+        );
+        assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "red");
     }
 
     /// A Source that keeps failing is left longer each time, up to an hour, and no
