@@ -124,7 +124,9 @@ fn echo(mut stream: TcpStream) {
 /// what came back is in order up to where it stopped; 2, reset by this end half way.
 fn exchange(to: (&str, u16), length: u64, mode: u8) -> Result<(), String> {
     let mut stream = TcpStream::connect(to).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
     let mut sending = stream.try_clone().map_err(|e| e.to_string())?;
     let writer = std::thread::spawn(move || -> std::io::Result<()> {
         sending.write_all(&[&length.to_be_bytes()[..], &[mode]].concat())?;
@@ -160,7 +162,9 @@ fn exchange(to: (&str, u16), length: u64, mode: u8) -> Result<(), String> {
                 }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(format!("nothing for 30 s after {at} of {length} bytes back (mode {mode})"));
+                return Err(format!(
+                    "nothing for 30 s after {at} of {length} bytes back (mode {mode})"
+                ));
             }
             Err(e) => break Some(e),
         }
@@ -184,10 +188,14 @@ fn exchange(to: (&str, u16), length: u64, mode: u8) -> Result<(), String> {
 /// requests and answers asks of whatever passes its bytes. How many turns a second.
 fn turns(to: (&str, u16), count: u64) -> Result<f64, String> {
     let mut stream = TcpStream::connect(to).map_err(|e| format!("connect: {e}"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(30))).map_err(|e| e.to_string())?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
     let failed = |e: std::io::Error| format!("turns: {e}");
-    stream.write_all(&[&(count * 100).to_be_bytes()[..], &[0]].concat()).map_err(failed)?;
+    stream
+        .write_all(&[&(count * 100).to_be_bytes()[..], &[0]].concat())
+        .map_err(failed)?;
     let started = Instant::now();
     for turn in 0..count {
         let sent: Vec<u8> = (turn * 100..turn * 100 + 100).map(byte).collect();
@@ -214,7 +222,10 @@ fn asked(host: &str, port: &str) -> std::io::Result<String> {
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
     let mut answer = String::new();
     stream.read_to_string(&mut answer)?;
-    let (first, last) = (answer.lines().next().unwrap_or_default(), answer.lines().last().unwrap_or_default());
+    let (first, last) = (
+        answer.lines().next().unwrap_or_default(),
+        answer.lines().last().unwrap_or_default(),
+    );
     Ok(format!("{first} {last}"))
 }
 
@@ -294,14 +305,28 @@ fn files(path: &std::path::Path, found: &mut Vec<String>) {
     use std::os::unix::fs::PermissionsExt;
     let Ok(has) = std::fs::metadata(path) else { return };
     if has.is_dir() {
-        let mut inside: Vec<_> = std::fs::read_dir(path).into_iter().flatten().flatten().map(|e| e.path()).collect();
+        let mut inside: Vec<_> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
         inside.sort();
-        for path in inside.iter().filter(|path| !path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".."))) {
+        for path in inside.iter().filter(|path| {
+            !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".."))
+        }) {
             files(path, found);
         }
     } else {
         let content = std::fs::read_to_string(path).unwrap_or_else(|e| format!("failed: {:?}", e.kind()));
-        found.push(format!("{} {:o} {}", path.display(), has.permissions().mode() & 0o777, content.trim()));
+        found.push(format!(
+            "{} {:o} {}",
+            path.display(),
+            has.permissions().mode() & 0o777,
+            content.trim()
+        ));
     }
 }
 
@@ -367,14 +392,21 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
                 Ok(out) => out,
                 Err(e) => return e.to_string(),
             };
-            if op == "~" && let Err(e) = std::fs::remove_file(a) {
+            if op == "~"
+                && let Err(e) = std::fs::remove_file(a)
+            {
                 return format!("not removed: {e}");
             }
             let said = fill(&mut out, b.parse().expect("how many bytes"));
             held.push(out);
             said
         }
-        "^" => went(std::fs::OpenOptions::new().append(true).open(a).and_then(|mut f| f.write_all(b"x"))),
+        "^" => went(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(a)
+                .and_then(|mut f| f.write_all(b"x")),
+        ),
         "-" => went(std::fs::remove_file(a).or_else(|_| std::fs::remove_dir_all(a))),
         ">" => went(std::fs::rename(a, b)),
         "&" => went(std::fs::hard_link(a, b)),
@@ -386,17 +418,30 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
                 Err(e) => return e.to_string(),
             };
             let mut attr = [0u32; 7];
-            let got = syscall(16, [file.as_raw_fd() as u64, 0x801c_581f, attr.as_mut_ptr() as u64, 0, 0]);
+            let got = syscall(
+                16,
+                [file.as_raw_fd() as u64, 0x801c_581f, attr.as_mut_ptr() as u64, 0, 0],
+            );
             if got < 0 || op == "?" {
-                return if got < 0 { how(got) } else { format!("project {}", attr[3]) };
+                return if got < 0 {
+                    how(got)
+                } else {
+                    format!("project {}", attr[3])
+                };
             }
             attr[3] = 0;
-            how(syscall(16, [file.as_raw_fd() as u64, 0x401c_5820, attr.as_ptr() as u64, 0, 0]))
+            how(syscall(
+                16,
+                [file.as_raw_fd() as u64, 0x401c_5820, attr.as_ptr() as u64, 0, 0],
+            ))
         }
         "!" => {
             let attr = [0u32; 6];
             let at_fdcwd = -100i64 as u64;
-            how(syscall(469, [at_fdcwd, name.as_ptr() as u64, attr.as_ptr() as u64, 24, 0]))
+            how(syscall(
+                469,
+                [at_fdcwd, name.as_ptr() as u64, attr.as_ptr() as u64, 24, 0],
+            ))
         }
         // statfs(2): of a project's directory, its limit and what it holds, in bytes ("#") or
         // in files ("%").
@@ -408,7 +453,12 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
             }
             let block = fs[1];
             match op {
-                "#" => format!("size {} used {} free {}", fs[2] * block, (fs[2] - fs[3]) * block, fs[3] * block),
+                "#" => format!(
+                    "size {} used {} free {}",
+                    fs[2] * block,
+                    (fs[2] - fs[3]) * block,
+                    fs[3] * block
+                ),
                 _ => format!("files {} held {}", fs[5], fs[5] - fs[6]),
             }
         }
@@ -432,7 +482,13 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
         "=" => std::fs::metadata(a).map_or_else(|e| e.to_string(), |meta| format!("size {}", meta.len())),
         // Whose users it has: the first line of its uid_map ("0 0 4294967295", the node's).
         "@" => match std::fs::read_to_string("/proc/self/uid_map") {
-            Ok(map) => map.lines().next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" "),
+            Ok(map) => map
+                .lines()
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             Err(e) => e.to_string(),
         },
         _ => panic!("pod quota: no step {step}"),
@@ -448,19 +504,33 @@ fn main() {
             // Where it is told to ask for names, and the address it asks from (a UDP socket
             // connected sends nothing): both in its node's pod range.
             let resolv = std::fs::read_to_string("/etc/resolv.conf").expect("a resolv.conf");
-            let ns = resolv.lines().find_map(|line| line.strip_prefix("nameserver ")).expect("a nameserver").trim();
+            let ns = resolv
+                .lines()
+                .find_map(|line| line.strip_prefix("nameserver "))
+                .expect("a nameserver")
+                .trim();
             let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket");
             socket.connect(format!("{ns}:53")).expect("a way to the nameserver");
-            println!("where: nameserver {ns} from {}", socket.local_addr().expect("a local address").ip());
+            println!(
+                "where: nameserver {ns} from {}",
+                socket.local_addr().expect("a local address").ip()
+            );
             let mut name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
             name = format!("HTTP/1.0 200 OK\r\n\r\n{}", name.trim());
             for told in ["GREETING", "PASSWORD"] {
                 name += &std::env::var(told).map(|told| format!(" {told}")).unwrap_or_default();
             }
             if let [file] = keeps {
-                let mut kept = std::fs::OpenOptions::new().create(true).append(true).open(file).expect("the file it keeps");
+                let mut kept = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(file)
+                    .expect("the file it keeps");
                 kept.write_all(b"started\n").expect("a line in the file it keeps");
-                let lines = std::fs::read_to_string(file).expect("the file it keeps, read").lines().count();
+                let lines = std::fs::read_to_string(file)
+                    .expect("the file it keeps, read")
+                    .lines()
+                    .count();
                 name += &format!(" started {lines}");
             }
             let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
@@ -475,7 +545,10 @@ fn main() {
         // (after its node was drained, or started again) it goes on from there.
         ["count", dir] => {
             let file = format!("{dir}/step");
-            let was: u32 = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let was: u32 = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
             std::fs::write(&file, format!("{}\n", was + 1)).expect("its step, written down");
             match was {
                 0 => println!("began: step 1"),
@@ -485,7 +558,10 @@ fn main() {
         // What it was given (PASSWORD), to whoever asks on port 80: for a container on its
         // node's own network, whose root takes no file.
         ["say"] => {
-            let said = format!("HTTP/1.0 200 OK\r\n\r\n{}", std::env::var("PASSWORD").unwrap_or_default());
+            let said = format!(
+                "HTTP/1.0 200 OK\r\n\r\n{}",
+                std::env::var("PASSWORD").unwrap_or_default()
+            );
             let listener = TcpListener::bind("0.0.0.0:80").expect("port 80");
             for mut stream in listener.incoming().flatten() {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
@@ -537,7 +613,11 @@ fn main() {
                 let names = std::fs::read_dir(dir).into_iter().flatten().flatten();
                 let mut names: Vec<String> = names
                     .map(|entry| {
-                        let opens = if std::fs::File::open(entry.path()).is_ok() { '+' } else { '-' };
+                        let opens = if std::fs::File::open(entry.path()).is_ok() {
+                            '+'
+                        } else {
+                            '-'
+                        };
                         format!("{}{opens}", entry.file_name().to_string_lossy())
                     })
                     .collect();
@@ -572,7 +652,9 @@ fn main() {
         }
         ["self"] => {
             let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
-            let uid = status.lines().find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next());
+            let uid = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next());
             println!("nested: pid {}, uid {}", std::process::id(), uid.unwrap_or("?"));
         }
         ["node", kind, numbers, path] => {
@@ -593,20 +675,34 @@ fn main() {
             println!("ids: map {}", map.split_whitespace().collect::<Vec<_>>().join(" "));
             for path in paths {
                 if let Some(read) = path.strip_prefix('=') {
-                    let holds = std::fs::read_to_string(read).map(|text| text.trim().to_string()).map_err(|e| e.kind());
+                    let holds = std::fs::read_to_string(read)
+                        .map(|text| text.trim().to_string())
+                        .map_err(|e| e.kind());
                     println!("ids: {path} holds {holds:?}");
                     continue;
                 }
                 if *path == ":80" {
-                    println!("ids: :80 binds {:?}", TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).map(drop).map_err(|e| e.kind()));
+                    println!(
+                        "ids: :80 binds {:?}",
+                        TcpListener::bind("[::]:80")
+                            .or_else(|_| TcpListener::bind("0.0.0.0:80"))
+                            .map(drop)
+                            .map_err(|e| e.kind())
+                    );
                     continue;
                 }
                 let found = if *path == "root-only" {
                     // (A BAR of a device: 0600 and the node's root's, as sysfs makes it.)
-                    let devices = std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten();
-                    let files = devices.flat_map(|device| std::fs::read_dir(device.path()).into_iter().flatten().flatten());
+                    let devices = std::fs::read_dir("/sys/bus/pci/devices")
+                        .into_iter()
+                        .flatten()
+                        .flatten();
+                    let files =
+                        devices.flat_map(|device| std::fs::read_dir(device.path()).into_iter().flatten().flatten());
                     let named = |name: &str| name.strip_prefix("resource").is_some_and(|n| n.parse::<u8>().is_ok());
-                    let found = files.map(|file| file.path()).find(|path| path.file_name().is_some_and(|n| named(&n.to_string_lossy())));
+                    let found = files
+                        .map(|file| file.path())
+                        .find(|path| path.file_name().is_some_and(|n| named(&n.to_string_lossy())));
                     found.unwrap_or_default()
                 } else if let Some(made) = path.strip_prefix('+') {
                     if let Err(e) = std::fs::write(made, "made") {
@@ -616,7 +712,8 @@ fn main() {
                 } else {
                     path.into()
                 };
-                let owner = std::fs::metadata(&found).map_or_else(|e| format!("{:?}", e.kind()), |has| has.uid().to_string());
+                let owner =
+                    std::fs::metadata(&found).map_or_else(|e| format!("{:?}", e.kind()), |has| has.uid().to_string());
                 let opens = std::fs::File::open(&found).map(drop).map_err(|e| e.kind());
                 println!("ids: {path} {} owner {owner} opens {opens:?}", found.display());
             }
@@ -631,9 +728,21 @@ fn main() {
         }
         ["tell", paths @ ..] => {
             let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
-            let of = |key: &str| status.lines().find_map(|line| line.strip_prefix(key)?.split_whitespace().next()).unwrap_or("?");
-            println!("tell: started uid {} caps eff {} bnd {}", of("Uid:"), of("CapEff:"), of("CapBnd:"));
-            let mut told: Vec<String> = std::env::vars().map(|(name, value)| format!("{name}={value}")).collect();
+            let of = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key)?.split_whitespace().next())
+                    .unwrap_or("?")
+            };
+            println!(
+                "tell: started uid {} caps eff {} bnd {}",
+                of("Uid:"),
+                of("CapEff:"),
+                of("CapBnd:")
+            );
+            let mut told: Vec<String> = std::env::vars()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect();
             told.sort();
             told.iter().for_each(|told| println!("tell: env {told}"));
             let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
@@ -643,21 +752,40 @@ fn main() {
                     let (before, after) = line.split_once(" - ")?;
                     let fields: Vec<&str> = before.split(' ').collect();
                     let read_only = fields.get(5)?.split(',').any(|option| option == "ro");
-                    (fields.get(4) == Some(path)).then(|| format!("{} {} {}", after.split(' ').next().unwrap_or("?"), fields[3], if read_only { "ro" } else { "rw" }))
+                    (fields.get(4) == Some(path)).then(|| {
+                        format!(
+                            "{} {} {}",
+                            after.split(' ').next().unwrap_or("?"),
+                            fields[3],
+                            if read_only { "ro" } else { "rw" }
+                        )
+                    })
                 });
                 let is_dir = std::path::Path::new(path).is_dir();
-                let probe = if is_dir { format!("{path}/written") } else { path.to_string() };
+                let probe = if is_dir {
+                    format!("{path}/written")
+                } else {
+                    path.to_string()
+                };
                 let wrote = match is_dir {
                     true => std::fs::write(&probe, "x").and_then(|()| std::fs::remove_file(&probe)),
                     false => std::fs::OpenOptions::new().append(true).open(&probe).map(drop),
                 };
-                println!("tell: mount {path} {} write {:?}", mount.as_deref().unwrap_or("none"), wrote.map_err(|e| e.kind()));
+                println!(
+                    "tell: mount {path} {} write {:?}",
+                    mount.as_deref().unwrap_or("none"),
+                    wrote.map_err(|e| e.kind())
+                );
             }
             let mut said = Vec::new();
             loop {
                 let mut now = Vec::new();
-                paths.iter().for_each(|path| files(std::path::Path::new(path), &mut now));
-                now.iter().filter(|line| !said.contains(*line)).for_each(|line| println!("tell: file {line}"));
+                paths
+                    .iter()
+                    .for_each(|path| files(std::path::Path::new(path), &mut now));
+                now.iter()
+                    .filter(|line| !said.contains(*line))
+                    .for_each(|line| println!("tell: file {line}"));
                 if said.is_empty() {
                     println!("tell: watching");
                 }
@@ -671,7 +799,9 @@ fn main() {
         ["echo"] => {
             // (On IPv6 and IPv4 both, where the pod has IPv6: the kernel sends a connection
             // on the node's own network to a replica's IPv6 address only.)
-            let listener = TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).expect("port 80");
+            let listener = TcpListener::bind("[::]:80")
+                .or_else(|_| TcpListener::bind("0.0.0.0:80"))
+                .expect("port 80");
             for stream in listener.incoming().flatten() {
                 std::thread::spawn(move || echo(stream));
             }
@@ -688,7 +818,10 @@ fn main() {
             // What a connection there is to, as the client sees it: the Service's address
             // where kithd passes it on, the replica's where the kernel sent it straight there.
             let reached = TcpStream::connect(to).and_then(|stream| stream.peer_addr());
-            println!("check: reached {}", reached.map_or_else(|e| e.to_string(), |at| at.to_string()));
+            println!(
+                "check: reached {}",
+                reached.map_or_else(|e| e.to_string(), |at| at.to_string())
+            );
             let mut failed = Vec::new();
             let mut connections = 0;
             // One after another, each closed as soon as all is sent: nothing, a byte, less
@@ -702,7 +835,9 @@ fn main() {
                 .map(|thread| {
                     std::thread::spawn(move || {
                         let sizes = [1, 4096, 65536, 300_000];
-                        (0..40).filter_map(|i| exchange(to, sizes[(thread as usize + i) % 4] + thread, 0).err()).collect::<Vec<_>>()
+                        (0..40)
+                            .filter_map(|i| exchange(to, sizes[(thread as usize + i) % 4] + thread, 0).err())
+                            .collect::<Vec<_>>()
                     })
                 })
                 .collect();
@@ -722,7 +857,11 @@ fn main() {
             for failure in &failed {
                 println!("failed: {failure}");
             }
-            println!("check: {connections} connections and one of 5000 turns ({:.0} a second), {} failed", rate.unwrap_or(0.0), failed.len());
+            println!(
+                "check: {connections} connections and one of 5000 turns ({:.0} a second), {} failed",
+                rate.unwrap_or(0.0),
+                failed.len()
+            );
             std::process::exit(if failed.is_empty() { 0 } else { 1 });
         }
         ["fill", file, bytes, how @ ..] => {
@@ -768,7 +907,12 @@ fn main() {
                 }
             });
             let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-            let server = resolv.lines().find_map(|line| line.strip_prefix("nameserver ")?.trim().parse::<std::net::IpAddr>().ok());
+            let server = resolv.lines().find_map(|line| {
+                line.strip_prefix("nameserver ")?
+                    .trim()
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            });
             let server = SocketAddr::from((server.expect("a nameserver in /etc/resolv.conf"), 53));
             // (Its node, where a pod not behind an exit asks for names: kith-mesh's GATEWAY.)
             let node = SocketAddr::from(([100, 88, 0, 1], 53));
@@ -780,16 +924,27 @@ fn main() {
                     let mut said = String::new();
                     stream.read_to_string(&mut said).map(|_| said)
                 });
-                let web = if fetched.is_ok_and(|said| said.contains("outside")) { "ok" } else { "failed" };
+                let web = if fetched.is_ok_and(|said| said.contains("outside")) {
+                    "ok"
+                } else {
+                    "failed"
+                };
                 // (A name std asks as every program does: musl, from /etc/resolv.conf.)
                 use std::net::ToSocketAddrs;
                 let named = format!("kithleak-{round}.example:80").to_socket_addrs();
-                let named = if named.is_ok_and(|mut found| found.any(|at| at == outside)) { "ok" } else { "failed" };
+                let named = if named.is_ok_and(|mut found| found.any(|at| at == outside)) {
+                    "ok"
+                } else {
+                    "failed"
+                };
                 let tcp = asks(server, &format!("kithleak-tcp-{round}.example"), true);
                 let asked_node = asks(node, &format!("kithleak-node-{round}.example"), false);
                 // (kithd's own API on its node, as any service of the node's: not for it.)
                 let api = knocked(SocketAddr::from(([100, 88, 0, 1], 7443)));
-                let v6 = TcpStream::connect_timeout(&"[2001:db8::7]:80".parse().expect("an address"), Duration::from_secs(2));
+                let v6 = TcpStream::connect_timeout(
+                    &"[2001:db8::7]:80".parse().expect("an address"),
+                    Duration::from_secs(2),
+                );
                 let v6 = match v6 {
                     Ok(_) => "connected".to_string(),
                     Err(e) => format!("{:?}", e.kind()),
@@ -799,7 +954,9 @@ fn main() {
                         let _ = socket.send_to(format!("kithleak {round}").as_bytes(), to);
                     }
                 }
-                println!("probe {round}: web {web} dns {named} tcp-dns {tcp} node-dns {asked_node} node-api {api} ipv6 {v6}");
+                println!(
+                    "probe {round}: web {web} dns {named} tcp-dns {tcp} node-dns {asked_node} node-api {api} ipv6 {v6}"
+                );
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -831,7 +988,10 @@ fn main() {
         ["init", script] => {
             for (kind, at) in [("devtmpfs", "/dev"), ("proc", "/proc")] {
                 let _ = std::fs::create_dir_all(at);
-                let (kind, at) = (std::ffi::CString::new(kind).expect("a name"), std::ffi::CString::new(at).expect("a path"));
+                let (kind, at) = (
+                    std::ffi::CString::new(kind).expect("a name"),
+                    std::ffi::CString::new(at).expect("a path"),
+                );
                 // mount(2), by x86-64's number for it (as `node` asks mknod).
                 let mut mounted: i64 = 165;
                 unsafe {
@@ -849,16 +1009,26 @@ fn main() {
                 }
                 assert!(mounted == 0, "init: mounting {at:?}: {mounted}");
             }
-            let console = std::fs::OpenOptions::new().read(true).write(true).open("/dev/console").expect("a console");
+            let console = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/console")
+                .expect("a console");
             let mut out = console.try_clone().expect("the console, again");
             for line in std::fs::read_to_string(script).expect("the script").lines() {
                 let left = line.starts_with("& ");
                 let words: Vec<&str> = line.trim_start_matches("& ").split_whitespace().collect();
                 let told = words.iter().take_while(|word| word.contains('=')).count();
-                let Some((program, rest)) = words[told..].split_first() else { continue };
+                let Some((program, rest)) = words[told..].split_first() else {
+                    continue;
+                };
                 let mut command = std::process::Command::new(program);
-                command.args(rest).envs(words[..told].iter().filter_map(|word| word.split_once('=')));
-                command.stdout(console.try_clone().expect("the console")).stderr(console.try_clone().expect("the console"));
+                command
+                    .args(rest)
+                    .envs(words[..told].iter().filter_map(|word| word.split_once('=')));
+                command
+                    .stdout(console.try_clone().expect("the console"))
+                    .stderr(console.try_clone().expect("the console"));
                 let done = match command.spawn() {
                     Ok(_) if left => Ok(()),
                     Ok(mut child) => match child.wait() {
@@ -917,6 +1087,8 @@ fn main() {
                 }
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod quota STEP... | pod probe | pod knock TO | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
+        _ => panic!(
+            "pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod quota STEP... | pod probe | pod knock TO | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"
+        ),
     }
 }

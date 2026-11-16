@@ -512,6 +512,13 @@ pub fn user_namespace(from: u32, count: u32) -> Result<OwnedFd> {
         }
     }
     drop((made_in, go_out));
+    // The child by descriptor, taken while it lives (it waits for `go`): whoever collects
+    // this process's children may collect it first, and its number may be another child's
+    // by the time it is waited for here.
+    // SAFETY: pidfd_open takes a process id and flags, and gives a descriptor or -1.
+    let held = unsafe { libc::syscall(libc::SYS_pidfd_open, child, 0) };
+    // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+    let held = (held >= 0).then(|| unsafe { OwnedFd::from_raw_fd(held as libc::c_int) });
     let mut errno = [0u8; 4];
     let users = made
         .read_exact(&mut errno)
@@ -524,9 +531,20 @@ pub fn user_namespace(from: u32, count: u32) -> Result<OwnedFd> {
             errno => Err(Error::from_raw_os_error(errno)),
         });
     let _ = go.write_all(&[0]);
-    // SAFETY: waitpid on a child of this process, with no status asked for. (Another
-    // thread collecting it first is no harm: it is not needed after this.)
-    unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    // SAFETY: a wait for a child of this process, with no status asked for. (Another thread
+    // collecting it first is no harm: the descriptor is that child's and no later one's.)
+    unsafe {
+        match &held {
+            Some(held) => libc::waitid(
+                libc::P_PIDFD,
+                held.as_raw_fd() as libc::id_t,
+                std::ptr::null_mut(),
+                libc::WEXITED,
+            ),
+            // (No pidfd: a kernel before 5.3, or no descriptor left. By its number, then.)
+            None => libc::waitpid(child, std::ptr::null_mut(), 0),
+        }
+    };
     users
 }
 
@@ -865,5 +883,22 @@ mod tests {
             }
             Err(e) => assert!(!root, "root made no user namespace: {e}"),
         }
+        // Its helper is collected when it returns, made or refused: no child of this
+        // process is left that has ended. (No other test here has a child.)
+        // SAFETY: waitid that looks (WNOWAIT) at any child, writing to `info`, which is its own.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let looked = unsafe {
+            libc::waitid(
+                libc::P_ALL,
+                0,
+                &raw mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        // SAFETY: waitid filled `info` (or left it zeroed: no child has ended).
+        assert!(
+            looked != 0 || unsafe { info.si_pid() } == 0,
+            "a child was left uncollected"
+        );
     }
 }
