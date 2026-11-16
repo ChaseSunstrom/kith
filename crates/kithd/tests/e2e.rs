@@ -730,6 +730,45 @@ fn node_workload_runs_one_copy_alone() {
     assert_eq!(daemon.status("NodeWorkload/agent")["ready"], 0);
 }
 
+/// What a node's owner turned off where its kithd is started is not run there, whoever
+/// applied it and whatever the store says, and its status says which word turned it off.
+#[test]
+fn node_policy_refuses_what_the_node_turned_off() {
+    let daemon = Daemon::start_with("policy", &["--node-policy", "no-exec-units"]);
+    daemon.apply(&exec("Workload", "tool", "echo ran", ""));
+    wait_for("the Workload to say this node's policy refuses it", || {
+        let notes = daemon.status("workload/tool")["notes"].to_string();
+        notes.contains("execUnits is off") && notes.contains("--node-policy exec-units")
+    });
+    let status = daemon.status("workload/tool");
+    assert!(
+        status["containers"].as_array().is_none_or(|units| units.is_empty()),
+        "{status}"
+    );
+    assert_eq!(daemon.log("w_default_tool_0_main"), "", "nothing of it ran");
+    // A word that is no word of the policy: the start is refused, with the word named.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("policy-wrong");
+    std::fs::create_dir_all(&dir).unwrap();
+    let wrong = [
+        "--state",
+        "state",
+        "--registry-port",
+        "0",
+        "--socket",
+        "kithd.sock",
+        "--node-policy",
+        "hardned",
+    ];
+    let ended = Command::new(env!("CARGO_BIN_EXE_kithd"))
+        .current_dir(&dir)
+        .args(wrong)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&ended.stderr);
+    assert!(!ended.status.success() && !dir.join("kithd.sock").exists(), "{said}");
+    assert!(said.contains("'hardned' is not a word of the policy"), "{said}");
+}
+
 #[test]
 fn exec_units_run() {
     if !e2e() {

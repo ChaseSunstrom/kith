@@ -865,8 +865,12 @@ pub async fn keep(
             (mine.map(|key| (key.spec.clone(), key.status.clone())), peers)
         };
         let (mine, said) = mine.unzip();
+        // (A node whose own policy takes no wipe from the cluster: its record is kept, and
+        // the cluster's duress codes are not made its own. A wipe is then as the cluster
+        // forgetting its key: it runs on, and opens next with its recovery key alone.)
+        let wipes = crate::policy::get().allows("wipe");
         match (&mine, &record.key) {
-            (Some(spec), _) if spec["wiped"] == true => {
+            (Some(spec), _) if spec["wiped"] == true && wipes => {
                 eprintln!(
                     "kithd: the cluster has wiped this node: its lock record is erased and its state can no longer be opened"
                 );
@@ -882,8 +886,12 @@ pub async fn keep(
                 // (Forgotten, by the cluster's duress code: this node runs on, and what
                 // opens it with no node asked goes as it does when it is locked. Its
                 // recovery key is then what opens it, until `kith node unlock`.)
-                let forgotten = spec["forgotten"] == true;
-                if forgotten && !shut {
+                let forgotten = spec["forgotten"] == true || spec["wiped"] == true;
+                if spec["wiped"] == true && !shut {
+                    eprintln!(
+                        "kithd: the cluster has wiped this node, and this node's policy takes no wipe from the cluster (wipe is off): its lock record is kept, it runs on, and opens next with its recovery key alone"
+                    );
+                } else if forgotten && !shut {
                     eprintln!(
                         "kithd: the cluster has forgotten the key of this node's state (its duress code was typed): this node runs on, and opens next with its recovery key alone"
                     );
@@ -897,8 +905,12 @@ pub async fn keep(
                     tpm: record.tpm.clone().filter(|_| seal),
                     parent: record.parent.clone().filter(|_| seal),
                     pass: record.pass.clone().filter(|_| !shut),
-                    duress: public("duress"),
-                    duress_all: public("duressAll"),
+                    duress: if wipes { public("duress") } else { record.duress.clone() },
+                    duress_all: if wipes {
+                        public("duressAll")
+                    } else {
+                        record.duress_all.clone()
+                    },
                     ..record.clone()
                 };
                 if left != record && write(&left) {
