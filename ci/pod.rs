@@ -4,7 +4,9 @@
 //!   pod serve [FILE]           make a file in the root, then answer every connection on
 //!                              port 80 (as HTTP) with this pod's name, what GREETING and
 //!                              PASSWORD say where it is told them, and, given a FILE it
-//!                              adds a line to at each start, how many lines that has
+//!                              adds a line to at each start, how many lines that has; at
+//!                              start it says `where: nameserver IP from IP` (its resolver,
+//!                              and the address it reaches it from: its node's pod range)
 //!   pod say                    answer every connection on port 80 (as HTTP) with what
 //!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
@@ -210,6 +212,13 @@ fn main() {
     match &args[1..] {
         ["serve", keeps @ ..] if keeps.len() < 2 => {
             std::fs::write("/made-here", "a pod's root takes a file").expect("a file in the root");
+            // Where it is told to ask for names, and the address it asks from (a UDP socket
+            // connected sends nothing): both in its node's pod range.
+            let resolv = std::fs::read_to_string("/etc/resolv.conf").expect("a resolv.conf");
+            let ns = resolv.lines().find_map(|line| line.strip_prefix("nameserver ")).expect("a nameserver").trim();
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket");
+            socket.connect(format!("{ns}:53")).expect("a way to the nameserver");
+            println!("where: nameserver {ns} from {}", socket.local_addr().expect("a local address").ip());
             let mut name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
             name = format!("HTTP/1.0 200 OK\r\n\r\n{}", name.trim());
             for told in ["GREETING", "PASSWORD"] {

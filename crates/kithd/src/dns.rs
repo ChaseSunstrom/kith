@@ -386,7 +386,7 @@ pub async fn run(
     // This node's pods are its own to ask for any name, whatever their addresses are. (A list
     // takes the place of the local networks, so they are named with it: a list of the pods'
     // network alone had every other client refused.)
-    let pods = format!("{}/16", kith_mesh::pod::GATEWAY);
+    let pods = crate::pods::range().to_string();
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");

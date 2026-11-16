@@ -91,6 +91,9 @@ struct Args {
     /// first, while the state disk is under its reserve); pulled again when a unit needs it. 0 keeps every image
     #[arg(long, env = "KITH_IMAGE_GRACE", value_name = "SECONDS", default_value_t = 86400)]
     image_grace: u64,
+    /// The IPv4 network this node's pods get their addresses from (/8 to /24; refused if an address of this node, a LAN or a tailnet, is in it)
+    #[arg(long, env = "KITH_POD_RANGE", value_name = "ADDR/BITS", default_value_t = kith_mesh::pod::Range::default())]
+    pod_range: kith_mesh::pod::Range,
     /// Serve the API to other nodes on this address (TLS); the first start makes this node a cluster of one
     #[arg(long, env = "KITH_LISTEN", value_name = "ADDR:PORT")]
     listen: Option<std::net::SocketAddr>,
@@ -204,6 +207,9 @@ pub struct Shared {
     /// Dry runs (`/v1/diff`, `apply?dryRun`) at once, from asking admission to the answer:
     /// the page asks on every edit, and each asks the kinds' WASM. The rest wait their turn.
     pub dry_runs: tokio::sync::Semaphore,
+    /// The order access is decided in, where a change is put in the log: a change to access
+    /// holds it alone until applied, an Identity's write shared once decided again (`raft.rs`).
+    pub order: tokio::sync::RwLock<()>,
     /// On a worker that runs from a view (`view`): the index of the store its view is at.
     /// `None` on every other node, which keeps the store.
     pub view: watch::Sender<Option<u64>>,
@@ -274,6 +280,14 @@ fn main() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether a range that clashes with an address of this node ends the start: one an operator
+/// named (not the default), when kithd is not the first process. There a refusal restarts the
+/// machine, and a lease that lands in the range one day would make a reboot loop nobody
+/// can reach: it is said and the start goes on.
+fn clash_refuses(range: kith_mesh::pod::Range, first_process: bool) -> bool {
+    range != kith_mesh::pod::Range::default() && !first_process
 }
 
 /// The installer (kith OS started with `kith.install`): nothing is served, a disk is
@@ -515,6 +529,7 @@ async fn replica(
         stop: watch::channel(false).0,
         pods: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
+        order: tokio::sync::RwLock::default(),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
@@ -582,6 +597,20 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let _in = rt.enter();
         early = stops().ok();
         boot.network();
+    }
+    // Pods are made as root only; elsewhere the range is never used, so a clash is no matter.
+    pods::set_range(args.pod_range);
+    if nix::unistd::getuid().is_root()
+        && let Err(clash) = args.pod_range.refuse_if_in_use()
+    {
+        if clash_refuses(args.pod_range, first_process) {
+            return Err(clash);
+        }
+        // (Not `eprintln!`: PID 1 must not panic on a stderr it cannot write.)
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
+        );
     }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
     // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
@@ -993,6 +1022,38 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    #[test]
+    fn a_clash_of_the_pods_range_ends_the_start_only_for_one_named_outside_init() {
+        let (default, named) = (kith_mesh::pod::Range::default(), "10.77.0.0/20".parse().unwrap());
+        assert!(super::clash_refuses(named, false));
+        assert!(!super::clash_refuses(named, true), "as init it would loop the reboot");
+        assert!(!super::clash_refuses(default, false) && !super::clash_refuses(default, true));
+    }
+
+    #[test]
+    fn the_pods_range_is_the_default_or_a_network_the_node_names() {
+        use clap::Parser;
+        let parse = |args: &[&str]| super::Args::try_parse_from(["kithd"].into_iter().chain(args.iter().copied()));
+        assert_eq!(parse(&[]).unwrap().pod_range.to_string(), "100.88.0.0/16");
+        assert_eq!(
+            parse(&["--pod-range", "10.77.0.0/20"])
+                .unwrap()
+                .pod_range
+                .gateway()
+                .to_string(),
+            "10.77.0.1"
+        );
+        let refused = parse(&["--pod-range", "127.0.0.0/16"])
+            .err()
+            .expect("loopback")
+            .to_string();
+        assert!(
+            refused.contains("--pod-range") && refused.contains("loopback"),
+            "{refused}"
+        );
+        assert!(parse(&["--pod-range", "10.77.0.0/25"]).is_err() && parse(&["--pod-range", "10.77.0.0"]).is_err());
     }
 
     use super::*;

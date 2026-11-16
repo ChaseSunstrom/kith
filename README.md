@@ -451,6 +451,22 @@ spec:
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
   A pod's names outside the cluster are asked of its node's resolvers: they need a resolver
   on the node (in `/etc/resolv.conf`) or `--dns-upstream`, and `--dns` is not needed for them.
+  The IPv4 address only its node knows is taken from `100.88.0.0/16` unless that node's
+  kithd is told another with `--pod-range ADDRESS/BITS` (or `KITH_POD_RANGE`; on kith OS
+  after ` -- ` on the kernel command line or in `boot.args` of the config partition), for a
+  node whose own network or tailnet is in it. It is the node's own to name (nodes of one
+  cluster may differ: no pod reaches another by it), from `/8` to `/24` (a `/24` holds 254
+  pods) and a whole network (`10.77.0.0/20`, not `10.77.0.1/20`); never loopback,
+  link-local (169.254.0.0/16), multicast or reserved space. At start, as root, kithd reads the
+  addresses its node has on its links (not the loopback's) and finds one that is inside the
+  range or whose network (`192.168.1.5/16`) holds it; it changes nothing, and a range that comes
+  up on the node later is not noticed. When the range was named with `--pod-range` and
+  kithd is not the first process of a kith OS node, kithd then refuses to start, naming the
+  address and the link; on the default range, and on kith OS (a refusal there restarts the
+  machine, and a lease that lands in the range one day would make it loop), it says so on stderr
+  and goes on. The node's DNS answers names outside the cluster for any address in the
+  range, so a range that is not private lets whoever can reach its listener from such an
+  address use it: choose a private one. Pods of the old range go when kithd restarts.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
@@ -476,8 +492,7 @@ spec:
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
 - Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace); the range pods' addresses are taken
-  from is fixed.
+  capabilities and the filter (no user namespace).
 
 ### What a container is given
 
@@ -1852,9 +1867,12 @@ went. A certificate that no longer stands for its Identity is a refusal too,
 and so is no certificate at all (one line a minute of those). Refusals past
 sixty a minute are counted rather than written. A watch ends when its
 Identity is deleted or given another certificate. `Audit` is not a name a
-custom kind may take. Permission is asked when a request arrives, not again
-when its write is committed: a Role removed in between does not stop a write
-already under way. `kith audit` shows the last of it,
+custom kind may take. Permission is asked when a request arrives, and an
+Identity's apply, delete or rollback is asked again on the leader as it is put
+in the log: a RoleBinding deleted before then stops it, even when the node it
+reached had not heard of the deletion yet. A write already in the log before
+the deletion stays (SECURITY.md says what else is decided once, where it
+arrives). `kith audit` shows the last of it,
 as does `GET /v1/audit` for an Identity with `get` on `Audit`.
 
 ```
@@ -3901,6 +3919,7 @@ sh ci/vm.sh --test init                                 # and: it serves, then r
 sh ci/vm.sh --test image                                # kith OS's image: UEFI, verity root, DHCP, state, tampering
 sh ci/vm.sh --test update                               # and its two slots: an update, marked good; a broken one, gone back from
 sh ci/vm.sh --test chaos                                # three nodes: each cut off in turn, each reset in turn, all reset at once, while writes go on
+sh ci/vm.sh --test access                               # three nodes: a RoleBinding deleted while one is cut off; no write after it is kept
 sh ci/vm.sh --test pods                                 # two nodes: pods with a network, an address and a root each
 sh ci/kube.sh                                           # the real kubectl and helm (fetched once, by hash) against kithd
 sh ci/kube.sh --vm                                      # and against two nodes, where what they make runs (sh ci/vm.sh --test kube)
