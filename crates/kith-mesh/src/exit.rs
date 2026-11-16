@@ -66,6 +66,9 @@ struct Rule<'a> {
     to: Option<(IpAddr, u8)>,
     from: Option<Ipv4Addr>,
     table: Option<u32>,
+    /// Of a rule with no table (unreachable), a table all the same: the kernel tells two
+    /// rules apart by it, so each exit has its own (two may have one address).
+    owner: Option<u32>,
 }
 
 impl Rule<'_> {
@@ -100,6 +103,7 @@ impl Rule<'_> {
                     .push(RuleAttribute::SuppressPrefixLen(if self.v6 { 0 } else { 31 }));
             }
         }
+        rule.attributes.extend(self.owner.map(RuleAttribute::Table));
         rule
     }
 
@@ -136,6 +140,7 @@ fn rules(link: &str, number: u16, range: crate::pod::Range, mesh: Option<(Ipv6Ad
         to,
         from: None,
         table,
+        owner: None,
     };
     let mut rules = vec![
         rule(false, NOWHERE, None, None),
@@ -260,34 +265,63 @@ pub fn ensure(number: u16, tunnel: &Tunnel) -> Result<()> {
         RouteNetlinkMessage::NewRoute(route),
         NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
     )?;
-    for (priority, table) in [(FROM_TUNNEL, Some(table(number))), (FROM_TUNNEL_NOWHERE, None)] {
-        let rule = Rule {
-            v6: false,
-            priority,
-            iif: None,
-            to: None,
-            from: Some(tunnel.address),
-            table,
-        };
+    for rule in from_tunnel(number, tunnel.address) {
         rule.set(true)?;
     }
     Ok(())
 }
 
+/// What the node sends from the tunnel `number`'s `address`: by its table, else nowhere.
+/// (Two exits of one address: what either sends goes by the first one's tunnel that is
+/// up, and nowhere when neither is.)
+fn from_tunnel(number: u16, address: Ipv4Addr) -> [Rule<'static>; 2] {
+    let rule = |priority, table, owner| Rule {
+        v6: false,
+        priority,
+        iif: None,
+        to: None,
+        from: Some(address),
+        table,
+        owner,
+    };
+    [
+        rule(FROM_TUNNEL, Some(table(number)), None),
+        rule(FROM_TUNNEL_NOWHERE, None, Some(table(number))),
+    ]
+}
+
+/// Whether the kernel has all of the tunnel `number` that [`ensure`] made of `address`'s
+/// tunnel but the link: its table's route (gone with the link, too) and its rules.
+pub fn whole(number: u16, address: Ipv4Addr) -> Result<bool> {
+    let mut asked = RouteMessage::default();
+    asked.header.address_family = AddressFamily::Inet;
+    let routes = ask_route(RouteNetlinkMessage::GetRoute(asked), NLM_F_DUMP)?;
+    let routed = routes.iter().any(|route| {
+        matches!(route, RouteNetlinkMessage::NewRoute(route)
+            if route.attributes.contains(&RouteAttribute::Table(table(number))))
+    });
+    let dump = ask_route(RouteNetlinkMessage::GetRule(RuleMessage::default()), NLM_F_DUMP)?;
+    let ruled = from_tunnel(number, address).iter().all(|wanted| {
+        let wanted = wanted.message();
+        dump.iter().any(|rule| {
+            matches!(rule, RouteNetlinkMessage::NewRule(rule)
+                if rule.header.family == wanted.header.family
+                    && rule.header.action == wanted.header.action
+                    && rule.header.src_len == wanted.header.src_len
+                    && wanted.attributes.iter().all(|one| rule.attributes.contains(one)))
+        })
+    });
+    Ok(routed && ruled)
+}
+
 /// Take the tunnel `number` away, and the rules of its address (`address`, if known).
 pub fn remove(number: u16, address: Option<Ipv4Addr>) -> Result<()> {
-    if let Some(address) = address {
-        for (priority, table) in [(FROM_TUNNEL, Some(table(number))), (FROM_TUNNEL_NOWHERE, None)] {
-            let rule = Rule {
-                v6: false,
-                priority,
-                iif: None,
-                to: None,
-                from: Some(address),
-                table,
-            };
-            rule.set(false)?;
-        }
+    for rule in address
+        .map(|address| from_tunnel(number, address))
+        .into_iter()
+        .flatten()
+    {
+        rule.set(false)?;
     }
     let gone = ask_route(
         RouteNetlinkMessage::DelLink(crate::netlink::link(0, Some(&device(number)))),
@@ -398,7 +432,38 @@ mod tests {
         }
         ensure(7, &tunnel).unwrap();
         forget().unwrap();
+        // Two exits of one address (a provider gives each the same): taking one away
+        // leaves the other's rule that lets nothing of that address out by another way.
+        ensure(8, &tunnel).unwrap();
+        let nowhere = || {
+            let dump = ask_route(RouteNetlinkMessage::GetRule(RuleMessage::default()), NLM_F_DUMP).unwrap();
+            dump.into_iter()
+                .filter(|rule| {
+                    matches!(rule, RouteNetlinkMessage::NewRule(rule)
+                    if rule.header.action == RuleAction::Unreachable
+                        && rule.attributes.contains(&RuleAttribute::Priority(FROM_TUNNEL_NOWHERE)))
+                })
+                .count()
+        };
+        assert_eq!(nowhere(), 2);
+        // Whole, until a rule of it or its table's route is taken away by hand.
+        assert!(whole(8, tunnel.address).unwrap());
+        from_tunnel(8, tunnel.address)[1].set(false).unwrap();
+        assert!(!whole(8, tunnel.address).unwrap());
+        ensure(8, &tunnel).unwrap();
+        let route = ask_route(RouteNetlinkMessage::GetRoute(RouteMessage::default()), NLM_F_DUMP).unwrap();
+        let route = route.into_iter().find_map(|route| match route {
+            RouteNetlinkMessage::NewRoute(route) if route.attributes.contains(&RouteAttribute::Table(table(8))) => {
+                Some(route)
+            }
+            _ => None,
+        });
+        ask_route(RouteNetlinkMessage::DelRoute(route.unwrap()), NLM_F_ACK).unwrap();
+        assert!(!whole(8, tunnel.address).unwrap());
         remove(7, Some(tunnel.address)).unwrap();
         remove(7, Some(tunnel.address)).unwrap();
+        assert_eq!(nowhere(), 1);
+        remove(8, Some(tunnel.address)).unwrap();
+        assert_eq!(nowhere(), 0);
     }
 }

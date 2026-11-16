@@ -305,7 +305,9 @@ async fn relay(shared: Arc<Shared>, id: String, (udp, port): (bool, u16)) {
         // loopback link: no rule of an exit's is passed.)
         let own = {
             let pods = shared.pods.lock().expect("nothing panics holding the pods");
-            pods.made.get(&id).map(|pod| kith_mesh::pod::addresses(range(), None, pod.number).0)
+            pods.made
+                .get(&id)
+                .map(|pod| kith_mesh::pod::addresses(range(), None, pod.number).0)
         };
         let done = match (own, udp) {
             (None, _) => Err(std::io::Error::other("the pod is not on this node")),
@@ -427,7 +429,7 @@ async fn datagrams(
     let mut senders: BTreeMap<std::net::SocketAddr, Sender> = BTreeMap::new();
     let mut answering = tokio::task::JoinSet::new();
     let mut buffer = vec![0; 65_536];
-    for heard in 0_u64.. {
+    for heard in 0_u64..=u64::MAX {
         let Ok((length, from)) = outside.recv_from(&mut buffer).await else {
             // (The socket's error: not asked again at once.)
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -505,8 +507,16 @@ mod tests {
         let refused = refuse_own(&mut wanted, &[(8443, "API"), (5353, "DNS")]);
         assert_eq!(wanted.into_keys().collect::<Vec<_>>(), [(true, 6881)]);
         assert_eq!(refused.len(), 2);
-        assert!(refused[0].contains("pod a: port 8443") && refused[0].contains("API"), "{}", refused[0]);
-        assert!(refused[1].contains("pod c: port 1023") && refused[1].contains("below 1024"), "{}", refused[1]);
+        assert!(
+            refused[0].contains("pod a: port 8443") && refused[0].contains("API"),
+            "{}",
+            refused[0]
+        );
+        assert!(
+            refused[1].contains("pod c: port 1023") && refused[1].contains("below 1024"),
+            "{}",
+            refused[1]
+        );
     }
 
     /// An echo server standing for a pod's UDP port, and a relay of it at a free port.
@@ -562,7 +572,9 @@ mod tests {
 
     /// A TCP echo server standing for a pod's port, and a relay of it at a free port whose
     /// connections end after `idle` with nothing passed.
-    async fn tcp_relay(idle: std::time::Duration) -> (std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+    async fn tcp_relay(
+        idle: std::time::Duration,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
         let pod = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let pod_at = pod.local_addr().unwrap();
         tokio::spawn(async move {

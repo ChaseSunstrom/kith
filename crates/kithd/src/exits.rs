@@ -35,6 +35,13 @@ struct Up {
     namespaces: Vec<String>,
 }
 
+impl Up {
+    /// Whether this one's tunnel is `held`'s (its DNS and namespaces aside).
+    fn tunnel_of(&self, held: &Up) -> bool {
+        (self.number, &self.tunnel) == (held.number, &held.tunnel)
+    }
+}
+
 /// What a pod of `namespace` that leaves by the exit `name` is given here: the tunnel's
 /// number and where it asks for names. `Err` (why) when it may not start on this node.
 pub fn ready(shared: &Shared, name: &str, namespace: &str) -> Result<(u16, Vec<Ipv4Addr>), String> {
@@ -224,10 +231,20 @@ fn tend(shared: &Shared, wanted: BTreeMap<String, Result<Up, String>>) {
     // What goes, or changes: taken away, and its pods' connections forgotten.
     let held: Vec<(String, Up)> = exits.up.iter().map(|(name, up)| (name.clone(), up.clone())).collect();
     for (name, up) in held {
-        let same = matches!(wanted.get(&name), Some(Ok(now)) if *now == up);
+        let now = match wanted.get(&name) {
+            Some(Ok(now)) if now.tunnel_of(&up) => Some(now),
+            _ => None,
+        };
+        // (Whole: its link, its table's route and its rules, none taken away by hand.)
         let there = std::fs::exists(format!("/sys/class/net/{}", kith_mesh::exit::device(up.number)));
-        if same && there.unwrap_or(false) {
+        let whole = there.unwrap_or(false) && kith_mesh::exit::whole(up.number, up.tunnel.address).unwrap_or(false);
+        if let Some(now) = now.filter(|_| whole) {
+            // (Its namespaces or DNS alone changed: the tunnel stays as it is.)
+            exits.up.insert(name, now.clone());
             continue;
+        }
+        if now.is_some() {
+            eprintln!("kithd: exit {name}: its tunnel, a rule or a route of it is gone: made again");
         }
         if let Err(e) = kith_mesh::exit::remove(up.number, Some(up.tunnel.address)) {
             eprintln!("kithd: exit {name}: taking its tunnel away: {e}");
@@ -296,6 +313,29 @@ mod tests {
         let v6 = parse(&conf(&peer).replace("10.2.0.2/32, ", "")).unwrap_err();
         assert!(v6.contains("IPv4"), "{v6}");
         assert!(parse(&conf(&peer).replace(KEY, "short")).is_err());
+    }
+
+    #[test]
+    fn a_tunnel_is_made_again_only_when_it_changes() {
+        let peer = format!("[Peer]\nPublicKey = {KEY}\nEndpoint = 192.0.2.7:51820\n");
+        let (tunnel, dns) = parse(&conf(&peer)).unwrap();
+        let held = Up {
+            number: 7,
+            tunnel,
+            dns,
+            namespaces: vec!["media".into()],
+        };
+        // Another namespace or DNS: the same tunnel.
+        let mut now = held.clone();
+        now.namespaces.push("other".into());
+        now.dns = vec![Ipv4Addr::new(10, 2, 0, 9)];
+        assert!(now.tunnel_of(&held));
+        // Another endpoint or number: another.
+        now.tunnel.endpoint = "192.0.2.8:51820".parse().unwrap();
+        assert!(!now.tunnel_of(&held));
+        let mut moved = held.clone();
+        moved.number = 8;
+        assert!(!moved.tunnel_of(&held));
     }
 
     #[test]

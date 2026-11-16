@@ -581,11 +581,20 @@ spec:
   kithd listen on that port of each of the node's IPv4 addresses and pass each connection
   or datagram to the pod; the replies go back the same way, not through the tunnel. The
   first pod of a node to publish a port has it; another waits for it to go (kithd's log
-  says so). `publish` works for any pod, not only an exit's.
+  says so). `publish` works for any pod, not only an exit's. The app is reached at the
+  pod's own address, so it must listen on all of them (`0.0.0.0`), not on 127.0.0.1
+  alone, and sees each client as that address, not the client's. No port below 1024 is
+  published, nor one kithd serves on (5000, 7443 and 51820 are refused when applied, and
+  the node's DNS, ingress and other ports by the node, in its log). A connection ends
+  after 10 minutes with nothing sent; a port takes 512 at once, and past that a new UDP
+  sender takes the place of the one heard from longest ago.
 - **What an Exit is.** It is cluster-wide: whoever may write one decides which namespaces'
   pods leave through it, so a Role scoped to a namespace cannot. Only the Exit's node is
   sent the Exit and its Secret. `Endpoint` has to be an address, not a name (a name would
-  be asked outside the tunnel). The tunnel carries IPv4 only.
+  be asked outside the tunnel). The tunnel carries IPv4 only. A node holds several, even
+  two whose provider gave each the same address; changing an Exit's namespaces or `dns`
+  leaves its tunnel up (pods started after ask the new `dns`), and a tunnel, rule or route of one taken away is made again within
+  a minute.
 - Not yet: OpenVPN, the provider's port forwarding, one key on two nodes, an exit's
   traffic from a pod on another node, and phones or laptops through an exit.
 
