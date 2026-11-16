@@ -58,6 +58,7 @@ mod volume_files;
 mod volumes;
 mod wasm;
 mod worker;
+mod workload_identity;
 
 use clap::Parser;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -997,6 +998,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let replicas = replicas::run(shared.clone(), state.clone(), stopping.clone());
         let images = images::run(shared.clone(), state.clone(), stopping.clone());
         let encrypted = encrypted::run(shared.clone(), state.clone(), stopping.clone());
+        let identities = workload_identity::run(shared.clone(), stopping.clone());
         let registry = images::serve(shared.clone(), door, stopping.clone());
         let storage = async {
             tokio::join!(
@@ -1006,7 +1008,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(replicas),
                 apart(images),
                 apart(registry),
-                apart(encrypted)
+                apart(encrypted),
+                apart(identities)
             )
         };
         let says = vec![

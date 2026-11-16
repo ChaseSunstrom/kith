@@ -1180,6 +1180,129 @@ fn ask_as_node(address: &str, dir: &Path, method: &str, path: &str, body: Option
     (code.to_string(), said.to_string())
 }
 
+/// A Workload that runs as an Identity: the CA holder signs, for the worker it is placed on
+/// alone, a certificate for a key it never saw; the API takes that for what the Identity's
+/// Role allows, and refuses it the moment the store says otherwise. The test plays the
+/// worker's part with its certificate: the container's image is one nobody serves, so the
+/// worker asks for nothing itself (e2e.rs has a container that runs as an Identity).
+#[test]
+fn a_workload_runs_as_an_identity() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let test = "runsas";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token", "--worker"]);
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two ready nodes", || {
+        alpha.kith(&["get", "node"]).1.matches("ready at").count() == 2
+    });
+    let apply = |text: &str| {
+        std::fs::write(alpha.dir.join("apply.yaml"), text).unwrap();
+        alpha.ok(&["apply", "-f", "apply.yaml"]);
+    };
+    let identity = |namespace: &str| {
+        format!(
+            "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: gateway }}\n\
+             spec: {{ workloads: [{{ namespace: {namespace}, names: [proxy] }}] }}\n"
+        )
+    };
+    apply(&format!(
+        "apiVersion: kith.dev/v1\nkind: Namespace\nmetadata: {{ name: web }}\n---\n{}---\n\
+         apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: services }}\n\
+         spec: {{ rules: [{{ kinds: [Service], verbs: [get, list] }}] }}\n---\n\
+         apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: gateway }}\n\
+         spec: {{ role: services, subjects: [gateway] }}\n---\n\
+         apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: token, namespace: web }} # pragma: allowlist secret\n\
+         spec: {{ data: {{ a: b }} }}\n---\n\
+         apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: proxy, namespace: web }}\nspec:\n  \
+         identity: gateway\n  placement: {{ require: {{ kith.dev/trust: worker }} }}\n  template:\n    \
+         containers: [{{ name: run, image: '127.0.0.1:1/none:1' }}]\n",
+        identity("web")
+    ));
+    wait_for("proxy to be placed on the worker", || {
+        let proxy = alpha.ok(&["get", "workload/proxy", "-n", "web", "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&proxy).unwrap()["status"]["nodes"]["0"] == "beta"
+    });
+
+    // The worker makes the key; the CA holder is sent its public half.
+    let key = rcgen::KeyPair::generate().unwrap();
+    let public = alpha.dir.join("public.der");
+    std::fs::write(&public, rcgen::PublicKeyData::subject_public_key_info(&key)).unwrap();
+    let ask = |node: &Path| {
+        let mut curl = Command::new("curl");
+        curl.args([
+            "-sk",
+            "-w",
+            "\n%{http_code}",
+            "--max-time",
+            "15",
+            "-X",
+            "POST",
+            "--data-binary",
+        ]);
+        curl.arg(format!("@{}", public.display()));
+        curl.arg("--cert")
+            .arg(node.join("node.crt"))
+            .arg("--key")
+            .arg(node.join("node.key"));
+        let out = curl.arg(format!(
+            "https://{}/v1/workload-certificate/web/proxy/0",
+            alpha.address()
+        ));
+        let out = String::from_utf8_lossy(&out.output().unwrap().stdout).into_owned();
+        let (said, code) = out.rsplit_once('\n').unwrap();
+        (code.to_string(), said.to_string())
+    };
+    let (alphas, betas) = (alpha.dir.join("state/pki"), beta.dir.join("state/pki"));
+    // Not for a node it is not placed on, whatever that node is.
+    let (code, said) = ask(&alphas);
+    assert!(
+        code == "403" && said.contains("not placed on node alpha"),
+        "{code} {said}"
+    );
+    let (code, cert) = ask(&betas);
+    assert_eq!(code, "200", "{cert}");
+    let (code, said) = ask(&betas);
+    assert_eq!(code, "429", "once a minute: {said}");
+
+    // The pod's files: what its Identity's Role allows, and nothing else.
+    let pod = alpha.dir.join("pod");
+    std::fs::create_dir_all(&pod).unwrap();
+    std::fs::write(pod.join("node.crt"), &cert).unwrap();
+    std::fs::write(pod.join("node.key"), key.serialize_pem()).unwrap();
+    let call = |path: &str| ask_as_node(&alpha.address(), &pod, "GET", path, None);
+    let services = "/v1/resources?kind=Service";
+    assert_eq!(call(services).0, "200", "{:?}", call(services));
+    assert_eq!(call("/v1/resources/Secret/web/token").0, "403");
+    // The Identity's word withdrawn (the Identity still there): refused; given back, good.
+    apply(&identity("shop"));
+    let (code, said) = call(services);
+    assert!(
+        code == "401" && said.contains("does not name namespace web"),
+        "{code} {said}"
+    );
+    apply(&identity("web"));
+    assert_eq!(call(services).0, "200");
+    // A copy of the files taken before the Workload is deleted is refused after.
+    alpha.ok(&["delete", "workload/proxy", "-n", "web"]);
+    let (code, said) = call(services);
+    assert!(
+        code == "401" && said.contains("there is no Workload/web/proxy"),
+        "{code} {said}"
+    );
+    // Each certificate made is written down.
+    let audit = alpha.ok(&["audit"]);
+    assert!(
+        audit.contains("node beta") && audit.contains("Identity/gateway"),
+        "{audit}"
+    );
+}
+
 /// A worker's own units are still said to run, and what is not a worker's to write is
 /// refused on the route nodes write by, whatever its certificate is admitted to; the other
 /// node routes hand it no blob nothing on it names and no Volume it is no replica of.

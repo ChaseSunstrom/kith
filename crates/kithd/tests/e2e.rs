@@ -1916,6 +1916,87 @@ fn source_syncs_git_and_oci() {
 
 /// An Identity with a certificate does over TLS what its Roles allow, and the audit
 /// log says who did what. (Loopback and curl are all this needs.)
+/// A Workload that runs as an Identity: its container finds the certificate, the key and
+/// the API's address in memory, its user's alone, and calls the API with them as that
+/// Identity, for what its Role allows and nothing else.
+#[test]
+fn a_container_runs_as_an_identity() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1 (needs network and a delegated cgroup)");
+        return;
+    }
+    let image = std::env::var("KITH_E2E_IMAGE").unwrap_or("mirror.gcr.io/library/busybox:1.36".into());
+    let port = free_port();
+    let listen: &'static str = Box::leak(format!("127.0.0.1:{port}").into_boxed_str());
+    let args: &'static [&'static str] = Box::leak(Box::new(["--name", "alpha", "--listen", listen]));
+    let daemon = Daemon::start_with("runsas", args);
+    // (A fixture Secret: nothing of it is secret.)
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1
+kind: Identity
+metadata: {{ name: gateway }}
+spec: {{ workloads: [{{ namespace: default, names: [proxy] }}] }}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {{ name: services }}
+spec: {{ rules: [{{ kinds: [Service], verbs: [get, list] }}] }}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {{ name: gateway }}
+spec: {{ role: services, subjects: [gateway] }}
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: {{ name: token }} # pragma: allowlist secret
+spec: {{ data: {{ a: b }} }}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {{ name: proxy }}
+spec:
+  identity: gateway
+  template:
+    containers:
+      - name: main
+        image: {image}
+        command: [sh, -c, 'cd /run/kith/identity && stat -L -c \"%a %u\" tls.key && id -u && cat address && echo && cat tls.crt tls.key; exec sleep 300']
+"
+    ));
+    let mut said = String::new();
+    wait_for("the container to show its files", || {
+        said = daemon.kith(&["logs", "Workload/proxy"]).1;
+        said.contains("END PRIVATE KEY")
+    });
+    // Its user's alone.
+    let mut lines = said.lines();
+    let (mode, user) = lines.next().unwrap().split_once(' ').unwrap();
+    assert_eq!((mode, user), ("400", lines.next().unwrap()), "{said}");
+    assert_eq!(lines.next().unwrap(), listen, "the API's address: {said}");
+    let pem = |label: &str| {
+        let begin = said.find(&format!("-----BEGIN {label}-----")).unwrap();
+        let end = said[begin..].find(&format!("-----END {label}-----")).unwrap() + begin;
+        format!("{}-----END {label}-----\n", &said[begin..end])
+    };
+    let pod = daemon.dir.join("pod");
+    std::fs::create_dir_all(&pod).unwrap();
+    std::fs::write(pod.join("tls.crt"), pem("CERTIFICATE")).unwrap();
+    std::fs::write(pod.join("tls.key"), pem("PRIVATE KEY")).unwrap();
+    let call = |path: &str| {
+        let mut curl = Command::new("curl");
+        curl.args(["-sk", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code}"]);
+        curl.arg("--cert")
+            .arg(pod.join("tls.crt"))
+            .arg("--key")
+            .arg(pod.join("tls.key"));
+        let out = curl.arg(format!("https://{listen}{path}")).output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(call("/v1/resources?kind=Service"), "200");
+    assert_eq!(call("/v1/resources/Secret/default/token"), "403");
+}
+
 #[test]
 fn rbac_is_enforced_and_audited() {
     let port = free_port();

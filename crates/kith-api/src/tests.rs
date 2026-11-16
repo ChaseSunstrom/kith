@@ -1755,3 +1755,48 @@ fn an_exit_and_a_published_port_are_checked() {
         assert!(refused.contains(why), "{kind} {bad}: {refused}");
     }
 }
+
+/// An Identity says which Workloads may run as it (`workloads`: a namespace, and maybe
+/// names), and a Workload which Identity it runs as (`identity`): both names are checked,
+/// and an Identity bound to a key of its own runs as no Workload.
+#[test]
+fn an_identity_names_the_workloads_that_run_as_it() {
+    let read = |text: String| {
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map_err(|e| e.msg)
+    };
+    let identity = |spec: &str| {
+        read(format!(
+            "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: gateway }}\nspec: {spec}\n"
+        ))
+    };
+    let read_back = identity("{ workloads: [{ namespace: edge }, { namespace: web, names: [proxy, api] }] }").unwrap();
+    let spec = &read_back[0].spec;
+    assert_eq!(spec["workloads"][1]["names"][1], "api", "{spec}");
+    for bad in [
+        "{ workloads: [{ namespace: Edge }] }",
+        "{ workloads: [{ namespace: web, names: ['a b'] }] }",
+    ] {
+        assert!(identity(bad).unwrap_err().contains("invalid name"), "{bad}");
+    }
+    let keyed = identity("{ publicKey: abc, workloads: [{ namespace: edge }] }").unwrap_err();
+    assert!(keyed.contains("workloads") && keyed.contains("publicKey"), "{keyed}");
+
+    let workload = |identity: &str| {
+        read(format!(
+            "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: proxy, namespace: web }}\n\
+             spec: {{ identity: {identity}, template: {{ containers: [{{ name: c, image: i }}] }} }}\n"
+        ))
+    };
+    assert_eq!(workload("gateway").unwrap()[0].spec["identity"], "gateway");
+    assert!(workload("'Gate way'").unwrap_err().contains("identity"));
+    assert!(workload("gate.way").unwrap_err().contains("no `.`"));
+    // Only containers are given the certificate: a template with anything else is refused.
+    let exec = read(
+        "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: proxy }\n\
+         spec: { identity: gateway, template: { exec: [{ name: e, command: [sh] }] } }\n"
+            .into(),
+    );
+    assert!(exec.unwrap_err().contains("only containers"));
+}

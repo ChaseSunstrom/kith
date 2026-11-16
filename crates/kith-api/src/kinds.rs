@@ -271,6 +271,10 @@ spec! {
         pub placement: Option<Placement>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub priority_class: Option<String>,
+        /// The Identity its pods call kith's API as; that Identity's `workloads` names this
+        /// Workload's namespace (and the Workload, where it names any).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub identity: Option<String>,
     }
 
     pub enum Strategy { Rolling, Recreate, BlueGreen }
@@ -1234,6 +1238,17 @@ spec! {
         pub public_key: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub groups: Vec<String>,
+        /// The Workloads that may run as this Identity (`identity:`): whoever may apply a
+        /// Workload in a namespace named here may run any image with its rights.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub workloads: Vec<RunAs>,
+    }
+
+    /// Workloads that may run as an Identity: those of a namespace, or only the ones named.
+    pub struct RunAs {
+        pub namespace: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub names: Vec<String>,
     }
 }
 
@@ -1353,8 +1368,23 @@ no_checks!(
     NodeKeySpec,
     RoleSpec,
     RoleBindingSpec,
-    IdentitySpec,
 );
+
+impl Spec for IdentitySpec {
+    fn check(&self) -> Result<(), String> {
+        for (at, run) in self.workloads.iter().enumerate() {
+            crate::check_name(&run.namespace).map_err(|e| format!("workloads[{at}].namespace: {e}"))?;
+            for name in &run.names {
+                crate::check_name(name).map_err(|e| format!("workloads[{at}].names: {e}"))?;
+            }
+        }
+        // (Its key is a person's or a machine's: a pod's is made again each time it starts.)
+        if self.public_key.is_some() && !self.workloads.is_empty() {
+            return Err("workloads: an Identity with a publicKey is run as by no Workload".into());
+        }
+        Ok(())
+    }
+}
 
 /// `storage` limits a container's pod alone: in the Resources a node keeps back, a namespace's
 /// quota or a seat's reserve, `field`, it would look like a limit and limit nothing.
@@ -2009,6 +2039,19 @@ impl Spec for WorkloadSpec {
         // ponytail: a typo guard, not a design limit; raise it when one Workload really needs more.
         if self.replicas.is_some_and(|n| n > 1000) {
             return Err("replicas: at most 1000".into());
+        }
+        if let Some(identity) = &self.identity {
+            crate::check_name(identity).map_err(|e| format!("identity: {e}"))?;
+            // (Each name is one label of the pod's certificate's names.)
+            if identity.contains('.') {
+                return Err("identity: an Identity a Workload runs as has a name with no `.`".into());
+            }
+            // The certificate is given to containers, in memory: nothing else is given one.
+            if !self.template.exec.is_empty() || !self.template.vms.is_empty() {
+                return Err(
+                    "identity: only containers are given its certificate: this template has exec units or VMs".into(),
+                );
+            }
         }
         self.template.check("template")
     }

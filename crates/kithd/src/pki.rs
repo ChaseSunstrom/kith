@@ -8,7 +8,8 @@
 // ponytail: the node that holds the CA key also makes each joiner's key pair, and sends
 // it back over the pinned TLS channel. A signing request would keep the key on the
 // joiner, but reading one needs an X.509 parser nothing else uses; the CA node can mint
-// any certificate anyway. Certificates last ten years: there is no renewal yet.
+// any certificate anyway. Certificates last ten years: there is no renewal yet. (A
+// Workload's pod's lasts two hours, for a key its node made: `workload_identity`.)
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -34,6 +35,33 @@ const USER_SUFFIX: &str = ".user.kith";
 /// In the certificate a node is given as it joins: `INDEX.born.kith`, an index of the store
 /// by which its Node was there. A store that is past it and has no such Node had it deleted.
 const BORN_SUFFIX: &str = ".born.kith";
+/// A Workload's certificate names the Identity it runs as (`<identity>.runs.kith`), the
+/// Workload (`<name>.<namespace>.workload.kith`) and the node it was made for
+/// (`<node>.on.kith`): no node's and no Identity's own, so a kithd that knows none reads
+/// no subject in it.
+const RUNS_SUFFIX: &str = ".runs.kith";
+const WORKLOAD_SUFFIX: &str = ".workload.kith";
+const ON_SUFFIX: &str = ".on.kith";
+/// How long a Workload's certificate lasts: it is made again at half.
+pub const WORKLOAD_LIFE: Duration = Duration::from_secs(2 * 3600);
+/// A P-256 public key's SubjectPublicKeyInfo (DER) up to its point, as `KeyPair::generate`
+/// makes them: the one kind of key a node may send for a Workload's certificate.
+const P256_SPKI: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce,
+    0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// The point of a P-256 key a node made: rcgen signs for it without its private half.
+struct NodeKey<'a>(&'a [u8]);
+
+impl rcgen::PublicKeyData for NodeKey<'_> {
+    fn der_bytes(&self) -> &[u8] {
+        self.0
+    }
+    fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
+        &rcgen::PKCS_ECDSA_P256_SHA256
+    }
+}
 const TOKEN_LIFE: Duration = Duration::from_secs(3600);
 
 type Fallible<T> = Result<T, String>;
@@ -119,12 +147,43 @@ impl Ca {
         Ok((cert, key.serialize_pem(), key.public_key_pem()))
     }
 
-    fn sign(
+    /// The certificate of the Workload `namespace/name` on the node `node`, running as the
+    /// Identity `identity`, for the P-256 key `public` (SubjectPublicKeyInfo, DER) the node
+    /// made: good for calling the API for [`WORKLOAD_LIFE`] from `now` (seconds since 1970).
+    pub fn issue_workload(
+        &self,
+        identity: &str,
+        (namespace, name): (&str, &str),
+        node: &str,
+        public: &[u8],
+        now: u64,
+    ) -> Fallible<String> {
+        let point = public
+            .strip_prefix(&P256_SPKI)
+            .filter(|point| point.len() == 65 && point[0] == 4);
+        let point = point.ok_or("the key is not a P-256 public key")?;
+        for part in [namespace, name, node] {
+            valid_name(part)?;
+        }
+        let names = vec![
+            format!("{identity}{RUNS_SUFFIX}"),
+            format!("{name}.{namespace}{WORKLOAD_SUFFIX}"),
+            format!("{node}{ON_SUFFIX}"),
+        ];
+        let mut params = self.params(identity, names, vec![ExtendedKeyUsagePurpose::ClientAuth])?;
+        // A minute before, for a clock behind the CA holder's.
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now.saturating_sub(60));
+        params.not_after = rcgen::date_time_ymd(1970, 1, 1) + Duration::from_secs(now) + WORKLOAD_LIFE;
+        let issuer = Issuer::new(ca_params(), &self.key);
+        Ok(tls("signing the certificate", params.signed_by(&NodeKey(point), &issuer))?.pem())
+    }
+
+    fn params(
         &self,
         name: &str,
         names: Vec<String>,
         usages: Vec<ExtendedKeyUsagePurpose>,
-    ) -> Fallible<(String, KeyPair)> {
+    ) -> Fallible<CertificateParams> {
         valid_name(name)?;
         let mut params = tls("naming the certificate", CertificateParams::new(names))?;
         params.distinguished_name.push(DnType::CommonName, name);
@@ -132,6 +191,16 @@ impl Ca {
         params.extended_key_usages = usages;
         params.use_authority_key_identifier_extension = true;
         params.not_after = rcgen::date_time_ymd(year_in(10), 1, 1);
+        Ok(params)
+    }
+
+    fn sign(
+        &self,
+        name: &str,
+        names: Vec<String>,
+        usages: Vec<ExtendedKeyUsagePurpose>,
+    ) -> Fallible<(String, KeyPair)> {
+        let params = self.params(name, names, usages)?;
         let key = tls("making the key", KeyPair::generate())?;
         // The issuer is rebuilt from the same parameters the CA certificate was made with.
         let issuer = Issuer::new(ca_params(), &self.key);
@@ -518,6 +587,15 @@ pub enum Subject {
     /// An Identity, and the public key (DER) the certificate is for: it stands for the
     /// Identity only while that names the same key.
     User(String, Vec<u8>),
+    /// A Workload's pod: the Identity it runs as, and the Workload's namespace and name, and
+    /// the node the certificate was made for. It stands for the Identity only while the store
+    /// says that Workload, placed on that node, runs as it ([`crate::workload_identity::stands`]).
+    Workload {
+        identity: String,
+        namespace: String,
+        name: String,
+        node: String,
+    },
 }
 
 pub fn subject_of(cert: &CertificateDer<'_>) -> Option<Subject> {
@@ -530,7 +608,15 @@ pub fn subject_of(cert: &CertificateDer<'_>) -> Option<Subject> {
             named(BORN_SUFFIX).and_then(|born| born.parse().ok()),
         )),
         (None, Some(user)) => Some(Subject::User(user.into(), cert.subject_public_key_info().to_vec())),
-        (None, None) => None,
+        (None, None) => {
+            let (name, namespace) = named(WORKLOAD_SUFFIX)?.split_once('.')?;
+            Some(Subject::Workload {
+                identity: named(RUNS_SUFFIX)?.into(),
+                namespace: namespace.into(),
+                name: name.into(),
+                node: named(ON_SUFFIX)?.into(),
+            })
+        }
     }
 }
 
@@ -695,6 +781,70 @@ mod tests {
 
         assert!(ca.issue("Not A Name").is_err());
         assert!(valid_name("-x").is_err() && valid_name("").is_err() && valid_name("node-1").is_ok());
+    }
+
+    #[test]
+    fn a_workload_certificate_is_for_a_key_the_ca_never_saw_and_lasts_two_hours() {
+        use rcgen::PublicKeyData;
+        let ca = Ca::create().unwrap();
+        // The node makes the key; the CA holder is sent its public half alone.
+        let key = KeyPair::generate().unwrap();
+        let public = key.subject_public_key_info();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let cert = ca
+            .issue_workload("reader", ("web", "proxy"), "beta", &public, now)
+            .unwrap();
+        let der = certs(&cert).unwrap().remove(0);
+        let end = webpki::EndEntityCert::try_from(&der).unwrap();
+        assert_eq!(end.subject_public_key_info().as_ref(), public.as_slice());
+        let names: Vec<_> = end.valid_dns_names().collect();
+        assert_eq!(names, ["reader.runs.kith", "proxy.web.workload.kith", "beta.on.kith"]);
+        let subject = Subject::Workload {
+            identity: "reader".into(),
+            namespace: "web".into(),
+            name: "proxy".into(),
+            node: "beta".into(),
+        };
+        assert_eq!(subject_of(&der), Some(subject));
+        // It names no node and no Identity the way their own certificates do: a kithd that
+        // knows no Workload's certificate reads no subject in it.
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.ends_with(NODE_SUFFIX) || name.ends_with(USER_SUFFIX) || *name == ANY_NODE)
+        );
+
+        // The cluster takes it from a client for two hours, and not after.
+        let verifier = WebPkiClientVerifier::builder_with_provider(roots(&ca.cert).unwrap(), provider())
+            .build()
+            .unwrap();
+        let at = |secs| verifier.verify_client_cert(&der, &[], UnixTime::since_unix_epoch(Duration::from_secs(secs)));
+        assert!(at(now + 60).is_ok() && at(now + 7100).is_ok());
+        assert!(at(now + 7300).is_err());
+
+        // A P-256 key, whole, and names that can be named.
+        assert!(
+            ca.issue_workload("reader", ("web", "proxy"), "beta", &public[1..], now)
+                .is_err()
+        );
+        assert!(
+            ca.issue_workload(
+                "reader",
+                ("web", "proxy"),
+                "beta",
+                &[public.clone(), vec![0]].concat(),
+                now
+            )
+            .is_err()
+        );
+        assert!(
+            ca.issue_workload("Reader", ("web", "proxy"), "beta", &public, now)
+                .is_err()
+        );
+        assert!(
+            ca.issue_workload("reader", ("web", "a.b"), "beta", &public, now)
+                .is_err()
+        );
     }
 
     #[test]

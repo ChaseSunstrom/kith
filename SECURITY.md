@@ -22,6 +22,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | A control node (what a node is unless its Node says `trust: worker`): everything in the cluster. Control nodes replicate the whole store, Secrets included, and run what they are told: **a control node is trusted as much as the admin.** A worker: what is placed on it, what every node reads to run a cluster (an ingress worker: the exposed hosts' certificates and keys too), and to write what it says of itself (see "A node that is taken") |
 | An Identity | A certificate for `NAME.user.kith` whose key is the one in its `Identity` | What its Roles say, by kind, verb and namespace |
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
+| A Workload that runs as an Identity | A certificate for `IDENTITY.runs.kith`, `NAME.NAMESPACE.workload.kith` and `NODE.on.kith`, for two hours, while the store says that Workload, placed on that node, runs as that Identity and the Identity names it | What the Identity's Roles say (see "A Workload that runs as an Identity") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
 | Whoever writes what kith fetches | Nothing by itself | What follows from it: a Source's repository is applied, a package is rendered, an image is run, an archive is restored |
 
@@ -524,6 +525,43 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **A Workload that runs as an Identity** (`spec.identity`, T-0408) calls the API with
+  that Identity's rights. Who may run as it is the Identity's word (`spec.workloads`:
+  namespaces, and Workloads by name), which only whoever may apply an Identity writes;
+  a Workload that names an Identity which does not name it is refused at apply, and an
+  Identity with a `publicKey` names none. **A namespace an Identity names is trusted
+  with its rights:** whoever may apply a Workload there (with no name list, any
+  Workload) can run any image as that Identity. The node that runs the pod makes a P-256
+  key for the pod's life and sends the node that holds the CA key its public half over
+  the cluster's mutual TLS; that node never makes or sees a private key. It signs only
+  for the node its link's certificate says (never one the request names), only while a
+  Workload placed on that node says the Identity and the Identity names it, asks this
+  again at every renewal, signs one a minute at most for one replica on one node, and
+  writes each in its audit log. The certificate names the Identity, the Workload and the
+  node; on each request the API asks its store again, so it stops the moment the
+  Identity's word is withdrawn, the Workload is deleted, moved, or says another
+  Identity, or the Identity or the Node is deleted. A kithd from before reads no subject
+  in it and refuses it. Requests made with it are written in the audit log under the
+  Identity's name. A worker answers no Identity: the pod is given a control node's
+  address. What each has:
+  - **A taken pod** has its certificate and key (in memory, `/run/kith/identity`, its
+    user's alone): the Identity's rights from anywhere that reaches a control node, for
+    as long as the store still says so, and at most two hours. **A certificate outlives
+    its pod by up to two hours** only where a Workload of the same name and namespace is
+    placed on the same node again and runs as the same Identity (the names are all a
+    certificate is checked by): with its rights, which whoever applied it has anyway.
+  - **A taken worker** can have certificates made for every Identity a Workload placed
+    on it runs as, for as long as one is placed there: the same bound as its Secrets,
+    and like them it can draw a Workload to itself by lying about what it has (see "A
+    node that is taken"). It cannot ask in another node's name, and deleting its Node
+    ends what it was given at once.
+  - Where the CA holder refuses a renewal the certificate is taken out of each
+    container's files at once (the pod's key stays on its node, in memory) and asked for
+    again in ten minutes; until it is given back it is refused on every request anyway.
+    A Workload whose Identity changes is given a certificate for the new one within a
+    minute; one given `identity` while it runs gets its files when its pod starts again.
+    Each container has its own copy, made its user's; only containers are given one (a
+    template with exec units or VMs and `identity` is refused at apply).
 - **An Exit keeps a pod's packets in its tunnel, not the pod's secrets from its provider.**
   The provider sees everything the pod sends, and answers its names. A published port of
   an exit's pod is open to whoever reaches the node's address: it is the pod's web UI on
@@ -1009,7 +1047,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     asked node has no Node for. On a worker that runs from a view and is started
     with the flag, that includes the deleted node's word for who asked: do not
     start a worker with it.
-  Certificates still last ten years; nothing but the Node's deletion ends one.
+  Certificates still last ten years (a Workload's pod's, two hours: above); nothing but
+  the Node's deletion ends one.
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.

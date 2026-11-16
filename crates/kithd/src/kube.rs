@@ -24,7 +24,7 @@
 //! than are kept, a store that was replaced, and the Namespaces (made up from every resource).
 
 use crate::Shared;
-use crate::access::{self, Caller, Certificate, Grants};
+use crate::access::{Caller, Certificate, Grants};
 use crate::api::{self, ApiError, LogOptions};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path as Route, Query, State};
@@ -2587,9 +2587,8 @@ impl Watch {
     /// deleted, or given another key, meanwhile is told no more.)
     fn stands(&self) -> bool {
         match (&self.call.caller, &self.call.certificate) {
-            (Caller::Identity(name), Some(Certificate(der))) => access::stands(&self.call.shared, name, der),
+            (Caller::Identity(_) | Caller::Node(_), Some(shown)) => shown.stands(&self.call.shared),
             (Caller::Identity(_), None) => false,
-            (Caller::Node(name), Some(Certificate(der))) => crate::cluster::admitted(&self.call.shared, name, der),
             (Caller::Admin, _) => true,
             // (A node shows its certificate, and nothing is passed on to a watch.)
             (Caller::Node(_), None) | (Caller::Via(..) | Caller::Checked(..), _) => false,

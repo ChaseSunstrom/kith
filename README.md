@@ -2123,8 +2123,47 @@ WHEN                  WHO           DID     WHAT                            OUTC
 2026-11-12T10:03:55Z  alice         delete  Node                            alice may not delete Node: no Role bound to it allows that
 ```
 
+### A Workload that calls the API
+
+A Workload that reads or writes the cluster (a controller, a gateway) runs as
+an Identity, with no key typed into a Secret. The Identity says which
+Workloads may (a namespace, and the Workloads in it where `names` is given),
+and the Workload says which Identity it runs as:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: { name: gateway }
+spec:
+  workloads: [{ namespace: web, names: [proxy] }]
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: proxy, namespace: web }
+spec:
+  identity: gateway
+  template:
+    containers: [{ name: proxy, image: registry.example/proxy:1 }]
+```
+
+Each container of its pods finds `ca.crt`, `tls.crt`, `tls.key` and `address`
+(a control node's, `HOST:PORT`) in `/run/kith/identity`, in memory and
+readable by the container's user alone, and calls `https://ADDRESS` with them
+as `gateway`: what that Identity's Roles allow, and nothing else. The node
+that runs the pod makes the key; the certificate lasts two hours and is made
+again after one, with the same key and without the container starting again.
+It stands only while the store still says so: the Identity names the
+Workload, the Workload says `identity: gateway` and is placed on that node,
+and the node is there. An apply where the Identity does not name the
+Workload is refused, and so is an Identity with both `publicKey` and
+`workloads`, and a template with exec units or VMs (only containers are given
+the files). Where the cluster no longer allows it, the certificate is taken out
+of the files within a minute, and asked for again every ten minutes. A node
+with no directory in memory does not start the pod.
+
 Not yet: `kith` over TLS, logging in through an identity provider (OIDC),
-certificates that expire before ten years, one audit log for the cluster.
+certificates for people that expire before ten years, one audit log for the
+cluster.
 
 ## Hardware
 

@@ -687,7 +687,7 @@ async fn members_only(
             };
             (status, EVICTED)
         }
-        Some(pki::Subject::User(..)) => (
+        Some(pki::Subject::User(..) | pki::Subject::Workload { .. }) => (
             StatusCode::FORBIDDEN,
             "this is for the cluster's nodes, not for an Identity",
         ),
@@ -724,6 +724,10 @@ pub fn node_router(shared: Arc<Shared>) -> Router {
             "/v1/volume-key/{namespace}/{name}",
             get(crate::encrypted::get).put(crate::encrypted::put),
         )
+        .route(
+            "/v1/workload-certificate/{namespace}/{name}/{replica}",
+            post(crate::workload_identity::issue),
+        )
         .with_state(shared.clone());
     let members = crate::raft::router(shared.clone()).merge(ping).merge(hop);
     let members_only = axum::middleware::from_fn_with_state(shared, members_only);
@@ -738,7 +742,7 @@ pub fn admin_router(shared: Arc<Shared>) -> Router {
     admin.route("/v1/cluster", get(status)).with_state(shared)
 }
 
-const CA_ELSEWHERE: &str =
+pub(crate) const CA_ELSEWHERE: &str =
     "only the node that holds the cluster CA key can do this: the one the cluster was started on";
 
 /// A certificate and key for the Identity `name`, which is made if it is not there. Its

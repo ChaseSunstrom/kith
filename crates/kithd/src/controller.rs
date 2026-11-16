@@ -2200,6 +2200,28 @@ async fn start(
             });
         }
     }
+    // A Workload that runs as an Identity: its pod's certificate and key, in memory, the files
+    // of each container its own.
+    if let Run::Container(_) = &slot.run
+        && slot.owner.starts_with("Workload/")
+    {
+        let identity = {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            let workload = state.store.get(&slot.owner);
+            workload.and_then(|workload| workload.spec["identity"].as_str().map(str::to_string))
+        };
+        if let Some(identity) = identity {
+            let (pod, container) = (pod_of(&slot.owner, slot.replica), id.rsplit('_').next().unwrap_or(id));
+            let host = crate::workload_identity::files(shared, &pod, container, &identity).await?;
+            unit.mounts.push(kith_runtime::Mount {
+                host,
+                container: crate::workload_identity::MOUNTED_AT.into(),
+                read_only: true,
+                // (Made the container's user's: its mode lets nobody else read them.)
+                give: true,
+            });
+        }
+    }
     if let Some((seat, client)) = &slot.seat {
         // The seat's own directory: its session puts its sockets there, and its apps find
         // them. It is the session's user's alone, so an app is that user or has nothing.

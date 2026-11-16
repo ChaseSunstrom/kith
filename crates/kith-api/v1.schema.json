@@ -2324,6 +2324,13 @@
           "items": {
             "type": "string"
           }
+        },
+        "workloads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RunAs"
+          },
+          "description": "The Workloads that may run as this Identity (`identity:`): whoever may apply a\nWorkload in a namespace named here may run any image with its rights."
         }
       }
     },
@@ -3326,6 +3333,25 @@
         "rules"
       ]
     },
+    "RunAs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": {
+          "type": "string"
+        },
+        "names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "namespace"
+      ],
+      "description": "Workloads that may run as an Identity: those of a namespace, or only the ones named."
+    },
     "S3": {
       "type": "object",
       "additionalProperties": false,
@@ -4215,6 +4241,13 @@
             "string",
             "null"
           ]
+        },
+        "identity": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The Identity its pods call kith's API as; that Identity's `workloads` names this\nWorkload's namespace (and the Workload, where it names any)."
         }
       },
       "required": [

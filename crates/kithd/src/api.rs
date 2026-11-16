@@ -607,13 +607,13 @@ async fn watch(
     // The wait may have been long: an Identity deleted, or given another key, meanwhile is
     // told no more, and that is written down.
     // (An Identity with no certificate on record is not taken on trust.)
-    if let (Caller::Node(name), Some(Extension(Certificate(der)))) = (&caller, &certificate)
-        && !crate::cluster::admitted(&shared, name, der)
+    if let (Caller::Node(_), Some(Extension(shown))) = (&caller, &certificate)
+        && !shown.stands(&shared)
     {
         return Err(ApiError::Unauthorized(crate::cluster::EVICTED.into()));
     }
     if let Caller::Identity(name) = &caller
-        && !certificate.is_some_and(|Extension(Certificate(der))| access::stands(&shared, name, &der))
+        && !certificate.is_some_and(|Extension(shown)| shown.stands(&shared))
     {
         let why = format!("this certificate does not stand for an Identity {name} any more");
         shared
@@ -902,6 +902,7 @@ pub(crate) fn log_chunk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pki::Subject;
     use rustls::pki_types::pem::PemObject;
     use std::time::Duration;
 
@@ -1366,7 +1367,7 @@ spec: {role: reader, subjects: [alice]}
             watch(
                 State(shared.clone()),
                 Extension(Caller::Identity("alice".into())),
-                Some(Extension(Certificate(der.to_vec()))),
+                Some(Extension(Certificate(Subject::User("alice".into(), der.to_vec())))),
                 Query(options),
             )
         };
@@ -1389,7 +1390,7 @@ spec: {role: reader, subjects: [alice]}
         let watching = watch(
             State(shared.clone()),
             Extension(Caller::Identity("alice".into())),
-            Some(Extension(Certificate(key(&given)))),
+            Some(Extension(Certificate(Subject::User("alice".into(), key(&given))))),
             Query(options),
         );
         let deleting = async {
@@ -1412,6 +1413,73 @@ spec: {role: reader, subjects: [alice]}
                 .iter()
                 .any(|e| e["verb"] == "watch" && e["what"][0] == "Identity/alice")
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Workload's pod watches as its Identity, by what the store says of it: once the
+    /// Workload is deleted its watch is told no more.
+    #[tokio::test]
+    async fn a_watch_by_a_workloads_pod_stands_while_the_store_says_so() {
+        let dir = std::env::temp_dir().join(format!("kithd-watch-workload-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let cluster = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {name: beta}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: gateway}
+spec: {workloads: [{namespace: web}]}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: {name: proxy, namespace: web}
+spec: {identity: gateway, template: {containers: [{name: c, image: i}]}}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: reader}
+spec: {rules: [{kinds: ['*'], verbs: [get, list, watch]}]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: gateway-reader}
+spec: {role: reader, subjects: [gateway]}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(cluster).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+            let placed = serde_json::json!({ "nodes": { "0": "beta" } });
+            state.store.set_status("Workload/web/proxy", Some(placed)).unwrap();
+        }
+        let pod = Subject::Workload {
+            identity: "gateway".into(),
+            namespace: "web".into(),
+            name: "proxy".into(),
+            node: "beta".into(),
+        };
+        let watch_as_pod = |shared: &Arc<Shared>| {
+            let after = *shared.generation.borrow() + 1;
+            let options = WatchOptions {
+                after: Some(after),
+                kind: None,
+                wait: Some(0),
+            };
+            watch(
+                State(shared.clone()),
+                Extension(Caller::Identity("gateway".into())),
+                Some(Extension(Certificate(pod.clone()))),
+                Query(options),
+            )
+        };
+        assert!(watch_as_pod(&shared).await.is_ok());
+        shared.store.lock().unwrap().store.delete("Workload/web/proxy").unwrap();
+        assert!(matches!(watch_as_pod(&shared).await, Err(ApiError::Unauthorized(_))));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

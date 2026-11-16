@@ -207,10 +207,30 @@ fn passed_on(path: &str) -> bool {
     )
 }
 
-/// The public key (DER) of the certificate a request came with, for an Identity or a node:
-/// a watch asks again whether it still stands for them once its wait is over.
+/// Whose the certificate a request came with is: a watch asks again whether it still stands
+/// for them once its wait is over.
 #[derive(Clone)]
-pub struct Certificate(pub Vec<u8>);
+pub struct Certificate(pub pki::Subject);
+
+impl Certificate {
+    /// Does it still stand: an Identity's while its `publicKey` is the certificate's key, a
+    /// node's while it is admitted, a Workload's pod's while the store says so.
+    pub fn stands(&self, shared: &Shared) -> bool {
+        match &self.0 {
+            pki::Subject::User(name, der) => stands(shared, name, der),
+            pki::Subject::Node(name, der, _) => crate::cluster::admitted(shared, name, der),
+            pki::Subject::Workload {
+                identity,
+                namespace,
+                name,
+                node,
+            } => {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                crate::workload_identity::stands(&state.store, identity, namespace, name, node).is_ok()
+            }
+        }
+    }
+}
 
 /// Does the key `der` still stand for the Identity `name`? Its `publicKey` may have been
 /// given another, or the Identity deleted, since the certificate was shown.
@@ -361,7 +381,13 @@ pub fn who(
             }
             return Err((status, why));
         }
-        Some(pki::Subject::User(name, key)) => (name, key),
+        Some(pki::Subject::User(name, key)) => (name, Ok(key)),
+        Some(pki::Subject::Workload {
+            identity,
+            namespace,
+            name,
+            node,
+        }) => (identity, Err((namespace, name, node))),
         None => {
             let why = "a certificate from this cluster's CA is needed".to_string();
             if shared.audit.stranger() {
@@ -387,10 +413,18 @@ pub fn who(
         }
         return Err((StatusCode::FORBIDDEN, why));
     }
-    if !stands(shared, name, key) {
-        let why = format!(
+    // A person's by its key; a Workload's pod's by what the store says of it, on each request.
+    let standing = match key {
+        Ok(key) if stands(shared, name, key) => Ok(()),
+        Ok(_) => Err(format!(
             "this certificate does not stand for an Identity {name}: there is none, or it has been given another"
-        );
+        )),
+        Err((namespace, workload, node)) => {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            crate::workload_identity::stands(&state.store, name, namespace, workload, node)
+        }
+    };
+    if let Err(why) = standing {
         shared
             .audit
             .record(&caller, method, vec![path.into()], Err(why.clone()));
@@ -428,11 +462,57 @@ pub async fn caller(
         Ok(caller) => caller,
         Err((status, why)) => return refuse(status, why).into_response(),
     };
-    if let Some(pki::Subject::User(_, key) | pki::Subject::Node(_, key, _)) = &peer.subject {
-        request.extensions_mut().insert(Certificate(key.clone()));
+    if let Some(subject) = &peer.subject {
+        request.extensions_mut().insert(Certificate(subject.clone()));
     }
     request.extensions_mut().insert(caller);
     next.run(request).await
+}
+
+/// Refuse a Workload of `resources` that says it runs as an Identity which does not say it
+/// may (`workloads`: its namespace, and the Workload where names are given; one with a key of
+/// its own names none, its own check). The Identity is the one in `resources` if there is one,
+/// else the store's.
+pub fn runs_as(store: &Store, resources: &[kith_api::Resource]) -> Result<(), String> {
+    for workload in resources.iter().filter(|resource| resource.kind == "Workload") {
+        let Some(name) = workload.spec["identity"].as_str() else {
+            continue;
+        };
+        let key = format!("Identity/{name}");
+        let given = resources.iter().find(|resource| resource.key() == key);
+        let refused = |why: String| Err(format!("{}: spec.identity: {why}", workload.key()));
+        // (The Workload's names are labels of its pods' certificates too.)
+        let namespace = workload.metadata.namespace.as_deref().unwrap_or("default");
+        if workload.metadata.name.contains('.') || namespace.contains('.') {
+            return refused("a Workload that runs as an Identity, and its namespace, have names with no `.`".into());
+        }
+        let Some(identity) = given.or_else(|| store.get(&key)) else {
+            return refused(format!("there is no Identity {name}"));
+        };
+        let namespace = workload
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(kith_api::DEFAULT_NAMESPACE);
+        let runs = identity.spec["workloads"].as_array().into_iter().flatten();
+        let mut theirs = runs.filter(|run| run["namespace"] == namespace).peekable();
+        if theirs.peek().is_none() {
+            return refused(format!(
+                "Identity {name} does not name namespace {namespace} in its workloads"
+            ));
+        }
+        let named = |run: &serde_json::Value| {
+            let names = run["names"].as_array().map_or(&[][..], Vec::as_slice);
+            names.is_empty() || names.iter().any(|named| *named == workload.metadata.name.as_str())
+        };
+        if !theirs.any(named) {
+            return refused(format!(
+                "Identity {name} does not name {} in its workloads",
+                workload.key()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -545,6 +625,52 @@ mod tests {
         assert!(who(&shared, None, "GET", "/v1/watch", None).is_err());
         assert_eq!(shared.audit.tail(10).unwrap().len(), 2);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Workload runs as an Identity only where that Identity names its namespace (and,
+    /// where it names any, the Workload): asked of the Workload (with the Identity as it is
+    /// in the same apply, or in the store), naming the field.
+    #[test]
+    fn a_workload_runs_only_as_an_identity_that_names_it() {
+        let identity = |workloads: &str, key: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: gateway }}\nspec: {{ workloads: {workloads}{key} }}\n"
+            )
+        };
+        let workload = |name: &str, namespace: &str| {
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {{ name: {name}, namespace: {namespace} }}\n\
+                 spec: {{ identity: gateway, template: {{ containers: [{{ name: c, image: i }}] }} }}\n"
+            );
+            Resource::from_source(&text).unwrap().remove(0).unwrap()
+        };
+        let named = store(&identity(
+            "[{ namespace: edge }, { namespace: web, names: [proxy] }]",
+            "",
+        ));
+        runs_as(&named, &[workload("any", "edge")]).unwrap();
+        runs_as(&named, &[workload("proxy", "web")]).unwrap();
+        for (store, asked, why) in [
+            (&named, workload("other", "web"), "does not name Workload/web/other"),
+            (&named, workload("proxy", "shop"), "does not name namespace shop"),
+            (&store(""), workload("proxy", "web"), "there is no Identity gateway"),
+            (&named, workload("a.b", "edge"), "names with no `.`"),
+        ] {
+            let said = runs_as(store, &[asked]).unwrap_err();
+            assert!(said.contains("spec.identity") && said.contains(why), "{said}");
+        }
+        // The Identity in the same apply is the one asked.
+        let both = |text: &str| Resource::from_source(text).unwrap().into_iter().map(Result::unwrap);
+        let mut asked: Vec<Resource> = both(&identity("[{ namespace: shop }]", "")).collect();
+        asked.push(workload("proxy", "shop"));
+        runs_as(&named, &asked).unwrap();
+        // (One with a key of its own names no Workloads: the Identity's own check, and the store's.)
+        let mut keyed = Store::default();
+        let mut held = both(&identity("[]", "")).next().unwrap();
+        held.spec = serde_json::json!({ "publicKey": "abc", "workloads": [{ "namespace": "web" }] });
+        assert!(keyed.apply(held).is_err());
+        // Nor is anything else asked.
+        runs_as(&store(""), &both(&identity("[]", "")).collect::<Vec<_>>()).unwrap();
     }
 
     fn store(yaml: &str) -> Store {
