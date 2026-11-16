@@ -230,13 +230,19 @@ rewrite rule that a neighbour forging the node's address could aim at.
 
 ## The node's own policy
 
-A file on the node's config partition, written at install and by whoever has the node's
-disk, read by the root part only, never by the store:
+Words given to kithd where it is started, `--node-policy`: on kith OS among kithd's
+arguments on the node's config partition, written at install and by whoever has the
+node's disk, measured with the rest of that partition where the state's key is sealed to
+the TPM, and reached by no API; elsewhere on kithd's command line or in
+`KITH_NODE_POLICY`. Read by the root part only, never from the store. (As built, not a
+file of YAML as first drawn: the config partition already holds kithd's arguments, and a
+second file there would be a second thing to parse before anything is trusted.) The keys,
+as a Node's status says them, each on where nothing is said:
 
 ```yaml
-allow:
+policy:
   execUnits: true        # a process of the node's root, with all of /dev
-  rootContainers: true   # runAsUser: 0 with no user namespace of its own
+  rootContainers: true   # a container that is the node's root (no other user, no user namespace of its own)
   unconfined: true       # seccomp unconfined, or refused calls allowed back by name
   nodeNetwork: true      # containers that are no pod: the node's own network
   devices: [all]         # which classes a DeviceClaim may hand a container: gpu, input, usb, …
@@ -247,14 +253,20 @@ allow:
   wipe: true             # a NodeKey of the store may erase this node, or change its duress keys
 ```
 
-`allow: hardened` is all of them off (`devices: [gpu]`). The list has one key for every
+The words are those keys in small letters with dashes, commas between, read left to
+right: `no-exec-units` turns one off, `exec-units` turns it on again,
+`devices=gpu+input` names the classes handed out. A word that is no word of the policy
+ends the start; on kith OS, where an ended start is a machine starting again for ever,
+the node runs hardened instead and says so.
+
+`--node-policy hardened` is all of them off (`devices=gpu`). The list has one key for every
 item of "What the split does not change"; a new way for the store to be root on a node
 gets a key here in the same change, and review refuses it otherwise.
 
 Every key defaults to on: a node does what it does today, and an upgrade changes
 nothing a cluster runs. With them on, a hole in the serving part is one request from
 root, and SECURITY.md says so in those words: the split is then defence in depth and no
-more. With `allow: hardened` the fifth criterion's claim holds: a hole in the serving
+more. With `--node-policy hardened` the fifth criterion's claim holds: a hole in the serving
 part is the store and the cluster (every Secret, any Identity, another node's place on
 the mesh), and not this node's disks, kernel, lock record or the state's key. Whether a
 new install should be hardened by default is the owner's to say (it refuses exec units
@@ -299,10 +311,10 @@ can drop that nothing it starts may be given.
 So Step A is **the node's own policy, held by the single process**, as its own commits,
 before any of the split:
 
-- the policy file is read at start from the config partition (all on when there is
-  none), and each key that is off refuses its thing where the unit is made
-  (`controller.rs`, `vm.rs`, `api/run.rs`, `crypt.rs`), in words that name the key and
-  the file; a Node's status says its policy, so the scheduler does not place on a node
+- the policy is read at start from kithd's arguments (all on when there is none), and
+  each key that is off refuses its thing where the unit is made (`controller.rs`,
+  `api/run.rs`, `crypt.rs`, by `policy.rs`), in words that name the key and the word
+  that turns it on; a Node's status says its policy, so the scheduler does not place on a node
   what it would refuse, and `kith get nodes` shows it;
 - where `execUnits`, `vmPaths` and `run` are all off, kithd cuts its bounding set at
   start to what it and its containers use: the fourteen of a root pod

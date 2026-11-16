@@ -164,7 +164,27 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves"])?;
+            only(key, fields, &["os", "mesh", "serves", "policy"])?;
+            // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
+            let small = |policy: &Value| match policy {
+                Value::Null => true,
+                Value::Object(keys) => {
+                    keys.len() <= 16
+                        && keys.iter().all(|(key, value)| match value {
+                            Value::Bool(_) => key.len() <= 32,
+                            Value::Array(classes) => {
+                                key == "devices"
+                                    && classes.len() <= 8
+                                    && classes.iter().all(|c| c.as_str().is_some_and(|c| c.len() <= 16))
+                            }
+                            _ => false,
+                        })
+                }
+                _ => false,
+            };
+            if !fields.get("policy").is_none_or(small) {
+                return Err(refused(key, "`policy` is null or a node's own policy as it says it"));
+            }
             if let Some(serves) = fields.get("serves") {
                 serving_shape(key, serves)?;
                 // A worker that joined to run from a view was let in to read the store, not to answer ingress.
@@ -695,6 +715,20 @@ spec: { volume: there, every: 1d }
         // Another node's serves.
         let theirs = patch_of("Node/w", json!({ "serves": { "dns": 53 } }));
         assert!(try_as(&store, "w-b", theirs).is_err());
+        // Its own policy, as a node says it; nothing else under that name, and not another node's.
+        let policy = |said: Value| patch_of("Node/w", json!({ "policy": said }));
+        for said in [json!({ "run": false, "vms": true, "devices": ["gpu"] }), Value::Null] {
+            assert!(try_as(&store, "w", policy(said.clone())).is_ok(), "{said}");
+        }
+        for said in [
+            json!({ "run": "no" }),
+            json!({ "devices": [1] }),
+            json!({ "other": ["gpu"] }),
+            json!("hardened"),
+        ] {
+            assert!(try_as(&store, "w", policy(said.clone())).is_err(), "{said}");
+        }
+        assert!(try_as(&store, "w-b", policy(json!({ "run": false }))).is_err());
         // A viewed worker: the control node that let it join to view did not let it serve ingress.
         store
             .set_status(
