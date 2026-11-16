@@ -148,7 +148,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   ports below 1024 would need the node's to be anyone's, and they stay root's), a
   NodeWorkload's, one given devices, and one with its image or a volume on a file system
   that takes no id-mapped mount (a volume of another node, over NFS); `hostUsers` in its
-  status says which. A `runAsUser` of 65536 or more is refused for a shifted one. Its
+  status says which. A node mounts another node's shared Volume nosuid and nodev, so a
+  set-uid file or a device node a workload on the other node wrote is not honoured on this
+  node (it stays executable: containers run programs from their volumes). A `runAsUser` of 65536 or more is refused for a shifted one. Its
   `/sys` is the node's, bound in, as a user namespace may mount no other.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
