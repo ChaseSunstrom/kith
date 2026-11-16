@@ -1082,8 +1082,8 @@ fn worker_holds_no_secret_that_nothing_placed_on_it_names() {
     wait_for("alpha to list itself", || {
         alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
     });
-    // Whether a worker is sent the store is its token's maker's to say, never the node's:
-    // one that says it cannot run from a view (it serves ingress) is not let in.
+    // Whether a worker serves ingress (and is sent the hosts' certificates) is its token's
+    // maker's to say, never the node's: one that says so with a plain worker's token is not let in.
     let token = alpha.ok(&["node", "token", "--worker"]);
     let (address, token) = (alpha.address(), token.trim());
     let args = [
@@ -1199,6 +1199,215 @@ fn worker_holds_no_secret_that_nothing_placed_on_it_names() {
         beta.kith(&["node", "status"]).1.contains(&gamma.address())
     });
     assert_eq!(files_with(&beta.dir.join("state"), other), Vec::<PathBuf>::new());
+}
+
+/// A helper process, killed when the test is over.
+struct Stop(Child);
+
+impl Drop for Stop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A worker that serves ingress runs from a view too: it is sent the certificate (and key) of
+/// each host the cluster exposes and the ACME account's thumbprint, and no other Secret it is
+/// not placed on; a control node with `--acme` orders for it, and it serves HTTPS with what was
+/// ordered. It writes no Secret and orders nothing; a plain worker is sent no host's
+/// certificate and may not start serving ingress. (In a network namespace of its own, where
+/// it may listen on ports 80 and 443.)
+#[test]
+fn ingress_worker_is_sent_its_hosts_certificates_and_no_other_secret() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    let name = "ingress_worker_is_sent_its_hosts_certificates_and_no_other_secret";
+    if std::env::var_os("KITH_IN_NAMESPACE").is_none() {
+        let unshare = |args: &[&str]| Command::new("unshare").arg("-Urn").args(args).status();
+        if !unshare(&["true"]).is_ok_and(|status| status.success()) {
+            return eprintln!("skipped: no unprivileged user namespaces here (unshare -Urn)");
+        }
+        let me = std::env::current_exe().unwrap();
+        let again = "ip link set lo up && KITH_IN_NAMESPACE=1 exec \"$0\" --exact \"$1\" --nocapture";
+        let status = unshare(&["sh", "-c", again, me.to_str().unwrap(), name]).unwrap();
+        assert!(status.success(), "the test failed inside its namespace");
+        return;
+    }
+    use serde_json::json;
+    let test = "ingress";
+    // A certificate authority of our own (never a real one): every host is 127.0.0.1 to it,
+    // where the ingress worker answers its challenges on port 80.
+    let authority = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join("authority");
+    let _ = std::fs::remove_dir_all(&authority);
+    std::fs::create_dir_all(&authority).unwrap();
+    std::fs::write(authority.join("fake_acme.py"), include_str!("fake_acme.py")).unwrap();
+    let port = free_port().to_string();
+    let fake = Command::new("python3")
+        .args(["fake_acme.py", "127.0.0.1", &port, "."])
+        .current_dir(&authority)
+        .spawn()
+        .unwrap();
+    let _fake = Stop(fake);
+    wait_for("the authority to listen", || authority.join("ca.pem").exists());
+    let directory = format!("http://127.0.0.1:{port}/directory");
+    let alpha = Node::start(test, "alpha", &["--acme", &directory]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let apply = |node: &Node, text: &str| {
+        std::fs::write(node.dir.join("apply.yaml"), text).unwrap();
+        node.ok(&["apply", "-f", "apply.yaml"]);
+    };
+    // A Secret nothing places, a certificate kept by hand for a host nothing exposes, and a
+    // Service exposed at a host, through the nodes that serve ingress.
+    let (unplaced, gone) = ("the-word-nothing-places", "the-key-of-a-host-nothing-exposes");
+    apply(
+        &alpha,
+        &format!(
+            "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: unplaced }}\nspec: {{ data: {{ word: {unplaced} }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Secret\nmetadata: {{ name: tls-gone.example.test }}\n\
+             spec: {{ data: {{ tls.crt: none, tls.key: {gone} }} }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: shop }}\nspec:\n  selector: {{ app: shop }}\n  \
+             ports: [{{ port: 80, targetPort: 8080 }}]\n  expose: {{ host: shop.example.test, via: edge }}\n"
+        ),
+    );
+    // A plain worker, and a worker whose token says it serves ingress.
+    let token = alpha.ok(&["node", "token", "--worker"]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    let token = alpha.ok(&["node", "token", "--worker", "--ingress"]);
+    let mesh = free_port().to_string();
+    let join = ["--join", &alpha.address(), "--token", token.trim()];
+    let serve = ["--ingress", "--mesh", &mesh, "--mesh-interface", "kith-edge"];
+    let edge = Node::start(test, "edge", &[&join[..], &serve[..]].concat());
+    wait_for("both workers to have their views", || {
+        beta.nodes().len() == 3 && edge.nodes().len() == 3
+    });
+    let node: serde_json::Value = serde_json::from_str(&alpha.ok(&["get", "node/edge", "-o", "json"])).unwrap();
+    assert_eq!(
+        (&node["spec"]["ingress"], &node["status"]["view"]),
+        (&json!(true), &json!(true)),
+        "{node}"
+    );
+
+    // Alpha (which serves no ingress itself) orders the certificate, and the edge serves it.
+    let tls = || {
+        let service = alpha.ok(&["get", "service/shop", "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&service).unwrap()["status"]["tls"].clone()
+    };
+    wait_for("a certificate for the edge's host", || tls()["state"] == "ready");
+    wait_for("the certificate to reach the edge's view", || {
+        edge.kith(&["get", "secret/tls-shop.example.test"]).0 == 0
+    });
+    let ca = authority.join("ca.pem");
+    // (No replica behind the Service: the handshake, with the authority's certificate, is enough.)
+    let handshake = |host: &str| {
+        let said = Command::new("openssl")
+            .args([
+                "s_client",
+                "-connect",
+                "127.0.0.1:443",
+                "-servername",
+                host,
+                "-verify_hostname",
+                host,
+            ])
+            .arg("-CAfile")
+            .arg(&ca)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        // (Said only where the server showed a certificate that the authority signed for it.)
+        let said = String::from_utf8_lossy(&said.stdout).into_owned();
+        said.contains(&format!("Verified peername: {host}\n")) && said.contains("Verify return code: 0 (ok)")
+    };
+    wait_for("the edge to serve HTTPS for the host", || {
+        handshake("shop.example.test")
+    });
+    assert!(!handshake("gone.example.test"), "a host nothing exposes is served");
+    let ordered = Command::new("curl")
+        .args(["-s", &format!("http://127.0.0.1:{port}/orders")])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(ordered.stdout).unwrap(), "1");
+
+    // What the edge's view holds: the host's certificate, the thumbprint, no other Secret.
+    let view: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(edge.dir.join("state/view.json")).unwrap()).unwrap();
+    let secrets: Vec<String> = view["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|resource| resource["kind"] == "Secret")
+        .map(|secret| {
+            let metadata = &secret["metadata"];
+            format!(
+                "{}/{}",
+                metadata["namespace"].as_str().unwrap_or("default"),
+                metadata["name"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(secrets, ["default/tls-shop.example.test"]);
+    assert_eq!(edge.kith(&["get", "configmap/acme", "-n", "kith-system"]).0, 0);
+    let secret = |name: &str, namespace: &str| {
+        let got = alpha.ok(&["get", &format!("secret/{name}"), "-n", namespace, "-o", "json"]);
+        serde_json::from_str::<serde_json::Value>(&got).unwrap()["spec"]["data"].clone()
+    };
+    let account = secret("acme-account", "kith-system")["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = secret("tls-shop.example.test", "default")["tls.key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let key = key.lines().nth(1).unwrap().to_string();
+    for (node, text) in [
+        (&edge, &account),
+        (&edge, &unplaced.to_string()),
+        (&edge, &gone.to_string()),
+    ] {
+        assert_eq!(files_with(&node.dir, text), Vec::<PathBuf>::new(), "{text}");
+    }
+    assert!(files_with(&edge.dir, &key).contains(&edge.dir.join("state/view.json")));
+    let (code, _, err) = edge.kith(&["get", "secret/acme-account", "-n", "kith-system"]);
+    assert!(code != 0 && err.contains("not found"), "{err}");
+    // The plain worker has no host's certificate.
+    assert_eq!(files_with(&beta.dir, &key), Vec::<PathBuf>::new());
+    assert_eq!(files_with(&beta.dir, &account), Vec::<PathBuf>::new());
+
+    // With its own certificate the edge writes no Secret and says no certificate was ordered.
+    let edges = edge.dir.join("state/pki");
+    let write = |command: serde_json::Value| {
+        let (code, said) = ask_as_node(
+            &alpha.address(),
+            &edges,
+            "POST",
+            "/v1/raft/write",
+            Some(&command.to_string()),
+        );
+        format!("{code} {said}")
+    };
+    let forged = json!({ "apiVersion": "kith.dev/v1", "kind": "Secret",
+        "metadata": { "name": "tls-shop.example.test" }, "spec": { "data": { "tls.crt": "c", "tls.key": "k" } } });
+    for forged in [
+        json!({ "Apply": { "resources": [forged], "at": 0 } }),
+        json!({ "Patch": { "statuses": [["Service/default/shop", { "tls": { "state": "ready" } }]] } }),
+    ] {
+        let said = write(forged.clone());
+        assert!(
+            said.contains("a worker writes only what it says of itself"),
+            "{forged}: {said}"
+        );
+    }
+
+    // The plain worker may not start serving ingress: it would be sent no host's certificate.
+    beta.stop();
+    let args = ["--name", "beta", "--ingress", "--mesh", &free_port().to_string()];
+    let said = kithd_fails(&beta.dir, &args);
+    assert!(said.contains("kith node token --worker --ingress"), "{said}");
 }
 
 #[test]

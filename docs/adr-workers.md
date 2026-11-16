@@ -1,9 +1,9 @@
 # A worker keeps no Secret that nothing placed on it names
 
 Status: built (T-0184 step 5): the list a worker's writes are held to ("Writes"), what the
-other node routes hand a worker, and the view (`crates/kithd/src/view.rs`). Ingress on a
-worker is not ("Open"): a worker let in by a token made with `--worker --ingress` is still
-sent the whole store.
+other node routes hand a worker, and the view (`crates/kithd/src/view.rs`); ingress on a
+worker (T-0390, "An ingress worker"): its view holds the hosts' certificates, and a control
+node orders them.
 The design was reviewed three times before there was code (the first draft was found not
 sound as written); what each pass found is decided below, and listed at the end. Where
 the code differs from the plan is in "As built".
@@ -87,7 +87,7 @@ defines included.
 | Device, Seat, DeviceClaim | whole | who holds a Device is worked out from all of them |
 | DNSZone, DNSRecord, DNSBlockList | whole | the resolver |
 | OSRelease, UpdatePlan | whole | a node updates itself from these |
-| Secret | those named (in `env`, `envFrom` or files) by a template whose `status.nodes` names the worker, and the one a Backup of a Volume on it names. A Secret that says `trust: control` is never sent to a worker, whatever names it. Not `kith-system/acme-account`, nor a `tls-` Secret, until ingress is built for workers | given to its units |
+| Secret | those named (in `env`, `envFrom` or files) by a template whose `status.nodes` names the worker, and the one a Backup of a Volume on it names. A Secret that says `trust: control` is never sent to a worker, whatever names it. To a worker whose Node says `ingress`, the `tls-` Secret of every host a Service exposes too. Never `kith-system/acme-account` | given to its units |
 | ConfigMap | those named the same way, and those a DNSBlockList names. Not a Release's `kith-values` (the node that leads reads those) | given to its units; block lists |
 | Backup | those of Volumes on the worker | it backs up its own Volumes |
 | NodeKey | the worker's own | its encrypted state |
@@ -150,9 +150,10 @@ logged naming it, on both nodes):
   traffic.)
 - **Its own Node's status**: `os`, `mesh` (its key, its port, whom it reaches) and `serves`
   (the DNS port it answers, `ingress: true` if it answers ingress; null when it serves
-  neither), the fields a node writes of itself after it has joined. A worker that runs from
-  a view is refused `serves.ingress`, since the control node that let it join did not let it
-  serve ingress; the address and `view` are never its to write. A mesh key another Node says is
+  neither), the fields a node writes of itself after it has joined, and `thumbprint` (the
+  ACME account's thumbprint its view holds, in a thumbprint's shape). A worker that runs from
+  a view is refused `serves.ingress` unless its Node's spec says `ingress` (written by the
+  control node that let it join, from the token); the address and `view` are never its to write. A mesh key another Node says is
   refused: two nodes that say one key are both left out of the mesh today, so a worker
   could cut any node off by saying its key. Not `address`, `raftId` or
   `certificate`: the node that admitted it wrote those at the join, and `certificate` is
@@ -297,6 +298,10 @@ another node in a ping; each refused or dropped, and written down with who sent 
   node's Device is then not reported. Any node can today.
 - The files of every Volume that is on it or that it is a replica of, the backups and
   images of those Volumes, and the Images its units run.
+- **If it serves ingress** (its Node says `ingress`): the certificate and key of every host a
+  Service exposes, so it can pose as each until that certificate is replaced and has expired
+  (delete its Node, then each `tls-` Secret: a control node orders new keys), and the ACME
+  account's thumbprint, which answers a challenge but orders nothing.
 - **If it is an `edge`** (its spec says so, which the owner wrote): other nodes that
   cannot reach each other send their traffic through it, and it reads what is not
   encrypted again inside the tunnel. It can say it reaches every node and be picked
@@ -330,7 +335,7 @@ Not measured: a store whose units report ten times a second.
    `spec.node` or over another node's (a name cut at 63 characters among them), a `synced`
    larger than a control node's.
 2. The view: the route, the client, `view.json`, the barrier, the API's refusal. `--ingress`
-   on a worker is refused when kithd starts.
+   on a worker whose Node does not say `ingress` is refused when kithd starts (T-0390).
 3. A VM test with one worker: it runs a Workload with a Secret, holds no other Secret on
    its disk, loses the Secret when the Workload leaves, comes back up with no control
    node in reach, and follows a control node that goes away.
@@ -341,13 +346,16 @@ Not measured: a store whose units report ten times a second.
 - **`status.view` on a Node.** "No field is added to a kind" holds for specs. A control node
   writes `view: true` into a worker's status when it sends it its first view (or lets it in
   as one that asked for a view), and the node that leads sends the store to no worker whose
-  status says so. A worker cannot write it (its own Node's `os` and `mesh` are all it may).
+  status says so. A worker cannot write it (its own Node's `os`, `mesh`, `serves` and `thumbprint` are all
+  it may).
   A node whose status says it does not become a control node again by a change to its Node.
 - **A worker says at the join that it can run from a view**, and is told the name and key of
   the node that let it in. Whether it is sent a view or the store is not its to choose (the
   sixth review found that it was): a worker's token lets in only a node that says it can,
-  and a kithd from before views, or one started with `--ingress`, is refused unless the
-  token was made with `kith node token --worker --ingress` (`/v1/tokens?trust=worker&store=whole`).
+  and a kithd from before views is refused unless the token was made with
+  `kith node token --worker --ingress` (`/v1/tokens?trust=worker&store=whole`: the word on
+  the wire is from before ingress workers ran from a view). A kithd started with `--ingress`
+  is let in only by that token too, and then runs from a view.
 - **One control node, by name and key.** The worker's client takes no other node's
   certificate at the address it calls: the name, and the key that node's Node names in the
   view. Another node of the cluster on the path cannot answer in its place.
@@ -364,14 +372,50 @@ Not measured: a store whose units report ten times a second.
 - Not built: a worker that knows of a control node older than views does not skip to the
   next by version, it asks each in turn and says which answered 404.
 
+## An ingress worker (T-0390)
+
+The node most exposed is the one most worth making a worker. It terminates TLS, so it is
+sent the `tls-` Secrets of the hosts it serves; that much is what it is for. It needs
+neither the ACME account's key nor to write a certificate: the answer to an HTTP-01
+challenge is the token and the account key's thumbprint, which is not secret, so a control
+node orders and the worker answers. Decided and built:
+
+- **Who says it serves ingress.** The token's maker: `kith node token --worker --ingress`.
+  The control node that admits the node writes `spec.ingress: true` into its Node from the
+  token, never from what the joining node asks; a node that asks to serve ingress with a
+  plain worker's token is refused at the join, and a viewed worker started with `--ingress`
+  whose Node does not say it is refused when kithd starts. An owner may also write
+  `ingress` into a worker's Node by hand.
+- **What its view adds.** The `tls-` Secret of every host a Service exposes (Service and
+  Namespace changes make the round work out the names again), and the ConfigMap
+  `kith-system/acme` with the account's thumbprint. Never `kith-system/acme-account`,
+  whatever names it, and never a Secret that says `trust: control` (a host's `tls-` Secret
+  that says so is served by control nodes only).
+- **Who orders.** A control node with `--acme`: one that serves ingress orders for itself,
+  and the one that leads orders for the hosts only workers serve. It writes the thumbprint
+  before its first order, and asks the authority for nothing until each reachable worker
+  that serves ingress from a view says, as `thumbprint` in its own Node's status, that its
+  view holds it: the authority may ask any node that serves ingress, and one whose view is
+  behind would answer 404 and fail the order for an hour. (No fixed pause is long enough
+  for a view that lags; the leader logs whom it waits on.) A worker that says a wrong one
+  holds up orders, as a wrong answer to the challenge would. The worker writes no
+  certificate, no Secret, no ConfigMap and no Service's `tls` status; the write list
+  refuses each.
+- **A worker that served ingress before this** was sent the whole store, and its Node says
+  no `ingress`. It is not moved silently: its kithd says at start what to do, and each
+  control node that sends it the store says so once, by name. Writing `ingress: true`
+  into its Node makes it ask for a view and erase its copy, as any worker from before views;
+  so does deleting it and joining it again with an ingress worker's token.
+- **A cluster half updated.** An older control node writes no `ingress` (the node is then
+  a whole-store worker, warned about once a newer control node sees it) and sends a viewed
+  worker no certificate, refusing its `serves.ingress`: update the control nodes first.
+- Tested: `ingress_worker_is_sent_its_hosts_certificates_and_no_other_secret` in
+  `crates/kithd/tests/cluster.rs` (a stand-in ACME authority on 127.0.0.1; which Secrets
+  the worker's view and files hold, a TLS handshake for its host and none for another, the
+  writes refused) and the VM test `sh ci/vm.sh --test worker`.
+
 ## Open
 
-- **An ingress node as a worker.** The node most exposed is the one most worth making a
-  worker. It terminates TLS, so it has to be sent the `tls-` Secrets of the hosts it
-  serves; that much is what it is for. Today it also reads the ACME account's key and
-  writes certificates. It needs neither: the answer to an HTTP-01 challenge is the token
-  and the account key's thumbprint, which is not secret, so a control node can order and
-  a worker can answer. Its own task after step 5.
 - **A Device a worker reports** could be believed only by claims that name the node. Not
   decided: it would change what a selector claim means for everyone.
 - **A worker offline for long** runs a view that is old: a Secret changed meanwhile is the

@@ -4,10 +4,12 @@
 //! else to HTTPS.
 //!
 //! A host's certificate and key are the Secret `tls-<host>` next to its Service
-//! (`tls.crt`, `tls.key`). With `--acme`, a node that finds none (or one that runs out
-//! soon) orders one and puts it there. Every node with `--ingress` answers the
-//! challenge: the answer takes only the account's key, which is the Secret
-//! `kith-system/acme-account`.
+//! (`tls.crt`, `tls.key`). With `--acme`, a control node that finds none (or one that runs
+//! out soon) orders one and puts it there: one that serves ingress itself, and the leader
+//! while a worker does. Every node with `--ingress` answers the challenge, with the
+//! thumbprint of the account (whose key is the Secret `kith-system/acme-account`, which
+//! only control nodes hold); a worker reads it from the ConfigMap `kith-system/acme`, in
+//! the view it is sent with the `tls-` Secrets of the exposed hosts.
 //
 // ponytail: TLS ends here and, for a host without `paths` or `headers`, the bytes go on
 // as they are: no HTTP is read, so there is no X-Forwarded-For; a Service that asks
@@ -50,7 +52,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsAcceptor;
 
-const ACCOUNT: &str = "Secret/kith-system/acme-account";
+pub(crate) const ACCOUNT: &str = "Secret/kith-system/acme-account";
+/// The ConfigMap (namespace and name) with the account's thumbprint, which a challenge is
+/// answered with: what a worker that serves ingress has of the account.
+pub(crate) const THUMBPRINT: &str = "kith-system/acme";
 /// A host is asked a certificate for once in this many seconds at most, so that a setup
 /// that cannot work does not use up what the authority allows.
 const BETWEEN_ORDERS: u64 = 3600;
@@ -133,6 +138,11 @@ impl Exposed {
 // Service (all nodes agree on it), so a Service edited more than `HISTORY_LIMIT` times
 // looks as new as its oldest kept edit. A creation time in the metadata would fix that.
 pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
+    exposed_in(store, prefix, false)
+}
+
+/// [`exposed`], of a worker's view (`view`) or of the store.
+fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, Exposed>, BTreeMap<String, String>) {
     let mut hosts: BTreeMap<String, Exposed> = BTreeMap::new();
     let mut refused = BTreeMap::new();
     let born = |service: &Resource| {
@@ -147,6 +157,24 @@ pub fn exposed(store: &Store, prefix: Ipv6Addr) -> (BTreeMap<String, Exposed>, B
     let mut services: Vec<&Resource> = store.list(Some("Service")).collect();
     // (Stable: of the same age, by key.)
     services.sort_by_key(|service| born(service));
+    if view {
+        // A view keeps no history (a Service in it is as old as its last change), so there the
+        // store's own word goes first: a Service the leader's status says was refused is last.
+        let said_refused = |service: &&Resource| {
+            let status = service.status.as_ref();
+            status.is_some_and(|status| status["expose"]["state"] == "refused")
+        };
+        services.sort_by_key(said_refused);
+        // And one it has not reported on yet (no `address`) is not served where another
+        // claims its host: which came first is the leader's word, not this view's.
+        let host = |service: &Resource| service.spec["expose"]["host"].as_str().map(str::to_ascii_lowercase);
+        let mut claims: BTreeMap<String, usize> = BTreeMap::new();
+        for claimed in services.iter().filter_map(|service| host(service)) {
+            *claims.entry(claimed).or_default() += 1;
+        }
+        let unreported = |service: &Resource| service.status.as_ref().is_none_or(|status| status["address"].is_null());
+        services.retain(|service| !unreported(service) || host(service).is_none_or(|claimed| claims[&claimed] < 2));
+    }
     for service in services {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
             continue;
@@ -230,7 +258,7 @@ fn secret(store: &Store, key: &str) -> BTreeMap<String, String> {
     spec.map(|spec| spec.data).unwrap_or_default()
 }
 
-fn tls_secret(host: &str, exposed: &Exposed) -> String {
+pub(crate) fn tls_secret(host: &str, exposed: &Exposed) -> String {
     format!("Secret/{}/tls-{host}", exposed.namespace)
 }
 
@@ -828,16 +856,25 @@ async fn secure(mut door: Door, tls: TlsAcceptor, web: Arc<Web>, limits: Limits)
     }
 }
 
-/// What the store says now: the hosts, their certificates (and which are due for
-/// another), the account key if there is one, and the Services whose status does not yet
-/// name the Secret of the certificate that serves them (service key and what to say).
+/// The thumbprint a control node wrote for workers that serve ingress (in [`THUMBPRINT`]).
+fn thumbprint_of(store: &Store) -> Option<String> {
+    let map = store.get(&format!("ConfigMap/{THUMBPRINT}"))?;
+    map.spec["data"]["thumbprint"].as_str().map(str::to_string)
+}
+
+/// What the store (or a worker's view of it: `view`) says now: the hosts, their certificates
+/// (and which are due for another), the account key if there is one, and the Services whose
+/// status does not yet name the Secret of the certificate that serves them (service key and
+/// what to say). Challenges are answered with the account's thumbprint, or where the account
+/// key is not there (a worker's view) with the one a control node wrote down.
 #[allow(clippy::type_complexity)]
 fn look(
     store: &Store,
     prefix: Ipv6Addr,
     web: &Web,
+    view: bool,
 ) -> (Vec<(String, Exposed)>, Option<acme::Account>, Vec<(String, Value)>) {
-    let hosts = exposed(store, prefix).0;
+    let hosts = exposed_in(store, prefix, view).0;
     let mut certificates = BTreeMap::new();
     let mut wanting = Vec::new();
     let mut naming = Vec::new();
@@ -876,7 +913,8 @@ fn look(
     let account = key.and_then(|key| acme::Account::from_pkcs8(&key).ok());
     *web.hosts.lock().expect("nothing panics holding it") = hosts;
     *web.certificates.0.lock().expect("nothing panics holding it") = certificates;
-    *web.thumbprint.lock().expect("nothing panics holding it") = account.as_ref().map(acme::Account::thumbprint);
+    let thumbprint = account.as_ref().map(acme::Account::thumbprint);
+    *web.thumbprint.lock().expect("nothing panics holding it") = thumbprint.or_else(|| thumbprint_of(store));
     (wanting, account, naming)
 }
 
@@ -981,52 +1019,144 @@ async fn order(
     say(shared, &of.service, tls).await;
 }
 
-/// Serve ports 443 and 80 until told to stop; with `acme` (a directory URL), order the
-/// certificates that are missing.
-pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut stopping: watch::Receiver<bool>) {
+/// Write down the account's thumbprint for the workers that serve ingress (they answer the
+/// authority's challenges with it, and have nothing else of the account), unless the store
+/// has it already.
+async fn tell_thumbprint(shared: &Shared, account: &acme::Account) {
+    let thumbprint = account.thumbprint();
+    let kept = thumbprint_of(&shared.store.lock().expect("nothing panics holding the store").store);
+    if kept.as_deref() == Some(thumbprint.as_str()) {
+        return;
+    }
+    let (namespace, name) = THUMBPRINT.split_once('/').expect("namespace/name");
+    let map = json!({
+        "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+        "metadata": { "name": name, "namespace": namespace }, "spec": { "data": { "thumbprint": thumbprint } },
+    });
+    let map = serde_json::from_value::<Resource>(map).map_err(|e| e.to_string());
+    let command = map
+        .and_then(|map| map.validated())
+        .map(|map| kith_store::Command::Apply {
+            resources: vec![map],
+            at: now(),
+        });
+    let told = match command {
+        Ok(command) => shared.submit(command).await.map(drop).map_err(|e| e.to_string()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = told {
+        eprintln!("kithd: ingress: writing down the ACME account's thumbprint: {e}");
+    }
+}
+
+/// The reachable workers that serve ingress from a view whose Node does not say their view holds
+/// `thumbprint` (`status.thumbprint`). The authority asks any node that serves ingress, so an
+/// order waits on these: asked first, one would answer the challenge 404 and the order fail.
+fn unanswered(store: &Store, thumbprint: &str) -> Vec<String> {
+    let waits = |status: &Value| {
+        status["view"] == true
+            && status["serves"]["ingress"] == true
+            && status["state"] != "unreachable"
+            && status["thumbprint"] != thumbprint
+    };
+    store
+        .list(Some("Node"))
+        .filter(|node| node.status.as_ref().is_some_and(waits))
+        .map(|node| node.metadata.name.clone())
+        .collect()
+}
+
+/// What this worker (`me`) is to say its view holds, the thumbprint it answers challenges with
+/// (`holds`), where its own Node does not say it yet.
+fn to_say(store: &Store, me: &str, holds: Option<&str>) -> Option<String> {
+    let own = store.get(&format!("Node/{me}"))?;
+    let says = own.status.as_ref().and_then(|status| status["thumbprint"].as_str());
+    holds.filter(|holds| says != Some(*holds)).map(str::to_string)
+}
+
+/// Until told to stop: with `strays` (`--ingress`), serve ports 443 and 80 from what the store
+/// (or this worker's view of it) holds; on a control node with `acme` (a directory URL), order
+/// the certificates that are missing, where it serves ingress itself or, as the leader, while
+/// any node does. A worker orders nothing: its writes would be refused, and it is never sent
+/// the account key.
+pub async fn run(
+    shared: Arc<Shared>,
+    acme: Option<String>,
+    strays: Option<Strays>,
+    mut stopping: watch::Receiver<bool>,
+) {
     let Some(cluster) = &shared.cluster else { return };
     let prefix = crate::mesh::prefix(&cluster.me.ca);
     let web = Arc::new(Web::default());
-    let any = |port: u16| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
-    let (https, http) = match (TcpListener::bind(any(443)).await, TcpListener::bind(any(80)).await) {
-        (Ok(https), Ok(http)) => (https, http),
-        (Err(e), _) | (_, Err(e)) => {
-            return eprintln!("kithd: no ingress: ports 443 and 80: {e} (binding them takes CAP_NET_BIND_SERVICE)");
-        }
+    let served = match strays {
+        Some(strays) => match listen(&shared, prefix, &web, strays).await {
+            Some(tasks) => Some(tasks),
+            None => return,
+        },
+        None => None,
     };
-    let tls = match crate::pki::ingress_config(web.certificates.clone()) {
-        Ok(tls) => TlsAcceptor::from(tls),
-        Err(e) => return eprintln!("kithd: no ingress: {e}"),
-    };
-    let me = kith_mesh::node_address(prefix, shared.members.me());
-    let door = |listener| Door {
-        listener,
-        prefix,
-        me,
-        strays: strays.clone(),
-    };
-    let (https, http) = (door(https), door(http));
-    let secure = tokio::spawn(secure(https, tls, web.clone(), Limits::new(CONNECTIONS, PER_SOURCE)));
-    let router = axum::Router::new().fallback(plain).with_state(web.clone());
-    let http = Capped(http, Limits::new(CONNECTIONS, PER_SOURCE));
-    let plain = tokio::spawn(async move {
-        let _ = axum::serve(http, router).await;
-    });
-    eprintln!("kithd: ingress on ports 443 and 80");
-
+    let me = shared.members.me().to_string();
     // (reqwest's TLS wants to be told once which crypto to use.)
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
+    let mut said = false;
+    // (What this worker last said its view holds, and when; the workers the last order waited on.)
+    let mut saying: Option<(String, Instant)> = None;
+    let mut waited = Vec::new();
     loop {
-        let (wanting, account, naming) = {
+        let (worker, wanted, (wanting, account, naming)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            look(&state.store, prefix, &web)
+            let worker = crate::access::is_worker(&state.store, &me);
+            let mut nodes = state.store.list(Some("Node"));
+            let wanted = nodes.any(|node| node.status.as_ref().is_some_and(|s| s["serves"]["ingress"] == true));
+            (worker, wanted, look(&state.store, prefix, &web, worker))
         };
-        for (service, tls) in naming {
-            say(&shared, &service, tls).await;
+        let leads = !worker && {
+            let metrics = shared.raft.metrics().borrow().clone();
+            metrics.current_leader == Some(metrics.id)
+        };
+        if worker && acme.is_some() && !said {
+            said = true;
+            eprintln!(
+                "kithd: ingress: --acme does nothing on a worker: the leading control node orders its certificates \
+                 (give the control nodes --acme)"
+            );
         }
-        if let Some(directory) = acme.as_deref().filter(|_| !wanting.is_empty()) {
+        // Who orders: a control node that serves ingress, and the leader for the workers that do.
+        let orders = !worker && (served.is_some() || (leads && wanted));
+        if orders {
+            for (service, tls) in naming {
+                say(&shared, &service, tls).await;
+            }
+        }
+        // The leader keeps the thumbprint written whether or not anything is ordered now, so
+        // a worker has it before a renewal asks; and whoever orders writes it first.
+        if let Some(account) = account.as_ref().filter(|_| acme.is_some() && (leads || orders)) {
+            tell_thumbprint(&shared, account).await;
+        }
+        // A worker that serves ingress says when its view holds the thumbprint it answers
+        // challenges with: the leader orders once each one has it. (The same word again only
+        // after a while: one refused, or a view not caught up yet, is not sent at every change.)
+        if worker && served.is_some() {
+            let holds = web.thumbprint.lock().expect("nothing panics holding it").clone();
+            let says = to_say(
+                &shared.store.lock().expect("nothing panics holding the store").store,
+                &me,
+                holds.as_deref(),
+            );
+            let again =
+                |(was, at): &(String, Instant)| Some(was) != says.as_ref() || at.elapsed() > Duration::from_secs(10);
+            if let Some(print) = says.clone().filter(|_| saying.as_ref().is_none_or(again)) {
+                saying = Some((print.clone(), Instant::now()));
+                let fields = serde_json::Map::from_iter([("thumbprint".to_string(), Value::from(print))]);
+                let statuses = vec![(format!("Node/{me}"), fields)];
+                if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
+                    eprintln!("kithd: ingress: saying this node's view holds the ACME account's thumbprint: {e}");
+                }
+            }
+        }
+        if let Some(directory) = acme.as_deref().filter(|_| orders && !wanting.is_empty()) {
             let orders = async {
                 match account {
                     // (Made now, used from the next look on: by then every node has it,
@@ -1042,6 +1172,25 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
                         }
                     }
                     Some(account) => {
+                        // A worker answers a challenge with the thumbprint its view holds: none is
+                        // asked for until each that serves ingress says it has it (its view may be
+                        // any while behind). The store's change when one says it wakes this again.
+                        let print = account.thumbprint();
+                        let waits = unanswered(
+                            &shared.store.lock().expect("nothing panics holding the store").store,
+                            &print,
+                        );
+                        if !waits.is_empty() {
+                            if waits != waited {
+                                eprintln!(
+                                    "kithd: ingress: no certificate is asked for until each ingress worker's view holds the ACME account's thumbprint; waiting on: {}",
+                                    waits.join(", ")
+                                );
+                            }
+                            waited = waits;
+                            return;
+                        }
+                        waited.clear();
                         for (host, of) in &wanting {
                             order(&shared, directory, &account, host, of, &mut tried).await;
                         }
@@ -1059,8 +1208,51 @@ pub async fn run(shared: Arc<Shared>, acme: Option<String>, strays: Strays, mut 
             _ = stopping.changed() => break,
         }
     }
-    secure.abort();
-    plain.abort();
+    if let Some((secure, plain)) = served {
+        secure.abort();
+        plain.abort();
+    }
+}
+
+/// Listen on ports 443 and 80 and serve them from `web`; the two tasks that do, or nothing
+/// (said why) where the ports cannot be had.
+async fn listen(
+    shared: &Shared,
+    prefix: Ipv6Addr,
+    web: &Arc<Web>,
+    strays: Strays,
+) -> Option<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>)> {
+    let any = |port: u16| SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port);
+    let (https, http) = match (TcpListener::bind(any(443)).await, TcpListener::bind(any(80)).await) {
+        (Ok(https), Ok(http)) => (https, http),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("kithd: no ingress: ports 443 and 80: {e} (binding them takes CAP_NET_BIND_SERVICE)");
+            return None;
+        }
+    };
+    let tls = match crate::pki::ingress_config(web.certificates.clone()) {
+        Ok(tls) => TlsAcceptor::from(tls),
+        Err(e) => {
+            eprintln!("kithd: no ingress: {e}");
+            return None;
+        }
+    };
+    let me = kith_mesh::node_address(prefix, shared.members.me());
+    let door = |listener| Door {
+        listener,
+        prefix,
+        me,
+        strays: strays.clone(),
+    };
+    let (https, http) = (door(https), door(http));
+    let secure = tokio::spawn(secure(https, tls, web.clone(), Limits::new(CONNECTIONS, PER_SOURCE)));
+    let router = axum::Router::new().fallback(plain).with_state(web.clone());
+    let http = Capped(http, Limits::new(CONNECTIONS, PER_SOURCE));
+    let plain = tokio::spawn(async move {
+        let _ = axum::serve(http, router).await;
+    });
+    eprintln!("kithd: ingress on ports 443 and 80");
+    Some((secure, plain))
 }
 
 #[cfg(test)]
@@ -1179,6 +1371,48 @@ mod tests {
         );
     }
 
+    /// In a worker's view (which keeps no history to say which came first) a host two Services
+    /// claim goes by what the leader wrote in their status: one it has not reported on yet is
+    /// not served, so the worker never serves the one the leader then refuses.
+    #[test]
+    fn in_a_view_a_host_two_services_claim_goes_by_the_leaders_word() {
+        let mut store = Store::default();
+        let service = |name: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: {name} }}\nspec:\n  \
+                 selector: {{ app: {name} }}\n  ports: [{{ port: 80 }}]\n  expose: {{ host: shop.example.org, via: edge }}\n---\n"
+            )
+        };
+        for resource in Resource::from_source(&(service("a") + &service("b"))).unwrap() {
+            store.put(resource.unwrap());
+        }
+        let prefix = kith_mesh::prefix(b"ca");
+        let served = |store: &Store| {
+            exposed_in(store, prefix, true)
+                .0
+                .get("shop.example.org")
+                .map(|of| of.service.clone())
+        };
+        // Neither reported on yet: neither is served.
+        assert_eq!(served(&store), None);
+        // The leader reported on b, and refused a (b came first): b, though a sorts first.
+        let mut b = store.get("Service/default/b").unwrap().clone();
+        b.status = Some(json!({ "address": "fd00::1", "expose": null }));
+        store.put(b);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/b"));
+        let mut a = store.get("Service/default/a").unwrap().clone();
+        let refused = "the host shop.example.org is already exposed by Service/default/b";
+        a.status = Some(json!({ "address": "fd00::2", "expose": { "state": "refused", "message": refused } }));
+        store.put(a);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/b"));
+        // One Service alone on its host is served before the leader says anything of it.
+        store.delete("Service/default/b").unwrap();
+        let mut a = store.get("Service/default/a").unwrap().clone();
+        a.status = None;
+        store.put(a);
+        assert_eq!(served(&store).as_deref(), Some("Service/default/a"));
+    }
+
     #[tokio::test]
     async fn an_idle_connection_is_cut_and_one_that_moves_bytes_is_not() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1230,17 +1464,17 @@ mod tests {
         let prefix = kith_mesh::prefix(b"ca");
         let web = Web::default();
         // No certificate: it is wanted, and nothing is named.
-        let (wanting, _, naming) = look(&store, prefix, &web);
+        let (wanting, _, naming) = look(&store, prefix, &web, false);
         assert_eq!((wanting.len(), naming.len()), (1, 0));
         assert!(wanting[0].1.proxy);
         // (Only a Service that asks gets the line.)
         let quiet = Resource::from_source(&service.replace("proxyProtocol: true", "proxyProtocol: false"));
         let mut other = store.clone();
         other.apply(quiet.unwrap().remove(0).unwrap()).unwrap();
-        assert!(!look(&other, prefix, &web).0[0].1.proxy);
+        assert!(!look(&other, prefix, &web, false).0[0].1.proxy);
         // One applied by hand: not wanted, and the status is to name its Secret.
         store.apply(serde_json::from_value(secret).unwrap()).unwrap();
-        let (wanting, _, naming) = look(&store, prefix, &web);
+        let (wanting, _, naming) = look(&store, prefix, &web, false);
         assert!(wanting.is_empty());
         assert_eq!(naming.len(), 1);
         let (to, said) = &naming[0];
@@ -1249,7 +1483,7 @@ mod tests {
         assert_eq!(said["state"], "ready");
         // Once the status says so, it is not said again.
         store.set_status(to, Some(json!({ "tls": said }))).unwrap();
-        assert!(look(&store, prefix, &web).2.is_empty());
+        assert!(look(&store, prefix, &web, false).2.is_empty());
     }
 
     #[test]
@@ -2058,5 +2292,215 @@ mod tests {
         let mut got = Vec::new();
         service.read_to_end(&mut got).await.unwrap();
         assert_eq!(got, b"GET /x HTTP/1.1\nX: a\0b\n\n");
+    }
+
+    /// The leading control node orders the certificate of a host only a worker serves, from
+    /// an authority on 127.0.0.1; the worker's view has the certificate and the thumbprint
+    /// (and no account key), it answers the challenge from them and serves the certificate
+    /// once its view has it; and the worker, given `--acme`, asks the authority nothing and
+    /// writes nothing.
+    #[tokio::test]
+    async fn orders_for_a_worker_that_serves_ingress_from_the_control_node() {
+        use crate::cluster::{Cluster, pinned_peer};
+        let host = "shop.example.org";
+        let ca = crate::pki::Ca::create().unwrap();
+        let edge = pinned_peer::node(&ca, "edge");
+        let control = Cluster::new(pinned_peer::node(&ca, "a"), Some(ca)).unwrap();
+        let shared = pinned_peer::shared_of("orders-for-a-worker", control, &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let leads = shared.raft.wait(Some(Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let source = format!(
+            "\
+apiVersion: kith.dev/v1
+kind: Node
+metadata: {{ name: edge }}
+spec: {{ trust: worker, ingress: true }}
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: {{ name: web, namespace: shop }}
+spec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}], expose: {{ host: {host}, via: edge }} }}
+"
+        );
+        let resources = Resource::from_source(&source).unwrap().into_iter().map(Result::unwrap);
+        let command = kith_store::Command::Apply {
+            resources: resources.collect(),
+            at: now(),
+        };
+        shared.submit(command).await.unwrap();
+        let say_of_edge = |field: &str, said: Value| {
+            let fields = serde_json::Map::from_iter([(field.to_string(), said)]);
+            kith_store::Command::Patch {
+                statuses: vec![("Node/edge".to_string(), fields)],
+            }
+        };
+        shared
+            .submit(say_of_edge("serves", json!({ "ingress": true })))
+            .await
+            .unwrap();
+        // (It runs from a view, as the control node that let it join wrote.)
+        shared.submit(say_of_edge("view", true.into())).await.unwrap();
+
+        let (base, asked) = crate::acme::tests::authority(host, |_, answer| answer.clone()).await;
+        let directory = format!("{base}/directory");
+        let (stop, stopping) = watch::channel(false);
+        let ordering = tokio::spawn(run(shared.clone(), Some(directory.clone()), None, stopping));
+        let key = format!("Secret/shop/tls-{host}");
+        // (What a control node sends the worker first: its whole view.)
+        let view_of = |shared: &Shared| {
+            let state = shared.store.lock().unwrap();
+            let Some(crate::view::Sent::Whole { resources, .. }) = crate::view::round(&state, "edge", &mut None) else {
+                panic!("a first round sends the whole view");
+            };
+            let mut view = Store::default();
+            resources.into_iter().for_each(|resource| view.put(resource));
+            view
+        };
+        // (Before the certificate: the worker's view, which has the host and no certificate.)
+        let before = view_of(&shared);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // (When the thumbprint was written, and when the worker said its view holds it.)
+        let (mut printed, mut reported) = (None, None);
+        while shared.store.lock().unwrap().store.get(&key).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "no certificate was ordered: {:?}",
+                asked.lock().unwrap()
+            );
+            let print = thumbprint_of(&shared.store.lock().unwrap().store);
+            let now = Instant::now();
+            if print.is_some() {
+                printed.get_or_insert(now);
+            }
+            // The worker's view is a while behind (longer than any fixed pause): until it says
+            // it holds the thumbprint, the authority is asked nothing, as the worker would
+            // answer its challenge 404 and the order fail.
+            if reported.is_none() {
+                assert!(
+                    asked.lock().unwrap().is_empty(),
+                    "the authority was asked before the worker had the thumbprint"
+                );
+            }
+            if let Some(print) =
+                print.filter(|_| reported.is_none() && printed.is_some_and(|at| now >= at + Duration::from_secs(7)))
+            {
+                shared.submit(say_of_edge("thumbprint", print.into())).await.unwrap();
+                reported = Some(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            reported.is_some(),
+            "a certificate was ordered before the worker said it had the thumbprint"
+        );
+        let _ = stop.send(true);
+        ordering.await.unwrap();
+        let status = shared
+            .store
+            .lock()
+            .unwrap()
+            .store
+            .get("Service/shop/web")
+            .unwrap()
+            .status
+            .clone();
+        assert_eq!(status.unwrap()["tls"]["source"], "acme");
+
+        // The worker's view: the certificate and the thumbprint, never the account key.
+        let view = view_of(&shared);
+        assert!(view.get(&key).is_some());
+        assert!(view.get(ACCOUNT).is_none());
+        let account = look(
+            &shared.store.lock().unwrap().store,
+            kith_mesh::prefix(b"ca"),
+            &Web::default(),
+            false,
+        )
+        .1;
+        let thumbprint = account.unwrap().thumbprint();
+        assert_eq!(thumbprint_of(&view).as_deref(), Some(thumbprint.as_str()));
+
+        // It answers the authority's challenge with the thumbprint its view holds, and serves
+        // the certificate from the next look at its view: nothing is started again.
+        let web = Arc::new(Web::default());
+        let prefix = kith_mesh::prefix(b"ca");
+        let (wanting, account, naming) = look(&before, prefix, &web, true);
+        assert_eq!((wanting.len(), account.is_none(), naming.len()), (1, true, 0));
+        assert!(web.certificates.0.lock().unwrap().is_empty());
+        let (wanting, account, _) = look(&view, prefix, &web, true);
+        assert!(wanting.is_empty() && account.is_none());
+        assert!(web.certificates.0.lock().unwrap().contains_key(host));
+        let uri: Uri = "/.well-known/acme-challenge/a-token_1".parse().unwrap();
+        let said = plain(State(web.clone()), HeaderMap::new(), uri).await;
+        assert_eq!(said.status(), StatusCode::OK);
+        let said = axum::body::to_bytes(said.into_body(), 4096).await.unwrap();
+        assert_eq!(said, acme::answer("a-token_1", &thumbprint).as_bytes());
+
+        // The worker, running from that view with --acme, asks the authority nothing: its
+        // certificates are the control node's to order, and it has no account to order with.
+        let worker = pinned_peer::shared_with("orders-for-a-worker-edge", edge, &[]).await;
+        let mut held = view_of(&shared);
+        held.remove(&key);
+        worker.store.lock().unwrap().store = held.clone();
+        worker.view.send_replace(Some(u64::MAX));
+        let were = asked.lock().unwrap().len();
+        let (stop, stopping) = watch::channel(false);
+        let running = tokio::spawn(run(worker.clone(), Some(directory), None, stopping));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let _ = stop.send(true);
+        running.await.unwrap();
+        assert_eq!(asked.lock().unwrap().len(), were, "the worker asked the authority");
+        assert!(
+            worker.store.lock().unwrap().store == held,
+            "the worker wrote to its view"
+        );
+    }
+
+    /// Orders wait on each reachable worker that serves ingress from a view until it says its
+    /// view holds the thumbprint; a worker says it when its own Node does not.
+    #[test]
+    fn the_leader_orders_once_each_ingress_worker_holds_the_thumbprint() {
+        let mut store = Store::default();
+        let node = |name: &str| {
+            format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n---\n")
+        };
+        let source: String = ["a", "b", "c", "d", "e"].map(node).concat();
+        for resource in Resource::from_source(&source).unwrap() {
+            store.put(resource.unwrap());
+        }
+        let set = |store: &mut Store, name: &str, status: Value| {
+            store.set_status(&format!("Node/{name}"), Some(status)).unwrap()
+        };
+        // a: a control node that serves ingress (it has the account); b: a viewed worker that
+        // does not serve ingress; c and d: viewed ingress workers, d unreachable; e: one that
+        // says it already.
+        set(&mut store, "a", json!({ "serves": { "ingress": true } }));
+        set(&mut store, "b", json!({ "view": true, "serves": { "dns": 53 } }));
+        set(&mut store, "c", json!({ "view": true, "serves": { "ingress": true } }));
+        set(
+            &mut store,
+            "d",
+            json!({ "view": true, "serves": { "ingress": true }, "state": "unreachable" }),
+        );
+        set(
+            &mut store,
+            "e",
+            json!({ "view": true, "serves": { "ingress": true }, "thumbprint": "print" }),
+        );
+        assert_eq!(unanswered(&store, "print"), ["c"]);
+        assert_eq!(unanswered(&store, "another"), ["c", "e"]);
+
+        assert_eq!(to_say(&store, "c", Some("print")).as_deref(), Some("print"));
+        assert_eq!(to_say(&store, "e", Some("print")), None);
+        assert_eq!(to_say(&store, "e", Some("another")).as_deref(), Some("another"));
+        assert_eq!(to_say(&store, "c", None), None);
+        assert_eq!(to_say(&store, "gone", Some("print")), None);
+        set(
+            &mut store,
+            "c",
+            json!({ "view": true, "serves": { "ingress": true }, "thumbprint": "print" }),
+        );
+        assert!(unanswered(&store, "print").is_empty());
     }
 }
