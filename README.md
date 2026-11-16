@@ -320,9 +320,28 @@ spec:
   one there is (on the node, its files are yours), and root, when asked for, is root of
   that namespace alone. It is still in your groups there (a namespace made without
   privileges cannot leave them), for what that is worth to it: the files it can reach
-  are its image, its volumes and the devices it claims. On kith OS, where kithd is root, there is no user namespace yet:
-  the container is that user of the node, and `runAsUser: 0` is the node's root with
-  three capabilities (to send signals, to take a port below 1024, to write the audit log).
+  are its image, its volumes and the devices it claims. On kith OS, where kithd is root,
+  a pod's container (one with a network of its own: [a pod](#a-replica-as-a-pod)) is a
+  user namespace of its own too: its users 0 to 65535 are 65536 users of the node that no
+  other container has (taken as it starts, given back once it is gone; which are taken is
+  read from the containers' bundles on the disk, and one left behind whose processes
+  outlive its kill keeps its range until they are gone), so `runAsUser: 0` is root of that
+  namespace alone, and a `runAsUser` of 65536 or more is refused. Its image and its
+  volumes are mounted id-mapped: a file its user 1000 makes is user 1000's on the disk, as
+  before, and no owner on the disk is changed to fit its range. Id-mapped mounts are
+  Linux 5.12's (btrfs's 5.15, tmpfs's 6.3; kith OS's own kernel, 6.18, has them all); a
+  kernel or file system that refuses one fails the container's start rather than run it as
+  the node's users. Any port of the pod's own network is anyone's in it, so its root still
+  serves port 80. The rest keep the node's
+  users, so that `runAsUser: 0` is the node's root with three capabilities (to send
+  signals, to take a port below 1024, to write the audit log): a container on the node's
+  network (a port it serves is below 1024 as often as not, and no capability of a user
+  namespace reaches the node's network; the node's ports below 1024 stay its root's), one
+  whose image or a volume is on a file system that takes no id-mapped mount (ext4, xfs,
+  btrfs and tmpfs take one; a volume of another node is NFS, which does not), one given
+  devices (theirs are the node's users) and a NodeWorkload's (the node's own). A
+  container's status says which it is: `hostUsers: false` for a namespace of its own; a
+  pod's container kept so by a file system also says which path on kithd's log.
 - **Nothing more than that user.** No capabilities (on kith OS the one for ports below
   1024 is kept), and no way to any: `no_new_privs` is set, so a setuid program in the
   image is an ordinary program.
@@ -362,8 +381,9 @@ spec:
   sandbox starts too, and so does `no_new_privs`. What it costs: inside a user namespace
   a program is that namespace's root, and reaches kernel code a plain user never calls
   (mounting, more of the network); much of what has let a user become the node's root was
-  found there. A container that is the node's root (`runAsUser: 0` on kith OS, or a pod
-  whose image is root's) is not started with it, and says so.
+  found there. A container that is the node's root (on kith OS where it keeps the node's
+  users: `runAsUser: 0`, or a pod whose image is root's) is not started with it, and
+  says so.
 - **Whose image it is.** With `signedBy`, the image is run only if one of those keys
   signed it, as `cosign sign --key` does: the signature is looked for in the image's own
   repository (the tag `sha256-DIGEST.sig`) and checked against the manifest's digest
@@ -414,14 +434,17 @@ spec:
   node is a wide door into a kernel driver, and no filter here narrows it. All of this is
   for keeping an honest program's mistakes small. Untrusted programs belong in a VM
   ([Virtual machines](#virtual-machines)), which is what a `vms` unit is for.
-- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS; the filter is a
+- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS for a container
+  on the node's network, one given devices or one with a volume of another node, and a
+  pod's `/sys` is the node's, bound in (a user namespace may mount no other); the filter is a
   list of what is refused, not of what is allowed, so a call the kernel gains later is let
   through until it is named here; signatures with a certificate instead of a key
   (cosign's keyless signing), a transparency log, and signatures kept as referrers of the
   image (cosign's newer bundle format) are not read; keys are named by each template,
   not once for a cluster or a registry; an `exec` unit is none of this: it is a process
   of the host. The user namespace of the first kind (kithd as your service) has been run;
-  the kith OS kind has been run in VMs with the default user and with root.
+  the kith OS kind has been run in VMs for pods as root, serving port 80, and its
+  id-mapped volumes beside one of another node.
 
 ### A replica as a pod
 
@@ -1983,10 +2006,11 @@ spec:
   loads into the kernel for each container, asked at every open and every `mknod` of a
   device node by a process in it. It lets through the few every container has, the
   terminals of the container's own `/dev/pts`, and each device it was given (to read and
-  write, not to make a second node of); all else is refused. So a pod that is root there,
-  which has the capability to make device nodes, makes none for its node's disk and opens
-  none. (A pod that made a node for itself before, `/dev/net/tun` or `/dev/fuse`, is
-  refused now: write a `Device` for the node, `class: other` with its `path`, and claim
+  write, not to make a second node of); all else is refused. So a pod that is root there
+  and keeps the node's users (one given devices, say), which has the capability to make
+  device nodes, makes none for its node's disk and opens none; one in a user namespace of
+  its own makes no device node at all, as below. (A pod that made a node for itself
+  before, `/dev/net/tun` or `/dev/fuse`, is refused now: write a `Device` for the node, `class: other` with its `path`, and claim
   it.) A container whose device filter cannot be loaded is not started. Where kithd is
   your own service there is no filter and none is needed: a container there is in a user
   namespace, where the kernel lets no one make a device node, and it has the nodes in its
