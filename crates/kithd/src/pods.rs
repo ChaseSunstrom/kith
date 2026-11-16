@@ -12,7 +12,7 @@
 // StatefulSet's `web-0.web`) are not served yet.
 
 use crate::Shared;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -221,6 +221,8 @@ fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Re
 /// the pod's own IPv4 address (the app sees it, not the LAN client's), until the pod goes or
 /// stops publishing it. No rule of the kernel's is made for it (nothing is passed on that
 /// kithd did not take). Never one of kithd's own ports here (`own`), nor one below 1024.
+/// Which namespace has each port is kept in this node's own file (`published.json` in its
+/// state), so that it is the same namespace's after kithd starts again ([`keep_for`]).
 //
 // ponytail: a pod of this node that asks for a port another has waits for that one to go,
 // and says nothing of it but kithd's log.
@@ -229,10 +231,16 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
     // (Each port's pod, and its relay.)
     type Relay = (Asker, tokio::task::JoinHandle<()>);
     let mut open: BTreeMap<(bool, u16), Relay> = BTreeMap::new();
-    let mut said = std::collections::BTreeSet::new();
+    let mut said = BTreeSet::new();
+    let record = shared.logs.with_file_name("published.json");
+    let mut kept = kept_in(&record);
+    let mut written = kept.clone();
     loop {
-        let mut asked = published(&shared);
+        // (Asked before the store is read: it only gets newer.)
+        let current = current(&shared);
+        let (asking, mut asked) = published(&shared);
         let mut refused = refuse_own(&mut asked, &own);
+        refused.extend(keep_for(&mut kept, current.then_some(&asking), &mut asked));
         let held = open.iter().map(|(port, (pod, _))| (*port, pod.clone())).collect();
         let wanted = chosen(asked, &held, &mut refused);
         for refused in refused {
@@ -249,10 +257,23 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
             kept
         });
         for (port, pod) in wanted {
+            kept.insert(port, pod.2.clone());
             open.entry(port).or_insert_with(|| {
                 let (id, number, _) = pod.clone();
                 (pod, tokio::spawn(relay(shared.clone(), (id, number), port)))
             });
+        }
+        if kept != written {
+            match keep(&record, &kept) {
+                Ok(()) => written.clone_from(&kept),
+                // (Said once; tried again each time round, the ports published all the while.)
+                Err(e) => {
+                    let why = format!("kithd: keeping who has this node's published ports: {e}");
+                    if said.insert(why.clone()) {
+                        eprintln!("{why}");
+                    }
+                }
+            }
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -283,19 +304,83 @@ fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<Asker>>, own: &[(u16, &str)
     refused
 }
 
+/// This node's own record of which namespace has each published port (UDP, and the number):
+/// a file of kithd's in the node's state, never the store's. One that is not there, or
+/// cannot be read, is nothing kept.
+fn kept_in(record: &Path) -> BTreeMap<(bool, u16), String> {
+    let kept: Option<Vec<((bool, u16), String)>> = std::fs::read(record)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    kept.unwrap_or_default().into_iter().collect()
+}
+
+/// Write that record, whole or not at all.
+fn keep(record: &Path, kept: &BTreeMap<(bool, u16), String>) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(&kept.iter().collect::<Vec<_>>()).expect("ports and names are JSON");
+    crate::pki::write_whole(record, &bytes)
+}
+
+/// Whether this node's store is as new as it was when kithd last ran here: one that keeps
+/// the store starts from its last snapshot, and has the rest once all it has logged
+/// (`logged`) is applied (`applied`); a worker's view (`view`) is read whole from its file
+/// (0: it has none yet).
+fn as_new(view: Option<u64>, logged: Option<u64>, applied: Option<u64>) -> bool {
+    view.map_or(logged.is_some() && applied >= logged, |at| at > 0)
+}
+
+/// [`as_new`] of this node now.
+fn current(shared: &Shared) -> bool {
+    let metrics = shared.raft.metrics();
+    let metrics = metrics.borrow();
+    let applied = metrics.last_applied.map(|log| log.index);
+    as_new(*shared.view.borrow(), metrics.last_log_index, applied)
+}
+
+/// Hold each port this node keeps for a namespace (`kept`: the one whose pod had it last
+/// here) to that namespace: a pod of another that asks for it is taken out of `asked`, with
+/// why. So with kithd started again, or the pod that had it made again, another namespace
+/// neither takes the port nor stops it. A port is kept until no Workload or Job of the
+/// namespace asks for it in the store (`asking`; `None` while the store is not yet as new
+/// as it was, see [`as_new`]: nothing is let go then).
+fn keep_for(
+    kept: &mut BTreeMap<(bool, u16), String>,
+    asking: Option<&Asking>,
+    asked: &mut BTreeMap<(bool, u16), Vec<Asker>>,
+) -> Vec<String> {
+    if let Some(asking) = asking {
+        kept.retain(|port, namespace| asking.contains(&(*port, namespace.clone())));
+    }
+    let mut refused = Vec::new();
+    for (port, namespace) in kept.iter() {
+        let Some(pods) = asked.get_mut(port) else { continue };
+        pods.retain(|(id, _, of)| {
+            if of != namespace {
+                let why = "it is another namespace's on this node";
+                refused.push(format!("kithd: pod {id}: port {} is not published: {why}", port.1));
+            }
+            of == namespace
+        });
+    }
+    asked.retain(|_, pods| !pods.is_empty());
+    refused
+}
+
 /// At most this many ports of a node published at once: each is a listener of kithd's.
 const PORTS: usize = 64;
 
 /// A pod asking for a published port: its id, its number, and its namespace.
 type Asker = (String, u16, String);
 
+/// The published ports (UDP, and the number) asked for in the store, each with the namespace asking.
+type Asking = BTreeSet<((bool, u16), String)>;
+
 /// Which of the pods asking for each port (`asked`, in the store's order) has it: the one
 /// that had it (`held`) while it asks still, else the first of the namespace that had it,
 /// else the first where all that ask are of one namespace; and at most [`PORTS`] ports,
 /// those held first. Why each other is not published goes to `refused`. (A pod that came
 /// later, or of a namespace whose name sorts first, takes no port; and where pods of two
-/// namespaces ask for a port none had, after a restart say, none has it: the apply refuses
-/// that, but not a Release's or a Source's writing.)
+/// namespaces ask for a port none had, none has it: the apply refuses that, but not a
+/// Release's or a Source's writing. After a restart [`keep_for`] has left one namespace's.)
 fn chosen(
     asked: BTreeMap<(bool, u16), Vec<Asker>>,
     held: &BTreeMap<(bool, u16), Asker>,
@@ -387,10 +472,12 @@ pub fn unshared(store: &kith_api::store::Store, resources: &[kith_api::Resource]
     Ok(())
 }
 
-/// The pods of this node that ask for each published port (UDP, and the number), in the
-/// store's order.
-fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<Asker>> {
+/// Each published port (UDP, and the number) with the namespace of a Workload or Job of
+/// pods that asks for it in the store, on whichever node and however many of them; and the
+/// pods of this node that ask for each, in the store's order.
+fn published(shared: &Shared) -> (Asking, BTreeMap<(bool, u16), Vec<Asker>>) {
     let mut asked = Vec::new();
+    let mut asking = BTreeSet::new();
     {
         let state = shared.store.lock().expect("nothing panics holding the store");
         for resource in ["Workload", "Job"]
@@ -409,6 +496,7 @@ fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<Asker>> {
             if template.pod == Some(true) && !ports.is_empty() {
                 let key = resource.key();
                 let namespace = resource.metadata.namespace.clone().unwrap_or_default();
+                asking.extend(ports.iter().map(|port| (*port, namespace.clone())));
                 let ids = (0..replicas).map(|replica| crate::controller::pod_of(&key, replica));
                 asked.extend(ids.map(|id| (id, namespace.clone(), ports.clone())));
             }
@@ -425,7 +513,7 @@ fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<Asker>> {
                 .push((id.clone(), pod.number, namespace.clone()));
         }
     }
-    wanted
+    (asking, wanted)
 }
 
 /// Pass what comes to `port` of this node on to the pod `id` (of `number`), until told to stop.
@@ -736,6 +824,88 @@ mod tests {
         // (Its pod gone, another of its namespace has it.)
         let held = BTreeMap::from([((false, 8080), pod("b/z-0", 4))]);
         assert_eq!(chosen(asked(), &held, &mut refused)[&(false, 8080)], pod("b/y-0", 3));
+    }
+
+    /// The node's record of who had a port holds it to that namespace across a restart of
+    /// kithd: of pods of two namespaces asking for it, the recorded one's has it and the
+    /// other's is refused, with why; and so while the recorded one's pod is not made yet and
+    /// the store is not yet as new as it was.
+    #[test]
+    fn published_port_kept_by_its_namespace_across_a_restart() {
+        let pod = |id: &str, number| (id.to_string(), number, id[..1].to_string());
+        let asks = |namespace: &str| ((false, 8080), namespace.to_string());
+        let record = std::env::temp_dir().join(format!("kith-published-kept-{}.json", std::process::id()));
+        // (What the kithd before this one wrote: b had TCP 8080.)
+        keep(&record, &BTreeMap::from([asks("b")])).unwrap();
+        let mut kept = kept_in(&record);
+        std::fs::remove_file(&record).unwrap();
+        let asking = BTreeSet::from([asks("a"), asks("b")]);
+        let mut asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 3)])]);
+        let mut refused = keep_for(&mut kept, Some(&asking), &mut asked);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(
+            refused[0].contains("pod a/x-0: port 8080") && refused[0].contains("another namespace's"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            chosen(asked, &BTreeMap::new(), &mut refused)[&(false, 8080)],
+            pod("b/y-0", 3)
+        );
+        // (b's pod not made yet, and the store not yet read as far as b's Workload: a's has
+        // no port still, and the record stands.)
+        let mut asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2)])]);
+        assert_eq!(keep_for(&mut kept, None, &mut asked).len(), 1);
+        assert!(asked.is_empty() && kept == BTreeMap::from([asks("b")]));
+        // The store is as new as it was once all this node has logged is applied; a worker's
+        // view, once it has one.
+        assert!(!as_new(None, None, None) && !as_new(None, Some(9), Some(4)) && !as_new(None, Some(9), None));
+        assert!(as_new(None, Some(9), Some(9)) && as_new(Some(3), None, None) && !as_new(Some(0), Some(9), Some(9)));
+    }
+
+    /// A node that keeps the store, started alone, has a store as new as it was once what
+    /// it has logged is applied (else no port it keeps for a namespace would be let go).
+    #[tokio::test]
+    async fn published_port_is_let_go_once_the_store_is_as_new_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("kith-published-current-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300)).await;
+        let shared = shared.unwrap();
+        let patience = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !current(&shared) {
+            assert!(std::time::Instant::now() < patience, "never as new as it was");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no record (a first start, or a file that cannot be read) it is as before: a port
+    /// pods of two namespaces ask for goes to neither. A record of a namespace that asks for
+    /// the port no more gives it nothing, and the port goes to who asks.
+    #[test]
+    fn published_port_with_no_record() {
+        let pod = |id: &str, number| (id.to_string(), number, id[..1].to_string());
+        let asks = |namespace: &str| ((false, 8080), namespace.to_string());
+        let record = std::env::temp_dir().join(format!("kith-published-none-{}.json", std::process::id()));
+        assert!(kept_in(&record).is_empty());
+        std::fs::write(&record, b"[[[false, 8080], ").unwrap();
+        let mut kept = kept_in(&record);
+        std::fs::remove_file(&record).unwrap();
+        assert!(kept.is_empty());
+        let asking = BTreeSet::from([asks("a"), asks("b")]);
+        let mut asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 3)])]);
+        let mut refused = keep_for(&mut kept, Some(&asking), &mut asked);
+        assert!(refused.is_empty() && chosen(asked, &BTreeMap::new(), &mut refused).is_empty());
+        assert!(
+            refused.len() == 2 && refused.iter().all(|why| why.contains("more than one namespace")),
+            "{refused:?}"
+        );
+        let mut kept = BTreeMap::from([asks("g")]);
+        let mut asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2)])]);
+        assert!(keep_for(&mut kept, Some(&BTreeSet::from([asks("a")])), &mut asked).is_empty() && kept.is_empty());
+        assert_eq!(
+            chosen(asked, &BTreeMap::new(), &mut refused)[&(false, 8080)],
+            pod("a/x-0", 2)
+        );
     }
 
     /// A port another namespace's Workload or Job publishes is refused at apply; one of the
