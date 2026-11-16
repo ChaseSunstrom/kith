@@ -28,6 +28,9 @@ pub struct Granted {
     pub devices: Vec<PathBuf>,
     /// The seat whose directory it has at `/run/seat`, and whether to read only.
     pub seat: Option<(String, bool)>,
+    /// Each Device it draws on here, and its class: the node's own policy may hand out none
+    /// of a class, and what holds one is then not run (`policy::Policy::device`).
+    pub classes: Vec<(String, DeviceClass)>,
 }
 
 /// The answer for every workload that names claims (its key), and every `DeviceClaim` (its key).
@@ -466,7 +469,7 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted>
         let drawn = drawn.and_then(|(seat, _)| store.get(&format!("Seat/{seat}")));
         let drawn = drawn.and_then(|seat| serde_json::from_value::<SeatSpec>(seat.spec.clone()).ok());
         let drawn = drawn.map(|seat| seat.devices).unwrap_or_default();
-        let mut paths = BTreeSet::new();
+        let (mut paths, mut classes) = (BTreeSet::new(), Vec::new());
         let all = held.devices.iter().map(|name| (name, true));
         for (name, whole) in all.chain(drawn.iter().map(|name| (name, false))) {
             let Some(device) = store.get(&format!("Device/{name}")) else {
@@ -478,6 +481,7 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted>
             if spec.node != me || !(whole || spec.class == DeviceClass::Gpu) {
                 continue;
             }
+            classes.push((name.clone(), spec.class.clone()));
             // (What comes with it: the nodes of NVIDIA's driver.)
             let nodes = spec
                 .nodes
@@ -505,7 +509,7 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted>
             }
         }
         let (devices, seat) = (paths.into_iter().collect(), held.seat);
-        granted.insert(key, Granted { devices, seat });
+        granted.insert(key, Granted { devices, seat, classes });
     }
     granted
 }
