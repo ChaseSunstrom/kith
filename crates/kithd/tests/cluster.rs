@@ -437,6 +437,61 @@ fn running_log_entries(node: &Node) -> Option<String> {
     log_entries(&copy).ok()
 }
 
+/// Every member's kithd reads store format 2, and says so with each answer to Raft's calls:
+/// the leader marks the store, every control node's log holds the mark (and so says format
+/// 2), and a node started again on that state serves. (Not behind KITH_E2E: it pulls nothing.)
+#[test]
+fn the_store_is_marked_once_every_member_reads_its_format() {
+    let test = "mark";
+    let mut alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let mut beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    let mark = r#""payload":{"Normal":"Mark"}"#;
+    let marked = |node: &Node| running_log_entries(node).is_some_and(|log| log.contains(mark));
+    wait_for("both logs to hold the mark", || marked(&alpha) && marked(&beta));
+    // Each answers Raft's calls with the format its kithd reads: what a leader waits to hear
+    // from every member before it marks. (Asked as beta, of alpha, and the other way.)
+    let says = |of: &Node, by: &Node| {
+        let pki = by.dir.join("state/pki");
+        let mut curl = Command::new("curl");
+        curl.args(["-sk", "-D", "-", "-o", "/dev/null", "--max-time", "15"]);
+        curl.arg("--cert").arg(pki.join("node.crt"));
+        curl.arg("--key").arg(pki.join("node.key"));
+        let asked = curl.arg(format!("https://{}/v1/raft/stands", of.address()));
+        String::from_utf8_lossy(&asked.output().unwrap().stdout).to_ascii_lowercase()
+    };
+    for (of, by) in [(&alpha, &beta), (&beta, &alpha)] {
+        let said = says(of, by);
+        assert!(said.contains("x-kith-store: 2"), "{said}");
+    }
+    // What is made now is of its entry in the log: both nodes answer, and agree.
+    let config = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: after }\nspec: { data: { a: '1' } }\n";
+    std::fs::write(alpha.dir.join("after.yaml"), config).unwrap();
+    alpha.ok(&["apply", "-f", "after.yaml"]);
+    wait_for("beta to have it", || beta.kith(&["get", "configmap/after"]).0 == 0);
+    alpha.stop();
+    beta.stop();
+    for node in [&alpha, &beta] {
+        assert!(store_holds(node, mark), "{}", node.dir.display());
+        let snapshot = std::fs::read_to_string(node.dir.join("state/raft/snapshot.json")).unwrap_or_default();
+        assert!(
+            snapshot.is_empty() || snapshot.starts_with(r#"{"format":2,"#),
+            "{snapshot:.80}"
+        );
+    }
+    // Started again on the marked state, each serves what it had.
+    alpha.child = Node::spawn(&alpha.dir, "alpha", alpha.port, &[]);
+    beta.child = Node::spawn(&beta.dir, "beta", beta.port, &[]);
+    wait_for("both to answer again", || {
+        [&alpha, &beta]
+            .iter()
+            .all(|node| node.kith(&["get", "configmap/after"]).0 == 0)
+    });
+}
+
 /// The cluster's duress code typed at one disk: no control node keeps either key it held,
 /// in its snapshot or its log, and `kith node unlock` has it hold a key again.
 /// (Not behind KITH_E2E: it pulls nothing.)

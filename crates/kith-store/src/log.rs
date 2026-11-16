@@ -45,7 +45,7 @@ impl Log {
         // which format this is. A file with no number is from before they were numbered.
         let stamped = (|| {
             let txn = db.begin_write().map_err(text)?;
-            {
+            let format = {
                 let mut meta = txn.open_table(META).map_err(text)?;
                 let old = meta.get("format").map_err(text)?;
                 let old = old.map(|value| serde_json::from_slice::<u32>(value.value()));
@@ -54,13 +54,14 @@ impl Log {
                     // Nothing is committed: a newer file is left as it was.
                     return Ok(format);
                 }
-                // (An older format is brought up to this one here, when there is one.)
-                let now = crate::FORMAT.to_string();
-                meta.insert("format", now.as_bytes()).map_err(text)?;
-            }
+                // (Its number stays: the file is the newer format only once it holds what
+                // an older build would not read, and `put` says so then.)
+                meta.insert("format", format.to_string().as_bytes()).map_err(text)?;
+                format
+            };
             txn.open_table(LOG).map_err(text)?;
             txn.commit().map_err(text)?;
-            Ok(crate::FORMAT)
+            Ok(format)
         })();
         crate::known(stamped.map_err(|e: String| failed(&e))?, path)?;
         Ok(Log { db: Arc::new(db) })
@@ -87,6 +88,12 @@ impl Log {
         self.write(|txn| {
             let mut table = txn.open_table(LOG).map_err(writing)?;
             for entry in entries {
+                // (With the entry, or not at all: a build from before cannot read the entry,
+                // and is told the format, not a line of JSON.)
+                if matches!(entry.payload, openraft::EntryPayload::Normal(crate::Command::Mark)) {
+                    let mut meta = txn.open_table(META).map_err(writing)?;
+                    meta.insert("format", b"2".as_slice()).map_err(writing)?;
+                }
                 let value = serde_json::to_vec(&entry).map_err(writing)?;
                 table.insert(entry.log_id.index, value.as_slice()).map_err(writing)?;
             }

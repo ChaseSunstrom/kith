@@ -148,13 +148,50 @@ impl Link {
                 return Err(unreachable(&why).into());
             }
         };
+        // A marked store is sent whole only to a kithd that said it reads one: a kithd from
+        // before would take the snapshot, drop when each resource was made, and order by what
+        // is left. (It is heard before: a link sends entries, or a heartbeat, first.)
+        let marked = shared
+            .store
+            .lock()
+            .expect("nothing panics holding the store")
+            .store
+            .marked();
+        let said = heard(self.target).map(|(format, _)| format);
+        let to = name.map_or(String::new(), |name| format!(" to node {name}"));
+        if marked && what == "snapshot" && said.is_none_or(|said| said < kith_store::FORMAT) {
+            let why = "no snapshot is sent: the store is in format 2, and its kithd has not said it reads that";
+            self.say(format!(
+                "raft link{to} at {}: {why} (update it, if it is older)",
+                self.address
+            ));
+            return Err(unreachable(why).into());
+        }
         let call = client.post(format!("https://{}/v1/raft/{what}", self.address));
         let reply = call.timeout(option.hard_ttl()).json(rpc).send().await;
+        // (Whatever it answers, it is the voter that answers: what its kithd reads is heard.)
+        if let Ok(reply) = &reply {
+            let said = reply
+                .headers()
+                .get(READS)
+                .and_then(|said| said.to_str().ok()?.parse().ok());
+            let said = (said.unwrap_or(1), Instant::now());
+            HEARD
+                .lock()
+                .expect("nothing panics holding what was heard")
+                .insert(self.target, said);
+        }
         let reply = reply.and_then(reqwest::Response::error_for_status);
         let reply = reply.map_err(|e| {
-            let to = name.map_or(String::new(), |name| format!(" to node {name}"));
+            // (An entry a kithd from before cannot read is refused by it as a bad request.)
+            let older = marked && heard(self.target).is_some_and(|(said, _)| said < kith_store::FORMAT);
+            let update = if older {
+                " (the store is in format 2, which its kithd does not read: update it)"
+            } else {
+                ""
+            };
             self.say(format!(
-                "raft link{to} at {}: {}",
+                "raft link{to} at {}: {}{update}",
                 self.address,
                 crate::cluster::why(&e)
             ));
@@ -784,7 +821,7 @@ fn changes_access(command: &Command) -> bool {
         Command::Apply { resources, .. } => resources.iter().any(|resource| access(&resource.kind)),
         Command::Delete { key } | Command::Rollback { key, .. } => keyed(key),
         Command::Import { .. } => true,
-        Command::Status { .. } | Command::Patch { .. } | Command::Report { .. } => false,
+        Command::Status { .. } | Command::Patch { .. } | Command::Report { .. } | Command::Mark => false,
     }
 }
 
@@ -855,6 +892,102 @@ fn nodes_of(store: &kith_api::store::Store) -> BTreeMap<NodeId, BasicNode> {
         Some((id, BasicNode::new(status["address"].as_str()?)))
     };
     store.list(Some("Node")).filter_map(member).collect()
+}
+
+/// The header a node answers Raft's calls with: the newest store format its kithd reads.
+pub(crate) const READS: &str = "x-kith-store";
+/// What each member last answered with ([`READS`]; 1 where it said nothing, as a kithd from
+/// before does), and when: heard by the links, so only the member itself can say it.
+static HEARD: Mutex<BTreeMap<NodeId, (u32, Instant)>> = Mutex::new(BTreeMap::new());
+fn heard(member: NodeId) -> Option<(u32, Instant)> {
+    let heard = HEARD.lock().expect("nothing panics holding what was heard");
+    heard.get(&member).copied()
+}
+
+/// A member not heard for this long is not known to read anything: it may have been put
+/// back on an older kithd since.
+const FRESH: Duration = Duration::from_secs(30);
+
+/// Which of `members` (but `me`) are not known to read the store's newest format: not
+/// heard lately, or heard saying less. While there is one the leader does not mark the
+/// store ([`Command::Mark`]), which such a kithd could not read.
+fn not_reading(
+    heard: &BTreeMap<NodeId, (u32, Instant)>,
+    members: &BTreeSet<NodeId>,
+    me: NodeId,
+    now: Instant,
+) -> BTreeSet<NodeId> {
+    let reads = |member: &NodeId| {
+        let said = heard.get(member);
+        said.is_some_and(|(format, at)| *format >= kith_store::FORMAT && now.duration_since(*at) < FRESH)
+    };
+    let others = members.iter().filter(|member| **member != me);
+    others.filter(|member| !reads(member)).copied().collect()
+}
+
+/// On the leader, until the store is marked: mark it once every member's kithd reads a
+/// marked one. On every node that keeps the store, in a cluster or not: any may come to lead.
+pub async fn tend_format(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+    // (A worker that runs from a view keeps no store, and marks none.)
+    if shared.view.borrow().is_some() {
+        return;
+    }
+    let mut said = Vec::new();
+    loop {
+        if shared
+            .store
+            .lock()
+            .expect("nothing panics holding the store")
+            .store
+            .marked()
+        {
+            return;
+        }
+        if let Err(e) = mark(&shared, &mut said).await {
+            eprintln!("kithd: {e}");
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            _ = stopping.changed() => return,
+        }
+    }
+}
+
+/// One look: where this node leads, mark the store, or say (in `said`, and in the log when
+/// it changes) who is waited for.
+async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
+    let metrics = shared.raft.metrics().borrow().clone();
+    if metrics.current_leader != Some(metrics.id) {
+        return Ok(());
+    }
+    // The members, and the Nodes about to be: one that joined on an older kithd is waited for.
+    let members = metrics.membership_config.membership().nodes().map(|(id, _)| *id);
+    let members: BTreeSet<NodeId> = members.chain(nodes_of_store(shared).into_keys()).collect();
+    let waiting = {
+        let heard = HEARD.lock().expect("nothing panics holding what was heard");
+        not_reading(&heard, &members, metrics.id, Instant::now())
+    };
+    if waiting.is_empty() {
+        let marked = shared.submit(Command::Mark).await;
+        marked.map_err(|e| format!("marking the store: {e}"))?;
+        eprintln!(
+            "kithd: the store keeps from now on when each resource was first made (format 2: an older kithd does not read it)"
+        );
+        return Ok(());
+    }
+    let named = |id: &NodeId| match voter(shared, *id) {
+        Found::One(name, _) => name,
+        _ => format!("member {id}"),
+    };
+    let waiting: Vec<String> = waiting.iter().map(named).collect();
+    if *said != waiting {
+        let names = waiting.join(", ");
+        eprintln!(
+            "kithd: the store stays in format 1 until every member's kithd reads format 2: {names} did not say so (down, or on an older kithd)"
+        );
+        *said = waiting;
+    }
+    Ok(())
 }
 
 fn nodes_of_store(shared: &Shared) -> BTreeMap<NodeId, BasicNode> {
@@ -1651,6 +1784,74 @@ mod tests {
         assert_eq!(next(1, &[1, 2], &[1], &[1]), voters(&[2]));
         // Every node a worker (the API refuses it): nothing is changed, the voters go on.
         assert_eq!(next(1, &[1, 2, 3], &[1, 2, 3], &[1, 2, 3]), None);
+    }
+
+    /// A marked store is sent whole to no kithd that has not said it reads one (a kithd from
+    /// before would take it and drop when each resource was made); entries still go.
+    #[tokio::test]
+    async fn marked_store_is_sent_as_a_snapshot_only_to_a_kithd_that_reads_it() {
+        use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
+        use kith_store::openraft::error::Infallible;
+        use std::sync::atomic::Ordering;
+        let ca = pki::Ca::create().unwrap();
+        let (a, b) = (node(&ca, "a"), node(&ca, "b"));
+        // (Answers `{}` and says nothing of formats, as a kithd from before does.)
+        let (home, to_b) = answering_as(&b).await;
+        let shared = shared_with("mark-snapshot", a, &[at("b", &home, None)]).await;
+        // (An id no other test's link has: what is heard is kept by id.)
+        let id = 7_233_001;
+        let status = serde_json::json!({ "address": home, "state": "ready", "raftId": id.to_string() });
+        let marked = {
+            let mut state = shared.store.lock().unwrap();
+            state.store.set_status("Node/b", Some(status)).unwrap();
+            kith_store::run(&mut state.store, Command::Mark)
+        };
+        marked.unwrap();
+        let cell = Arc::new(OnceLock::new());
+        cell.set(Arc::downgrade(&shared)).ok().unwrap();
+        let mut link = Link {
+            shared: cell,
+            target: id,
+            address: home.clone(),
+            said: None,
+        };
+        let option = || RPCOption::new(Duration::from_secs(5));
+        let nothing = serde_json::json!({});
+        let mut send = async |what: &str| {
+            let sent = link
+                .call::<_, serde_json::Value, Infallible>(what, &nothing, option())
+                .await;
+            sent.map_err(|e| e.to_string())
+        };
+        let reached = || to_b.load(Ordering::SeqCst);
+        // Never heard: no snapshot. Entries go, and with their answer it is heard to read format 1.
+        assert!(send("snapshot").await.unwrap_err().contains("no snapshot is sent"));
+        assert_eq!(reached(), 0);
+        let _ = send("append").await;
+        assert_eq!((reached(), heard(id).map(|(said, _)| said)), (1, Some(1)));
+        assert!(send("snapshot").await.unwrap_err().contains("no snapshot is sent"));
+        assert_eq!(reached(), 1);
+        // Updated, it says so, and is sent one.
+        HEARD.lock().unwrap().insert(id, (kith_store::FORMAT, Instant::now()));
+        let _ = send("snapshot").await;
+        assert_eq!(reached(), 2);
+    }
+
+    /// The store is marked (format 2, which a kithd from before does not read) only once
+    /// every other member was heard saying, lately, that its kithd reads it.
+    #[test]
+    fn store_format_waits_for_every_member_to_say_it_reads_it() {
+        let now = Instant::now() + Duration::from_secs(3600);
+        let ago = |seconds: u64| now - Duration::from_secs(seconds);
+        let set = |ids: &[u64]| ids.iter().copied().collect::<BTreeSet<_>>();
+        // 2 reads it, 3 said nothing (a kithd from before), 4 read it a while ago (put
+        // back since, or down), 5 was never heard, 6 reads a later format.
+        let heard = BTreeMap::from([(2, (2, ago(1))), (3, (1, ago(1))), (4, (2, ago(31))), (6, (3, ago(29)))]);
+        let waits = |members: &[u64]| not_reading(&heard, &set(members), 1, now);
+        // (The leader is not asked: it runs this.)
+        assert_eq!(waits(&[1]), set(&[]));
+        assert_eq!(waits(&[1, 2, 6]), set(&[]));
+        assert_eq!(waits(&[1, 2, 3, 4, 5, 6]), set(&[3, 4, 5]));
     }
 
     #[test]

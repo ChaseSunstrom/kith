@@ -108,6 +108,53 @@ fn readme_says_nothing_that_was_true_once() {
     }
 }
 
+/// Who has a host two Services name is said in both documents: the one made first, a
+/// delete gives it up, a Namespace's hosts keep it for good, and what the update is.
+#[test]
+fn readme_and_security_say_who_has_a_host_two_services_name() {
+    let security = std::fs::read_to_string(root().join("SECURITY.md")).unwrap();
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (name, text, said) in [
+        (
+            "README.md",
+            flat(README),
+            "Two Services with one host: the one made first has it",
+        ),
+        ("README.md", flat(README), "a Service that is deleted gives its host up"),
+        ("README.md", flat(README), "Before updating, back the store up"),
+        (
+            "README.md",
+            flat(README),
+            "A cluster of one node has nobody to wait for",
+        ),
+        (
+            "README.md",
+            flat(README),
+            "keep the host with its Namespace's `hosts` before updating",
+        ),
+        ("SECURITY.md", flat(&security), "Deleting a Service gives its host up"),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "only a Namespace's `hosts` keep a host for good",
+        ),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "edited more than a hundred times before the switch",
+        ),
+    ] {
+        assert!(text.contains(said), "{name} no longer says: {said}");
+    }
+    for (name, text) in [("README.md", flat(README)), ("SECURITY.md", flat(&security))] {
+        assert!(
+            !text.contains("the older has it"),
+            "{name} still orders hosts by the oldest kept revision alone"
+        );
+        assert!(!text.contains("can lose a host after a hundred edits"), "{name}");
+    }
+}
+
 /// Who reads an Image on a node is said one way in both documents: the registry answers
 /// kithd's own pull only, and neither still says what was so before.
 #[test]

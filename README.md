@@ -1052,8 +1052,13 @@ kith node status                                   # who leads the store, who vo
   (`Secret/kith-system/acme-account`) are in the store like other Secrets.
   `expose.host` has to be a domain name a certificate authority issues for:
   an IP address, a label that starts or ends with `-`, or a `_` is refused
-  when applied. Two Services with one host: the older has it, and the other's
-  status says `expose: refused` and why. Until a host is kept for a namespace,
+  when applied. Two Services with one host: the one made first has it, and the other's
+  status says `expose: refused` and why. First is by when the store says each was
+  made, which no edit changes and no trimming of its history loses; a Service that is
+  deleted gives its host up, and made again it is the newer one. (A cluster that began
+  on a kithd from before this was kept has it once
+  [the store is in format 2](#what-an-update-keeps-the-format-of-the-store).)
+  Until a host is kept for a namespace,
   whoever may write a Service anywhere has it by being first: a Namespace
   with `spec: { hosts: ['*.example.org', example.org] }` (a name, or `*.` and
   a domain for every name under it; YAML wants the `*` quoted) keeps those
@@ -3117,24 +3122,51 @@ change the kernel command line has the machine anyway.
 ### What an update keeps: the format of the store
 
 ```sh
-cargo test -p kith-store format        # this build reads a state written in format 1
+cargo test -p kith-store format        # this build reads a state written in format 1, and in 2
 ```
 
 A node's copy of the cluster's resources is two files in its state,
 `raft/log.redb` and `raft/snapshot.json`. Both say which format they are in:
-1 today, and a file from before the number was written is 1 too.
+1 or 2, and a file from before the number was written is 1.
+
+Format 2 keeps when each resource was first made, apart from its history (which is
+trimmed): it is what says which of two Services naming one host was there first. A
+kithd that reads format 2 does not write it by being started: a format 1 state stays
+format 1, readable by the kithd before, until the cluster's leader marks the store
+with one entry in the log. It does that once every other node that keeps the store
+(the control nodes, and a worker from before workers ran from a view) has answered it
+in the last half minute saying its kithd reads format 2, which each says with every
+answer to the leader's own calls; until then the leader's log names who it waits for
+(`the store stays in format 1 until every member's kithd reads format 2: NAME did not
+say so`), and every node orders hosts as before. A node that is down, or never
+updated, holds the mark back. From that entry on the files say format 2, a kithd from
+before refuses them, and the leader sends such a kithd no snapshot. So:
+
+1. Before updating, back the store up: stop a control node's kithd, copy the `raft/`
+   directory of its state, and start it again.
+2. Update one node at a time. Until the last of them is updated, any can be put back
+   on the kithd it had.
+3. Half a minute or less after the last one answers, the leader says `the store keeps
+   from now on when each resource was first made`, and there is no going back short of
+   that backup. A cluster of one node has nobody to wait for: it marks its store as
+   soon as the new kithd starts.
+
+What there was at the mark is taken as made at the time of its oldest revision still
+kept: a Service edited more than a hundred times before it may already count as newer
+than one that names its host. Where that matters, keep the host with its Namespace's
+`hosts` before updating.
 
 - A kithd reads every format up to its own. `crates/kith-store/fixtures/format-1`
-  is a state as format 1 is written, every kind of change in its log, and the
-  test above has each later build open it, read every entry of the log back
+  and `format-2` are a state as each format is written, every kind of change in its
+  log, and the test above has each later build open them, read every entry of the log back
   as it was written, and end with the same resources. A build that cannot does not pass; a build that changes what is written
   takes the next number, adds a fixture of its own and keeps the old ones.
 - A kithd refuses a state in a format newer than its own and leaves the
   files as they were, rather than read them as if they were its own:
   `raft/log.redb is in format 2 and this kithd reads up to format 1: start
   the kithd that wrote it, or a newer one`. So going back to an older release
-  is sure only while both write the same format, and a release that takes a
-  new number will say so.
+  is sure only while the state is in a format that release reads, and a release
+  that takes a new number says so, and when the state changes to it.
 
 Not numbered yet: what nodes say to each other (a snapshot one node sends
 another is written down by the node that takes it, in its own format), and

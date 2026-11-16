@@ -32,7 +32,17 @@ use std::sync::{Arc, Mutex};
 /// The format of the two files a replica is on disk, the log and the snapshot. It goes up
 /// when a build writes what an earlier build would misread; a file with no number is 1.
 /// `fixtures/format-N` is a state as format N's builds wrote it, and stays readable.
-pub const FORMAT: u32 = 1;
+///
+/// This is the newest a build reads. What it writes is [`format_of`] its store: 1 until the
+/// cluster's one [`Command::Mark`], so a kithd started on a format 1 state leaves it one an
+/// older kithd reads, and going back is possible until every member has the newer.
+pub const FORMAT: u32 = 2;
+
+/// The format `store` is written in: 2 once it keeps when each resource was first made
+/// (an older build would drop that, and order by what is left), 1 before.
+pub fn format_of(store: &Store) -> u32 {
+    if store.marked() { 2 } else { 1 }
+}
 
 /// A file in a format this build does not know is refused, never read as if it were its own.
 fn known(format: u32, file: &Path) -> Result<(), String> {
@@ -81,6 +91,10 @@ pub enum Command {
     Import {
         store: Store,
     },
+    /// From here on the store keeps when each resource is first made ([`Store::mark`]), and
+    /// is in format 2. Once in a cluster's life, proposed by the leader when every member's
+    /// kithd reads it: a build from before reads neither this entry nor what follows it.
+    Mark,
 }
 
 /// What a command that worked gives back.
@@ -144,8 +158,17 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
             Ok(Done::Nothing)
         }
         Command::Import { store: imported } => {
+            // (What comes in is from before replication, and so from before the mark.)
+            let marked = store.marked();
             *store = imported;
             store.cut_node_key_histories();
+            if marked {
+                store.mark();
+            }
+            Ok(Done::Nothing)
+        }
+        Command::Mark => {
+            store.mark();
             Ok(Done::Nothing)
         }
     }
@@ -162,7 +185,8 @@ pub fn keys(command: &Command) -> Option<Vec<String>> {
             named(&mut statuses.iter().map(|(key, _)| key))
         }
         Command::Patch { statuses } => named(&mut statuses.iter().map(|(key, _)| key)),
-        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } => Vec::new(),
+        // (The mark: what there is keeps the order it had, by its oldest kept revision.)
+        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } | Command::Mark => Vec::new(),
     })
 }
 

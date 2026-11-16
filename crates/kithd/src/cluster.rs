@@ -660,7 +660,15 @@ async fn members_only(
                 }
                 return refuse(StatusCode::FORBIDDEN, why).into_response();
             }
-            return next.run(request).await;
+            // (What Raft's caller hears with every answer: the store format this kithd reads.)
+            let raft = path.starts_with("/v1/raft/");
+            let mut answer = next.run(request).await;
+            if raft {
+                answer
+                    .headers_mut()
+                    .insert(crate::raft::READS, kith_store::FORMAT.into());
+            }
+            return answer;
         }
         Some(pki::Subject::Node(name, ..)) => {
             // (One a minute, as on the API.)
