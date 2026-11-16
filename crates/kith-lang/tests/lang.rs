@@ -602,3 +602,21 @@ fn f(x, y = [..[1, 2], x]) = { ..{ a: x }, "k${x}": y, n: -x % 3 };
         }
     }
 }
+
+/// A file's value is taken apart into resources by its steps too: a list that holds
+/// itself twice, sixty deep, is a few steps to make and 2^60 to walk (review-2 lang H1).
+#[test]
+fn limits_hold_a_file_that_gives_a_list_shared_many_times() {
+    let (sent, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let g = "fn g(x, n) = if n == 0 then x else g([x, x], n - 1);";
+        // (Given whole, and inside a resource, where its nulls are left out.)
+        for src in [format!("{g} g(null, 60)"), format!("{g} {{ kind: \"ConfigMap\", a: g(null, 60) }}")] {
+            sent.send(gives(&src)).unwrap();
+        }
+    });
+    for _ in 0..2 {
+        let said = got.recv_timeout(std::time::Duration::from_secs(20)).expect("it ends");
+        assert!(said.unwrap_err().contains("did not end in"));
+    }
+}

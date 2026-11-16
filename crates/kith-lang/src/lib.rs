@@ -181,7 +181,11 @@ fn run(entry: &str, load: Load, globals: &[(&str, serde_json::Value)], library: 
         while let Some((value, at)) = found.pop() {
             match &value {
                 V::Null => {}
-                V::List(items) => found.extend(items.iter().rev().cloned()),
+                // (A step each: a list can hold one list many times, few steps to make.)
+                V::List(items) => {
+                    machine.spend(items.len(), at).map_err(|fail| shown(&machine, fail))?;
+                    found.extend(items.iter().rev().cloned());
+                }
                 V::Rec(_) => {
                     let top = Pos { line: 1, col: 1 };
                     docs.push(

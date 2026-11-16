@@ -291,7 +291,7 @@ impl<'a> Machine<'a> {
         }
     }
 
-    fn spend(&mut self, steps: usize, at: At) -> Result<()> {
+    pub(crate) fn spend(&mut self, steps: usize, at: At) -> Result<()> {
         self.steps += steps as u64;
         match self.steps > STEPS {
             true => Err(fail(at, format!("did not end in {STEPS} steps"))),
@@ -991,7 +991,9 @@ impl<'a> Machine<'a> {
             V::Float(_) => return Err(fail(at, "not a number any more (divided by 0?)")),
             V::Str(text) => scalar(text.to_string(), false),
             V::List(items) => {
-                let mut nodes = Vec::with_capacity(items.len());
+                // (Each item a step, a null left out too: a list can hold one list many times.)
+                self.spend(items.len(), at)?;
+                let mut nodes = Vec::new();
                 for (item, at) in items.iter().filter(|(item, _)| !matches!(item, V::Null)) {
                     nodes.push(self.node(item, *at, pos, size)?);
                 }
