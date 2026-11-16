@@ -71,6 +71,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/lock", get(crate::crypt::warned))
         .route("/v1/lock/{name}", post(crate::crypt::set))
         .route("/v1/lock/{name}/passphrase", post(crate::crypt::pass))
+        .route("/v1/lock/{name}/pin", post(crate::crypt::pin))
         .route("/v1/lock/{name}/recovery", post(crate::crypt::recovery))
         .route("/v1/duress", post(crate::crypt::duress_all))
         .route("/v1/seats/{name}/activity", post(crate::seats::activity))

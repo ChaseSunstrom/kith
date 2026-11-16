@@ -2324,7 +2324,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["tpm-pin"] * (b"\ntpm-pin: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -2340,9 +2340,10 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                 if [ -n "$sealing" ]; then
                     tpm=''
                     mkdir "$work/tpm"
-                    own() { # LOG [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept)
-                        machine=$1
+                    own() { # LOG [away] [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept); away: without its card, so no node is in reach
+                        machine=$1 card=1
                         shift
+                        [ "${1:-}" != away ] || { card='' && shift; }
                         [ -z "$tpm" ] || kill "$tpm" 2>/dev/null || true
                         rm -f "$work/tpm.sock"
                         swtpm socket --tpm2 --tpmstate "dir=$work/tpm" --ctrl "type=unixio,path=$work/tpm.sock" >/dev/null 2>&1 &
@@ -2354,8 +2355,9 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                             [ "$tries" -lt 50 ] || fail "swtpm did not start"
                             sleep 0.1
                         done
+                        [ -n "$card" ] || set -- -nic none "$@"
+                        [ -z "$card" ] || set -- -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac" "$@"
                         vm "$machine" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
-                            -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac" \
                             -chardev "socket,id=tpmc,path=$work/tpm.sock" -tpmdev emulator,id=tpm0,chardev=tpmc -device tpm-tis,tpmdev=tpm0 "$@"
                     }
                     off() { # the machine's power cut
@@ -2455,7 +2457,78 @@ with open(sys.argv[1], "r+b") as disk:
                     told '"sealed": *false'
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside, once its seal was taken back: $(says "$work/beta.disk")"
-                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none"
+                    # A PIN, asked of the machine itself at its own address (no node passes one
+                    # on): refused unless the owner says this TPM is untried (swtpm's is: 3
+                    # wrong PINs, then one more every 1000 seconds, which 8 digits are enough
+                    # for). (Its second card has no ROM, so the firmware starts as before.)
+                    own beta9 -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 2))-10.0.2.15:7443" -device virtio-net-pci,netdev=u,romfile=
+                    up beta9
+                    pin=40917253
+                    api POST /v1/lock/kith-000902/pin -H 'Content-Type: application/json' -d "{\"pin\":\"$pin\",\"untried\":true}" | grep -qF 'ask node kith-000902 itself' || fail "a PIN was passed on by the other node"
+                    given() { # JSON: to the machine itself
+                        curl -s --max-time 60 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" --resolve "kith:$((port + 2)):127.0.0.1" \
+                            -X POST -H 'Content-Type: application/json' -d "$1" "https://kith:$((port + 2))/v1/lock/kith-000902/pin"
+                    }
+                    tries=0
+                    until said=$(given "{\"pin\":\"$pin\"}") && [ -n "$said" ]; do
+                        tries=$((tries + 1))
+                        [ "$tries" -lt 150 ] || fail "the machine does not answer at its own address"
+                        sleep 0.2
+                    done
+                    printf '%s' "$said" | grep -qF 'On hardware' || fail "a PIN was taken without the owner saying the TPM is untried: $said"
+                    given '{"pin":"4091","untried":true}' | grep -qF 'a PIN is 6 to 32 digits' || fail "a PIN of 4 digits was not refused"
+                    said=$(given "{\"pin\":\"$pin\",\"untried\":true}")
+                    printf '%s' "$said" | grep -q '"pin": *true' || fail "the machine took no PIN: $said"
+                    hears beta9 "this machine's TPM and its PIN open its state; its TPM alone no longer does"
+                    ! api GET /v1/resources | grep -qF "$pin" || fail "the PIN is in the store"
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm-parent tpm-pin' ] || fail "the disk of the machine with a PIN, read from outside: $(says "$work/beta.disk")"
+                    ! grep -aqF "$pin" "$work/beta.disk" "$work/alpha.log" "$work/beta9.log" || fail "the PIN is on the machine's disk or was said by a node"
+                    # Away from its cluster it asks at its console: its PIN opens it.
+                    own pin1 away
+                    hears pin1 'Or type its PIN, or the recovery key, here: neither is shown'
+                    hears pin1 'still locked'
+                    ! grep -aqF 'state on' "$work/pin1.log" || fail "a machine away from its cluster opened its state before its PIN was typed"
+                    types() { printf '%s\n' "$2" | socat - "unix-connect:$work/$1.tty" >/dev/null; }
+                    types pin1 "$pin"
+                    hears pin1 'kithd: init: opened with its PIN'
+                    hears pin1 'kithd: init: state on /dev/dm-'
+                    off
+                    # Started again: a wrong PIN opens nothing and is counted, until the TPM
+                    # refuses every PIN, the right one too, and says for how long. (Setting
+                    # the PIN tried a wrong one; a TPM cut off after a PIN was used counts
+                    # one more: how many are left here is not known beforehand.)
+                    answered() { grep -acF -e "kithd: init: that does not open this node's state" -e 'kithd: init: the TPM refuses every PIN for now' "$work/$1.log" || true; }
+                    after() { # LOG N: the console answered more than N lines
+                        tries=0
+                        until [ "$(answered "$1")" -gt "$2" ]; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "the console answered no more than $2 lines"
+                            sleep 0.2
+                        done
+                    }
+                    own pin2 away
+                    hears pin2 'Or type its PIN, or the recovery key, here: neither is shown'
+                    hears pin2 'still locked'
+                    wrong=0
+                    until grep -aqF 'the TPM refuses every PIN for now' "$work/pin2.log"; do
+                        [ "$wrong" -lt 4 ] || fail "the TPM refused no PIN after $wrong wrong ones"
+                        types pin2 40917250
+                        after pin2 "$wrong"
+                        wrong=$((wrong + 1))
+                    done
+                    types pin2 "$pin"
+                    after pin2 "$wrong"
+                    [ "$(grep -acF 'the TPM refuses every PIN for now' "$work/pin2.log")" -ge 2 ] || fail "the right PIN, typed while the TPM refused every PIN, was not refused"
+                    grep -aqF 'the next is taken within 1000 seconds' "$work/pin2.log" || fail "the console did not say when the TPM takes a PIN again"
+                    ! grep -aqF 'state on' "$work/pin2.log" || fail "a PIN opened the state while the TPM refused every PIN"
+                    # The recovery key opens it all the same, and no console showed a PIN.
+                    types pin2 "${recovery##* }"
+                    hears pin2 'kithd: init: opened with the recovery key'
+                    hears pin2 'kithd: init: state on /dev/dm-'
+                    ! grep -aqF -e "$pin" -e 40917250 "$work/pin1.log" "$work/pin2.log" || fail "the machine's console showed a PIN as it was typed"
+                    off
+                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none; a PIN not passed on by the other node, given at its own address (once the owner said the TPM is untried), away from its cluster it opened with that PIN, then refused $wrong wrong ones until its TPM refused every PIN, the right one too, and the recovery key opened it all the same"
                     exit 0
                 fi
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"

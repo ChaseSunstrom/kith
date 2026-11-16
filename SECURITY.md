@@ -1037,6 +1037,41 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A node with a PIN** (`kith node pin NAME --untried-tpm`, off unless given; the line
+  `tpm-pin:` of its lock record) opens its state with its TPM and a PIN of 6 to 32 digits
+  typed at its console, and no longer by its TPM alone: its record holds a half of the key
+  sealed to the PCRs above (no guess counted) and a half the TPM gives only for the PIN,
+  counting each wrong one. Who opens what: the cluster's key still opens it, as before (a
+  PIN adds a way, it closes none), and so does the recovery key; a copy of the disk on
+  another machine opens by neither half. The guesses are bounded by the TPM, not by kith:
+  kithd refuses a PIN unless the TPM's lockout lets through at most one in a hundred of the
+  PINs of that length in a year (its M wrong ones at once, then one every I seconds). That
+  bound is for a PIN of random digits: a date, or 123456, is among the first guesses, so
+  choose the digits at random. Setting a PIN makes kithd take the TPM's lockout
+  authorization where it is empty (32 random bytes, kept in a file of its own in the
+  node's encrypted state and nowhere else), so that nobody else can forgive the count;
+  where someone else holds it, or the TPM refuses the one kithd keeps (a disk moved, a
+  state put back: kithd shows it to the TPM each time, and a refused one shuts the TPM's
+  lockout hierarchy for its recovery time), the PIN is refused. Setting a PIN again shows
+  the kept authorization to the TPM, and that forgives the wrong tries counted; it lets
+  nobody try the old PIN, which the new one replaces, and only whoever may apply the
+  node's NodeKey can set one. If that state is lost (a
+  wipe, or a duress code, which erases the record and with it the state's key), the file
+  can no longer be read, and only clearing the TPM in the firmware's settings gives the
+  lockout authorization back. Each setting of a PIN tries one wrong PIN, which the TPM
+  counts. The bound assumes the machine stays powered; whether a TPM counts a start after
+  a power cut as a wrong try is unchecked, on swtpm and on hardware. Anyone at the console
+  can type M wrong PINs and lock the PIN for a while; the console says so and when the
+  next is taken. After an update that moves the PCRs, the PIN opens nothing until it is
+  set again (a seal for the next system is not built: docs/adr-unlock.md, step 4); and a
+  node locked, then unlocked, has no PIN until it is set again. The PIN is asked of the node it is for alone, at its
+  own address over TLS or its own socket: unlike a passphrase, no node passes one on (a
+  relay would see it in plain), and a relayed PIN stays refused until the owner says
+  otherwise. It is kept by no node, the store or the audit log, nor shown as it is typed; kithd zeroes its own copies, not the
+  ones the HTTP and JSON layers made on the way. It has run against a software TPM only:
+  `--untried-tpm` is the owner saying so, until docs/adr-unlock.md's checklist has run on
+  that machine. It is a word, not a lock: whoever may apply a NodeKey at that node can
+  send the field.
 - **A running encrypted node has its key in memory.** The encryption keeps a disk
   that is off, or away from its cluster. While the node runs, the key of its state is
   in the kernel's memory (dm-crypt's) and in kithd's, for as long as it runs: kithd

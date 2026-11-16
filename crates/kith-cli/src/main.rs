@@ -448,6 +448,23 @@ enum NodeCommand {
         #[arg(long)]
         off: bool,
     },
+    /// Have NAME's state open with its TPM and a PIN, typed at its console when it starts: its TPM
+    /// alone opens it no more, and the TPM refuses every PIN for a while after a few wrong ones
+    Pin {
+        name: String,
+        /// Say that this machine's TPM has not been tried as docs/adr-unlock.md's "On hardware: the
+        /// owner's checklist" says: no PIN is set without it, as none has yet run on a real TPM. It is
+        /// the owner's word, not a lock: whoever may apply a NodeKey at NAME can send it. With it,
+        /// kithd takes the TPM's lockout authorization where it is empty and keeps it only in NAME's
+        /// encrypted state: if that state is lost, only clearing the TPM gives it back. Each setting
+        /// tries one wrong PIN, which the TPM counts. Use random digits (a date is among the first
+        /// guesses)
+        #[arg(long, conflicts_with = "off")]
+        untried_tpm: bool,
+        /// Take it away: the node asks the cluster again (its TPM alone opens it only if sealed)
+        #[arg(long)]
+        off: bool,
+    },
     /// Forget the key of NAME's encrypted state for good: what its disk holds can no longer be read
     Wipe {
         name: String,
@@ -1459,6 +1476,32 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     ),
                 }
             );
+        }
+        Command::Node {
+            command: NodeCommand::Pin { name, untried_tpm, off },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are held by kithd: leave out --store");
+            };
+            if !off && !untried_tpm {
+                return fail(
+                    "a PIN has run against a software TPM only, never yet against a machine's own: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm. Know first: where the TPM's lockout authorization is empty, kithd takes the TPM's lockout authorization and keeps it only in the node's encrypted state; if that state is lost, only clearing the TPM gives it back. And each setting of a PIN tries one wrong PIN, which the TPM counts. Make the PIN random digits: a date or 123456 is among the first guesses",
+                );
+            }
+            // (Read here, unseen, never from the command line; for the kithd asked, which takes
+            // it for itself alone and passes it on to no node.)
+            let pin = match off {
+                true => None,
+                false => Some(secret(&format!("A PIN for {name}'s state, 6 to 32 digits: "))?),
+            };
+            let body = serde_json::json!({ "pin": pin, "untried": untried_tpm }).to_string();
+            let said: serde_json::Value = request(&kithd, "POST", &format!("/v1/lock/{name}/pin"), body.as_bytes())?;
+            match said["lockout"].as_str() {
+                Some(lockout) => println!(
+                    "{name} opens its state with its TPM and that PIN, typed at its console when it starts, or with the cluster's key as before; its TPM alone no longer does. {lockout}. Take it away with --off"
+                ),
+                None => println!("{name} has no PIN: it asks the cluster for the key of its state"),
+            }
         }
         Command::Identity {
             command: IdentityCommand::Cert { name, out },

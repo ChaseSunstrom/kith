@@ -3434,6 +3434,7 @@ kith node seal beta                    # beta's own TPM keeps the key too: it st
 kith node seal beta --off              # taken back: beta asks the cluster again
 kith node passphrase beta              # asks for one, twice, unseen: typed at beta's console, it opens beta's state away from home
 kith node passphrase beta --off        # taken away
+kith node pin beta --untried-tpm       # asked of beta's own kithd alone: a PIN, twice, unseen; beta's TPM then opens its state only with it typed at its console
 kith node recovery beta                # beta, running, makes a new recovery key and shows it, once: the old one opens no more
 kith node duress beta                  # a duress code for beta, shown once: typed at beta's waiting console, it erases beta's way in
 kith node duress --all                 # one code for the whole cluster (--off takes either away)
@@ -3575,6 +3576,36 @@ keys lie when the machine starts, which is the kernel's own layout (US): a
 passphrase with letters that sit elsewhere on your keyboard is typed where
 they sit there.
 
+**The TPM and a PIN.** `kith node pin beta --untried-tpm` asks for a PIN (6 to
+32 digits, typed on the row above the letters), twice and unseen, and gives
+it to beta's own kithd (its socket, or `POST /v1/lock/beta/pin` at beta's own
+address): another node refuses it and passes it on to none, until the owner
+decides otherwise. From then on beta's TPM opens its state
+only with that PIN typed at its console, where it takes the recovery key, and
+no longer by itself. A copy of the disk opens on no other machine, and on this
+one only while its system is the one sealed to. The TPM counts each wrong PIN:
+beta refuses a PIN that this TPM's lockout would let be guessed one time in a
+hundred in a year (it names the shortest it takes). That holds for random
+digits only: a date or 123456 is among the first guesses, so pick them at
+random. Setting a PIN takes the TPM's lockout authorization where it is empty,
+kept in beta's encrypted state alone, so that nobody else can forgive the
+count; if that state is lost, only clearing the TPM in the firmware's settings
+gives the authorization back. Setting a PIN again shows the kept authorization
+to the TPM, which forgives the wrong tries counted; nobody gets to try the old
+PIN by it, since the new one replaces it, and only whoever may apply beta's
+NodeKey can set one. Each setting tries one wrong PIN, which the TPM
+counts. After too many wrong ones the TPM refuses every PIN, the right one too,
+for a while, and the console says how long; the recovery key still opens.
+The cluster's key opens beta's state as before: a PIN adds a lock to the
+machine alone, not to the cluster's way. `--off` takes it away. After an
+update that moves the PCRs the PIN opens nothing until it is set again (a seal
+for the next system is not built yet), and locking beta, then unlocking it,
+drops the PIN. It has run against a software TPM only, never on a real one,
+and is refused without `--untried-tpm`, the owner saying so, until the
+checklist in docs/adr-unlock.md ("On hardware: the owner's checklist") has run
+on the machine. That flag is a word, not a lock: whoever may apply a NodeKey at
+beta can send it.
+
 What is and is not protected:
 
 - The cluster holds the key wrapped with a secret that only the node's disk
@@ -3597,8 +3628,8 @@ What is and is not protected:
 - A stolen machine that is not locked, started on the cluster's own network,
   is handed its key: lock it when it goes missing.
 
-Not yet: a passphrase and the TPM both asked for (two locks, where these are
-two doors), a keyboard layout at the console, encrypting a node that was not installed that way, the disk's secret kept in
+Not yet: a passphrase and the TPM both asked for (the TPM and a PIN are, above;
+a passphrase and its seal are still two doors), the cluster's key and the TPM both asked for, a keyboard layout at the console, encrypting a node that was not installed that way, the disk's secret kept in
 the TPM (so that erasing it would not depend on what a flash disk keeps), a duress code that opens a decoy.
 
 ### Not in kith OS yet
