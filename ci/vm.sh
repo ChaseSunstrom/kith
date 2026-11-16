@@ -1807,7 +1807,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -1866,7 +1866,7 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                     hears beta2 "this machine's TPM holds the key of its state"
                     told '"sealed": *true'
                     off
-                    [ "$(says "$work/beta.disk")" = 'sealed held tpm' ] || fail "the sealed machine's disk, read from outside: $(says "$work/beta.disk")"
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm tpm-parent' ] || fail "the sealed machine's disk, read from outside: $(says "$work/beta.disk")"
                     # Started again: its own TPM gives the key, and no node is asked.
                     own beta3
                     hears beta3 'TPM gave the key of its state: no node was asked'

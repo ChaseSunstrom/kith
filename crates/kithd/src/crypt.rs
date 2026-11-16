@@ -288,7 +288,6 @@ impl Record {
         if let Some(key) = &self.key {
             text += &format!("key: {}\n", hex(key));
         }
-        // (Before the peers: what does not fit the record's room is cut from its end.)
         if let Some(sealed) = &self.tpm {
             text += &format!("tpm: {}\n", hex(sealed));
         }
@@ -306,8 +305,18 @@ impl Record {
                 text += &format!("{name}: {}\n", hex(key));
             }
         }
-        if !self.peers.is_empty() {
-            text += &format!("peers: {}\n", self.peers.join(" "));
+        // (Last, with as many whole peers as fit the room and its ending zero: the rest are
+        // left out, as a node finds its peers again.)
+        let mut line = "peers:".to_string();
+        for peer in &self.peers {
+            if text.len() + line.len() + peer.len() + 2 >= ROOM {
+                break;
+            }
+            line += &format!(" {peer}");
+        }
+        if line.len() > "peers:".len() {
+            text += &line;
+            text += "\n";
         }
         text
     }
@@ -328,11 +337,25 @@ impl Record {
     }
 
     /// Write it `at` this place of `disk` (a config partition's start and [`AT`]), over
-    /// all of what was there, and read it back.
+    /// all of what was there, and read it back. One that would not fit its room but by
+    /// peers left out is not written: the line it would cut is named.
     fn write(&self, disk: &File, at: u64) -> Result<(), String> {
         let mut bytes = self.text().into_bytes();
-        // (A zero ends it, so one byte less than the room; peers past it are left out.)
-        bytes.truncate(ROOM - 1);
+        // (A zero ends it, so one byte less than the room.)
+        if bytes.len() >= ROOM {
+            let mut end = 0;
+            let cut = bytes.split(|b| *b == b'\n').find(|line| {
+                end += line.len() + 1;
+                end >= ROOM
+            });
+            let cut = cut
+                .and_then(|line| line.split(|b| *b == b':').next())
+                .unwrap_or_default();
+            return Err(format!(
+                "the lock record would not fit its {ROOM} bytes: its {}: line would be cut, so it is not written",
+                String::from_utf8_lossy(cut)
+            ));
+        }
         bytes.resize(ROOM, 0);
         let mut back = vec![0; ROOM];
         let wrote = disk.write_all_at(&bytes, at).and_then(|()| disk.sync_all());
@@ -711,7 +734,7 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
 
 /// What a `tpm-parent:` line that cannot be read is: present, so the seal beside it is not
 /// opened without the check it stands for.
-const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal --off, then kith node seal, makes a new one)";
+const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
 
 /// `opened` sealed by this machine's TPM again (under the storage key whose name `record`
 /// keeps, if it keeps one), written in place of `record`'s seal in one write, read back,
@@ -735,19 +758,33 @@ fn sealed_anew<T: std::io::Read + std::io::Write>(
     let disk = File::options().read(true).write(true).open(config);
     let disk = disk.map_err(|e| format!("writing the lock record: {e}"))?;
     let back = with.write(&disk, AT).and_then(|()| Record::read(config));
+    // (As written but for peers that did not fit, which are left out.)
     let back = back.and_then(|back| {
-        back.filter(|back| *back == with)
-            .ok_or("the lock record did not read back as written".into())
+        back.filter(|back| {
+            *back
+                == Record {
+                    peers: back.peers.clone(),
+                    ..with.clone()
+                }
+        })
+        .ok_or("the lock record did not read back as written".into())
     });
-    let opens = back.and_then(|back| tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref()));
+    let opens = back.and_then(|back| {
+        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref());
+        key.map(|key| (key, back))
+    });
     match opens {
-        Ok(key) if key == opened => Ok(with),
+        Ok((key, back)) if key == opened => Ok(back),
         opens => {
             let why = opens.err().unwrap_or("the TPM gave another key back".into());
-            record.write(&disk, AT)?;
-            Err(format!(
-                "the new seal did not open as written ({why}): the old one stays"
-            ))
+            match record.write(&disk, AT) {
+                Ok(()) => Err(format!(
+                    "the new seal did not open as written ({why}): the old one stays"
+                )),
+                Err(e) => Err(format!(
+                    "the new seal did not open as written ({why}), and the old record could not be put back ({e})"
+                )),
+            }
         }
     }
 }
@@ -1637,7 +1674,54 @@ mod tests {
             ..again.clone()
         };
         assert_eq!(sealed_anew(&mut tpm, &unread, &key, &path), Err(UNREAD.to_string()));
-        assert_eq!(Record::read(&path), Ok(Some(again)));
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        // A new seal that does not open as written (its answer changed on the bus): the old
+        // record is put back, and the error says why.
+        tpm.0.flip = Some((crate::tpm::UNSEAL, 16, 1));
+        let refused = sealed_anew(&mut tpm, &again, &key, &path).unwrap_err();
+        assert!(
+            refused.contains(crate::tpm::FORGED) && refused.contains("the old one stays"),
+            "{refused}"
+        );
+        assert_eq!(Record::read(&path), Ok(Some(again.clone())));
+        // More peers than the room holds: sealed anew all the same, with those that fit.
+        let crowded = Record {
+            peers: (0..400).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..again
+        };
+        let kept = sealed_anew(&mut tpm, &crowded, &key, &path).unwrap();
+        assert!(kept.peers.len() > 100 && kept.peers.len() < 400);
+        assert_eq!(Record::read(&path), Ok(Some(kept)));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A record that would not fit its room is refused, naming the line that would be cut;
+    /// only whole `peers:` entries are left out to make it fit.
+    #[test]
+    fn crypt_record_too_long_is_refused_not_cut() {
+        let path = std::env::temp_dir().join(format!("kith-crypt-long-{}", std::process::id()));
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let disk = File::options().read(true).write(true).open(&path).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            ..Record::default()
+        };
+        record.write(&disk, AT).unwrap();
+        let long = Record {
+            tpm: Some(vec![5; 2100]),
+            ..record.clone()
+        };
+        let refused = long.write(&disk, AT).unwrap_err();
+        assert!(refused.contains("tpm:"), "{refused}");
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+        let many = Record {
+            peers: (0..400).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..record
+        };
+        many.write(&disk, AT).unwrap();
+        let read = Record::read(&path).unwrap().unwrap();
+        assert!(read.peers.len() > 100 && read.peers.len() < 400);
+        assert_eq!(read.peers[..], many.peers[..read.peers.len()]);
         std::fs::remove_file(&path).unwrap();
     }
 

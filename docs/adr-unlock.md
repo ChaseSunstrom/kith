@@ -180,7 +180,7 @@ Unchanged from T-0237: the SHA-256 bank, PCRs 0, 4, 7, 9, 12 and 15.
 
 Decided: every command that carries a secret, or whose answer is one, runs with a session
 salted to the storage key, with parameter encryption, and the storage key's name is kept
-beside the seal and checked before the salt is sent.
+beside the seal and checked before any salt or secret is sent.
 
 Which key: the storage key kithd already makes as the parent (TPM2_CreatePrimary under the
 owner hierarchy, the template above). It is the key every seal lives under, so salting to it
@@ -585,10 +585,10 @@ Older kithd (a node gone back to its other slot, or taken down by an `allowDowng
 - It reads NodeKey `seal: "pin"` as not sealed (it asks `== true`), so it never makes a
   TPM-alone seal where the owner chose a PIN.
 
-Room: 4 KiB, `peers:` last. Today `Record::write` cuts whatever does not fit from the end,
+Room: 4 KiB, `peers:` last. `Record::write` cut whatever did not fit from the end,
 silently. With the new lines the record could exceed that, and a seal line cut in half is a
-record that does not parse. Decided: a write that would cut anything but whole entries of
-`peers:` is refused. Estimated: the lines other than `peers:` stay under 3.1 kB in either mode.
+record that does not parse. Decided, and built (T-0585): a write that would cut anything but
+whole entries of `peers:` is refused, naming the line it would cut. Estimated: the lines other than `peers:` stay under 3.1 kB in either mode.
 A sealed blob made through the session is 272 bytes on swtpm (T-0585), not the 200 first
 estimated: 144 more hex characters a blob, at most three blobs in a mode, so 2.6 kB became
 3.1 kB.

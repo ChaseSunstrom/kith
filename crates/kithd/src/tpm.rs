@@ -52,7 +52,7 @@ const PASSWORD: u32 = 0x4000_0009;
 const CREATE_PRIMARY: u32 = 0x131;
 const CREATE: u32 = 0x153;
 const LOAD: u32 = 0x157;
-const UNSEAL: u32 = 0x15e;
+pub(crate) const UNSEAL: u32 = 0x15e;
 const FLUSH: u32 = 0x165;
 const START_SESSION: u32 = 0x176;
 const PCR_READ: u32 = 0x17e;
@@ -70,8 +70,14 @@ const DECRYPT: u8 = 0x20;
 const ENCRYPT: u8 = 0x40;
 
 /// What an unseal or a seal is refused with when the TPM's storage key is not the one the
-/// seal was made under.
-pub const ANOTHER: &str = "this is not the TPM the key was sealed with, or something sits between it and this machine";
+/// seal was made under, and what the owner does when the TPM was cleared or the disk moved.
+pub const ANOTHER: &str = "this is not the TPM the key was sealed with, or something sits between it and this machine \
+     (if its TPM was cleared or its disk moved: kith node seal NAME --off, then kith node seal NAME, seals it to this one)";
+/// What an answer is that comes without the session its command was sent with; that runs
+/// on past its session; that comes in plain where it was asked to come encrypted.
+const UNSESSIONED: &str = "the TPM answered without the session it was asked with";
+const LONGER: &str = "the TPM's answer runs on past its session";
+const PLAIN: &str = "the TPM answered in plain where it was asked to encrypt";
 /// What an answer whose HMAC does not hold is.
 pub const FORGED: &str =
     "an answer came from no TPM this machine has a session with: it was changed on its way (its HMAC does not hold)";
@@ -223,6 +229,8 @@ impl<T: Read + Write> Tpm<T> {
             }
         };
         match u32::from_be_bytes(reply[6..10].try_into().expect("four bytes")) {
+            // (Asked with a session, a TPM that gives what was asked answers with it.)
+            0 if tag == SESSIONS && reply[0..2] != SESSIONS.to_be_bytes() => Err(UNSESSIONED.into()),
             0 => Ok(reply[10..whole].to_vec()),
             POLICY_FAILED => Err("the TPM does not give the key: this is not the system it was sealed for".into()),
             refused => Err(format!("the TPM refuses (its code {refused:#x})")),
@@ -380,6 +388,12 @@ impl<T: Read + Write> Tpm<T> {
         let mut parameters = answer.take(length)?.to_vec();
         let (theirs, attributes, proof) = (answer.sized(false)?, answer.take(1)?, answer.sized(false)?);
         let answered = Sha256::digest([&0u32.to_be_bytes()[..], &command.to_be_bytes(), &parameters].concat());
+        if !answer.0.is_empty() {
+            return Err(LONGER.into());
+        }
+        if crypt == ENCRYPT && attributes[0] & ENCRYPT == 0 {
+            return Err(PLAIN.into());
+        }
         let told = [&answered[..], theirs, &nonce, attributes].concat();
         hmac::verify(&key, &told, proof).map_err(|_| FORGED)?;
         if crypt == ENCRYPT {
@@ -507,13 +521,17 @@ pub(crate) mod tests {
     }
 
     /// The way to a TPM, every byte both ways kept, each answer with the command it
-    /// answers; and one byte of one answer changed on its way, as a proxy on the bus would.
+    /// answers; and one answer changed on its way, as a proxy on the bus would.
     pub(crate) struct Wire {
         stream: UnixStream,
         pub sent: Vec<u8>,
         pub answers: Vec<(u32, Vec<u8>)>,
-        /// The command whose next answer is changed, and at which byte.
-        pub flip: Option<(u32, usize)>,
+        /// The command whose next answer is changed, at which byte, and its bits flipped.
+        pub flip: Option<(u32, usize, u8)>,
+        /// The command whose next answer gets one byte more at its end (its length too).
+        pub tail: Option<u32>,
+        /// What is left of the answer being read.
+        waiting: Vec<u8>,
     }
 
     impl Wire {
@@ -523,6 +541,8 @@ pub(crate) mod tests {
                 sent: Vec::new(),
                 answers: Vec::new(),
                 flip: None,
+                tail: None,
+                waiting: Vec::new(),
             }
         }
 
@@ -551,17 +571,33 @@ pub(crate) mod tests {
 
     impl Read for Wire {
         fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
-            let got = self.stream.read(into)?;
-            let (command, answer) = self.answers.last_mut().expect("a command before its answer");
-            if let Some((flipped, at)) = self.flip
-                && flipped == *command
-                && (answer.len()..answer.len() + got).contains(&at)
-            {
-                into[at - answer.len()] ^= 1;
-                self.flip = None;
+            // (Each answer is taken whole from swtpm, changed, then given in parts.)
+            if self.waiting.is_empty() {
+                let mut answer = vec![0; 10];
+                self.stream.read_exact(&mut answer)?;
+                let length = u32::from_be_bytes(answer[2..6].try_into().unwrap()) as usize;
+                answer.resize(length.max(10), 0);
+                self.stream.read_exact(&mut answer[10..])?;
+                let (command, kept) = self.answers.last_mut().expect("a command before its answer");
+                if let Some((flipped, at, bits)) = self.flip
+                    && flipped == *command
+                {
+                    answer[at] ^= bits;
+                    self.flip = None;
+                }
+                if self.tail == Some(*command) {
+                    answer.push(0);
+                    let length = answer.len() as u32;
+                    answer[2..6].copy_from_slice(&length.to_be_bytes());
+                    self.tail = None;
+                }
+                kept.extend(&answer);
+                self.waiting = answer;
             }
-            answer.extend(&into[..got]);
-            Ok(got)
+            let given = into.len().min(self.waiting.len());
+            into[..given].copy_from_slice(&self.waiting[..given]);
+            self.waiting.drain(..given);
+            Ok(given)
         }
     }
 
@@ -738,10 +774,10 @@ pub(crate) mod tests {
 
         // One byte of the answer changed (the first of the key, as it crosses encrypted):
         // refused before anything in it is used. So in TPM2_Create's answer (the blob).
-        tpm.0.flip = Some((UNSEAL, 16));
+        tpm.0.flip = Some((UNSEAL, 16, 1));
         let refused = tpm.unseal(&sealed, Some(&name)).unwrap_err();
         assert_eq!(refused, FORGED);
-        tpm.0.flip = Some((CREATE, 20));
+        tpm.0.flip = Some((CREATE, 20, 1));
         assert_eq!(tpm.seal(&key, Some(&name)).unwrap_err(), FORGED);
         // And nothing of it is left behind in the TPM: it opens as before.
         assert_eq!(tpm.unseal(&sealed, Some(&name)).as_ref(), Ok(&key));
@@ -768,12 +804,37 @@ pub(crate) mod tests {
         assert_eq!(asked, [CREATE_PRIMARY, FLUSH, CREATE_PRIMARY, FLUSH], "{asked:x?}");
 
         // The storage key's x changed in CreatePrimary's answer (a proxy's own key).
-        tpm.0.flip = Some((CREATE_PRIMARY, 50));
+        tpm.0.flip = Some((CREATE_PRIMARY, 50, 1));
         let before = tpm.0.answers.len();
         assert_eq!(tpm.unseal(&sealed, Some(&name)), Err(ANOTHER.to_string()));
         assert_eq!(tpm.0.commands()[before..], [CREATE_PRIMARY, FLUSH]);
         // The same TPM: sealed again under the name kept, and the same name.
         let (_, again) = tpm.seal(&key, Some(&name)).unwrap();
         assert_eq!(again, name);
+    }
+
+    /// An answer to a command sent with a session is refused unless it comes with one, ends
+    /// where its session does, and says it is encrypted where that was asked; each is
+    /// checked before its HMAC, so each says what it is.
+    #[test]
+    fn tpm_answer_out_of_its_shape_is_refused() {
+        let Some((_software, wire)) = software() else { return };
+        let mut tpm = Tpm(wire);
+        measured(&mut tpm);
+        let key = vec![9; 64]; // pragma: allowlist secret
+        let (sealed, name) = tpm.seal(&key, None).unwrap();
+        // Unseal's answer: header (10), parameterSize (4), outData (2 + 64), nonceTPM
+        // (2 + 32), then the session's attributes.
+        let attributes = 10 + 4 + 2 + key.len() + 2 + 32;
+        for (change, refused) in [
+            ((Some((UNSEAL, 1, 1)), None), UNSESSIONED),
+            ((None, Some(UNSEAL)), LONGER),
+            ((Some((UNSEAL, attributes, ENCRYPT)), None), PLAIN),
+        ] {
+            (tpm.0.flip, tpm.0.tail) = change;
+            // (Compared, not printed: a failure shows no key.)
+            assert_eq!(tpm.unseal(&sealed, Some(&name)).err().as_deref(), Some(refused));
+        }
+        assert!(tpm.unseal(&sealed, Some(&name)) == Ok(key));
     }
 }
