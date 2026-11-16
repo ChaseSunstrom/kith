@@ -1270,7 +1270,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   node came back from, until the release is changed or another is given. (T-0572.)
 - **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
   node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
-  makes one), it writes zeros over the node's lock record (the disk's secret, and what
+  makes one), it writes zeros over the node's lock record and its copy (the disk's secret, and what
   the recovery key, a passphrase and the TPM's seal opened) and has the cluster forget
   the node's key. What it does not do: a disk copied beforehand, with its recovery key
   or a passphrase it had, still opens, and until a node of the cluster has heard the

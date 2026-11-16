@@ -92,10 +92,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Where in the config partition the record is (the node's config is its first 64 kB),
-/// and how long it may be.
+/// and how long it may be. A copy of it follows, written first: a write cut by a power
+/// cut leaves one of the two whole (T-0596).
 pub const AT: u64 = 512 << 10;
 const ROOM: usize = 4096;
 const FIRST: &str = "kith-lock v1";
+/// `sum: ` and the SHA-256 of the lines after it, in hex: a record cut part way is not taken.
+const SUM_LINE: usize = "sum: \n".len() + 64;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Record {
@@ -298,6 +301,11 @@ fn typed(line: &str) -> Option<Vec<u8>> {
 impl Record {
     pub fn parse(bytes: &[u8]) -> Option<Record> {
         let text = std::str::from_utf8(bytes.split(|byte| *byte == 0).next()?).ok()?;
+        // (One an older kithd wrote has no sum, and is taken as it is.)
+        if let Some(summed) = text.strip_prefix(FIRST).and_then(|text| text.strip_prefix("\nsum: ")) {
+            let (sum, rest) = summed.split_once('\n')?;
+            (unhex(sum)?[..] == *digest::digest(&digest::SHA256, rest.as_bytes()).as_ref()).then_some(())?;
+        }
         let mut lines = text.lines();
         (lines.next()? == FIRST).then_some(())?;
         let mut record = Record::default();
@@ -357,7 +365,7 @@ impl Record {
         // left out, as a node finds its peers again.)
         let mut line = "peers:".to_string();
         for peer in &self.peers {
-            if text.len() + line.len() + peer.len() + 2 >= ROOM {
+            if SUM_LINE + text.len() + line.len() + peer.len() + 2 >= ROOM {
                 break;
             }
             line += &format!(" {peer}");
@@ -366,17 +374,21 @@ impl Record {
             text += &line;
             text += "\n";
         }
-        text
+        let rest = &text[FIRST.len() + 1..];
+        let sum = digest::digest(&digest::SHA256, rest.as_bytes());
+        format!("{FIRST}\nsum: {}\n{rest}", hex(sum.as_ref()))
     }
 
     /// The record of the node whose config partition is `config`, if its state is encrypted.
     /// A record that begins as one and cannot be read is an error: the state under it is
     /// not a file system to mount as it lies.
     pub fn read(config: &Path) -> Result<Option<Record>, String> {
-        let mut bytes = vec![0; ROOM];
+        let mut bytes = vec![0; 2 * ROOM];
         let read = File::open(config).and_then(|config| config.read_exact_at(&mut bytes, AT));
-        Ok(match (read, Record::parse(&bytes)) {
-            (Ok(()), None) if bytes.starts_with(FIRST.as_bytes()) => {
+        let (record, copy) = bytes.split_at(ROOM);
+        // (The copy, where a write was cut in the record: it was written first.)
+        Ok(match (read, Record::parse(record).or_else(|| Record::parse(copy))) {
+            (Ok(()), None) if record.starts_with(FIRST.as_bytes()) || copy.starts_with(FIRST.as_bytes()) => {
                 return Err("this node's state is encrypted, and its lock record is damaged".into());
             }
             (Ok(()), record) => record,
@@ -406,7 +418,11 @@ impl Record {
         }
         bytes.resize(ROOM, 0);
         let mut back = vec![0; ROOM];
-        let wrote = disk.write_all_at(&bytes, at).and_then(|()| disk.sync_all());
+        let wrote = disk
+            .write_all_at(&bytes, at + ROOM as u64)
+            .and_then(|()| disk.sync_all())
+            .and_then(|()| disk.write_all_at(&bytes, at))
+            .and_then(|()| disk.sync_all());
         let read = wrote.and_then(|()| from_disk(disk, at).read_exact_at(&mut back, at));
         read.map_err(|e| format!("writing the lock record: {e}"))?;
         (back == bytes)
@@ -537,22 +553,22 @@ async fn forgotten(client: &reqwest::Client, peer: &str, id: &str, pair: &ring::
 /// kept. The kernel lets whole pages go: the pages the record lies in, to their ends.)
 fn from_disk(disk: &File, at: u64) -> &File {
     let gone = nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED;
-    let (first, end) = (at & !4095, (at + ROOM as u64 + 4095) & !4095);
+    let (first, end) = (at & !4095, (at + 2 * ROOM as u64 + 4095) & !4095);
     let fd = std::os::fd::AsRawFd::as_raw_fd(disk);
     let _ = nix::fcntl::posix_fadvise(fd, first as i64, (end - first) as i64, gone);
     disk
 }
 
-/// The lock record of the config partition `config`, erased: the disk's secret and every
-/// wrapped key with it. Read back from the disk: one that took the write and kept the
-/// record is not erased.
+/// The lock record of the config partition `config`, erased, and its copy: the disk's
+/// secret and every wrapped key with it. Read back from the disk: one that took the write
+/// and kept the record is not erased.
 fn erase(config: &Path) -> std::io::Result<()> {
     let disk = File::options().read(true).write(true).open(config)?;
-    let mut back = [1; ROOM];
-    disk.write_all_at(&[0; ROOM], AT)?;
+    let mut back = [1; 2 * ROOM];
+    disk.write_all_at(&[0; 2 * ROOM], AT)?;
     disk.sync_all()?;
     from_disk(&disk, AT).read_exact_at(&mut back, AT)?;
-    match back == [0; ROOM] {
+    match back == [0; 2 * ROOM] {
         true => Ok(()),
         false => Err(std::io::Error::other("the lock record is still on the disk")),
     }
@@ -2335,6 +2351,68 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// A power cut in the record's write leaves the old record or the new one, whichever
+    /// 512-byte sectors of either copy it cut after; a record an older kithd wrote (one copy,
+    /// no sum) is read as before (T-0596).
+    #[test]
+    fn lock_record_cut_at_any_sector_reads_as_old_or_new() {
+        let path = std::env::temp_dir().join(format!("kith-crypt-torn-{}", std::process::id()));
+        let old = Record {
+            secret: vec![7; 32],
+            recovery: vec![1; 16],
+            peers: (0..150).map(|n| format!("10.0.{n}.1:7443")).collect(),
+            ..Record::default()
+        };
+        let new = Record {
+            secret: vec![8; 32],
+            key: Some(vec![9; 64]),
+            ..old.clone()
+        };
+        let fresh = |with: &Record| {
+            std::fs::write(&path, vec![0; AT as usize + 3 * ROOM]).unwrap();
+            let disk = File::options().read(true).write(true).open(&path).unwrap();
+            with.write(&disk, AT).unwrap();
+            disk
+        };
+        let wrote = {
+            let disk = fresh(&new);
+            let mut whole = vec![0; 2 * ROOM];
+            disk.read_exact_at(&mut whole, AT).unwrap();
+            whole
+        };
+        // The new record goes over the old, cut after each sector of the copy and then of
+        // the record (the copy is written first): only the sectors before the cut are new,
+        // in any order the disk took them.
+        for copy_first in [true, false] {
+            for sectors in 0..ROOM / 512 {
+                for from_end in [false, true] {
+                    let disk = fresh(&old);
+                    let (whole, part) = if copy_first { (None, ROOM) } else { (Some(ROOM), 0) };
+                    if let Some(copy) = whole {
+                        disk.write_all_at(&wrote[copy..copy + ROOM], AT + copy as u64).unwrap();
+                    }
+                    let range = if from_end { ROOM - 512 * sectors..ROOM } else { 0..512 * sectors };
+                    let at = part + range.start;
+                    disk.write_all_at(&wrote[at..part + range.end], AT + at as u64).unwrap();
+                    let read = Record::read(&path).unwrap().unwrap();
+                    assert!(read == old || read == new, "cut at {copy_first} {sectors} {from_end}");
+                }
+            }
+        }
+        // As an older kithd wrote it: the text alone, in one copy.
+        let disk = fresh(&old);
+        disk.write_all_at(&vec![0; 2 * ROOM], AT).unwrap();
+        let text = old.text();
+        let unsummed: String = text.lines().filter(|line| !line.starts_with("sum: ")).map(|line| format!("{line}\n")).collect();
+        disk.write_all_at(unsummed.as_bytes(), AT).unwrap();
+        assert_eq!(Record::read(&path), Ok(Some(old.clone())));
+        // Both copies damaged: said, not taken as no record.
+        disk.write_all_at(b"kith-lock v1\nsum: 00\nsecret: 07", AT).unwrap();
+        disk.write_all_at(b"kith-lock v1\nsum: 00\nsecret: 07", AT + ROOM as u64).unwrap();
+        assert!(Record::read(&path).unwrap_err().contains("damaged"));
+        std::fs::remove_file(&path).unwrap();
+    }
+
     #[test]
     fn crypt_records_are_read_as_written() {
         let record = Record {
@@ -2415,11 +2493,14 @@ mod tests {
         assert_eq!(Record::parse(b"kith-lock v2\nsecret: 00\n"), None);
         assert_eq!(Record::parse(b"kith-lock v1\nsecret: 0707\n"), None);
         assert_eq!(Record::parse(b"kith-lock v1\nsecret: zz\n"), None);
-        // On a disk, a record that begins as one and is not one is an error, not a plain state.
+        // On a disk, a record that begins as one and is not one, nor is its copy, is an error,
+        // not a plain state; one whose copy is whole is the copy.
         disk.write_all_at(b"kith-lock v1\nsecret: zz\n\0", AT).unwrap();
         let path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&disk));
+        assert_eq!(Record::read(Path::new(&path)).unwrap().unwrap().tpm, held.tpm);
+        disk.write_all_at(b"kith-lock v1\nsecret: zz\n\0", AT + ROOM as u64).unwrap();
         assert!(Record::read(Path::new(&path)).is_err());
-        disk.write_all_at(&[0; ROOM], AT).unwrap();
+        disk.write_all_at(&[0; 2 * ROOM], AT).unwrap();
         assert_eq!(Record::read(Path::new(&path)), Ok(None));
         // Erased: a record that was there is zeros, as read back.
         many.write(&disk, AT).unwrap();
