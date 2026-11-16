@@ -54,6 +54,9 @@ tar = { version = "0.4", default-features = false }
 # The blob store's names. `pure`: no C or assembly to build for musl.
 blake3 = { version = "1", default-features = false, features = ["pure", "std"] }
 sha2 = "0.11"
+# The TPM's sessions encrypt what crosses its bus in AES-128-CFB (tpm.rs): ring has no AES
+# block alone. The block cipher only; CFB is a few lines in tpm.rs.
+aes = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 # (A clock a test owns: the waiting console answers at a fixed time.)

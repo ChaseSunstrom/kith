@@ -472,6 +472,8 @@ spec:
   (`--mesh`), so every node reaches it and Services send to it. What it asks outside
   the cluster leaves from behind its node's address. It is told this node's DNS, with
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+  A pod's names outside the cluster are asked of its node's resolvers: they need a resolver
+  on the node (in `/etc/resolv.conf`) or `--dns-upstream`, and `--dns` is not needed for them.
   The IPv4 address only its node knows is taken from `100.88.0.0/16` unless that node's
   kithd is told another with `--pod-range ADDRESS/BITS` (or `KITH_POD_RANGE`; on kith OS
   after ` -- ` on the kernel command line or in `boot.args` of the config partition), for a
@@ -1346,8 +1348,9 @@ spec:
   tag. The artifact is one blob (the package's files) and a signature
   (Ed25519, over the package's name, version and the blob's SHA-256) as the
   annotation `dev.kith.signature`.
-- For a Release that names a Repository, the node that leads the store asks
-  the registry for the versions, fetches the newest that fits, checks it
+- For a Release that names a Repository (applied by someone who may `apply`
+  Packages: without that right nothing is fetched, and the Release's status
+  says so), the node that leads the store asks the registry for the versions, fetches the newest that fits, checks it
   against the Repository's `publicKey` and stores it as a Package (annotated
   `kith.dev/repository`); the Release installs only Packages from its
   Repository. A package that is unsigned or signed with another key is
@@ -2921,7 +2924,8 @@ the other, so the system that runs is never the one being changed:
    each time it starts the slot (`+2-1`, `+1-2`, `+0-3`).
 3. A slot that comes up, and whose kithd is still running ten seconds later,
    is marked good: the counter is dropped and the console says
-   `slot b is good`.
+   `slot b is good`. On a node whose state is encrypted the ten seconds start
+   when the state is open, not while it waits for its key.
 4. A slot that does not (a root its verity tree refuses, a kithd that cannot
    start) is restarted until its tries are gone. The boot loader then starts
    the slot that worked, and kithd says so on each start:
@@ -3471,9 +3475,11 @@ its seal when it hears of it.
 What the seal does not cover: a machine taken whole and started as it is
 opens its state by itself, and no lock reaches it until it hears its cluster
 again; what stands between whoever holds it and its state is then the running
-system alone. Nor a system taken while it runs, nor a TPM chip whose pins are
-probed while the machine starts (the key crosses its bus as it is), nor a
-machine with no TPM. It has run against a software TPM only, never on a real
+system alone. Nor a system taken while it runs, nor a machine with no TPM.
+The key crosses the TPM chip's bus encrypted, to the storage key whose name
+the seal keeps, so probing the chip's pins reads nothing; but someone on the
+bus when the seal was made, or who resets the TPM and replays an allowed
+start's measurements, can still get it (SECURITY.md). It has run against a software TPM only, never on a real
 one.
 
 **A passphrase.** For a machine with no TPM, or whose owner will not have

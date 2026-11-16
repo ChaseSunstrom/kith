@@ -280,6 +280,21 @@ fn main() {
                 writeln!(out, "{line}").expect("a line out");
             }
         }
+        // NAME...: the addresses this container's resolver gives each (what /etc/resolv.conf
+        // says), on stdout, sorted; what it says when it gives none.
+        ["lookup", names @ ..] if !names.is_empty() => {
+            for name in names {
+                match std::net::ToSocketAddrs::to_socket_addrs(&(*name, 0)) {
+                    Ok(found) => {
+                        let mut ips: Vec<String> = found.map(|addr| addr.ip().to_string()).collect();
+                        ips.sort();
+                        ips.dedup();
+                        println!("{name}: {ips:?}");
+                    }
+                    Err(e) => println!("{name}: failed: {e}"),
+                }
+            }
+        }
         ["seen", dir, hears @ ..] if hears.len() < 2 => {
             if let [socket] = hears {
                 let _ = std::fs::remove_file(socket);
@@ -521,6 +536,6 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked]"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked]"),
     }
 }

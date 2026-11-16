@@ -39,6 +39,9 @@
 # KITH_COMPARE_RAW names another file for the rows (to try the script out).
 # KITH_COMPARE_ONLY (with it) names the workloads to run alone when a change is tried out
 # (ci/compare_workloads.py says which): one system, no node lost, rows for no table.
+# ci/stress.sh uses that with KITH_COMPARE_WORKLOADS (another adapter, run in place of
+# ci/compare_workloads.py) and KITH_COMPARE_RESTART (the first node is stopped as its power
+# button stops it, started again on its disk, and the adapter run once more as `after`).
 #
 # ponytail: one machine shape, three nodes, three runs: enough to say which is bigger and
 # by about how much, not a benchmark. More nodes and more load when someone needs them.
@@ -253,7 +256,7 @@ since() { echo "$(date +%s.%N) $1" | awk '{ printf "%.1f", $1 - $2 }'; } # secon
 workloads() { # kith|k3s, and the wait for a lost node or nothing
     [ -z "${2:-}" ] || return 0
     note "$1: the workloads"
-    NODE_CPUS=2 python3 "$root/ci/compare_workloads.py" "$1" || fail "the workloads did not all run on $1"
+    NODE_CPUS=2 COMPARE_WORK=$work python3 "${KITH_COMPARE_WORKLOADS:-$root/ci/compare_workloads.py}" "$1" || fail "the workloads did not all run on $1"
 }
 
 # ---- kith: three kith OS nodes -------------------------------------------------------
@@ -266,9 +269,10 @@ kith() { # the wait for a lost node, or nothing
     more=${1:+--lost-after $1}
     node() { # N [kithd's further arguments]
         # (A disk of 8 GB, as the Alpine machines have: the node's state grows to it.)
-        cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && truncate -s 8G "$work/n$1.raw"
+        # (A node started again is on the disk it had.)
+        [ -f "$work/n$1.raw" ] || { cp "$root/target/os/kith-os.raw" "$work/n$1.raw" && truncate -s 8G "$work/n$1.raw"; }
         # shellcheck disable=SC2046
-        machine "$1" -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" $(lan "$1") \
+        machine "$1" -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -qmp "unix:$work/n$1.qmp,server=on,wait=off" $(lan "$1") \
             -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 --mesh 51820 $more ${2:-}"
     }
@@ -339,13 +343,26 @@ EOF
         api call DELETE "/v1/resources/Workload/default/a$i" >/dev/null || fail "a$i was not deleted"
     done
     applied=$(middle <"$work/applies")
-    more=$(workloads kith "${1:-}")
+    said=$(workloads kith "${1:-}")
     # (What the image's file holds by now, not the size it was made: the state it wrote too.)
     disk=$(du -m "$work/n1.raw" | cut -f 1)
 
     # (A change tried out, some workloads alone: no node is lost for it, and the row is for no table.)
     if [ -n "${KITH_COMPARE_ONLY:-}" ]; then
-        echo "kith tried $more" >>"$raw"
+        # (The adapter says `stop` and then `after` with what it printed before; a run that
+        # ended in a limit has its machines left as they are.)
+        if [ -n "${KITH_COMPARE_RESTART:-}" ]; then
+            case $said in
+            *'"limit"'*) ;;
+            *)
+                said=$(NODE_CPUS=2 COMPARE_WORK=$work python3 "$KITH_COMPARE_WORKLOADS" stop "$said") || fail "the first node was not stopped"
+                node 1
+                API_EVERY=0.5 api wait 900 /v1/resources/Node/n1 '(j.get("status") or {}).get("state") == "ready"' >/dev/null || fail "the first node did not become ready again"
+                said=$(NODE_CPUS=2 COMPARE_WORK=$work python3 "$KITH_COMPARE_WORKLOADS" after "$said") || fail "the adapter's second part failed"
+                ;;
+            esac
+        fi
+        echo "kith tried $said" >>"$raw"
         note "kith: $(tail -n 1 "$raw")"
         return 0
     fi
@@ -359,7 +376,7 @@ EOF
     lose "${on#n}"
     gone=$(LOST=$on API_EVERY=0.5 api wait 1200 /v1/resources/Workload/default/move \
         '(j["status"].get("ready") == 1) and os.environ["LOST"] not in j["status"]["nodes"].values()') || fail "the replica of the lost node $on ran nowhere else"
-    echo "kith ${1:-default} control=$control worker=$worker apply=$applied lost=$gone boot=$boot ready=$ready disk=$disk $more" >>"$raw"
+    echo "kith ${1:-default} control=$control worker=$worker apply=$applied lost=$gone boot=$boot ready=$ready disk=$disk $said" >>"$raw"
     note "kith: $(tail -n 1 "$raw")"
 }
 

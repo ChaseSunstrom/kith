@@ -805,8 +805,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.
-  - What a Release reads to render is not asked for: a Package of a Repository that is
-    there, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - What a Release reads to render is not asked for: a Package that is in the cluster
+    already, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - kithd fetches a Package from a Repository for a Release only when the Release's
+    writer has `apply` on `Package`, the right a pull or push by hand takes; the
+    Release's status says so when it has not. The right is on Packages, which are in
+    no namespace, so a Role that names namespaces does not give it; and it is not on
+    one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
   - An Identity deleted and made again under the same name is the same writer: what
@@ -892,10 +897,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   15) is refused the key and asks the cluster. The boot file is not signed for Secure
   Boot: a changed one starts, and is refused the key. Taken whole and started as it is, it
   opens by itself: no lock reaches a machine that does not hear its cluster. The key
-  crosses the TPM's bus as it is (a chip's pins can be probed while the machine
-  starts); after a start the TPM refused, the node seals again for whatever system
-  the cluster then handed the key to; and all of it has run against a software TPM
-  only.
+  crosses the TPM's bus encrypted, in a session salted to the TPM's storage key, whose
+  name is kept in the lock record (`tpm-parent:`) and checked before any salt or secret
+  is sent, so whoever only listens on the chip's pins reads no key, and a TPM that is not the
+  one sealed to is refused. What the session does not stop: someone on the bus when
+  the seal was made (they could answer with a key of their own, whose name is then the
+  one kept; a seal of the older form, with no name kept, is opened and sealed again
+  with whichever key answers), whoever can write both the bus and the lock record,
+  and someone who resets the TPM on its bus and replays the measurements of an
+  allowed start, then asks it for the key themselves. After a start the TPM refused,
+  the node seals again for whatever system the cluster then handed the key to. A node
+  taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
+  seal trusts the bus once again. And all of it has run against a software TPM only.
 - **The offline unlock gives up that the key is not on the machine.** A node that
   opens its encrypted state with no node in reach has its key on its own disk again:
   sealed to its TPM (above), or, with `kith node passphrase` (off unless one is given),
@@ -909,6 +922,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is kept by neither, nor by the store or the audit log; it is in kithd's memory on
   both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
   disk keeps of sectors it has replaced is not kith's to say.
+- **An update on a node whose state is encrypted is good only once the state is open.**
+  A new system is on trial for three starts, and is marked good ten seconds after kithd
+  has the node's state to use: on an encrypted node, after its key came (from its TPM,
+  the cluster, a recovery key or a passphrase), however long that took. So a new system
+  that can never open the state is not kept. And so a node on trial that is kept from
+  its key (no seal, and its cluster out of reach) and is restarted three times while it
+  waits goes back to the system it ran before, which then waits for the key the same
+  way. Nothing is lost by that but the update: its plan is paused, as for any release a
+  node came back from, until the release is changed or another is given. (T-0572.)
 - **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
   node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
   makes one), it writes zeros over the node's lock record (the disk's secret, and what

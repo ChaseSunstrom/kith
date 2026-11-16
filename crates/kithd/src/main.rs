@@ -644,6 +644,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             None => rt.block_on(key)?,
         });
     }
+    // (From here the node has its state: a slot on trial may be marked good.)
+    init::STATE_OPEN.notify_one();
     let state = args
         .state
         .clone()
