@@ -266,15 +266,30 @@ fn published(shared: &Shared) -> BTreeMap<(bool, u16), String> {
 /// Pass what comes to `port` of this node on to the pod `id`, until told to stop.
 async fn relay(shared: Arc<Shared>, id: String, (udp, port): (bool, u16)) {
     let at = std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-    let done = match udp {
-        true => datagrams(&shared, &id, at).await,
-        false => connections(&shared, &id, at).await,
-    };
-    if let Err(e) = done {
-        eprintln!("kithd: pod {id}: publishing port {port}: {e}");
+    let mut said = false;
+    loop {
+        let done = match udp {
+            true => {
+                let to_pod = || {
+                    inside(&shared, &id, || {
+                        let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+                        socket.connect((Ipv4Addr::LOCALHOST, port))?;
+                        Ok(socket)
+                    })
+                };
+                datagrams(at, to_pod).await
+            }
+            false => connections(&shared, &id, at).await,
+        };
+        if let Err(e) = done
+            && !std::mem::replace(&mut said, true)
+        {
+            eprintln!("kithd: pod {id}: publishing port {port}: {e}; tried again every two seconds");
+        }
+        // (The port's last relay, stopped a moment ago, may hold it yet; or something not
+        // kithd's does.)
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-    // (Not tried again until the pod, or what it publishes, changes.)
-    std::future::pending::<()>().await
 }
 
 /// At most this many connections, or senders, a published port at once.
@@ -306,33 +321,39 @@ async fn connections(shared: &Arc<Shared>, id: &str, at: std::net::SocketAddr) -
     }
 }
 
-async fn datagrams(shared: &Arc<Shared>, id: &str, at: std::net::SocketAddr) -> std::io::Result<()> {
+/// Pass each datagram to `at` on through a socket `to_pod` makes, one per sender, and its
+/// answers back.
+async fn datagrams(
+    at: std::net::SocketAddr,
+    to_pod: impl Fn() -> std::io::Result<std::net::UdpSocket>,
+) -> std::io::Result<()> {
     let outside = Arc::new(tokio::net::UdpSocket::bind(at).await?);
-    // Per sender, a socket of the pod's own, which takes the answers back to it.
-    let mut senders: BTreeMap<std::net::SocketAddr, (Arc<tokio::net::UdpSocket>, tokio::task::JoinHandle<()>)> =
+    // Per sender, a socket of the pod's own, which takes the answers back to it. (Its task
+    // is this one's: stopped with it, which lets go of the port at once.)
+    let mut senders: BTreeMap<std::net::SocketAddr, (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle)> =
         BTreeMap::new();
+    let mut answering = tokio::task::JoinSet::new();
     let mut buffer = vec![0; 65_536];
     loop {
         let Ok((length, from)) = outside.recv_from(&mut buffer).await else {
+            // (The socket's error: not asked again at once.)
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             continue;
         };
+        while answering.try_join_next().is_some() {}
         senders.retain(|_, (_, answers)| !answers.is_finished());
         let inner = match senders.get(&from) {
             Some((inner, _)) => inner.clone(),
             None if senders.len() >= AT_ONCE => continue,
             None => {
-                let made = inside(shared, id, || {
-                    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-                    socket.connect((Ipv4Addr::LOCALHOST, at.port()))?;
-                    socket.set_nonblocking(true).map(|()| socket)
-                });
+                let made = to_pod().and_then(|socket| socket.set_nonblocking(true).map(|()| socket));
                 let Ok(inner) = made.and_then(tokio::net::UdpSocket::from_std) else {
                     continue;
                 };
                 let inner = Arc::new(inner);
                 let (back, outside) = (inner.clone(), outside.clone());
                 // (A sender heard nothing from for a minute is forgotten.)
-                let answers = tokio::spawn(async move {
+                let answers = answering.spawn(async move {
                     let mut buffer = vec![0; 65_536];
                     let quiet = std::time::Duration::from_secs(60);
                     while let Ok(Ok(length)) = tokio::time::timeout(quiet, back.recv(&mut buffer)).await {
@@ -362,5 +383,53 @@ pub async fn names(
         Ok(sockets) => crate::dns::run(shared, sockets, upstreams, stopping).await,
         // (A `--dns` on every address has this one too.)
         Err(e) => eprintln!("kithd: no DNS of the pods' own: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A published UDP port stopped (its pod gone) is free at once for the pod made again,
+    /// though a sender's answers were still awaited.
+    #[tokio::test]
+    async fn a_udp_port_stopped_is_free_at_once() {
+        let pod = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let pod_at = pod.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 64];
+            while let Ok((length, from)) = pod.recv_from(&mut buffer) {
+                let _ = pod.send_to(&buffer[..length], from);
+            }
+        });
+        let at = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let to_pod = move || {
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+            socket.connect(pod_at).map(|()| socket)
+        };
+        let relay = tokio::spawn(datagrams(at, to_pod));
+        let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut buffer = [0; 64];
+        let answered = async {
+            loop {
+                sender.send_to(b"hello", at).await.unwrap();
+                let wait = std::time::Duration::from_millis(200);
+                if let Ok(Ok(length)) = tokio::time::timeout(wait, sender.recv(&mut buffer)).await {
+                    return length;
+                }
+            }
+        };
+        let length = tokio::time::timeout(std::time::Duration::from_secs(5), answered)
+            .await
+            .unwrap();
+        assert_eq!(&buffer[..length], b"hello");
+        relay.abort();
+        let _ = relay.await;
+        tokio::net::UdpSocket::bind(at)
+            .await
+            .expect("the port is free once its relay is stopped");
     }
 }
