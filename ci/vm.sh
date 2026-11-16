@@ -18,6 +18,9 @@
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
+#                               (one node's pod range is not the default: --pod-range)
+#   sh ci/vm.sh --test poddns   two nodes on the mesh: a pod of a node with no --dns finds a name outside
+#                               the cluster through its node's upstream, a second kithd with its own
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
@@ -110,7 +113,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test pods      instead: two nodes on the mesh with ci/pod.rs as a container image
                    already there: three pods of one Workload (so two on one node) each
                    listen on port 80 as root, write to their root and have an address
-                   of their own; a pod of a user who is not root finds their Service
+                   of their own (the second node's from --pod-range 10.77.0.0/20, the
+                   first's from the default 100.88.0.0/16, each told by its pods which);
+                   a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
                    writes to /dev/stdout by name; a pod that is root is kept from a
@@ -125,6 +130,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
                    KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
+  --test poddns    instead: two nodes on the mesh, the first started without --dns but with
+                   --dns-upstream the second, which serves DNS too and forwards what it does
+                   not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
+                   on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
+                   starts neither with an upstream: the control, where the name is not found
   --test services  instead: one node on the mesh with ci/pod.rs as a container image
                    already there: a pod that sends back every byte it is sent, its
                    Service, and a Job on the same node sending through that Service
@@ -202,7 +212,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | services | kube | worker | chaos | access | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, services, kube, worker, chaos, access, tunnel" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos | access | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos, access, tunnel" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -238,7 +248,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = tunnel ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = tunnel ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -265,7 +275,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         # worker: two, on the mesh; services: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = tunnel ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = tunnel ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
         # (tunnel: one node, whose card out reaches nothing but this machine's forwards, to
@@ -295,22 +305,21 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
                 echo '{}' >"$image/config.json"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
-                if [ "$test" != share ]; then
-                    # And what those tests' pods run (ci/pod.rs), as an image that names no
-                    # user, as one that names a user who is not root, and as two that say
-                    # what to start (an image nothing more is said of, as a chart has one).
-                    rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
-                    digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
-                    image=$work/seed/runtime/images/$digest
-                    mkdir -p "$image/rootfs/bin"
-                    cp "$work/pod" "$image/rootfs/bin/pod"
-                    echo '{}' >"$image/config.json"
-                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
-                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
-                    for tag in serve again; do
-                        printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
-                    done
-                fi
+                # And what those tests' pods run (ci/pod.rs), as an image that names no user,
+                # as one that names a user who is not root, and as two that say what to start
+                # (an image nothing more is said of, as a chart has one). (share: what a
+                # container's ids are, and what it sees of files.)
+                rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
+                digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
+                image=$work/seed/runtime/images/$digest
+                mkdir -p "$image/rootfs/bin"
+                cp "$work/pod" "$image/rootfs/bin/pod"
+                echo '{}' >"$image/config.json"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
+                for tag in serve again; do
+                    printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
+                done
                 if [ "$test" = pods ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
                     # pod, for a user who is not root: a sandbox started inside a container.
@@ -436,7 +445,16 @@ EOF
 
         # Nobody can log in to these nodes: the first says a token on its console, and
         # who sends it back is the cluster's admin; the others join with tokens it asks for.
-        node 1 --claim
+        # (poddns: the first node asks the second for names it does not know, and the second asks an
+        # outside resolver on this machine; KITH_POD_NOUPSTREAM=1 gives both an upstream that answers
+        # nothing, the control. Neither asks the network out there.)
+        first='' joined=''
+        if [ "$test" = poddns ]; then
+            first='--dns-upstream 10.9.0.2:5353'
+            joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))"
+            [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
+        fi
+        node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
             && [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' -d '{"token":"x","name":"root"}' "https://127.0.0.1:$((port + 1))/v1/claim")" = 403 ]; do
@@ -453,7 +471,10 @@ EOF
             asks=/v1/tokens
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
-            node "$n" "--join 10.9.0.1:7443 --token $join"
+            # (pods: the second node takes its pods' addresses from another range than the first's.)
+            range=''
+            [ "$test$n" != pods2 ] || range='--pod-range 10.77.0.0/20'
+            node "$n" "--join 10.9.0.1:7443 --token $join $range ${joined:-}"
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
         # what it says" (`none` for a unit with no address of its own).
@@ -474,6 +495,45 @@ for r in found:
         print(ready, status.get("state", "-"), *sorted(u.get("address", "none") for u in units), *said)
 ' "$1" "$2"
         }
+        if [ "$test" = poddns ]; then
+            # The outside resolver is this machine's (ci/outside-dns.py): what the second node asks
+            # for a name no node knows. The first node's pods ask the second, which has no such name.
+            # (A SERVFAIL, when an upstream did not answer in time, is "Try again" to the pod, and musl
+            # does not retry it: so the Job may run again (`retries`), up to the deadline below.)
+            python3 "$root/ci/outside-dns.py" $((port + 9)) >/dev/null 2>"$work/outside-dns.log" &
+            vms="$vms $!"
+            sleep 1
+            # The second node's DNS is up once it says so: until then node 1 asks a port nothing
+            # listens on and the pod gets SERVFAIL ("Try again"), so the Job waits for that line.
+            waited=0
+            until grep -aq 'serving DNS on 0.0.0.0:5353' "$work/n2.log" 2>/dev/null; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 180 ] || fail "the second node did not serve DNS: $(tail -n 3 "$work/n2.log" 2>/dev/null)"
+                sleep 1
+            done
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"lookup"},"spec":{"retries":4,"template":{"pod":true,"containers":[
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","lookup","outside.example.test"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job lookup was not applied"
+            waited=0
+            until line=$(units Job lookup) && case $line in *' succeeded'* | *' failed'*) true ;; *) false ;; esac; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 240 ] || fail "waited for the Job lookup; it says: $line"
+                sleep 1
+            done
+            any GET "/v1/logs/Job/default/lookup" >"$work/lookup.out" || fail "what the Job lookup wrote could not be read"
+            echo "vm.sh: the Job lookup: $line; its pod wrote: $(cat "$work/lookup.out")" >&2
+            if [ "${KITH_POD_NOUPSTREAM:-}" = 1 ]; then
+                grep -q 'outside.example.test: failed' "$work/lookup.out" || fail "the control found a name with no upstream: $(cat "$work/lookup.out")"
+                echo "vm.sh: ok: control: with an upstream that answers nothing, a pod did not find outside.example.test" >&2
+                exit 0
+            fi
+            # (What the Job wrote comes back as JSON, so the quotes around the address are \" in it.)
+            grep -Fq 'outside.example.test: [\"198.51.100.7\"]' "$work/lookup.out" || fail "the pod did not find outside.example.test through its node's upstream: $(cat "$work/lookup.out") (the outside resolver's stderr: $(cat "$work/outside-dns.log"))"
+            echo "vm.sh: ok: a pod of a node started without --dns found outside.example.test (198.51.100.7) through its node's upstream, a second kithd, which asked an outside resolver" >&2
+            exit 0
+        fi
         if [ "$test" = worker ]; then
             monitor() { echo "$2" | socat - "unix-connect:$work/keys$1" >/dev/null; } # N COMMAND
             # What listens on port 80 of node N's own network says (the word of the Secret it
@@ -889,9 +949,12 @@ EOF
             asks() {
                 name=$1
                 shift
+                # ($pinned: a Volume that puts the Job on its node.)
+                mounts=''
+                [ -z "${pinned:-}" ] || mounts=",\"volumeMounts\":[{\"volume\":\"$pinned\",\"path\":\"/state\"}]"
                 cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$name"},"spec":{"retries":0,"template":{"pod":true,"containers":[
-  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]}]}}}]
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]$mounts}]}}}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $name was not applied"
                 waited=0
@@ -912,6 +975,37 @@ EOF
             for heard in web-0 web-1 web-2 'HTTP/1.0 200 OK'; do
                 grep -q "$heard" "$work/ask.out" || fail "the pod that asked did not hear $heard: $(cat "$work/ask.out")"
             done
+            # A pod on each node (a Volume of its node puts it there) says where it asks for
+            # names and from which address: the first node's in 100.88.0.0/16 (the default),
+            # the second's in the range that node was told (--pod-range).
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n1"},"spec":{"node":"n1","path":"pod"}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n2"},"spec":{"node":"n2","path":"pod"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the volumes that put a pod on each node were not applied"
+            for side in n1 n2; do
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"at-$side"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","serve"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}},
+   "volumeMounts":[{"volume":"on-$side","path":"/state"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pod at-$side was not applied"
+                waited=0
+                until line=$(units Workload "at-$side") && [ "${line%% *}" = 1 ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for the pod at-$side to be ready; the Workload says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Workload/default/at-$side?replica=0" >"$work/at-$side.out" || fail "what the pod at-$side wrote could not be read"
+            done
+            grep -qE 'where: nameserver 100\.88\.0\.1 from 100\.88\.[0-9]+\.[0-9]+' "$work/at-n1.out" || fail "the pod on n1 is not in the default range: $(cat "$work/at-n1.out")"
+            grep -qE 'where: nameserver 10\.77\.0\.1 from 10\.77\.[0-9]+\.[0-9]+' "$work/at-n2.out" || fail "the pod on n2 is not in the range of --pod-range: $(cat "$work/at-n2.out")"
+            # And one pod on n2 asks this machine, from behind its node's address: the node
+            # sends it as its own only if the masquerade rule matches the range it was told.
+            pinned='on-n2'
+            asks egress 10.0.2.2 $((port + 9))
+            pinned=''
+            grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
             # A Workload of an image nothing else uses, deleted once it runs: its image is
             # looked for again at the end.
             cat >"$work/apply.json" <<EOF
@@ -959,12 +1053,13 @@ EOF
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
                 printf '%s\n' "$line" | grep -Eq "$4" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
             }
-            # What holds a container to its devices: a pod that is root may make device nodes,
-            # and makes /dev/null again and reads it; its node's own disk it may neither make
-            # nor read. (NAME, block or character, and where /sys has the device's numbers.)
+            # What holds a container to its devices: a pod that is root is root of a user
+            # namespace of its own on kith OS, where the kernel makes no device node, not even
+            # /dev/null again; its node's own disk it may neither make nor read. (NAME, block
+            # or character, and where /sys has the device's numbers.)
             makes() { job "$1" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"node\",\"$2\",\"$3\",\"/dev/made\"]" '^[0-9]+ succeeded'; }
             makes null c /sys/class/mem/null/dev
-            grep -q 'node: made 0, read Ok(0)' "$work/null.out" || fail "a pod that is root could not make /dev/null again and read it: $(cat "$work/null.out" "$work/null.err")"
+            grep -q 'node: made -1, read Err' "$work/null.out" || fail "a pod that is root made a device node in a user namespace of its own: $(cat "$work/null.out" "$work/null.err")"
             makes disk b /sys/class/block/vda/dev
             grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
 
@@ -1106,7 +1201,7 @@ EOF
             grep -ah 'kithd: .*image' "$work"/n?.log | tr -d '\r' | sed 's/^/vm.sh: /' >&2
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh and its IPv4 one from its node's range (the second node's from --pod-range, the first's the default; a pod on each said which at its node's DNS), each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
             exit 0
         fi
         if [ "$test" = kube ]; then
@@ -1363,10 +1458,11 @@ EOF
             }
             refused() { # NAME FILE: the Job failed because FILE was there already
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
-                grep -q "/data/$2: File exists" "$work/$1.err" || fail "the Job $1 did not fail for /data/$2 being there: $(cat "$work/$1.err")"
+                grep -q "/data/$2: File exists" "$work/$1.err" || fail "the Job $1 did not fail for /data/$2 being there: $(cat "$work/$1.err"); it says: $(job "$1")"
             }
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"data"},"spec":{"node":"n1","path":"all","shared":true}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"roots"},"spec":{"node":"n1","path":"all","shared":true}},
  {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on1"},"spec":{"node":"n1","path":"own"}},
  {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on2"},"spec":{"node":"n2","path":"own"}}]
 EOF
@@ -1376,7 +1472,7 @@ EOF
             run write on2 from-n2
             until_job write succeeded
             grep -aq 'kithd: mounted volume default/data from node n1' "$work/n2.log" || fail "the second node did not say it mounted the volume"
-            grep -aq 'kithd: serving 1 shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
+            grep -aq 'kithd: serving [0-9]* shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
             run again on1 from-n2
             until_job again failed
             refused again from-n2
@@ -1405,6 +1501,80 @@ EOF
             user root 0
             until_job root succeeded
 
+            # A container on the node's network keeps the node's users (a port it serves is
+            # under 1024 as often as not, and no capability of a user namespace reaches that
+            # network), and the node's ports under 1024 stay its root's.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"node-ids"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","ids","=/proc/sys/net/ipv4/ip_unprivileged_port_start"],"runAsUser":0,
+   "volumeMounts":[{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job node-ids was not applied"
+            until_job node-ids succeeded
+            said=$(any GET /v1/logs/Job/default/node-ids | field data) || fail "what the Job node-ids said could not be read"
+            printf '%s\n' "$said" | grep -q '^ids: map 0 0 4294967295$' || fail "a container on the node's network did not keep the node's users: $said"
+            printf '%s\n' "$said" | grep -q '^ids: =/proc/sys/net/ipv4/ip_unprivileged_port_start holds Ok("1024")$' || fail "the node's ports under 1024 are not its root's alone: $said"
+
+            # A pod's root is not the node's: its ids are a range of the node's of its own (two
+            # running at once never share one), the node's own files (its /sys) are nobody's
+            # to it, a file there only the node's root opens does not open, and port 80 of its
+            # own network is still its to bind. Its
+            # volume's files are owned on disk as before: read on the second node through NFS
+            # (which takes no id-mapped mount: that container keeps the node's users, and says
+            # so), what containers on the first made is root's, or nobody's, as they were. (Root
+            # writes a volume of its own: the Jobs made data nobody's, and a Workload's root has
+            # no capability to write what is another's.)
+            sees() { # NAME REPLICA UNTIL: what a replica of the Workload said, once it said UNTIL
+                waited=0
+                until said=$(any GET "/v1/logs/Workload/default/$1?replica=$2" 2>/dev/null | field data) && printf '%s\n' "$said" | grep -q "$3"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "replica $2 of the Workload $1 did not say what it sees: $said"
+                    sleep 1
+                done
+                printf '%s\n' "$said"
+            }
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ids"},"spec":{"replicas":2,"template":{"pod":true,"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays",":80","/sys","root-only","+/roots/by-root"],"runAsUser":0,
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots"},{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload ids was not applied"
+            range() { # REPLICA: the first id of its range
+                said=$(sees ids "$1" '^ids: +/roots/by-root /') || exit 1
+                printf '%s\n' "$said" | grep -q '^ids: :80 binds Ok(())$' || fail "a pod's root did not bind port 80 of its own network: $said"
+                printf '%s\n' "$said" | grep -q '^ids: /sys /sys owner 65534 opens Ok' || fail "the node's /sys is not nobody's to a container: $said"
+                printf '%s\n' "$said" | grep -q '^ids: root-only /sys/.* owner 65534 opens Err(PermissionDenied)' || fail "a container's root opened a file only the node's root does: $said"
+                printf '%s\n' "$said" | grep -q '^ids: +/roots/by-root /roots/by-root owner 0 opens Ok' || fail "a container's root did not make a file of its own in its volume: $said"
+                printf '%s\n' "$said" | sed -n 's/^ids: map 0 \([0-9]*\) 65536$/\1/p' | grep -E '^[1-9][0-9]{4,}$' || fail "replica $1 of the Workload ids has no range of its own: $said"
+            }
+            first=$(range 0) || exit 1
+            second=$(range 1) || exit 1
+            [ "$first" -ge 65536 ] && [ "$second" -ge 65536 ] && [ "$first" != "$second" ] || fail "two containers have the ranges $first and $second"
+            echo "vm.sh: two containers' ids start at $first and $second of the node's" >&2
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"owners"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays","/roots/by-root","/data/from-n1","/data/from-n2"],
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots","readOnly":true},{"volume":"on2","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload owners was not applied"
+            said=$(sees owners 0 '^ids: /data/from-n2 ') || exit 1
+            for made in roots/by-root:0 data/from-n1:65534 data/from-n2:65534; do
+                printf '%s\n' "$said" | grep -q "^ids: /${made%:*} /${made%:*} owner ${made#*:} opens Ok" || fail "/${made%:*} is not ${made#*:}'s on disk: $said"
+            done
+            printf '%s\n' "$said" | grep -q '^ids: map 0 0 4294967295$' || fail "a container with a volume through NFS did not keep the node's users: $said"
+            any GET /v1/resources >"$work/all.json" || fail "the resources could not be read"
+            python3 - "$work/all.json" <<'EOF' || fail "the units do not say whose users they have: $(cat "$work/all.json")"
+import json, sys
+
+found = json.load(open(sys.argv[1]))
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+said = {r["metadata"]["name"]: [c.get("hostUsers") for c in (r.get("status") or {}).get("containers", [])] for r in found if r["kind"] == "Workload"}
+sys.exit(0 if said.get("ids") == [False, False] and said.get("owners") == [True] else 1)
+EOF
+            for made in ids owners; do
+                any DELETE "/v1/resources/Workload/default/$made" >/dev/null || fail "the Workload $made was not deleted"
+            done
+
             # From outside the mesh (this machine, through the node's other card) there is no
             # NFS server to talk to: it listens on the mesh address alone.
             python3 - "$((port + 5))" <<'EOF' || fail "the first node's NFS port answered an address outside the mesh"
@@ -1429,7 +1599,7 @@ EOF
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Shares were not applied"
             waited=0
-            until grep -aq 'kithd: serving 1 shared volume.*; 2 Share(s) to the addresses they name' "$work/n1.log"; do
+            until grep -aq 'kithd: serving [0-9]* shared volume.*; 2 Share(s) to the addresses they name' "$work/n1.log"; do
                 waited=$((waited + 1))
                 [ "$waited" -lt 60 ] || fail "the first node did not say it serves the Shares"
                 sleep 1
@@ -1502,7 +1672,7 @@ EOF
             ! dd if="$work/n2.raw" bs=512 skip="$state_start" count="$state_sectors" status=none | grep -aq kith-volume || fail "the encrypted volume's file system is in the clear on its node's disk"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there; a pod's root was not the node's (two at once had ranges of ids of their own, the node's /sys was nobody's to them, a file only the node's root opens did not open, and each bound port 80 of its own network) while a container on the node's network kept the node's users and the node's ports under 1024 stayed its root's, and what containers made in a volume was owned on disk as before"
             exit 0
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "

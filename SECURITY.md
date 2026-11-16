@@ -138,6 +138,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   `no_new_privs`, on a read-only image, behind a seccomp filter that refuses some forty
   system calls: mounting, new namespaces, loading modules, bpf, perf, io_uring, keyrings,
   another process's memory, the clock. An image that names root as its user gets nobody.
+  On kith OS a pod's container (a network namespace of its own) is a user namespace whose
+  ids 0 to 65535 are a range of the node's ids no other container has, so its root
+  (`runAsUser: 0`) is not the node's root: a root-only file of the node is not its, and
+  its capabilities count only for what is its namespace's (not even the pod's network,
+  which the node's root made: any port there is anyone's, as kith-mesh sets it per pod).
+  Its image and its volumes are mounted id-mapped, so owners on disk are what they were.
+  Not shifted, and so the node's users as before: a container on the node's network (its
+  ports below 1024 would need the node's to be anyone's, and they stay root's), a
+  NodeWorkload's, one given devices, and one with its image or a volume on a file system
+  that takes no id-mapped mount (a volume of another node, over NFS); `hostUsers` in its
+  status says which. A `runAsUser` of 65536 or more is refused for a shifted one. Its
+  `/sys` is the node's, bound in, as a user namespace may mount no other.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
   and nothing in its `/proc` is covered; it is refused to a container that is the node's
@@ -369,11 +381,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   unconfined: true }`, `pod: true`, `userNamespaces: true`. That last gives a user who is
   not root the kernel's code for a namespace's root (mounting, a network of its own),
   where much of what has made a user the node's root was found; the other refused calls
-  stay refused inside. On kith OS there is no user namespace, so `runAsUser: 0`
-  there is the node's root with three capabilities, and root in a pod is the node's root
-  with fourteen (T-0280). One of the fourteen makes device nodes; the device filter on
-  the pod's cgroup is what keeps it from the node's disks. Containers that are not pods
-  share the node's network, and an
+  stay refused inside. On kith OS a pod's container is a user namespace of its own, so
+  its root, with fourteen capabilities, is not the node's; but in one that keeps the
+  node's users (one on the node's network, a NodeWorkload's, one given devices, one with
+  a volume of another node) `runAsUser: 0` is the node's root with three capabilities,
+  and a pod's that keeps them has fourteen.
+  A user namespace is also more of the kernel to get wrong: a flaw in its code is a way
+  out that a container without one did not have. The root of a container's namespace
+  owns, in its id-mapped volumes, what the node's root owns there, as before. One of the
+  fourteen makes device nodes (in a pod that keeps the node's users: in a namespace of its
+  own the kernel makes it none); the device filter on the pod's cgroup is what keeps it
+  from the node's disks. Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
@@ -785,8 +803,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.
-  - What a Release reads to render is not asked for: a Package of a Repository that is
-    there, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - What a Release reads to render is not asked for: a Package that is in the cluster
+    already, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - kithd fetches a Package from a Repository for a Release only when the Release's
+    writer has `apply` on `Package`, the right a pull or push by hand takes; the
+    Release's status says so when it has not. The right is on Packages, which are in
+    no namespace, so a Role that names namespaces does not give it; and it is not on
+    one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
   - An Identity deleted and made again under the same name is the same writer: what
@@ -889,6 +912,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is kept by neither, nor by the store or the audit log; it is in kithd's memory on
   both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
   disk keeps of sectors it has replaced is not kith's to say.
+- **An update on a node whose state is encrypted is good only once the state is open.**
+  A new system is on trial for three starts, and is marked good ten seconds after kithd
+  has the node's state to use: on an encrypted node, after its key came (from its TPM,
+  the cluster, a recovery key or a passphrase), however long that took. So a new system
+  that can never open the state is not kept. And so a node on trial that is kept from
+  its key (no seal, and its cluster out of reach) and is restarted three times while it
+  waits goes back to the system it ran before, which then waits for the key the same
+  way. Nothing is lost by that but the update: its plan is paused, as for any release a
+  node came back from, until the release is changed or another is given. (T-0572.)
 - **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
   node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
   makes one), it writes zeros over the node's lock record (the disk's secret, and what

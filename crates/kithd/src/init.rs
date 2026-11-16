@@ -431,6 +431,18 @@ pub struct Boot {
     pub sealed: Option<(crate::crypt::Record, std::path::PathBuf)>,
 }
 
+/// Told once this node has its state to use: at once where it is not encrypted, and where
+/// it is, when it has been opened (crypt.rs), however long the key takes to come.
+pub static STATE_OPEN: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Wait for `open`, then `wait` more. A system that cannot open the node's state is not a
+/// good one: marked good while it waited for a key, the boot loader would never go back to
+/// the one that could (T-0572).
+async fn state_then(open: &tokio::sync::Notify, wait: std::time::Duration) {
+    open.notified().await;
+    tokio::time::sleep(wait).await;
+}
+
 impl Boot {
     /// Ask for as long as kithd runs (it serves meanwhile). Call inside the runtime.
     pub fn network(self) {
@@ -448,11 +460,12 @@ impl Boot {
             tokio::spawn(crate::dhcp::keep(card, self.name.clone(), got));
         }
         let Some(slot) = self.slot else { return };
-        // ponytail: good means kithd started and is still running a little later (one that
-        // cannot start ends, and the machine restarts, well within that). Whether the node
-        // is healthy in its cluster is the update plan's to judge (T-0073).
+        // ponytail: good means kithd started, has its state to use, and is still running a
+        // little later (one that cannot start ends, and the machine restarts, well within
+        // that). Whether the node is healthy in its cluster is the update plan's to judge
+        // (T-0073).
         tokio::spawn(async move {
-            tokio::time::sleep(GOOD).await;
+            state_then(&STATE_OPEN, GOOD).await;
             let said = tokio::task::spawn_blocking(move || crate::os::esp(|esp| crate::os::settle(slot, esp)));
             match said.await {
                 Ok(Ok(said)) => said.iter().for_each(|line| eprintln!("kithd: init: {line}")),
@@ -723,6 +736,25 @@ pub fn end(failed: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slot on trial is good only once the node has its state: however long it waits
+    /// for a key, the wait before it is marked good has not begun.
+    #[tokio::test]
+    async fn slot_is_good_only_after_the_state_is_open() {
+        let open = std::sync::Arc::new(tokio::sync::Notify::new());
+        let wait = std::time::Duration::from_millis(20);
+        let waiting = tokio::spawn({
+            let open = open.clone();
+            async move { state_then(&open, wait).await }
+        });
+        tokio::time::sleep(wait * 5).await;
+        assert!(!waiting.is_finished(), "good before the state is open");
+        open.notify_one();
+        tokio::time::timeout(wait * 50, waiting).await.unwrap().unwrap();
+        // (Opened before anything waits, as on a node whose state is not encrypted: the same.)
+        open.notify_one();
+        tokio::time::timeout(wait * 50, state_then(&open, wait)).await.unwrap();
+    }
 
     #[test]
     fn init_counts_a_file_systems_blocks() {

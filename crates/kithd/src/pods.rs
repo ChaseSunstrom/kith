@@ -53,6 +53,17 @@ pub struct Pods {
 /// Where the node keeps that it guards what it passes on, until it restarts.
 const GUARDED: &str = "/run/kith-pods";
 
+/// The range this node's pods get their addresses from (`--pod-range`), set once at start.
+static RANGE: std::sync::OnceLock<kith_mesh::pod::Range> = std::sync::OnceLock::new();
+
+pub fn set_range(range: kith_mesh::pod::Range) {
+    let _ = RANGE.set(range);
+}
+
+pub fn range() -> kith_mesh::pod::Range {
+    RANGE.get().copied().unwrap_or_default()
+}
+
 impl Pods {
     /// The pod `id` (of `namespace`, called `hostname`), made if it is not there yet.
     /// `net`: this node's /80 of the mesh, where there is a cluster. `exit`: the tunnel it
@@ -67,8 +78,9 @@ impl Pods {
         exit: Option<(u16, &[Ipv4Addr])>,
     ) -> Result<Given, String> {
         let failed = |e: std::io::Error| format!("the pod's network: {e}");
+        let range = range();
         if self.made.is_empty() {
-            let guarded = kith_mesh::pod::node(Path::new(GUARDED).exists(), &self.mesh).map_err(failed)?;
+            let guarded = kith_mesh::pod::node(range, Path::new(GUARDED).exists(), &self.mesh).map_err(failed)?;
             if guarded {
                 let _ = std::fs::write(GUARDED, "");
             }
@@ -81,16 +93,12 @@ impl Pods {
         }
         if !self.made.contains_key(id) {
             let taken: Vec<u16> = self.made.values().map(|pod| pod.number).collect();
-            let numbers = match exit {
-                Some(_) => kith_mesh::exit::PODS,
-                None => kith_mesh::pod::NUMBERS,
-            };
-            let number = numbers.into_iter().find(|number| !taken.contains(number));
+            let number = range.numbers().find(|number| !taken.contains(number));
             let number = number.ok_or("this node has no number left for another pod")?;
-            let (v4, v6) = kith_mesh::pod::addresses(net, number);
+            let (v4, v6) = kith_mesh::pod::addresses(range, net, number);
             let address = v6.map_or(IpAddr::V4(v4), IpAddr::V6);
             let dir = state.join("pods").join(id);
-            let gateway = kith_mesh::pod::GATEWAY;
+            let gateway = range.gateway();
             let resolv = match exit {
                 // (Asked through the tunnel, of its own DNS: never this node's, nor its cache.)
                 Some((_, dns)) => dns.iter().map(|server| format!("nameserver {server}\n")).collect(),
@@ -104,7 +112,7 @@ impl Pods {
                 .and_then(|()| std::fs::write(dir.join("hosts"), hosts));
             written.map_err(|e| format!("{}: {e}", dir.display()))?;
             let tunnel = exit.map(|(tunnel, _)| tunnel);
-            let namespace = kith_mesh::pod::make(number, v6, tunnel).map_err(failed)?;
+            let namespace = kith_mesh::pod::make(range, number, v6, tunnel).map_err(failed)?;
             let pod = Pod {
                 number,
                 exit: tunnel,
@@ -154,7 +162,7 @@ impl Pods {
         let Some(pod) = self.made.get(id) else {
             return Vec::new();
         };
-        let v4 = IpAddr::V4(kith_mesh::pod::addresses(None, pod.number).0);
+        let v4 = IpAddr::V4(kith_mesh::pod::addresses(range(), None, pod.number).0);
         if pod.address == v4 {
             vec![v4]
         } else {
@@ -379,7 +387,7 @@ pub async fn names(
         () = up.notified() => {}
         _ = stopping.changed() => return,
     }
-    match crate::dns::bind((kith_mesh::pod::GATEWAY, 53).into()).await {
+    match crate::dns::bind((range().gateway(), 53).into()).await {
         Ok(sockets) => crate::dns::run(shared, sockets, upstreams, stopping).await,
         // (A `--dns` on every address has this one too.)
         Err(e) => eprintln!("kithd: no DNS of the pods' own: {e}"),

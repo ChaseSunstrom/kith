@@ -1,17 +1,19 @@
 //! Device-mapper by ioctl (linux/dm-ioctl.h): what `dmsetup create` and `dmsetup remove`
 //! do, for a machine with no dmsetup. One mapping of one dm-crypt target. And two more
 //! things such a machine has no tool for: a file as a block device (`losetup`), and an ext4
-//! file system grown where it is mounted (`resize2fs`). And one that has no tool anywhere
-//! but a container runtime: the program a cgroup asks which devices its processes may
-//! open (`bpf(2)`).
+//! file system grown where it is mounted (`resize2fs`). And what has no tool anywhere but
+//! a container runtime: the program a cgroup asks which devices its processes may open
+//! (`bpf(2)`), and a mount whose owners are seen through a user namespace
+//! (`mount_setattr(2)`), with such a namespace to see them through.
 //!
-//! The `unsafe` of the workspace is here: the ioctl call and the bpf call themselves (and
-//! taking the file descriptor bpf answers with). Each request is put together as bytes, so
-//! there is no struct whose layout has to match the kernel's.
+//! The `unsafe` of the workspace is here: the ioctl, bpf and mount calls themselves (and
+//! taking the file descriptors they answer with), and the fork of a child that holds a
+//! user namespace while it is made. Each request is put together as bytes, so there is no
+//! struct whose layout has to match the kernel's.
 
 use std::fs::File;
 use std::io::{Error, Result};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 /// `struct dm_ioctl`: version, sizes, flags, the device's number, its name and uuid.
@@ -224,7 +226,6 @@ fn verifier_said(log: &[u8], cut: bool) -> String {
 
 /// Load `program` as a `kind` of program for `attach`, and put it on `cgroup` as that.
 fn cgroup_program(cgroup: &File, program: &[u8], kind: u32, attach: u32) -> Result<()> {
-    use std::os::fd::{FromRawFd, OwnedFd};
     if program.is_empty() || !program.len().is_multiple_of(8) {
         return Err(Error::other("not a program of whole instructions"));
     }
@@ -351,6 +352,135 @@ pub fn seal_relro() -> Result<usize> {
 #[cfg(not(target_env = "musl"))]
 pub fn seal_relro() -> Result<usize> {
     Ok(0)
+}
+
+/// A user namespace in which the ids 0..`count` are this one's `from`..`from + count`
+/// (users and groups alike), as a descriptor for [`mount_mapped`]: no process is left in
+/// it. A child makes it and waits while this process writes its maps, which only root may
+/// do for ids that are not its own; the child is gone when this returns, collected here or
+/// by whoever collects this process's children.
+pub fn user_namespace(from: u32, count: u32) -> Result<OwnedFd> {
+    use std::io::{Read, Write};
+    let map = format!("0 {from} {count}\n");
+    let pipe = || -> Result<(File, File)> {
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: pipe2 writes two descriptors to `ends`, which has room for them.
+        if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        // SAFETY: two descriptors the kernel just made for this process, and nobody else's.
+        Ok(unsafe { (File::from_raw_fd(ends[0]), File::from_raw_fd(ends[1])) })
+    };
+    let (mut made, made_in) = pipe()?;
+    let (go_out, mut go) = pipe()?;
+    let (said, wait) = (made_in.as_raw_fd(), go_out.as_raw_fd());
+    // SAFETY: the child calls nothing but unshare, write, read and _exit, which a child of
+    // a process with threads may call, and touches no memory but its own stack.
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(Error::last_os_error());
+    }
+    if child == 0 {
+        // SAFETY: as above; `said` and `wait` are this child's copies of the pipes' ends.
+        unsafe {
+            let errno = match libc::unshare(libc::CLONE_NEWUSER) {
+                0 => 0,
+                _ => *libc::__errno_location(),
+            };
+            libc::write(said, (&raw const errno).cast(), 4);
+            // (A byte and not the end of the pipe: another child made at the same time
+            // may hold a copy of this one's writing end.)
+            let mut byte = 0u8;
+            libc::read(wait, (&raw mut byte).cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    drop((made_in, go_out));
+    let mut errno = [0u8; 4];
+    let users = made
+        .read_exact(&mut errno)
+        .and_then(|()| match i32::from_ne_bytes(errno) {
+            0 => {
+                std::fs::write(format!("/proc/{child}/uid_map"), &map)?;
+                std::fs::write(format!("/proc/{child}/gid_map"), &map)?;
+                Ok(OwnedFd::from(File::open(format!("/proc/{child}/ns/user"))?))
+            }
+            errno => Err(Error::from_raw_os_error(errno)),
+        });
+    let _ = go.write_all(&[0]);
+    // SAFETY: waitpid on a child of this process, with no status asked for. (Another
+    // thread collecting it first is no harm: it is not needed after this.)
+    unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+    users
+}
+
+/// What a mount made by [`mount_mapped`] is besides mapped: read-only, without setuid,
+/// without devices.
+pub const RDONLY: u64 = 0x1;
+pub const NOSUID: u64 = 0x2;
+pub const NODEV: u64 = 0x4;
+
+/// Mount `from` (with every mount under it) at `to`, which is there already and of the same
+/// kind (a directory, a file), seen through `users` (from [`user_namespace`]): to the
+/// processes of a namespace with the same maps, a file owned by id n on disk is their n's,
+/// and what they make there as n is n's on disk. `flags` are of [`RDONLY`], [`NOSUID`],
+/// [`NODEV`]. A mount under `from` on a file system that takes no mapping (NFS, say)
+/// refuses the whole.
+pub fn mount_mapped(from: &Path, to: &Path, users: BorrowedFd, flags: u64) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(Error::other);
+    let (from, to) = (path(from)?, path(to)?);
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    let flags = flags & (RDONLY | NOSUID | NODEV);
+    // SAFETY: open_tree reads the string `from`, which lives through the call.
+    let tree = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
+        )
+    };
+    if tree < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+    let tree = unsafe { OwnedFd::from_raw_fd(tree as libc::c_int) };
+    // struct mount_attr: what to set, what to clear, the propagation, the user namespace.
+    let attr: [u64; 4] = [MOUNT_ATTR_IDMAP | flags, 0, 0, users.as_raw_fd() as u64];
+    // SAFETY: mount_setattr reads the empty string and `attr`, whose size it is told; both
+    // live through the call.
+    let set = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            tree.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH as libc::c_uint | AT_RECURSIVE,
+            attr.as_ptr(),
+            std::mem::size_of_val(&attr),
+        )
+    };
+    if set < 0 {
+        return Err(Error::last_os_error());
+    }
+    // SAFETY: move_mount reads the two strings, which live through the call.
+    let moved = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            tree.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    match moved < 0 {
+        true => Err(Error::last_os_error()),
+        false => Ok(()),
+    }
 }
 
 const PT_LOAD: u32 = 1;
@@ -534,5 +664,29 @@ mod tests {
     fn grow_refusals_are_errors() {
         assert!(grow(Path::new("/proc"), 1 << 20).is_err());
         assert!(grow(Path::new("/nowhere/at/all"), 1).is_err());
+    }
+
+    /// Ids that are not its own are mapped by root alone, and a mapped mount of nothing,
+    /// or through what is no user namespace, is refused (a mapped mount that holds is the
+    /// VM test's to show: ci/vm.sh --test share).
+    #[test]
+    fn mapped_mount_refusals_are_errors() {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+        let no_users = File::open("/proc/self/stat").unwrap();
+        let (nowhere, elsewhere) = (Path::new("/nowhere/at/all"), Path::new("/nowhere/else"));
+        assert!(mount_mapped(nowhere, elsewhere, no_users.as_fd(), RDONLY).is_err());
+        assert!(user_namespace(u32::MAX, 2).is_err() && user_namespace(1 << 16, 0).is_err());
+        let root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+        match user_namespace(7 << 16, 1 << 16) {
+            Ok(users) => {
+                assert!(root, "a user namespace of ids not its own, made by no root");
+                let kind = std::fs::read_link(format!("/proc/self/fd/{}", users.as_raw_fd())).unwrap();
+                assert!(kind.to_string_lossy().starts_with("user:["), "{kind:?}");
+                // (Of a mount this process has not got, and none is made.)
+                assert!(mount_mapped(nowhere, elsewhere, users.as_fd(), NOSUID | NODEV).is_err());
+            }
+            Err(e) => assert!(!root, "root made no user namespace: {e}"),
+        }
     }
 }

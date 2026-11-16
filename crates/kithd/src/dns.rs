@@ -386,7 +386,7 @@ pub async fn run(
     // This node's pods are its own to ask for any name, whatever their addresses are. (A list
     // takes the place of the local networks, so they are named with it: a list of the pods'
     // network alone had every other client refused.)
-    let pods = format!("{}/16", kith_mesh::pod::GATEWAY);
+    let pods = crate::pods::range().to_string();
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
@@ -527,6 +527,55 @@ mod tests {
         assert_eq!(*fixed.borrow_and_update(), told);
         assert!(fixed.has_changed().is_err(), "nothing follows the file for it");
         let _ = std::fs::remove_file(&conf);
+    }
+
+    /// A name no node knows, asked by a client the forwarders let through (run gives a node its
+    /// local networks and its pods'), is passed to the upstream and its answer comes back. (The
+    /// client here is on loopback: a test cannot send from a pod's own address.)
+    #[tokio::test]
+    async fn pod_outside_name() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let told = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = upstream.recv_from(&mut buf).await.unwrap();
+            // The query again, answered with one A record of 198.51.100.7 for its name.
+            let mut reply = buf[..n].to_vec();
+            reply[2..4].copy_from_slice(&[0x81, 0x80]);
+            reply[6..8].copy_from_slice(&[0, 1]);
+            reply.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 198, 51, 100, 7]);
+            upstream.send_to(&reply, from).await.unwrap();
+        });
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = udp.local_addr().unwrap();
+        let pods = crate::pods::range().to_string();
+        let forwarders: Vec<Cidr> = kith_dns::LOCAL_NETWORKS
+            .into_iter()
+            .chain([pods.as_str()])
+            .filter_map(|net| net.parse().ok())
+            .collect();
+        let (_zones, served) = watch::channel(Arc::new(Zones::default()));
+        let (_, asked) = watch::channel(Arc::from(vec![told]));
+        let cache = Arc::new(kith_dns::Cache::default());
+        tokio::spawn(kith_dns::serve(udp, tcp, served, asked, forwarders, cache));
+        let mut query = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in ["outside", "example", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(&query, listen).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = &buf[..n];
+        assert_eq!(reply[3] & 0x0f, 0, "answered, not refused or failed");
+        assert_eq!(reply[6..8], [0, 1], "one answer");
+        assert!(reply.ends_with(&[198, 51, 100, 7]), "the upstream's address: {reply:?}");
     }
 
     fn store(yaml: &str) -> Store {

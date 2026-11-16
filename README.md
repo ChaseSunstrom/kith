@@ -320,9 +320,28 @@ spec:
   one there is (on the node, its files are yours), and root, when asked for, is root of
   that namespace alone. It is still in your groups there (a namespace made without
   privileges cannot leave them), for what that is worth to it: the files it can reach
-  are its image, its volumes and the devices it claims. On kith OS, where kithd is root, there is no user namespace yet:
-  the container is that user of the node, and `runAsUser: 0` is the node's root with
-  three capabilities (to send signals, to take a port below 1024, to write the audit log).
+  are its image, its volumes and the devices it claims. On kith OS, where kithd is root,
+  a pod's container (one with a network of its own: [a pod](#a-replica-as-a-pod)) is a
+  user namespace of its own too: its users 0 to 65535 are 65536 users of the node that no
+  other container has (taken as it starts, given back once it is gone; which are taken is
+  read from the containers' bundles on the disk, and one left behind whose processes
+  outlive its kill keeps its range until they are gone), so `runAsUser: 0` is root of that
+  namespace alone, and a `runAsUser` of 65536 or more is refused. Its image and its
+  volumes are mounted id-mapped: a file its user 1000 makes is user 1000's on the disk, as
+  before, and no owner on the disk is changed to fit its range. Id-mapped mounts are
+  Linux 5.12's (btrfs's 5.15, tmpfs's 6.3; kith OS's own kernel, 6.18, has them all); a
+  kernel or file system that refuses one fails the container's start rather than run it as
+  the node's users. Any port of the pod's own network is anyone's in it, so its root still
+  serves port 80. The rest keep the node's
+  users, so that `runAsUser: 0` is the node's root with three capabilities (to send
+  signals, to take a port below 1024, to write the audit log): a container on the node's
+  network (a port it serves is below 1024 as often as not, and no capability of a user
+  namespace reaches the node's network; the node's ports below 1024 stay its root's), one
+  whose image or a volume is on a file system that takes no id-mapped mount (ext4, xfs,
+  btrfs and tmpfs take one; a volume of another node is NFS, which does not), one given
+  devices (theirs are the node's users) and a NodeWorkload's (the node's own). A
+  container's status says which it is: `hostUsers: false` for a namespace of its own; a
+  pod's container kept so by a file system also says which path on kithd's log.
 - **Nothing more than that user.** No capabilities (on kith OS the one for ports below
   1024 is kept), and no way to any: `no_new_privs` is set, so a setuid program in the
   image is an ordinary program.
@@ -362,8 +381,9 @@ spec:
   sandbox starts too, and so does `no_new_privs`. What it costs: inside a user namespace
   a program is that namespace's root, and reaches kernel code a plain user never calls
   (mounting, more of the network); much of what has let a user become the node's root was
-  found there. A container that is the node's root (`runAsUser: 0` on kith OS, or a pod
-  whose image is root's) is not started with it, and says so.
+  found there. A container that is the node's root (on kith OS where it keeps the node's
+  users: `runAsUser: 0`, or a pod whose image is root's) is not started with it, and
+  says so.
 - **Whose image it is.** With `signedBy`, the image is run only if one of those keys
   signed it, as `cosign sign --key` does: the signature is looked for in the image's own
   repository (the tag `sha256-DIGEST.sig`) and checked against the manifest's digest
@@ -414,14 +434,17 @@ spec:
   node is a wide door into a kernel driver, and no filter here narrows it. All of this is
   for keeping an honest program's mistakes small. Untrusted programs belong in a VM
   ([Virtual machines](#virtual-machines)), which is what a `vms` unit is for.
-- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS; the filter is a
+- Not yet: no AppArmor or SELinux profile; no user namespace on kith OS for a container
+  on the node's network, one given devices or one with a volume of another node, and a
+  pod's `/sys` is the node's, bound in (a user namespace may mount no other); the filter is a
   list of what is refused, not of what is allowed, so a call the kernel gains later is let
   through until it is named here; signatures with a certificate instead of a key
   (cosign's keyless signing), a transparency log, and signatures kept as referrers of the
   image (cosign's newer bundle format) are not read; keys are named by each template,
   not once for a cluster or a registry; an `exec` unit is none of this: it is a process
   of the host. The user namespace of the first kind (kithd as your service) has been run;
-  the kith OS kind has been run in VMs with the default user and with root.
+  the kith OS kind has been run in VMs for pods as root, serving port 80, and its
+  id-mapped volumes beside one of another node.
 
 ### A replica as a pod
 
@@ -449,6 +472,24 @@ spec:
   (`--mesh`), so every node reaches it and Services send to it. What it asks outside
   the cluster leaves from behind its node's address. It is told this node's DNS, with
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+  A pod's names outside the cluster are asked of its node's resolvers: they need a resolver
+  on the node (in `/etc/resolv.conf`) or `--dns-upstream`, and `--dns` is not needed for them.
+  The IPv4 address only its node knows is taken from `100.88.0.0/16` unless that node's
+  kithd is told another with `--pod-range ADDRESS/BITS` (or `KITH_POD_RANGE`; on kith OS
+  after ` -- ` on the kernel command line or in `boot.args` of the config partition), for a
+  node whose own network or tailnet is in it. It is the node's own to name (nodes of one
+  cluster may differ: no pod reaches another by it), from `/8` to `/24` (a `/24` holds 254
+  pods) and a whole network (`10.77.0.0/20`, not `10.77.0.1/20`); never loopback,
+  link-local (169.254.0.0/16), multicast or reserved space. At start, as root, kithd reads the
+  addresses its node has on its links (not the loopback's) and finds one that is inside the
+  range or whose network (`192.168.1.5/16`) holds it; it changes nothing, and a range that comes
+  up on the node later is not noticed. When the range was named with `--pod-range` and
+  kithd is not the first process of a kith OS node, kithd then refuses to start, naming the
+  address and the link; on the default range, and on kith OS (a refusal there restarts the
+  machine, and a lease that lands in the range one day would make it loop), it says so on stderr
+  and goes on. The node's DNS answers names outside the cluster for any address in the
+  range, so a range that is not private lets whoever can reach its listener from such an
+  address use it: choose a private one. Pods of the old range go when kithd restarts.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
@@ -474,8 +515,7 @@ spec:
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
 - Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace); the range pods' addresses are taken
-  from is fixed.
+  capabilities and the filter (no user namespace).
 
 ### A pod behind a VPN exit
 
@@ -1339,8 +1379,9 @@ spec:
   tag. The artifact is one blob (the package's files) and a signature
   (Ed25519, over the package's name, version and the blob's SHA-256) as the
   annotation `dev.kith.signature`.
-- For a Release that names a Repository, the node that leads the store asks
-  the registry for the versions, fetches the newest that fits, checks it
+- For a Release that names a Repository (applied by someone who may `apply`
+  Packages: without that right nothing is fetched, and the Release's status
+  says so), the node that leads the store asks the registry for the versions, fetches the newest that fits, checks it
   against the Repository's `publicKey` and stores it as a Package (annotated
   `kith.dev/repository`); the Release installs only Packages from its
   Repository. A package that is unsigned or signed with another key is
@@ -2037,10 +2078,11 @@ spec:
   loads into the kernel for each container, asked at every open and every `mknod` of a
   device node by a process in it. It lets through the few every container has, the
   terminals of the container's own `/dev/pts`, and each device it was given (to read and
-  write, not to make a second node of); all else is refused. So a pod that is root there,
-  which has the capability to make device nodes, makes none for its node's disk and opens
-  none. (A pod that made a node for itself before, `/dev/net/tun` or `/dev/fuse`, is
-  refused now: write a `Device` for the node, `class: other` with its `path`, and claim
+  write, not to make a second node of); all else is refused. So a pod that is root there
+  and keeps the node's users (one given devices, say), which has the capability to make
+  device nodes, makes none for its node's disk and opens none; one in a user namespace of
+  its own makes no device node at all, as below. (A pod that made a node for itself
+  before, `/dev/net/tun` or `/dev/fuse`, is refused now: write a `Device` for the node, `class: other` with its `path`, and claim
   it.) A container whose device filter cannot be loaded is not started. Where kithd is
   your own service there is no filter and none is needed: a container there is in a user
   namespace, where the kernel lets no one make a device node, and it has the nodes in its
@@ -2913,7 +2955,8 @@ the other, so the system that runs is never the one being changed:
    each time it starts the slot (`+2-1`, `+1-2`, `+0-3`).
 3. A slot that comes up, and whose kithd is still running ten seconds later,
    is marked good: the counter is dropped and the console says
-   `slot b is good`.
+   `slot b is good`. On a node whose state is encrypted the ten seconds start
+   when the state is open, not while it waits for its key.
 4. A slot that does not (a root its verity tree refuses, a kithd that cannot
    start) is restarted until its tries are gone. The boot loader then starts
    the slot that worked, and kithd says so on each start:

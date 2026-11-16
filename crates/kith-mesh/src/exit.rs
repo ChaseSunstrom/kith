@@ -31,10 +31,6 @@ pub struct Tunnel {
     pub keepalive: u16,
 }
 
-/// The numbers of the pods that leave by an exit (their IPv4 addresses are 100.88.255.x);
-/// [`crate::pod::NUMBERS`] ends before them.
-pub const PODS: std::ops::RangeInclusive<u16> = 0xff00..=0xfffe;
-
 /// The connection-tracking mark of whatever a pod of an exit started.
 pub const MARK: u32 = 0x6b78;
 
@@ -43,12 +39,10 @@ pub fn device(number: u16) -> String {
     format!("kx{number}")
 }
 
-/// The link of pod `number` on the node: an exit's pods have names of their own.
+/// The link on the node of pod `number`, one that leaves by an exit: a name of its own
+/// (another pod's is [`crate::pod::link_of`]'s), which its rules and the node's are made by.
 pub fn link(number: u16) -> String {
-    match PODS.contains(&number) {
-        true => format!("kpx{number}"),
-        false => format!("kp{number}"),
-    }
+    format!("kpx{number}")
 }
 
 fn table(number: u16) -> u32 {
@@ -127,14 +121,14 @@ impl Rule<'_> {
     }
 }
 
-/// The pod range, and the mesh: what a pod of an exit still reaches by the node's routes.
-const PODS_NET: (IpAddr, u8) = (IpAddr::V4(Ipv4Addr::new(100, 88, 0, 0)), 16);
-
 /// The rules of the pod whose node-side link is `link`, leaving by the tunnel `number`:
-/// to another pod by the main table, to the mesh (`mesh`, its /48) the same way, and the
-/// rest of IPv4 to the tunnel's table, IPv6 nowhere. Whatever finds no route there finds
-/// the last rule, which has nowhere to send it: with the tunnel gone, nothing leaves.
-fn rules(link: &str, number: u16, mesh: Option<(Ipv6Addr, u8)>) -> Vec<Rule<'_>> {
+/// to another pod (of the node's `range`) by the main table, to the mesh (`mesh`, its
+/// /48) the same way, and the rest of IPv4 to the tunnel's table, IPv6 nowhere. Whatever
+/// finds no route there finds the last rule, which has nowhere to send it: with the
+/// tunnel gone, nothing leaves.
+fn rules(link: &str, number: u16, range: crate::pod::Range, mesh: Option<(Ipv6Addr, u8)>) -> Vec<Rule<'_>> {
+    let (network, bits) = range.network();
+    let pods = Some((IpAddr::V4(network), bits));
     let rule = |v6, priority, to, table| Rule {
         v6,
         priority,
@@ -146,8 +140,8 @@ fn rules(link: &str, number: u16, mesh: Option<(Ipv6Addr, u8)>) -> Vec<Rule<'_>>
     let mut rules = vec![
         rule(false, NOWHERE, None, None),
         rule(true, NOWHERE, None, None),
-        rule(false, NOT_A_POD, Some(PODS_NET), None),
-        rule(false, TO_PODS, Some(PODS_NET), Some(254)),
+        rule(false, NOT_A_POD, pods, None),
+        rule(false, TO_PODS, pods, Some(254)),
         rule(false, OUT, None, Some(table(number))),
     ];
     if let Some((mesh, bits)) = mesh {
@@ -158,8 +152,8 @@ fn rules(link: &str, number: u16, mesh: Option<(Ipv6Addr, u8)>) -> Vec<Rule<'_>>
 
 /// Hold the pod `link` to the tunnel `number` (before its link is made: the last rules,
 /// which let nothing out, are made first), and read the rules back from the kernel.
-pub fn hold(link: &str, number: u16, mesh: Option<(Ipv6Addr, u8)>) -> Result<()> {
-    let mut last = rules(link, number, mesh);
+pub fn hold(link: &str, number: u16, range: crate::pod::Range, mesh: Option<(Ipv6Addr, u8)>) -> Result<()> {
+    let mut last = rules(link, number, range, mesh);
     let rest = last.split_off(2);
     for rule in last {
         rule.set(true)?;
@@ -342,8 +336,8 @@ mod tests {
 
     #[test]
     fn an_exits_pods_and_tunnels_have_names_of_their_own() {
-        assert_eq!(link(0xff00), "kpx65280");
-        assert_eq!(link(2), "kp2");
+        assert_eq!(link(2), "kpx2");
+        assert_eq!(crate::pod::link_of(2), "kp2");
         assert_ne!(number("vpn"), number("vpn2"));
     }
 
@@ -355,15 +349,16 @@ mod tests {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh rules");
         }
         let mesh = Some(("fd00:1:2::".parse().unwrap(), 48));
+        let range = crate::pod::Range::default();
         assert!(!held("kpx65280").unwrap());
-        hold("kpx65280", 7, mesh).unwrap();
+        hold("kpx65280", 7, range, mesh).unwrap();
         // (Again changes nothing: one that is there is as good.)
-        hold("kpx65280", 7, mesh).unwrap();
+        hold("kpx65280", 7, range, mesh).unwrap();
         assert!(held("kpx65280").unwrap());
         // (Released, it still goes nowhere; held by another tunnel, it has that one's alone.)
         release("kpx65280").unwrap();
         assert!(held("kpx65280").unwrap());
-        hold("kpx65280", 8, mesh).unwrap();
+        hold("kpx65280", 8, range, mesh).unwrap();
         let dump = ask_route(RouteNetlinkMessage::GetRule(RuleMessage::default()), NLM_F_DUMP).unwrap();
         let tables: Vec<_> = dump
             .into_iter()

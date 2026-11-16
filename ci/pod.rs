@@ -4,7 +4,9 @@
 //!   pod serve [FILE]           make a file in the root, then answer every connection on
 //!                              port 80 (as HTTP) with this pod's name, what GREETING and
 //!                              PASSWORD say where it is told them, and, given a FILE it
-//!                              adds a line to at each start, how many lines that has
+//!                              adds a line to at each start, how many lines that has; at
+//!                              start it says `where: nameserver IP from IP` (its resolver,
+//!                              and the address it reaches it from: its node's pod range)
 //!   pod say                    answer every connection on port 80 (as HTTP) with what
 //!                              PASSWORD says, writing nowhere (its root may take no file)
 //!   pod ask HOST PORT [...]    ask each 40 times, and say each different answer's first
@@ -37,7 +39,7 @@
 //!                              write BYTES to it, 64 KiB each half second, saying if a write
 //!                              fails (the disk is full), and wait; unlinked: removes FILE
 //!                              first and writes to it held open, with no name
-//!   pod probe                  what `vm.sh --test tunnel` runs behind an exit: answers on
+//!   pod probe                what `vm.sh --test tunnel` runs behind an exit: answers on
 //!                              port 8080 (TCP, as HTTP) and sends back what comes to UDP
 //!                              8080; and each second asks 198.51.100.1:80 and a new name
 //!                              (over UDP, and over TCP) where its resolv.conf says, asks its
@@ -51,6 +53,12 @@
 //!                              says each it was asked
 //!   pod shout TO WHAT          sends WHAT to TO (ADDRESS:PORT) over UDP, once a second, ten
 //!                              times
+//!   pod ids|stays [PATH ...]   say its uid_map (whose ids it has on the node), then of each
+//!                              PATH its owner as seen here and whether it opens; `+PATH` is
+//!                              a file it writes first; `root-only` is a file of a PCI
+//!                              device's in /sys that only the node's root opens; `=PATH`
+//!                              says what the file holds; `:80` says whether port 80 binds;
+//!                              stays: then wait
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -284,6 +292,13 @@ fn main() {
     match &args[1..] {
         ["serve", keeps @ ..] if keeps.len() < 2 => {
             std::fs::write("/made-here", "a pod's root takes a file").expect("a file in the root");
+            // Where it is told to ask for names, and the address it asks from (a UDP socket
+            // connected sends nothing): both in its node's pod range.
+            let resolv = std::fs::read_to_string("/etc/resolv.conf").expect("a resolv.conf");
+            let ns = resolv.lines().find_map(|line| line.strip_prefix("nameserver ")).expect("a nameserver").trim();
+            let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("a UDP socket");
+            socket.connect(format!("{ns}:53")).expect("a way to the nameserver");
+            println!("where: nameserver {ns} from {}", socket.local_addr().expect("a local address").ip());
             let mut name = std::fs::read_to_string("/proc/sys/kernel/hostname").expect("a name");
             name = format!("HTTP/1.0 200 OK\r\n\r\n{}", name.trim());
             for told in ["GREETING", "PASSWORD"] {
@@ -337,6 +352,21 @@ fn main() {
             let mut out = out.expect("/dev/stdout, by its name");
             for line in heard {
                 writeln!(out, "{line}").expect("a line out");
+            }
+        }
+        // NAME...: the addresses this container's resolver gives each (what /etc/resolv.conf
+        // says), on stdout, sorted; what it says when it gives none.
+        ["lookup", names @ ..] if !names.is_empty() => {
+            for name in names {
+                match std::net::ToSocketAddrs::to_socket_addrs(&(*name, 0)) {
+                    Ok(found) => {
+                        let mut ips: Vec<String> = found.map(|addr| addr.ip().to_string()).collect();
+                        ips.sort();
+                        ips.dedup();
+                        println!("{name}: {ips:?}");
+                    }
+                    Err(e) => println!("{name}: failed: {e}"),
+                }
             }
         }
         ["seen", dir, hears @ ..] if hears.len() < 2 => {
@@ -415,6 +445,43 @@ fn main() {
             }
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
             println!("node: made {made}, read {read:?}");
+        }
+        [how @ ("ids" | "stays"), paths @ ..] => {
+            use std::os::unix::fs::MetadataExt;
+            let map = std::fs::read_to_string("/proc/self/uid_map").expect("its uid_map");
+            println!("ids: map {}", map.split_whitespace().collect::<Vec<_>>().join(" "));
+            for path in paths {
+                if let Some(read) = path.strip_prefix('=') {
+                    let holds = std::fs::read_to_string(read).map(|text| text.trim().to_string()).map_err(|e| e.kind());
+                    println!("ids: {path} holds {holds:?}");
+                    continue;
+                }
+                if *path == ":80" {
+                    println!("ids: :80 binds {:?}", TcpListener::bind("[::]:80").or_else(|_| TcpListener::bind("0.0.0.0:80")).map(drop).map_err(|e| e.kind()));
+                    continue;
+                }
+                let found = if *path == "root-only" {
+                    // (A BAR of a device: 0600 and the node's root's, as sysfs makes it.)
+                    let devices = std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten();
+                    let files = devices.flat_map(|device| std::fs::read_dir(device.path()).into_iter().flatten().flatten());
+                    let named = |name: &str| name.strip_prefix("resource").is_some_and(|n| n.parse::<u8>().is_ok());
+                    let found = files.map(|file| file.path()).find(|path| path.file_name().is_some_and(|n| named(&n.to_string_lossy())));
+                    found.unwrap_or_default()
+                } else if let Some(made) = path.strip_prefix('+') {
+                    if let Err(e) = std::fs::write(made, "made") {
+                        println!("ids: {path} not written: {e}");
+                    }
+                    made.into()
+                } else {
+                    path.into()
+                };
+                let owner = std::fs::metadata(&found).map_or_else(|e| format!("{:?}", e.kind()), |has| has.uid().to_string());
+                let opens = std::fs::File::open(&found).map(drop).map_err(|e| e.kind());
+                println!("ids: {path} {} owner {owner} opens {opens:?}", found.display());
+            }
+            while *how == "stays" {
+                std::thread::sleep(Duration::from_secs(60));
+            }
         }
         ["put", file, text] => {
             std::thread::sleep(Duration::from_secs(3));
@@ -683,6 +750,6 @@ fn main() {
                 }
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
     }
 }
