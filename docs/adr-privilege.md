@@ -42,6 +42,9 @@ the node today:
 - a container that is no pod: it shares the node's network;
 - a device given to a container by a DeviceClaim: `/dev/input/event*` reads what is
   typed at the console (a passphrase among it), `/dev/bus/usb` is a plugged-in disk;
+- a Volume in `kith-system`: its path is any directory of the node, mounted writable
+  into a container (`crates/kithd/src/volumes.rs`, `host_dir`): `/etc`, or the state
+  itself, to whoever runs as the files' owner (found by Step A's review);
 - a VM: its `disks[].path`, `kernel`, `initrd` and `firmware` are paths on the node,
   given to QEMU, which runs as root (`crates/kithd/src/vm.rs`); a disk path of the
   node's own disk is the node's disk. Its program is a field too;
