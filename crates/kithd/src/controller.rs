@@ -211,6 +211,22 @@ struct Controller {
     floor: SystemTime,
     /// What the last failed look said, said once until it changes.
     look_failed: Option<String>,
+    /// What this node last found its own hardware to be (`devices::scan`), and when: kept for
+    /// `SCAN_KEPT`, where a pass at each change of the store would walk `/sys` every time.
+    scanned: Option<(Instant, Vec<Resource>)>,
+}
+
+/// How long a look at the node's own hardware is gone by (a walk of `/sys` measured 3.3 ms in
+/// a debug build on a machine with 45 devices). Under `TICK`, so an idle node looks at each
+/// one; a device plugged in or taken out shows within this.
+const SCAN_KEPT: Duration = Duration::from_secs(5);
+
+/// What `slot` holds if it was made less than `kept` ago; else what `make` gives now, kept.
+fn fresh<T>(slot: &mut Option<(Instant, T)>, kept: Duration, make: impl FnOnce() -> T) -> &T {
+    if slot.as_ref().is_none_or(|(at, _)| at.elapsed() >= kept) {
+        *slot = Some((Instant::now(), make()));
+    }
+    &slot.as_ref().expect("filled above").1
 }
 
 /// Free bytes on the state disk, its reserve, and the pods as counted.
@@ -304,6 +320,7 @@ pub async fn run(
         clocks: None,
         floor: SystemTime::now(),
         look_failed: None,
+        scanned: None,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -664,11 +681,15 @@ impl Controller {
         let node_policy = crate::policy::get();
         let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
         let found = me.filter(|_| node_policy.names_devices());
-        let found = found.map(|me| crate::devices::scan(Path::new("/sys"), me));
+        let found = found.map(|me| {
+            fresh(&mut self.scanned, SCAN_KEPT, || {
+                crate::devices::scan(Path::new("/sys"), me)
+            })
+        });
         let (resources, granted, mounted, tunes, found): (Vec<Resource>, _, _, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
-            let found = found.map(|found| crate::devices::as_found(store, &found));
+            let found = found.map(|found| crate::devices::as_found(store, found));
             let kinds = ["Workload", "NodeWorkload", "Job"];
             let resources = kinds
                 .into_iter()
@@ -2302,6 +2323,20 @@ fn signers(rules: &[(String, Vec<String>)], image: &str, template: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_look_is_kept_for_its_time_and_made_again_after() {
+        let (mut slot, mut made) = (None, 0);
+        let mut look = |kept| {
+            *fresh(&mut slot, kept, || {
+                made += 1;
+                made
+            })
+        };
+        let hour = Duration::from_secs(3600);
+        assert_eq!((look(hour), look(hour)), (1, 1));
+        assert_eq!((look(Duration::ZERO), look(hour)), (2, 2));
+    }
 
     /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
     fn signing_key(n: u8) -> String {
