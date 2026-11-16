@@ -19,12 +19,12 @@ mod de;
 mod emit;
 mod parse;
 
-pub use de::{from_node, from_str};
+pub use de::{from_json, from_node, from_str};
 pub use emit::to_string;
 pub use parse::{Key, Node, Value, parse};
 
 /// 1-based line and column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Pos {
     pub line: usize,
     pub col: usize,

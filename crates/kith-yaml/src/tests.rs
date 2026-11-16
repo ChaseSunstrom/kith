@@ -290,3 +290,41 @@ fn emit_round_trips_random_values() {
         assert_eq!(back, v, "emitted:\n{text}");
     }
 }
+
+/// JSON is read by the same code as YAML, with JSON's types: what serde_json would take,
+/// it takes, and what serde_json would refuse it refuses with serde's own words.
+#[test]
+fn json_is_read_with_its_own_types() {
+    let good = json!({ "name": "no", "version": "1.0", "enabled": true, "count": 3,
+        "mode": { "custom": { "step": 2 } }, "tags": ["1", "on"] });
+    let ours: Typed = from_json(&good).unwrap();
+    assert_eq!(ours, serde_json::from_value::<Typed>(good).unwrap());
+    let numbers = json!({ "a": 1.0, "b": -3, "c": 18446744073709551615u64, "d": 1e300, "e": "5", "f": null });
+    assert_eq!(from_json::<Json>(&numbers).unwrap(), numbers);
+    let base = json!({ "name": "a", "version": "v", "enabled": false, "mode": "rolling" });
+    for (field, bad) in [
+        ("name", json!(5)),
+        ("version", json!(1.5)),
+        ("name", json!(true)),
+        ("enabled", json!("true")),
+        ("count", json!("3")),
+        ("mode", json!(1)),
+        ("tags", json!([1])),
+        ("name", json!(null)),
+        ("enabled", json!(null)),
+        ("mode", json!(null)),
+        ("tags", json!(null)),
+        ("tags", json!({})),
+        ("mode", json!({ "custom": null })),
+        ("mode", json!({ "custom": { "step": null } })),
+        ("mode", json!({ "custom": { "step": -1 } })),
+        ("count", json!(1.5)),
+        ("other", json!(1)),
+    ] {
+        let mut sent = base.clone();
+        sent[field] = bad;
+        let said = serde_json::from_value::<Typed>(sent.clone()).unwrap_err().to_string();
+        let ours = from_json::<Typed>(&sent).unwrap_err().msg;
+        assert_eq!(ours, said, "{field}: {sent}");
+    }
+}

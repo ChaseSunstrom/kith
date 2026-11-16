@@ -16,7 +16,43 @@ impl de::Error for Error {
 }
 
 pub fn from_node<T: DeserializeOwned>(node: &Node) -> Result<T, Error> {
-    T::deserialize(De(node))
+    T::deserialize(De(node, false))
+}
+
+/// Read JSON by the same code as YAML (one `Deserialize` per type in the binary, not one for
+/// each format), with JSON's types: a number, a bool or a null is no string nor a variant's
+/// name, as serde_json has it. The errors have no position.
+pub fn from_json<T: DeserializeOwned>(json: &serde_json::Value) -> Result<T, Error> {
+    use serde_json::Value as Json;
+    fn node(json: &Json) -> Node {
+        let scalar = |text: String, plain| Value::Scalar { text, plain };
+        let value = match json {
+            Json::Null => scalar("null".into(), true),
+            Json::Bool(b) => scalar(b.to_string(), true),
+            Json::Number(n) => scalar(n.to_string(), true),
+            Json::String(s) => scalar(s.clone(), false),
+            Json::Array(items) => Value::Seq(items.iter().map(node).collect()),
+            Json::Object(fields) => Value::Map(
+                fields
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            Key {
+                                name: name.clone(),
+                                pos: Pos::default(),
+                            },
+                            node(value),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        Node {
+            pos: Pos::default(),
+            value,
+        }
+    }
+    T::deserialize(De(&node(json), true)).map_err(|e| Error { msg: e.msg, pos: None })
 }
 
 /// Parse a source holding exactly one document.
@@ -38,12 +74,55 @@ fn at<T>(pos: Pos, result: Result<T, Error>) -> Result<T, Error> {
     })
 }
 
-struct De<'a>(&'a Node);
+/// A node, and whether it came from JSON (`true`): then a plain scalar is a number, a bool or
+/// a null, and only that.
+struct De<'a>(&'a Node, bool);
 
 impl<'a> De<'a> {
     fn is_null(&self) -> bool {
         matches!(&self.0.value, Value::Scalar { text, plain: true } if resolve(text) == Plain::Null)
     }
+
+    /// What JSON's reader says of this node where `wanted` is wanted.
+    fn json_refuses(&self, wanted: &str) -> Error {
+        let unexpected = match &self.0.value {
+            Value::Scalar { text, plain: false } => Unexpected::Str(text),
+            Value::Scalar { text, plain: true } => match resolve(text) {
+                Plain::Null => Unexpected::Other("null"),
+                Plain::Bool(b) => Unexpected::Bool(b),
+                Plain::Int(i) => Unexpected::Signed(i),
+                Plain::UInt(u) => Unexpected::Unsigned(u),
+                Plain::Float(f) => Unexpected::Float(f),
+                Plain::Str(s) => Unexpected::Str(s),
+            },
+            Value::Seq(_) => Unexpected::Seq,
+            Value::Map(_) => Unexpected::Map,
+        };
+        de::Error::invalid_type(unexpected, &wanted)
+    }
+
+    /// A null where something else is wanted, as YAML's reader says it or as serde_json does.
+    fn null(&self, wanted: &dyn de::Expected) -> Error {
+        let null = if self.1 {
+            Unexpected::Other("null")
+        } else {
+            Unexpected::Unit
+        };
+        de::Error::invalid_type(null, wanted)
+    }
+}
+
+/// What reads as anything (`deserialize_any`), but a null from JSON is refused as serde_json
+/// refuses it. (From YAML a null is read as `()` and refused by what wanted something else.)
+macro_rules! not_null {
+    ($($name:ident($($arg:ident: $ty:ty),*))*) => {$(
+        fn $name<V: Visitor<'de>>(self, $($arg: $ty,)* v: V) -> Result<V::Value, Error> {
+            if self.1 && self.is_null() {
+                return at(self.0.pos, Err(self.null(&v)));
+            }
+            self.deserialize_any(v)
+        }
+    )*};
 }
 
 impl<'de> de::Deserializer<'de> for De<'_> {
@@ -60,10 +139,11 @@ impl<'de> de::Deserializer<'de> for De<'_> {
                 Plain::Float(f) => v.visit_f64(f),
                 Plain::Str(s) => v.visit_str(s),
             },
-            Value::Seq(items) => v.visit_seq(Seq(items.iter())),
+            Value::Seq(items) => v.visit_seq(Seq(items.iter(), self.1)),
             Value::Map(entries) => v.visit_map(Map {
                 iter: entries.iter(),
                 value: None,
+                json: self.1,
             }),
         };
         at(self.0.pos, result)
@@ -72,9 +152,8 @@ impl<'de> de::Deserializer<'de> for De<'_> {
     /// A string field takes any scalar's raw text: `1.0`, `no` and `true` stay strings.
     fn deserialize_str<V: Visitor<'de>>(self, v: V) -> Result<V::Value, Error> {
         match &self.0.value {
-            Value::Scalar { .. } if self.is_null() => {
-                at(self.0.pos, Err(de::Error::invalid_type(Unexpected::Unit, &v)))
-            }
+            Value::Scalar { .. } if self.is_null() => at(self.0.pos, Err(self.null(&v))),
+            Value::Scalar { plain: true, .. } if self.1 => self.deserialize_any(v),
             Value::Scalar { text, .. } => at(self.0.pos, v.visit_str(text)),
             _ => self.deserialize_any(v),
         }
@@ -111,8 +190,10 @@ impl<'de> de::Deserializer<'de> for De<'_> {
         v: V,
     ) -> Result<V::Value, Error> {
         let result = match &self.0.value {
+            // (As serde_json says it.)
+            Value::Scalar { plain: true, .. } if self.1 => Err(self.json_refuses("string or map")),
             Value::Scalar { text, .. } => v.visit_enum(text.as_str().into_deserializer()),
-            Value::Map(entries) if entries.len() == 1 => v.visit_enum(Variant(&entries[0].0, &entries[0].1)),
+            Value::Map(entries) if entries.len() == 1 => v.visit_enum(Variant(&entries[0].0, &entries[0].1, self.1)),
             _ => Err(de::Error::custom("expected a variant name or a map with a single key")),
         };
         at(self.0.pos, result)
@@ -122,13 +203,19 @@ impl<'de> de::Deserializer<'de> for De<'_> {
         v.visit_unit()
     }
 
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 bytes byte_buf
-        unit unit_struct seq tuple tuple_struct map struct
+    not_null! {
+        deserialize_bool() deserialize_i8() deserialize_i16() deserialize_i32() deserialize_i64()
+        deserialize_i128() deserialize_u8() deserialize_u16() deserialize_u32() deserialize_u64()
+        deserialize_u128() deserialize_f32() deserialize_f64() deserialize_bytes() deserialize_byte_buf()
+        deserialize_seq() deserialize_map() deserialize_tuple(_len: usize)
+        deserialize_tuple_struct(_name: &'static str, _len: usize)
+        deserialize_struct(_name: &'static str, _fields: &'static [&'static str])
     }
+
+    serde::forward_to_deserialize_any! { unit unit_struct }
 }
 
-struct Seq<'a>(std::slice::Iter<'a, Node>);
+struct Seq<'a>(std::slice::Iter<'a, Node>, bool);
 
 impl<'de> de::SeqAccess<'de> for Seq<'_> {
     type Error = Error;
@@ -136,7 +223,7 @@ impl<'de> de::SeqAccess<'de> for Seq<'_> {
     fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, Error> {
         self.0
             .next()
-            .map(|node| at(node.pos, seed.deserialize(De(node))))
+            .map(|node| at(node.pos, seed.deserialize(De(node, self.1))))
             .transpose()
     }
 }
@@ -144,6 +231,7 @@ impl<'de> de::SeqAccess<'de> for Seq<'_> {
 struct Map<'a> {
     iter: std::slice::Iter<'a, (Key, Node)>,
     value: Option<&'a Node>,
+    json: bool,
 }
 
 impl<'de> de::MapAccess<'de> for Map<'_> {
@@ -159,11 +247,11 @@ impl<'de> de::MapAccess<'de> for Map<'_> {
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
         let node = self.value.take().expect("next_value before next_key");
-        at(node.pos, seed.deserialize(De(node)))
+        at(node.pos, seed.deserialize(De(node, self.json)))
     }
 }
 
-struct Variant<'a>(&'a Key, &'a Node);
+struct Variant<'a>(&'a Key, &'a Node, bool);
 
 impl<'de, 'a> de::EnumAccess<'de> for Variant<'a> {
     type Error = Error;
@@ -171,7 +259,7 @@ impl<'de, 'a> de::EnumAccess<'de> for Variant<'a> {
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, De<'a>), Error> {
         let name = at(self.0.pos, seed.deserialize(self.0.name.as_str().into_deserializer()))?;
-        Ok((name, De(self.1)))
+        Ok((name, De(self.1, self.2)))
     }
 }
 
@@ -187,10 +275,16 @@ impl<'de> de::VariantAccess<'de> for De<'_> {
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _: usize, v: V) -> Result<V::Value, Error> {
+        if self.1 && !matches!(self.0.value, Value::Seq(_)) {
+            return at(self.0.pos, Err(self.json_refuses("tuple variant")));
+        }
         de::Deserializer::deserialize_any(self, v)
     }
 
     fn struct_variant<V: Visitor<'de>>(self, _: &'static [&'static str], v: V) -> Result<V::Value, Error> {
+        if self.1 && !matches!(self.0.value, Value::Map(_)) {
+            return at(self.0.pos, Err(self.json_refuses("struct variant")));
+        }
         de::Deserializer::deserialize_any(self, v)
     }
 }

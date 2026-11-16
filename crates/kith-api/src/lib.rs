@@ -134,8 +134,9 @@ macro_rules! kinds {
             namespaced: kinds!(@ $scope),
             about: $about,
             from_node: |node| finish::<$spec>(Some(node), kith_yaml::from_node(node)?),
+            // (By kith-yaml's reader too: one Deserialize for each kind in the binary, not two.)
             from_json: |json| {
-                let typed = serde_json::from_value(json).map_err(|e| e.to_string())?;
+                let typed = kith_yaml::from_json(&json).map_err(|e| e.msg)?;
                 finish::<$spec>(None, typed).map_err(|e| e.msg)
             },
             #[cfg(feature = "generate")]
