@@ -270,7 +270,9 @@ assemble() { # DIR
     # 128 MB at a time, each with as many inodes as this first part has: 8192, one for
     # every 16 KiB, which is what the images of containers need.)
     part 40-state linux-generic state 32M "Format=ext4"
-    SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-N 8192' systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os.raw" >"$w/repart.log" 2>&1 \
+    # (project: each pod's writable files are a project of their own, and quota keeps
+    # the count and the limit of each: T-0470.)
+    SYSTEMD_REPART_MKFS_OPTIONS_EXT4='-N 8192 -O quota,project' systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os.raw" >"$w/repart.log" 2>&1 \
         || { cat "$w/repart.log" >&2; die "systemd-repart failed"; }
     qemu-img convert -f raw -O qcow2 "$w/kith-os.raw" "$w/kith-os.qcow2"
 
