@@ -424,15 +424,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   `exec-units`, `vm-paths` and `run` are all off (every way for the store to start a
   process as the node's root with all its capabilities), kithd also cuts its bounding set
   at start to the fourteen a root pod keeps (`KEPT` in `crates/kithd/src/policy.rs`). The
-  bounding set limits what an exec gives a child, so nothing kithd starts by an exec (a
-  container's process, a helper, a nested unit) can hold a capability outside that list in
-  the node's own user namespace, whatever its spec asks for and whatever bug let it ask:
-  not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
-  `BPF` or the rest (the node's status lists what it kept). A pod with `userNamespaces`
-  has a full bounding set inside its own namespace, over that namespace's resources only
-  (above). A container's own set is what its spec says, the fourteen at most; the cut
-  is what a child kithd forks has before the runtime sets that, so no container reads
-  it (`ci/vm.sh --test policy` reads kithd's own `CapBnd`). **It does not limit kithd's own threads**, which keep every
+  bounding set limits what an exec gives a child, so nothing kithd starts by an exec can
+  hold a capability outside that list in the node's own user namespace, whatever its spec
+  asks for and whatever bug let it ask: not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or
+  `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`, `BPF` or the rest (the node's status lists what
+  it kept). A pod with `userNamespaces` has a full bounding set inside its own namespace,
+  over that namespace's resources only (above). **A container's bounding set is its own
+  spec's on any node, cut or not** (the fourteen for a root pod, three for a root that is
+  not one, one for a user): the cut is what kithd's other children inherit (a Source's
+  git, dnsmasq, the storage holder, an exec unit's shim, and libcontainer's init before it
+  sets the container's), so no container's `CapBnd` shows it; `ci/vm.sh --test policy`
+  reads kithd's own `CapBnd` instead. **It does not limit kithd's own threads**, which keep every
   capability (`CapEff` is not cut; `ci/vm.sh --test policy` reads it): a hole inside kithd,
   or a stolen certificate that reaches a hole there, is not held back by this. That is
   the split's job (`docs/adr-privilege.md`, T-0334). Nor does it say an effect is impossible: root

@@ -1402,7 +1402,15 @@ for r in found:
                 # thread it made after the cut, once on its console: the bounding set is exactly
                 # what is kept, a later thread's too; the effective set is not cut, so it holds
                 # what the bounding set does not, and a later thread's is the same.)
-                said=$(grep -ao 'kithd: capability bounding set cut: CapBnd [0-9a-f]* CapEff [0-9a-f]*; a later thread: CapBnd [0-9a-f]* CapEff [0-9a-f]*' "$work/${n}.log" | tail -n 1) || fail "the node $n did not say its bounding set was cut"
+                # (A node's console reaches its log a little after kithd writes it: asked for up to
+                # 30 s, not once.)
+                said=''
+                for _ in $(seq 30); do
+                    said=$(grep -ao 'kithd: capability bounding set cut: CapBnd [0-9a-f]* CapEff [0-9a-f]*; a later thread: CapBnd [0-9a-f]* CapEff [0-9a-f]*' "$work/${n}.log" | tail -n 1)
+                    [ -n "$said" ] && break
+                    sleep 1
+                done
+                [ -n "$said" ] || fail "the node $n did not say its bounding set was cut: $(grep -a 'kithd:' "$work/${n}.log" | head -n 5)"
                 echo "vm.sh: kithd on $n: ${said#kithd: capability bounding set cut: }" >&2
                 # shellcheck disable=SC2046
                 python3 -c '

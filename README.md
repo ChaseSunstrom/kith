@@ -1067,11 +1067,13 @@ this node's policy refuses exec units: processes of the node's root, with all of
 Where `exec-units`, `vm-paths` and `run` are all off (nothing the cluster asks can start
 a process as the node's root with every capability), kithd cuts its bounding set at
 start to the fourteen a root pod keeps (`KEPT` in `crates/kithd/src/policy.rs`). That
-limits what an exec gives a child: nothing kithd starts by an exec (a container's
-process, a helper, a nested unit) can hold `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`,
-`SYS_TIME`, `SYS_ADMIN`, `SYS_BOOT` or any other capability outside the list in the node's
-own user namespace, whatever its spec asks for (a pod with `userNamespaces` has a full
-bounding set inside its own namespace, over that namespace's resources only). kithd's own threads keep every capability, so a hole inside kithd is not
+limits what an exec gives a child: nothing kithd starts by an exec can hold `SYS_MODULE`,
+`SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, `SYS_ADMIN`, `SYS_BOOT` or any other capability
+outside the list in the node's own user namespace, whatever its spec asks for (a pod with
+`userNamespaces` has a full bounding set inside its own namespace, over that namespace's
+resources only). A container's own bounding set is its spec's on any node, cut or not; the
+cut is what kithd's other children inherit (a Source's git, dnsmasq, the storage holder, an
+exec unit's shim, libcontainer's init before its capset). kithd's own threads keep every capability, so a hole inside kithd is not
 held back by this (the split in `docs/adr-privilege.md` is for that), and root without
 `SYS_PTRACE` can still trace root's own processes or write `/proc/sys`: not covered.
 The Node's status says what it kept (`status.policy.capabilities`; `all` where it did not
