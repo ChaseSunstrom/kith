@@ -377,8 +377,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the list above. `kithd --node-policy` is given where a node's kithd is started
   (on kith OS among its arguments on the config partition, which the installer writes
   and no API reaches), is never read from the store, and turns off, each by its own
-  word: `exec` units (`no-exec-units`); containers that would be the node's root, each
-  then held to `runAsNonRoot` (`no-root-containers`); `seccomp` unconfined or with
+  word: `exec` units (`no-exec-units`); containers that would be the node's root, which
+  is root in one that keeps the node's users, not root in a pod's range of its own
+  (`no-root-containers`); `seccomp` unconfined or with
   refused calls allowed back (`no-unconfined`); containers on the node's own network
   (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the
   node or another hypervisor than qemu (`no-vm-paths`), PCI devices handed to a VM
@@ -398,8 +399,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   node refuses by its own policy whatever it was sent). Not done yet: a VM's kernel and
   disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use; and
   a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
-  a user namespace of its own, with what that gives (above), and a container held to
-  `runAsNonRoot` may still be of group 0, which reads what a Volume's files give that
+  a user namespace of its own, with what that gives (above), and a container that keeps the node's
+  users and is not root may still be of group 0, which reads what a Volume's files give that
   group. The policy is no defence against whoever can write the node's config partition
   or kithd's arguments and environment where it is started (`KITH_NODE_POLICY` and the
   command line say it too), or is root on the node already.

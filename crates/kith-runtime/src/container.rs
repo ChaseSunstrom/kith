@@ -83,6 +83,9 @@ pub struct Unit {
     pub user: Option<u32>,
     /// Not started if the user it would be is root, whoever says so (`user`, or its image).
     pub non_root: bool,
+    /// Not started if it would be the node's root: root, where kithd is root, with no range
+    /// of ids of its own (see `shifts`). Root of its own range is not the node's.
+    pub no_node_root: bool,
     /// Capabilities it starts without, of those it would have: `all`, or names as Linux
     /// has them without `CAP_` (`NET_RAW`).
     pub drop: Vec<String>,
@@ -1277,6 +1280,9 @@ fn spec_shifted(
         return Err("runAsNonRoot: this container would be root (its image names no other user, or names root): say who with runAsUser".into());
     }
     let shift = shift.filter(|_| uid.is_root());
+    if unit.no_node_root && user == 0 && uid.is_root() && shift.is_none() {
+        return Err("this container would be the node's root: its user is root and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser".into());
+    }
     let mut spec = match shift {
         _ if !uid.is_root() => Spec::rootless(uid.as_raw(), gid.as_raw()),
         None => Spec::default(),
@@ -1921,6 +1927,23 @@ mod tests {
             assert_eq!(made.is_err(), is_root);
             assert!(made.err().is_none_or(|e| e.to_string().starts_with("runAsNonRoot")));
         }
+        // And where the node takes no root of its own: root is refused only where it would
+        // be the node's (kithd is root and the container has no range of its own).
+        let nobody = Uid::from_raw(1000);
+        for (kithd, shift, refused) in [(root, None, true), (root, Some(100_000), false), (nobody, None, false)] {
+            let unit = Unit {
+                no_node_root: true,
+                ..pod.clone()
+            };
+            let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), (kithd, Gid::from_raw(0)), shift);
+            assert_eq!(made.is_err(), refused, "{kithd} {shift:?}");
+            assert!(made.err().is_none_or(|e| e.to_string().contains("the node's root")));
+        }
+        let user = Unit {
+            no_node_root: true,
+            ..Unit::default()
+        };
+        assert!(spec_of("a", &image, &user, "/kith/a", Path::new("/b"), root, Gid::from_raw(0)).is_ok());
         // No filter, or some of it, only as the unit says.
         let (uid, gid) = (Uid::from_raw(0), Gid::from_raw(0));
         let unit = Unit {

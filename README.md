@@ -1005,8 +1005,8 @@ kithd --node-policy hardened,node-network # the same, but containers that are no
 kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith run`
 ```
 
-The words: `exec-units`, `root-containers` (off: every container is held to
-`runAsNonRoot`), `unconfined` (a `seccomp` that is unconfined or allows refused calls
+The words: `exec-units`, `root-containers` (off: no container is root unless it has a
+range of ids of its own, as a pod's has on kith OS), `unconfined` (a `seccomp` that is unconfined or allows refused calls
 back), `node-network` (containers that are no pod), `vms`, `vm-paths` (a VM's kernel,
 firmware or disks as paths on the node, or another hypervisor than qemu), `passthrough`,
 `host-paths` (a Volume in `kith-system`, whose path is anywhere on the node), `run`

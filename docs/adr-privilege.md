@@ -36,8 +36,11 @@ the node today:
 
 - an `exec` unit: a plain process of kithd's user (root on kith OS) with all of `/dev`
   (`crates/kith-runtime/src/container.rs`, `exec`);
-- a container with `runAsUser: 0` (the node's root with three capabilities; fourteen in
-  a pod, T-0280), until containers have a user namespace of their own on kith OS (T-0242);
+- a container with `runAsUser: 0` that keeps the node's users (the node's root with
+  three capabilities): one on the node's network, with a device, with `hostUsers`, or
+  with its image or a volume on a file system that takes no id-mapped mount. A pod's
+  container otherwise has a range of ids of its own on kith OS (T-0242), and its root
+  is not the node's;
 - a container with `seccomp: { unconfined: true }` or calls allowed back by name;
 - a container that is no pod: it shares the node's network;
 - a device given to a container by a DeviceClaim: `/dev/input/event*` reads what is
@@ -245,7 +248,7 @@ as a Node's status says them, each on where nothing is said:
 ```yaml
 policy:
   execUnits: true        # a process of the node's root, with all of /dev
-  rootContainers: true   # a container that is the node's root (no other user, no user namespace of its own)
+  rootContainers: true   # a container that is the node's root (root, and no range of ids of its own)
   unconfined: true       # seccomp unconfined, or refused calls allowed back by name
   nodeNetwork: true      # containers that are no pod: the node's own network
   devices: [all]         # which classes a DeviceClaim may hand a container: gpu, input, usb, …

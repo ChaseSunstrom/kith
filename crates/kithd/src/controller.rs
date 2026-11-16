@@ -2146,10 +2146,11 @@ async fn start(
         Run::Container(c) => {
             (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
             unit.user = c.run_as_user;
-            // (Root in a container is the node's root: a node whose policy has none of them
-            // holds every container to `runAsNonRoot`, as if each had said it.)
-            let rootless = !crate::policy::get().allows("rootContainers");
-            (unit.non_root, unit.drop) = (rootless || c.run_as_non_root == Some(true), c.drop_capabilities.clone());
+            // (Root in a container that keeps the node's users is the node's root: a node
+            // whose policy has none of them starts no such container. Root of a range of
+            // its own, a pod's, is not the node's.)
+            unit.no_node_root = !crate::policy::get().allows("rootContainers");
+            (unit.non_root, unit.drop) = (c.run_as_non_root == Some(true), c.drop_capabilities.clone());
             let address = address.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()).to_string();
             for var in c.env.iter().filter(|var| var.field == Some(Field::Address)) {
                 unit.env.retain(|(name, _)| *name != var.name);
@@ -2184,11 +2185,8 @@ async fn start(
                 .await
                 .map_err(|e| e.to_string())?;
             let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
-            // The runtime says it as the container's own word; here it was the node's.
-            let whose = |e: kith_runtime::Error| match rootless
-                && c.run_as_non_root != Some(true)
-                && e.to_string().contains("runAsNonRoot")
-            {
+            // The runtime says what the container would be; here whose word refused it.
+            let whose = |e: kith_runtime::Error| match e.to_string().contains("would be the node's root") {
                 true => format!(
                     "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
                 ),
