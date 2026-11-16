@@ -494,8 +494,16 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
             // (Asked on every pass: a writer that loses a right is told at once.)
             writer_may(store, release, &output.resources, &done.delete)?;
             // And of whoever pushed the Package it came from: no more than its pusher, besides
-            // the Release's writer. One a Repository supplied has none: its key is its trust.
-            if let Some(package) = package.filter(|package| !package.metadata.annotations.contains_key(REPOSITORY)) {
+            // the Release's writer. One the Repository the Release names supplied has none: that
+            // Repository's key (or, with none, its address) is its trust. Any other, annotated
+            // or not, is asked of its writer, and refused when none is written down.
+            let origin = release.spec["package"]["repo"]
+                .as_str()
+                .and_then(|repo| origin(store, repo));
+            let fetched = |package: &Resource| {
+                origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
+            };
+            if let Some(package) = package.filter(|package| !fetched(package)) {
                 writer_may(store, package, &output.resources, &done.delete)?;
             }
             Ok((output, done))
@@ -1466,6 +1474,54 @@ mod tests {
         store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
         settle(&mut store, &mut renders);
         assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 1));
+    }
+
+    /// The pusher check is skipped only for a Package that carries the origin of the
+    /// Repository its Release names: a Package annotated for another Repository, or for
+    /// one that is not there, or met by a Release that names none, is no fetched one, and
+    /// is asked of its pusher (T-0550).
+    #[test]
+    fn package_origin_only_the_named_repositorys_own_is_taken_as_fetched() {
+        const HUB: &str = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\n\
+                           spec: { url: 'oci://127.0.0.1:1/kith' }\n";
+        let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: x }\nspec: { data: { k: v } }\n";
+        let annotated = |origin: String| {
+            let mut package = pushed_by_bob(package("1.0.0", &[("map.yaml", MAP), ("x.yaml", secret)]), 0);
+            package.metadata.annotations.insert(REPOSITORY.into(), origin);
+            package
+        };
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(&mut store, HUB);
+        bob(&mut store, "ConfigMap");
+        let hubs = origin(&store, "hub").unwrap();
+
+        // A Release that names no Repository does not take one a Repository supplied.
+        store.apply(annotated(hubs.clone())).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(message.contains("there is no Package maps"), "{message}");
+        assert!(store.get("Secret/shop/x").is_none());
+
+        // One that names a Repository that is not there takes an annotation it cannot
+        // match, and is asked of the pusher.
+        store.apply(annotated(String::new())).unwrap();
+        apply(
+            &mut store,
+            &RELEASE.replace("name: maps }", "name: maps, repo: ghost }"),
+        );
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(store.get("Secret/shop/x").is_none(), "{message}");
+
+        // The Repository it names, and its own origin: a fetched one, not asked of a pusher.
+        store.apply(annotated(hubs)).unwrap();
+        apply(&mut store, &RELEASE.replace("name: maps }", "name: maps, repo: hub }"));
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, "installed", "{}", said(&store).1);
+        assert!(store.get("Secret/shop/x").is_some());
     }
 
     /// A Package's writer is its name and its key's print: the local socket's renders as

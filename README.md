@@ -1388,7 +1388,8 @@ spec:
   refused, and the Repository's status says so (`state: error`, `message`).
   A newer version that does not check out is passed over for the newest
   that does (the status says which). A Repository without a `publicKey`
-  takes packages as they come. Change a Repository's `url` or `publicKey`
+  takes packages as they come: they are trusted on the word of whoever answers
+  at its `url`. Change a Repository's `url` or `publicKey`
   and what was fetched before is no longer taken for its: it is fetched and
   checked again.
 - A Package keeps its last 3 revisions (other kinds keep 100), because it
@@ -1399,8 +1400,12 @@ spec:
   the pusher may not, nothing new is made, what was installed stays, and the
   Release's status says whose right fell short. A Package pushed before kithd
   wrote the pusher down renders nothing new until it is pushed again. One fetched
-  from a Repository has no pusher and is trusted by the Repository's key, so
-  whoever may apply a Repository gives the rights of every Release that names it.
+  from a Repository has no pusher, and this check does not apply to it: it is
+  trusted by the Repository's key (with none, on the word of whoever answers at its
+  `url`), so whoever may apply a Repository gives the rights of every Release that
+  names it. Only kithd's fetcher says a Package was fetched (`kith.dev/repository`):
+  an apply or a Source's file that carries it is refused, and a Release takes it as
+  fetched only from the Repository it names.
 - A version is fetched once: pushing it to the registry again changes
   nothing here. A registry can also keep quiet about newer versions; the
   signature says a package is the publisher's, not that it is the newest.

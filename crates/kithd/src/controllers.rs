@@ -436,6 +436,15 @@ mod tests {
                 json!({ "apiVersion": "kith.dev/v1", "kind": "Namespace", "metadata": { "name": "x" }, "spec": {} }),
                 "cannot make a Namespace",
             ),
+            // (A Package is in no namespace: one a controller made could say a Repository sent it.)
+            (
+                json!({
+                    "apiVersion": "kith.dev/v1", "kind": "Package",
+                    "metadata": { "name": "maps-1.0.0", "annotations": { "kith.dev/repository": "hub@0123" } },
+                    "spec": { "version": "1.0.0", "files": {} },
+                }),
+                "cannot make a Package",
+            ),
         ] {
             let said = step(&store, key, Ok(json!({ "resources": [resource] }))).unwrap();
             let said = said.status.unwrap()["controller"]["message"].to_string();

@@ -276,7 +276,8 @@ Only the newest version is fixed. There are no security releases of older ones.
 - **Packages** are taken only with a signature over their name, version and hash, by a
   key the cluster was told to trust; there is no unsigned way in (but a package pushed by
   hand, which a Release renders with no more than its pusher's rights, and one from a
-  Repository that has no `publicKey`). A package's WebAssembly
+  Repository that has no `publicKey`, which is trusted on the word of whoever answers
+  at its URL). A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
   template in kith's own language (`.kith`) is evaluated inside kithd: it ends in
   500,000 steps, nested 3,000 deep and 1 MB of output or is refused, and it can read
@@ -884,10 +885,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     second one's rights. A Package with nobody written down (one from before this check),
     or an Identity gone or made again under the name, makes nothing new until it is
     pushed again; a Source that makes a Package writes its own writer on it. A Package
-    fetched from a Repository has no pusher: it is trusted by the Repository's `publicKey`
-    (or by nothing, where there is none), so the right to apply a Repository is the
-    rights of every Release that names it, and `apply` on `Package` lets someone have
-    kithd ask any Repository there is.
+    fetched from a Repository has no pusher, and the pusher check does not apply to it at
+    all: with a `publicKey` the key is what it is trusted by; **with none, it is trusted
+    on the word of whoever answers at the Repository's URL**. So the right to apply a
+    Repository is the rights of every Release that names it, and `apply` on `Package`
+    lets someone have kithd ask any Repository there is. What makes a Package "fetched"
+    is `kith.dev/repository`, which only kithd's own fetcher may write: an apply that
+    carries it is refused, a Source whose repository's files carry it makes nothing new
+    (its status names the resource), and a Release takes it as fetched only when it
+    equals the origin of the Repository the Release names (a print of that Repository's
+    name, URL and key); any other Package is asked of its pusher, and refused when
+    nobody is written down. A Package a Source made before this, with the annotation,
+    stays until deleted.
   - A Release and a Source act as the Identity that applied them while it has the key
     it had then. An Identity made again under the same name has another key, so what
     the old one applied is not acted on as the new one: it makes nothing new, fetches no
