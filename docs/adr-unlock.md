@@ -30,7 +30,7 @@ again today for whatever system runs). FIDO2 is the fifth, and is deferred here.
 | The disk's own secret moves into the TPM | no (README, "Not yet") | not here ("Open") |
 | Sealed to the Secure Boot state | PCR 7 is sealed to (T-0237); kith OS's boot file is not signed, so PCR 7 says "off" and no more | unchanged |
 | ... and to releases signed with the cluster's release key | no: a seal holds for one boot file (PCR 4) | step 4 |
-| An encrypted session to the TPM | no: the key crosses the TPM's bus in the clear (tpm.rs says so) | step 2 |
+| An encrypted session to the TPM | no when this record was written: the key crossed the TPM's bus in the clear | step 2, built (T-0585) |
 | TPM plus the cluster's key, automatic | not as asked: the cluster's key alone is automatic, and so is the TPM alone | not here ("Open") |
 | TPM plus a PIN | no (README, "Not yet": two locks) | step 3 |
 | A FIDO2 key touched at the console, two enrolled | no | deferred ("FIDO2") |
@@ -138,9 +138,10 @@ TPM2_PolicyPCR (0x17F) and TPM2_PCR_Extend (0x182). It knows one refusal by name
 TPM_RC_POLICY_FAIL from session 1 (0x99D).
 
 - Authorization is the password session (TPM_RS_PW) with an empty password, for the owner
-  hierarchy, the parent and PCR 15; and one policy session for TPM2_Unseal, unsalted and
-  unbound (tpmKey and bind both TPM_RH_NULL), with no symmetric algorithm and an empty HMAC.
-  No HMAC is computed anywhere, nothing is encrypted, and no name is computed.
+  hierarchy, TPM2_Load's parent and PCR 15. TPM2_Create runs under an HMAC session and
+  TPM2_Unseal under a policy session, each salted to the storage key, AES-128-CFB, with
+  HMACs computed and the answer's checked, as "The session" below says (T-0585). The
+  storage key's name is computed from its public area and kept on `tpm-parent:`.
 - The parent (the storage key): ECC P-256 under the owner hierarchy; restricted, decrypting,
   AES-128-CFB, noDA; made from its template at each use and flushed after, never kept in
   the TPM.
@@ -148,8 +149,10 @@ TPM_RC_POLICY_FAIL from session 1 (0x99D).
   userWithAuth, so only its policy opens it. The policy is TPM2_PolicyPCR over the six PCRs.
   Its digest is computed in kithd: SHA-256 of 32 zero bytes, TPM_CC_PolicyPCR, the
   selection, and SHA-256 of the values that TPM2_PCR_Read gave.
-- Its test (`tpm_gives_a_sealed_key_back_to_the_same_system_only`) runs all of this against
-  swtpm, and `sh ci/vm.sh --test tpm` runs it under OVMF with swtpm as the VM's TPM.
+- Its tests (`tpm_gives_a_sealed_key_back_to_the_same_system_only`,
+  `tpm_session_carries_no_key_and_checks_each_answer`,
+  `tpm_parent_is_checked_before_anything_is_sent`, and crypt.rs's
+  `tpm_parent_is_kept_when_an_old_seal_is_sealed_again`) run all of this against swtpm, and `sh ci/vm.sh --test tpm` runs it under OVMF with swtpm as the VM's TPM.
 
 ### The PCRs
 
@@ -177,7 +180,7 @@ Unchanged from T-0237: the SHA-256 bank, PCRs 0, 4, 7, 9, 12 and 15.
 
 Decided: every command that carries a secret, or whose answer is one, runs with a session
 salted to the storage key, with parameter encryption, and the storage key's name is kept
-beside the seal and checked before the salt is sent.
+beside the seal and checked before any salt or secret is sent.
 
 Which key: the storage key kithd already makes as the parent (TPM2_CreatePrimary under the
 owner hierarchy, the template above). It is the key every seal lives under, so salting to it
@@ -191,20 +194,20 @@ Sealing:
    TPM answers.
 2. kithd makes an ephemeral P-256 key (`ring::agreement`, already linked), computes Z, the
    x-coordinate of the shared point with the storage key's public point, and the salt as
-   KDFe(SHA-256, Z, "SECRET", its own x, the storage key's x, 256 bits) (unverified: Part 1,
-   ECDH secret sharing; Part 3, TPM2_StartAuthSession).
+   KDFe(SHA-256, Z, "SECRET", its own x, the storage key's x, 256 bits) (swtpm accepted it as
+   written; Part 1, ECDH secret sharing; Part 3, TPM2_StartAuthSession).
 3. TPM2_StartAuthSession: tpmKey the storage key, bind TPM_RH_NULL, a 32-byte random
    nonceCaller, encryptedSalt the ephemeral point (TPMS_ECC_POINT), sessionType HMAC,
    symmetric AES-128-CFB, authHash SHA-256. The session key is KDFa(SHA-256, salt, "ATH",
-   nonceTPM, nonceCaller, 256) (unverified: Part 1, session key).
+   nonceTPM, nonceCaller, 256) (swtpm accepted it as written; Part 1, session key).
 4. TPM2_PCR_Read and the policy, as today.
 5. TPM2_Create, the parent authorized by that session with `decrypt` set: `inSensitive`,
    which holds the key, crosses encrypted. AES-128-CFB, key and IV from KDFa(SHA-256,
-   session key, "CFB", nonceCaller, nonceTPM, 256) (unverified: Part 1, parameter
-   encryption). The command's HMAC is over cpHash (the command code, the parent's name, the
-   parameters as they cross), the two nonces and the session's attributes. The answer's
-   HMAC is checked before anything in it is used (unverified: Part 1, that cpHash and rpHash
-   are taken over the parameters encrypted).
+   session key, "CFB", nonceCaller, nonceTPM, 256) (swtpm accepted it as written; Part 1,
+   parameter encryption). The command's HMAC is over cpHash (the command code, the parent's
+   name, the parameters as they cross), the two nonces and the session's attributes. The
+   answer's HMAC is checked before anything in it is used (swtpm accepted it as written:
+   cpHash and rpHash are taken over the parameters encrypted; Part 1).
 6. Both handles flushed. Kept: the blob on `tpm:` (its format unchanged) and the name on
    `tpm-parent:`.
 
@@ -219,7 +222,8 @@ Unsealing:
 3. TPM2_StartAuthSession as in sealing, but sessionType POLICY. Then TPM2_PolicyPCR.
 4. TPM2_Unseal with that session, `encrypt` set and `continueSession` clear: `outData`
    comes back encrypted. The HMAC key is the session key alone, since the session ran no
-   PolicyAuthValue (unverified: Part 1, the HMAC of a policy session without one).
+   PolicyAuthValue (swtpm accepted it as written; Part 1, the HMAC of a policy session
+   without one).
 
 A seal made before step 2 has no `tpm-parent:`. It is unsealed through a session salted to
 the storage key as the TPM gives it (no name to check), so a probe that only listens reads
@@ -581,11 +585,13 @@ Older kithd (a node gone back to its other slot, or taken down by an `allowDowng
 - It reads NodeKey `seal: "pin"` as not sealed (it asks `== true`), so it never makes a
   TPM-alone seal where the owner chose a PIN.
 
-Room: 4 KiB, `peers:` last. Today `Record::write` cuts whatever does not fit from the end,
+Room: 4 KiB, `peers:` last. `Record::write` cut whatever did not fit from the end,
 silently. With the new lines the record could exceed that, and a seal line cut in half is a
-record that does not parse. Decided: a write that would cut anything but whole entries of
-`peers:` is refused. Estimated: the lines other than `peers:` stay under 2.6 kB in either mode
-(a sealed blob is about 200 bytes; unverified until a blob is made through the session).
+record that does not parse. Decided, and built (T-0585): a write that would cut anything but
+whole entries of `peers:` is refused, naming the line it would cut. Estimated: the lines other than `peers:` stay under 3.1 kB in either mode.
+A sealed blob made through the session is 272 bytes on swtpm (T-0585), not the 200 first
+estimated: 144 more hex characters a blob, at most three blobs in a mode, so 2.6 kB became
+3.1 kB.
 
 ## Order of writes
 
@@ -711,14 +717,20 @@ Claims this record makes that tpm.rs does not exercise against swtpm today, by c
 part of the TPM 2.0 library specification. The tests of steps 2 to 4 settle the first eleven
 on swtpm. None is settled on hardware by this task.
 
+Items 1 to 5 and 19 are settled on swtpm by step 2 (T-0585); they stay listed, as no hardware
+TPM has run them.
+
 1. TPM2_StartAuthSession (Part 3) with an ECC tpmKey: the salt is KDFe(SHA-256, Z, "SECRET",
-   the caller's x, the key's x) (Part 1, ECDH secret sharing).
-2. The session key is KDFa(SHA-256, salt, "ATH", nonceTPM, nonceCaller) (Part 1).
+   the caller's x, the key's x) (Part 1, ECDH secret sharing). swtpm accepted it as written.
+2. The session key is KDFa(SHA-256, salt, "ATH", nonceTPM, nonceCaller) (Part 1). swtpm
+   accepted it as written.
 3. AES-128-CFB parameter encryption takes its key and IV from KDFa(…, "CFB", nonceNewer,
-   nonceOlder) (Part 1).
-4. cpHash and rpHash are taken over the parameters as they cross, encrypted (Part 1).
+   nonceOlder) (Part 1). swtpm accepted it as written, both ways (TPM2_Create's
+   `inSensitive` in, TPM2_Unseal's `outData` out).
+4. cpHash and rpHash are taken over the parameters as they cross, encrypted (Part 1). swtpm
+   accepted it as written; a changed byte of an answer fails its HMAC.
 5. TPM2_Unseal with a salted policy session that ran no TPM2_PolicyAuthValue: the HMAC is keyed
-   by the session key alone (Part 1).
+   by the session key alone (Part 1). swtpm accepted it as written.
 6. TPM2_PolicyAuthValue (Part 3): the HMAC is keyed by the session key and the object's
    authValue; a wrong one on an object without noDA counts against the lockout (Part 1,
    dictionary attack protection).
@@ -746,7 +758,7 @@ on swtpm. None is settled on hardware by this task.
     PCR 9.
 18. kith OS's kernel exposes the event log (securityfs, `binary_bios_measurements`), the events
     before ExitBootServices included.
-19. A sealed blob is about 200 bytes.
+19. A sealed blob is about 200 bytes. swtpm made it 272 ("The lock record" uses that).
 20. QEMU's emulated security key speaks U2F only; the kernel's merged configuration lacks
     CONFIG_HIDRAW and CONFIG_USB_HID.
 21. A 4 KiB aligned write is whole after a power cut (depends on the disk).
@@ -771,6 +783,8 @@ Decisions that are the owner's:
 - **Whether the installer should take the signature of the image's update**, so that a freshly
   installed node counts as signed and seals before its first update.
 - **The `aes` crate**, a new dependency, for the session's AES-128-CFB, and later FIDO2's CBC.
+  Taken at step 2 (T-0585): `aes` 0.9, the block cipher alone, CFB written in tpm.rs; kithd
+  grew by 16 KiB (12,026,656 to 12,043,040 bytes, musl release).
 - **FIDO2**: built as its own task, with a software authenticator for its tests.
 - **A second copy of the lock record** against a torn write, and what a duress code and an
   older kithd then do with it.
@@ -821,8 +835,8 @@ Decided without being asked, and said here so that they are not found later:
   holds no secret to guess.
 - The recovery key is a way back in every case this record covers.
 
-Also found: tpm.rs's own comment, the README and SECURITY.md say the key crosses the bus in
-plain. They stay true until step 2 lands, and change with it.
+Also found: tpm.rs's own comment, the README and SECURITY.md said the key crosses the bus in
+plain. They changed with step 2 (T-0585).
 
 ## What the plan review and the rival plan raised
 

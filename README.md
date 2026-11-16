@@ -514,8 +514,12 @@ spec:
   and a root of its own and behind the same filter on system calls as every container.
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
-- Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace).
+- On kith OS, where kithd is root, each container of a pod is a user namespace of its
+  own, with users of the node no other container has: its root is not the node's root,
+  and a root-only file of the node it is handed stays shut to it
+  ([what a container is kept from](#what-a-container-is-kept-from); `sh ci/vm.sh --test share`
+  shows it). A pod on the node's network, one given devices or one with a volume of
+  another node keeps the node's users.
 
 ### A pod behind a VPN exit
 
@@ -822,7 +826,7 @@ kith node status                                   # who leads the store, who vo
 
   ```sh
   kith node token --worker             # on alpha: the node this token lets in is a worker
-  kith node token --worker --ingress   # a worker that serves ingress: it is sent the whole store
+  kith node token --worker --ingress   # a worker that serves ingress: it is sent the hosts' certificates too
   ```
 
   ```yaml
@@ -880,8 +884,9 @@ kith node status                                   # who leads the store, who vo
   fewer than three nodes.
 
   A worker writes to the store only what it says of itself: its units' state, its
-  own Node's `os` and `mesh`, its Devices and Seats, and the backups and images of
-  the Volumes that are on it. The control node it writes to checks each write and
+  own Node's `os`, `mesh`, `serves` and `thumbprint`, its Devices and Seats, and
+  the backups and images of the Volumes that are on it. The control node it writes
+  to checks each write and
   refuses the rest, in the audit log under the worker's name (`kith audit`). So run
   `kith` on a control node, and point a kubeconfig, `curl` and the web UI at one: a
   worker's port answers no person (`this node is a worker and answers no one by
@@ -893,8 +898,8 @@ kith node status                                   # who leads the store, who vo
 
   A worker holds no blob but one it is using, is given no encrypted Volume's key to
   keep, and its copy of a replicated Volume takes over only when no control node has
-  one. Not on a worker yet: an ingress that gets its certificates by ACME (it would
-  have to write them), and being the only node that answers DNS if you read
+  one. Not on a worker yet: ordering certificates by ACME (an ingress worker serves
+  the ones a control node orders, below), and being the only node that answers DNS if you read
   `DNSRecord` or `DNSBlockList` status (a worker answers and leaves the status to
   the control nodes).
 
@@ -918,11 +923,35 @@ kith node status                                   # who leads the store, who vo
   worker`). A
   control node, or a worker from before views, that is made a worker erases its
   copy of the store once its first view is written down; to make it a control node
-  again, delete its Node and join it again. A worker that serves ingress is still
-  sent the whole store (it reads the hosts' certificates), so the node the internet
-  reaches holds no less as a worker yet; it is let in only by a token that says so,
-  `kith node token --worker --ingress`, and a plain worker's token refuses a kithd
-  started with `--ingress`. What a worker that is taken still
+  again, delete its Node and join it again.
+
+  A worker that serves ingress (the node the internet reaches) runs from a view too,
+  which also holds the `tls-` Secret of every host a Service exposes and the ACME
+  account's thumbprint (the ConfigMap `kith-system/acme`), never the account's key.
+  It is let in only by a token that says so, and a plain worker's token refuses a
+  kithd started with `--ingress`. Its certificates are ordered by a control node:
+  start the control nodes with `--acme` (with or without `--ingress`); the one that
+  leads orders for the workers' hosts once each ingress worker says its view holds the
+  thumbprint, and the worker answers the authority's challenges on port 80:
+
+  ```sh
+  kithd --acme ...                         # on each control node
+  kith node token --worker --ingress       # on a control node
+  kithd --join ADDRESS --token TOKEN --ingress --mesh   # on the edge machine
+  ```
+
+  If that worker is taken, it has every exposed host's key: delete its Node, then
+  delete each `tls-` Secret (`kith get secret`) and the control node orders new ones
+  with new keys. To move an ingress worker to another machine: join the new one as
+  above, point the hosts' DNS at it, then delete the old one's Node. A worker that
+  served ingress before this (sent the whole store to do it) goes on being sent the
+  store, and its kithd and every control node that sends it the store say so, with
+  what to do: delete its Node and join it again with an ingress worker's token, or
+  set `ingress: true` in its Node's spec (it then asks for a view and erases its
+  copy). In a cluster half updated, an older control node writes no `ingress` into a
+  Node it admits (that worker is sent the whole store, as before, and is warned
+  about) and sends a worker it serves no certificate: update every control node
+  before an ingress worker joins. What a worker that is taken still
   has is in SECURITY.md, "A node that is taken"; the design is `docs/adr-workers.md`.
   Say `trust` only once every node runs a kithd that knows it: an older kithd
   does not read a Node or a Secret that has it, an older control node writes
@@ -962,7 +991,9 @@ kith node status                                   # who leads the store, who vo
   another ACME directory; giving the flag agrees to that authority's terms)
   and another before it runs out. The host's DNS has to point at the ingress
   nodes first: the authority checks by asking port 80 there, and any node
-  with `--ingress` can answer. `kith get service/NAME -o yaml` shows how it
+  with `--ingress` can answer (an ingress worker's are ordered by the control
+  node that leads the store, and only while it has `--acme`: give it to every
+  control node that may lead, above). `kith get service/NAME -o yaml` shows how it
   went (`tls`: its `secret` names the Secret whose certificate serves the
   host, one applied by hand included); after a failure kithd tries again an
   hour later, not sooner.
@@ -1077,6 +1108,47 @@ that dies halfway needs `kith delete node/NAME` and a new token,
 certificates last ten years and cannot be renewed (a node's stops being taken when its Node is deleted,
 an Identity's when the Identity is), and `kith` itself
 only talks to the kithd on its own machine.
+
+## What a node refuses, whatever the cluster says
+
+A node runs what the cluster's store tells it, and some of that is the node's own root: an
+`exec` unit, a container that is root, a VM from a path on the node. Whoever holds an
+admin's credential has every node through them. A node's owner can turn each off for that
+node, where its kithd is started and nowhere else:
+
+```sh
+kithd --node-policy hardened              # none of it, and a GPU the only Device handed out
+kithd --node-policy hardened,node-network # the same, but containers that are no pod
+kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith run`
+```
+
+The words: `exec-units`, `root-containers` (off: no container is root unless it has a
+range of ids of its own, as a pod's has on kith OS), `unconfined` (a `seccomp` that is unconfined or allows refused calls
+back), `node-network` (containers that are no pod), `vms`, `vm-paths` (a VM's kernel,
+firmware or disks as paths on the node, or another hypervisor than qemu), `passthrough`,
+`host-paths` (a Volume in `kith-system`, whose path is anywhere on the node), `run`
+(`kith run`), `wipe` (the cluster erasing this node's key, or setting its duress codes)
+and `devices=gpu+input` (the classes of Device a DeviceClaim hands out; `all`, or nothing
+after the `=` for none; with classes named, only Devices the node listed itself are
+handed out, not ones written by hand). `no-` before a word turns it off, and they are
+read left to right. On kith OS they go with kithd's other arguments at the end of what
+the config partition says (` -- --node-policy hardened`); elsewhere `KITH_NODE_POLICY`
+does too.
+
+What a node refuses is not run there, and the Workload says why:
+
+```
+this node's policy refuses exec units: processes of the node's root, with all of /dev (execUnits is off: `--node-policy exec-units` where the node's kithd is started allows it)
+```
+
+`kith get node/NAME -o yaml` shows a node's policy under `status.policy` once it has
+one. A node with none does everything, as before. The scheduler reads it: a Workload or
+Job that asks for what a node refuses is placed on the nodes that allow it, and waits,
+saying so, when none does. (A NodeWorkload's copy, a claimed Device and a Volume belong
+to one node: there the node itself says why it runs nothing.) A VM's kernel and disks are
+paths on the node today, so `vms` without `vm-paths` runs no VM of use. A word kithd does
+not know ends its start (on kith OS the node runs `hardened` instead, and says so on its
+console). What this is and is not a defence against: [SECURITY.md](SECURITY.md).
 
 ## Restarting a node on purpose
 
@@ -1356,8 +1428,12 @@ spec:
   message such as `Secret/store/db: Release/store/shop was applied by alice,
   and alice may not apply Secret in namespace store: no Role bound to it
   allows that`. A writer who loses a right, or whose Identity is deleted,
-  stops the next render, not what is installed. A Release from before kithd
-  wrote this down makes nothing new until it is applied again.
+  stops the next render, not what is installed. A Release (and a Source) acts
+  as the Identity that applied it only while that Identity has the key it had
+  then: kithd writes the print of the key down beside the name
+  (`kith.dev/written-key`). After a new certificate for the Identity, or an
+  Identity made again under the same name, it makes nothing new and says to
+  apply it again; so does a Release from before kithd wrote this down.
 - `version` is one version (`1.2.0`) or a range (`^1.2`, `>=1, <3`); none is
   any version that is not a pre-release. A Release goes on the newest
   package that fits and stays on it; with `autoUpgrade: true` it follows
@@ -3271,6 +3347,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
 Then nothing is asked, and nothing confirmed: a stick with answers on it
@@ -3517,9 +3594,11 @@ its seal when it hears of it.
 What the seal does not cover: a machine taken whole and started as it is
 opens its state by itself, and no lock reaches it until it hears its cluster
 again; what stands between whoever holds it and its state is then the running
-system alone. Nor a system taken while it runs, nor a TPM chip whose pins are
-probed while the machine starts (the key crosses its bus as it is), nor a
-machine with no TPM. It has run against a software TPM only, never on a real
+system alone. Nor a system taken while it runs, nor a machine with no TPM.
+The key crosses the TPM chip's bus encrypted, to the storage key whose name
+the seal keeps, so probing the chip's pins reads nothing; but someone on the
+bus when the seal was made, or who resets the TPM and replays an allowed
+start's measurements, can still get it (SECURITY.md). It has run against a software TPM only, never on a real
 one.
 
 **A passphrase.** For a machine with no TPM, or whose owner will not have

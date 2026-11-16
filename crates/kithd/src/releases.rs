@@ -31,6 +31,78 @@ pub const OWNER: &str = "kith.dev/owned-by";
 /// written by the API server (a client's word for it is replaced) and, on what a Source
 /// makes, the Source's own. What it renders is made with that one's rights.
 pub const WRITER: &str = "kith.dev/written-by";
+/// The annotation beside [`WRITER`] when that is an Identity: the print of its `publicKey`
+/// (`pki::key_print`) when it applied. An Identity made again under the name has another
+/// key, so what the old one applied is not acted on as the new one. None for the local socket.
+pub const KEY: &str = "kith.dev/written-key";
+
+/// The print of the key the Identity `name` has in `store`, if it is there with one.
+pub fn print_of(store: &Store, name: &str) -> Option<String> {
+    let identity = store.get(&format!("Identity/{name}"))?;
+    crate::pki::print_of_key(identity.spec["publicKey"].as_str()?)
+}
+
+/// Whether `owner` (a Release or a Source) was applied by the Identity `caller` is now:
+/// one with the key it had then. One written down with no key, or another key (an Identity
+/// made again under that name, or given a new certificate), is not acted on. One that is
+/// not there is for the rights to say (it has none); the local socket has no key.
+fn same_writer(store: &Store, owner: &Resource, caller: &crate::access::Caller) -> Result<(), String> {
+    let crate::access::Caller::Identity(name) = caller else {
+        return Ok(());
+    };
+    if store.get(&format!("Identity/{name}")).is_none() {
+        return Ok(());
+    }
+    let written = owner.metadata.annotations.get(KEY);
+    if written.is_some() && written == print_of(store, name).as_ref() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} was applied by an earlier Identity named {name}, or by {name} before it had the key it has now, \
+         so it makes nothing new: apply it again",
+        owner.key()
+    ))
+}
+
+/// For tests: the key `nth` (of two, made once) of the Identity bob, as a PEM and its print.
+#[cfg(test)]
+pub(crate) fn bobs_key(nth: usize) -> (String, String) {
+    static KEYS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        let ca = crate::pki::Ca::create().unwrap();
+        (0..2).map(|_| ca.issue_user("bob").unwrap().2).collect()
+    });
+    (keys[nth].clone(), crate::pki::print_of_key(&keys[nth]).unwrap())
+}
+
+/// For tests: the Identity bob in `store`, with his key `nth`.
+#[cfg(test)]
+pub(crate) fn bob_is(store: &mut Store, nth: usize) {
+    let identity = json!({
+        "apiVersion": kith_api::API_VERSION, "kind": "Identity",
+        "metadata": { "name": "bob" }, "spec": { "publicKey": bobs_key(nth).0 },
+    });
+    store.apply(serde_json::from_value(identity).unwrap()).unwrap();
+}
+
+/// For tests: `bob`'s mark on what he applied with his key `nth`, as the API writes it
+/// (what the local socket writes is `"annotations: { 'kith.dev/written-by': 'local socket' }"`).
+#[cfg(test)]
+pub(crate) fn bobs_note(nth: usize) -> String {
+    format!(
+        "annotations: {{ 'kith.dev/written-by': 'bob', 'kith.dev/written-key': '{}' }}",
+        bobs_key(nth).1
+    )
+}
+
+/// For tests: `source` (applied through the local socket) as bob applied it with his key `nth`.
+#[cfg(test)]
+pub(crate) fn by_bob(source: &str, nth: usize) -> String {
+    source.replace(
+        "annotations: { 'kith.dev/written-by': 'local socket' }",
+        &bobs_note(nth),
+    )
+}
 /// What no package gets to make, besides anything that is in no namespace (nodes,
 /// packages, repositories): what installs things.
 const KEPT: [&str; 2] = ["Release", "Source"];
@@ -471,6 +543,7 @@ pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone:
             "{key} was applied by {writer}, as whom kithd makes nothing: apply it again"
         ));
     };
+    same_writer(store, owner, &caller)?;
     let grants = Grants::of(&caller, store);
     let short = |(at, (verb, kind, namespace)): (String, crate::api::Right)| {
         let place = namespace.map_or(String::new(), |namespace| format!(" in namespace {namespace}"));
@@ -515,6 +588,7 @@ pub fn supplied(store: &Store, release: &Resource) -> Result<(), String> {
             "{key} was applied by {writer}, for whom kithd fetches nothing: apply it again"
         ));
     };
+    same_writer(store, release, &caller)?;
     if Grants::of(&caller, store).may(&kith_api::kinds::Verb::Apply, "Package", None) {
         return Ok(());
     }
@@ -1002,12 +1076,12 @@ mod tests {
         apply(
             store,
             &format!(
-                "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
-                 apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
+                "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
                  spec: {{ rules: [{{ kinds: [{kinds}], verbs: [apply, delete], namespaces: [shop] }}] }}\n---\n\
                  apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-shop }}\nspec: {{ role: shop, subjects: [bob] }}\n"
             ),
         );
+        bob_is(store, 0);
     }
 
     fn said(store: &Store) -> (Value, String) {
@@ -1020,7 +1094,7 @@ mod tests {
     /// write Releases and no Secret gets no Secret by way of a package.
     #[test]
     fn release_rights_a_release_makes_nothing_its_writer_may_not() {
-        let as_bob = RELEASE.replace("local socket", "bob");
+        let as_bob = by_bob(RELEASE, 0);
         let kinds = [
             ("Secret", "spec: { data: { k: v } }"),
             ("Backup", "spec: { volume: v, every: 1d }"),
@@ -1085,7 +1159,7 @@ mod tests {
     /// written down acts as nobody, not as the cluster.
     #[test]
     fn rights_later_a_release_whose_writer_may_no_longer_installs_nothing_new() {
-        let as_bob = RELEASE.replace("local socket", "bob");
+        let as_bob = by_bob(RELEASE, 0);
         let keys = |store: &Store| -> Vec<String> {
             let owned = store.list(None).filter(|resource| owner(resource).is_some());
             owned.map(Resource::key).collect()
@@ -1132,7 +1206,7 @@ mod tests {
         // Applied before anyone wrote the writer down, or by one kithd does not act as:
         // nothing new, and how to mend it.
         for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
-            let release = as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written);
+            let release = as_bob.replace(&format!(", {}", bobs_note(0)), written);
             apply(&mut store, &release.replace("extra: false", "extra: true"));
             settle(&mut store, &mut renders);
             let (state, message) = said(&store);
@@ -1150,7 +1224,7 @@ mod tests {
         const HUB: &str = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\n\
                            spec: { url: 'oci://127.0.0.1:1/kith' }\n";
         let from_hub = RELEASE.replace("name: maps }", "name: maps, repo: hub }");
-        let as_bob = from_hub.replace("local socket", "bob");
+        let as_bob = by_bob(&from_hub, 0);
         let (mut store, mut renders) = (Store::default(), Renders::new());
         apply(&mut store, HUB);
         // A Role in one namespace reaches no Package, whatever kinds it lists: Packages are
@@ -1181,10 +1255,7 @@ mod tests {
         apply(&mut store, &from_hub);
         assert_eq!(supplied(&store, &release(&store)), Ok(()));
         for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
-            apply(
-                &mut store,
-                &as_bob.replace(", annotations: { 'kith.dev/written-by': 'bob' }", written),
-            );
+            apply(&mut store, &as_bob.replace(&format!(", {}", bobs_note(0)), written));
             let refused = supplied(&store, &release(&store)).unwrap_err();
             assert!(refused.contains("apply it again"), "{refused}");
         }
@@ -1200,5 +1271,92 @@ mod tests {
         store.apply(here).unwrap();
         settle(&mut store, &mut renders);
         assert_eq!(said(&store).0, json!("installed"), "{}", said(&store).1);
+    }
+
+    /// What a Release installs by its writer's rights is for that Identity's key: one made
+    /// again under the name (another key, wider Roles) gets nothing of the old one's Release,
+    /// not a Package fetched for it either; applied again by the new one it goes on (T-0551).
+    #[test]
+    fn writer_key_a_release_is_not_acted_on_for_an_identity_made_again_under_its_name() {
+        let from_hub = RELEASE.replace("name: maps }", "name: maps, repo: hub }");
+        let owned = |store: &Store| store.list(None).filter(|resource| owner(resource).is_some()).count();
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "Release, ConfigMap");
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: packages }\n\
+             spec: { rules: [{ kinds: [Package], verbs: [apply] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-packages }\n\
+             spec: { role: packages, subjects: [bob] }\n",
+        );
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &by_bob(RELEASE, 0));
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 2));
+        apply(&mut store, &by_bob(&from_hub, 0));
+        let release = |store: &Store| store.get("Release/shop/mine").unwrap().clone();
+        assert_eq!(supplied(&store, &release(&store)), Ok(()));
+
+        // bob removed and made again with another key, whose Roles allow more.
+        store.delete("Identity/bob").unwrap();
+        bob_is(&mut store, 1);
+        let refused = supplied(&store, &release(&store)).unwrap_err();
+        assert!(
+            refused.contains("an earlier Identity named bob") && refused.contains("apply it again"),
+            "{refused}"
+        );
+        apply(&mut store, &by_bob(&RELEASE.replace("extra: true", "extra: false"), 0));
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error");
+        assert!(
+            message.contains("an earlier Identity named bob") && message.contains("apply it again"),
+            "{message}"
+        );
+        assert_eq!(
+            owned(&store),
+            2,
+            "what was installed stays, and nothing new is made or taken"
+        );
+
+        // Applied again by the new one: it goes on.
+        apply(&mut store, &by_bob(&RELEASE.replace("extra: true", "extra: false"), 1));
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 1));
+        apply(&mut store, &by_bob(&from_hub, 1));
+        assert_eq!(supplied(&store, &release(&store)), Ok(()));
+    }
+
+    /// A Release's writer is its name and its key's print: the local socket's has no print
+    /// and works; a name with no print (written before), or the print of a key the Identity
+    /// no longer has (a new certificate), makes nothing new and says to apply it again.
+    #[test]
+    fn writer_print_a_release_needs_the_key_its_writer_has_now() {
+        let owned = |store: &Store| store.list(None).filter(|resource| owner(resource).is_some()).count();
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "Release, ConfigMap");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 2));
+
+        let more = RELEASE.replace("extra: true", "extra: false");
+        let name_only = more.replace("'local socket'", "'bob'");
+        let mut again = |store: &mut Store, release: &str| {
+            apply(store, release);
+            settle(store, &mut renders);
+            said(store)
+        };
+        let (state, message) = again(&mut store, &name_only);
+        assert_eq!(state, "error");
+        assert!(message.contains("apply it again"), "{message}");
+        // A new certificate: the Identity has a key the Release's print is not.
+        bob_is(&mut store, 1);
+        let (state, message) = again(&mut store, &by_bob(&more, 0));
+        assert_eq!(state, "error");
+        assert!(message.contains("apply it again"), "{message}");
+        assert_eq!(owned(&store), 2, "nothing is taken away or made");
+        let (state, message) = again(&mut store, &by_bob(&more, 1));
+        assert_eq!((state, owned(&store)), (json!("installed"), 1), "{message}");
     }
 }

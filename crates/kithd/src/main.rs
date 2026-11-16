@@ -38,6 +38,7 @@ mod netboot;
 mod os;
 mod pki;
 mod pods;
+mod policy;
 mod probe;
 mod raft;
 mod registry;
@@ -154,16 +155,22 @@ struct Args {
     /// never votes, and what it runs is not started elsewhere while it is away
     #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
     roaming: bool,
+    /// What the cluster may not have this node do as its root, whoever asks: `hardened`
+    /// (none of it), or words with commas between, `no-` before one to turn it off:
+    /// exec-units, root-containers, unconfined, node-network, vms, vm-paths, passthrough,
+    /// run, wipe; and devices=gpu+input for the classes of Device handed out
+    #[arg(long, env = "KITH_NODE_POLICY", value_name = "WORDS")]
+    node_policy: Option<String>,
     /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
     #[arg(long, env = "KITH_INGRESS", requires = "mesh")]
     ingress: bool,
     /// Get the certificates for exposed hosts from this ACME directory (Let's Encrypt
-    /// if none is named); giving this agrees to that authority's terms
+    /// if none is named); giving this agrees to that authority's terms. On control nodes:
+    /// one that serves ingress orders for itself, and the leader for the workers that do
     #[arg(
         long,
         env = "KITH_ACME",
         value_name = "URL",
-        requires = "ingress",
         num_args = 0..=1,
         default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
@@ -457,8 +464,8 @@ async fn membership(
                 }
                 None => None,
             };
-            // (A node that serves ingress reads Secrets a view does not have: it is sent the store.)
-            let joined = cluster::request_join(address, token, &name, port, mesh, !args.ingress).await?;
+            // (A worker runs from a view; one that serves ingress says so, as its token must.)
+            let joined = cluster::request_join(address, token, &name, port, mesh, args.ingress).await?;
             if let Some((through, certificate)) = joined.view.clone() {
                 let first = view::Upstream {
                     name: through,
@@ -605,6 +612,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         .build()
         .map_err(|e| format!("starting: {e}"))?;
     let first_process = boot.is_some();
+    // Before anything is run or served: what this node's owner has it refuse.
+    policy::set(policy::read(args.node_policy.as_deref(), first_process)?);
     let sealed = boot.as_mut().and_then(|boot| boot.sealed.take());
     // As the first process, SIGTERM and Ctrl-Alt-Del are heard from the start: the kernel
     // drops what process 1 does not handle. (Anywhere else the default, which ends kithd, stays until serving.)
@@ -734,11 +743,20 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     ))?;
     // (An exit's pods pass on to the mesh by its link alone.)
     shared.pods.lock().expect("nothing panics holding the pods").mesh = args.mesh_interface.clone();
-    if args.ingress && shared.view.borrow().is_some() {
+    // A viewed worker serves ingress only where its Node says so (as the join of a token for
+    // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
+    // Node not in the view yet: its first view is still to come, and says.)
+    let unsaid = args.ingress && shared.view.borrow().is_some() && {
+        let me = shared.members.me();
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let node = state.store.get(&format!("Node/{me}"));
+        node.is_some_and(|node| node.spec["ingress"] != true)
+    };
+    if unsaid {
         return Err(
-            "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \
-             Secret a view does not have: serve ingress on a control node, or delete this node and join it again \
-             with --ingress (it is then sent the whole store)"
+            "--ingress: this node is a worker that joined without a token for an ingress worker, so it is sent no \
+             host's certificate: delete this node and join it again with a token from \
+             `kith node token --worker --ingress`, or serve ingress on a control node"
                 .into(),
         );
     }
@@ -928,7 +946,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         };
         let ingress = async {
-            if args.ingress {
+            // (A control node with --acme alone orders for the workers that serve ingress.)
+            if args.ingress || args.acme.is_some() {
+                let strays = args.ingress.then_some(strays);
                 ingress::run(shared.clone(), args.acme.clone(), strays, stopping.clone()).await;
             }
         };
@@ -950,7 +970,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(encrypted)
             )
         };
-        let saying = say_serves(shared.clone(), serves(args.dns, args.ingress), stopping.clone());
+        let says = vec![
+            ("serves", serves(args.dns, args.ingress)),
+            ("policy", policy::get().status()),
+        ];
+        let saying = say_serves(shared.clone(), says, stopping.clone());
         let (served, nodes, (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
@@ -995,8 +1019,9 @@ fn serves(dns: Option<std::net::SocketAddr>, ingress: bool) -> serde_json::Value
     }
 }
 
-/// Keep what this node says it serves as its flags say, for as long as the node runs.
-async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping: watch::Receiver<bool>) {
+/// Keep what this node says of itself in its own Node's status as its flags say (what it
+/// `serves`, and its own `policy` where it has one), for as long as the node runs.
+async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
@@ -1004,18 +1029,22 @@ async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            let said = |own: &kith_api::Resource| {
+            let said = |own: &kith_api::Resource, field: &str| {
                 own.status
                     .as_ref()
-                    .map_or(serde_json::Value::Null, |s| s["serves"].clone())
+                    .map_or(serde_json::Value::Null, |s| s[field].clone())
             };
-            state.store.get(&node).map(|own| said(own) == serves)
+            let same = |own: &kith_api::Resource| mine.iter().all(|(field, value)| said(own, field) == *value);
+            state.store.get(&node).map(same)
         };
         // Looked at whenever the store changes, not once: a whole-status write to this Node
         // would take it off.
         let wrote = says == Some(false);
         if wrote {
-            let fields = serde_json::Map::from_iter([("serves".to_string(), serves.clone())]);
+            let fields = mine
+                .iter()
+                .map(|(field, value)| (field.to_string(), value.clone()))
+                .collect();
             let statuses = vec![(node.clone(), fields)];
             if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
                 eprintln!("kithd: serves: saying what this node serves: {e}");

@@ -15,7 +15,8 @@ use oci_spec::runtime::{
     LinuxDeviceCgroupBuilder, LinuxDeviceType, LinuxMemoryBuilder, LinuxResources, LinuxResourcesBuilder, MountBuilder,
     RootBuilder, Spec, UserBuilder,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -83,6 +84,9 @@ pub struct Unit {
     pub user: Option<u32>,
     /// Not started if the user it would be is root, whoever says so (`user`, or its image).
     pub non_root: bool,
+    /// Not started if it would be the node's root: root, where kithd is root, with no range
+    /// of ids of its own (see `shifts`). Root of its own range is not the node's.
+    pub no_node_root: bool,
     /// Capabilities it starts without, of those it would have: `all`, or names as Linux
     /// has them without `CAP_` (`NET_RAW`).
     pub drop: Vec<String>,
@@ -121,56 +125,133 @@ const RANGES: u32 = 32767;
 /// namespace that is the making thread's alone (see [`stage`]).
 const STAGE: &str = "/run/kith-stage";
 
-/// The ranges of containers being made, which no bundle's `config.json` names yet.
-static TAKING: std::sync::Mutex<BTreeSet<u32>> = std::sync::Mutex::new(BTreeSet::new());
+/// The ranges in use under each bundles directory, kept in memory after one scan of its
+/// bundles (the directory stays the record: a new process scans it again).
+static RANGES_IN_USE: std::sync::Mutex<BTreeMap<PathBuf, InUse>> = std::sync::Mutex::new(BTreeMap::new());
 
-fn taking() -> std::sync::MutexGuard<'static, BTreeSet<u32>> {
-    TAKING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Loads of a bundle's config.json by `look`, counted by the tests.
+#[cfg(test)]
+static LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[derive(Default)]
+struct InUse {
+    scanned: bool,
+    /// Each range's first id, with the names of the bundles that have it: those on disk, and
+    /// those being made. (Only a range's first id is looked at: every range is RANGE long from
+    /// a multiple of RANGE, so two that overlap start at the same id.)
+    held: BTreeMap<u32, BTreeSet<OsString>>,
+    /// The bundles whose config.json is there (or cannot be looked at) and does not load: it may
+    /// name any range, so none is given while one is. Looked at again at each take, only these.
+    unreadable: BTreeSet<OsString>,
 }
 
-/// A range of ids being taken by a container: free again when dropped, by when its bundle
-/// names it, or the bundle is gone.
-struct Range(u32);
-
-impl Drop for Range {
-    fn drop(&mut self) {
-        taking().remove(&self.0);
-    }
-}
-
-/// The lowest range of ids no container has: not one that a bundle under `bundles` maps, nor
-/// one being taken. What is taken is what the bundles say, so it holds over a restart of
-/// kithd, and a range is free once its container's bundle is removed. A bundle whose
-/// config.json is there (or cannot be looked at) and does not load may name any: none is given
-/// while it is.
-fn take_range(bundles: &Path) -> Result<Range> {
-    let mut taken = taking();
-    let mut used = taken.clone();
-    for entry in fs::read_dir(bundles).ctx("listing containers")? {
-        // (One being made has none yet: its range, if it has one, is being taken. Its file
-        // comes whole, by a rename: see `create`.)
-        let config = entry.ctx("listing containers")?.path().join("config.json");
+impl InUse {
+    /// What bundle `name` under `bundles` says now. (One being made has no config.json yet: its
+    /// range, if it has one, is held by its take. Its file comes whole, by a rename: see `create`.)
+    fn look(&mut self, bundles: &Path, name: OsString) {
+        let config = bundles.join(&name).join("config.json");
         let spec = match fs::metadata(&config) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Ok(_) => Spec::load(&config).ok(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Some(None),
+            Ok(_) => {
+                #[cfg(test)]
+                LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Spec::load(&config).ok().map(Some)
+            }
             Err(_) => None,
         };
         let Some(spec) = spec else {
-            return err(format!(
-                "{} does not load, and may name a range of ids: no container is given one until it is removed",
-                config.display()
-            ));
+            self.unreadable.insert(name);
+            return;
         };
-        let maps = spec.linux().as_ref().and_then(|linux| linux.uid_mappings().clone());
-        used.extend(maps.iter().flatten().map(|map| map.host_id()));
+        self.unreadable.remove(&name);
+        let maps = spec.and_then(|spec| spec.linux().as_ref().and_then(|linux| linux.uid_mappings().clone()));
+        for map in maps.iter().flatten() {
+            self.held.entry(map.host_id()).or_default().insert(name.clone());
+        }
     }
-    // (Only a range's first id is looked at: every range is RANGE long from a multiple of RANGE,
-    // so two that overlap start at the same id.)
-    let Some(base) = (1..=RANGES).map(|k| k * RANGE).find(|base| !used.contains(base)) else {
+
+    /// Bundle `name` is gone: so are its ranges (one a bundle of another name has stays).
+    fn forget(&mut self, name: &OsStr) {
+        self.unreadable.remove(name);
+        self.held.retain(|_, names| {
+            names.remove(name);
+            !names.is_empty()
+        });
+    }
+}
+
+fn in_use() -> std::sync::MutexGuard<'static, BTreeMap<PathBuf, InUse>> {
+    RANGES_IN_USE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The range of ids of container `name`, until its bundle is removed (by [`remove_bundle`]), or
+/// until this is dropped if the bundle was never made. Dropped with its bundle on the disk, it
+/// is held: the bundle names it.
+struct Range(u32, PathBuf, OsString);
+
+impl Drop for Range {
+    fn drop(&mut self) {
+        // (A bundle there, whole or not, may name it: held, until the bundle is removed.)
+        if matches!(fs::symlink_metadata(self.1.join(&self.2)), Err(e) if e.kind() == io::ErrorKind::NotFound)
+            && let Some(held) = in_use().get_mut(&self.1)
+        {
+            let (base, name) = (self.0, &self.2);
+            if let Some(names) = held.held.get_mut(&base) {
+                names.remove(name);
+                if names.is_empty() {
+                    held.held.remove(&base);
+                }
+            }
+        }
+    }
+}
+
+/// Removes the bundle directory `bundle`, and frees its ranges once it is gone.
+fn remove_bundle(bundle: &Path) -> io::Result<()> {
+    let removed = fs::remove_dir_all(bundle);
+    let gone = matches!(fs::symlink_metadata(bundle), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    if let (true, Some(parent), Some(name)) = (gone, bundle.parent(), bundle.file_name())
+        && let Some(held) = in_use().get_mut(parent)
+    {
+        held.forget(name);
+    }
+    removed
+}
+
+/// The lowest range of ids no container has: not one that a bundle under `bundles` maps, nor
+/// one being taken, for the container `name`. The bundles are all looked at once, at the first
+/// take for `bundles` in this process; after it the ranges in use are kept in memory, taken at
+/// each take and freed where a bundle is removed (so a take costs no reading of every bundle:
+/// n creates would read n^2/2). What is in use at that scan is what the bundles say, so it
+/// holds over a restart of kithd. A bundle whose config.json is there (or cannot be looked at)
+/// and does not load may name any: none is given while it is.
+fn take_range(bundles: &Path, name: &str) -> Result<Range> {
+    let mut all = in_use();
+    let used = all.entry(bundles.to_path_buf()).or_default();
+    if used.scanned {
+        for name in used.unreadable.clone() {
+            used.look(bundles, name);
+        }
+    } else {
+        for entry in fs::read_dir(bundles).ctx("listing containers")? {
+            used.look(bundles, entry.ctx("listing containers")?.file_name());
+        }
+        used.scanned = true;
+    }
+    if let Some(bad) = used.unreadable.first() {
+        return err(format!(
+            "{} does not load, and may name a range of ids: no container is given one until it is removed",
+            bundles.join(bad).join("config.json").display()
+        ));
+    }
+    let Some(base) = (1..=RANGES)
+        .map(|k| k * RANGE)
+        .find(|base| !used.held.contains_key(base))
+    else {
         return err("every range of ids on this node is a container's");
     };
-    taken.insert(base);
-    Ok(Range(base))
+    used.held.entry(base).or_default().insert(name.into());
+    Ok(Range(base, bundles.to_path_buf(), name.into()))
 }
 
 /// Whether a container gets a user namespace of its own where kithd is root: one with a network
@@ -254,6 +335,10 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
     }
     Ok(())
 }
+
+/// The words of the refusal of a `no_node_root` unit that would be root, by which whoever
+/// set it knows the refusal for its own.
+pub const NODE_ROOT: &str = "would be the node's root";
 
 /// What root keeps in a container that is `as_image`, where kithd is root: what Docker and
 /// containerd give by default. Nothing in it reaches out of the container's namespaces.
@@ -396,7 +481,7 @@ impl Runtime {
         .ctx(&what)?;
         let (uid, gid) = (nix::unistd::getuid(), nix::unistd::getgid());
         let range = match uid.is_root().then(|| shifts(image, unit)) {
-            Some(Ok(true)) => Some(take_range(&self.root.join("containers")).ctx(&what)?),
+            Some(Ok(true)) => Some(take_range(&self.root.join("containers"), id).ctx(&what)?),
             // (Not its Workload's choice, and its status says only `hostUsers`: said here too.)
             Some(Err(path)) => {
                 eprintln!(
@@ -917,7 +1002,7 @@ impl Handle {
                 if deleted.is_ok() && !self.reaped {
                     let _ = waitpid(self.pid, None);
                 }
-                let removed = fs::remove_dir_all(&self.bundle).ctx("deleting the container");
+                let removed = remove_bundle(&self.bundle).ctx("deleting the container");
                 deleted.and(removed).map_err(|error| Undeleted { error, handle: None })
             }
         }
@@ -959,7 +1044,7 @@ fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl Fn
     }
     remove_cgroup();
     let _ = fs::remove_dir_all(state);
-    let _ = fs::remove_dir_all(bundle);
+    let _ = remove_bundle(bundle);
     Ok(())
 }
 
@@ -977,7 +1062,7 @@ fn sweep(state: &Path, bundle: &Path, cgroup: &Path, kill: impl FnOnce()) -> boo
         return false;
     }
     let _ = fs::remove_dir_all(state);
-    let _ = fs::remove_dir_all(bundle);
+    let _ = remove_bundle(bundle);
     true
 }
 
@@ -1277,6 +1362,10 @@ fn spec_shifted(
         return Err("runAsNonRoot: this container would be root (its image names no other user, or names root): say who with runAsUser".into());
     }
     let shift = shift.filter(|_| uid.is_root());
+    if unit.no_node_root && (user == 0 || group == 0) && uid.is_root() && shift.is_none() {
+        let which = if user == 0 { "user" } else { "group" };
+        return Err(format!("this container {NODE_ROOT}: its {which} is root's and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser").into());
+    }
     let mut spec = match shift {
         _ if !uid.is_root() => Spec::rootless(uid.as_raw(), gid.as_raw()),
         None => Spec::default(),
@@ -1921,6 +2010,64 @@ mod tests {
             assert_eq!(made.is_err(), is_root);
             assert!(made.err().is_none_or(|e| e.to_string().starts_with("runAsNonRoot")));
         }
+        // And where the node takes no root of its own: root is refused only where it would
+        // be the node's (kithd is root and the container has no range of its own).
+        let nobody = Uid::from_raw(1000);
+        for (kithd, shift, refused) in [(root, None, true), (root, Some(100_000), false), (nobody, None, false)] {
+            let unit = Unit {
+                no_node_root: true,
+                ..pod.clone()
+            };
+            let made = spec_shifted(
+                "a",
+                &image,
+                &unit,
+                "/kith/a",
+                Path::new("/b"),
+                (kithd, Gid::from_raw(0)),
+                shift,
+            );
+            assert_eq!(made.is_err(), refused, "{kithd} {shift:?}");
+            assert!(made.err().is_none_or(|e| e.to_string().contains(NODE_ROOT)));
+        }
+        let user = Unit {
+            no_node_root: true,
+            ..Unit::default()
+        };
+        assert!(spec_of("a", &image, &user, "/kith/a", Path::new("/b"), root, Gid::from_raw(0)).is_ok());
+        // Nor of root's group: a pod takes its image's `1001:0` as it is, and with the node's
+        // users that is the node's group 0. With a range of its own, or told who to be, it is made.
+        let grouped = Image {
+            user: Some("1001:0".into()),
+            ..image.clone()
+        };
+        let unit = Unit {
+            no_node_root: true,
+            user: None,
+            ..pod.clone()
+        };
+        let made = |unit: &Unit, shift| {
+            spec_shifted(
+                "a",
+                &grouped,
+                unit,
+                "/kith/a",
+                Path::new("/b"),
+                (root, Gid::from_raw(0)),
+                shift,
+            )
+        };
+        let refused = made(&unit, None).unwrap_err().to_string();
+        assert!(
+            refused.contains(NODE_ROOT) && refused.contains("its group is root's"),
+            "{refused}"
+        );
+        assert!(made(&unit, Some(100_000)).is_ok());
+        let told = Unit {
+            user: Some(1001),
+            ..unit.clone()
+        };
+        assert!(made(&told, None).is_ok());
         // No filter, or some of it, only as the unit says.
         let (uid, gid) = (Uid::from_raw(0), Gid::from_raw(0));
         let unit = Unit {
@@ -2386,8 +2533,8 @@ mod tests {
         let bundles = std::env::temp_dir().join(format!("kith-ranges-{}", std::process::id()));
         let _ = fs::remove_dir_all(&bundles);
         fs::create_dir_all(bundles.join("exec-unit")).unwrap();
-        let first = take_range(&bundles).unwrap();
-        let second = take_range(&bundles).unwrap();
+        let first = take_range(&bundles, "a").unwrap();
+        let second = take_range(&bundles, "b").unwrap();
         assert_ne!(first.0, second.0);
         assert!(
             first.0 >= RANGE && second.0 >= RANGE,
@@ -2412,11 +2559,11 @@ mod tests {
         spec.unwrap().save(bundles.join("a").join("config.json")).unwrap();
         let named = first.0;
         drop(first);
-        let third = take_range(&bundles).unwrap();
+        let third = take_range(&bundles, "c").unwrap();
         assert!(third.0 != named && third.0 != second.0);
         // Its bundle gone, its range is free again.
-        fs::remove_dir_all(bundles.join("a")).unwrap();
-        let fourth = take_range(&bundles).unwrap();
+        remove_bundle(&bundles.join("a")).unwrap();
+        let fourth = take_range(&bundles, "d").unwrap();
         assert_eq!(fourth.0, named);
         let _ = fs::remove_dir_all(&bundles);
     }
@@ -2433,7 +2580,7 @@ mod tests {
         for dir in [&state, &bundles.join("a"), &cgroup] {
             fs::create_dir_all(dir).unwrap();
         }
-        let held = take_range(&bundles).unwrap();
+        let held = take_range(&bundles, "a").unwrap();
         let image = Image {
             entrypoint: vec!["/bin/true".into()],
             ..Image::default()
@@ -2458,7 +2605,9 @@ mod tests {
             killed && state.exists() && bundles.join("a").exists(),
             "a unit that still runs is kept"
         );
-        let taken: Vec<Range> = (0..3).map(|_| take_range(&bundles).unwrap()).collect();
+        let taken: Vec<Range> = (0..3)
+            .map(|n| take_range(&bundles, &format!("n{n}")).unwrap())
+            .collect();
         assert!(
             taken.iter().all(|range| range.0 != named),
             "its range is not given again"
@@ -2469,6 +2618,7 @@ mod tests {
             !state.exists() && !bundles.join("a").exists(),
             "gone once nothing of it runs"
         );
+        assert_eq!(take_range(&bundles, "z").unwrap().0, named, "and its range is free");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -2480,21 +2630,123 @@ mod tests {
         let bundles = std::env::temp_dir().join(format!("kith-unreadable-{}", std::process::id()));
         let _ = fs::remove_dir_all(&bundles);
         fs::create_dir_all(bundles.join("making")).unwrap();
-        assert!(take_range(&bundles).is_ok());
         // (Its config.json cannot be looked at, here as it is under no directory: as unreadable.)
         fs::write(bundles.join("stray"), "").unwrap();
-        let refused = take_range(&bundles)
+        fs::create_dir_all(bundles.join("torn")).unwrap();
+        fs::write(bundles.join("torn/config.json"), "{\"ociVersion\":").unwrap();
+        let refused = take_range(&bundles, "x")
             .err()
             .expect("no range while a bundle's config.json cannot be looked at");
         assert!(refused.to_string().contains("stray"), "{refused}");
+        // Looked at again at each take, those only: still refused while one is there, and
+        // given once they are gone (removed by the runtime or by hand).
         fs::remove_file(bundles.join("stray")).unwrap();
-        fs::create_dir_all(bundles.join("torn")).unwrap();
-        fs::write(bundles.join("torn/config.json"), "{\"ociVersion\":").unwrap();
-        let refused = take_range(&bundles)
+        let refused = take_range(&bundles, "x")
             .err()
             .expect("no range while a bundle cannot be read");
         assert!(refused.to_string().contains("torn"), "{refused}");
+        remove_bundle(&bundles.join("torn")).unwrap();
+        assert!(take_range(&bundles, "x").is_ok(), "one with no config.json names none");
         let _ = fs::remove_dir_all(&bundles);
+    }
+
+    /// What was scanned once is kept: n takes with n bundles on disk load each bundle's
+    /// config.json once, not once per take. The ranges the bundles name are not given.
+    #[test]
+    fn idmapped_takes_load_each_bundle_once() {
+        let _taking = RANGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let bundles = std::env::temp_dir().join(format!("kith-loads-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&bundles);
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let root = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        for k in 1..=50u32 {
+            let (name, dir) = (format!("old{k}"), bundles.join(format!("old{k}")));
+            fs::create_dir_all(&dir).unwrap();
+            let spec = spec_shifted(&name, &image, &Unit::default(), "/kith/x", &dir, root, Some(k * RANGE));
+            spec.unwrap().save(dir.join("config.json")).unwrap();
+        }
+        let before = LOADS.load(std::sync::atomic::Ordering::SeqCst);
+        let taken: Vec<Range> = (0..50)
+            .map(|n| take_range(&bundles, &format!("new{n}")).unwrap())
+            .collect();
+        let loads = LOADS.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(loads <= 50, "{loads} loads for 50 bundles");
+        let bases: BTreeSet<u32> = taken.iter().map(|range| range.0).collect();
+        assert_eq!(
+            bases,
+            (51..=100).map(|k| k * RANGE).collect(),
+            "none a bundle's, none twice"
+        );
+        let _ = fs::remove_dir_all(&bundles);
+    }
+
+    /// A range is free once its bundle is removed, by each way the runtime removes one: a
+    /// delete, a sweep (a cleanup's, a failed create's), and the clearing of a kept id.
+    #[test]
+    fn idmapped_a_range_is_free_once_its_bundle_is_removed_by_any_path() {
+        let _taking = RANGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("kith-freed-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (bundles, cgroup) = (root.join("containers"), root.join("cgroup"));
+        fs::create_dir_all(&cgroup).unwrap();
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let ids = (nix::unistd::Uid::from_raw(0), nix::unistd::Gid::from_raw(0));
+        // A bundle of each name, as create makes one: its range taken, its config.json written.
+        let make = |name: &str| {
+            let dir = bundles.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            let range = take_range(&bundles, name).unwrap();
+            let spec = spec_shifted(name, &image, &Unit::default(), "/kith/x", &dir, ids, Some(range.0));
+            spec.unwrap().save(dir.join("config.json")).unwrap();
+            range.0
+        };
+        let handle = |name: &str| Handle {
+            container: None,
+            go: None,
+            pid: Pid::from_raw(0),
+            reaped: true,
+            bundle: bundles.join(name),
+            cgroup: cgroup.clone(),
+            range: None,
+        };
+        let state = root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        let runtime = Runtime {
+            root: root.clone(),
+            cgroup_parent: format!("/kith-test-freed-{}", std::process::id()),
+            images: ImageStore::new(root.join("images")).unwrap(),
+            shim: "/proc/self/exe".into(),
+        };
+        // (Each is made as the lowest free range, so the one a take gives after its removal is the same.)
+        let freed = |name: &str, remove: &dyn Fn()| {
+            let base = make(name);
+            remove();
+            let next = take_range(&bundles, "next").unwrap();
+            assert_eq!(next.0, base, "{name}: its range is free");
+        };
+        freed("delete", &|| assert!(handle("delete").finish(Ok(())).is_ok()));
+        freed("sweep", &|| {
+            assert!(sweep(&state.join("sweep"), &bundles.join("sweep"), &cgroup, || {}))
+        });
+        freed("clear", &|| {
+            fs::create_dir_all(state.join("clear")).unwrap();
+            clear_kept(&state.join("clear"), &bundles.join("clear"), &cgroup, || {}).unwrap();
+        });
+        freed("clean", &|| {
+            assert_eq!(runtime.sweep_left(&root.join("sys")).unwrap(), 1)
+        });
+        // And a range whose bundle stays (a unit with processes left) is not.
+        let kept = make("kept");
+        fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        assert!(!sweep(&state.join("kept"), &bundles.join("kept"), &cgroup, || {}));
+        assert_ne!(take_range(&bundles, "next").unwrap().0, kept);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// What keeps a container's users the node's: the node's network (its ports under 1024 are
@@ -2565,6 +2817,7 @@ mod tests {
     /// cgroup has processes; only what was removed is counted.
     #[test]
     fn idmapped_a_bundle_left_with_no_state_is_swept_unless_its_cgroup_runs() {
+        let _taking = RANGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!("kith-unmade-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         // (A parent under the node's /sys/fs/cgroup that is not there: nothing of the node's is
@@ -2585,7 +2838,7 @@ mod tests {
         let running = sys.join(parent.trim_start_matches('/')).join("kith-running");
         fs::create_dir_all(&running).unwrap();
         fs::write(running.join("cgroup.events"), "populated 1\n").unwrap();
-        assert!(take_range(&root.join("containers")).is_err());
+        assert!(take_range(&root.join("containers"), "x").is_err());
         assert_eq!(runtime.sweep_left(&sys).unwrap(), 1, "only what was removed is counted");
         assert!(!root.join("containers/torn").exists(), "nothing of it ran: gone");
         assert!(

@@ -29,6 +29,10 @@ type Writes = (Vec<(String, Map<String, Value>)>, Vec<(String, String)>);
 /// workers.
 pub const TRUST: &str = "kith.dev/trust";
 
+/// What starts the labels every node has for the scheduler from its own policy, one for each
+/// key it allows (`kith.dev/policy-allows-execUnits`), whatever its own labels say.
+const ALLOWS: &str = "kith.dev/policy-allows-";
+
 /// Whether `resource`'s template names one of `guarded`, the keys of the Secrets that are
 /// for control nodes only: it is then placed on those.
 fn control_only(guarded: &BTreeSet<String>, resource: &Resource) -> bool {
@@ -183,6 +187,21 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
             _ => "control",
         };
         labels.insert(TRUST.into(), trust.into());
+        // And one for each thing its own policy allows (all of them, where it says none):
+        // what a node says it refuses is not placed on it.
+        let said = node
+            .status
+            .as_ref()
+            .map(|status| crate::policy::Policy::said(&status["policy"]));
+        for (_, key, _) in crate::policy::KEYS {
+            let allowed = said.as_ref().is_none_or(|said| said.allows(key));
+            let label = format!("{ALLOWS}{key}");
+            if allowed {
+                labels.insert(label, "true".into());
+            } else {
+                labels.remove(&label);
+            }
+        }
         Some(Node {
             name: node.metadata.name.clone(),
             labels,
@@ -206,6 +225,7 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
     let mounts = crate::volumes::resolve(store).owners;
     let guarded = guarded(store);
     let (mut replicas, mut waiting) = (Vec::new(), BTreeMap::new());
+    let mut refused: BTreeMap<String, String> = BTreeMap::new();
     for resource in owners(store) {
         let Some((count, requests, mut placement)) = wants(resource) else {
             continue;
@@ -214,6 +234,25 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
             let (require, prefer) = Default::default();
             let placement = placement.get_or_insert(kith_api::kinds::Placement { require, prefer });
             placement.require.insert(TRUST.into(), "control".into());
+        }
+        // What of it a node's policy may refuse: it goes where all of that is allowed. (Not
+        // its claimed Devices or its Volumes: those are on one node, which says so itself.)
+        let template = crate::controller::template_of(resource).ok();
+        let needs = template.map(|(template, _)| crate::policy::needs(&template, false));
+        let needs = needs.unwrap_or_default();
+        if !needs.is_empty() {
+            let (require, prefer) = Default::default();
+            let placement = placement.get_or_insert(kith_api::kinds::Placement { require, prefer });
+            let allowed = needs.iter().map(|key| (format!("{ALLOWS}{key}"), "true".to_string()));
+            placement.require.extend(allowed);
+            let refusing = |node: &&Node| {
+                needs
+                    .iter()
+                    .any(|key| !node.labels.contains_key(&format!("{ALLOWS}{key}")))
+            };
+            if nodes.iter().any(|node| refusing(&node)) {
+                refused.insert(resource.key(), needs.join(", "));
+            }
         }
         let key = resource.key();
         // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
@@ -247,6 +286,16 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
         }
     }
     let mut made = kith_sched::schedule(&nodes, &replicas, grace);
+    // (One that fits nowhere, and asks for what some node's policy refuses: said, so that
+    // "missing required labels" is not all there is to go on.)
+    for (id, why) in &mut made.unschedulable {
+        let workload = id.rsplit_once('#').map_or(id.as_str(), |(workload, _)| workload);
+        if let Some(needs) = refused.get(workload) {
+            why.push_str(&format!(
+                "; it asks for what a node's own policy may refuse ({needs}), and goes only where the Node's status.policy allows it"
+            ));
+        }
+    }
     made.unschedulable.extend(waiting);
     (nodes, replicas, made)
 }
@@ -1065,6 +1114,49 @@ spec: { template: { exec: [{ name: run, command: [sleep, inf] }] } }
             .find(|(of, _)| of == "Job/default/batch")
             .map(|(_, f)| f["nodes"].clone());
         assert_eq!(nodes, Some(json!({ "0": "b" })));
+    }
+
+    /// What a node says its own policy refuses is not placed on it, whatever label of the
+    /// scheduler's someone gave it; with no node left that allows it, the reason says so.
+    #[test]
+    fn a_replica_goes_only_where_the_nodes_policy_allows_what_it_asks_for() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a, labels: { kith.dev/policy-allows-execUnits: 'true' } }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: tool }
+spec: { replicas: 2, template: { exec: [{ name: run, command: [sleep, inf] }] } }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web }
+spec: { replicas: 2, template: { pod: true, containers: [{ name: web, image: x }] } }
+";
+        let hardened = json!({ "policy": crate::policy::Policy::hardened().status() });
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let grace = Duration::from_secs(300);
+        let store = drained_store(source, &[("Node/a", hardened.clone())]);
+        let (_, _, made) = decide(&store, &there, grace, None);
+        let on = |made: &Plan, id: &str| made.bind.get(id).cloned();
+        let tools = ["Workload/default/tool#0", "Workload/default/tool#1"];
+        assert!(tools.iter().all(|id| on(&made, id).as_deref() == Some("b")), "{made:?}");
+        // (A pod of containers that are not root asks for nothing a hardened node refuses.)
+        let webs = ["Workload/default/web#0", "Workload/default/web#1"].map(|id| on(&made, id));
+        assert!(webs.contains(&Some("a".into())), "{made:?}");
+        let store = drained_store(source, &[("Node/a", hardened.clone()), ("Node/b", hardened)]);
+        let (_, _, made) = decide(&store, &there, grace, None);
+        let why = &made.unschedulable["Workload/default/tool#0"];
+        assert!(why.contains("execUnits") && why.contains("status.policy"), "{why}");
+        assert!(on(&made, "Workload/default/web#0").is_some(), "{made:?}");
     }
 
     #[test]

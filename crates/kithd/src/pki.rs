@@ -547,6 +547,12 @@ pub fn print_of(pem: &str) -> Fallible<String> {
     Ok(key_print(&cert.subject_public_key_info()))
 }
 
+/// [`key_print`] of the key `pem` (an Identity's `publicKey`); none if it is not a key.
+pub fn print_of_key(pem: &str) -> Option<String> {
+    let key = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).ok()?;
+    Some(key_print(key.as_ref()))
+}
+
 /// Is `pem` (an Identity's `publicKey`) the key `der`?
 pub fn same_key(pem: &str, der: &[u8]) -> bool {
     rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).is_ok_and(|key| key.as_ref() == der)
@@ -566,8 +572,9 @@ pub enum Lets {
     Control,
     /// A worker (`spec.trust`): it is sent a view of the store, never the store.
     Worker,
-    /// A worker that is sent the whole store all the same: it serves ingress.
-    WorkerWhole,
+    /// A worker that serves ingress: its view holds the certificates of the cluster's
+    /// exposed hosts as well (`spec.ingress`, written by the node that admits it).
+    WorkerIngress,
 }
 
 fn digest(secret: &str) -> [u8; 32] {
@@ -739,7 +746,7 @@ mod tests {
         assert_eq!(tokens.good(&token, true), Some(Lets::Control));
         assert_eq!(tokens.good(&token, true), None);
         // What its node is is what its maker said, kept here and not in the token.
-        for lets in [Lets::Worker, Lets::WorkerWhole] {
+        for lets in [Lets::Worker, Lets::WorkerIngress] {
             let worker = tokens.mint(&ca.cert, None, lets).unwrap();
             assert_eq!(tokens.good(&worker, true), Some(lets));
         }

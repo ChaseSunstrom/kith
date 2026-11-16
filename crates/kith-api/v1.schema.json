@@ -2818,6 +2818,13 @@
           ],
           "description": "How far the node is trusted: `control` (the default) may vote on the store and\nits word for who asked is taken by the others; a `worker` never votes, is not\nfollowed as a leader, and gets nothing that asks for control nodes."
         },
+        "ingress": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "A worker that serves ingress: its view holds the certificates of the hosts the\ncluster exposes (and so their keys), and it may say it serves ingress. Written by\nthe node that admitted it, from its token; a control node orders its certificates."
+        },
         "mesh": {
           "anyOf": [
             {

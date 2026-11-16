@@ -98,12 +98,29 @@ pub fn named(store: &Store, node: &str) -> BTreeSet<String> {
         let map = list.spec["configMap"]["name"].as_str();
         named.extend(map.map(|map| format!("ConfigMap/kith-system/{map}")));
     }
+    // A worker that serves ingress (the node that admitted it said so, from its token): the
+    // certificate of each host exposed, and the thumbprint it answers challenges with.
+    if serves_ingress(store, node) {
+        let hosts = crate::ingress::exposed(store, std::net::Ipv6Addr::UNSPECIFIED).0;
+        secrets.extend(hosts.iter().map(|(host, of)| crate::ingress::tls_secret(host, of)));
+        named.insert(format!("ConfigMap/{}", crate::ingress::THUMBPRINT));
+    }
     let for_control = |key: &String| store.get(key).is_some_and(|secret| secret.spec["trust"] == "control");
-    named.extend(secrets.into_iter().filter(|key| !for_control(key)));
+    // (The account key orders certificates: a control node's alone, whatever names it.)
+    let sendable = |key: &String| !for_control(key) && key != crate::ingress::ACCOUNT;
+    named.extend(secrets.into_iter().filter(sendable));
     named
 }
 
-/// The kinds [`named`] reads: what it says changes only when one of these does.
+/// Does the Node `node` say it is a worker that serves ingress (`spec.ingress`)?
+pub fn serves_ingress(store: &Store, node: &str) -> bool {
+    store
+        .get(&format!("Node/{node}"))
+        .is_some_and(|node| node.spec["ingress"] == true)
+}
+
+/// The kinds [`named`] reads: what it says changes only when one of these does, the
+/// worker's own Node, or (for a worker that serves ingress) one of [`EXPOSES`].
 const NAMES: [&str; 8] = [
     "Exit",
     "Workload",
@@ -114,6 +131,9 @@ const NAMES: [&str; 8] = [
     "DNSBlockList",
     "Secret",
 ];
+
+/// What says which hosts are exposed.
+const EXPOSES: [&str; 2] = ["Service", "Namespace"];
 
 fn sent(key: &str, named: &BTreeSet<String>) -> bool {
     WHOLE.contains(&kind(key)) || named.contains(key)
@@ -159,8 +179,15 @@ fn round_of<'a>(
         return None;
     }
     let changed = last.as_ref().and_then(|last| Some((last, touched(last.at)?)));
+    let own = format!("Node/{node}");
+    let names = |last: &Last, key: &str| {
+        let ingress = last
+            .named
+            .contains(&format!("ConfigMap/{}", crate::ingress::THUMBPRINT));
+        NAMES.contains(&kind(key)) || key == own || (ingress && EXPOSES.contains(&kind(key)))
+    };
     let named = match &changed {
-        Some((last, touched)) if !touched.iter().any(|key| NAMES.contains(&kind(key))) => last.named.clone(),
+        Some((last, touched)) if !touched.iter().any(|key| names(last, key)) => last.named.clone(),
         _ => named(store, node),
     };
     let message = match changed {
@@ -482,9 +509,38 @@ impl Follower<'_> {
 }
 
 /// Is this node a worker that is sent the whole store and need not be: its Node says worker,
-/// it does not vote, and it serves no ingress (which reads Secrets a view does not have)?
+/// it does not vote, and if it serves ingress its Node says so (its view then holds the
+/// certificates)?
 fn due(shared: &Shared, me: &str, ingress: bool) -> bool {
-    !ingress && crate::access::worker(shared, me) && !crate::cluster::votes(shared, me)
+    let said = || {
+        serves_ingress(
+            &shared.store.lock().expect("a handler panicked holding the store").store,
+            me,
+        )
+    };
+    crate::access::worker(shared, me) && !crate::cluster::votes(shared, me) && (!ingress || said())
+}
+
+/// The workers that are still sent the whole store to serve ingress: they joined with a token
+/// from before ingress workers ran from a view, and their Node does not say `ingress`.
+fn whole_for_ingress(store: &Store) -> Vec<String> {
+    let whole = |node: &&Resource| {
+        let status = node.status.as_ref();
+        node.spec["trust"] == "worker"
+            && node.spec["ingress"] != true
+            && status.is_some_and(|status| status["view"] != true && status["serves"]["ingress"] == true)
+    };
+    let nodes = store.list(Some("Node")).filter(whole);
+    nodes.map(|node| node.metadata.name.clone()).collect()
+}
+
+/// What to do about such a worker `node`.
+fn rejoin(node: &str) -> String {
+    format!(
+        "worker {node} serves ingress from a copy of the whole store (every Secret): delete node {node} and join it \
+         again with a token from `kith node token --worker --ingress` (its view then holds only the certificates), \
+         or set `ingress: true` in its Node's spec"
+    )
 }
 
 /// The control nodes this node knows of, by name.
@@ -548,11 +604,15 @@ async fn stream(
 /// On a node that is no control node: once its Node says worker, follow a control node's
 /// view, for as long as kithd runs. A node that was sent the whole store until then lets go
 /// of it when the first whole view is on its disk (`Follower::take`).
+///
+/// A worker still sent the whole store to serve ingress is not let go of it silently: it says
+/// so as it starts, and each control node says so of it (once, while it is so).
 pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stopping: watch::Receiver<bool>) {
-    let Some(cluster) = shared.cluster.as_ref().filter(|cluster| cluster.ca.is_none()) else {
+    let Some(cluster) = shared.cluster.as_ref() else {
         return;
     };
     let me = cluster.me.name.clone();
+    let mut told = Vec::new();
     let first = load(&state).ok().flatten().and_then(|(.., first)| first);
     let mut follower = Follower {
         shared: &shared,
@@ -570,7 +630,21 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
         }
         let viewing = shared.view.borrow().is_some();
         let mut pause = Duration::from_secs(5);
-        if (viewing || due(&shared, &me, ingress)) && !nodes.is_empty() {
+        let whole = {
+            let state = shared.store.lock().expect("a handler panicked holding the store");
+            match crate::access::is_worker(&state.store, &me) {
+                // (Who it is sent to: a worker, of itself.)
+                true if ingress && !viewing && !serves_ingress(&state.store, &me) => vec![me.clone()],
+                true => Vec::new(),
+                false => whole_for_ingress(&state.store),
+            }
+        };
+        for node in whole.iter().filter(|node| !told.contains(*node)) {
+            eprintln!("kithd: {}", rejoin(node));
+        }
+        told = whole;
+        // (The node that holds the cluster's key is a control node: it follows nobody.)
+        if cluster.ca.is_none() && (viewing || due(&shared, &me, ingress)) && !nodes.is_empty() {
             let upstream = &nodes[turn % nodes.len()];
             match stream(&mut follower, upstream, &mut stopping).await {
                 // (It was there: called again first, at once.)
@@ -875,6 +949,155 @@ spec: {}
         // Further behind than the store remembers: everything again.
         let whole = round_of(&store, 12, |_| None, "w", &mut last);
         assert!(matches!(whole, Some(Sent::Whole { at: 12, .. })));
+    }
+
+    /// An ingress worker `i` (its Node says `ingress`, as its join wrote it): the Secret of each
+    /// host the cluster exposes, and the thumbprint challenges are answered with. Never the ACME
+    /// account key, a host no Service exposes, or a Secret for control nodes.
+    #[test]
+    fn an_ingress_workers_view_holds_the_certificates_of_exposed_hosts_and_no_account_key() {
+        let mut store = store();
+        let source = "\
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: i }
+spec: { trust: worker, ingress: true }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: shop, namespace: shop }
+spec: { selector: { app: shop }, ports: [{ port: 80 }], expose: { host: shop.example.test, via: edge } }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: inner }
+spec: { selector: { app: inner }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: tls-shop.example.test, namespace: shop }
+spec: { data: { tls.crt: c, tls.key: k } }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: tls-gone.example.test, namespace: shop }
+spec: { data: { tls.crt: c, tls.key: k } }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: tls-blog.example.test }
+spec: { trust: control, data: { tls.crt: c, tls.key: k } }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: tls-api.example.test }
+spec: { data: { tls.crt: c, tls.key: k } }
+---
+apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: acme-account, namespace: kith-system }
+spec: { data: { key: k } }
+---
+apiVersion: kith.dev/v1
+kind: ConfigMap
+metadata: { name: acme, namespace: kith-system }
+spec: { data: { thumbprint: t } }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: blog }
+spec: { selector: { app: blog }, ports: [{ port: 80 }], expose: { host: blog.example.test, via: edge } }
+";
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let secrets = |node: &str| -> Vec<String> {
+            let named = named(&store, node).into_iter();
+            named.filter(|key| key.starts_with("Secret/")).collect()
+        };
+        assert_eq!(secrets("i"), ["Secret/shop/tls-shop.example.test"]);
+        assert!(named(&store, "i").contains("ConfigMap/kith-system/acme"));
+        // A worker that does not serve ingress, and a control node, are sent none of it.
+        for node in ["w", "a"] {
+            let named = named(&store, node);
+            assert!(
+                !named.iter().any(|key| key.contains("tls-") || key.contains("acme")),
+                "{node}: {named:?}"
+            );
+        }
+
+        // A Service that comes exposing a host: that host's Secret is sent with it, and the
+        // account key never is, whatever changed.
+        let mut last = None;
+        let none = |_: u64| -> Option<BTreeSet<&str>> { unreachable!("nothing was sent yet") };
+        let Some(Sent::Whole { resources, .. }) = round_of(&store, 20, none, "i", &mut last) else {
+            panic!("the first round sends everything");
+        };
+        assert!(!keys(&resources).iter().any(|key| key.ends_with("acme-account")));
+        let api = "\
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: api }
+spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.example.test, via: edge } }
+";
+        store
+            .apply(Resource::from_source(api).unwrap().remove(0).unwrap())
+            .unwrap();
+        let touched = BTreeSet::from(["Service/default/api", "Secret/kith-system/acme-account"]);
+        let Some(Sent::Changed { put, gone, .. }) = round_of(&store, 21, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert_eq!(
+            keys(&put),
+            ["Secret/default/tls-api.example.test", "Service/default/api"]
+        );
+        assert!(gone.is_empty(), "{gone:?}");
+        // Its Node no longer says ingress: every certificate is taken back.
+        let mut node = store.get("Node/i").unwrap().clone();
+        node.spec["ingress"] = serde_json::Value::Null;
+        store.put(node);
+        let touched = BTreeSet::from(["Node/i"]);
+        let Some(Sent::Changed { gone, .. }) = round_of(&store, 22, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert_eq!(
+            gone,
+            [
+                "ConfigMap/kith-system/acme",
+                "Secret/default/tls-api.example.test",
+                "Secret/shop/tls-shop.example.test"
+            ]
+        );
+
+        // It serves ingress again; then what made a host's Secret sent goes, while it still does.
+        let mut node = store.get("Node/i").unwrap().clone();
+        node.spec["ingress"] = true.into();
+        store.put(node);
+        let touched = BTreeSet::from(["Node/i"]);
+        let Some(Sent::Changed { put, .. }) = round_of(&store, 23, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert!(keys(&put).contains(&"Secret/default/tls-api.example.test".to_string()));
+        // The Service that exposed the host is deleted: the host's Secret goes with it.
+        store.delete("Service/default/api").unwrap();
+        let touched = BTreeSet::from(["Service/default/api"]);
+        let Some(Sent::Changed { gone, .. }) = round_of(&store, 24, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert!(
+            gone.contains(&"Secret/default/tls-api.example.test".to_string()),
+            "{gone:?}"
+        );
+        // A host's Secret is made one for control nodes: it goes, though its host is exposed.
+        let mut secret = store.get("Secret/shop/tls-shop.example.test").unwrap().clone();
+        secret.spec["trust"] = "control".into();
+        store.put(secret);
+        let touched = BTreeSet::from(["Secret/shop/tls-shop.example.test"]);
+        let Some(Sent::Changed { put, gone, .. }) = round_of(&store, 25, |_| Some(touched), "i", &mut last) else {
+            panic!("a round after the first sends what changed");
+        };
+        assert_eq!(gone, ["Secret/shop/tls-shop.example.test"]);
+        assert!(put.is_empty(), "{:?}", keys(&put));
     }
 
     /// Serve `app` on a loopback port with the node certificate of `me`; the port.

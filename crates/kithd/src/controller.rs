@@ -661,9 +661,16 @@ impl Controller {
         // Devices they come to (`granted` knows no other node's).
         // And, the same way, the Volumes of this node they mount.
         // And what its seats ask of each workload's cgroups here (a guarantee, or holding back).
-        let (resources, granted, mounted, tunes): (Vec<Resource>, _, _, _) = {
+        // (Where this node's policy names the classes of Device it hands out, a Device is what
+        // the node finds itself: looked for before the store is held.)
+        let node_policy = crate::policy::get();
+        let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+        let found = me.filter(|_| node_policy.names_devices());
+        let found = found.map(|me| crate::devices::scan(Path::new("/sys"), me));
+        let (resources, granted, mounted, tunes, found): (Vec<Resource>, _, _, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
+            let found = found.map(|found| crate::devices::as_found(store, &found));
             let kinds = ["Workload", "NodeWorkload", "Job"];
             let resources = kinds
                 .into_iter()
@@ -679,6 +686,7 @@ impl Controller {
                 granted.unwrap_or_default(),
                 mounted.unwrap_or_default(),
                 tunes.unwrap_or_default(),
+                found,
             )
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
@@ -712,8 +720,27 @@ impl Controller {
             // ponytail: a NodeWorkload cannot claim (a copy on every node, a device on one), and
             // alone, a node has no name for the Devices to name: both run nothing, and say so.
             let claimed = !template.device_claims.is_empty();
-            let crate::claims::Granted { devices, seat } = granted.get(&key).cloned().unwrap_or_default();
+            let crate::claims::Granted { devices, seat, classes } = granted.get(&key).cloned().unwrap_or_default();
             let allowed = !claimed || (resource.kind != "NodeWorkload" && granted.contains_key(&key));
+            // What this node's own policy refuses of it is not run here, whoever wrote it and
+            // whatever the store says (docs/adr-privilege.md): said where a replica is this
+            // node's to run.
+            let mut refused = node_policy.refuses(&template, !crate::vm::pci(&devices).is_empty());
+            let kept = |(name, class): &&(String, kith_api::kinds::DeviceClass)| {
+                !node_policy.device(class) || found.as_ref().is_some_and(|found| !found.contains(name))
+            };
+            let kept: Vec<&str> = classes.iter().filter(kept).map(|(name, _)| name.as_str()).collect();
+            if !kept.is_empty() {
+                refused.push(format!(
+                    "this node's policy hands out no Device of the class of {}, or it is not what this node finds its own hardware to be (`--node-policy devices=…` where the node's kithd is started names the classes it does)",
+                    kept.join(", ")
+                ));
+            }
+            let allowed = allowed && refused.is_empty();
+            let nodes = resource.status.as_ref().and_then(|status| status["nodes"].as_object());
+            if me.is_none_or(|me| nodes.is_some_and(|nodes| nodes.values().any(|node| node == me))) {
+                note.extend(refused);
+            }
             if claimed && resource.kind == "NodeWorkload" {
                 note.push("a NodeWorkload cannot hold DeviceClaims: it runs nothing (use a Workload)".into());
             } else if claimed && me.is_none() {
@@ -2146,6 +2173,10 @@ async fn start(
         Run::Container(c) => {
             (unit.command, unit.args, unit.working_dir) = (c.command.clone(), c.args.clone(), c.working_dir.clone());
             unit.user = c.run_as_user;
+            // (Root in a container that keeps the node's users is the node's root: a node
+            // whose policy has none of them starts no such container. Root of a range of
+            // its own, a pod's, is not the node's.)
+            unit.no_node_root = !crate::policy::get().allows("rootContainers");
             (unit.non_root, unit.drop) = (c.run_as_non_root == Some(true), c.drop_capabilities.clone());
             let address = address.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into()).to_string();
             for var in c.env.iter().filter(|var| var.field == Some(Field::Address)) {
@@ -2180,14 +2211,24 @@ async fn start(
                 .pull_signed(&c.image, policy, &signed_by)
                 .await
                 .map_err(|e| e.to_string())?;
-            runtime.create(id, &image, &unit, log("out")?, log("err")?)
+            let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
+            // The runtime says what the container would be; here whose word refused it.
+            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
+                true => format!(
+                    "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
+                ),
+                false => e.to_string(),
+            };
+            created.map_err(whose)
         }
         Run::Exec(e) => {
             unit.command = e.command.clone();
-            runtime.exec(id, &unit, log("out")?, log("err")?)
+            runtime
+                .exec(id, &unit, log("out")?, log("err")?)
+                .map_err(|e| e.to_string())
         }
     };
-    let mut handle = created.map_err(|e| e.to_string())?;
+    let mut handle = created?;
     match handle.start() {
         Ok(()) => Ok(handle),
         Err(e) => {
