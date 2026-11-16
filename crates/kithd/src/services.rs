@@ -95,14 +95,19 @@ const SPARE_PER_NODE: usize = 64;
 /// threads those moments queue, and the rest of kithd keeps a core of its own.
 const THREADS: usize = 4;
 
-fn namespace(resource: &Resource) -> String {
+pub fn namespace(resource: &Resource) -> String {
     resource.key().split('/').nth(1).unwrap_or_default().to_string()
 }
 
-/// The address of every Service in the store.
+/// Is this Service headless? One that cannot be read is not.
+pub fn headless(service: &Resource) -> bool {
+    serde_json::from_value::<ServiceSpec>(service.spec.clone()).is_ok_and(|spec| spec.headless == Some(true))
+}
+
+/// The address of every Service in the store that has one: a headless Service has none.
 pub fn addresses(store: &Store, prefix: Ipv6Addr) -> BTreeMap<String, Ipv6Addr> {
     let address = |service: &Resource| kith_mesh::service_address(prefix, &namespace(service), &service.metadata.name);
-    let services = store.list(Some("Service"));
+    let services = store.list(Some("Service")).filter(|service| !headless(service));
     services.map(|service| (service.key(), address(service))).collect()
 }
 
@@ -143,6 +148,35 @@ fn unclaimed_with(
     Ok(())
 }
 
+/// The Workloads a Service's selector picks: of its namespace, with every label it asks for. A
+/// selector that asks for nothing picks none (it would take in every workload).
+pub fn behind<'a>(store: &'a Store, service: &Resource, spec: &ServiceSpec) -> Vec<&'a Resource> {
+    let ns = namespace(service);
+    let picks = |workload: &&Resource| {
+        let has = |(label, value): (&String, &String)| workload.metadata.labels.get(label) == Some(value);
+        namespace(workload) == ns && !spec.selector.is_empty() && spec.selector.iter().all(has)
+    };
+    store.list(Some("Workload")).filter(picks).collect()
+}
+
+/// The mesh address of each ready replica of `workload`, by replica number. (A unit with no
+/// address, or one that is not on the mesh, names nothing.)
+pub fn ready_addresses(workload: &Resource) -> BTreeMap<u32, Ipv6Addr> {
+    let ready: BTreeSet<u32> = ready_on(workload).into_iter().map(|(_, replica)| replica).collect();
+    let units = workload.status.as_ref().and_then(|status| status["containers"].as_array());
+    let mut addresses = BTreeMap::new();
+    for unit in units.into_iter().flatten() {
+        let replica = unit["replica"].as_u64().and_then(|replica| u32::try_from(replica).ok());
+        let address = unit["address"].as_str().and_then(|address| address.parse::<Ipv6Addr>().ok());
+        if let (Some(replica), Some(address)) = (replica, address) {
+            if ready.contains(&replica) {
+                addresses.entry(replica).or_insert(address);
+            }
+        }
+    }
+    addresses
+}
+
 /// The replicas of `workload` with every unit ready, and the node each runs on.
 fn ready_on(workload: &Resource) -> Vec<(String, u32)> {
     let mut replicas: BTreeMap<(u64, &str), bool> = BTreeMap::new();
@@ -169,13 +203,12 @@ fn table(store: &Store, prefix: Ipv6Addr) -> Table {
         let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
             continue;
         };
+        // (A headless Service has no address to listen on: its name answers the replicas.)
+        if spec.headless == Some(true) {
+            continue;
+        }
         let address = kith_mesh::service_address(prefix, &namespace(service), &service.metadata.name);
-        // (A selector that asks for nothing would take in every workload: it takes none.)
-        let behind = |workload: &&Resource| {
-            let has = |(label, value): (&String, &String)| workload.metadata.labels.get(label) == Some(value);
-            namespace(workload) == namespace(service) && !spec.selector.is_empty() && spec.selector.iter().all(has)
-        };
-        let workloads: Vec<&Resource> = store.list(Some("Workload")).filter(behind).collect();
+        let workloads = behind(store, service, &spec);
         for port in &spec.ports {
             if port.protocol == Some(Protocol::Udp) {
                 continue;
