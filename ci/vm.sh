@@ -18,6 +18,7 @@
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
+#                               (one node's pod range is not the default: --pod-range)
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
@@ -108,7 +109,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test pods      instead: two nodes on the mesh with ci/pod.rs as a container image
                    already there: three pods of one Workload (so two on one node) each
                    listen on port 80 as root, write to their root and have an address
-                   of their own; a pod of a user who is not root finds their Service
+                   of their own (the second node's from --pod-range 10.77.0.0/20, the
+                   first's from the default 100.88.0.0/16, each told by its pods which);
+                   a pod of a user who is not root finds their Service
                    by its short name and its Kubernetes one, hears all three through
                    it, reaches this machine from behind its node's address, and
                    writes to /dev/stdout by name; a pod that is root is kept from a
@@ -421,7 +424,10 @@ EOF
             asks=/v1/tokens
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
-            node "$n" "--join 10.9.0.1:7443 --token $join"
+            # (pods: the second node takes its pods' addresses from another range than the first's.)
+            range=''
+            [ "$test$n" != pods2 ] || range='--pod-range 10.77.0.0/20'
+            node "$n" "--join 10.9.0.1:7443 --token $join $range"
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
         # what it says" (`none` for a unit with no address of its own).
@@ -640,9 +646,12 @@ EOF
             asks() {
                 name=$1
                 shift
+                # ($pinned: a Volume that puts the Job on its node.)
+                mounts=''
+                [ -z "${pinned:-}" ] || mounts=",\"volumeMounts\":[{\"volume\":\"$pinned\",\"path\":\"/state\"}]"
                 cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$name"},"spec":{"retries":0,"template":{"pod":true,"containers":[
-  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]}]}}}]
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask"$(printf ',"%s"' "$@")]$mounts}]}}}]
 EOF
                 any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $name was not applied"
                 waited=0
@@ -663,6 +672,37 @@ EOF
             for heard in web-0 web-1 web-2 'HTTP/1.0 200 OK'; do
                 grep -q "$heard" "$work/ask.out" || fail "the pod that asked did not hear $heard: $(cat "$work/ask.out")"
             done
+            # A pod on each node (a Volume of its node puts it there) says where it asks for
+            # names and from which address: the first node's in 100.88.0.0/16 (the default),
+            # the second's in the range that node was told (--pod-range).
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n1"},"spec":{"node":"n1","path":"pod"}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n2"},"spec":{"node":"n2","path":"pod"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the volumes that put a pod on each node were not applied"
+            for side in n1 n2; do
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"at-$side"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"web","image":"kith.test/pod:1","command":["/bin/pod","serve"],"ports":[{"port":80}],"readiness":{"tcp":{"port":80}},
+   "volumeMounts":[{"volume":"on-$side","path":"/state"}]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pod at-$side was not applied"
+                waited=0
+                until line=$(units Workload "at-$side") && [ "${line%% *}" = 1 ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for the pod at-$side to be ready; the Workload says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Workload/default/at-$side?replica=0" >"$work/at-$side.out" || fail "what the pod at-$side wrote could not be read"
+            done
+            grep -qE 'where: nameserver 100\.88\.0\.1 from 100\.88\.[0-9]+\.[0-9]+' "$work/at-n1.out" || fail "the pod on n1 is not in the default range: $(cat "$work/at-n1.out")"
+            grep -qE 'where: nameserver 10\.77\.0\.1 from 10\.77\.[0-9]+\.[0-9]+' "$work/at-n2.out" || fail "the pod on n2 is not in the range of --pod-range: $(cat "$work/at-n2.out")"
+            # And one pod on n2 asks this machine, from behind its node's address: the node
+            # sends it as its own only if the masquerade rule matches the range it was told.
+            pinned='on-n2'
+            asks egress 10.0.2.2 $((port + 9))
+            pinned=''
+            grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
             # A Workload of an image nothing else uses, deleted once it runs: its image is
             # looked for again at the end.
             cat >"$work/apply.json" <<EOF
@@ -857,7 +897,7 @@ EOF
             grep -ah 'kithd: .*image' "$work"/n?.log | tr -d '\r' | sed 's/^/vm.sh: /' >&2
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh, each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
+            echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh and its IPv4 one from its node's range (the second node's from --pod-range, the first's the default; a pod on each said which at its node's DNS), each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
             exit 0
         fi
         if [ "$test" = kube ]; then
