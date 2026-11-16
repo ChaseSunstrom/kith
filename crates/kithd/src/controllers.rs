@@ -149,9 +149,10 @@ impl Shared {
     }
 }
 
-/// What a run answered for: the resource's revision, the module, and the revision of
-/// each thing it owns. The same again is not asked again.
-type Stamp = (releases::Stamp, [u8; 32], Vec<(String, Option<u64>)>);
+/// What a run answered for: the resource's revision, the definition's (the controller acts
+/// as whoever applied it: applied again, a refused run is made again), the module, and the
+/// revision of each thing it owns. The same again is not asked again.
+type Stamp = (releases::Stamp, releases::Stamp, [u8; 32], Vec<(String, Option<u64>)>);
 
 struct Job {
     key: String,
@@ -169,6 +170,7 @@ fn due(store: &Store, seen: &BTreeMap<String, Stamp>) -> Vec<Job> {
             continue;
         };
         let digest = wasm::digest(&wasm);
+        let defined = releases::stamp(store, definition);
         for resource in store.list(definition.spec["kind"].as_str()) {
             let key = resource.key();
             let recorded = releases::recorded(resource);
@@ -182,6 +184,7 @@ fn due(store: &Store, seen: &BTreeMap<String, Stamp>) -> Vec<Job> {
             let stamp = (
                 // (With when it was applied: one deleted and made again is not the same one.)
                 releases::stamp(store, resource),
+                defined,
                 digest,
                 recorded.iter().map(revision).collect(),
             );
@@ -575,6 +578,69 @@ mod tests {
             store.apply(resource.unwrap()).unwrap();
         }
         assert_eq!(made(&store).apply.len(), 1);
+    }
+
+    /// A run that was refused is not asked again as it is: but the definition applied again
+    /// (by one who may) is a new reason, and the controller is run once more.
+    #[test]
+    fn controller_retry_a_refused_run_is_made_again_when_its_definition_is_applied_again() {
+        let key = "GameServer/play/one";
+        let with_module = KIND.replace(
+            "schema: { type: object }",
+            "schema: { type: object }, controller: { wasm: AAEC }",
+        );
+        let mut store = store(&with_module);
+        let mut seen = BTreeMap::new();
+        let jobs = due(&store, &seen);
+        assert_eq!(jobs.len(), 1);
+        // (It ran and was refused: what the run does records it as seen.)
+        seen.insert(key.to_string(), jobs.into_iter().next().unwrap().stamp);
+        assert!(due(&store, &seen).is_empty());
+        // The definition applied again, by someone else.
+        let again = with_module.replace("'local socket'", "bob");
+        for resource in Resource::from_source(&again).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        assert_eq!(due(&store, &seen).len(), 1, "applied again, the controller runs again");
+    }
+
+    /// Admission modules are asked of custom kinds only: the kinds the API stamps with their
+    /// writer (a KindDefinition, a Package) are never handed to one, so none can change a
+    /// writer or a key print (a custom kind's resource is asked as any, whatever it carries).
+    #[test]
+    fn wasm_admission_is_not_asked_of_what_is_stamped() {
+        let stamped = "kith.dev/written-by: bob, kith.dev/written-key: abcd";
+        let kind = KIND.replace(
+            "schema: { type: object }",
+            "schema: { type: object }, admission: { wasm: AAEC }",
+        );
+        let source = format!(
+            "{kind}---\napiVersion: kith.dev/v1\nkind: Package\n\
+             metadata: {{ name: maps-1.0.0, annotations: {{ {stamped} }} }}\nspec: {{ version: 1.0.0, files: {{}} }}\n---\n\
+             apiVersion: games.example.com/v1\nkind: GameServer\n\
+             metadata: {{ name: two, namespace: play, annotations: {{ {stamped} }} }}\nspec: {{}}\n"
+        );
+        let store = store(KIND);
+        let mut resources: Vec<Resource> = Resource::from_source(&source)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let asked = checks(&store, &mut resources).unwrap();
+        let kinds: Vec<String> = asked
+            .iter()
+            .map(|check| match check {
+                Check::Module(of, _) => format!("module {of}"),
+                Check::Admit { at, .. } => format!("admit {}", resources[*at].key()),
+            })
+            .collect();
+        // The definition's modules are checked as modules; only the GameServers are admitted.
+        let want = [
+            "module KindDefinition/gameserver: admission",
+            "admit GameServer/play/one",
+            "admit GameServer/play/two",
+        ];
+        assert_eq!(kinds, want);
     }
 
     #[test]

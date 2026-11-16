@@ -201,8 +201,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
 - **A Release or a Source makes only what its writer may make.** The API writes down
   who applied it (`kith.dev/written-by`, whatever the body said; through another node,
-  whom that node passed on), and a rollback to an older revision is written down as
-  whoever rolls back. Each time the controller renders, every resource is asked for as
+  whom that node passed on), and a rollback to an older revision (of a Release, a Source,
+  a KindDefinition or a Package: each is stamped) is written down as whoever rolls back,
+  not as whoever applied the old revision; a rolled-back Package that says a Repository
+  fetched it is refused, like an apply of one. Each time the controller renders, every resource is asked for as
   that writer would be asked if they applied it themselves, with what it reaches (a
   Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs); each one the render
   drops, for leave to delete it. One refusal and nothing of the render is applied: the
@@ -221,7 +223,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   the controller's module answered is asked for as that writer would be asked if they
   applied it, and what it no longer answers, for leave to delete it; where the writer
   may not, nothing new is made, what was made stays, and the resource's status names
-  the resource, the right and the writer. The controller does not act as whoever applied
+  the resource, the right and the writer. The writer's rights are asked only when the
+  controller runs: a right taken away from them shows at its next run (nothing new is
+  made between), and a run that was refused is made again when the KindDefinition is
+  applied again, which is the way to mend it. The controller does not act as whoever applied
   the custom resource it runs for, so a custom kind lets someone ask for a thing without
   the right to make its parts, as an operator does.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
