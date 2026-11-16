@@ -407,8 +407,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container that keeps the node's
   users and is not root is still the node's user of its number, with whatever files on
-  the node that user owns, and may be of group 0, which reads what a Volume's files give
-  that group. The policy is no defence against whoever can write the node's config partition
+  the node that user owns; one that would be of root's group (its image says `1001:0`,
+  say) is refused as root is. The policy is no defence against whoever can write the node's config partition
   or kithd's arguments and environment where it is started (`KITH_NODE_POLICY` and the
   command line say it too), or is root on the node already.
   (T-0334, docs/adr-privilege.md.)

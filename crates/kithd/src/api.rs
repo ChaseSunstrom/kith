@@ -304,10 +304,21 @@ struct ApplyOptions {
     dry_run: bool,
 }
 
-/// What resources known by kind and namespace alone (a revision gone back to) reach into
-/// besides themselves, which whoever writes them must be allowed too.
-fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>)]) -> Result<(), ApiError> {
-    allowed(shared, caller, |_| reached(written))
+/// What going back to revision `to` of `key` takes: what applying that revision would
+/// ([`takes`]: a claim that provisions asks for its Volume there too). Of a revision that is
+/// not there, what its kind and namespace alone say.
+fn back_takes(store: &Store, key: &str, to: u64) -> Vec<Right> {
+    let history = store.history(key).ok();
+    let was = history.and_then(|history| history.iter().find(|was| was.resource.metadata.revision == Some(to)));
+    match was {
+        Some(was) => takes(store, std::slice::from_ref(&was.resource)),
+        None => {
+            let (kind, namespace) = place_of(key);
+            let mut asks = vec![(Verb::Apply, kind.clone(), namespace.clone())];
+            asks.extend(reached(&[(kind, namespace)]));
+            asks
+        }
+    }
 }
 
 /// Why `caller` may not write `command`, as the store now stands: the asking of [`applied`],
@@ -325,12 +336,7 @@ fn reach_of(shared: &Shared, caller: &Caller, written: &[(String, Option<String>
 pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Option<String> {
     let asks = match command {
         Command::Apply { resources, .. } => takes(store, resources),
-        Command::Rollback { key, .. } => {
-            let (kind, namespace) = place_of(key);
-            let mut asks = vec![(Verb::Apply, kind.clone(), namespace.clone())];
-            asks.extend(reached(&[(kind, namespace)]));
-            asks
-        }
+        Command::Rollback { key, to, .. } => back_takes(store, key, *to),
         Command::Delete { key } => {
             let (kind, namespace) = place_of(key);
             vec![(Verb::Delete, kind, namespace)]
@@ -666,8 +672,7 @@ async fn rollback(
     Path(key): Path<String>,
     Query(options): Query<RollbackOptions>,
 ) -> Reply<Change> {
-    permit(&shared, &caller, Verb::Apply, |_| vec![place_of(&key)])?;
-    reach_of(&shared, &caller, &[place_of(&key)])?;
+    allowed(&shared, &caller, |store| back_takes(store, &key, options.to))?;
     let (to, at) = (options.to, kith_api::store::now());
     // (What the cluster has forgotten or wiped is in the versions before it.)
     if key.starts_with("NodeKey/") {
@@ -953,9 +958,78 @@ spec: {}
             reach(&shared, &bob, &claim(", provision: true")).is_err(),
             "bob may not write Volumes"
         );
-        // Going back to a revision of one is writing it.
-        assert!(reach_of(&shared, &bob, &[place_of("Share/default/s")]).is_err());
-        assert!(reach_of(&shared, &bob, &[place_of("ConfigMap/default/c")]).is_ok());
+        // Going back to a revision of one is writing it (one not there: by its kind alone).
+        let back = |key: &str| allowed(&shared, &bob, |store| back_takes(store, key, 1));
+        assert!(back("Share/default/s").is_err(), "bob may not write Volumes");
+        assert!(back("Backup/default/b").is_err(), "bob may not read Secrets");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Going back to a revision takes what applying that revision would: a claim that
+    /// provisioned asks for its Volume again, at the API and where the leader decides.
+    #[tokio::test]
+    async fn rollback_takes_what_applying_the_revision_would() {
+        let dir = std::env::temp_dir().join(format!("kithd-back-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let all = "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: claimer}
+spec: {rules: [{kinds: [VolumeClaim], verbs: [apply]}]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: carol-claimer}
+spec: {role: claimer, subjects: [carol]}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: carol}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: VolumeClaim
+metadata: {name: k}
+spec: {size: 1Gi, provision: true}
+---
+apiVersion: kith.dev/v1
+kind: VolumeClaim
+metadata: {name: k}
+spec: {size: 1Gi}
+";
+        let key = "VolumeClaim/default/k";
+        let (provisioned, plain) = {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(all).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+            let history = state.store.history(key).unwrap();
+            let of = |provision: bool| {
+                let was = history
+                    .iter()
+                    .find(|was| (was.resource.spec["provision"] == true) == provision);
+                was.unwrap().resource.metadata.revision.unwrap()
+            };
+            (of(true), of(false))
+        };
+        let carol = Caller::Identity("carol".into());
+        let back = |caller: &Caller, to: u64| allowed(&shared, caller, |store| back_takes(store, key, to));
+        assert!(back(&carol, provisioned).is_err(), "carol may not write Volumes");
+        assert!(back(&carol, plain).is_ok());
+        assert!(back(&Caller::Admin, provisioned).is_ok());
+        // And the leader, as it puts the write in the log.
+        let state = shared.store.lock().unwrap();
+        let command = |to: u64| Command::Rollback {
+            key: key.into(),
+            to,
+            at: 0,
+        };
+        let said = refused(&state.store, &carol, &command(provisioned)).unwrap();
+        assert!(said.contains("may not apply Volume in namespace default"), "{said}");
+        assert_eq!(refused(&state.store, &carol, &command(plain)), None);
+        drop(state);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
