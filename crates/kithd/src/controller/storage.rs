@@ -1065,18 +1065,29 @@ mod tests {
     fn storage_limit_a_deleted_file_held_open_is_counted() {
         use std::io::Write;
         let root = dir("unlinked");
-        let (me, roots) = ([std::process::id()], std::slice::from_ref(&root));
-        let before = unlinked(&me, roots, later()).0;
+        let roots = std::slice::from_ref(&root);
         let mut file = std::fs::File::create(root.join("held")).unwrap();
         file.write_all(&vec![1u8; 4 * MIB as usize]).unwrap();
         file.sync_all().unwrap();
+        // (Held by a process of its own, and only that one counted: this one's open files are
+        // every other test's too, and theirs come and go between two readings.)
+        let held = std::fs::File::open(root.join("held")).unwrap();
+        let mut holder = std::process::Command::new("sleep")
+            .arg("600")
+            .stdin(held)
+            .spawn()
+            .unwrap();
+        drop(file);
+        let holders = [holder.id()];
+        let before = unlinked(&holders, roots, later()).0;
         std::fs::remove_file(root.join("held")).unwrap();
         // Gone from its directory: the walk finds nothing, the processes' open files do.
         assert!(count(roots, u64::MAX, later()).0 < MIB);
-        let (held, finished) = unlinked(&me, roots, later());
+        let (held, finished) = unlinked(&holders, roots, later());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
         assert!(held >= before + 4 * MIB && finished, "{held} {before}");
-        drop(file);
-        assert!(unlinked(&me, roots, later()).0 < held);
+        assert!(unlinked(&holders, roots, later()).0 < held);
         std::fs::remove_dir_all(root).unwrap();
     }
 
