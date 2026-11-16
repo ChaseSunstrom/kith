@@ -274,7 +274,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   when next needed, so it costs availability (a pull, or a start that fails while the
   registry cannot be reached), not integrity.
 - **Packages** are taken only with a signature over their name, version and hash, by a
-  key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
+  key the cluster was told to trust; there is no unsigned way in (but a package pushed by
+  hand, which a Release renders with no more than its pusher's rights, and one from a
+  Repository that has no `publicKey`). A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
   template in kith's own language (`.kith`) is evaluated inside kithd: it ends in
   500,000 steps, nested 3,000 deep and 1 MB of output or is refused, and it can read
@@ -870,6 +872,22 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
+  - A Package pushed by hand is rendered with no more than its pusher's rights, besides
+    its Release's writer's: the API writes the pusher down on the Package as on a Release
+    (name and key print, whatever the body said), and each render is asked for as the
+    pusher would be asked if they applied what it makes, and what it no longer makes, for
+    leave to delete it. So one who may push Packages and nothing else cannot publish a
+    version that an admin's `autoUpgrade` Release then renders with the admin's rights;
+    where the pusher may not, nothing new is made, what was installed stays, and the
+    Release's status names the Package, the resource, the namespace and the pusher. A
+    second push of a name and version by another replaces the first, and is held to the
+    second one's rights. A Package with nobody written down (one from before this check),
+    or an Identity gone or made again under the name, makes nothing new until it is
+    pushed again; a Source that makes a Package writes its own writer on it. A Package
+    fetched from a Repository has no pusher: it is trusted by the Repository's `publicKey`
+    (or by nothing, where there is none), so the right to apply a Repository is the
+    rights of every Release that names it, and `apply` on `Package` lets someone have
+    kithd ask any Repository there is.
   - A Release and a Source act as the Identity that applied them while it has the key
     it had then. An Identity made again under the same name has another key, so what
     the old one applied is not acted on as the new one: it makes nothing new, fetches no

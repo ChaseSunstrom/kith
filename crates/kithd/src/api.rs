@@ -360,9 +360,10 @@ fn writer(caller: &Caller) -> &Caller {
     }
 }
 
-/// `resources` with each Release, Source and KindDefinition (its controller acts as the writer) written down as `caller`'s, and, for an
-/// Identity, the print of the key it has in `store`: what the client said of either is
-/// not taken. (None, as the local socket's: it acts for no key.)
+/// `resources` with each Release, Source, KindDefinition (its controller acts as the writer) and
+/// Package (a Release renders it with no more than its pusher's rights) written down as
+/// `caller`'s, and, for an Identity, the print of the key it has in `store`: what the client
+/// said of either is not taken. (None, as the local socket's: it acts for no key.)
 fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
     let who = writer(caller);
     let print = match who {
@@ -370,7 +371,10 @@ fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<
         _ => None,
     };
     for resource in &mut resources {
-        if matches!(resource.kind.as_str(), "Release" | "Source" | "KindDefinition") {
+        if matches!(
+            resource.kind.as_str(),
+            "Release" | "Source" | "KindDefinition" | "Package"
+        ) {
             let annotations = &mut resource.metadata.annotations;
             annotations.insert(crate::releases::WRITER.into(), who.to_string());
             match &print {
@@ -1088,6 +1092,31 @@ spec: {}
         let sent = "apiVersion: kith.dev/v1\nkind: KindDefinition\n\
                     metadata: {name: g, annotations: {'kith.dev/written-by': 'local socket', 'kith.dev/written-key': 'forged'}}\n\
                     spec: {group: games.example.com, version: v1, kind: GameServer, schema: {type: object}}\n";
+        let sent: Vec<Resource> = Resource::from_source(sent)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let by = |caller: &Caller| {
+            let made = stamped(&store, caller, sent.clone());
+            let annotations = &made[0].metadata.annotations;
+            (annotations.get(WRITER).cloned(), annotations.get(KEY).cloned())
+        };
+        let (name, print) = by(&Caller::Identity("bob".into()));
+        assert_eq!((name.as_deref(), print), (Some("bob"), Some(bobs_key(0).1)));
+        assert_eq!(by(&Caller::Admin), (Some("local socket".into()), None));
+    }
+
+    /// A Package is written down as its pusher's, name and key print, whatever the client
+    /// sent: a Release renders it with no more than that one's rights (T-0550).
+    #[test]
+    fn package_writer_the_server_writes_who_pushed_a_package() {
+        use crate::releases::{KEY, WRITER, bob_is, bobs_key};
+        let mut store = Store::default();
+        bob_is(&mut store, 0);
+        let sent = "apiVersion: kith.dev/v1\nkind: Package\n\
+                    metadata: {name: maps-1.0.0, annotations: {'kith.dev/written-by': 'local socket', 'kith.dev/written-key': 'forged'}}\n\
+                    spec: {version: 1.0.0, files: {}}\n";
         let sent: Vec<Resource> = Resource::from_source(sent)
             .unwrap()
             .into_iter()

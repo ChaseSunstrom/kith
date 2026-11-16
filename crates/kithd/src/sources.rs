@@ -710,7 +710,12 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
             let mut resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
             // What a Source makes that makes more is the Source writer's too (its name and its
             // key's print), whatever the repository says of it.
-            let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source" | "KindDefinition");
+            let makes = |resource: &Resource| {
+                matches!(
+                    resource.kind.as_str(),
+                    "Release" | "Source" | "KindDefinition" | "Package"
+                )
+            };
             if resources.iter().any(makes) {
                 for resource in resources.to_mut().iter_mut().filter(|resource| makes(resource)) {
                     let annotations = &mut resource.metadata.annotations;
@@ -1602,6 +1607,25 @@ mod tests {
         assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
         assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "blue");
         assert!(store.get("ConfigMap/shop/b").is_some());
+    }
+
+    /// A Package a Source makes is its writer's to render with, as a Release's is: it
+    /// carries the Source's writer, whatever the repository says (T-0550).
+    #[test]
+    fn package_writer_a_package_a_source_makes_carries_the_sources_writer() {
+        let package = "apiVersion: kith.dev/v1\nkind: Package\n\
+                       metadata: { name: maps-1.0.0, annotations: { 'kith.dev/written-by': 'forged' } }\n\
+                       spec: { version: 1.0.0, files: { package.yaml: 'name: maps\\nversion: 1.0.0\\n' } }\n";
+        let mut store = Store::default();
+        apply(&mut store, &SOURCE.replace("namespace: shop", "namespace: kith-system"));
+        let fetched = Fetches::from([(
+            "Source/kith-system/repo".to_string(),
+            at("r1", &[("p.yaml", package.to_string())])
+                .remove("Source/shop/repo")
+                .unwrap(),
+        )]);
+        settle(&mut store, &fetched);
+        assert_eq!(writer(&store, "Package/maps-1.0.0").as_deref(), Some("local socket"));
     }
 
     /// What a Source makes that makes more carries the Source's writer's print with its

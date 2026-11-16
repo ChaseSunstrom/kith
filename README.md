@@ -1393,6 +1393,14 @@ spec:
   checked again.
 - A Package keeps its last 3 revisions (other kinds keep 100), because it
   carries its files; push a new version rather than rolling far back.
+- A Release renders a Package pushed by hand with no more than its pusher's
+  rights, besides its own writer's: what the Package makes, and what it no longer
+  makes, is asked of whoever pushed it, as of whoever applied the Release. Where
+  the pusher may not, nothing new is made, what was installed stays, and the
+  Release's status says whose right fell short. A Package pushed before kithd
+  wrote the pusher down renders nothing new until it is pushed again. One fetched
+  from a Repository has no pusher and is trusted by the Repository's key, so
+  whoever may apply a Repository gives the rights of every Release that names it.
 - A version is fetched once: pushing it to the registry again changes
   nothing here. A registry can also keep quiet about newer versions; the
   signature says a package is the publisher's, not that it is the newest.
