@@ -598,7 +598,9 @@ fn main() {
         ["shout", to, what] => {
             let socket = UdpSocket::bind("0.0.0.0:0").expect("a UDP socket");
             for _ in 0..10 {
-                let _ = socket.send_to(what.as_bytes(), to);
+                if let Err(e) = socket.send_to(what.as_bytes(), to) {
+                    eprintln!("shout: {e}");
+                }
                 std::thread::sleep(Duration::from_secs(1));
             }
         }

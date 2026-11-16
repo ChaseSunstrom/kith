@@ -259,19 +259,24 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         [ "$test" != kube ] || time=$((time * 2))
         [ "$test" != tunnel ] || time=$((time * 2))
         port=$((20000 + $$ % 20000))
-        fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
+        fail() { tail -n 30 "$work"/n?.log || true; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
         # worker: two, on the mesh; services: one, on the mesh.)
-        others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps=''
+        others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway=''
         seed() { :; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = tunnel ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
         # (tunnel: one node, whose card out reaches nothing but this machine's forwards, to
-        # its API and to its pod's ports published on it; and what both its cards carry, kept.)
+        # its API and to its pod's web port published on it; and what both its cards carry,
+        # kept. The UDP port published is asked from the node's LAN by ci/lan_probe.py: QEMU's
+        # restricted user network drops every UDP answer of its guest's, and gives by DHCP no
+        # way out: the node's is over its LAN, by the provider's machine, which is "outside"
+        # too. So what a pod sends past its tunnel has somewhere to go, and is seen.)
         if [ "$test" = tunnel ]; then
-            others='' inside=8080 out=",restrict=on,hostfwd=udp:127.0.0.1:$((port + 7))-:8080"
+            # (The comma doubled: QEMU's options take one as the next option's start.)
+            others='' inside=8080 out=",restrict=on" gateway=,,10.9.0.9
             dumps="-object filter-dump,id=lan-dump,netdev=lan,file=$work/lan.pcap -object filter-dump,id=out-dump,netdev=out,file=$work/out.pcap"
         fi
         # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
@@ -377,7 +382,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
                 -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside$out" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" $dumps \
-                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
+                -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24$gateway -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
         }
@@ -631,10 +636,10 @@ EOF
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the pod behind the Exit was not applied"
             # What the pod says each round, and its web and UDP ports as this machine reaches
-            # them on the node.
+            # them on the node (UDP as a machine on the node's LAN).
             rounds() { any GET '/v1/logs/Workload/media/probe?replica=0&tail=20' 2>/dev/null | grep -o 'probe [0-9]*: [^"\\]*'; }
             web() { curl -s --max-time 5 "http://127.0.0.1:$((port + 5))/"; }
-            echoed() { printf 'a datagram for the pod' | socat -t 3 -T 5 - "udp:127.0.0.1:$((port + 7))" 2>/dev/null; }
+            echoed() { python3 -I "$root/ci/lan_probe.py" "$((port + 8))" 52:54:00:00:09:01 10.9.0.1 8080 'a datagram for the pod' 2>/dev/null; }
             up='web ok dns ok tcp-dns ok node-dns silent ipv6 [A-Z]'
             down='web failed dns failed tcp-dns silent node-dns silent ipv6 [A-Z]'
             probes() { # PATTERN WHAT: three rounds of the pod's, all after the last one before, each say PATTERN
@@ -777,7 +782,7 @@ print(len(leaks), tunnel, control, "; ".join(leaks[:10]))
             read -r leaked tunnelled controls rest <"$work/counted"
             [ "$leaked" = 0 ] || fail "$leaked packets of the pod's left the node outside its tunnel: $rest"
             [ "$tunnelled" -gt 0 ] || fail "no packet went to the provider through the tunnel"
-            [ "$controls" -gt 0 ] || fail "the pod behind no exit sent nothing that was seen: the count of the node's packets sees nothing"
+            [ "$controls" -gt 0 ] || fail "the pod behind no exit sent nothing that was seen: the count of the node's packets sees nothing; the Job says: $line: $(any GET '/v1/logs/Job/default/control?stderr=true' 2>&1)"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: one node and a WireGuard provider: a pod behind an Exit reached outside and asked its names (UDP and TCP) only through the tunnel, never IPv6 and never its node's DNS; with the provider stopped, its Secret changed, its Exit deleted and its node reset it reached nothing, and then through the tunnel again; its web and UDP ports published on the node answered; a pod of a namespace the Exit does not list was refused; and of $tunnelled packets to the provider and $controls of a pod behind no exit seen on the node's cards, none of the pod's left outside the tunnel"
             exit 0
