@@ -11,7 +11,7 @@
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
 mod prune;
-mod storage;
+pub mod storage;
 
 use crate::Shared;
 use futures_util::FutureExt;
@@ -211,6 +211,9 @@ struct Controller {
     floor: SystemTime,
     /// What the last failed look said, said once until it changes.
     look_failed: Option<String>,
+    /// Each pod's project, where the state disk holds pods to their limits as they write
+    /// (`storage::held_at_write`); `None` where they are counted.
+    projects: Option<storage::Projects>,
 }
 
 /// Free bytes on the state disk, its reserve, and the pods as counted.
@@ -283,6 +286,10 @@ pub async fn run(
         }
     }
     let mut exited = signal(SignalKind::child()).expect("installing a signal handler");
+    let state = shared.logs.parent().unwrap_or(&shared.logs);
+    let held = storage::held_at_write(state);
+    eprintln!("kithd: pods' storage limits are held {}", storage::how(held));
+    let projects = held.then(|| storage::Projects::read(state));
     let mut controller = Controller {
         runtime,
         logs: shared.logs.clone(),
@@ -304,6 +311,7 @@ pub async fn run(
         clocks: None,
         floor: SystemTime::now(),
         look_failed: None,
+        projects,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -563,6 +571,20 @@ pub fn pod_of(owner: &str, replica: u32) -> String {
         name.unwrap_or_default(),
     );
     format!("{prefix}{replica}")
+}
+
+/// Per pod with a container: its storage limit, the sum of what its containers state in
+/// `resources.storage` (`None` where none does).
+fn pod_limits(slots: &BTreeMap<String, Slot>) -> BTreeMap<String, Option<u64>> {
+    let mut limits: BTreeMap<String, Option<u64>> = BTreeMap::new();
+    for slot in slots.values() {
+        let Run::Container(c) = &slot.run else { continue };
+        let limit = limits.entry(pod_of(&slot.owner, slot.replica)).or_default();
+        if let Some(bytes) = c.resources.as_ref().and_then(|r| r.storage.as_ref()?.bytes()) {
+            *limit = Some(limit.unwrap_or(0).saturating_add(bytes));
+        }
+    }
+    limits
 }
 
 fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
@@ -1175,6 +1197,7 @@ impl Controller {
             .filter(|(_, slot)| slot.leaving)
             .map(|(id, slot)| (id.clone(), slot.owner.clone(), slot.devices.clone()))
             .collect();
+        let limits = pod_limits(&self.slots);
         for (id, slot) in self.slots.iter_mut() {
             if *stopping.borrow() {
                 return TICK; // the caller stops everything
@@ -1238,9 +1261,22 @@ impl Controller {
                     slot.message = Some(why);
                     continue;
                 }
+                // Its pod's project, its limit set, before anything of it starts.
+                let pod = pod_of(&slot.owner, slot.replica);
+                let given = match (&slot.run, self.projects.as_mut()) {
+                    (Run::Container(_), Some(projects)) => Some(
+                        projects
+                            .give(&pod, limits.get(&pod).copied().flatten())
+                            .map_err(|e| format!("putting its pod's files in a project of their own: {e}")),
+                    ),
+                    _ => None,
+                };
                 let mut stop_now = stopping.clone();
                 let started = tokio::select! {
-                    started = start(shared, &self.runtime, &self.logs, mesh, id, slot) => started,
+                    started = async {
+                        let project = given.transpose()?;
+                        start(shared, &self.runtime, &self.logs, mesh, id, slot, project).await
+                    } => started,
                     // A pull can take minutes; shutting down does not wait for it.
                     _ = stop_now.changed() => return TICK,
                 };
@@ -1616,6 +1652,19 @@ impl Controller {
                 for (i, why) in chosen {
                     self.replace(&pods[i].id, began, &why, state);
                 }
+                // A held pod's running units say while it holds all its limit lets it.
+                for pod in &pods {
+                    let reached = storage::reached(pod);
+                    let theirs = |slot: &&mut Slot| {
+                        pod_of(&slot.owner, slot.replica) == pod.id && slot.handle.is_some() && !slot.leaving
+                    };
+                    for slot in self.slots.values_mut().filter(theirs) {
+                        let said = slot.message.as_deref();
+                        if said.is_none_or(|m| m.starts_with(storage::REACHED)) {
+                            slot.message = reached.clone();
+                        }
+                    }
+                }
             }
         }
         if self.count.is_some() || self.counted.is_some_and(|at| at.elapsed() < TICK) {
@@ -1629,25 +1678,29 @@ impl Controller {
         let total = disk.as_ref().map_or(0, |d| d.blocks() * d.fragment_size());
         let root = nix::unistd::getuid().is_root();
         let reserve = self.reserve.unwrap_or_else(|| storage::default_reserve(total, root));
-        // Per pod: its limit, the sum of its containers', and the roots and cgroups of those running.
+        // Per pod: its limit, the sum of its containers', the roots and cgroups of those running,
+        // and whether one is unconfined (one with the node's users may move its files out of
+        // its project: its pod is counted).
         type Paths = Vec<PathBuf>;
-        let mut pods: BTreeMap<String, (Option<u64>, Paths, Paths)> = BTreeMap::new();
+        let limits = pod_limits(&self.slots);
+        let mut pods: BTreeMap<String, (Option<u64>, Paths, Paths, bool)> = BTreeMap::new();
         for slot in self.slots.values() {
             let Run::Container(c) = &slot.run else { continue };
-            let (limit, roots, cgroups) = pods.entry(pod_of(&slot.owner, slot.replica)).or_default();
-            if let Some(bytes) = c.resources.as_ref().and_then(|r| r.storage.as_ref()?.bytes()) {
-                *limit = Some(limit.unwrap_or(0).saturating_add(bytes));
-            }
+            let pod = pod_of(&slot.owner, slot.replica);
+            let limit = limits.get(&pod).copied().flatten();
+            let (_, roots, cgroups, unconfined) = pods.entry(pod).or_insert((limit, Vec::new(), Vec::new(), false));
+            *unconfined |= c.seccomp.as_ref().is_some_and(|s| s.unconfined == Some(true));
             let running = slot.handle.as_ref().filter(|_| !slot.leaving);
             roots.extend(running.and_then(Handle::upper));
             cgroups.extend(running.map(|handle| handle.cgroup.clone()));
         }
+        let held = self.projects.is_some();
         let pods: Vec<(storage::Pod, Paths, Paths)> = pods
             .into_iter()
-            .filter(|(id, (limit, roots, _))| {
+            .filter(|(id, (limit, roots, _, _))| {
                 !roots.is_empty() && !self.replacing.contains_key(id) && storage::walked(*limit, free, reserve)
             })
-            .map(|(id, (limit, mut roots, cgroups))| {
+            .map(|(id, (limit, mut roots, cgroups, unconfined))| {
                 roots.push(replicas.join(&id).join("scratch"));
                 let pod = storage::Pod {
                     id,
@@ -1655,6 +1708,7 @@ impl Controller {
                     bytes: 0,
                     finished: true,
                     again: false,
+                    held: held && !unconfined,
                 };
                 (pod, roots, cgroups)
             })
@@ -1670,6 +1724,14 @@ impl Controller {
                 .map(|(mut pod, roots, cgroups)| {
                     // (A scratch set aside and not removed, by a kithd that stopped first, goes now.)
                     storage::sweep(&replicas.join(&pod.id), &stop);
+                    // Held, what it holds is read, not counted; a project that cannot be read
+                    // is counted.
+                    let usage = pod.held.then(|| storage::Projects::usage(&state, &pod.id)).flatten();
+                    pod.held = usage.is_some();
+                    if let Some(bytes) = usage {
+                        pod.bytes = bytes;
+                        return pod;
+                    }
                     let until = storage::Until {
                         at: Instant::now() + storage::SPELL,
                         stop: &stop,
@@ -1994,6 +2056,7 @@ async fn start(
     mesh: Option<(std::net::Ipv6Addr, &str)>,
     id: &str,
     slot: &mut Slot,
+    project: Option<u32>,
 ) -> Result<Handle, String> {
     let resources = match &slot.run {
         Run::Container(c) => &c.resources,
@@ -2011,6 +2074,7 @@ async fn start(
             .collect(),
         // A NodeWorkload is the node's own: it keeps the node's users.
         host_users: slot.owner.starts_with("NodeWorkload/"),
+        project,
         ..Unit::default()
     };
     // The volumes' directories are made here, on the node, under the state directory (the

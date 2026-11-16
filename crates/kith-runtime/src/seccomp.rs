@@ -80,9 +80,19 @@ const NAMESPACES: [libc::c_int; 8] = [
     0x80, // CLONE_NEWTIME
 ];
 
+/// The ioctls that set a file's project, or whether its directory's new files take it
+/// (FS_IOC_FSSETXATTR, FS_IOC_SETFLAGS), and the call that does the same by name.
+const FSSETXATTR: u64 = 0x401c_5820;
+const SETFLAGS: u64 = 0x4008_6602;
+/// file_setattr(2): one number on every architecture (libc names it not yet).
+const FILE_SETATTR: libc::c_long = 469;
+
 /// The filters of a container that allows `allowed` back: each is installed, and a call
-/// goes through when every one lets it.
-pub fn filters(allowed: &[String]) -> Result<Vec<BpfProgram>, String> {
+/// goes through when every one lets it. A container with the node's users (no user
+/// namespace) moves no file to another project either: the kernel lets a file's owner do
+/// that outside one, and its project is what holds a pod to its storage. (Not allowed back
+/// by name: a container that needs it is unconfined.)
+pub fn filters(allowed: &[String], node_users: bool) -> Result<Vec<BpfProgram>, String> {
     if let Some(unknown) = allowed
         .iter()
         .find(|name| !REFUSED.iter().any(|(refused, _)| refused == name))
@@ -111,6 +121,16 @@ pub fn filters(allowed: &[String]) -> Result<Vec<BpfProgram>, String> {
             }
         }
         rules.insert(*number, when);
+    }
+    if node_users {
+        let mut when = Vec::new();
+        for number in [FSSETXATTR, SETFLAGS] {
+            // (The kernel takes the low 32 bits of it: a Dword compares those alone.)
+            let set = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, number);
+            when.push(SeccompRule::new(vec![set.map_err(failed)?]).map_err(failed)?);
+        }
+        rules.insert(libc::SYS_ioctl, when);
+        rules.insert(FILE_SETATTR, Vec::new());
     }
     let answer = |rules, errno: i32| -> Result<BpfProgram, String> {
         SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Errno(errno as u32), arch)
@@ -181,12 +201,45 @@ mod tests {
 
     /// The first answer that is not "let it through", as the kernel takes the strictest.
     fn said(allowed: &[&str], arch: u32, number: i64, arg0: u64) -> u32 {
+        said_to(allowed, false, arch, number, [arg0, 0])
+    }
+
+    /// The same, to a container with the node's users or not, of a call with two arguments.
+    fn said_to(allowed: &[&str], node_users: bool, arch: u32, number: i64, args: [u64; 2]) -> u32 {
         let allowed: Vec<String> = allowed.iter().map(|name| name.to_string()).collect();
-        let filters = filters(&allowed).unwrap();
+        let filters = filters(&allowed, node_users).unwrap();
         let answers = filters
             .iter()
-            .map(|filter| answer(filter, arch, number as u32, [arg0, 0, 0, 0, 0, 0]));
+            .map(|filter| answer(filter, arch, number as u32, [args[0], args[1], 0, 0, 0, 0]));
         answers.min_by_key(|said| (said & 0xffff_0000) as i32).unwrap()
+    }
+
+    /// A container with the node's users moves none of its files to another project: the
+    /// kernel lets their owner do it outside a user namespace, and a project is what holds a
+    /// pod to its storage. Every other ioctl goes through, and a user namespace's container
+    /// (where the kernel refuses it itself) keeps them all.
+    #[test]
+    fn seccomp_keeps_files_in_their_project_for_the_node_s_users() {
+        let eperm = ERRNO | libc::EPERM as u32;
+        let ioctl = |node_users, number: u64| said_to(&[], node_users, NATIVE, libc::SYS_ioctl, [3, number]);
+        for (number, name) in [(FSSETXATTR, "FS_IOC_FSSETXATTR"), (SETFLAGS, "FS_IOC_SETFLAGS")] {
+            assert_eq!(ioctl(true, number), eperm, "{name}");
+            // (The kernel reads the low 32 bits alone: the high ones hide nothing.)
+            assert_eq!(ioctl(true, number | 0xffff_ffff_0000_0000), eperm, "{name}");
+            assert_eq!(ioctl(false, number), ALLOW, "{name}");
+        }
+        assert_eq!(
+            said_to(&[], true, NATIVE, FILE_SETATTR, [libc::AT_FDCWD as u64, 0]),
+            eperm
+        );
+        assert_eq!(said_to(&[], false, NATIVE, FILE_SETATTR, [0, 0]), ALLOW);
+        // Reading them, and every other ioctl, goes through.
+        for through in [0x801c_581f, 0x8008_6601, libc::TIOCGWINSZ as u64, libc::FIONREAD as u64] {
+            assert_eq!(ioctl(true, through), ALLOW, "{through:#x}");
+        }
+        assert_eq!(said_to(&[], true, NATIVE, libc::SYS_read, [0, FSSETXATTR]), ALLOW);
+        // What is refused by name still is.
+        assert_eq!(said_to(&[], true, NATIVE, libc::SYS_mount, [0, 0]), eperm);
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -246,7 +299,7 @@ mod tests {
             );
         }
         // A name that is not one of them is a mistake, and says what the names are.
-        let said = filters(&["mounts".to_string()]).unwrap_err();
+        let said = filters(&["mounts".to_string()], false).unwrap_err();
         assert!(
             said.contains("`mounts` is not a call the filter refuses") && said.contains("mount, umount2"),
             "{said}"

@@ -24,6 +24,8 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
+#   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
+#                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test worker   two nodes, one a worker: it runs what is placed on it with its Secret, its
@@ -143,6 +145,16 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    kithd passes its bytes; on the node's own network, the kernel
                    sends its connections straight to the pod. Needs rustc for
                    x86_64-unknown-linux-musl
+  --test quota     instead: one node as for services, its state disk made with project
+                   quotas (as os/build.sh makes it). Expected: kithd says it holds
+                   pods' storage limits at the write; a pod of 64 MiB writing 200 MiB
+                   is stopped at its limit by the kernel, in its root, its scratch
+                   and a file it removed and holds open, and is not replaced, while
+                   one beside it loses no write; a pod cannot move its files out of
+                   its project (in a user namespace the kernel refuses, as the node's
+                   root its filter does; unconfined it can, and is counted and
+                   replaced); what it changes of its image is charged to it. Needs
+                   rustc for x86_64-unknown-linux-musl
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
                    the one on PATH) asking the first as the cluster's admin: the
@@ -198,7 +210,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos, access" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | quota | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, quota, kube, worker, chaos, access" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -234,7 +246,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -251,12 +263,15 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         fail() { tail -n 30 "$work"/n?.log; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
-        # worker: two, on the mesh; services: one, on the mesh.)
+        # worker: two, on the mesh; services and quota: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
-        others=2 more=--mesh
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ]; then
+        others=2 more=--mesh project=''
         [ "$test" != services ] || others=''
+        # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
+        # as a node's state from before had none: kithd counts what their pods write.)
+        [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
         # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
         # (And an image no unit has used for two minutes goes: README, --image-grace.)
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
@@ -288,6 +303,16 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 for tag in serve again; do
                     printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
                 done
+                if [ "$test" = quota ]; then
+                    # (quota: files of the image that a pod's root is made of, for it to change:
+                    # one larger than its limit, others to rename over and to link. Not zeros,
+                    # which mkfs keeps no blocks for.)
+                    mkdir -p "$image/rootfs/data" "$image/rootfs/tree"
+                    head -c 12582912 /dev/urandom >"$image/rootfs/big"
+                    head -c 1048576 /dev/urandom >"$image/rootfs/data/small"
+                    head -c 1048576 /dev/urandom >"$image/rootfs/data/other"
+                    echo leaf >"$image/rootfs/tree/leaf"
+                fi
                 if [ "$test" = pods ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
                     # pod, for a user who is not root: a sandbox started inside a container.
@@ -318,12 +343,13 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
-                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
+                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 $project "$work/state.img" "$((state_sectors / 2))k" >&2
             fi
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
             # (Room for an image that is pulled: the state grows to the disk's end at the first start.)
-            case $test${KITH_E2E:-} in pods1 | kube1) truncate -s 2G "$1" ;; esac
+            # (quota: room for what its pods write.)
+            case $test${KITH_E2E:-} in pods1 | kube1 | quota*) truncate -s 2G "$1" ;; esac
         }
       elif [ "$test" = rollout ]; then
         # The nodes run an image built with the release key: the first release they take
@@ -666,8 +692,215 @@ EOF
                 fi
                 checked="$checked${checked:+; }$job: ${said#check: }, reached $reached"
             done
+            # (Its state disk has no project quotas, as a node's from before: kithd says it counts.)
+            grep -aq "kithd: pods' storage limits are held by a count every 10 s of what each pod wrote" "$work/n1.log" \
+                || fail "kithd did not say it counts what pods write on a state disk with no project quotas: $(grep -a 'storage limits' "$work/n1.log")"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
+            exit 0
+        fi
+        if [ "$test" = quota ]; then
+            # Each case that held says `quota: ok: CASE`; at the end every one must have.
+            : >"$work/oks"
+            ok() { echo "quota: ok: $1"; echo "$1" >>"$work/oks"; }
+            # KIND NAME MORE STEP ...: a pod that runs `pod quota STEP ...` (ci/pod.rs), MORE more
+            # of its container; what it said is in $work/NAME.out once it is done.
+            quota() {
+                kind=$1 name=$2 extra=$3
+                shift 3
+                steps=$(printf '"%s",' "$@")
+                spec='"replicas":1,'
+                [ "$kind" = Workload ] || spec='"selector":{},'
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"$kind","metadata":{"name":"$name"},"spec":{$spec"template":{"pod":true,"containers":[
+  {"name":"quota","image":"kith.test/pod:1","command":["/bin/pod","quota",${steps%,}]$extra}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the $kind $name was not applied"
+            }
+            done_() { # KIND NAME: wait for it to have said all it does
+                waited=0
+                until grep -q 'quota: done' "$work/$2.out" 2>/dev/null; do
+                    for replica in 0 1 2 3; do
+                        any GET "/v1/logs/$1/default/$2?replica=$replica" >"$work/$2.out" 2>/dev/null && grep -q 'quota: done' "$work/$2.out" && break
+                    done
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for the $1 $2 to be done; it says: $(units "$1" "$2"): $(cat "$work/$2.out" 2>/dev/null)"
+                    sleep 1
+                done
+            }
+            gone() { api 1 DELETE "/v1/resources/$1/default/$2" >/dev/null || fail "the $1 $2 was not deleted"; }
+            # What NAME said of STEP (its log comes as JSON: the lines are in its strings).
+            result() {
+                python3 -c '
+import json, sys
+def strings(v):
+    if isinstance(v, str):
+        yield v
+    for x in (v.values() if isinstance(v, dict) else v if isinstance(v, list) else []):
+        yield from strings(x)
+try:
+    log = json.load(open(sys.argv[1]))
+except ValueError:
+    sys.exit(1)
+said = [l[len(sys.argv[2]) + 1:] for s in strings(log) for l in s.splitlines() if l.startswith(sys.argv[2] + " ")]
+print(said[-1] if said else "nothing", end="")
+' "$work/$1.out" "quota: $2"
+            }
+            expect() { # NAME STEP PATTERN (grep -E, all of what it said) WHAT-IT-SHOWS
+                got=$(result "$1" "$2")
+                printf '%s\n' "$got" | grep -Eqx "$3" || fail "$1: $2 said \"$got\": $4"
+            }
+            stopped() { # NAME STEP LIMIT: the write failed at the kernel's quota, at most LIMIT in
+                got=$(result "$1" "$2")
+                wrote=$(printf '%s\n' "$got" | sed -n 's/^failed after \([0-9]*\): .* (os error 122)$/\1/p')
+                [ -n "$wrote" ] && [ "$wrote" -le "$3" ] || fail "$1: $2 said \"$got\": not stopped at the write at its limit of $3 bytes"
+            }
+            used() { # NAME STEP LIMIT: statfs of its project's directory says its limit, and no more used
+                got=$(result "$1" "$2")
+                case $got in "size $3 used "*) ;; *) fail "$1: $2 said \"$got\": its project's limit is not $3" ;; esac
+                got=${got#size $3 used }
+                [ "${got%% *}" -le "$3" ] || fail "$1: $2 holds ${got%% *} bytes, past its limit of $3"
+            }
+            free() { # NAME: what the state disk has free, as a pod with a Volume there sees it
+                quota Workload "$1" ',"volumeMounts":[{"volume":"free","path":"/free"}]' '#/free'
+                done_ Workload "$1"
+                gone Workload "$1"
+                got=$(result "$1" '#/free')
+                printf '%s\n' "${got##* }" | grep -Eqx '[0-9]+' || fail "$1: #/free said \"$got\""
+                echo "${got##* }"
+            }
+
+            # kithd says once how it holds pods' limits, and the Node says it too.
+            grep -aq "kithd: pods' storage limits are held at the write, by the state disk's project quota" "$work/n1.log" \
+                || fail "kithd did not say it holds pods' storage limits at the write: $(grep -a 'storage limits' "$work/n1.log")"
+            waited=0
+            until storage=$(any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    if r["kind"] == "Node" and r["metadata"]["name"] == "n1":
+        print(((r.get("status") or {}).get("os") or {}).get("storage", ""), end="")
+') && [ -n "$storage" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Node n1 did not say how it holds pods' storage limits"
+                sleep 1
+            done
+            [ "$storage" = "at the write, by the state disk's project quota" ] || fail "the Node n1 says its pods' limits are held $storage"
+            ok said
+
+            # A pod of 64 MiB writing 200 MiB, in its root and then its scratch, beside one writing
+            # 32 MiB: the first is stopped at the write, the second loses none, and the disk loses
+            # no more than both their limits let them (and 4 MiB of kithd's own).
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"free"},"spec":{"node":"n1","path":"free"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Volume free was not applied"
+            limit=67108864 storage=',"resources":{"storage":"64Mi"}'
+            for case in write scratch; do
+                to=/fill more=$storage
+                [ "$case" = write ] || { to=/work/fill more="$storage,\"volumeMounts\":[{\"scratch\":\"work\",\"path\":\"/work\"}]"; }
+                before=$(free "before-$case")
+                quota Workload "big-$case" "$more" "+$to:209715200" "#${to%/fill}/"
+                quota Workload "small-$case" "$more" "+$to:33554432"
+                done_ Workload "big-$case"
+                done_ Workload "small-$case"
+                after=$(free "after-$case")
+                stopped "big-$case" "+$to:209715200" "$limit"
+                used "big-$case" "#${to%/fill}/" "$limit"
+                expect "small-$case" "+$to:33554432" 'wrote 33554432' "a pod beside one at its limit lost a write"
+                [ $((before - after)) -le $((limit + 33554432 + 4194304)) ] || fail "$case: the state disk lost $((before - after)) bytes to two pods of 64 MiB, one writing 32 MiB"
+                # Its status says it holds all it may, and it is not replaced for it.
+                waited=0
+                until line=$(units Workload "big-$case") && printf '%s\n' "$line" | grep -q 'reached its storage limit'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 60 ] || fail "big-$case's status does not say it reached its storage limit: $line"
+                    sleep 1
+                done
+                sleep 12
+                any GET "/v1/logs/Workload/default/big-$case?replica=0" >"$work/big-$case.out" 2>/dev/null || true
+                [ "$(grep -o 'quota: done' "$work/big-$case.out" | wc -l)" = 1 ] || fail "big-$case was started again: $(cat "$work/big-$case.out")"
+                ! grep -aq 'replaced: its pod wrote' "$work/n1.log" || fail "a pod held to its limit was replaced: $(grep -a 'replaced: its pod wrote' "$work/n1.log")"
+                gone Workload "big-$case"
+                gone Workload "small-$case"
+                echo "vm.sh: $case: stopped at $wrote bytes of 200 MiB; the disk lost $((before - after)) bytes; $line" >&2
+                ok "$case"
+            done
+
+            # A file it removed and holds open, with no name to find: charged all the same.
+            quota Workload unlinked "$storage" "~/fill:209715200"
+            done_ Workload unlinked
+            stopped unlinked "~/fill:209715200" "$limit"
+            gone Workload unlinked
+            ok unlinked
+
+            # Moving its files out of its project: in a user namespace the kernel refuses; as the
+            # node's root (a NodeWorkload's pod) its filter does; unconfined nothing does, and
+            # what it then writes is counted, and it is replaced for it.
+            quota Workload userns '' '+/esc:1' '0/esc' '!/esc' '?/esc'
+            quota NodeWorkload noderoot '' '+/esc:1' '0/esc' '!/esc' '?/esc'
+            done_ Workload userns
+            done_ NodeWorkload noderoot
+            for step in 0/esc '!/esc'; do
+                expect userns "$step" '.* \(os error 22\)' "a pod in a user namespace moved its file out of its project"
+                expect noderoot "$step" '.* \(os error 1\)' "a pod as the node's root moved its file out of its project"
+            done
+            expect userns '?/esc' 'project [1-9][0-9]*' "its file is not in its pod's project"
+            expect noderoot '?/esc' 'project [1-9][0-9]*' "its file is not in its pod's project"
+            gone Workload userns
+            gone NodeWorkload noderoot
+            ok userns
+            ok noderoot
+            quota NodeWorkload unconfined "$storage,\"seccomp\":{\"unconfined\":true}" '+/esc:1' '0/esc' '?/esc' '+/esc:104857600'
+            done_ NodeWorkload unconfined
+            expect unconfined 0/esc ok "an unconfined pod as the node's root could not move its file out of its project"
+            expect unconfined '?/esc' 'project 0' "an unconfined pod's file stayed in its project"
+            expect unconfined '+/esc:104857600' 'wrote 104857600' "a file out of its project took less than it wrote"
+            waited=0
+            until grep -aq 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 67108864' "$work/n1.log"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "an unconfined pod that wrote past its limit out of its project was not replaced"
+                sleep 1
+            done
+            gone NodeWorkload unconfined
+            ok unconfined
+
+            # Its file linked and renamed to elsewhere: another file system (its Volume; another
+            # pod's root is not in its).
+            quota Workload elsewhere ',"volumeMounts":[{"volume":"free","path":"/free"}]' '+/mine:1' '&/mine:/free/linked' '>/mine:/free/moved'
+            done_ Workload elsewhere
+            expect elsewhere '&/mine:/free/linked' '.* \(os error 18\)' "a pod linked a file of its root into a Volume"
+            expect elsewhere '>/mine:/free/moved' '.* \(os error 18\)' "a pod moved a file of its root into a Volume"
+            gone Workload elsewhere
+            ok elsewhere
+
+            # What it changes of its image is charged to it: a file of its image larger than its
+            # limit, appended to; a directory renamed; a file renamed over one; one linked; one
+            # removed; then it fills the rest.
+            quota Workload image ',"resources":{"storage":"8Mi"}' '?/' '^/big' '>/tree:/moved' '+/new:1048576' '>/new:/data/small' '?/data/small' '&/data/other:/linked' '?/linked' '-/big' '+/fill:16777216' '#/'
+            done_ Workload image
+            its=$(result image '?/')
+            expect image '?/' 'project [1-9][0-9]*' "its root is in no project of its own"
+            expect image '^/big' '.* \(os error 122\)' "a file of its image larger than its limit was copied up whole"
+            expect image '>/tree:/moved' 'ok|.* \(os error 18\)' "a directory of its image renamed"
+            expect image '>/new:/data/small' ok "a file renamed over one of its image"
+            expect image '?/data/small' "$its" "a file renamed over one of its image left its project"
+            expect image '&/data/other:/linked' ok "a file of its image linked"
+            expect image '?/linked' "$its" "a file of its image linked is not charged to it"
+            expect image '-/big' ok "a file of its image removed"
+            stopped image '+/fill:16777216' 8388608
+            used image '#/' 8388608
+            gone Workload image
+            ok image
+
+            for case in said write scratch unlinked userns noderoot unconfined elsewhere image; do
+                grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
+            done
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
             exit 0
         fi
         if [ "$test" = pods ]; then
