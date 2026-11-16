@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""crates/kithd/kithd.order: the functions kithd runs from its start until it has idled a
-while, in the order it first runs each. kithd's build links them next to each other in
-that order (crates/kithd/build.rs says why).
+"""crates/kithd/kithd.order: the functions kithd runs from its start, through what a node
+does in its first minute, until it has idled a while, in the order it first runs each.
+kithd's build links them next to each other in that order (crates/kithd/build.rs says why).
+
+The first minute, asked of the traced kithd on 127.0.0.1 and nowhere else: a TLS request
+on its node listener, a join token, an apply of a ConfigMap, a small Workload, a DNSZone
+and a DNSRecord (each a write through Raft: it listens as a node, a cluster of one), and
+a DNS query it answers from them. What is not traced, and so is linked wherever the
+compiler put it: what kithd does only as the first process of kith OS (mounts, the
+network's answer, the state partition), which needs root and a machine of its own; a
+container's start (it forks, and this tracer follows threads); and an image pulled (it
+needs a registry).
 
     python3 ci/order.py           build kithd (ci/musl.sh), run it, write the file
     python3 ci/order.py --check   how many of the file's names the built kithd still has, and
@@ -25,10 +34,13 @@ any more orders nothing, so an old file is never wrong, only less use.
 import argparse
 import ctypes
 import glob
+import json
 import os
 import re
 import signal
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -36,8 +48,13 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ORDER = os.path.join(ROOT, "crates/kithd/kithd.order")
-# After it serves: long enough for what it does every second, every 5 and every 10.
+# After its first minute: long enough for what it does every second, every 5 and every 10.
 IDLE = 12
+# The longest any one thing asked of the traced kithd may take (it runs slower, traced).
+LIMIT = 120
+# What the order must name, or the traced run did not do what it says: the TLS handshake a
+# node listener makes, the answer to a DNS query, and a write through Raft.
+MUST = {"a TLS handshake": "6rustls6server", "a DNS answer": "8kith_dns6answer","a write through Raft": "12client_write"}
 # What a line of the file is made of: it is written into the linker's script as it is.
 PATTERN = r"[\w.$*]+"
 TRACEME, CONT, GETREGS, SETREGS, SETOPTIONS = 0, 7, 12, 13, 0x4200
@@ -94,19 +111,76 @@ def loose(name):
     return re.sub(r"\.\d+$", ".*", name)
 
 
+def free_port():
+    with socket.socket() as free:
+        free.bind(("127.0.0.1", 0))
+        return free.getsockname()[1]
+
+
+def first_minute(kithd, tmp, serving, node, dns):
+    """What a node does in its first minute, asked of the kithd at `serving` (its node
+    listener and its DNS on 127.0.0.1 at the ports `node` and `dns`). Raises if any fails."""
+    deadline = time.time() + LIMIT
+    while not os.path.exists(serving):
+        if time.time() > deadline:
+            raise TimeoutError("kithd did not serve")
+        time.sleep(0.05)
+
+    def kith(*arguments):
+        argv = [os.path.join(os.path.dirname(kithd), "kith"), "--socket", serving, *arguments]
+        return subprocess.run(argv, check=True, capture_output=True, text=True, timeout=LIMIT).stdout
+
+    def apply(name, kind, spec):
+        path = os.path.join(tmp, name + ".json")
+        with open(path, "w") as file:
+            json.dump({"apiVersion": "kith.dev/v1", "kind": kind, "metadata": {"name": name}, "spec": spec}, file)
+        kith("apply", "-f", path)
+
+    # A TLS request on the node listener, as a node that joins makes first (with no
+    # certificate of the cluster's: the handshake is kithd's whoever asks, the answer not).
+    anyone = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    anyone.check_hostname, anyone.verify_mode = False, ssl.CERT_NONE
+    with socket.create_connection(("127.0.0.1", node), timeout=LIMIT) as plain, anyone.wrap_socket(plain) as tls:
+        tls.sendall(b"GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        try:
+            tls.recv(512)
+        except (ssl.SSLError, OSError):
+            pass  # (Ended by kithd for want of a certificate: the handshake was made.)
+    kith("node", "token")
+    apply("first", "ConfigMap", {"data": {"k": "v"}})
+    # (No replica: a container's start is not traced, see above.)
+    container = {"name": "main", "image": "local.test/first:1"}
+    apply("first", "Workload", {"replicas": 0, "template": {"containers": [container]}})
+    apply("home", "DNSZone", {"domain": "home.example"})
+    apply("nas", "DNSRecord", {"zone": "home", "name": "nas", "type": "A", "values": ["192.0.2.20"]})
+    labels = b"".join(bytes([len(part)]) + part.encode() for part in "nas.home.example".split("."))
+    query = struct.pack(">HHHHHH", 0x5151, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack(">HH", 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        udp.settimeout(0.5)
+        while True:
+            udp.sendto(query, ("127.0.0.1", dns))
+            try:
+                if socket.inet_aton("192.0.2.20") in udp.recv(512):
+                    return
+            except TimeoutError:
+                pass
+            if time.time() > deadline:
+                raise TimeoutError("kithd did not answer the DNS query with the record")
+
+
 def traced(kithd, functions):
-    """Run kithd until it has idled; the names of the functions it ran, first run first."""
+    """Run kithd through its start, a node's first minute and a while idle; the names of
+    the functions it ran, first run first."""
     libc = ctypes.CDLL(None, use_errno=True)
     libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
     libc.ptrace.restype = ctypes.c_long
-    with socket.socket() as free:
-        free.bind(("127.0.0.1", 0))
-        port = str(free.getsockname()[1])
+    port, node, dns = str(free_port()), free_port(), free_port()
     with tempfile.TemporaryDirectory() as tmp:
         serving = os.path.join(tmp, "kithd.sock")
         # (Its own registry port: on the usual one, taken by another kithd, it would run
         # the code that says so, not the code that serves.)
         arguments = [kithd, "--state", os.path.join(tmp, "state"), "--socket", serving, "--registry-port", port]
+        arguments += ["--name", "first", "--listen", f"127.0.0.1:{node}", "--dns", f"127.0.0.1:{dns}"]
         pid = os.fork()
         if pid == 0:
             try:
@@ -126,16 +200,30 @@ def traced(kithd, functions):
             os.pwrite(memory, b"\xcc", address)
         order, seen, until, started = [], set(), None, time.time()
         libc.ptrace(CONT, pid, None, None)
+        # The first minute is asked by a process of its own (its `kith`s are its children,
+        # not this loop's to wait for); idling is counted from when it is done.
+        asking = os.fork()
+        if asking == 0:
+            try:
+                first_minute(kithd, tmp, serving, node, dns)
+                os._exit(0)
+            except BaseException as failed:  # noqa: BLE001 (whatever it is, said and counted)
+                said = getattr(failed, "stderr", "") or ""
+                print(f"order.py: the first minute: {failed!r} {said.strip()}", file=sys.stderr)
+                os._exit(1)
         while True:
             who, status = os.waitpid(-1, os.WNOHANG | WALL)
             if who == 0:
-                if until is None and os.path.exists(serving):
-                    until = time.time() + IDLE
                 if until and time.time() > until:
                     break
-                if until is None and time.time() > started + 120:
-                    sys.exit("kithd did not serve in 120 s")  # (It is killed as this ends.)
+                if until is None and time.time() > started + 2 * LIMIT:
+                    sys.exit(f"kithd did not get through its first minute in {2 * LIMIT} s")  # (It is killed as this ends.)
                 time.sleep(0.001)
+                continue
+            if who == asking:
+                if status != 0:
+                    sys.exit("kithd was not asked all a node's first minute asks: nothing written")
+                until = time.time() + IDLE
                 continue
             if not os.WIFSTOPPED(status):
                 if who == pid:
@@ -187,7 +275,7 @@ def self_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trace kithd at start and idle and write kithd.order, the order the linker lays its code out in.")
+    parser = argparse.ArgumentParser(description="Trace kithd at start, through a node's first minute and idle, and write kithd.order, the order the linker lays its code out in.")
     parser.add_argument("--self-test", action="store_true", help="run the name-pattern assertions and nothing else")
     parser.add_argument("--check", action="store_true", help="write nothing: fail if kithd.order is not in effect in the built kithd")
     args = parser.parse_args()
@@ -213,6 +301,9 @@ def main():
     # (Each pattern once, where the first function it names ran.)
     order = list(dict.fromkeys(loose(name) for name in traced(kithd, known)))
     order = [pattern for pattern in order if re.fullmatch(PATTERN, pattern)]
+    missing = [what for what, part in MUST.items() if not any(part in pattern for pattern in order)]
+    if missing:
+        sys.exit(f"the traced kithd ran no function of {', '.join(missing)}: nothing written")
     with open(ORDER, "w") as file:
         file.write("".join(name + "\n" for name in order))
     print(f"{len(order)} of {sum(map(len, known.values()))} functions ran; build again (sh ci/musl.sh) to link them in this order")
