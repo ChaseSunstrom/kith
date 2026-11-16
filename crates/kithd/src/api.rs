@@ -353,23 +353,39 @@ pub(crate) fn refused(store: &Store, caller: &Caller, command: &Command) -> Opti
 }
 
 /// Who `caller` is as a writer of a Release or a Source: whoever a node passed on, not the node.
-fn writer(caller: &Caller) -> String {
+fn writer(caller: &Caller) -> &Caller {
     match caller {
         Caller::Via(_, who) | Caller::Checked(_, who) => writer(who),
-        caller => caller.to_string(),
+        caller => caller,
     }
 }
 
-/// `resources` with each Release and Source written down as `caller`'s: what the client
-/// said of it is not taken.
-fn stamped(caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
+/// `resources` with each Release and Source written down as `caller`'s, and, for an
+/// Identity, the print of the key it has in `store`: what the client said of either is
+/// not taken. (None, as the local socket's: it acts for no key.)
+fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
+    let who = writer(caller);
+    let print = match who {
+        Caller::Identity(name) => crate::releases::print_of(store, name),
+        _ => None,
+    };
     for resource in &mut resources {
         if matches!(resource.kind.as_str(), "Release" | "Source") {
             let annotations = &mut resource.metadata.annotations;
-            annotations.insert(crate::releases::WRITER.into(), writer(caller));
+            annotations.insert(crate::releases::WRITER.into(), who.to_string());
+            match &print {
+                Some(print) => annotations.insert(crate::releases::KEY.into(), print.clone()),
+                None => annotations.remove(crate::releases::KEY),
+            };
         }
     }
     resources
+}
+
+/// [`stamped`] by the key the writer has in the store now.
+fn stamped_by(shared: &Shared, caller: &Caller, resources: Vec<Resource>) -> Vec<Resource> {
+    let state = shared.store.lock().expect("a handler panicked holding the store");
+    stamped(&state.store, caller, resources)
 }
 
 /// What applying `resources` would do, if `caller` may: a dry run.
@@ -378,7 +394,7 @@ pub(crate) async fn plan(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
-    let resources = stamped(caller, resources);
+    let resources = stamped_by(shared, caller, resources);
     allowed(shared, caller, |store| takes(store, &resources))?;
     // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
     let _turn = shared.dry_runs.acquire().await.expect("dry_runs is never closed");
@@ -436,7 +452,7 @@ pub(crate) async fn applied(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
-    let resources = stamped(caller, resources);
+    let resources = stamped_by(shared, caller, resources);
     // Each resource of the body is asked about: one that is not allowed refuses them all.
     allowed(shared, caller, |store| takes(store, &resources))?;
     let keys: Vec<String> = resources.iter().map(Resource::key).collect();
@@ -1010,6 +1026,56 @@ spec: {}
             Some("bob")
         );
         assert_eq!(written("Release/shop/r").as_deref(), Some("bob"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The print of the writer Identity's key is written beside its name, whatever the
+    /// client sent for it: through a node too, in a dry run and in an apply; the local
+    /// socket's has none (T-0551).
+    #[tokio::test]
+    async fn writer_print_the_server_writes_the_identitys_key_whatever_the_client_sent() {
+        use crate::releases::{KEY, bob_is, bobs_key};
+        let dir = std::env::temp_dir().join(format!("kithd-writer-print-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        bob_is(&mut shared.store.lock().unwrap().store, 0);
+        let sent = "apiVersion: kith.dev/v1\nkind: Release\n\
+                    metadata: {name: r, namespace: shop, annotations: {'kith.dev/written-by': 'local socket', 'kith.dev/written-key': 'forged'}}\n\
+                    spec: {package: {name: maps}}\n---\n\
+                    apiVersion: kith.dev/v1\nkind: Source\n\
+                    metadata: {name: s, namespace: shop}\n\
+                    spec: {git: {url: 'https://example.org/a.git'}}\n";
+        let sent: Vec<Resource> = Resource::from_source(sent)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let prints = |changes: &[Change]| -> Vec<Option<String>> {
+            changes
+                .iter()
+                .map(|change| change.after.metadata.annotations.get(KEY).cloned())
+                .collect()
+        };
+        let bob = Caller::Via("n1".into(), Box::new(Caller::Identity("bob".into())));
+        let planned = plan(&shared, &Caller::Admin, sent.clone()).await.ok().unwrap();
+        assert_eq!(
+            prints(&planned),
+            [None, None],
+            "the local socket has no key; what was sent is not kept"
+        );
+        let within = Duration::from_secs(30);
+        let made = tokio::time::timeout(within, applied(&shared, &Caller::Admin, sent.clone()));
+        assert_eq!(prints(&made.await.unwrap().ok().unwrap()), [None, None]);
+        // (As bob, who has no Role here: the stamp is the point, not the rights.)
+        let state = shared.store.lock().unwrap();
+        let print = Some(bobs_key(0).1);
+        for resource in stamped(&state.store, &bob, sent) {
+            assert_eq!(
+                resource.metadata.annotations.get(KEY),
+                print.as_ref(),
+                "{}",
+                resource.key()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

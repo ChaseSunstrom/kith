@@ -37,6 +37,7 @@ mod netboot;
 mod os;
 mod pki;
 mod pods;
+mod policy;
 mod probe;
 mod raft;
 mod registry;
@@ -153,6 +154,12 @@ struct Args {
     /// never votes, and what it runs is not started elsewhere while it is away
     #[arg(long, env = "KITH_ROAMING", requires_all = ["join", "mesh"])]
     roaming: bool,
+    /// What the cluster may not have this node do as its root, whoever asks: `hardened`
+    /// (none of it), or words with commas between, `no-` before one to turn it off:
+    /// exec-units, root-containers, unconfined, node-network, vms, vm-paths, passthrough,
+    /// run, wipe; and devices=gpu+input for the classes of Device handed out
+    #[arg(long, env = "KITH_NODE_POLICY", value_name = "WORDS")]
+    node_policy: Option<String>,
     /// Serve HTTPS (port 443, and 80) for Services with `expose`; for edge nodes
     #[arg(long, env = "KITH_INGRESS", requires = "mesh")]
     ingress: bool,
@@ -589,6 +596,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         .build()
         .map_err(|e| format!("starting: {e}"))?;
     let first_process = boot.is_some();
+    // Before anything is run or served: what this node's owner has it refuse.
+    policy::set(policy::read(args.node_policy.as_deref(), first_process)?);
     let sealed = boot.as_mut().and_then(|boot| boot.sealed.take());
     // As the first process, SIGTERM and Ctrl-Alt-Del are heard from the start: the kernel
     // drops what process 1 does not handle. (Anywhere else the default, which ends kithd, stays until serving.)
@@ -939,7 +948,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 apart(encrypted)
             )
         };
-        let saying = say_serves(shared.clone(), serves(args.dns, args.ingress), stopping.clone());
+        let says = vec![
+            ("serves", serves(args.dns, args.ingress)),
+            ("policy", policy::get().status()),
+        ];
+        let saying = say_serves(shared.clone(), says, stopping.clone());
         let (served, nodes, (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
@@ -984,8 +997,9 @@ fn serves(dns: Option<std::net::SocketAddr>, ingress: bool) -> serde_json::Value
     }
 }
 
-/// Keep what this node says it serves as its flags say, for as long as the node runs.
-async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping: watch::Receiver<bool>) {
+/// Keep what this node says of itself in its own Node's status as its flags say (what it
+/// `serves`, and its own `policy` where it has one), for as long as the node runs.
+async fn say_serves(shared: Arc<Shared>, mine: Vec<(&str, serde_json::Value)>, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
@@ -993,18 +1007,22 @@ async fn say_serves(shared: Arc<Shared>, serves: serde_json::Value, mut stopping
         // (Not known until the store has this node: asked again when the store changes.)
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
-            let said = |own: &kith_api::Resource| {
+            let said = |own: &kith_api::Resource, field: &str| {
                 own.status
                     .as_ref()
-                    .map_or(serde_json::Value::Null, |s| s["serves"].clone())
+                    .map_or(serde_json::Value::Null, |s| s[field].clone())
             };
-            state.store.get(&node).map(|own| said(own) == serves)
+            let same = |own: &kith_api::Resource| mine.iter().all(|(field, value)| said(own, field) == *value);
+            state.store.get(&node).map(same)
         };
         // Looked at whenever the store changes, not once: a whole-status write to this Node
         // would take it off.
         let wrote = says == Some(false);
         if wrote {
-            let fields = serde_json::Map::from_iter([("serves".to_string(), serves.clone())]);
+            let fields = mine
+                .iter()
+                .map(|(field, value)| (field.to_string(), value.clone()))
+                .collect();
             let statuses = vec![(node.clone(), fields)];
             if let Err(e) = shared.submit(kith_store::Command::Patch { statuses }).await {
                 eprintln!("kithd: serves: saying what this node serves: {e}");

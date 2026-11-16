@@ -665,11 +665,19 @@ mod tests {
                  spec: {{ package: {{ name: {name}, repo: hub }} }}\n---\n"
             )
         };
-        let by = |who: &str| format!(", annotations: {{ 'kith.dev/written-by': '{who}' }}");
+        // (ann has a key, as one who applies through the API has: her print is written with her name.)
+        let (ann_key, ann_print) = crate::releases::bobs_key(0);
+        let by = |who: &str| {
+            let print = if who == "ann" {
+                format!(", 'kith.dev/written-key': '{ann_print}'")
+            } else {
+                String::new()
+            };
+            format!(", annotations: {{ 'kith.dev/written-by': '{who}'{print} }}")
+        };
         let source = format!(
             "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: hub }}\nspec: {{ url: 'oci://127.0.0.1:1/kith' }}\n---\n\
              apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
-             apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: ann }}\nspec: {{}}\n---\n\
              apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
              spec: {{ rules: [{{ kinds: [Release, Package], verbs: [apply], namespaces: [shop] }}] }}\n---\n\
              apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: packages }}\n\
@@ -686,6 +694,11 @@ mod tests {
         for resource in Resource::from_source(&source).unwrap() {
             store.apply(resource.unwrap()).unwrap();
         }
+        let ann = json!({
+            "apiVersion": kith_api::API_VERSION, "kind": "Identity",
+            "metadata": { "name": "ann" }, "spec": { "publicKey": ann_key },
+        });
+        store.apply(serde_json::from_value(ann).unwrap()).unwrap();
         let names: Vec<String> = wanted(&store).into_iter().map(|wanted| wanted.name).collect();
         assert_eq!(names, ["anns", "sockets"]);
     }

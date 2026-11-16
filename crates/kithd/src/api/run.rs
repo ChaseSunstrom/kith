@@ -263,6 +263,12 @@ pub async fn hop(
 
 /// Writes the run down, starts the app, and joins it to the tunnel once it is up.
 fn start(shared: &Arc<Shared>, who: &impl Display, node: &str, spec: Spec, upgrade: OnUpgrade) -> Response {
+    // Whoever the cluster says may: this node's owner has it run no app for anyone.
+    if !crate::policy::get().allows("run") {
+        let why = "this node's policy refuses POST /v1/run (run is off: `--node-policy run` where the node's kithd is started allows it)";
+        audit(shared, who, node, &spec, Err(why.into()));
+        return say(StatusCode::FORBIDDEN, why);
+    }
     audit(shared, who, node, &spec, Ok(()));
     let app = match App::start(node, &spec) {
         Ok(app) => app,

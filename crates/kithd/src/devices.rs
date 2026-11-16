@@ -11,7 +11,7 @@
 use crate::Shared;
 use kith_api::{Metadata, Resource, store::Store};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -285,6 +285,16 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         )
     });
     devices.into_values().chain(seat).collect()
+}
+
+/// The names of the store's Devices that are what `found` (this node's own look at its
+/// hardware, [`scan`]) says they are: the same class, path and further nodes. A node whose
+/// policy names the classes of Device it hands out goes by these alone: the store says what
+/// class a Device is, and whoever writes the store could call the node's disk a GPU.
+pub fn as_found(store: &Store, found: &[Resource]) -> BTreeSet<String> {
+    let same =
+        |new: &&Resource| new.kind == "Device" && store.get(&new.key()).is_some_and(|live| live.spec == new.spec);
+    found.iter().filter(same).map(|new| new.metadata.name.clone()).collect()
 }
 
 /// What a long node name is cut to where its discovered names start (57 of a name's 63).
@@ -760,6 +770,37 @@ mod tests {
 
     fn written(source: &str) -> Resource {
         Resource::from_source(source).unwrap().remove(0).unwrap()
+    }
+
+    /// A node that names the classes of Device it hands out goes by its own look at its
+    /// hardware: a Device the store calls something else, or one only the store has, is not one.
+    #[test]
+    fn a_device_is_as_found_only_while_the_store_says_what_the_node_found() {
+        let root = tree("forged");
+        laptop(&root);
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        for resource in &found {
+            store.apply(resource.clone()).unwrap();
+        }
+        let devices = found.iter().filter(|r| r.kind == "Device").count();
+        assert!(
+            devices > 0 && as_found(&store, &found).len() == devices,
+            "every Device, and no Seat"
+        );
+        // Whoever writes the store calls the node's keyboard a GPU, and adds a disk as one.
+        let mut forged = found.iter().find(|r| r.spec["class"] == "input").unwrap().clone();
+        forged.spec["class"] = "gpu".into();
+        store.apply(forged.clone()).unwrap();
+        store
+            .apply(written(
+                "apiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: n1-gpu-disk }\nspec: { node: n1, class: gpu, path: /dev/sda }",
+            ))
+            .unwrap();
+        let named = as_found(&store, &found);
+        assert_eq!(named.len(), devices - 1);
+        assert!(!named.contains(&forged.metadata.name) && !named.contains("n1-gpu-disk"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

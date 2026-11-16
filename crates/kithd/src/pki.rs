@@ -547,6 +547,12 @@ pub fn print_of(pem: &str) -> Fallible<String> {
     Ok(key_print(&cert.subject_public_key_info()))
 }
 
+/// [`key_print`] of the key `pem` (an Identity's `publicKey`); none if it is not a key.
+pub fn print_of_key(pem: &str) -> Option<String> {
+    let key = rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).ok()?;
+    Some(key_print(key.as_ref()))
+}
+
 /// Is `pem` (an Identity's `publicKey`) the key `der`?
 pub fn same_key(pem: &str, der: &[u8]) -> bool {
     rustls::pki_types::SubjectPublicKeyInfoDer::from_pem_slice(pem.as_bytes()).is_ok_and(|key| key.as_ref() == der)
