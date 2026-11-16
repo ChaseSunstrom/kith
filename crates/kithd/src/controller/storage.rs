@@ -27,6 +27,9 @@ pub struct Pod {
     /// It is held to its limit as it writes (`Projects`): its bytes are its project's, read
     /// and not counted, and a write past its limit fails rather than it being replaced.
     pub held: bool,
+    /// Held, the files its project holds, and the most it may (`files_for`; 0: no limit).
+    pub files: u64,
+    pub most: u64,
 }
 
 /// How the message of a unit replaced for what its pod wrote begins.
@@ -57,15 +60,37 @@ pub fn how(held: bool) -> &'static str {
     }
 }
 
-/// What a held pod's running units say while it holds all its limit lets it, if it does.
+/// What a held pod's running units say while it holds all its limit lets it, if it does:
+/// in bytes, or in files.
 pub fn reached(pod: &Pod) -> Option<String> {
-    let limit = pod
-        .limit
-        .filter(|limit| pod.held && pod.bytes.saturating_add(NEAR) >= *limit)?;
-    Some(format!(
-        "{REACHED}its pod holds {} bytes outside its volumes, of its limit of {limit}: a write past it fails",
-        pod.bytes
-    ))
+    let limit = pod.limit.filter(|_| pod.held)?;
+    if pod.bytes.saturating_add(NEAR) >= limit {
+        return Some(format!(
+            "{REACHED}its pod holds {} bytes outside its volumes, of its limit of {limit}: a write past it fails",
+            pod.bytes
+        ));
+    }
+    (pod.most != 0 && pod.files >= pod.most).then(|| {
+        format!(
+            "{REACHED}its pod holds {} files outside its volumes, of the {} a limit of {limit} bytes lets it on this disk: a new file fails",
+            pod.files, pod.most
+        )
+    })
+}
+
+/// The fewest files a pod with a storage limit may make, however small its limit.
+const FILES: u64 = 4096;
+
+/// How many files a pod held to `limit` bytes may make on a disk of `disk_bytes` and
+/// `disk_files` (its inodes, all of them): its share of them, the same share it has of the
+/// bytes, and [`FILES`] at least. So pods whose limits fit the disk cannot together take
+/// every file of it (but for that floor, where their shares are smaller).
+//
+// ponytail: no field of its own (`resources.files`); a pod of very many small files gets
+// more with a larger `storage`. Add the field when an app meets this.
+pub fn files_for(limit: u64, disk_files: u64, disk_bytes: u64) -> u64 {
+    let share = u128::from(limit) * u128::from(disk_files) / u128::from(disk_bytes.max(1));
+    u64::try_from(share).unwrap_or(u64::MAX).max(FILES)
 }
 
 /// Each pod's project on the state disk, which holds it to its limit as it writes: its
@@ -113,8 +138,15 @@ impl Projects {
             }
             id => id,
         };
-        // Its limit first: an id given before may still hold the last pod's.
-        kith_dm_sys::set_project_limit(&self.state, id, limit.unwrap_or(0))?;
+        // Its limits first: an id given before may still hold the last pod's.
+        let files = match limit {
+            Some(limit) => {
+                let disk = nix::sys::statvfs::statvfs(&self.state)?;
+                files_for(limit, disk.files(), disk.blocks().saturating_mul(disk.fragment_size()))
+            }
+            None => 0,
+        };
+        kith_dm_sys::set_project_limit(&self.state, id, limit.unwrap_or(0), files)?;
         if had == 0 {
             // (The directory alone: its maps' files, which kithd writes, are in no project.)
             kith_dm_sys::set_project(&dir, id, false)?;
@@ -144,9 +176,10 @@ impl Projects {
         Ok(id)
     }
 
-    /// What the pod `pod` holds of the state disk, if it is held to its limit as it writes:
-    /// it has a project, and its scratch is in it.
-    pub fn usage(state: &Path, pod: &str) -> Option<u64> {
+    /// What the pod `pod` holds of the state disk in bytes and in files, and the most files
+    /// it may (0: no limit), if it is held to its limit as it writes: it has a project, and
+    /// its scratch is in it.
+    pub fn usage(state: &Path, pod: &str) -> Option<(u64, u64, u64)> {
         let dir = state.join(crate::files::REPLICAS).join(pod);
         let id = kith_dm_sys::project(&dir)
             .ok()
@@ -155,7 +188,12 @@ impl Projects {
         if kith_dm_sys::project(&dir.join("scratch")).ok()? != (id, true) {
             return None;
         }
-        kith_dm_sys::project_usage(state, id).ok().map(|(bytes, _)| bytes)
+        let (bytes, files) = kith_dm_sys::project_usage(state, id).ok()?;
+        Some((
+            bytes,
+            files,
+            kith_dm_sys::project_limit(state, id).map_or(0, |(_, most)| most),
+        ))
     }
 }
 
@@ -760,7 +798,47 @@ mod tests {
             finished: true,
             again: false,
             held: false,
+            files: 0,
+            most: 0,
         }
+    }
+
+    /// A pod's files are its share of the disk's, the share it has of its bytes, and 4096 at
+    /// least; held at them, its units say so, in files.
+    #[test]
+    fn storage_files_a_pod_has_its_share_of_the_disks_and_says_when_it_holds_them_all() {
+        // (A disk of 100 GiB with a file for each 16 KiB: 64 MiB is 4096 files' worth.)
+        let (disk, files) = (100 << 30, (100u64 << 30) / (16 << 10));
+        assert_eq!(files_for(64 * MIB, files, disk), 4096);
+        assert_eq!(files_for(1 << 30, files, disk), 65536);
+        assert_eq!(files_for(MIB, files, disk), FILES);
+        // (All of it is all its files; a limit past the disk, or a disk that says nothing, overflows nothing.)
+        assert_eq!(files_for(disk, files, disk), files);
+        assert_eq!(files_for(u64::MAX, u64::MAX, 1), u64::MAX);
+        assert_eq!(files_for(MIB, 0, 0), FILES);
+        // Two pods whose limits are the disk's two halves have its files between them, no more.
+        assert_eq!(files_for(disk / 2, files, disk) * 2, files);
+
+        let held = |files, most| Pod {
+            held: true,
+            files,
+            most,
+            ..pod("p", Some(64 * MIB), MIB)
+        };
+        let said = reached(&held(4096, 4096)).unwrap();
+        assert!(
+            said.starts_with(REACHED) && said.contains("holds 4096 files") && said.contains("a new file fails"),
+            "{said}"
+        );
+        assert!(reached(&held(4095, 4096)).is_none());
+        // (No limit on files: an older kithd's project, till the pod is made again.)
+        assert!(reached(&held(1 << 20, 0)).is_none());
+        // (In bytes first, where it holds both.)
+        let both = Pod {
+            bytes: 64 * MIB,
+            ..held(4096, 4096)
+        };
+        assert!(reached(&both).unwrap().contains("bytes outside"));
     }
 
     /// A pod held to its limit as it writes stops short of it: it is said to have reached
@@ -853,9 +931,9 @@ mod tests {
         let scratch = files.join("scratch");
         std::fs::write(scratch.join("some"), vec![1u8; MIB as usize]).unwrap();
         std::fs::File::open(scratch.join("some")).unwrap().sync_all().unwrap();
-        assert!(Projects::usage(&state, "default.a-0").unwrap() >= MIB);
+        assert!(Projects::usage(&state, "default.a-0").unwrap().0 >= MIB);
         for id in [a, b, a.max(b) + 1] {
-            kith_dm_sys::set_project_limit(&state, id, 0).unwrap();
+            kith_dm_sys::set_project_limit(&state, id, 0, 0).unwrap();
         }
         std::fs::remove_dir_all(state).unwrap();
     }
@@ -876,13 +954,17 @@ mod tests {
         }
         // (Ids of its own, far past what other tests on the disk give.)
         let first = 0x4000_0000 + (std::process::id() & 0xffff) * 16;
-        kith_dm_sys::set_project_limit(&state, first, 4096).unwrap();
+        kith_dm_sys::set_project_limit(&state, first, 4096, 7).unwrap();
         let mut projects = Projects {
             state: state.clone(),
             next: first,
         };
         assert_eq!(projects.give("default.a-0", Some(64 * MIB)).unwrap(), first);
-        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), 64 * MIB);
+        // (Its files with its bytes: its share of this disk's, never the last pod's 7.)
+        let disk = nix::sys::statvfs::statvfs(&state).unwrap();
+        let most = files_for(64 * MIB, disk.files(), disk.blocks() * disk.fragment_size());
+        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), (64 * MIB, most));
+        assert_eq!(Projects::usage(&state, "default.a-0").unwrap().2, most);
 
         // A container's root left in it outside the pod's directory: its id is not given again,
         // and its limit stays.
@@ -890,7 +972,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         kith_dm_sys::set_project(&root, first, true).unwrap();
         crate::files::sweep(&[&state], &std::collections::BTreeSet::new());
-        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), 64 * MIB);
+        assert_eq!(kith_dm_sys::project_limit(&state, first).unwrap(), (64 * MIB, most));
         let mut again = Projects {
             state: state.clone(),
             next: first,
@@ -899,7 +981,7 @@ mod tests {
         assert!(b > first, "{b}");
         std::fs::remove_dir(&root).unwrap();
         crate::files::sweep(&[&state], &std::collections::BTreeSet::new());
-        assert_eq!(kith_dm_sys::project_limit(&state, b).unwrap(), 0);
+        assert_eq!(kith_dm_sys::project_limit(&state, b).unwrap(), (0, 0));
 
         // A scratch with a file from before is left as it is, its pod counted; made anew, held.
         let scratch = state.join(crate::files::REPLICAS).join("default.c-0").join("scratch");
@@ -914,7 +996,7 @@ mod tests {
         assert_eq!(kith_dm_sys::project(&scratch).unwrap(), (c, true));
         assert!(Projects::usage(&state, "default.c-0").is_some());
         for id in [first, b, c] {
-            kith_dm_sys::set_project_limit(&state, id, 0).unwrap();
+            kith_dm_sys::set_project_limit(&state, id, 0, 0).unwrap();
         }
         std::fs::remove_dir_all(state).unwrap();
     }

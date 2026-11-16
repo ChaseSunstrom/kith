@@ -544,8 +544,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   system call refusal applies to every container. A state disk from before has no project
   quotas and is counted as before. A pod whose scratch held files from before projects is
   counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
-  a pod's own directories hold). The quota holds bytes, not files: there is no limit on
-  how many files a pod makes (T-0605), and each costs the disk an inode. **Stopped at the
+  a pod's own directories hold). The quota holds files too: a pod with
+  `resources.storage` may make its share of the state disk's files (inodes), the same
+  share its limit is of the disk's bytes, and 4096 at least, set in the same call as its
+  bytes; a new file past it fails (EDQUOT) and its units say it holds them all. So pods
+  whose limits fit the disk cannot together take every file of it (where a share is under
+  4096 the floor is more than the share, and enough such pods can). A pod of very many
+  small files gets more with a larger `storage`: there is no field for files alone. **Not
+  held in files:** a pod with no `resources.storage` (it has no limit of either kind, and
+  is replaced only when the disk runs low on bytes), a pod on a state disk without
+  project quotas, and an unconfined pod that moved its files out of its project (the 10 s
+  count is of bytes); a pod started by a kithd from before this keeps a project with no
+  file limit until one of its containers is started again. **Stopped at the
   limit:** every write a pod's own processes make outside its Volumes: a new file or an
   append in its container's root, a file of its image copied up to be changed (refused
   whole, the image's file left as it was), its disk scratch, and a file it removed and
