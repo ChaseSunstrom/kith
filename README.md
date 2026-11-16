@@ -1059,9 +1059,13 @@ this node's policy refuses exec units: processes of the node's root, with all of
 
 Where `exec-units`, `vm-paths` and `run` are all off (nothing the cluster asks can start
 a process as the node's root with every capability), kithd cuts its bounding set at
-start to what a root pod and it use: never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or
-`SYS_TIME`, nor the rest of what is not on its list (`KEPT` in `crates/kithd/src/policy.rs`
-says why each is). A hole in kithd or a stolen certificate is root there without them.
+start to the fourteen a root pod keeps (`KEPT` in `crates/kithd/src/policy.rs`). That
+limits what an exec gives a child: nothing kithd starts by an exec (a container's
+process, a helper, a nested unit) can hold `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`,
+`SYS_TIME`, `SYS_ADMIN`, `SYS_BOOT` or any other capability outside the list, whatever its
+spec asks for. kithd's own threads keep every capability, so a hole inside kithd is not
+held back by this (the split in `docs/adr-privilege.md` is for that), and root without
+`SYS_PTRACE` can still trace root's own processes or write `/proc/sys`: not covered.
 The Node's status says what it kept (`status.policy.capabilities`; `all` where it did not
 cut: a kithd that is not root, or one of the three still on).
 

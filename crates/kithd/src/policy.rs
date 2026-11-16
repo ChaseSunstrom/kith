@@ -54,18 +54,20 @@ pub const KEYS: [(&str, &str, &str); 10] = [
     ),
 ];
 
-/// The keys that, all off, let kithd give up capabilities for good: each is a way for the
-/// store to have this node start a process as its root with every capability the kernel has
-/// (an exec unit, a VM's qemu with the paths it is told, `/v1/run`). With none of them, what
-/// kithd starts is a container (which gets its own list) or kithd's own helpers.
+/// The keys that, all off, let kithd cut its bounding set: each is a way for the store to
+/// have this node exec a process as root with every capability the kernel has (an exec unit,
+/// a VM's qemu with the paths it is told, `/v1/run`). With none of them, what kithd execs
+/// is a container's process (which gets its own list) or a helper (git, a VM's qemu).
 const BOUNDED_BY: [&str; 3] = ["execUnits", "vmPaths", "run"];
 
 /// What a hardened node keeps in its bounding set (docs/adr-privilege.md, "Step A"): the
-/// number the kernel gives each capability, its name, and why kithd or what it starts holds
-/// it. A capability joins this list only when a VM test (`ci/vm.sh --test policy`) fails
-/// for want of it, with the line that says why. Never SYS_MODULE, SYS_RAWIO, SYS_PTRACE or
-/// SYS_TIME: the rest of the kernel's list is gone from kithd and everything it starts.
-pub const KEPT: [(u32, &str, &str); 19] = [
+/// number the kernel gives each capability, its name, and which process that kithd starts
+/// by an exec holds it. The bounding set limits only what an exec gives a child, never
+/// kithd's own threads (they keep what they have), so kithd's own needs (mounts, links,
+/// cgroups, powering off) are not on this list. A capability joins it only for a child
+/// that is exec'd (a container's process, the exec shim, a helper) and fails for want of
+/// it, with that child named here. Never SYS_MODULE, SYS_RAWIO, SYS_PTRACE or SYS_TIME.
+pub const KEPT: [(u32, &str, &str); 14] = [
     (0, "CHOWN", "a root pod: chown of what it owns (ROOTS)"),
     (
         1,
@@ -89,42 +91,13 @@ pub const KEPT: [(u32, &str, &str); 19] = [
         "SETUID",
         "a root pod: setuid, and the user of a unit that drops to one (ROOTS)",
     ),
-    (
-        8,
-        "SETPCAP",
-        "a root pod: dropping its own capabilities; and kithd's, to drop them in each container (ROOTS)",
-    ),
+    (8, "SETPCAP", "a root pod: dropping its own capabilities (ROOTS)"),
     (10, "NET_BIND_SERVICE", "a root pod: ports below 1024 (ROOTS)"),
-    (
-        12,
-        "NET_ADMIN",
-        "kithd: links, addresses, routes and nftables of pods and the mesh",
-    ),
-    (
-        13,
-        "NET_RAW",
-        "a root pod (ROOTS), and kithd: the raw sockets of DHCP and the mesh's probes",
-    ),
+    (13, "NET_RAW", "a root pod: raw sockets, ping (ROOTS)"),
     (18, "SYS_CHROOT", "a root pod: chroot (ROOTS)"),
-    (
-        21,
-        "SYS_ADMIN",
-        "kithd: mounts, namespaces, setns, pivot_root, cgroups, devices, the loop and mapper devices",
-    ),
-    (22, "SYS_BOOT", "kithd: powering off and restarting the machine"),
-    (
-        24,
-        "SYS_RESOURCE",
-        "kithd: raising limits (memory locks, queues) for what it starts",
-    ),
     (27, "MKNOD", "a root pod: device nodes of its own (ROOTS)"),
     (29, "AUDIT_WRITE", "a root pod: audit records of a login (ROOTS)"),
     (31, "SETFCAP", "a root pod: file capabilities (ROOTS)"),
-    (
-        39,
-        "BPF",
-        "kithd: the programs that filter a cgroup's devices and connections",
-    ),
 ];
 
 /// The bounding set a node with this policy cuts itself to, as a mask of capability numbers:
@@ -139,19 +112,10 @@ pub fn kept_mask(policy: &Policy) -> Option<u64> {
 /// The capabilities kithd cut itself to, as a mask; unset where it did not.
 static CUT: OnceLock<u64> = OnceLock::new();
 
-/// Cuts the bounding set of the calling thread, and so of everything it starts, to what
-/// [`kept_mask`] says, if the policy says anything: every number the kernel has (read from
-/// `/proc/sys/kernel/cap_last_cap`, so one a later kernel adds is cut too) that is not kept.
-/// Call it from `main`'s thread before the runtime or any other thread is made: a thread
-/// that exists keeps its own set. Does nothing where kithd is not root (there is nothing to
-/// bound); the node's status says what it holds either way.
-pub fn cut(policy: &Policy) -> Result<(), String> {
-    let Some(kept) = kept_mask(policy) else {
-        return Ok(());
-    };
-    if !nix::unistd::getuid().is_root() {
-        return Ok(());
-    }
+/// Drops from the calling thread's bounding set every capability the kernel has (read from
+/// `/proc/sys/kernel/cap_last_cap`, so one a later kernel adds is dropped too) that `kept`
+/// does not name. Needs CAP_SETPCAP.
+fn drop_to(kept: u64) -> Result<(), String> {
     let last = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
         .map_err(|e| format!("cutting the bounding set: /proc/sys/kernel/cap_last_cap: {e}"))?;
     let last: u32 = last
@@ -162,16 +126,47 @@ pub fn cut(policy: &Policy) -> Result<(), String> {
         kith_dm_sys::bounding_drop(cap)
             .map_err(|e| format!("cutting the bounding set: dropping capability {cap}: {e}"))?;
     }
-    CUT.set(kept).expect("the bounding set is cut once, at start");
-    // (Said once, from what the kernel now says, for whoever reads the console.)
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let bounding = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapBnd:"))
-        .unwrap_or("?")
-        .trim();
-    eprintln!("kithd: capability bounding set cut: CapBnd {bounding}");
     Ok(())
+}
+
+/// Cuts the bounding set of the calling thread, and so of everything it starts by an exec
+/// (and of the threads it makes later), to what [`kept_mask`] says, if the policy says
+/// anything. It limits only what an exec gives a child: kithd's own permitted and effective
+/// sets are as they were, so a hole in kithd itself is not held back by it.
+/// Call it from `main`'s thread before the runtime or any other thread is made: a thread
+/// that exists keeps its own set. Does nothing where kithd is not root (there is nothing to
+/// bound); the node's status says what it holds either way.
+pub fn cut(policy: &Policy) -> Result<(), String> {
+    let Some(kept) = kept_mask(policy) else {
+        return Ok(());
+    };
+    if !nix::unistd::getuid().is_root() {
+        return Ok(());
+    }
+    drop_to(kept)?;
+    CUT.set(kept).expect("the bounding set is cut once, at start");
+    // (Said once, from what the kernel now says of kithd and of a thread made after the cut,
+    // for whoever reads the console and for `ci/vm.sh --test policy`: the bounding set is
+    // cut and the effective set is not.)
+    let own = capabilities(&format!("/proc/{}/status", std::process::id()));
+    let later = std::thread::spawn(|| capabilities("/proc/thread-self/status"))
+        .join()
+        .unwrap_or_default();
+    eprintln!(
+        "kithd: capability bounding set cut: CapBnd {} CapEff {}; a later thread: CapBnd {} CapEff {}",
+        own.0, own.1, later.0, later.1
+    );
+    Ok(())
+}
+
+/// The `CapBnd` and `CapEff` lines of a `/proc/…/status`, as the kernel writes them (hex).
+fn capabilities(path: &str) -> (String, String) {
+    let status = std::fs::read_to_string(path).unwrap_or_default();
+    let field = |name: &str| {
+        let line = status.lines().find_map(|line| line.strip_prefix(name));
+        line.unwrap_or("?").trim().to_string()
+    };
+    (field("CapBnd:"), field("CapEff:"))
 }
 
 /// What the node's status says it holds: the names of what it kept, or `all` where it was not cut.
@@ -273,7 +268,8 @@ impl Policy {
     }
 
     /// As a Node's status says it: every key, the classes of Device, and the capabilities
-    /// kithd holds (`all`, or the names of what a hardened node kept: [`KEPT`]). Null where
+    /// what kithd execs can hold (`all`, or the names of what a hardened node kept in its
+    /// bounding set: [`KEPT`]; kithd's own threads hold more). Null where
     /// everything is allowed: a node with no policy says nothing.
     pub fn status(&self) -> serde_json::Value {
         if *self == Policy::default() {
@@ -455,11 +451,8 @@ mod tests {
             let name = cap.to_string();
             assert!(has(name.strip_prefix("CAP_").unwrap_or(&name)), "{name}");
         }
-        assert!(
-            ["SYS_ADMIN", "NET_ADMIN", "NET_RAW", "SYS_BOOT", "SYS_RESOURCE", "BPF"]
-                .into_iter()
-                .all(has)
-        );
+        // And nothing else: a capability kithd's own threads need is not kept for what it execs.
+        assert_eq!(KEPT.len(), kith_runtime::ROOTS.len());
         assert!(KEPT.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(KEPT.iter().all(|(number, _, why)| *number < 64 && !why.is_empty()));
         assert_eq!(mask.count_ones() as usize, KEPT.len());
@@ -483,17 +476,14 @@ mod tests {
             if effective >> 8 & 1 == 0 {
                 return None; // not root: no CAP_SETPCAP to drop with
             }
-            let last: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            for cap in (0..=last).filter(|cap| mask >> cap & 1 == 0) {
-                kith_dm_sys::bounding_drop(cap).unwrap();
-            }
+            drop_to(mask).unwrap();
             Some((bounding, status("thread-self").0))
         });
-        if let Some((was, now)) = cut.join().unwrap() {
+        let cut = cut.join().unwrap();
+        if cut.is_none() {
+            eprintln!("SKIPPED bounding_set_is_cut_to_what_is_kept: not root (no CAP_SETPCAP), nothing was cut");
+        }
+        if let Some((was, now)) = cut {
             assert_eq!(now, was & mask);
             for gone in [16, 17, 19, 25] {
                 // SYS_MODULE, SYS_RAWIO, SYS_PTRACE, SYS_TIME

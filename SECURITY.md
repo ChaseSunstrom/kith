@@ -406,13 +406,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use. Where
   `exec-units`, `vm-paths` and `run` are all off (every way for the store to start a
   process as the node's root with all its capabilities), kithd also cuts its bounding set
-  at start to the fourteen of a root pod and what it uses itself (`SYS_ADMIN`, `NET_ADMIN`,
-  `SYS_BOOT`, `SYS_RESOURCE`, `BPF`; `KEPT` in `crates/kithd/src/policy.rs` says why each):
-  never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or `SYS_TIME`, so a hole in kithd or a
-  stolen certificate of the cluster loads no module, reads no raw memory or port, traces
-  no process and sets no clock on that node (the node's status lists what it kept). It is
-  still root with what is left: `SYS_ADMIN` is a great deal, and a hole in a parser is
-  still all of that until the split. A pod on a hardened node can still be root inside
+  at start to the fourteen a root pod keeps (`KEPT` in `crates/kithd/src/policy.rs`). The
+  bounding set limits what an exec gives a child, so nothing kithd starts by an exec (a
+  container's process, a helper, a nested unit) can hold a capability outside that list,
+  whatever its spec asks for and whatever bug let it ask: not `SYS_MODULE`, `SYS_RAWIO`,
+  `SYS_PTRACE` or `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`, `BPF` or the rest (the node's
+  status lists what it kept). **It does not limit kithd's own threads**, which keep every
+  capability (`CapEff` is not cut; `ci/vm.sh --test policy` reads it): a hole inside kithd,
+  or a stolen certificate that reaches a hole there, is not held back by this. That is
+  the split's job (`docs/adr-privilege.md`, T-0334). Nor does it say an effect is impossible: root
+  without `SYS_PTRACE` can still trace root's own processes (the same user), and root can
+  write `/proc/sys` with file permissions alone; neither is covered by the cut. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container that keeps the node's
   users and is not root is still the node's user of its number, with whatever files on
   the node that user owns; one that would be of root's group (its image says `1001:0`,

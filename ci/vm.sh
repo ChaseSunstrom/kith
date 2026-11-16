@@ -182,7 +182,9 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test policy    instead: two nodes on the mesh started with --node-policy
                    no-exec-units,no-vm-paths,no-run. Expected: each says what it
                    kept of the bounding set (never SYS_MODULE, SYS_RAWIO,
-                   SYS_PTRACE or SYS_TIME), kithd's own CapBnd agrees, and a pod
+                   SYS_PTRACE or SYS_TIME), kithd's own CapBnd (and a later
+                   thread's) is that and its CapEff is not cut, the pod that is
+                   root has that CapBnd, and a pod
                    that is root, a container with no system call filter and a
                    sandbox inside a container (bubblewrap) all run; needs what
                    --test pods needs, less socat
@@ -1067,13 +1069,19 @@ for r in found:
                 for forbidden in SYS_MODULE SYS_RAWIO SYS_PTRACE SYS_TIME; do
                     case " $line " in *" $forbidden "*) fail "the node $n kept $forbidden: $line" ;; esac
                 done
-                case " $line " in *' SYS_ADMIN '*) ;; *) fail "the node $n says it kept nothing it needs: $line" ;; esac
-                # (And what the kernel says of kithd itself, which it said on its console once
-                # it had cut: no bit of SYS_MODULE (16), SYS_RAWIO (17), SYS_PTRACE (19) or SYS_TIME (25).)
-                bounding=$(grep -ao 'kithd: capability bounding set cut: CapBnd [0-9a-f]*' "$work/${n}.log" | tail -n 1) || fail "the node $n did not say its bounding set was cut"
-                bounding=${bounding##* }
-                python3 -c 'import sys; m = int(sys.argv[1], 16); sys.exit(any(m >> b & 1 for b in (16, 17, 19, 25)) or not m >> 21 & 1)' "$bounding" || fail "the bounding set of kithd on $n is $bounding"
-                echo "vm.sh: kithd on $n: CapBnd $bounding" >&2
+                # (And what the kernel says of kithd, read by it from /proc/PID/status and from a
+                # thread it made after the cut, once on its console: the bounding set is exactly
+                # what is kept, a later thread's too; the effective set is not cut, so it holds
+                # what the bounding set does not, and a later thread's is the same.)
+                said=$(grep -ao 'kithd: capability bounding set cut: CapBnd [0-9a-f]* CapEff [0-9a-f]*; a later thread: CapBnd [0-9a-f]* CapEff [0-9a-f]*' "$work/${n}.log" | tail -n 1) || fail "the node $n did not say its bounding set was cut"
+                echo "vm.sh: kithd on $n: ${said#kithd: capability bounding set cut: }" >&2
+                # shellcheck disable=SC2046
+                python3 -c '
+import sys
+bnd, eff, lbnd, leff = (int(w, 16) for w in sys.argv[1:5])
+kept = 0xA80425FB  # CHOWN DAC_OVERRIDE FOWNER FSETID KILL SETGID SETUID SETPCAP NET_BIND_SERVICE NET_RAW SYS_CHROOT MKNOD AUDIT_WRITE SETFCAP
+sys.exit(bnd != kept or lbnd != kept or eff & ~bnd == 0 or leff != eff)
+' $(printf '%s\n' "$said" | grep -o '[0-9a-f]\{16\}') || fail "kithd on $n: its bounding set is not what it kept, or its effective set was cut: $said"
             done
 
             # A Job of one container, on a node by a Volume of that node: NAME, the node, the container.
@@ -1101,6 +1109,9 @@ EOF
             # A pod that is root, on the joined node.
             job rooted n2 '"image":"kith.test/pod:1","command":["/bin/pod","tell"]'
             grep -q 'tell: started uid 0 ' "$work/rooted.out" || fail "the pod that is root did not start as root: $(cat "$work/rooted.out" "$work/rooted.err")"
+            # (Its own bounding set is what a root pod keeps, which is what the node kept.)
+            grep -m1 'tell: started uid 0 ' "$work/rooted.out" | sed 's/^/vm.sh: the pod that is root: /' >&2
+            [ "$(grep -m1 'tell: started uid 0 ' "$work/rooted.out" | sed 's/.* bnd //; s/[^0-9a-f].*//' | python3 -c 'import sys; print(int(sys.stdin.read().strip() or "0", 16))')" = $((0xA80425FB)) ] || fail "the bounding set of the pod that is root is not what the node kept: $(cat "$work/rooted.out")"
             # A container with no filter on its system calls.
             job open n1 '"image":"kith.test/pod:1","seccomp":{"unconfined":true},"command":["/bin/pod","tell"]'
             grep -q 'tell: started uid 0 ' "$work/open.out" || fail "the container with no filter did not start: $(cat "$work/open.out" "$work/open.err")"
@@ -1109,7 +1120,7 @@ EOF
             grep -q 'nested: pid 2, uid 0' "$work/boxed.out" || fail "the sandbox did not say where it found itself: $(cat "$work/boxed.out" "$work/boxed.err")"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh whose policy turns off exec units, VM paths and /v1/run cut their bounding set (kithd's own CapBnd had none of SYS_MODULE, SYS_RAWIO, SYS_PTRACE or SYS_TIME, and each node's status named what it kept) and ran a pod that is root (on the joined node), a container with no filter on its system calls and a sandbox inside a container"
+            echo "vm.sh: ok: two nodes on the mesh whose policy turns off exec units, VM paths and /v1/run cut their bounding set (kithd's own CapBnd, and a later thread's, was the fourteen a root pod keeps and its CapEff was not cut; each node's status named what was kept; the pod that is root had the same CapBnd) and ran a pod that is root (on the joined node), a container with no filter on its system calls and a sandbox inside a container"
             exit 0
         fi
         if [ "$test" = kube ]; then

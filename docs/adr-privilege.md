@@ -331,22 +331,32 @@ before any of the split:
 - where `execUnits`, `vmPaths` and `run` are all off (each a way to have the node start a
   process as its root with every capability), kithd cuts its bounding set at start,
   before its runtime or any thread but the first process's console and power-button
-  readers (a thread keeps the set it was made with), to what it and its containers use:
-  the fourteen of a root pod (`container.rs`, `ROOTS`: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
-  `FSETID`, `KILL`, `SETGID`, `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`,
-  `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE`, `SETFCAP`) and its own (`SYS_ADMIN` for mounts,
-  namespaces, cgroups and the loop and mapper devices; `NET_ADMIN` for links, routes and
-  nftables; `SYS_BOOT` to power off; `SYS_RESOURCE` for limits; `BPF` for the cgroup
-  filters). The list is `KEPT` in `policy.rs`, each with its reason: nineteen, and
-  `ci/vm.sh --test policy` (a root pod, an unconfined unit and a nested unit, two nodes
-  on the mesh, each reading its own `CapBnd`) passes with them; one more joins it only
-  when that test fails for want of it. Never `SYS_MODULE`,
-  `SYS_RAWIO`, `SYS_PTRACE` or `SYS_TIME`, nor any other the kernel has: a hole in kithd,
-  or a stolen certificate, is root on that node without them, and without the rest of
-  the list as well (no loading a module, no raw access to memory or ports, no tracing a
-  process, no setting the clock, no `SYS_NICE`, `NET_BROADCAST`, `IPC_LOCK`, `LINUX_IMMUTABLE`,
-  `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `WAKE_ALARM`, `PERFMON`, `CHECKPOINT_RESTORE`...).
-  The node's status says what it kept (`status.policy.capabilities`; `all` where it was
+  readers (a thread keeps the set it was made with), to the fourteen of a root pod
+  (`container.rs`, `ROOTS`: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`,
+  `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE`,
+  `SETFCAP`). The list is `KEPT` in `policy.rs`; a capability joins it only for a child
+  that kithd execs (a container's process, the exec shim, a helper) and fails for want of
+  it, with that child named there, as `ci/vm.sh --test policy` finds (a root pod, an
+  unconfined unit and a nested unit, two nodes on the mesh). None does so far: what
+  kithd itself needs (`SYS_ADMIN` for mounts, namespaces, cgroups and the loop and mapper
+  devices; `NET_ADMIN` for links and nftables; `SYS_BOOT` to power off; `BPF` for the
+  cgroup filters) it does in its own threads, which the bounding set does not limit.
+  **What this does and does not do.** The bounding set limits only what an exec gives a
+  child (a root child's permitted set becomes the bounding set); `PR_CAPBSET_DROP` does
+  not touch kithd's own permitted and effective sets. So nothing kithd starts by an exec
+  can hold a capability outside the list, whatever its spec asks and whatever bug let it
+  ask: not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
+  `BPF`, `SYS_NICE`, `IPC_LOCK`, `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `PERFMON`... But
+  kithd's own threads keep every capability (the VM test reads `CapEff` and says so), so
+  **a hole inside kithd is not held back by this**: that is the split's job ("Order of
+  work after Step A" below, T-0334). Neither is every effect covered: root without `SYS_PTRACE` can still
+  trace root's own processes, and root can write `/proc/sys` with file permissions alone.
+  kithd execs itself only as the exec shim, which serves nothing (it waits for a byte and
+  execs the unit's command), so no serving process has the bounding set for its permitted set:
+  `Handle::in_dev` (`/proc/PID/root` of a container), `storage::unlinked` (`/proc/PID/fd`)
+  and `setns` into a container that is not root's, which need `SYS_PTRACE`, run in
+  kithd's own threads;
+- the node's status says what it kept (`status.policy.capabilities`; `all` where it was
   not cut, which includes a kithd that is not root). A kithd that cannot cut as root
   does not start;
 - no system call filter on the single process. The filter is the serving part's.
