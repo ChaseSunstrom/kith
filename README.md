@@ -1282,8 +1282,9 @@ spec:
   tag. The artifact is one blob (the package's files) and a signature
   (Ed25519, over the package's name, version and the blob's SHA-256) as the
   annotation `dev.kith.signature`.
-- For a Release that names a Repository, the node that leads the store asks
-  the registry for the versions, fetches the newest that fits, checks it
+- For a Release that names a Repository (applied by someone who may `apply`
+  Packages: without that right nothing is fetched, and the Release's status
+  says so), the node that leads the store asks the registry for the versions, fetches the newest that fits, checks it
   against the Repository's `publicKey` and stores it as a Package (annotated
   `kith.dev/repository`); the Release installs only Packages from its
   Repository. A package that is unsigned or signed with another key is

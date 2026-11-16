@@ -751,8 +751,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
 - **A Release and a Source act with their writer's rights, as far as these go:**
   - Deleting one removes what it installed as the node does: leave to delete the
     Release or Source is enough, not leave to delete each thing.
-  - What a Release reads to render is not asked for: a Package of a Repository that is
-    there, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - What a Release reads to render is not asked for: a Package that is in the cluster
+    already, and the `kith-values` ConfigMaps of `kith-system` and its namespace.
+  - kithd fetches a Package from a Repository for a Release only when the Release's
+    writer has `apply` on `Package`, the right a pull or push by hand takes; the
+    Release's status says so when it has not. The right is on Packages, which are in
+    no namespace, so a Role that names namespaces does not give it; and it is not on
+    one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
   - An Identity deleted and made again under the same name is the same writer: what

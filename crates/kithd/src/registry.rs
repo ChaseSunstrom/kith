@@ -474,6 +474,10 @@ fn wanted(store: &Store) -> BTreeSet<Wanted> {
         let Some(repository) = spec.package.repo else {
             continue;
         };
+        // (Whose right fell short is in the Release's status: `releases::package`.)
+        if crate::releases::supplied(store, release).is_err() {
+            continue;
+        }
         let installed = release.status.as_ref().and_then(|status| status["version"].as_str());
         let name = spec.package.name;
         let Some(origin) = crate::releases::origin(store, &repository) else {
@@ -649,6 +653,42 @@ mod tests {
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    /// Registries are asked only for Releases whose writer may apply Packages (T-0546):
+    /// one who may write Releases alone has kithd ask no Repository.
+    #[test]
+    fn fetch_rights_only_a_writer_that_may_apply_packages_has_a_registry_asked() {
+        let release = |name: &str, writer: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: Release\n\
+                 metadata: {{ name: {name}, namespace: shop{writer} }}\n\
+                 spec: {{ package: {{ name: {name}, repo: hub }} }}\n---\n"
+            )
+        };
+        let by = |who: &str| format!(", annotations: {{ 'kith.dev/written-by': '{who}' }}");
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: {{ name: hub }}\nspec: {{ url: 'oci://127.0.0.1:1/kith' }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: bob }}\nspec: {{}}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Identity\nmetadata: {{ name: ann }}\nspec: {{}}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: shop }}\n\
+             spec: {{ rules: [{{ kinds: [Release, Package], verbs: [apply], namespaces: [shop] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: packages }}\n\
+             spec: {{ rules: [{{ kinds: [Package], verbs: [apply] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: shop }}\nspec: {{ role: shop, subjects: [bob, ann] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: packages }}\nspec: {{ role: packages, subjects: [ann] }}\n---\n\
+             {}{}{}{}",
+            release("bobs", &by("bob")),
+            release("anns", &by("ann")),
+            release("sockets", &by("local socket")),
+            release("nobodys", ""),
+        );
+        let mut store = Store::default();
+        for resource in Resource::from_source(&source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let names: Vec<String> = wanted(&store).into_iter().map(|wanted| wanted.name).collect();
+        assert_eq!(names, ["anns", "sockets"]);
+    }
 
     /// What a fake registry says: status, header lines, body.
     type Reply = (u16, Vec<String>, Vec<u8>);
