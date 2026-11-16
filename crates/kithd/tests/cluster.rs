@@ -125,7 +125,9 @@ impl Node {
         let out = Command::new(kith)
             .args(args)
             .current_dir(&self.dir)
-            .env("KITH_SOCKET", self.dir.join("kithd.sock"))
+            // Relative: a Unix socket's path holds 107 bytes, and a test's under a worktree's
+            // target (as a lane's landing check runs it) is longer.
+            .env("KITH_SOCKET", "kithd.sock")
             .env_remove("KITH_STORE")
             .output()
             .unwrap();
