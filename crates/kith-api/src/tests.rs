@@ -1611,6 +1611,17 @@ fn an_exit_and_a_published_port_are_checked() {
         ),
         (
             "Workload",
+            template(
+                "pod: true,",
+                &(8080..8089)
+                    .map(|port| format!("{{ port: {port}, publish: true }}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            "at most 8 ports",
+        ),
+        (
+            "Workload",
             template("pod: true, exitt: vpn,", ""),
             "unknown field `exitt`",
         ),

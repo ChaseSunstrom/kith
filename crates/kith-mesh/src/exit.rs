@@ -218,10 +218,29 @@ pub fn held(link: &str) -> Result<bool> {
     Ok(families == [true, true])
 }
 
+/// The node's guard against every tunnel (`inet kith-exits`): what comes in by one (a
+/// link `kx`), to the node itself or to be passed on, is an answer to what was sent out
+/// by it, or is dropped. A tunnel's other end is someone else's machine, and nothing of
+/// the node's is for it, kithd's API least of all. Made anew, whole, before each tunnel.
+pub fn guard() -> Result<()> {
+    use crate::pod::{INET, answering, came_by, verdict};
+    let mut batch = crate::pod::Batch::new(GUARD);
+    batch.table(INET);
+    for (chain, hook) in [("in", 1), ("passed", 2)] {
+        batch.chain(INET, chain, "filter", hook, 0, Some(1));
+        batch.rule(INET, chain, &[came_by(b"kx"), answering(), verdict(1)]);
+        batch.rule(INET, chain, &[came_by(b"kx"), verdict(0)]);
+    }
+    batch.send()
+}
+
+const GUARD: &str = "kith-exits";
+
 /// The tunnel `number` as `tunnel` says, made or changed: its link, its key and its one
 /// peer, its address, a table whose one route is the tunnel, and what the node itself
 /// sends from the tunnel's address (a DNS question for a pod) sent by that table only.
 pub fn ensure(number: u16, tunnel: &Tunnel) -> Result<()> {
+    guard()?;
     let name = device(number);
     // (Made anew: nothing of what it was stays, an address or a peer. Meanwhile its pods'
     // rules find no route in its table, and send nothing.)
@@ -291,8 +310,12 @@ fn from_tunnel(number: u16, address: Ipv4Addr) -> [Rule<'static>; 2] {
 }
 
 /// Whether the kernel has all of the tunnel `number` that [`ensure`] made of `address`'s
-/// tunnel but the link: its table's route (gone with the link, too) and its rules.
+/// tunnel but the link: its table's route (gone with the link, too), its rules, and the
+/// [`guard`]'s table.
 pub fn whole(number: u16, address: Ipv4Addr) -> Result<bool> {
+    if !crate::pod::has_table(crate::pod::INET, GUARD)? {
+        return Ok(false);
+    }
     let mut asked = RouteMessage::default();
     asked.header.address_family = AddressFamily::Inet;
     let routes = ask_route(RouteNetlinkMessage::GetRoute(asked), NLM_F_DUMP)?;
@@ -424,12 +447,16 @@ mod tests {
             endpoint: "192.0.2.7:51820".parse().unwrap(),
             keepalive: 25,
         };
+        assert!(!crate::pod::has_table(crate::pod::INET, GUARD).unwrap());
         match ensure(7, &tunnel) {
             Err(e) if e.kind() == ErrorKind::PermissionDenied => {
                 return eprintln!("skipped: {e} (this namespace may not write its sysctls)");
             }
             made => made.unwrap(),
         }
+        // The guard is there with the tunnel, and no pod (whose table is another).
+        assert!(crate::pod::has_table(crate::pod::INET, GUARD).unwrap());
+        assert!(!crate::pod::has_table(crate::pod::INET, "kith-pods").unwrap());
         ensure(7, &tunnel).unwrap();
         forget().unwrap();
         // Two exits of one address (a provider gives each the same): taking one away

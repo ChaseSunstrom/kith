@@ -193,11 +193,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   tunnel's own table (with no tunnel there, unreachable), IPv6 to the mesh's range only
   and unreachable past it. The firewall (`inet kith-pods`, chain `passed`) drops whatever
   comes from an exit's pod link (`kpx`) unless it goes to a tunnel, another pod or the
-  mesh, and drops what comes in by a tunnel unless it answers a connection an exit's pod
-  started (marked when it starts). These rules are the kernel's, so they hold with kithd
-  stopped or killed; a node that starts again makes them again before any pod. The pod's
-  DNS is the exit's, through the tunnel, and its packets to the node's own resolver are
-  dropped. When a tunnel is made again or goes, the connections its pods had are
+  mesh, and its chain `in` drops what comes from one to the node itself unless it
+  answers what the node asked of the pod: an exit's pod reaches no service of its
+  node's, its DNS and kithd's API among them, on any port. What comes in by a tunnel
+  (`inet kith-exits`, made, whole, before each tunnel is) is dropped, to the node itself
+  or passed on, unless it answers a connection sent out by it: the provider's end
+  reaches nothing of the node's, with a pod or none. These rules are the kernel's, so
+  they hold with kithd stopped or killed; a node that starts again makes them again
+  before any pod or tunnel. The pod's DNS is the exit's, through the tunnel. When a tunnel is made again or goes, the connections its pods had are
   forgotten (conntrack), so none goes on by an older path. A pod names an exit only from
   a namespace the Exit lists: refused at apply, and again by the node before it starts
   one. Its replicas are placed on the Exit's node, and every other node refuses to start
@@ -213,15 +216,20 @@ Only the newest version is fixed. There are no security releases of older ones.
   address. About every minute kithd checks each tunnel's link, its table's route and its
   rules, and makes the tunnel again when one is gone (until then what is left sends the
   pods' packets nowhere); a change to an Exit's namespaces or DNS alone leaves the tunnel
-  as it is. A published port (`publish: true`) is kithd listening on the node's IPv4
+  as it is. A pod's own rules are read back when it starts, not after: root taking one
+  away by hand on a running node is not seen. A published port (`publish: true`) is kithd listening on the node's IPv4
   addresses and passing what comes to the pod's own address (the app sees that address,
   not the client's; one listening on 127.0.0.1 alone is not reached): no rule of the
   kernel's lets anything else in. No port below 1024 is published, nor kithd's own
   (5000, 7443 and 51820 are refused at apply; the ports the node was started with, its
   DNS and ingress among them, by the node, which says so in its log). A connection ends
   after 10 minutes with nothing sent either way, or when its port is no longer published;
-  a port takes 512 at once, and a new UDP sender past that takes the place of the one
-  heard from longest ago.
+  a port takes 128 at once and a node 192 in all, and a new UDP sender past that takes the
+  place of the one heard from longest ago. A pod publishes 8 ports at most and a node 64,
+  so kithd runs out of files for none of it. A port another namespace's Workload or Job
+  publishes is refused at apply, and on a node the pod that has a port keeps it while it
+  asks, so one namespace's pod never takes another's (one written through the log, by a
+  Release or Source, is not asked at apply: there the node's first pod has it).
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -424,9 +432,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   An exit's pod is not given the cluster's names, and a Service may not reach it. A
   Release or Source applied by an admin skips the apply-time namespace check (it writes
   through the log); the node's own check before start still refuses an unlisted namespace.
-  Of the node itself, an exit's pod is kept from its DNS (port 53 of the node's own
-  addresses) and nothing else: the node's other services answer it as they answer any
-  pod. No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
+  Of the node itself, an exit's pod reaches nothing (only answers to the node's own
+  questions of it go back). A running pod keeps its tunnel after its namespace is taken
+  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
   policy with them says so in its status). Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between

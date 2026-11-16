@@ -1873,6 +1873,10 @@ impl Template {
                 if !published.insert((p.port, p.protocol == Some(Protocol::Udp))) {
                     return Err(format!("{at}: publish: published twice"));
                 }
+                // (Each is a listener of kithd's, and the connections it passes on.)
+                if published.len() > 8 {
+                    return Err(format!("{at}: publish: at most 8 ports a pod"));
+                }
             }
         }
         let mut names = std::collections::BTreeSet::new();

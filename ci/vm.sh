@@ -660,6 +660,7 @@ EOF
 /bin/ip link set wg0 up
 & PASSWORD=outside /bin/pod say
 & /bin/pod dns 198.51.100.1
+& /bin/pod knock 10.2.0.2:7443
 EOF
             (cd "$work/provider" && find . | LC_ALL=C sort | cpio -o -H newc --owner=0:0 --quiet) >"$work/provider.cpio"
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 256 -smp 1 -display none -no-reboot \
@@ -690,6 +691,17 @@ print(json.dumps([{"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"
 [{"apiVersion":"kith.dev/v1","kind":"Exit","metadata":{"name":"vpn"},"spec":{"node":"n1","secret":"vpn","namespaces":["media"]}}]
 EOF
             any POST /v1/apply "$work/exit.json" >/dev/null || fail "the Exit was not applied"
+            # The tunnel up and no pod yet: the provider, knocking on kithd's API at the node's
+            # end of the tunnel all along, is never answered.
+            waited=0
+            until grep -aq 'kithd: exit vpn: tunnel kx[0-9]* up' "$work/n1.log"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Exit's tunnel did not come up: $(grep -a 'kithd: exit' "$work/n1.log")"
+                sleep 1
+            done
+            sleep 10
+            grep -aq 'knock: 10.2.0.2:7443' "$work/n9.log" || fail "the provider never knocked on the node's end of the tunnel"
+            ! grep -a 'knock: 10.2.0.2:7443 answered' "$work/n9.log" || fail "the node answered its VPN provider on kithd's API, before any pod"
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"probe","namespace":"media"},"spec":{"template":{"pod":true,"exit":"vpn","containers":[
   {"name":"probe","image":"kith.test/pod:1","command":["/bin/pod","probe"],"ports":[{"port":8080,"publish":true},{"port":8080,"protocol":"udp","publish":true}]}]}}}]
@@ -700,8 +712,8 @@ EOF
             rounds() { any GET '/v1/logs/Workload/media/probe?replica=0&tail=20' 2>/dev/null | grep -o 'probe [0-9]*: [^"\\]*'; }
             web() { curl -s --max-time 5 "http://127.0.0.1:$((port + 5))/"; }
             echoed() { python3 -I "$root/ci/lan_probe.py" "$((port + 8))" 52:54:00:00:09:01 10.9.0.1 8080 'a datagram for the pod' 2>/dev/null; }
-            up='web ok dns ok tcp-dns ok node-dns silent ipv6 [A-Z]'
-            down='web failed dns failed tcp-dns silent node-dns silent ipv6 [A-Z]'
+            up='web ok dns ok tcp-dns ok node-dns silent node-api silent ipv6 [A-Z]'
+            down='web failed dns failed tcp-dns silent node-dns silent node-api silent ipv6 [A-Z]'
             probes() { # PATTERN WHAT: three rounds of the pod's, all after the last one before, each say PATTERN
                 before=$(rounds | tail -n 1)
                 waited=0
@@ -843,8 +855,9 @@ print(len(leaks), tunnel, control, "; ".join(leaks[:10]))
             [ "$leaked" = 0 ] || fail "$leaked packets of the pod's left the node outside its tunnel: $rest"
             [ "$tunnelled" -gt 0 ] || fail "no packet went to the provider through the tunnel"
             [ "$controls" -gt 0 ] || fail "the pod behind no exit sent nothing that was seen: the count of the node's packets sees nothing; the Job says: $line: $(any GET '/v1/logs/Job/default/control?stderr=true' 2>&1)"
+            ! grep -a 'knock: 10.2.0.2:7443 answered' "$work/n9.log" || fail "the node answered its VPN provider on kithd's API"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node and a WireGuard provider: a pod behind an Exit reached outside and asked its names (UDP and TCP) only through the tunnel, never IPv6 and never its node's DNS; with the provider stopped, its Secret changed, its Exit deleted and its node reset it reached nothing, and then through the tunnel again; its web and UDP ports published on the node answered; a pod of a namespace the Exit does not list was refused; and of $tunnelled packets to the provider and $controls of a pod behind no exit seen on the node's cards, none of the pod's left outside the tunnel"
+            echo "vm.sh: ok: one node and a WireGuard provider: the provider was never answered on kithd's API through the tunnel; a pod behind an Exit reached outside and asked its names (UDP and TCP) only through the tunnel, never IPv6, never its node's DNS nor kithd's API; with the provider stopped, its Secret changed, its Exit deleted and its node reset it reached nothing, and then through the tunnel again; its web and UDP ports published on the node answered; a pod of a namespace the Exit does not list was refused; and of $tunnelled packets to the provider and $controls of a pod behind no exit seen on the node's cards, none of the pod's left outside the tunnel"
             exit 0
         fi
         if [ "$test" = services ]; then

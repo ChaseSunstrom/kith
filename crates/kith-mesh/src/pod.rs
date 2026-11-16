@@ -18,7 +18,7 @@ use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, Ro
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use nix::sched::{CloneFlags, setns, unshare};
 use std::fs::File;
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
@@ -375,9 +375,9 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// anyone else than it was. Returns whether that is so, for the caller to say next time.
 ///
 /// Whatever the guard, the pods of an exit (links `kpx`) pass on only to their tunnel
-/// (`kx`), to another pod, and to the mesh (link `mesh`); what comes in by a tunnel
-/// passes on, or to the node, only as an answer to what was sent out by it; and nothing
-/// of theirs asks the node's own DNS.
+/// (`kx`), to another pod, and to the mesh (link `mesh`), and nothing of theirs reaches
+/// the node itself but answers to what it asked of them. (What comes in by a tunnel is
+/// [`crate::exit::guard`]'s, made before the tunnel is.)
 pub fn node(range: Range, guarded: bool, mesh: &str) -> Result<bool> {
     node_with(range, guarded, true, mesh)
 }
@@ -439,16 +439,26 @@ fn link_name(which: u32) -> Vec<u8> {
 }
 
 /// A verdict: accept (1) or drop (0).
-fn verdict(code: u32) -> Vec<u8> {
+pub(crate) fn verdict(code: u32) -> Vec<u8> {
     let verdict = attribute(2 | NESTED, &attribute(2 | NESTED, &number(1, code)));
     expression("immediate", &[number(1, 0), verdict])
 }
 
-/// Its connection is one already seen both ways, or one such a connection made (state's
-/// bits 2 and 4).
-fn answering() -> Vec<u8> {
+/// It came in by a link whose name begins with `name`.
+pub(crate) fn came_by(name: &[u8]) -> Vec<u8> {
+    [link_name(6), is(name)].concat()
+}
+
+/// Its connection is one already seen both ways, or one such a connection made.
+pub(crate) fn answering() -> Vec<u8> {
+    state(2 | 4)
+}
+
+/// Its connection's state is one of `states`' bits: 2, seen both ways; 4, made by such a
+/// connection (an ICMP error of it); 64, not tracked at all (IPv6's neighbour discovery).
+fn state(states: u32) -> Vec<u8> {
     let state = expression("ct", &[number(1, 1), number(2, 0)]);
-    let (mask, nothing) = (6u32.to_ne_bytes(), 0u32.to_ne_bytes());
+    let (mask, nothing) = (states.to_ne_bytes(), 0u32.to_ne_bytes());
     let masked = expression(
         "bitwise",
         &[
@@ -481,47 +491,10 @@ fn marked() -> Vec<u8> {
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
 /// comes in from or goes out to a pod's link.
 fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
-    const TABLE: &str = "kith-pods";
-    let (ip, inet) = (2u8, 1u8);
-    // (New table, delete table, new chain, new rule: of the subsystem nftables, 10.)
-    let (new_table, delete_table, new_chain, new_rule) = (0xa00u16, 0xa02u16, 0xa03u16, 0xa06u16);
-    let mut batch = Vec::new();
-    let mut sequence = 0u32;
-    let mut say = |kind: u16, family: u8, subsystem: u16, attributes: &[Vec<u8>]| {
-        let attributes = attributes.concat();
-        sequence += 1;
-        batch.extend((attributes.len() as u32 + 20).to_ne_bytes());
-        batch.extend(kind.to_ne_bytes());
-        // A request; what is not the batch's own beginning or end: acknowledged, and may create.
-        batch.extend(if subsystem == 0 { 0x405u16 } else { 1 }.to_ne_bytes());
-        batch.extend(sequence.to_ne_bytes());
-        batch.extend(0u32.to_ne_bytes());
-        batch.extend([family, 0]);
-        batch.extend(subsystem.to_be_bytes());
-        batch.extend(attributes);
-    };
-    let chain = |name: &str, kind: &str, hook: u32, priority: u32, policy: Option<u32>| {
-        let hook = attribute(4 | NESTED, &[number(1, hook), number(2, priority)].concat());
-        let mut chain = vec![text(1, TABLE), text(3, name), hook, text(7, kind)];
-        chain.extend(policy.map(|policy| number(5, policy)));
-        chain
-    };
-    let rule = |chain: &str, expressions: &[Vec<u8>]| {
-        vec![
-            text(1, TABLE),
-            text(2, chain),
-            attribute(4 | NESTED, &expressions.concat()),
-        ]
-    };
-    say(0x10, 0, 10, &[]); // a batch begins
-    for family in [ip, inet] {
-        // (Made so that it is there to take away: what an earlier kithd left goes.)
-        say(new_table, family, 0, &[text(1, TABLE)]);
-        say(delete_table, family, 0, &[text(1, TABLE)]);
-    }
-    say(new_table, ip, 0, &[text(1, TABLE)]);
+    let mut batch = Batch::new("kith-pods");
+    batch.table(IP);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
-    say(new_chain, ip, 0, &chain("out", "nat", 4, 100, None));
+    batch.chain(IP, "out", "nat", 4, 100, None);
     // Where it comes from (4 bytes, 12 into the IP header), with all but the range's bits
     // cleared (bitwise: and with the mask, or with 0), is the range's network.
     let from = expression("payload", &[number(1, 1), number(2, 1), number(3, 12), number(4, 4)]);
@@ -538,63 +511,133 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
         ],
     );
     if masquerade {
-        say(
-            new_rule,
-            ip,
-            0,
-            &rule("out", &[from, masked, is(&network), expression("masq", &[])]),
-        );
+        batch.rule(IP, "out", &[from, masked, is(&network), expression("masq", &[])]);
     }
-    say(new_table, inet, 0, &[text(1, TABLE)]);
+    batch.table(INET);
     // What is passed on (hook 2): with the guard, dropped (0) unless a rule lets it through.
-    say(
-        new_chain,
-        inet,
-        0,
-        &chain("passed", "filter", 2, 0, Some(u32::from(!guard))),
-    );
+    batch.chain(INET, "passed", "filter", 2, 0, Some(u32::from(!guard)));
     // What comes to the node itself (hook 1).
-    say(new_chain, inet, 0, &chain("in", "filter", 1, 0, Some(1)));
-    // (6 and 7: the names of the links it came in by and goes out by.)
-    let (from, to) = (
-        |name: &[u8]| [link_name(6), is(name)].concat(),
-        |name: &[u8]| [link_name(7), is(name)].concat(),
-    );
+    batch.chain(INET, "in", "filter", 1, 0, Some(1));
+    let to = |name: &[u8]| [link_name(7), is(name)].concat();
     let mesh = [mesh.as_bytes(), &[0]].concat();
-    for chain in ["passed", "in"] {
-        say(new_rule, inet, 0, &rule(chain, &[from(b"kx"), answering(), verdict(1)]));
-        say(new_rule, inet, 0, &rule(chain, &[from(b"kx"), verdict(0)]));
-    }
-    // (Of the transport header (2), the two bytes at 2: the port it goes to.)
-    let port = expression("payload", &[number(1, 1), number(2, 2), number(3, 2), number(4, 2)]);
-    say(
-        new_rule,
-        inet,
-        0,
-        &rule("in", &[from(b"kpx"), port, is(&53u16.to_be_bytes()), verdict(0)]),
-    );
-    say(new_rule, inet, 0, &rule("passed", &[from(b"kpx"), marked()]));
+    // A pod of an exit asks nothing of its node: what comes from one to the node itself is
+    // an answer to what the node asked of it (a Service's relay or probe, at its mesh
+    // address), an ICMP error of such, or IPv6's neighbour discovery (not tracked). Any
+    // other port of the node's, its DNS and kithd's API among them, hears nothing of it.
+    batch.rule(INET, "in", &[came_by(b"kpx"), state(2 | 4 | 64), verdict(1)]);
+    batch.rule(INET, "in", &[came_by(b"kpx"), verdict(0)]);
+    // (What comes in by a tunnel to be passed on is an answer, or the guard drops it; an
+    // answer is passed whatever this table's policy.)
+    batch.rule(INET, "passed", &[came_by(b"kx"), answering(), verdict(1)]);
+    batch.rule(INET, "passed", &[came_by(b"kpx"), marked()]);
     for allowed in [&b"kx"[..], b"kp", &mesh] {
-        say(
-            new_rule,
-            inet,
-            0,
-            &rule("passed", &[from(b"kpx"), to(allowed), verdict(1)]),
-        );
+        batch.rule(INET, "passed", &[came_by(b"kpx"), to(allowed), verdict(1)]);
     }
-    say(new_rule, inet, 0, &rule("passed", &[from(b"kpx"), verdict(0)]));
+    batch.rule(INET, "passed", &[came_by(b"kpx"), verdict(0)]);
     if guard {
         for link in [6, 7] {
-            say(
-                new_rule,
-                inet,
-                0,
-                &rule("passed", &[link_name(link), is(b"kp"), verdict(1)]),
-            );
+            batch.rule(INET, "passed", &[link_name(link), is(b"kp"), verdict(1)]);
         }
     }
-    say(0x11, 0, 10, &[]); // and ends
-    netfilter(&batch, sequence - 1)
+    batch.send()
+}
+
+/// nftables' families of tables: IPv4's, and both IPv4's and IPv6's.
+const IP: u8 = 2;
+pub(crate) const INET: u8 = 1;
+
+/// A netfilter batch, of the table `table`'s messages: sent whole, the kernel takes all of
+/// it or none (a table made anew has no moment without its rules).
+pub(crate) struct Batch {
+    bytes: Vec<u8>,
+    sequence: u32,
+    table: &'static str,
+}
+
+impl Batch {
+    pub(crate) fn new(table: &'static str) -> Batch {
+        let mut batch = Batch {
+            bytes: Vec::new(),
+            sequence: 0,
+            table,
+        };
+        batch.say(0x10, 0, 10, &[]); // a batch begins
+        batch
+    }
+
+    fn say(&mut self, kind: u16, family: u8, subsystem: u16, attributes: &[Vec<u8>]) {
+        let attributes = attributes.concat();
+        self.sequence += 1;
+        let bytes = &mut self.bytes;
+        bytes.extend((attributes.len() as u32 + 20).to_ne_bytes());
+        bytes.extend(kind.to_ne_bytes());
+        // A request; what is not the batch's own beginning or end: acknowledged, and may
+        // create; a rule after the chain's others (append: else the kernel puts it first,
+        // and a chain runs backwards, its drop ahead of the accept meant to come before).
+        let flags: u16 = match (subsystem, kind) {
+            (0, 0xa06) => 0xc05,
+            (0, _) => 0x405,
+            _ => 1,
+        };
+        bytes.extend(flags.to_ne_bytes());
+        bytes.extend(self.sequence.to_ne_bytes());
+        bytes.extend(0u32.to_ne_bytes());
+        bytes.extend([family, 0]);
+        bytes.extend(subsystem.to_be_bytes());
+        bytes.extend(attributes);
+    }
+
+    /// The table of `family` made anew: nothing an earlier one (an earlier kithd's) had stays.
+    pub(crate) fn table(&mut self, family: u8) {
+        // (New table, delete table, new table, of nftables' (10): made, so it is there to take away.)
+        let name = [text(1, self.table)];
+        for kind in [0xa00, 0xa02, 0xa00] {
+            self.say(kind, family, 0, &name);
+        }
+    }
+
+    /// A chain of the table, at `hook` with `priority`, and `policy` (accept, 1, or drop,
+    /// 0) for what no rule of it takes.
+    pub(crate) fn chain(&mut self, family: u8, name: &str, kind: &str, hook: u32, priority: u32, policy: Option<u32>) {
+        let hook = attribute(4 | NESTED, &[number(1, hook), number(2, priority)].concat());
+        let mut chain = vec![text(1, self.table), text(3, name), hook, text(7, kind)];
+        chain.extend(policy.map(|policy| number(5, policy)));
+        self.say(0xa03, family, 0, &chain);
+    }
+
+    /// A rule at the end of `chain`, of `expressions`.
+    pub(crate) fn rule(&mut self, family: u8, chain: &str, expressions: &[Vec<u8>]) {
+        let rule = [
+            text(1, self.table),
+            text(2, chain),
+            attribute(4 | NESTED, &expressions.concat()),
+        ];
+        self.say(0xa06, family, 0, &rule);
+    }
+
+    pub(crate) fn send(mut self) -> Result<()> {
+        self.say(0x11, 0, 10, &[]); // and ends
+        netfilter(&self.bytes, self.sequence - 1)
+    }
+}
+
+/// Whether nftables has the table `name` of `family`.
+pub(crate) fn has_table(family: u8, name: &str) -> Result<bool> {
+    // (Get table, of nftables' (10): a request, acknowledged.)
+    let attributes = text(1, name);
+    let mut message = Vec::new();
+    message.extend((attributes.len() as u32 + 20).to_ne_bytes());
+    message.extend(0xa01u16.to_ne_bytes());
+    message.extend(5u16.to_ne_bytes());
+    message.extend(1u32.to_ne_bytes());
+    message.extend(0u32.to_ne_bytes());
+    message.extend([family, 0, 0, 0]);
+    message.extend(attributes);
+    match netfilter(&message, 1) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Send netfilter `batch`, and take its answers: a no is the answer, or message `last`'s yes.
@@ -741,6 +784,17 @@ mod tests {
         }
         // And the machine this runs on can be asked (what it has is anyone's: only that it answers).
         assert!(held_addresses().is_ok_and(|held| held.iter().any(|held| held.address.is_loopback())));
+    }
+
+    #[test]
+    fn a_rule_goes_after_the_chains_others() {
+        // (Without append, 0x800, the kernel puts each rule first: the guard's drop of
+        // what comes by a tunnel ran ahead of its accept of the answers.)
+        let mut batch = Batch::new("t");
+        let start = batch.bytes.len();
+        batch.rule(INET, "c", &[verdict(1)]);
+        let flags = u16::from_ne_bytes([batch.bytes[start + 6], batch.bytes[start + 7]]);
+        assert_eq!(flags, 0xc05);
     }
 
     #[test]

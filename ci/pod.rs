@@ -269,6 +269,16 @@ fn asks(server: SocketAddr, name: &str, tcp: bool) -> &'static str {
     }
 }
 
+/// Whether `to` takes a TCP connection within two seconds: "answered", "refused" (a reset:
+/// something there said no), or "silent" (nothing came back at all).
+fn knocked(to: SocketAddr) -> &'static str {
+    match TcpStream::connect_timeout(&to, Duration::from_secs(2)) {
+        Ok(_) => "answered",
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => "refused",
+        Err(_) => "silent",
+    }
+}
+
 /// Every file at or under `path` as "PATH MODE CONTENT", through links (as a mounted
 /// ConfigMap has them) and past what such a mount keeps for itself (`..data` and the like).
 fn files(path: &std::path::Path, found: &mut Vec<String>) {
@@ -646,6 +656,8 @@ fn main() {
                 let named = if named.is_ok_and(|mut found| found.any(|at| at == outside)) { "ok" } else { "failed" };
                 let tcp = asks(server, &format!("kithleak-tcp-{round}.example"), true);
                 let asked_node = asks(node, &format!("kithleak-node-{round}.example"), false);
+                // (kithd's own API on its node, as any service of the node's: not for it.)
+                let api = knocked(SocketAddr::from(([100, 88, 0, 1], 7443)));
                 let v6 = TcpStream::connect_timeout(&"[2001:db8::7]:80".parse().expect("an address"), Duration::from_secs(2));
                 let v6 = match v6 {
                     Ok(_) => "connected".to_string(),
@@ -656,7 +668,21 @@ fn main() {
                         let _ = socket.send_to(format!("kithleak {round}").as_bytes(), to);
                     }
                 }
-                println!("probe {round}: web {web} dns {named} tcp-dns {tcp} node-dns {asked_node} ipv6 {v6}");
+                println!("probe {round}: web {web} dns {named} tcp-dns {tcp} node-dns {asked_node} node-api {api} ipv6 {v6}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        // Whether TO takes a TCP connection, once a second, said when it changes: from the
+        // provider's end of a tunnel, what the tunnel's node must never answer.
+        ["knock", to] => {
+            let to: SocketAddr = to.parse().expect("an address and port");
+            let mut was = "";
+            loop {
+                let now = knocked(to);
+                if now != was {
+                    println!("knock: {to} {now}");
+                    was = now;
+                }
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
@@ -728,7 +754,7 @@ fn main() {
                 let mut asked = [0; 512];
                 while let Ok((n, from)) = socket.recv_from(&mut asked) {
                     if let Some((said, name)) = answer(&asked[..n], address) {
-                        println!("dns: udp {name}");
+                        println!("dns: udp {name} from {from}");
                         let _ = socket.send_to(&said, from);
                     }
                 }
@@ -750,6 +776,6 @@ fn main() {
                 }
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod knock TO | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
     }
 }

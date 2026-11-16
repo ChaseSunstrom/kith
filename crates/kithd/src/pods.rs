@@ -209,29 +209,35 @@ fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Re
 /// stops publishing it. No rule of the kernel's is made for it (nothing is passed on that
 /// kithd did not take). Never one of kithd's own ports here (`own`), nor one below 1024.
 //
-// ponytail: the first pod of this node to publish a port has it; another that asks for it
-// waits for that one to go, and says nothing of it but kithd's log.
+// ponytail: a pod of this node that asks for a port another has waits for that one to go,
+// and says nothing of it but kithd's log.
 pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
-    let mut open: BTreeMap<(bool, u16), (String, tokio::task::JoinHandle<()>)> = BTreeMap::new();
+    // (Each port's pod, its id and number, and its relay.)
+    type Relay = ((String, u16), tokio::task::JoinHandle<()>);
+    let mut open: BTreeMap<(bool, u16), Relay> = BTreeMap::new();
     let mut said = std::collections::BTreeSet::new();
     loop {
-        let mut wanted = published(&shared);
-        for refused in refuse_own(&mut wanted, &own) {
+        let mut asked = published(&shared);
+        let mut refused = refuse_own(&mut asked, &own);
+        let held = open.iter().map(|(port, (pod, _))| (*port, pod.0.clone())).collect();
+        let wanted = chosen(asked, &held, &mut refused);
+        for refused in refused {
             if said.insert(refused.clone()) {
                 eprintln!("{refused}");
             }
         }
-        open.retain(|port, (id, task)| {
-            let kept = wanted.get(port) == Some(id);
+        // (A pod made again with another number is another address: its relay is made again.)
+        open.retain(|port, (pod, task)| {
+            let kept = wanted.get(port) == Some(pod);
             if !kept {
                 task.abort();
             }
             kept
         });
-        for (port, id) in wanted {
+        for (port, pod) in wanted {
             open.entry(port)
-                .or_insert_with(|| (id.clone(), tokio::spawn(relay(shared.clone(), id, port))));
+                .or_insert_with(|| (pod.clone(), tokio::spawn(relay(shared.clone(), pod, port))));
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -246,22 +252,111 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
 /// Take out of `wanted` the ports below 1024 and those kithd serves on itself here (`own`:
 /// either protocol), each with why, for the log. (The apply refuses them too, but only
 /// kithd's defaults, and a Workload stored by an older kithd was not asked.)
-fn refuse_own(wanted: &mut BTreeMap<(bool, u16), String>, own: &[(u16, &str)]) -> Vec<String> {
+fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<(String, u16)>>, own: &[(u16, &str)]) -> Vec<String> {
     let mut refused = Vec::new();
-    wanted.retain(|&(_, port), id| {
+    wanted.retain(|&(_, port), pods| {
         let why = match own.iter().find(|(served, _)| *served == port) {
             Some((_, what)) => format!("kithd serves its {what} on it at this node"),
             None if port < 1024 => "those below 1024 are the node's".to_string(),
             None => return true,
         };
-        refused.push(format!("kithd: pod {id}: port {port} is not published: {why}"));
+        for (id, _) in pods.iter() {
+            refused.push(format!("kithd: pod {id}: port {port} is not published: {why}"));
+        }
         false
     });
     refused
 }
 
-/// Which pod of this node each published port (UDP, and the number) goes to.
-fn published(shared: &Shared) -> BTreeMap<(bool, u16), String> {
+/// At most this many ports of a node published at once: each is a listener of kithd's.
+const PORTS: usize = 64;
+
+/// Which of the pods asking for each port (`asked`, in the store's order) has it: the one
+/// that had it (`held`, by its id) while it asks still, else the first; and at most
+/// [`PORTS`] ports, those held first. Why each other is not published goes to `refused`.
+/// (A pod that came later, or of a namespace whose name sorts first, takes no port.)
+fn chosen(
+    asked: BTreeMap<(bool, u16), Vec<(String, u16)>>,
+    held: &BTreeMap<(bool, u16), String>,
+    refused: &mut Vec<String>,
+) -> BTreeMap<(bool, u16), (String, u16)> {
+    let (old, new): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(port, _)| held.contains_key(port));
+    let mut wanted = BTreeMap::new();
+    for ((udp, port), pods) in old.into_iter().chain(new) {
+        let had = pods.iter().find(|(id, _)| held.get(&(udp, port)) == Some(id));
+        let Some(has) = had.or(pods.first()).cloned() else {
+            continue;
+        };
+        for (id, _) in pods.iter().filter(|(id, _)| *id != has.0) {
+            refused.push(format!(
+                "kithd: pod {id}: port {port} is not published: pod {} of this node has it",
+                has.0
+            ));
+        }
+        if wanted.len() == PORTS {
+            let at_most = format!("this node publishes {PORTS} ports at most");
+            refused.push(format!("kithd: pod {}: port {port} is not published: {at_most}", has.0));
+            continue;
+        }
+        wanted.insert((udp, port), has);
+    }
+    wanted
+}
+
+/// The ports (UDP, and the number) a Workload's or Job's pods publish.
+fn ports_of(resource: &kith_api::Resource) -> Vec<(bool, u16)> {
+    let Ok((template, _)) = crate::controller::template_of(resource) else {
+        return Vec::new();
+    };
+    let ports = template.containers().flat_map(|c| &c.ports);
+    let udp = |p: &kith_api::kinds::Port| p.protocol == Some(kith_api::kinds::Protocol::Udp);
+    ports
+        .filter(|p| p.publish == Some(true))
+        .map(|p| (udp(p), p.port))
+        .collect()
+}
+
+/// Refuse a Workload or Job of `resources` that publishes a port another namespace's does:
+/// on whichever node they meet, one namespace never has another's port. (Within one, the
+/// node's pod that has it keeps it.)
+pub fn unshared(store: &kith_api::store::Store, resources: &[kith_api::Resource]) -> Result<(), String> {
+    let namespace = |resource: &kith_api::Resource| resource.metadata.namespace.clone().unwrap_or_default();
+    let publishing = |resource: &kith_api::Resource| ["Workload", "Job"].contains(&resource.kind.as_str());
+    let asking: Vec<_> = resources
+        .iter()
+        .filter(|r| publishing(r))
+        .map(|r| (r, ports_of(r)))
+        .collect();
+    if asking.iter().all(|(_, ports)| ports.is_empty()) {
+        return Ok(());
+    }
+    let keys: Vec<String> = resources.iter().map(kith_api::Resource::key).collect();
+    let stored = ["Workload", "Job"].into_iter().flat_map(|kind| store.list(Some(kind)));
+    let others: Vec<_> = stored
+        .filter(|other| !keys.contains(&other.key()))
+        .chain(resources.iter().filter(|r| publishing(r)))
+        .map(|other| (namespace(other), other.kind.as_str(), ports_of(other)))
+        .collect();
+    for (resource, ports) in asking {
+        for (udp, port) in ports {
+            let taken = others
+                .iter()
+                .find(|(of, _, theirs)| *of != namespace(resource) && theirs.contains(&(udp, port)));
+            if let Some((_, kind, _)) = taken {
+                let protocol = if udp { "UDP" } else { "TCP" };
+                return Err(format!(
+                    "{}: {protocol} port {port} is published by a {kind} of another namespace",
+                    resource.key()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The pods of this node that ask for each published port (UDP, and the number), in the
+/// store's order, each with its number.
+fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<(String, u16)>> {
     let mut asked = Vec::new();
     {
         let state = shared.store.lock().expect("nothing panics holding the store");
@@ -286,33 +381,29 @@ fn published(shared: &Shared) -> BTreeMap<(bool, u16), String> {
         }
     }
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
-    let mut wanted = BTreeMap::new();
-    for (id, ports) in asked.into_iter().filter(|(id, _)| pods.made.contains_key(id)) {
+    let mut wanted: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for (id, ports) in asked {
+        let Some(pod) = pods.made.get(&id) else { continue };
         for port in ports {
-            wanted.entry(port).or_insert_with(|| id.clone());
+            wanted.entry(port).or_default().push((id.clone(), pod.number));
         }
     }
     wanted
 }
 
-/// Pass what comes to `port` of this node on to the pod `id`, until told to stop.
-async fn relay(shared: Arc<Shared>, id: String, (udp, port): (bool, u16)) {
+/// Pass what comes to `port` of this node on to the pod `id` (of `number`), until told to stop.
+async fn relay(shared: Arc<Shared>, (id, number): (String, u16), (udp, port): (bool, u16)) {
     let at = std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    // To the pod's own address, never its loopback: what it lets in from 127.0.0.1 alone
+    // (as only its own) is not let in from the LAN. (From inside the pod, by its
+    // loopback link: no rule of an exit's is passed.)
+    let own = kith_mesh::pod::addresses(range(), None, number).0;
     let mut said = false;
     loop {
-        // To the pod's own address, never its loopback: what it lets in from 127.0.0.1 alone
-        // (as only its own) is not let in from the LAN. (From inside the pod, by its
-        // loopback link: no rule of an exit's is passed.)
-        let own = {
-            let pods = shared.pods.lock().expect("nothing panics holding the pods");
-            pods.made
-                .get(&id)
-                .map(|pod| kith_mesh::pod::addresses(range(), None, pod.number).0)
-        };
-        let done = match (own, udp) {
-            (None, _) => Err(std::io::Error::other("the pod is not on this node")),
-            (Some(own), true) => {
-                let to_pod = || {
+        let done = match udp {
+            true => {
+                let (shared, id) = (shared.clone(), id.clone());
+                let to_pod = move || {
                     inside(&shared, &id, || {
                         let socket = std::net::UdpSocket::bind((own, 0))?;
                         socket.connect((own, port))?;
@@ -321,7 +412,7 @@ async fn relay(shared: Arc<Shared>, id: String, (udp, port): (bool, u16)) {
                 };
                 datagrams(at, AT_ONCE, to_pod).await
             }
-            (Some(own), false) => {
+            false => {
                 let to_pod = || inside(&shared, &id, TcpSocket::new_v4);
                 connections(at, (own, port).into(), IDLE, to_pod).await
             }
@@ -338,7 +429,12 @@ async fn relay(shared: Arc<Shared>, id: String, (udp, port): (bool, u16)) {
 }
 
 /// At most this many connections, or senders, a published port at once.
-const AT_ONCE: usize = 512;
+const AT_ONCE: usize = 128;
+
+/// At most this many connections and senders all of a node's published ports at once: a
+/// connection holds two files, a sender one, so with [`PORTS`] listeners they hold 448 at
+/// most of the 1024 kithd may (it never raises RLIMIT_NOFILE), and the rest of it has room.
+static RELAYED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(192);
 
 /// How long a connection of a published port is kept with nothing passed either way.
 const IDLE: std::time::Duration = std::time::Duration::from_secs(600);
@@ -356,7 +452,7 @@ async fn connections(
     let mut passing = tokio::task::JoinSet::new();
     loop {
         while passing.try_join_next().is_some() {}
-        let Ok(held) = room.clone().acquire_owned().await else {
+        let (Ok(held), Ok(node)) = (room.clone().acquire_owned().await, RELAYED.acquire().await) else {
             return Ok(());
         };
         let Ok((from, _)) = listener.accept().await else {
@@ -366,7 +462,7 @@ async fn connections(
         };
         let socket = to_pod();
         passing.spawn(async move {
-            let _held = held;
+            let _held = (held, node);
             if let Ok(socket) = socket
                 && let Ok(Ok(to)) = tokio::time::timeout(idle, socket.connect(to)).await
             {
@@ -419,13 +515,18 @@ async fn pass(mut a: TcpStream, mut b: TcpStream, idle: std::time::Duration) {
 async fn datagrams(
     at: std::net::SocketAddr,
     room: usize,
-    to_pod: impl Fn() -> std::io::Result<std::net::UdpSocket>,
+    to_pod: impl Fn() -> std::io::Result<std::net::UdpSocket> + Clone + Send + 'static,
 ) -> std::io::Result<()> {
     let outside = Arc::new(tokio::net::UdpSocket::bind(at).await?);
-    // Per sender, a socket of the pod's own, which takes the answers back to it, and when it
-    // was last heard from. (Its task is this one's: stopped with it, which lets go of the
-    // port at once.)
-    type Sender = (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle, u64);
+    // Per sender, a socket of the pod's own, which takes the answers back to it, when it was
+    // last heard from, and its room of the node's. (Its task is this one's: stopped with it,
+    // which lets go of the port at once.)
+    type Sender = (
+        Arc<tokio::net::UdpSocket>,
+        tokio::task::AbortHandle,
+        u64,
+        tokio::sync::SemaphorePermit<'static>,
+    );
     let mut senders: BTreeMap<std::net::SocketAddr, Sender> = BTreeMap::new();
     let mut answering = tokio::task::JoinSet::new();
     let mut buffer = vec![0; 65_536];
@@ -436,21 +537,32 @@ async fn datagrams(
             continue;
         };
         while answering.try_join_next().is_some() {}
-        senders.retain(|_, (_, answers, _)| !answers.is_finished());
+        senders.retain(|_, (_, answers, _, _)| !answers.is_finished());
         let inner = match senders.get_mut(&from) {
-            Some((inner, _, last)) => {
+            Some((inner, _, last, _)) => {
                 *last = heard;
                 inner.clone()
             }
             None => {
-                // (Full: the sender heard from longest ago is forgotten, not this one.)
-                if senders.len() >= room
-                    && let Some(oldest) = senders.iter().min_by_key(|(_, sender)| sender.2).map(|(at, _)| *at)
-                    && let Some((_, answers, _)) = senders.remove(&oldest)
-                {
-                    answers.abort();
-                }
-                let made = to_pod().and_then(|socket| socket.set_nonblocking(true).map(|()| socket));
+                // (Full, the port's room or the node's: the sender heard from longest ago is
+                // forgotten, not this one.)
+                let room_of_node = loop {
+                    if senders.len() < room
+                        && let Ok(permit) = RELAYED.try_acquire()
+                    {
+                        break Some(permit);
+                    }
+                    let oldest = senders.iter().min_by_key(|(_, sender)| sender.2).map(|(at, _)| *at);
+                    match oldest.and_then(|oldest| senders.remove(&oldest)) {
+                        Some((_, answers, _, _)) => answers.abort(),
+                        None => break None,
+                    }
+                };
+                let Some(room_of_node) = room_of_node else { continue };
+                // (Made in the pod's namespace, by a thread of its own: not this task's.)
+                let made = tokio::task::spawn_blocking(to_pod.clone()).await;
+                let made = made.map_err(std::io::Error::other).and_then(|made| made);
+                let made = made.and_then(|socket| socket.set_nonblocking(true).map(|()| socket));
                 let Ok(inner) = made.and_then(tokio::net::UdpSocket::from_std) else {
                     continue;
                 };
@@ -464,7 +576,7 @@ async fn datagrams(
                         let _ = outside.send_to(&buffer[..length], from).await;
                     }
                 });
-                senders.insert(from, (inner.clone(), answers, heard));
+                senders.insert(from, (inner.clone(), answers, heard, room_of_node));
                 inner
             }
         };
@@ -500,9 +612,9 @@ mod tests {
     #[test]
     fn a_port_kithd_serves_on_is_not_published() {
         let mut wanted = BTreeMap::from([
-            ((false, 8443), "a".to_string()),
-            ((true, 6881), "b".to_string()),
-            ((true, 1023), "c".to_string()),
+            ((false, 8443), vec![("a".to_string(), 2)]),
+            ((true, 6881), vec![("b".to_string(), 3)]),
+            ((true, 1023), vec![("c".to_string(), 4)]),
         ]);
         let refused = refuse_own(&mut wanted, &[(8443, "API"), (5353, "DNS")]);
         assert_eq!(wanted.into_keys().collect::<Vec<_>>(), [(true, 6881)]);
@@ -517,6 +629,71 @@ mod tests {
             "{}",
             refused[1]
         );
+    }
+
+    /// A port a pod has stays its own while it asks, whichever pod comes to ask for it too
+    /// (another namespace's, sorted first, among them); one made again with another number
+    /// keeps it, at its new address; and a node publishes [`PORTS`] at most, those it has first.
+    #[test]
+    fn a_published_port_stays_with_the_pod_that_has_it() {
+        let pod = |id: &str, number| (id.to_string(), number);
+        let mut refused = Vec::new();
+        let asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 3)])]);
+        let held = BTreeMap::from([((false, 8080), "b/y-0".to_string())]);
+        let wanted = chosen(asked, &held, &mut refused);
+        assert_eq!(wanted[&(false, 8080)], pod("b/y-0", 3));
+        assert!(refused[0].contains("pod a/x-0: port 8080") && refused[0].contains("pod b/y-0"));
+        // (Made again, as number 5: the same pod, at its new address.)
+        let asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 5)])]);
+        assert_eq!(chosen(asked, &held, &mut refused)[&(false, 8080)], pod("b/y-0", 5));
+        // (Gone: the next asks for it has it.)
+        let asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2)])]);
+        assert_eq!(chosen(asked, &held, &mut refused)[&(false, 8080)], pod("a/x-0", 2));
+        // At most PORTS: the one held is kept over one before it.
+        let mut asked: BTreeMap<_, _> = (0..=PORTS as u16)
+            .map(|n| ((false, 2000 + n), vec![pod("p", 2)]))
+            .collect();
+        asked.insert((true, 9000), vec![pod("q", 3)]);
+        let held = BTreeMap::from([((true, 9000), "q".to_string())]);
+        refused.clear();
+        let wanted = chosen(asked, &held, &mut refused);
+        assert_eq!(wanted.len(), PORTS);
+        assert!(wanted.contains_key(&(true, 9000)));
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused.iter().all(|why| why.contains("ports at most")), "{refused:?}");
+    }
+
+    /// A port another namespace's Workload or Job publishes is refused at apply; one of the
+    /// same namespace, or the other protocol's, is not.
+    #[test]
+    fn a_port_of_another_namespace_is_refused() {
+        let workload = |namespace: &str, name: &str, port: serde_json::Value| -> kith_api::Resource {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": {"name": name, "namespace": namespace},
+                "spec": {"template": {"pod": true, "containers": [{"name": "c", "image": "x", "ports": [port]}]}},
+            }))
+            .unwrap()
+        };
+        let tcp = serde_json::json!({"port": 8080, "publish": true});
+        let udp = serde_json::json!({"port": 8080, "protocol": "udp", "publish": true});
+        let mut store = kith_api::store::Store::default();
+        store.apply(workload("media", "web", tcp.clone())).unwrap();
+        let refused = unshared(&store, &[workload("other", "web", tcp.clone())]).unwrap_err();
+        assert!(
+            refused.contains("TCP port 8080 is published by a Workload of another namespace"),
+            "{refused}"
+        );
+        unshared(&store, &[workload("media", "second", tcp.clone())]).unwrap();
+        unshared(&store, &[workload("other", "web", udp)]).unwrap();
+        // (In one apply too; and the stored one changed by it is not counted.)
+        let both = [workload("a", "x", tcp.clone()), workload("b", "x", tcp.clone())];
+        assert!(unshared(&kith_api::store::Store::default(), &both).is_err());
+        let moved = serde_json::json!({"port": 8081, "publish": true});
+        unshared(
+            &store,
+            &[workload("media", "web", moved), workload("other", "web", tcp)],
+        )
+        .unwrap();
     }
 
     /// An echo server standing for a pod's UDP port, and a relay of it at a free port.

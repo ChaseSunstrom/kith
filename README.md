@@ -567,7 +567,9 @@ spec:
   would leave by any other link, whether kithd runs or not. With the provider silent, the
   tunnel deleted or the Exit deleted, the pod reaches nothing outside; it does not fall
   back to the node's own way out. IPv6 never leaves (only the mesh's range is routed),
-  and nothing from the tunnel comes in that the pod did not start.
+  and nothing from the tunnel comes in, to the pod or to the node, that was not started
+  from this side: the provider reaches none of the node's services (kithd's API among
+  them), from the moment the tunnel is made. Nor does an exit's pod, on any port.
 - **Names through the tunnel.** The pod asks the exit's DNS (`DNS` in the file, or the
   Exit's `dns`), over UDP and TCP, through the tunnel: never the node's resolver or its
   cache. So an exit's pod has no cluster DNS names, and a Service that sends to it may not
@@ -580,14 +582,15 @@ spec:
 - **Its web UI from the LAN.** `publish: true` on a port (TCP, or `protocol: udp`) makes
   kithd listen on that port of each of the node's IPv4 addresses and pass each connection
   or datagram to the pod; the replies go back the same way, not through the tunnel. The
-  first pod of a node to publish a port has it; another waits for it to go (kithd's log
-  says so). `publish` works for any pod, not only an exit's. The app is reached at the
+  pod of a node that has a port keeps it; another of the same namespace waits for it to
+  go (kithd's log says so), and one of another namespace is refused when applied. A pod
+  publishes 8 ports at most, a node 64. `publish` works for any pod, not only an exit's. The app is reached at the
   pod's own address, so it must listen on all of them (`0.0.0.0`), not on 127.0.0.1
   alone, and sees each client as that address, not the client's. No port below 1024 is
   published, nor one kithd serves on (5000, 7443 and 51820 are refused when applied, and
   the node's DNS, ingress and other ports by the node, in its log). A connection ends
-  after 10 minutes with nothing sent; a port takes 512 at once, and past that a new UDP
-  sender takes the place of the one heard from longest ago.
+  after 10 minutes with nothing sent; a port takes 128 at once (a node 192 in all), and
+  past that a new UDP sender takes the place of the one heard from longest ago.
 - **What an Exit is.** It is cluster-wide: whoever may write one decides which namespaces'
   pods leave through it, so a Role scoped to a namespace cannot. Only the Exit's node is
   sent the Exit and its Secret. `Endpoint` has to be an address, not a name (a name would
