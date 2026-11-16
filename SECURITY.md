@@ -860,6 +860,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   is kept by neither, nor by the store or the audit log; it is in kithd's memory on
   both for as long as the request takes, and that memory is not wiped after. A line taken away is written over where it lay: what a flash
   disk keeps of sectors it has replaced is not kith's to say.
+- **An update on a node whose state is encrypted is good only once the state is open.**
+  A new system is on trial for three starts, and is marked good ten seconds after kithd
+  has the node's state to use: on an encrypted node, after its key came (from its TPM,
+  the cluster, a recovery key or a passphrase), however long that took. So a new system
+  that can never open the state is not kept. And so a node on trial that is kept from
+  its key (no seal, and its cluster out of reach) and is restarted three times while it
+  waits goes back to the system it ran before, which then waits for the key the same
+  way. Nothing is lost by that but the update: its plan is paused, as for any release a
+  node came back from, until the release is changed or another is given. (T-0572.)
 - **A duress code destroys on purpose, and only what it reaches.** Typed at an encrypted
   node's waiting console (`kith node duress`, off until someone who may apply NodeKeys
   makes one), it writes zeros over the node's lock record (the disk's secret, and what

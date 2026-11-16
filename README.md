@@ -2857,7 +2857,8 @@ the other, so the system that runs is never the one being changed:
    each time it starts the slot (`+2-1`, `+1-2`, `+0-3`).
 3. A slot that comes up, and whose kithd is still running ten seconds later,
    is marked good: the counter is dropped and the console says
-   `slot b is good`.
+   `slot b is good`. On a node whose state is encrypted the ten seconds start
+   when the state is open, not while it waits for its key.
 4. A slot that does not (a root its verity tree refuses, a kithd that cannot
    start) is restarted until its tries are gone. The boot loader then starts
    the slot that worked, and kithd says so on each start:
