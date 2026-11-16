@@ -2173,7 +2173,9 @@ mod tests {
     }
 
     /// Two unpacks at once into one index, which an earlier stop left an entry in that nothing
-    /// links and one that is not whole: every file is whole, and equal files are one.
+    /// links and one that is not whole: every file is whole, and equal files are one. (Except
+    /// the body of the entry cut short: two files of the first unpack may both find it unusable
+    /// at once and each replace it, as `share_all` says, so those four are one inode or two.)
     #[test]
     fn shared_files_two_unpacks_at_once_and_stray_entries() {
         let (dir, _) = sandbox("shared-at-once");
@@ -2237,13 +2239,21 @@ mod tests {
         // The first unpack's whole file took its place, and the rest share it.
         assert_eq!(fs::read_to_string(&cut).unwrap(), "file 1");
         for n in 1..150 {
-            let one = ino(&x.join(format!("f{n}")));
-            for other in [
+            let four = [
+                x.join(format!("f{n}")),
                 x.join(format!("f{}", n + 150)),
                 y.join(format!("f{n}")),
                 y.join(format!("f{}", n + 150)),
-            ] {
-                assert_eq!(ino(&other), one, "f{n}");
+            ]
+            .map(|path| ino(&path));
+            if n == 1 {
+                let mut distinct = four.to_vec();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert!(distinct.len() <= 2, "f1: {four:?}");
+                assert!(distinct.contains(&ino(&cut)), "f1: the entry is none of the four");
+            } else {
+                assert!(four.iter().all(|&i| i == four[0]), "f{n}");
             }
         }
         fs::remove_dir_all(&dir).unwrap();

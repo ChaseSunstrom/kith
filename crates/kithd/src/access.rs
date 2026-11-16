@@ -440,6 +440,34 @@ mod tests {
     use super::*;
     use kith_api::Resource;
 
+    /// A writer written down as a string comes back as the one it names and no other: not as
+    /// a node, nor as someone a node passed on (their text has a space no Identity's name has),
+    /// nor as the local socket by another spelling.
+    #[test]
+    fn writer_named_a_text_that_reads_like_another_caller_is_no_caller() {
+        assert_eq!(Caller::named("local socket"), Some(Caller::Admin));
+        assert_eq!(Caller::named("bob"), Some(Caller::Identity("bob".into())));
+        for odd in [
+            "node n1",
+            "bob via node n1",
+            "Local socket",
+            "local  socket",
+            "local socket ",
+            "",
+            "bob ",
+            "BOB",
+        ] {
+            assert_eq!(Caller::named(odd), None, "{odd:?}");
+        }
+        // Whoever a Display writes for a node, or for someone it passed on, is read back as none.
+        let node = Caller::Node("n1".into());
+        let via = Caller::Via("n1".into(), Box::new(Caller::Identity("bob".into())));
+        let checked = Caller::Checked("n1".into(), Box::new(Caller::Admin));
+        for written in [node.to_string(), via.to_string(), checked.to_string()] {
+            assert_eq!(Caller::named(&written), None, "{written}");
+        }
+    }
+
     #[test]
     fn a_worker_is_what_its_node_says_and_a_cluster_keeps_a_control_node() {
         let mut store = Store::default();
@@ -630,6 +658,8 @@ spec: {role: gone, subjects: [bob]}
             "/v1/volumes/default/a",
             "/v1/volumes/default/a/files/more",
             "/v1/lock/n1",
+            // (A PIN is asked of its node alone: docs/adr-unlock.md "Open".)
+            "/v1/lock/n2/pin",
             "/v1/backups/default/a",
             "/apis/logs/v1/x",
             "/ui/logs/x",

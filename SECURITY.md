@@ -201,8 +201,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
 - **A Release or a Source makes only what its writer may make.** The API writes down
   who applied it (`kith.dev/written-by`, whatever the body said; through another node,
-  whom that node passed on), and a rollback to an older revision is written down as
-  whoever rolls back. Each time the controller renders, every resource is asked for as
+  whom that node passed on), and a rollback to an older revision (of a Release, a Source,
+  a KindDefinition or a Package: each is stamped) is written down as whoever rolls back,
+  not as whoever applied the old revision; a rolled-back Package that says a Repository
+  fetched it is refused, like an apply of one. Each time the controller renders, every resource is asked for as
   that writer would be asked if they applied it themselves, with what it reaches (a
   Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs); each one the render
   drops, for leave to delete it. One refusal and nothing of the render is applied: the
@@ -215,6 +217,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   by the API; an Identity given a new certificate, or made again under the same name,
   has another key, and its Releases and Sources make nothing new and fetch nothing
   until it applies them again. The local socket's have no key.
+- **A custom kind's controller acts as whoever applied its KindDefinition.** The API
+  writes that one down on the KindDefinition as on a Release (name and key print,
+  whatever the body said, a rollback being whoever rolls back), and at each run what
+  the controller's module answered is asked for as that writer would be asked if they
+  applied it, and what it no longer answers, for leave to delete it; where the writer
+  may not, nothing new is made, what was made stays, and the resource's status names
+  the resource, the right and the writer. The writer's rights are asked only when the
+  controller runs: a right taken away from them shows at its next run (nothing new is
+  made between), and a run that was refused is made again when the KindDefinition is
+  applied again, which is the way to mend it. The controller does not act as whoever applied
+  the custom resource it runs for, so a custom kind lets someone ask for a thing without
+  the right to make its parts, as an operator does.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -265,7 +279,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   when next needed, so it costs availability (a pull, or a start that fails while the
   registry cannot be reached), not integrity.
 - **Packages** are taken only with a signature over their name, version and hash, by a
-  key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
+  key the cluster was told to trust; there is no unsigned way in (but a package pushed by
+  hand, which a Release renders with no more than its pusher's rights, and one from a
+  Repository that has no `publicKey`, which is trusted on the word of whoever answers
+  at its URL). A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
   template in kith's own language (`.kith`) is evaluated inside kithd: it ends in
   500,000 steps, nested 3,000 deep and 1 MB of output or is refused, and it can read
@@ -421,9 +438,37 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
-- **What a replica writes outside its Volumes is counted, not held at the write.** Its
-  containers' writable roots and its disk scratch share the node's state disk, with no
-  quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`
+- **What a replica writes outside its Volumes is held at the write where the state disk
+  keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
+  disk scratch share the node's state disk. Where the state disk keeps project quotas (a
+  kith OS state disk made since T-0598, mounted with `prjquota`, and kithd root), each pod
+  is given a project of its own, its limit set to its `resources.storage` before anything
+  is put in it, and its replica directory, scratch and roots in it: a write past
+  `resources.storage` fails at once (EDQUOT), and its units say it reached its limit.
+  kithd says at start, and in the Node's status, which way it holds limits. A pod cannot
+  move its files out of its project; an unconfined pod can, and is counted every 10 s as
+  before. A container that keeps the node's users can no longer change file flags or
+  projects (chattr, FS_IOC_SETFLAGS/FSSETXATTR, file_setattr fail with EPERM). The x32
+  system call refusal applies to every container. A state disk from before has no project
+  quotas and is counted as before. A pod whose scratch held files from before projects is
+  counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
+  a pod's own directories hold). The quota holds bytes, not files: there is no limit on
+  how many files a pod makes (T-0605), and each costs the disk an inode. **Stopped at the
+  limit:** every write a pod's own processes make outside its Volumes: a new file or an
+  append in its container's root, a file of its image copied up to be changed (refused
+  whole, the image's file left as it was), its disk scratch, and a file it removed and
+  holds open; in a pod with a user namespace of its own and in one with the node's users
+  alike. (The root is an overlay that libcontainer's first process mounts, as the node's
+  root with every capability for a pod with the node's users; the kernel leaves
+  CAP_SYS_RESOURCE out of the credentials an overlay writes with, so they are held too.
+  `sh ci/vm.sh --test quota` shows each.) **Only counted:** what kithd itself writes into
+  a pod's project (a new container's root directories: kithd is root, whose writes the
+  kernel lets past a hard limit: 64 KiB past the limit is let be, and further the pod is
+  replaced at the next count, about every 10 seconds, its project's usage read, not
+  walked), an unconfined pod's file moved out of its project, and a scratch from before
+  projects (both walked and replaced as on a disk with no quotas, below). A project id is given again once nothing on the disk is
+  left in it, its new limit set first. Elsewhere,
+  with no quota, kithd counts them about every 10 seconds (each pod with a `resources.storage`
   limit, and every pod while the disk has less than twice its reserve free) and replaces
   a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
   5% of it and at most 1 GiB unless said where kithd is root, none where it is not), the
@@ -475,8 +520,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one may end early at what the other took, for the next count to go on with. When the pod
   is gone its replica directory is removed whole, in one call that is none of the above: a
   stop does not cut it short, and it keeps a directory open for each level it is deep in, so
-  a chain of directories deeper than kithd may have files open is not removed by it. A limit held at
-  the write (an ext4 project quota on each root) is not done.
+  a chain of directories deeper than kithd may have files open is not removed by it.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
   that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound
@@ -861,6 +905,30 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
+  - A Package pushed by hand is rendered with no more than its pusher's rights, besides
+    its Release's writer's: the API writes the pusher down on the Package as on a Release
+    (name and key print, whatever the body said), and each render is asked for as the
+    pusher would be asked if they applied what it makes, and what it no longer makes, for
+    leave to delete it. So one who may push Packages and nothing else cannot publish a
+    version that an admin's `autoUpgrade` Release then renders with the admin's rights;
+    where the pusher may not, nothing new is made, what was installed stays, and the
+    Release's status names the Package, the resource, the namespace and the pusher. A
+    second push of a name and version by another replaces the first, and is held to the
+    second one's rights. A Package with nobody written down (one from before this check),
+    or an Identity gone or made again under the name, makes nothing new until it is
+    pushed again; a Source that makes a Package writes its own writer on it. A Package
+    fetched from a Repository has no pusher, and the pusher check does not apply to it at
+    all: with a `publicKey` the key is what it is trusted by; **with none, it is trusted
+    on the word of whoever answers at the Repository's URL**. So the right to apply a
+    Repository is the rights of every Release that names it, and `apply` on `Package`
+    lets someone have kithd ask any Repository there is. What makes a Package "fetched"
+    is `kith.dev/repository`, which only kithd's own fetcher may write: an apply that
+    carries it is refused, a Source whose repository's files carry it makes nothing new
+    (its status names the resource), and a Release takes it as fetched only when it
+    equals the origin of the Repository the Release names (a print of that Repository's
+    name, URL and key); any other Package is asked of its pusher, and refused when
+    nobody is written down. A Package a Source made before this, with the annotation,
+    stays until deleted.
   - A Release and a Source act as the Identity that applied them while it has the key
     it had then. An Identity made again under the same name has another key, so what
     the old one applied is not acted on as the new one: it makes nothing new, fetches no
@@ -870,7 +938,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - During an upgrade, a node from before this check neither writes the writer down nor
     checks it; and each Release and Source from before it makes nothing new until it is
     applied again.
-  - A WebAssembly controller still applies what it returns with the node's rights.
+  - A custom kind's WebAssembly controller acts as whoever applied its KindDefinition,
+    with what is said above of a Release's writer (name and key print written down by
+    the API, a Source that makes a KindDefinition writing its own, nothing new for a
+    writer gone or made again, a KindDefinition from before this check making nothing
+    new until it is applied again). So the right to apply a custom kind's resources is
+    the right to what its controller makes of them in that namespace, as far as the
+    definition's writer may make it: whoever may apply the kind in a namespace gets
+    there any ConfigMap, Workload or Secret the definition's writer could apply, and
+    the answer of a module the writer set is the writer's. Admission modules still run
+    on every write of their kind, whoever writes it.
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
   Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
@@ -960,6 +1037,41 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A node with a PIN** (`kith node pin NAME --untried-tpm`, off unless given; the line
+  `tpm-pin:` of its lock record) opens its state with its TPM and a PIN of 6 to 32 digits
+  typed at its console, and no longer by its TPM alone: its record holds a half of the key
+  sealed to the PCRs above (no guess counted) and a half the TPM gives only for the PIN,
+  counting each wrong one. Who opens what: the cluster's key still opens it, as before (a
+  PIN adds a way, it closes none), and so does the recovery key; a copy of the disk on
+  another machine opens by neither half. The guesses are bounded by the TPM, not by kith:
+  kithd refuses a PIN unless the TPM's lockout lets through at most one in a hundred of the
+  PINs of that length in a year (its M wrong ones at once, then one every I seconds). That
+  bound is for a PIN of random digits: a date, or 123456, is among the first guesses, so
+  choose the digits at random. Setting a PIN makes kithd take the TPM's lockout
+  authorization where it is empty (32 random bytes, kept in a file of its own in the
+  node's encrypted state and nowhere else), so that nobody else can forgive the count;
+  where someone else holds it, or the TPM refuses the one kithd keeps (a disk moved, a
+  state put back: kithd shows it to the TPM each time, and a refused one shuts the TPM's
+  lockout hierarchy for its recovery time), the PIN is refused. Setting a PIN again shows
+  the kept authorization to the TPM, and that forgives the wrong tries counted; it lets
+  nobody try the old PIN, which the new one replaces, and only whoever may apply the
+  node's NodeKey can set one. If that state is lost (a
+  wipe, or a duress code, which erases the record and with it the state's key), the file
+  can no longer be read, and only clearing the TPM in the firmware's settings gives the
+  lockout authorization back. Each setting of a PIN tries one wrong PIN, which the TPM
+  counts. The bound assumes the machine stays powered; whether a TPM counts a start after
+  a power cut as a wrong try is unchecked, on swtpm and on hardware. Anyone at the console
+  can type M wrong PINs and lock the PIN for a while; the console says so and when the
+  next is taken. After an update that moves the PCRs, the PIN opens nothing until it is
+  set again (a seal for the next system is not built: docs/adr-unlock.md, step 4); and a
+  node locked, then unlocked, has no PIN until it is set again. The PIN is asked of the node it is for alone, at its
+  own address over TLS or its own socket: unlike a passphrase, no node passes one on (a
+  relay would see it in plain), and a relayed PIN stays refused until the owner says
+  otherwise. It is kept by no node, the store or the audit log, nor shown as it is typed; kithd zeroes its own copies, not the
+  ones the HTTP and JSON layers made on the way. It has run against a software TPM only:
+  `--untried-tpm` is the owner saying so, until docs/adr-unlock.md's checklist has run on
+  that machine. It is a word, not a lock: whoever may apply a NodeKey at that node can
+  send the field.
 - **A running encrypted node has its key in memory.** The encryption keeps a disk
   that is off, or away from its cluster. While the node runs, the key of its state is
   in the kernel's memory (dm-crypt's) and in kithd's, for as long as it runs: kithd

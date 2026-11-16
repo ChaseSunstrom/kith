@@ -12,7 +12,7 @@
 // is followed and no hook runs. No signed-commit check yet.
 
 use crate::Shared;
-use crate::releases::{KEY, OWNER, Step, WRITER, carry_out, owner, reconcile, recorded, writer_may};
+use crate::releases::{KEY, OWNER, REPOSITORY, Step, WRITER, carry_out, owner, reconcile, recorded, writer_may};
 use kith_api::Resource;
 use kith_api::kinds::{Approval, SourceSpec};
 use kith_api::store::Store;
@@ -707,10 +707,28 @@ fn plan(store: &Store, fetches: &Fetches) -> Vec<Step> {
         // (Worked out once for each fetch, not each time the store changes.)
         let done = fetched.as_ref().map_err(String::clone).and_then(|fetched| {
             let resources = fetched.resources.get_or_init(|| desired(&key, fetched));
-            let mut resources = settled(store, &key, resources.as_ref().map_err(String::clone)?)?;
+            let resources = resources.as_ref().map_err(String::clone)?;
+            // (Only kithd's own fetcher says a Package came from a Repository, once it has
+            // checked it: a repository's file saying so would be rendered as one, unasked
+            // of the Source's writer.)
+            if let Some(resource) = resources
+                .iter()
+                .find(|resource| resource.metadata.annotations.contains_key(REPOSITORY))
+            {
+                return Err(format!(
+                    "{} is annotated {REPOSITORY}, which says kithd fetched and checked it: a repository's file cannot say so, remove it",
+                    resource.key()
+                ));
+            }
+            let mut resources = settled(store, &key, resources)?;
             // What a Source makes that makes more is the Source writer's too (its name and its
             // key's print), whatever the repository says of it.
-            let makes = |resource: &Resource| matches!(resource.kind.as_str(), "Release" | "Source");
+            let makes = |resource: &Resource| {
+                matches!(
+                    resource.kind.as_str(),
+                    "Release" | "Source" | "KindDefinition" | "Package"
+                )
+            };
             if resources.iter().any(makes) {
                 for resource in resources.to_mut().iter_mut().filter(|resource| makes(resource)) {
                     let annotations = &mut resource.metadata.annotations;
@@ -1408,6 +1426,11 @@ mod tests {
         )]);
         settle(&mut store, &system);
         assert!(store.get("GameServer/kith-system/one").is_some() && store.get("Realm/north").is_some());
+        // A definition it brings is acted on as the Source's writer too (its controller's rights).
+        assert_eq!(
+            writer(&store, "KindDefinition/gameserver").as_deref(),
+            Some("local socket")
+        );
 
         apply(&mut store, SOURCE);
         let mut both = system.clone();
@@ -1597,6 +1620,63 @@ mod tests {
         assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
         assert_eq!(store.get("ConfigMap/shop/a").unwrap().spec["data"]["colour"], "blue");
         assert!(store.get("ConfigMap/shop/b").is_some());
+    }
+
+    /// A Package a Source makes is its writer's to render with, as a Release's is: it
+    /// carries the Source's writer, whatever the repository says (T-0550).
+    #[test]
+    fn package_writer_a_package_a_source_makes_carries_the_sources_writer() {
+        let package = "apiVersion: kith.dev/v1\nkind: Package\n\
+                       metadata: { name: maps-1.0.0, annotations: { 'kith.dev/written-by': 'forged' } }\n\
+                       spec: { version: 1.0.0, files: { package.yaml: 'name: maps\\nversion: 1.0.0\\n' } }\n";
+        let mut store = Store::default();
+        apply(&mut store, &SOURCE.replace("namespace: shop", "namespace: kith-system"));
+        let fetched = Fetches::from([(
+            "Source/kith-system/repo".to_string(),
+            at("r1", &[("p.yaml", package.to_string())])
+                .remove("Source/shop/repo")
+                .unwrap(),
+        )]);
+        settle(&mut store, &fetched);
+        assert_eq!(writer(&store, "Package/maps-1.0.0").as_deref(), Some("local socket"));
+    }
+
+    /// `kith.dev/repository` says kithd fetched and checked a Package: a Source's
+    /// repository cannot say it of one of its own (it would be rendered as a fetched one,
+    /// unasked of its writer). The Source makes nothing new and says why; what it applied
+    /// stays (T-0550).
+    #[test]
+    fn package_origin_a_source_cannot_make_a_package_say_a_repository_sent_it() {
+        let package = "apiVersion: kith.dev/v1\nkind: Package\n\
+                       metadata: { name: maps-9.9.9, annotations: { 'kith.dev/repository': 'hub-0123' } }\n\
+                       spec: { version: 9.9.9, files: { package.yaml: 'name: maps\\nversion: 9.9.9\\n' } }\n";
+        let mut store = Store::default();
+        let status = |store: &Store| store.get("Source/kith-system/repo").unwrap().status.clone().unwrap();
+        // (A Source in kith-system: the only one that may make a Package.)
+        let files = |rev: &str, files: &[(&str, String)]| {
+            Fetches::from([(
+                "Source/kith-system/repo".to_string(),
+                at(rev, files).remove("Source/shop/repo").unwrap(),
+            )])
+        };
+        apply(&mut store, &SOURCE.replace("namespace: shop", "namespace: kith-system"));
+        settle(&mut store, &files("r1", &[("a.yaml", map("a", "red"))]));
+        assert_eq!(status(&store)["state"], "synced", "{}", status(&store));
+        settle(
+            &mut store,
+            &files("r2", &[("a.yaml", map("a", "blue")), ("p.yaml", package.to_string())]),
+        );
+        let message = status(&store)["message"].as_str().unwrap_or_default().to_string();
+        assert_eq!(status(&store)["state"], "error", "{}", status(&store));
+        assert!(
+            message.contains("Package/maps-9.9.9") && message.contains("kith.dev/repository"),
+            "{message}"
+        );
+        assert!(store.get("Package/maps-9.9.9").is_none());
+        assert_eq!(
+            store.get("ConfigMap/kith-system/a").unwrap().spec["data"]["colour"],
+            "red"
+        );
     }
 
     /// What a Source makes that makes more carries the Source's writer's print with its

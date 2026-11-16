@@ -12,7 +12,8 @@
 //!   `{resource, owned}`, it answers `{status, resources}`. The resources are applied
 //!   as the resource's own (in its namespace, annotated like a Release's, removed when
 //!   no longer answered and when their owner goes) and the status fields are recorded,
-//!   with `resources` (what it owns) and `controller` (how the last run went).
+//!   with `resources` (what it owns) and `controller` (how the last run went). The
+//!   controller acts as whoever applied its `KindDefinition` ([`releases::writer_may`]).
 //
 // ponytail: a delete is not asked about; a rollback is asked, but comes back as it was. A module sees one resource and what it owns: one that has
 // to look further is a Workload on the watch API.
@@ -148,9 +149,10 @@ impl Shared {
     }
 }
 
-/// What a run answered for: the resource's revision, the module, and the revision of
-/// each thing it owns. The same again is not asked again.
-type Stamp = (releases::Stamp, [u8; 32], Vec<(String, Option<u64>)>);
+/// What a run answered for: the resource's revision, the definition's (the controller acts
+/// as whoever applied it: applied again, a refused run is made again), the module, and the
+/// revision of each thing it owns. The same again is not asked again.
+type Stamp = (releases::Stamp, releases::Stamp, [u8; 32], Vec<(String, Option<u64>)>);
 
 struct Job {
     key: String,
@@ -168,6 +170,7 @@ fn due(store: &Store, seen: &BTreeMap<String, Stamp>) -> Vec<Job> {
             continue;
         };
         let digest = wasm::digest(&wasm);
+        let defined = releases::stamp(store, definition);
         for resource in store.list(definition.spec["kind"].as_str()) {
             let key = resource.key();
             let recorded = releases::recorded(resource);
@@ -181,6 +184,7 @@ fn due(store: &Store, seen: &BTreeMap<String, Stamp>) -> Vec<Job> {
             let stamp = (
                 // (With when it was applied: one deleted and made again is not the same one.)
                 releases::stamp(store, resource),
+                defined,
                 digest,
                 recorded.iter().map(revision).collect(),
             );
@@ -254,6 +258,11 @@ fn step(store: &Store, key: &str, answered: Result<Value, String>) -> Option<Ste
     let done = answered.and_then(|answer| {
         let resources = desired(store, owner, &answer)?;
         let done = releases::reconcile(store, key, &releases::recorded(owner), &resources, true)?;
+        // The controller acts as whoever applied its KindDefinition, asked on every run.
+        let definition = store
+            .definition(&owner.kind)
+            .ok_or_else(|| format!("no KindDefinition makes a {}", owner.kind))?;
+        releases::writer_may(store, definition, &resources, &done.delete)?;
         Ok((answer, done))
     });
     let revision = owner.metadata.revision;
@@ -375,7 +384,9 @@ mod tests {
         store
     }
 
-    const KIND: &str = "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: { name: gameserver }\n\
+    // (As the API writes it for the local socket.)
+    const KIND: &str = "apiVersion: kith.dev/v1\nkind: KindDefinition\n\
+        metadata: { name: gameserver, annotations: { 'kith.dev/written-by': 'local socket' } }\n\
         spec: { group: games.example.com, version: v1, kind: GameServer, schema: { type: object } }\n---\n\
         apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: { name: one, namespace: play }\nspec: { map: dust }\n";
 
@@ -428,6 +439,15 @@ mod tests {
                 json!({ "apiVersion": "kith.dev/v1", "kind": "Namespace", "metadata": { "name": "x" }, "spec": {} }),
                 "cannot make a Namespace",
             ),
+            // (A Package is in no namespace: one a controller made could say a Repository sent it.)
+            (
+                json!({
+                    "apiVersion": "kith.dev/v1", "kind": "Package",
+                    "metadata": { "name": "maps-1.0.0", "annotations": { "kith.dev/repository": "hub@0123" } },
+                    "spec": { "version": "1.0.0", "files": {} },
+                }),
+                "cannot make a Package",
+            ),
         ] {
             let said = step(&store, key, Ok(json!({ "resources": [resource] }))).unwrap();
             let said = said.status.unwrap()["controller"]["message"].to_string();
@@ -440,6 +460,187 @@ mod tests {
         let said = said.status.unwrap()["controller"]["message"].to_string();
         assert!(said.contains("is there already"), "{said}");
         assert!(step(&store, "GameServer/play/gone", Err("x".into())).is_none());
+    }
+
+    /// bob, who may apply `kinds` (a YAML list's insides) in play, and delete them when `delete`;
+    /// the GameServer's KindDefinition applied by him, with his first key.
+    fn bob_defines(kinds: &str, delete: bool) -> Store {
+        let verbs = if delete { "apply, delete" } else { "apply" };
+        let role = format!(
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {{ name: play }}\n\
+             spec: {{ rules: [{{ kinds: [{kinds}], verbs: [{verbs}], namespaces: [play] }}] }}\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {{ name: bob-play }}\nspec: {{ role: play, subjects: [bob] }}\n"
+        );
+        let mut store = store(&role);
+        releases::bob_is(&mut store, 0);
+        for resource in Resource::from_source(&releases::by_bob(KIND, 0)).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        store
+    }
+
+    fn answers(kind: &str, name: &str) -> Value {
+        let spec = if kind == "Secret" {
+            json!({ "data": { "k": "v" } })
+        } else {
+            json!({ "data": {} })
+        };
+        json!({ "resources": [{ "apiVersion": "kith.dev/v1", "kind": kind,
+            "metadata": { "name": name }, "spec": spec }] })
+    }
+
+    fn message(step: &Step) -> String {
+        step.status.as_ref().unwrap()["controller"]["message"].to_string()
+    }
+
+    /// A controller makes what whoever applied its KindDefinition may make in that namespace,
+    /// and takes away what that one may delete: no Secret by way of a GameServer for one who
+    /// may not apply Secrets. What was made stays; the status says whose right fell short.
+    #[test]
+    fn controller_rights_a_controller_makes_nothing_the_definitions_writer_may_not() {
+        let key = "GameServer/play/one";
+        let store = bob_defines("ConfigMap", true);
+        let ok = step(&store, key, Ok(answers("ConfigMap", "c"))).unwrap();
+        assert_eq!(ok.apply.len(), 1, "{ok:?}");
+        assert_eq!(ok.status.as_ref().unwrap()["controller"]["state"], "ok");
+
+        let refused = step(&store, key, Ok(answers("Secret", "s"))).unwrap();
+        let said = message(&refused);
+        assert!(refused.apply.is_empty() && refused.delete.is_empty(), "{said}");
+        assert!(
+            said.contains("Secret/play/s: ")
+                && said.contains("KindDefinition/gameserver was applied by bob")
+                && said.contains("bob may not apply Secret in namespace play"),
+            "{said}"
+        );
+        assert_eq!(refused.status.as_ref().unwrap()["controller"]["state"], "error");
+
+        // Taking away is asked too: a stray goes only where its writer may delete.
+        let mut store = bob_defines("ConfigMap", false);
+        let mut stray = answers("ConfigMap", "c")["resources"][0].clone();
+        stray["metadata"]["namespace"] = "play".into();
+        stray["metadata"]["annotations"] = json!({ OWNER: key });
+        store.apply(serde_json::from_value(stray).unwrap()).unwrap();
+        let owns = json!({ "resources": ["ConfigMap/play/c"] });
+        store.set_status(key, Some(owns.clone())).unwrap();
+        let held = step(&store, key, Ok(json!({ "resources": [] }))).unwrap();
+        let said = message(&held);
+        assert!(held.delete.is_empty() && held.apply.is_empty(), "{said}");
+        assert!(
+            said.contains("bob may not delete ConfigMap in namespace play"),
+            "{said}"
+        );
+        // (And a writer who may delete takes it away.)
+        let mut store = bob_defines("ConfigMap", true);
+        let stray = serde_json::from_value(json!({ "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+            "metadata": { "name": "c", "namespace": "play", "annotations": { OWNER: key } }, "spec": { "data": {} } }));
+        store.apply(stray.unwrap()).unwrap();
+        store.set_status(key, Some(owns)).unwrap();
+        let gone = step(&store, key, Ok(json!({ "resources": [] }))).unwrap();
+        assert_eq!(gone.delete, ["ConfigMap/play/c"]);
+    }
+
+    /// A KindDefinition applied through the local socket works as before. One with nobody
+    /// written down, one that kithd does not act as, one whose writer is gone, and one whose
+    /// writer was made again under the name make nothing new; applied again, they do.
+    #[test]
+    fn controller_writer_a_definition_is_acted_on_only_for_the_writer_it_had() {
+        let key = "GameServer/play/one";
+        let answer = || Ok(answers("ConfigMap", "c"));
+        let made = |store: &Store| step(store, key, answer()).unwrap();
+        assert_eq!(made(&store(KIND)).apply.len(), 1);
+
+        for written in ["", ", annotations: { 'kith.dev/written-by': 'node n1' }"] {
+            let kind = KIND.replace(", annotations: { 'kith.dev/written-by': 'local socket' }", written);
+            let step = made(&store(&kind));
+            let said = message(&step);
+            assert!(step.apply.is_empty() && said.contains("apply it again"), "{said}");
+        }
+
+        let mut store = bob_defines("ConfigMap", true);
+        assert_eq!(made(&store).apply.len(), 1);
+        store.delete("Identity/bob").unwrap();
+        let said = message(&made(&store));
+        assert!(
+            said.contains("there is no Identity bob") && made(&store).apply.is_empty(),
+            "{said}"
+        );
+        // Made again under the name, with another key: not the one that applied it.
+        releases::bob_is(&mut store, 1);
+        let again = made(&store);
+        let said = message(&again);
+        assert!(
+            again.apply.is_empty() && said.contains("an earlier Identity named bob"),
+            "{said}"
+        );
+        // Applied again by the new one: on it goes.
+        for resource in Resource::from_source(&releases::by_bob(KIND, 1)).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        assert_eq!(made(&store).apply.len(), 1);
+    }
+
+    /// A run that was refused is not asked again as it is: but the definition applied again
+    /// (by one who may) is a new reason, and the controller is run once more.
+    #[test]
+    fn controller_retry_a_refused_run_is_made_again_when_its_definition_is_applied_again() {
+        let key = "GameServer/play/one";
+        let with_module = KIND.replace(
+            "schema: { type: object }",
+            "schema: { type: object }, controller: { wasm: AAEC }",
+        );
+        let mut store = store(&with_module);
+        let mut seen = BTreeMap::new();
+        let jobs = due(&store, &seen);
+        assert_eq!(jobs.len(), 1);
+        // (It ran and was refused: what the run does records it as seen.)
+        seen.insert(key.to_string(), jobs.into_iter().next().unwrap().stamp);
+        assert!(due(&store, &seen).is_empty());
+        // The definition applied again, by someone else.
+        let again = with_module.replace("'local socket'", "bob");
+        for resource in Resource::from_source(&again).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        assert_eq!(due(&store, &seen).len(), 1, "applied again, the controller runs again");
+    }
+
+    /// Admission modules are asked of custom kinds only: the kinds the API stamps with their
+    /// writer (a KindDefinition, a Package) are never handed to one, so none can change a
+    /// writer or a key print (a custom kind's resource is asked as any, whatever it carries).
+    #[test]
+    fn wasm_admission_is_not_asked_of_what_is_stamped() {
+        let stamped = "kith.dev/written-by: bob, kith.dev/written-key: abcd";
+        let kind = KIND.replace(
+            "schema: { type: object }",
+            "schema: { type: object }, admission: { wasm: AAEC }",
+        );
+        let source = format!(
+            "{kind}---\napiVersion: kith.dev/v1\nkind: Package\n\
+             metadata: {{ name: maps-1.0.0, annotations: {{ {stamped} }} }}\nspec: {{ version: 1.0.0, files: {{}} }}\n---\n\
+             apiVersion: games.example.com/v1\nkind: GameServer\n\
+             metadata: {{ name: two, namespace: play, annotations: {{ {stamped} }} }}\nspec: {{}}\n"
+        );
+        let store = store(KIND);
+        let mut resources: Vec<Resource> = Resource::from_source(&source)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let asked = checks(&store, &mut resources).unwrap();
+        let kinds: Vec<String> = asked
+            .iter()
+            .map(|check| match check {
+                Check::Module(of, _) => format!("module {of}"),
+                Check::Admit { at, .. } => format!("admit {}", resources[*at].key()),
+            })
+            .collect();
+        // The definition's modules are checked as modules; only the GameServers are admitted.
+        let want = [
+            "module KindDefinition/gameserver: admission",
+            "admit GameServer/play/one",
+            "admit GameServer/play/two",
+        ];
+        assert_eq!(kinds, want);
     }
 
     #[test]

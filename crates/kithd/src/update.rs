@@ -866,6 +866,8 @@ pub async fn node(
     let me = format!("Node/{}", cluster.me.name);
     let mut generation = shared.generation.subscribe();
     let (mut raised, mut unraised) = (false, String::new());
+    // How its pods' storage limits hold, for whoever looks at the node.
+    let storage = crate::controller::storage::how(crate::controller::storage::held_at_write(&state));
     loop {
         // (Its slot is marked good a little after the start, and no update is taken before.)
         if !raised && crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed) {
@@ -886,7 +888,8 @@ pub async fn node(
                 Err(_) => {}
             }
         }
-        let said = report(&state, &version, slot, keys.whose());
+        let mut said = report(&state, &version, slot, keys.whose());
+        said["storage"] = json!(storage);
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
