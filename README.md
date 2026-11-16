@@ -594,7 +594,8 @@ spec:
   kithd listen on that port of each of the node's IPv4 addresses and pass each connection
   or datagram to the pod; the replies go back the same way, not through the tunnel. The
   pod of a node that has a port keeps it; another of the same namespace waits for it to
-  go (kithd's log says so), and one of another namespace is refused when applied. A pod
+  go (kithd's log says so), and one of another namespace is refused when applied; the
+  node remembers whose each port is, kithd started again or not. A pod
   publishes 8 ports at most, a node 64. `publish` works for any pod, not only an exit's. The app is reached at the
   pod's own address, so it must listen on all of them (`0.0.0.0`), not on 127.0.0.1
   alone, and sees each client as that address, not the client's. No port below 1024 is

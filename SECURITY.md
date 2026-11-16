@@ -238,9 +238,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   node with many clients of its API or ingress besides can still run out. A port another
   namespace's Workload or Job publishes is refused at apply, and on a node the pod that
   has a port keeps it while it asks, another pod of its namespace after it, so one
-  namespace's pod never takes another's; where pods of two namespaces ask for a port no
-  pod has (one written through the log, by a Release or Source, is not asked at apply, and
-  a node that starts again has none), none of them has it.
+  namespace's pod never takes another's. The node keeps which namespace has each port in
+  a file of its own (`published.json` in its state, not the store), and holds the port to
+  that namespace for as long as a Workload or Job of it asks for the port: across a restart
+  of kithd, and while the pod that had it is made again, a pod of another namespace that
+  asks for it (one written through the log, by a Release or Source, is not asked at apply)
+  neither takes it nor stops it, and kithd's log says it was refused. After a restart
+  nothing is let go until the node's store is as new as it was. Where pods of two
+  namespaces ask for a port the node has kept for neither (a first start, a file that
+  cannot be read, a node whose state is new), none of them has it. Whoever can write the
+  node's state can write that file, as they can everything else of the node's.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
