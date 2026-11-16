@@ -151,17 +151,33 @@ impl Store {
                 at: self.clock.unwrap_or_else(now),
                 resource: change.after.clone(),
             });
-            // A Package carries its files (up to 4 MB), so it keeps few revisions.
-            let limit = if change.after.kind == "Package" {
-                PACKAGE_HISTORY_LIMIT
-            } else {
-                HISTORY_LIMIT
+            // A Package carries its files (up to 4 MB), so it keeps few revisions. A NodeKey
+            // keeps its live one alone: a key the cluster forgot is in no earlier revision
+            // (and [`Store::cut_node_key_histories`] cuts what a store from before kept).
+            let limit = match change.after.kind.as_str() {
+                "Package" => PACKAGE_HISTORY_LIMIT,
+                "NodeKey" => 1,
+                _ => HISTORY_LIMIT,
             };
             while history.len() > limit {
                 history.remove(0);
             }
         }
         Ok(change)
+    }
+
+    /// Cut every NodeKey's history to its live revision, as a store loaded from before that
+    /// limit may hold more: whether one was cut. Two copies that cut at different times stay
+    /// the same store: nothing reads a NodeKey's earlier revisions (it is not rolled back).
+    pub fn cut_node_key_histories(&mut self) -> bool {
+        let mut cut = false;
+        for history in self.resources.values_mut() {
+            if history.len() > 1 && history.last().is_some_and(|r| r.resource.kind == "NodeKey") {
+                history.drain(..history.len() - 1);
+                cut = true;
+            }
+        }
+        cut
     }
 
     /// Apply several resources, all or nothing: if one is refused the store is left as it was.

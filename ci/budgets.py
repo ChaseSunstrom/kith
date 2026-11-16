@@ -273,7 +273,8 @@ def peak_rss(argv, env):
 
 
 def idle_rss(kithd, tmp):
-    """Resident set size of a kithd that serves its socket and has nothing to run.
+    """Resident set size of a kithd that serves its socket and has nothing to run, and how
+    much of it is anonymous (its own, not pages of its binary), both in bytes.
 
     Measured with the binary read from disk, as a node has it, and not as the linker left it:
     the kernel maps the cached pages around each page kithd touches, and pages a linker has
@@ -298,8 +299,8 @@ def idle_rss(kithd, tmp):
             time.sleep(0.05)
         time.sleep(0.5)  # past startup: the first reconcile pass has run
         with open(f"/proc/{daemon.pid}/status") as status:
-            line = next(l for l in status if l.startswith("VmRSS:"))
-        return int(line.split()[1]) * 1024
+            kb = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in status if l.startswith(("VmRSS:", "RssAnon:"))}
+        return kb["VmRSS"], kb["RssAnon"]
     finally:
         daemon.send_signal(signal.SIGTERM)
         daemon.wait()
@@ -401,8 +402,15 @@ def main():
         for name, (args, limit) in RSS_BUDGETS.items():
             rss = peak_rss([os.path.join(bin_dir, "kith"), *args], env)
             results.append(check(name, "peak RSS", rss, 1 if self_test else limit))
-        rss = idle_rss(os.path.join(bin_dir, "kithd"), tmp)
+        # The median of three starts, and its parts said: all but about 1 MB is pages of the
+        # binary, and how many of those the kernel maps around each one kithd touches is the
+        # page cache's doing (the same code read 9.21 MB and then 7.64 MB on a CI runner).
+        # A red line then says which part grew: its own memory, or the binary's pages (for
+        # those, ci/order.py).
+        starts = sorted(idle_rss(os.path.join(bin_dir, "kithd"), tempfile.mkdtemp(dir=tmp)) for _ in range(3))
+        rss, own = starts[1]
         results.append(check("kithd", "idle RSS", rss, 1 if self_test else KITHD_IDLE_RSS))
+        print(f"     kithd: of it {own / MB:.2f} MB its own, {(rss - own) / MB:.2f} MB pages of its binary; three starts: {', '.join(f'{r / MB:.2f}' for r, _ in starts)} MB")
         results.extend(relro_sealed(bin_dir, tmp, -1 if self_test else 0))
         timed = medians(bin_dir, tmp, 1 if self_test else RUNS)
         for name in TIMED:
