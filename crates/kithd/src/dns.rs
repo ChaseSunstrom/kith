@@ -549,7 +549,7 @@ mod tests {
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let listen = udp.local_addr().unwrap();
-        let pods = format!("{}/16", kith_mesh::pod::GATEWAY);
+        let pods = crate::pods::range().to_string();
         let forwarders: Vec<Cidr> = kith_dns::LOCAL_NETWORKS
             .into_iter()
             .chain([pods.as_str()])
