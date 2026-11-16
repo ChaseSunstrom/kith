@@ -496,6 +496,9 @@ async fn replica(
     state: &std::path::Path,
     lost_after: std::time::Duration,
 ) -> Result<Arc<Shared>, String> {
+    // One kept by an earlier version holds the NodeKeys of its day, and so does one a crash left
+    // between the rename and the cut: every start cuts, on any node.
+    cut_or_say(&state.join("store.json.imported"));
     let changed = Arc::new(Notify::new());
     let clock = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     let generation = watch::channel(clock.map_or(0, |d| d.as_millis() as u64)).0;
@@ -562,7 +565,7 @@ async fn replica(
         shared.raft.initialize(alone).await.map_err(|e| failed(&e))?;
     }
     // The store of a kithd from before replication comes in once, into an empty store.
-    let old = state.join("store.json");
+    let (old, kept) = (state.join("store.json"), state.join("store.json.imported"));
     if old.exists() {
         let empty = shared.store.lock().expect("nothing panics holding the store").store == Default::default();
         if empty {
@@ -570,7 +573,7 @@ async fn replica(
             let imported = shared.submit(kith_store::Command::Import { store }).await;
             imported.map_err(|e| format!("bringing in {}: {e}", old.display()))?;
             // Left in place it would come in again, should the store ever be empty.
-            std::fs::rename(&old, state.join("store.json.imported")).map_err(|e| {
+            keep_imported(&old, &kept).map_err(|e| {
                 format!(
                     "{} was brought in but cannot be moved aside ({e}): remove it",
                     old.display()
@@ -586,6 +589,37 @@ async fn replica(
         }
     }
     Ok(shared)
+}
+
+/// Keep the store from before replication aside, as `kept`, with no NodeKey in it: the
+/// replicated store holds them, and forgets or wipes them, which a copy here would outlive.
+fn keep_imported(old: &std::path::Path, kept: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(old, kept)?;
+    // (A cut that fails is said, not an error: it is tried again at each start.)
+    cut_or_say(kept);
+    Ok(())
+}
+
+fn cut_or_say(kept: &std::path::Path) {
+    if let Err(e) = strip_node_keys(kept) {
+        eprintln!(
+            "kithd: {} may hold NodeKeys and could not be cut ({e}); it is left as it is",
+            kept.display()
+        );
+    }
+}
+
+/// Rewrite the kept file without its NodeKeys (and their history), if it has any: a temporary
+/// file beside it, synced, renamed over it. A file that is not a store is left as it is.
+fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
+    if !kept.exists() {
+        return Ok(());
+    }
+    let mut file = kith_api::store::FileStore::read(kept).map_err(|e| e.to_string())?;
+    if file.store.drop_node_keys() {
+        file.save().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
@@ -1215,6 +1249,81 @@ spec: {}
         // A port of 0 is any port: not said.
         let any: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
         assert_eq!(serves(Some(any), false), serde_json::Value::Null);
+    }
+
+    /// A store with a NodeKey that has an earlier revision (as one written before the limit of one
+    /// holds), and a Workload beside it, as text.
+    fn old_store_text(wrapped: &str) -> String {
+        let key = |wrapped: &str| {
+            let id = "ab".repeat(32);
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata:\n  name: n1\nspec:\n  id: \"{id}\"\n  wrapped: \"{wrapped}\"\n"
+            );
+            kith_api::Resource::from_source(&text).unwrap().pop().unwrap().unwrap()
+        };
+        let mut store = kith_api::store::Store::default();
+        store.apply(key(wrapped)).unwrap();
+        let web = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: web\nspec:\n  template:\n    containers:\n      - name: web\n        image: nginx:1.27\n";
+        store
+            .apply(kith_api::Resource::from_source(web).unwrap().pop().unwrap().unwrap())
+            .unwrap();
+        let mut old = serde_json::to_value(&store).unwrap();
+        let first = old["resources"]["NodeKey/n1"][0].clone();
+        old["resources"]["NodeKey/n1"].as_array_mut().unwrap().insert(0, first);
+        old["resources"]["NodeKey/n1"][0]["resource"]["spec"]["wrapped"] = "deadbeef".repeat(8).into();
+        old.to_string()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kithd-imported-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// What the kept file holds is the store as it was, less every NodeKey and its history.
+    fn assert_kept_without_node_keys(kept: &std::path::Path, wrapped: &str) {
+        let text = std::fs::read_to_string(kept).unwrap();
+        for leaked in ["NodeKey", wrapped, "deadbeef"] {
+            assert!(!text.contains(leaked), "{leaked} is still in the kept file");
+        }
+        let store = kith_api::store::FileStore::read(kept).unwrap().store;
+        assert_eq!(
+            store.history("Workload/default/web").unwrap().len(),
+            1,
+            "the rest is as it was"
+        );
+    }
+
+    #[test]
+    fn imported_store_holds_no_node_key() {
+        let dir = scratch("import");
+        let (old, kept) = (dir.join("store.json"), dir.join("store.json.imported"));
+        let wrapped = "c0ffee".repeat(10); // pragma: allowlist secret
+        std::fs::write(&old, old_store_text(&wrapped)).unwrap();
+        keep_imported(&old, &kept).unwrap();
+        assert!(!old.exists());
+        assert_kept_without_node_keys(&kept, &wrapped);
+    }
+
+    #[test]
+    fn imported_store_from_an_earlier_version_is_rewritten_at_start_and_a_bad_one_left_alone() {
+        let dir = scratch("start");
+        let kept = dir.join("store.json.imported");
+        let wrapped = "c0ffee".repeat(10); // pragma: allowlist secret
+        std::fs::write(&kept, old_store_text(&wrapped)).unwrap();
+        strip_node_keys(&kept).unwrap();
+        assert_kept_without_node_keys(&kept, &wrapped);
+        assert!(!dir.join("store.json.imported.tmp").exists());
+        // A second start finds nothing to cut, and does not write.
+        let before = std::fs::metadata(&kept).unwrap().modified().unwrap();
+        strip_node_keys(&kept).unwrap();
+        assert_eq!(std::fs::metadata(&kept).unwrap().modified().unwrap(), before);
+        // A file that is not a store stays as it is; a missing one is nothing.
+        std::fs::write(&kept, "not json, a NodeKey wrapped").unwrap();
+        assert!(strip_node_keys(&kept).is_err());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "not json, a NodeKey wrapped");
+        assert!(strip_node_keys(&dir.join("absent")).is_ok());
     }
 
     #[test]
