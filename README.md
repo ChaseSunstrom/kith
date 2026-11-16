@@ -3406,9 +3406,11 @@ its seal when it hears of it.
 What the seal does not cover: a machine taken whole and started as it is
 opens its state by itself, and no lock reaches it until it hears its cluster
 again; what stands between whoever holds it and its state is then the running
-system alone. Nor a system taken while it runs, nor a TPM chip whose pins are
-probed while the machine starts (the key crosses its bus as it is), nor a
-machine with no TPM. It has run against a software TPM only, never on a real
+system alone. Nor a system taken while it runs, nor a machine with no TPM.
+The key crosses the TPM chip's bus encrypted, to the storage key whose name
+the seal keeps, so probing the chip's pins reads nothing; but someone on the
+bus when the seal was made, or who resets the TPM and replays an allowed
+start's measurements, can still get it (SECURITY.md). It has run against a software TPM only, never on a real
 one.
 
 **A passphrase.** For a machine with no TPM, or whose owner will not have

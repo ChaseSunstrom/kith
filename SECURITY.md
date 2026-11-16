@@ -843,10 +843,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   15) is refused the key and asks the cluster. The boot file is not signed for Secure
   Boot: a changed one starts, and is refused the key. Taken whole and started as it is, it
   opens by itself: no lock reaches a machine that does not hear its cluster. The key
-  crosses the TPM's bus as it is (a chip's pins can be probed while the machine
-  starts); after a start the TPM refused, the node seals again for whatever system
-  the cluster then handed the key to; and all of it has run against a software TPM
-  only.
+  crosses the TPM's bus encrypted, in a session salted to the TPM's storage key, whose
+  name is kept in the lock record (`tpm-parent:`) and checked before anything is sent,
+  so whoever only listens on the chip's pins reads no key, and a TPM that is not the
+  one sealed to is refused. What the session does not stop: someone on the bus when
+  the seal was made (they could answer with a key of their own, whose name is then the
+  one kept; a seal of the older form, with no name kept, is opened and sealed again
+  with whichever key answers), whoever can write both the bus and the lock record,
+  and someone who resets the TPM on its bus and replays the measurements of an
+  allowed start, then asks it for the key themselves. After a start the TPM refused,
+  the node seals again for whatever system the cluster then handed the key to; and
+  all of it has run against a software TPM only.
 - **The offline unlock gives up that the key is not on the machine.** A node that
   opens its encrypted state with no node in reach has its key on its own disk again:
   sealed to its TPM (above), or, with `kith node passphrase` (off unless one is given),
