@@ -103,6 +103,12 @@ impl Node {
             .current_dir(dir)
             .args(["--state", "state", "--socket", "kithd.sock", "--name", name])
             .args(["--listen", &format!("{host}:{port}")])
+            // (No registry unless a test names one: every node would else try port 5000.)
+            .args(if args.contains(&"--registry-port") {
+                Vec::new()
+            } else {
+                vec!["--registry-port", "0"]
+            })
             .args(args)
             .stdin(Stdio::null())
             .spawn()
@@ -144,7 +150,10 @@ impl Node {
     }
 
     fn stop(&mut self) {
-        let _ = Command::new("kill").arg(self.child.id().to_string()).status();
+        let _ = Command::new("kill")
+            .arg(self.child.id().to_string())
+            .stderr(Stdio::null())
+            .status();
         let _ = self.child.wait();
     }
 }
@@ -397,6 +406,131 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
     assert_eq!(names, ["beta"]);
 }
 
+/// Whether a stopped node's store holds `text` anywhere: its snapshot or a log entry.
+fn store_holds(node: &Node, text: &str) -> bool {
+    let raft = node.dir.join("state/raft");
+    let snapshot = std::fs::read_to_string(raft.join("snapshot.json")).unwrap_or_default();
+    snapshot.contains(text) || log_entries(&raft.join("log.redb")).unwrap().contains(text)
+}
+
+/// The entries the Raft log in `file` gives back, as JSON.
+fn log_entries(file: &Path) -> Result<String, String> {
+    use kith_store::openraft::RaftLogReader;
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let mut log = kith_store::Log::open(file)?;
+    let entries = runtime
+        .block_on(log.try_get_log_entries(..))
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::to_string(&entries).unwrap())
+}
+
+/// The same of a running node, read from a copy of its log (kithd holds the file's lock):
+/// `None` while the copy, taken in the middle of a write, does not read. A copy of a live
+/// file can be torn, so a wait on this is retried and proves nothing alone: the proof is
+/// [`store_holds`], read once the nodes have stopped.
+fn running_log_entries(node: &Node) -> Option<String> {
+    let copy = node.dir.join("log-copy.redb");
+    let _ = std::fs::remove_file(&copy);
+    std::fs::copy(node.dir.join("state/raft/log.redb"), &copy).ok()?;
+    log_entries(&copy).ok()
+}
+
+/// The cluster's duress code typed at one disk: no control node keeps either key it held,
+/// in its snapshot or its log, and `kith node unlock` has it hold a key again.
+/// (Not behind KITH_E2E: it pulls nothing.)
+#[test]
+fn forgotten_key_is_on_no_control_nodes_disk() {
+    use ring::signature::KeyPair;
+    // (Short: the socket's path is under it, and a socket's path has 107 bytes at most.)
+    let test = "forgot";
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let join = |name: &str| {
+        let token = alpha.ok(&["node", "token"]);
+        Node::start(test, name, &["--join", &alpha.address(), "--token", token.trim()])
+    };
+    let (beta, gamma) = (join("beta"), join("gamma"));
+    let mut nodes = [alpha, beta, gamma];
+    wait_for("three voters", || {
+        nodes
+            .iter()
+            .all(|node| node.ok(&["node", "status"]).contains("voters:    alpha, beta, gamma"))
+    });
+
+    let hex = |bytes: &[u8]| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+    let code = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+    let all = hex(code.public_key().as_ref());
+    let (one, other) = ("a1".repeat(32), "b2".repeat(32));
+    let (first, second, again) = ("5ea1ed01".repeat(8), "5ea1ed02".repeat(8), "5ea1ed03".repeat(8)); // pragma: allowlist secret
+    let key = |name: &str, id: &str, wrapped: &str| {
+        format!(
+            "---\napiVersion: kith.dev/v1\nkind: NodeKey\nmetadata: {{ name: {name} }}\nspec: {{ id: {id}, wrapped: {wrapped}, duressAll: {all} }}\n"
+        )
+    };
+    let keys = key("disk-a", &one, &first) + &key("disk-b", &other, &second);
+    std::fs::write(nodes[0].dir.join("keys.yaml"), keys).unwrap();
+    nodes[0].ok(&["apply", "-f", "keys.yaml"]);
+    let pki = |node: &Node| node.dir.join("state/pki");
+    let handed = |node: &Node, id: &str| {
+        let body = format!("{{\"id\":\"{id}\"}}");
+        ask_as_node(&node.address(), &pki(node), "POST", "/v1/unlock", Some(&body)).1
+    };
+    wait_for("gamma to hand out disk-b's key", || {
+        handed(&nodes[2], &other).contains(&second)
+    });
+
+    // The cluster's code, typed at disk-a: disk-a is wiped and disk-b forgotten.
+    let forget = |body: String| ask_as_node(&nodes[1].address(), &pki(&nodes[1]), "POST", "/v1/forget", Some(&body));
+    let (_, said) = forget(format!("{{\"id\":\"{one}\"}}"));
+    let said: serde_json::Value = serde_json::from_str(&said).unwrap();
+    let nonce = said["nonce"].as_str().unwrap();
+    let bytes: Vec<u8> = (0..nonce.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&nonce[at..at + 2], 16).unwrap())
+        .collect();
+    let signed = code.sign(&[b"kith-forget ", one.as_bytes(), b" ", &bytes].concat());
+    let signature = hex(signed.as_ref());
+    let (status, said) = forget(format!(
+        "{{\"id\":\"{one}\",\"nonce\":\"{nonce}\",\"signature\":\"{signature}\"}}"
+    ));
+    assert_eq!(status, "200", "{said}");
+    // Every control node snapshots the store as it is now.
+    for node in &nodes {
+        let snapshot = node.dir.join("state/raft/snapshot.json");
+        wait_for("a snapshot with the keys forgotten", || {
+            let held = std::fs::read_to_string(&snapshot).unwrap_or_default();
+            held.contains("forgotten") && !held.contains(&first) && !held.contains(&second)
+        });
+        // And drops its log up to there (a leader once no node it sends to reads it still).
+        wait_for("the log dropped up to the forget", || {
+            running_log_entries(node).is_some_and(|log| !log.contains(&first) && !log.contains(&second))
+        });
+    }
+    assert!(!handed(&nodes[2], &other).contains(&second));
+
+    // disk-b, opened with its recovery key, gives the cluster its key to hold again.
+    nodes[2].ok(&["node", "unlock", "disk-b"]);
+    std::fs::write(nodes[2].dir.join("again.yaml"), key("disk-b", &other, &again)).unwrap();
+    nodes[2].ok(&["apply", "-f", "again.yaml"]);
+    wait_for("alpha to hand out disk-b's new key", || {
+        handed(&nodes[0], &other).contains(&again)
+    });
+
+    for node in &mut nodes {
+        node.stop();
+    }
+    for node in &nodes {
+        assert!(
+            !store_holds(node, &first) && !store_holds(node, &second),
+            "{}",
+            node.dir.display()
+        );
+        assert!(store_holds(node, &again), "{}", node.dir.display());
+    }
+}
+
 #[test]
 fn the_store_survives_its_leader() {
     if std::env::var_os("KITH_E2E").is_none() {
@@ -443,6 +577,7 @@ fn the_store_survives_its_leader() {
     // The leader dies without a word: the two that are left pick one of themselves and go on.
     let _ = Command::new("kill")
         .args(["-9", &alpha.child.id().to_string()])
+        .stderr(Stdio::null())
         .status();
     let _ = alpha.child.wait();
     std::fs::write(beta.dir.join("after.yaml"), config("after")).unwrap();
