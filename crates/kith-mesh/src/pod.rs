@@ -18,7 +18,7 @@ use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, Ro
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use nix::sched::{CloneFlags, setns, unshare};
 use std::fs::File;
-use std::io::{Error, Result};
+use std::io::{Error, ErrorKind, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
@@ -98,6 +98,11 @@ impl Range {
 
     fn mask(&self) -> u32 {
         u32::MAX << (32 - self.bits)
+    }
+
+    /// The range as a network: its address and its length.
+    pub fn network(&self) -> (Ipv4Addr, u8) {
+        (self.network.into(), self.bits)
     }
 
     /// What every pod sends through, and where it asks for names: the range's first address,
@@ -222,8 +227,17 @@ fn address(index: u32, address: IpAddr, bits: u8) -> Result<()> {
 
 /// A route out of link `index`: to `to` alone, or (`None`) to everywhere, through `via`.
 fn route(index: u32, to: Option<IpAddr>, via: Option<IpAddr>) -> Result<()> {
+    let bits = match to {
+        Some(IpAddr::V4(_)) => 32,
+        _ => 128,
+    };
+    route_to(index, to.map(|to| (to, bits)), via)
+}
+
+/// The same, to the network `to` (an address and its length).
+fn route_to(index: u32, to: Option<(IpAddr, u8)>, via: Option<IpAddr>) -> Result<()> {
     let mut route = RouteMessage::default();
-    let v4 = matches!(to.or(via), Some(IpAddr::V4(_)));
+    let v4 = matches!(to.map(|to| to.0).or(via), Some(IpAddr::V4(_)));
     route.header.address_family = if v4 { AddressFamily::Inet } else { AddressFamily::Inet6 };
     route.header.table = 254; // main
     route.header.protocol = RouteProtocol::Boot;
@@ -237,8 +251,8 @@ fn route(index: u32, to: Option<IpAddr>, via: Option<IpAddr>) -> Result<()> {
         IpAddr::V4(address) => RouteAddress::Inet(address),
         IpAddr::V6(address) => RouteAddress::Inet6(address),
     };
-    if let Some(to) = to {
-        route.header.destination_prefix_length = if v4 { 32 } else { 128 };
+    if let Some((to, bits)) = to {
+        route.header.destination_prefix_length = bits;
         route.attributes.push(RouteAttribute::Destination(said(to)));
     }
     route
@@ -250,6 +264,11 @@ fn route(index: u32, to: Option<IpAddr>, via: Option<IpAddr>) -> Result<()> {
         NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
     )
     .map(drop)
+}
+
+/// The link of pod `number` on the node (an exit's pod's is [`crate::exit::link`]).
+pub fn link_of(number: u16) -> String {
+    format!("kp{number}")
 }
 
 fn index_of(name: &str) -> Result<u32> {
@@ -275,10 +294,26 @@ pub fn within<T: Send>(namespace: &(impl AsFd + Sync), f: impl FnOnce() -> T + S
 /// Make the pod `number` its network namespace, with the addresses [`addresses`] gives
 /// it, and give the namespace back: it lasts while this, or a process in it, does, and
 /// the links go with it. Only root can ([`node`] comes first, once).
-pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> {
+///
+/// With `exit` (a tunnel's number), it leaves by that tunnel only: its link is
+/// [`crate::exit::link`]'s, its rules ([`crate::exit::hold`]) are made, and read back,
+/// before its link is, and its IPv6 goes to the mesh and nowhere else.
+pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) -> Result<OwnedFd> {
     let (v4, _) = addresses(range, None, number);
     let gateway = range.gateway();
-    let host = format!("kp{number}");
+    let host = match exit {
+        Some(_) => crate::exit::link(number),
+        None => link_of(number),
+    };
+    // The mesh, where there is one: the /48 of the pod's address.
+    let mesh = v6.map(|v6| {
+        let mut bytes = v6.octets();
+        bytes[6..].fill(0);
+        (Ipv6Addr::from(bytes), crate::MESH_BITS)
+    });
+    if let Some(tunnel) = exit {
+        crate::exit::hold(&host, tunnel, range, mesh)?;
+    }
     // (A thread of its own: it is in the pod's namespace for a while, and nothing else of
     // this process must find itself there.)
     let made = || -> Result<OwnedFd> {
@@ -290,8 +325,11 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> 
         up(1)?; // (the loopback: the first link of a new namespace)
 
         enter(&ours)?;
-        // (One left by a pod of this number that is gone is in the way: away with it.)
-        let _ = ask_route(RouteNetlinkMessage::DelLink(link(0, Some(&host))), NLM_F_ACK);
+        // (One left by a pod of this number that is gone, of either kind, is in the way: it
+        // has the address. Away with it.)
+        for gone in [link_of(number), crate::exit::link(number)] {
+            let _ = ask_route(RouteNetlinkMessage::DelLink(link(0, Some(&gone))), NLM_F_ACK);
+        }
         let mut peer = link(0, Some("eth0"));
         peer.attributes.push(LinkAttribute::NetNsFd(pod.as_raw_fd()));
         let mut pair = link(0, Some(&host));
@@ -317,7 +355,10 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> 
         route(eth0, None, Some(gateway.into()))?;
         if let Some(v6) = v6 {
             address(eth0, v6.into(), 128)?;
-            route(eth0, None, Some(GATEWAY6.into()))?;
+            match (exit, mesh) {
+                (Some(_), Some((mesh, bits))) => route_to(eth0, Some((mesh.into(), bits)), Some(GATEWAY6.into()))?,
+                _ => route(eth0, None, Some(GATEWAY6.into()))?,
+            }
         }
         Ok(pod.into())
     };
@@ -332,15 +373,20 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>) -> Result<OwnedFd> 
 /// A machine that passed nothing on until now (or `guarded`: until this was done here
 /// before) passes on only what comes from or goes to a pod: it is no more of a router for
 /// anyone else than it was. Returns whether that is so, for the caller to say next time.
-pub fn node(range: Range, guarded: bool) -> Result<bool> {
-    node_with(range, guarded, true)
+///
+/// Whatever the guard, the pods of an exit (links `kpx`) pass on only to their tunnel
+/// (`kx`), to another pod, and to the mesh (link `mesh`), and nothing of theirs reaches
+/// the node itself but answers to what it asked of them. (What comes in by a tunnel is
+/// [`crate::exit::guard`]'s, made before the tunnel is.)
+pub fn node(range: Range, guarded: bool, mesh: &str) -> Result<bool> {
+    node_with(range, guarded, true, mesh)
 }
 
-fn node_with(range: Range, guarded: bool, masquerade: bool) -> Result<bool> {
+fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str) -> Result<bool> {
     crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
-    nat(range, guard, masquerade)?;
+    nat(range, guard, masquerade, mesh)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -352,6 +398,11 @@ fn node_with(range: Range, guarded: bool, masquerade: bool) -> Result<bool> {
     std::fs::write(passes, "1")?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     Ok(guard)
+}
+
+/// Whether the tables [`node`] makes are there (gone with `nft flush ruleset`, say).
+pub fn tables() -> Result<bool> {
+    has_table(INET, "kith-pods")
 }
 
 // ---- nftables, as the kernel takes it (nfnetlink): a few attributes by hand ----
@@ -371,7 +422,7 @@ fn text(kind: u16, text: &str) -> Vec<u8> {
     attribute(kind, &[text.as_bytes(), &[0]].concat())
 }
 
-fn number(kind: u16, number: u32) -> Vec<u8> {
+pub(crate) fn number(kind: u16, number: u32) -> Vec<u8> {
     attribute(kind, &number.to_be_bytes())
 }
 
@@ -387,51 +438,68 @@ fn is(bytes: &[u8]) -> Vec<u8> {
     expression("cmp", &[number(1, 1), number(2, 0), value])
 }
 
+/// The name of the link a packet came in by (6) or goes out by (7), in register 1.
+fn link_name(which: u32) -> Vec<u8> {
+    expression("meta", &[number(2, which), number(1, 1)])
+}
+
+/// A verdict: accept (1) or drop (0).
+pub(crate) fn verdict(code: u32) -> Vec<u8> {
+    let verdict = attribute(2 | NESTED, &attribute(2 | NESTED, &number(1, code)));
+    expression("immediate", &[number(1, 0), verdict])
+}
+
+/// It came in by a link whose name begins with `name`.
+pub(crate) fn came_by(name: &[u8]) -> Vec<u8> {
+    [link_name(6), is(name)].concat()
+}
+
+/// Its connection is one already seen both ways, or one such a connection made.
+pub(crate) fn answering() -> Vec<u8> {
+    state(2 | 4)
+}
+
+/// Its connection's state is one of `states`' bits: 2, seen both ways; 4, made by such a
+/// connection (an ICMP error of it); 64, not tracked at all (IPv6's neighbour discovery).
+fn state(states: u32) -> Vec<u8> {
+    let state = expression("ct", &[number(1, 1), number(2, 0)]);
+    let (mask, nothing) = (states.to_ne_bytes(), 0u32.to_ne_bytes());
+    let masked = expression(
+        "bitwise",
+        &[
+            number(1, 1),
+            number(2, 1),
+            number(3, 4),
+            attribute(4 | NESTED, &attribute(1, &mask)),
+            attribute(5 | NESTED, &attribute(1, &nothing)),
+        ],
+    );
+    let some = expression(
+        "cmp",
+        &[
+            number(1, 1),
+            number(2, 1),
+            attribute(3 | NESTED, &attribute(1, &nothing)),
+        ],
+    );
+    [state, masked, some].concat()
+}
+
+/// Its connection is marked as one a pod of an exit started ([`crate::exit::MARK`]).
+fn marked() -> Vec<u8> {
+    let value = attribute(2 | NESTED, &attribute(1, &crate::exit::MARK.to_ne_bytes()));
+    let mark = expression("immediate", &[number(1, 1), value]);
+    [mark, expression("ct", &[number(2, 3), number(4, 1)])].concat()
+}
+
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
 /// comes in from or goes out to a pod's link.
-fn nat(range: Range, guard: bool, masquerade: bool) -> Result<()> {
-    const TABLE: &str = "kith-pods";
-    let (ip, inet) = (2u8, 1u8);
-    // (New table, delete table, new chain, new rule: of the subsystem nftables, 10.)
-    let (new_table, delete_table, new_chain, new_rule) = (0xa00u16, 0xa02u16, 0xa03u16, 0xa06u16);
-    let mut batch = Vec::new();
-    let mut sequence = 0u32;
-    let mut say = |kind: u16, family: u8, subsystem: u16, attributes: &[Vec<u8>]| {
-        let attributes = attributes.concat();
-        sequence += 1;
-        batch.extend((attributes.len() as u32 + 20).to_ne_bytes());
-        batch.extend(kind.to_ne_bytes());
-        // A request; what is not the batch's own beginning or end: acknowledged, and may create.
-        batch.extend(if subsystem == 0 { 0x405u16 } else { 1 }.to_ne_bytes());
-        batch.extend(sequence.to_ne_bytes());
-        batch.extend(0u32.to_ne_bytes());
-        batch.extend([family, 0]);
-        batch.extend(subsystem.to_be_bytes());
-        batch.extend(attributes);
-    };
-    let chain = |name: &str, kind: &str, hook: u32, priority: u32, policy: Option<u32>| {
-        let hook = attribute(4 | NESTED, &[number(1, hook), number(2, priority)].concat());
-        let mut chain = vec![text(1, TABLE), text(3, name), hook, text(7, kind)];
-        chain.extend(policy.map(|policy| number(5, policy)));
-        chain
-    };
-    let rule = |chain: &str, expressions: &[Vec<u8>]| {
-        vec![
-            text(1, TABLE),
-            text(2, chain),
-            attribute(4 | NESTED, &expressions.concat()),
-        ]
-    };
-    say(0x10, 0, 10, &[]); // a batch begins
-    for family in [ip, inet] {
-        // (Made so that it is there to take away: what an earlier kithd left goes.)
-        say(new_table, family, 0, &[text(1, TABLE)]);
-        say(delete_table, family, 0, &[text(1, TABLE)]);
-    }
-    say(new_table, ip, 0, &[text(1, TABLE)]);
+fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
+    let mut batch = Batch::new("kith-pods");
+    batch.table(IP);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
-    say(new_chain, ip, 0, &chain("out", "nat", 4, 100, None));
+    batch.chain(IP, "out", "nat", 4, 100, None);
     // Where it comes from (4 bytes, 12 into the IP header), with all but the range's bits
     // cleared (bitwise: and with the mask, or with 0), is the range's network.
     let from = expression("payload", &[number(1, 1), number(2, 1), number(3, 12), number(4, 4)]);
@@ -448,30 +516,139 @@ fn nat(range: Range, guard: bool, masquerade: bool) -> Result<()> {
         ],
     );
     if masquerade {
-        say(
-            new_rule,
-            ip,
-            0,
-            &rule("out", &[from, masked, is(&network), expression("masq", &[])]),
-        );
+        batch.rule(IP, "out", &[from, masked, is(&network), expression("masq", &[])]);
     }
+    batch.table(INET);
+    // What is passed on (hook 2): with the guard, dropped (0) unless a rule lets it through.
+    batch.chain(INET, "passed", "filter", 2, 0, Some(u32::from(!guard)));
+    // What comes to the node itself (hook 1).
+    batch.chain(INET, "in", "filter", 1, 0, Some(1));
+    let to = |name: &[u8]| [link_name(7), is(name)].concat();
+    let mesh = [mesh.as_bytes(), &[0]].concat();
+    // A pod of an exit asks nothing of its node: what comes from one to the node itself is
+    // an answer to what the node asked of it (a Service's relay or probe, at its mesh
+    // address), an ICMP error of such, or IPv6's neighbour discovery (not tracked). Any
+    // other port of the node's, its DNS and kithd's API among them, hears nothing of it.
+    batch.rule(INET, "in", &[came_by(b"kpx"), state(2 | 4 | 64), verdict(1)]);
+    batch.rule(INET, "in", &[came_by(b"kpx"), verdict(0)]);
+    // (What comes in by a tunnel to be passed on is an answer, or the guard drops it; an
+    // answer is passed whatever this table's policy.)
+    batch.rule(INET, "passed", &[came_by(b"kx"), answering(), verdict(1)]);
+    batch.rule(INET, "passed", &[came_by(b"kpx"), marked()]);
+    for allowed in [&b"kx"[..], b"kp", &mesh] {
+        batch.rule(INET, "passed", &[came_by(b"kpx"), to(allowed), verdict(1)]);
+    }
+    batch.rule(INET, "passed", &[came_by(b"kpx"), verdict(0)]);
     if guard {
-        say(new_table, inet, 0, &[text(1, TABLE)]);
-        // What is passed on (hook 2): dropped (0) unless a rule lets it through.
-        say(new_chain, inet, 0, &chain("passed", "filter", 2, 0, Some(0)));
-        // (6 and 7: the names of the links it came in by and goes out by.)
         for link in [6, 7] {
-            let name = expression("meta", &[number(2, link), number(1, 1)]);
-            let verdict = attribute(2 | NESTED, &attribute(2 | NESTED, &number(1, 1)));
-            let accept = expression("immediate", &[number(1, 0), verdict]);
-            say(new_rule, inet, 0, &rule("passed", &[name, is(b"kp"), accept]));
+            batch.rule(INET, "passed", &[link_name(link), is(b"kp"), verdict(1)]);
         }
     }
-    say(0x11, 0, 10, &[]); // and ends
-    let last = sequence - 1;
+    batch.send()
+}
 
+/// nftables' families of tables: IPv4's, and both IPv4's and IPv6's.
+const IP: u8 = 2;
+pub(crate) const INET: u8 = 1;
+
+/// A netfilter batch, of the table `table`'s messages: sent whole, the kernel takes all of
+/// it or none (a table made anew has no moment without its rules).
+pub(crate) struct Batch {
+    bytes: Vec<u8>,
+    sequence: u32,
+    table: &'static str,
+}
+
+impl Batch {
+    pub(crate) fn new(table: &'static str) -> Batch {
+        let mut batch = Batch {
+            bytes: Vec::new(),
+            sequence: 0,
+            table,
+        };
+        batch.say(0x10, 0, 10, &[]); // a batch begins
+        batch
+    }
+
+    fn say(&mut self, kind: u16, family: u8, subsystem: u16, attributes: &[Vec<u8>]) {
+        let attributes = attributes.concat();
+        self.sequence += 1;
+        let bytes = &mut self.bytes;
+        bytes.extend((attributes.len() as u32 + 20).to_ne_bytes());
+        bytes.extend(kind.to_ne_bytes());
+        // A request; what is not the batch's own beginning or end: acknowledged, and may
+        // create; a rule after the chain's others (append: else the kernel puts it first,
+        // and a chain runs backwards, its drop ahead of the accept meant to come before).
+        let flags: u16 = match (subsystem, kind) {
+            (0, 0xa06) => 0xc05,
+            (0, _) => 0x405,
+            _ => 1,
+        };
+        bytes.extend(flags.to_ne_bytes());
+        bytes.extend(self.sequence.to_ne_bytes());
+        bytes.extend(0u32.to_ne_bytes());
+        bytes.extend([family, 0]);
+        bytes.extend(subsystem.to_be_bytes());
+        bytes.extend(attributes);
+    }
+
+    /// The table of `family` made anew: nothing an earlier one (an earlier kithd's) had stays.
+    pub(crate) fn table(&mut self, family: u8) {
+        // (New table, delete table, new table, of nftables' (10): made, so it is there to take away.)
+        let name = [text(1, self.table)];
+        for kind in [0xa00, 0xa02, 0xa00] {
+            self.say(kind, family, 0, &name);
+        }
+    }
+
+    /// A chain of the table, at `hook` with `priority`, and `policy` (accept, 1, or drop,
+    /// 0) for what no rule of it takes.
+    pub(crate) fn chain(&mut self, family: u8, name: &str, kind: &str, hook: u32, priority: u32, policy: Option<u32>) {
+        let hook = attribute(4 | NESTED, &[number(1, hook), number(2, priority)].concat());
+        let mut chain = vec![text(1, self.table), text(3, name), hook, text(7, kind)];
+        chain.extend(policy.map(|policy| number(5, policy)));
+        self.say(0xa03, family, 0, &chain);
+    }
+
+    /// A rule at the end of `chain`, of `expressions`.
+    pub(crate) fn rule(&mut self, family: u8, chain: &str, expressions: &[Vec<u8>]) {
+        let rule = [
+            text(1, self.table),
+            text(2, chain),
+            attribute(4 | NESTED, &expressions.concat()),
+        ];
+        self.say(0xa06, family, 0, &rule);
+    }
+
+    pub(crate) fn send(mut self) -> Result<()> {
+        self.say(0x11, 0, 10, &[]); // and ends
+        netfilter(&self.bytes, self.sequence - 1)
+    }
+}
+
+/// Whether nftables has the table `name` of `family`.
+pub(crate) fn has_table(family: u8, name: &str) -> Result<bool> {
+    // (Get table, of nftables' (10): a request, acknowledged.)
+    let attributes = text(1, name);
+    let mut message = Vec::new();
+    message.extend((attributes.len() as u32 + 20).to_ne_bytes());
+    message.extend(0xa01u16.to_ne_bytes());
+    message.extend(5u16.to_ne_bytes());
+    message.extend(1u32.to_ne_bytes());
+    message.extend(0u32.to_ne_bytes());
+    message.extend([family, 0, 0, 0]);
+    message.extend(attributes);
+    match netfilter(&message, 1) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Send netfilter `batch`, and take its answers: a no is the answer, or message `last`'s yes.
+pub(crate) fn netfilter(batch: &[u8], last: u32) -> Result<()> {
     let socket = crate::netlink::socket(12)?; // netfilter's
-    socket.send(&batch, 0)?;
+    socket.send(batch, 0)?;
     // The kernel answers each message in turn: a no is the answer, or the last one's yes.
     loop {
         let (bytes, _) = socket.recv_from_full().map_err(silent)?;
@@ -615,6 +792,17 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_goes_after_the_chains_others() {
+        // (Without append, 0x800, the kernel puts each rule first: the guard's drop of
+        // what comes by a tunnel ran ahead of its accept of the answers.)
+        let mut batch = Batch::new("t");
+        let start = batch.bytes.len();
+        batch.rule(INET, "c", &[verdict(1)]);
+        let flags = u16::from_ne_bytes([batch.bytes[start + 6], batch.bytes[start + 7]]);
+        assert_eq!(flags, 0xc05);
+    }
+
+    #[test]
     fn a_pods_addresses_are_its_nodes() {
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let (v4, v6) = addresses(Range::default(), Some(net), 0x0102);
@@ -641,19 +829,19 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, false) {
+        let masquerade = match node(range, false, "kith0") {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, false, false).unwrap());
+            assert!(node_with(range, false, false, "kith0").unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
             .map(|number| {
                 let (v4, v6) = addresses(range, Some(net), number);
-                let namespace = make(range, number, v6).unwrap();
+                let namespace = make(range, number, v6, None).unwrap();
                 let listener = within(&namespace, || TcpListener::bind("[::]:80")).unwrap().unwrap();
                 (namespace, listener, v4, v6.unwrap())
             })
@@ -711,6 +899,7 @@ mod tests {
             );
         });
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, true, masquerade).unwrap());
+        assert!(node_with(range, true, masquerade, "kith0").unwrap());
+        assert!(tables().unwrap());
     }
 }

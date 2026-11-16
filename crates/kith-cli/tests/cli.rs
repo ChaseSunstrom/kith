@@ -278,8 +278,8 @@ fn examples_and_schemas() {
     assert_eq!(sb.kith(&["diff", "-f", examples]).0, 0);
 
     let (_, out, _) = sb.kith(&["schema"]);
-    // (A heading and the 35 kinds the README counts.)
-    assert_eq!(out.lines().count(), 36);
+    // (A heading and the 36 kinds the README counts.)
+    assert_eq!(out.lines().count(), 37);
     let (_, out, _) = sb.kith(&["schema", "workload"]);
     let schema: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(schema["title"], "Workload");

@@ -188,6 +188,59 @@ Only the newest version is fixed. There are no security releases of older ones.
   there has the fourteen capabilities a container runtime gives by default, and no
   other; and its root file system is its own to write. It keeps `no_new_privs`, the
   seccomp filter and its namespaces, and has a network namespace of its own.
+- **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
+  tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
+  the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
+  kithd writes, and reads back, routing rules in both families for that link: IPv4 to the
+  tunnel's own table (with no tunnel there, unreachable), IPv6 to the mesh's range only
+  and unreachable past it. The firewall (`inet kith-pods`, chain `passed`) drops whatever
+  comes from an exit's pod link (`kpx`) unless it goes to a tunnel, another pod or the
+  mesh, and its chain `in` drops what comes from one to the node itself unless it
+  answers what the node asked of the pod: an exit's pod reaches no service of its
+  node's, its DNS and kithd's API among them, on any port. What comes in by a tunnel
+  (`inet kith-exits`, made, whole, before each tunnel is) is dropped, to the node itself
+  or passed on, unless it answers a connection sent out by it: the provider's end
+  reaches nothing of the node's, with a pod or none. These rules are the kernel's, so
+  they hold with kithd stopped or killed; a node that starts again makes `inet kith-exits`
+  again before its first tunnel, and `kith-pods` before its first pod. Taken away by hand
+  while pods run (`nft flush ruleset`), they are made again within a minute: until then an
+  exit's pod may reach the node's services. The pod's DNS is the exit's, through the tunnel. When a tunnel is made again or goes, the connections its pods had are
+  forgotten (conntrack), so none goes on by an older path. A pod names an exit only from
+  a namespace the Exit lists: refused at apply, and again by the node before it starts
+  one. Its replicas are placed on the Exit's node, and every other node refuses to start
+  them; a build older than exits refuses such a template outright (its fields are
+  checked), so it cannot run one with no tunnel. The Exit and its Secret are sent only
+  to the Exit's node; the Secret is in `kith-system`, read by kithd, mounted in no
+  container. Writing an Exit is cluster-wide: a Role scoped to a namespace cannot. kithd
+  asks the kernel for this over netlink: routing rules (`RTM_NEWRULE`/`RTM_DELRULE`), a
+  WireGuard device and its peer, and conntrack's flush by mark; kith OS's kernel has
+  multiple routing tables in both families, connection marks and conntrack over netlink
+  for it. Two Exits whose providers gave them one address each keep their own rules:
+  taking one away leaves the other's that sends nowhere what the node sends from that
+  address. About every minute kithd checks each tunnel's link, its table's route and its
+  rules, and makes the tunnel again when one is gone (until then what is left sends the
+  pods' packets nowhere); a change to an Exit's namespaces or DNS alone leaves the tunnel
+  as it is. A pod's own rules are read back when it starts, not after: root taking one
+  away by hand on a running node is not seen. A published port (`publish: true`) is kithd listening on the node's IPv4
+  addresses and passing what comes to the pod's own address (the app sees that address,
+  not the client's; one listening on 127.0.0.1 alone is not reached): no rule of the
+  kernel's lets anything else in. No port below 1024 is published, nor kithd's own
+  (5000, 7443 and 51820 are refused at apply; the ports the node was started with, its
+  DNS and ingress among them, by the node, which says so in its log). A connection ends
+  after 10 seconds if nothing has been sent either way yet, after 10 minutes with nothing
+  sent once something has, or when its port is no longer published. Each port has 2
+  connections or UDP senders of its own, and the node's ports share 64 more, taken after a
+  connection is accepted: a client that fills one port and all that the node shares leaves
+  each other port its 2, and a connection past that is ended at once. A new UDP sender
+  past that takes the place of the one of its port heard from longest ago. A pod publishes
+  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
+  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
+  node with many clients of its API or ingress besides can still run out. A port another
+  namespace's Workload or Job publishes is refused at apply, and on a node the pod that
+  has a port keeps it while it asks, another pod of its namespace after it, so one
+  namespace's pod never takes another's; where pods of two namespaces ask for a port no
+  pod has (one written through the log, by a Release or Source, is not asked at apply, and
+  a node that starts again has none), none of them has it.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -438,6 +491,24 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   container's own user can read, and in the container's description that the runtime
   keeps in the node's state while it runs: on that disk, encrypted only where the
   state is. A ConfigMap's files are on the state disk too.
+- **An Exit keeps a pod's packets in its tunnel, not the pod's secrets from its provider.**
+  The provider sees everything the pod sends, and answers its names. A published port of
+  an exit's pod is open to whoever reaches the node's address: it is the pod's web UI on
+  the LAN, and nothing keeps the internet from it but the node's own place on the network.
+  An Exit whose Secret's file is wrong, or whose node is not root, runs none of its pods
+  (they wait, and their status says why); a name in `Endpoint` is refused, not looked up.
+  An exit's pod is not given the cluster's names, and a Service may not reach it. A
+  Release or Source applied by an admin skips the apply-time namespace check (it writes
+  through the log); the node's own check before start still refuses an unlisted namespace.
+  Of the node itself, an exit's pod reaches nothing (only answers to the node's own
+  questions of it go back). A running pod keeps its tunnel after its namespace is taken
+  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
+  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  away by hand on a running node (the code that makes it again is tested in a network
+  namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
+  starting a pod and making its rules (the rules come first; nothing shows the order
+  holds under a kill), and names a pod's own resolver library cached before its exit
+  changed.
 - **What a replica writes outside its Volumes is held at the write where the state disk
   keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
   disk scratch share the node's state disk. Where the state disk keeps project quotas (a

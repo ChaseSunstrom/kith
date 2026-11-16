@@ -257,7 +257,9 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
         let key = resource.key();
         // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
         // to one node waits, with the reason.
-        let node = match crate::volumes::together(claims.get(&key), mounts.get(&key)) {
+        let node = crate::volumes::together(claims.get(&key), mounts.get(&key));
+        // (And where its exit is.)
+        let node = match node.and_then(|node| crate::exits::pinned(store, resource, node)) {
             Ok(node) => node,
             Err(why) => {
                 waiting.extend((0..count).map(|replica| (format!("{key}#{replica}"), why.clone())));
