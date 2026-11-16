@@ -3200,6 +3200,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
 Then nothing is asked, and nothing confirmed: a stick with answers on it
