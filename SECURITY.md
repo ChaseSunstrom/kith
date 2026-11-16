@@ -210,7 +210,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   makes is written down as the Source's writer. Rights lost later stop the next render,
   not what is installed; a writer whose Identity is gone, or a Release or Source with no
   writer written down (one from before this check), makes nothing until it is applied
-  again.
+  again. The writer is its name and the print of the Identity's `publicKey`
+  (`kith.dev/written-key`, SHA-256 as a node's certificate is kept), also written
+  by the API; an Identity given a new certificate, or made again under the same name,
+  has another key, and its Releases and Sources make nothing new and fetch nothing
+  until it applies them again. The local socket's have no key.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -821,8 +825,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
-  - An Identity deleted and made again under the same name is the same writer: what
-    the old one applied renders with the new one's rights.
+  - A Release and a Source act as the Identity that applied them while it has the key
+    it had then. An Identity made again under the same name has another key, so what
+    the old one applied is not acted on as the new one: it makes nothing new, fetches no
+    Package, and says to apply it again; what was installed stays. The same after a
+    new certificate for the Identity (a certificate lasts ten years). A Source that
+    makes a Release writes the Source's name and print on it.
   - During an upgrade, a node from before this check neither writes the writer down nor
     checks it; and each Release and Source from before it makes nothing new until it is
     applied again.
