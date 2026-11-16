@@ -2028,7 +2028,15 @@ mod tests {
                 no_node_root: true,
                 ..pod.clone()
             };
-            let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), (kithd, Gid::from_raw(0)), shift);
+            let made = spec_shifted(
+                "a",
+                &image,
+                &unit,
+                "/kith/a",
+                Path::new("/b"),
+                (kithd, Gid::from_raw(0)),
+                shift,
+            );
             assert_eq!(made.is_err(), refused, "{kithd} {shift:?}");
             assert!(made.err().is_none_or(|e| e.to_string().contains(NODE_ROOT)));
         }
