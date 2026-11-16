@@ -475,10 +475,9 @@ pub(crate) async fn applied(
         let nodes: Vec<_> = nodes
             .map(|node| (node.metadata.name.as_str(), Some(&node.spec)))
             .collect();
-        access::control_stays(&state.store, &nodes)
-            .and_then(|()| crate::releases::claims(&state.store, &resources))
-            .and_then(|()| crate::exits::admitted(&state.store, &resources))
-            .and_then(|()| crate::pods::unshared(&state.store, &resources))
+        // (An Exit's rule and a published port's are asked where it is written: `submit_as`.)
+        let stays = access::control_stays(&state.store, &nodes);
+        stays.and_then(|()| crate::releases::claims(&state.store, &resources))
     };
     if let Err(why) = claimed {
         shared.audit.record(caller, "apply", keys, Err(why.clone()));

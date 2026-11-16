@@ -629,9 +629,15 @@ impl Shared {
     /// [`Shared::submit`] for `who`: an Identity's write is decided again where it is put in
     /// the log ([`Shared::turn`]).
     pub async fn submit_as(&self, command: Command, who: Option<&Caller>) -> Result<Done, Error> {
+        // What every writer is asked, a Release's, a Source's and a controller's too: these
+        // are not rules of the API alone. (Asked of this node's store: of two writes at once
+        // both can pass, and then each node's own rule decides, `pods::chosen`.)
         if let Command::Apply { resources, .. } = &command {
             let state = self.store.lock().expect("a handler panicked holding the store");
-            crate::blobs::put_first(&state.store, resources).map_err(Error::Invalid)?;
+            let asked = crate::blobs::put_first(&state.store, resources)
+                .and_then(|()| crate::exits::admitted(&state.store, resources))
+                .and_then(|()| crate::pods::unshared(&state.store, resources));
+            asked.map_err(Error::Invalid)?;
         }
         self.write_as(command, who).await.map(|(done, _)| done)
     }
@@ -1835,6 +1841,39 @@ mod tests {
         HEARD.lock().unwrap().insert(id, (kith_store::FORMAT, Instant::now()));
         let _ = send("snapshot").await;
         assert_eq!(reached(), 2);
+    }
+
+    /// What an apply is asked, every writer is asked: a Workload a Release, a Source or a
+    /// controller writes goes into the log through `Shared::submit`, and is refused there for
+    /// a port another namespace publishes or an Exit that does not list its namespace.
+    #[tokio::test]
+    async fn every_writer_is_asked_what_an_apply_is() {
+        let dir = std::env::temp_dir().join(format!("kithd-every-writer-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let workload = |namespace: &str, name: &str, template: serde_json::Value| -> kith_api::Resource {
+            let mut template = template;
+            template["pod"] = true.into();
+            template["containers"][0]["name"] = "c".into();
+            template["containers"][0]["image"] = "x".into();
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kith.dev/v1", "kind": "Workload", "metadata": {"name": name, "namespace": namespace},
+                "spec": {"template": template},
+            }))
+            .unwrap()
+        };
+        let web = || serde_json::json!({ "containers": [{ "ports": [{ "port": 8080, "publish": true }] }] });
+        let write = async |resources: Vec<kith_api::Resource>| {
+            let written = shared.submit(Command::Apply { resources, at: 1 }).await;
+            written.map(drop).map_err(|e| e.to_string())
+        };
+        write(vec![workload("media", "web", web())]).await.unwrap();
+        let refused = write(vec![workload("other", "web", web())]).await.unwrap_err();
+        assert!(refused.ends_with("TCP port 8080 is not available"), "{refused}");
+        write(vec![workload("media", "second", web())]).await.unwrap();
+        let through = serde_json::json!({ "exit": "vpn", "containers": [{}] });
+        let refused = write(vec![workload("other", "dl", through)]).await.unwrap_err();
+        assert!(refused.ends_with("there is no Exit vpn"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The store is marked (format 2, which a kithd from before does not read) only once

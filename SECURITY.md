@@ -236,13 +236,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
   its limit of open files (1024), and its listeners, API and ingress take of it too, so a
   node with many clients of its API or ingress besides can still run out. A port another
-  namespace's Workload or Job publishes is refused at apply, and on a node the pod that
-  has a port keeps it while it asks, another pod of its namespace after it, so one
+  namespace's Workload or Job publishes is refused when written, and so is a pod through
+  an Exit that does not list its namespace: both are asked of every writer (a person's
+  apply, a Release, a Source, kithd's own controllers), where the write goes into the
+  log. Two writes at once can both pass, and a rollback to an older revision is not
+  asked; then each node's own rule decides (an Exit's node lets in only pods of the
+  namespaces it lists): the pod
+  that has a port keeps it while it asks, another pod of its namespace after it, so one
   namespace's pod never takes another's. The node keeps which namespace has each port in
   a file of its own (`published.json` in its state, not the store), and holds the port to
   that namespace for as long as a Workload or Job of it asks for the port: across a restart
   of kithd, and while the pod that had it is made again, a pod of another namespace that
-  asks for it (one written through the log, by a Release or Source, is not asked at apply)
+  asks for it (one of two writes at once, or one a rollback brought back)
   neither takes it nor stops it, and kithd's log says it was refused. After a restart
   nothing is let go until the node's store is as new as it was. Where pods of two
   namespaces ask for a port the node has kept for neither (a first start, a file that
