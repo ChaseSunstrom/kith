@@ -1449,7 +1449,7 @@ EOF
             # spec's three (the runtime's default), on a cut node as on any, so it reads the same
             # as it would uncut; the cut itself is only in kithd's own CapBnd, above.
             podded=false
-            job plain n1 '"image":"kith.test/pod:1","command":["/bin/pod","tell"]'
+            job plain n1 '"image":"kith.test/pod:1","runAsUser":0,"command":["/bin/pod","tell"]'
             podded=true
             grep -q 'tell: started uid 0 ' "$work/plain.out" || fail "the container that is root and not a pod did not start as root: $(cat "$work/plain.out" "$work/plain.err")"
             grep -m1 'tell: started uid 0 ' "$work/plain.out" | sed 's/^/vm.sh: the container that is root and not a pod: /' >&2
