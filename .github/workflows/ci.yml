@@ -44,6 +44,11 @@ jobs:
       # with no lld of its own orders nothing: this fails then too, saying so).
       - name: kithd's order file still names its functions
         run: python3 ci/order.py --self-test && python3 ci/order.py --check
+      # ... and names what kithd runs today: code written since the last trace that runs at start
+      # or idle is linked wherever the compiler put it (43 such functions once cost 2 MB).
+      # Printed, not enforced, until a run here says how many another CPU's own functions are.
+      - name: kithd's order file names what kithd runs (printed, not enforced)
+        run: python3 ci/order.py --stale || true
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
       - name: Times on the CI runner (printed, not enforced)
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --times

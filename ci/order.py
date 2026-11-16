@@ -16,6 +16,9 @@ needs a registry).
     python3 ci/order.py --check   how many of the file's names the built kithd still has, and
                                   has together where its code starts: exit 1 under 95 in 100
                                   of the names, or four fifths of those together
+    python3 ci/order.py --stale   trace and write nothing: exit 1 when more than a few
+                                  functions that ran are not in the file (code written since
+                                  that runs at start or idle: write the file again)
     python3 ci/order.py --self-test   what a name keeps through an ordinary change
 
 How: a breakpoint on the first byte of every function (the linker's map says where each
@@ -52,6 +55,10 @@ ORDER = os.path.join(ROOT, "crates/kithd/kithd.order")
 IDLE = 12
 # The longest any one thing asked of the traced kithd may take (it runs slower, traced).
 LIMIT = 120
+# How many functions may run that kithd.order does not name before --stale fails. Four traces
+# of one build named none (of 5206 to 5209 that ran); the 43 that one change added without a
+# new trace cost 2 MB of idle memory.
+STALE = 8
 # What the order must name, or the traced run did not do what it says: the TLS handshake a
 # node listener makes, the answer to a DNS query, and a write through Raft.
 MUST = {"a TLS handshake": "6rustls6server", "a DNS answer": "8kith_dns6answer","a write through Raft": "12client_write"}
@@ -255,8 +262,15 @@ def traced(kithd, functions):
     return order
 
 
+def unnamed(ran, names):
+    """The patterns of `ran`, in its order, that the file's `names` do not hold."""
+    names = set(names)
+    return [pattern for pattern in ran if pattern not in names]
+
+
 def self_test():
     """What a name keeps through an ordinary change, and what it does not."""
+    assert unnamed(["a", "b", "c"], ["c", "a"]) == ["b"] and unnamed([], ["a"]) == []
     # A crate's hash, an impl's number in its module, and the number the compiler gives a copy.
     was = "_RNvMs0_NtCshUCiHv8I5f8_5alloc5allocNtB5_6Global18alloc_impl_runtime.7057"
     now = "_RNvMs1_NtCs1gUZZmupoa8_5alloc5allocNtB5_6Global18alloc_impl_runtime.4840"
@@ -277,6 +291,7 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description="Trace kithd at start, through a node's first minute and idle, and write kithd.order, the order the linker lays its code out in.")
     parser.add_argument("--self-test", action="store_true", help="run the name-pattern assertions and nothing else")
+    parser.add_argument("--stale", action="store_true", help="write nothing: trace, and fail if more than a few functions that ran are not in kithd.order")
     parser.add_argument("--check", action="store_true", help="write nothing: fail if kithd.order is not in effect in the built kithd")
     args = parser.parse_args()
     if args.self_test:
@@ -304,6 +319,11 @@ def main():
     missing = [what for what, part in MUST.items() if not any(part in pattern for pattern in order)]
     if missing:
         sys.exit(f"the traced kithd ran no function of {', '.join(missing)}: nothing written")
+    if args.stale:
+        with open(ORDER) as file:
+            new = unnamed(order, file.read().split())
+        print(f"{len(new)} of the {len(order)} functions that ran are not in kithd.order (at most {STALE}): {' '.join(new[:8])}")
+        sys.exit(0 if len(new) <= STALE else "kithd.order is stale: write it again (python3 ci/order.py) and build")
     with open(ORDER, "w") as file:
         file.write("".join(name + "\n" for name in order))
     print(f"{len(order)} of {sum(map(len, known.values()))} functions ran; build again (sh ci/musl.sh) to link them in this order")
