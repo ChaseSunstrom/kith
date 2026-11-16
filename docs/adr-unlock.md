@@ -338,9 +338,15 @@ It refuses to seal with a PIN of d digits unless all of these hold:
   TPM2_DictionaryAttackLockReset: authorized by lockoutAuth). So where lockoutAuthSet is
   clear, kithd sets it, with TPM2_HierarchyChangeAuth (0x129) on TPM_RH_LOCKOUT
   (0x4000000A): 32 random bytes, sent encrypted in a salted session, kept in a file of the
-  state and nowhere else, then read back by lockoutAuthSet. Where it is set and kithd holds
-  no value for it, someone else does: kithd refuses ("clear the TPM in the firmware's
-  settings first").
+  state and nowhere else, then read back by lockoutAuthSet. Where it is set, a kept file is
+  no proof (a disk moved, a state put back): kithd shows the kept value to the TPM with
+  TPM2_DictionaryAttackLockReset in a salted session, which forgives the wrong tries counted
+  (it lets nobody try the old PIN, which the new one replaces, and only whoever may apply the
+  NodeKey sets one). Where kithd keeps no value, or the TPM refuses it (AUTH_FAIL or
+  BAD_AUTH), someone else holds it: kithd refuses ("clear the TPM in the firmware's settings
+  first"). A TPM whose lockout hierarchy is shut by an earlier wrong value (TPM_RC_LOCKOUT)
+  is told as a wait of its recovery time, and any other failure as itself; each refuses the
+  PIN.
 
 The refusal says which bound failed and the shortest PIN this TPM's M and I would take.
 kithd does not change M or I itself ("Open"). R is read and said, not bounded: only kithd

@@ -74,6 +74,9 @@ const POLICY_FAILED: u32 = 0x99d;
 /// first session's), and what every one is while the TPM is locked out.
 const AUTH_FAIL: u32 = 0x98e;
 const IN_LOCKOUT: u32 = 0x921;
+/// What a wrong authorization not counted against guesses is refused with (the first
+/// session's).
+const BAD_AUTH: u32 = 0x9a2;
 pub const NOT_THE_PIN: &str =
     "the TPM refuses that PIN: it is not the one this node's key was sealed with (each wrong one is counted)";
 pub const LOCKED_OUT: &str = "the TPM refuses every PIN for now: too many wrong ones were tried";
@@ -688,7 +691,7 @@ impl<T: Read + Write> Tpm<T> {
             // the lockout hierarchy for its recovery time, as CLEAR_FIRST says.
             let held = held.filter(|held| held.len() == 32).ok_or(CLEAR_FIRST)?;
             self.as_lockout(kept, DA_RESET, 0, Vec::new(), [held, held])
-                .map_err(|_| CLEAR_FIRST)?;
+                .map_err(|why| unproved(why, lockout.recovery))?;
             return self.lockout();
         }
         // (A TPM drops an authorization's last zero bytes: none is last.)
@@ -705,7 +708,26 @@ impl<T: Read + Write> Tpm<T> {
         }
         Ok(lockout)
     }
+}
 
+/// What the proof of a kept lockout authorization failing is, the PIN refused on each: the
+/// TPM refusing the value (its first session's AUTH_FAIL or BAD_AUTH), [`CLEAR_FIRST`]; its
+/// lockout hierarchy shut by an earlier wrong one, a wait of its `recovery` seconds; anything
+/// else (the bus, the storage key, a session), itself, so nobody clears a TPM for an I/O error.
+fn unproved(why: String, recovery: u32) -> String {
+    if why == NOT_THE_PIN || why == format!("the TPM refuses (its code {BAD_AUTH:#x})") {
+        CLEAR_FIRST.into()
+    } else if why == LOCKED_OUT {
+        format!(
+            "the TPM's lockout hierarchy is shut for now: a wrong lockout authorization was shown it. \
+             Set the PIN again {recovery} s after that, with the machine powered all along"
+        )
+    } else {
+        why
+    }
+}
+
+impl<T: Read + Write> Tpm<T> {
     /// `command` on the lockout hierarchy, authorized by `auth` in a session salted to the
     /// storage key (`kept`: its name), so no authorization crosses the bus in plain.
     fn as_lockout(
@@ -1178,6 +1200,11 @@ pub(crate) mod tests {
         // Forgiven by the lockout's authorization kithd keeps: the PIN opens again.
         as_lockout(&mut tpm, DA_RESET, &auth, &[]);
         assert_eq!(tpm.unseal_pin(&sealed, pin, name).as_ref(), Ok(&key));
+        // The PIN set anew with the right one kept: its proof forgives the count.
+        assert_eq!(tpm.unseal_pin(&sealed, b"40917254", name), Err(NOT_THE_PIN.into()));
+        assert_eq!(tpm.lockout().unwrap().counter, 1);
+        let proved = tpm.guard(8, Some(&auth), None, |_| panic!("made again")).unwrap();
+        assert_eq!((proved.counter, tpm.lockout().unwrap().counter), (0, 0));
         // A file of 32 bytes kept that are not the TPM's (a disk moved, a state put back):
         // the TPM is asked and says no, so refused. (Last: the TPM then shuts its lockout
         // hierarchy for its recovery time.)
@@ -1187,5 +1214,43 @@ pub(crate) mod tests {
             tpm.guard(8, Some(&other), None, |_| panic!("made again")),
             Err(CLEAR_FIRST.into())
         );
+        // Its lockout hierarchy now shut: even the right one waits, and is not told to clear.
+        let shut = tpm.guard(8, Some(&auth), None, |_| panic!("made again")).unwrap_err();
+        assert!(shut.contains("Set the PIN again 60 s after"), "{shut}");
+    }
+
+    /// A failed proof of the kept lockout authorization: refused by the TPM, clear it; its
+    /// hierarchy shut, wait; anything else, as it is. None of them sets a PIN.
+    #[test]
+    fn tpm_pin_tells_a_refused_lockout_from_a_shut_one_and_a_broken_bus() {
+        for (code, said) in [
+            (AUTH_FAIL, CLEAR_FIRST),
+            (BAD_AUTH, CLEAR_FIRST),
+            (IN_LOCKOUT, "Set the PIN again 60 s after"),
+            (0x101, "the TPM refuses (its code 0x101)"),
+        ] {
+            // (A TPM that answers each command with `code` alone.)
+            struct Answer(std::io::Cursor<Vec<u8>>);
+            impl Write for Answer {
+                fn write(&mut self, said: &[u8]) -> std::io::Result<usize> {
+                    Ok(said.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl Read for Answer {
+                fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+                    self.0.read(into)
+                }
+            }
+            let answer = [&0x8001u16.to_be_bytes()[..], &10u32.to_be_bytes(), &code.to_be_bytes()].concat();
+            let mut tpm = Tpm(Answer(std::io::Cursor::new(answer)));
+            let why = tpm.run(NO_SESSIONS, DA_RESET, &[]).unwrap_err();
+            let told = unproved(why, 60);
+            assert!(told.contains(said), "{code:#x}: {told}");
+        }
+        let io = unproved("asking the TPM: broken pipe".into(), 60);
+        assert_eq!(io, "asking the TPM: broken pipe");
     }
 }

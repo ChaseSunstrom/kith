@@ -809,6 +809,16 @@ async fn fetched(record: &Record, config: &Path, join: Option<&String>, pin: Opt
     fetched
 }
 
+/// The seal the TPM opens `record`'s state by alone, if any: none where its key is still on
+/// the disk, nor where a PIN guards it (a record with both lines, as the first PIN-setting
+/// kithd could leave, never opens without the PIN).
+fn tpm_alone(record: &Record) -> Option<&Vec<u8>> {
+    record
+        .tpm
+        .as_ref()
+        .filter(|_| record.key.is_none() && record.pin.is_none())
+}
+
 /// Open and mount the state of a node that has `record`. Returns once it is mounted,
 /// however long the key takes to come: the key, and who gave it.
 pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Result<(Vec<u8>, By), String> {
@@ -828,8 +838,7 @@ pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Resu
         }
         crate::tpm::open().and_then(|mut tpm| tpm.unseal(sealed, record.parent.as_deref()))
     };
-    let sealed = record.tpm.as_ref().filter(|_| record.key.is_none());
-    let (key, by) = match (&record.key, sealed.map(own)) {
+    let (key, by) = match (&record.key, tpm_alone(record).map(own)) {
         (Some(key), _) => {
             eprintln!(
                 "kithd: init: the key of this node's encrypted state is still on its disk: no other node holds it yet"
@@ -2280,6 +2289,13 @@ mod tests {
             (left.tpm, left.parent, left.pin),
             (None, record.parent.clone(), record.pin.clone())
         );
+        // Nor does such a record open by the TPM alone at the start that finds it.
+        assert_eq!(tpm_alone(&record), None);
+        let alone = Record {
+            pin: None,
+            ..record.clone()
+        };
+        assert_eq!(tpm_alone(&alone), alone.tpm.as_ref());
     }
 
     async fn pin_route(shared: Arc<Shared>, name: String, given: Json<PinGiven>) -> (StatusCode, String) {

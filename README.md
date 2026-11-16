@@ -3582,7 +3582,10 @@ digits only: a date or 123456 is among the first guesses, so pick them at
 random. Setting a PIN takes the TPM's lockout authorization where it is empty,
 kept in beta's encrypted state alone, so that nobody else can forgive the
 count; if that state is lost, only clearing the TPM in the firmware's settings
-gives the authorization back. Each setting tries one wrong PIN, which the TPM
+gives the authorization back. Setting a PIN again shows the kept authorization
+to the TPM, which forgives the wrong tries counted; nobody gets to try the old
+PIN by it, since the new one replaces it, and only whoever may apply beta's
+NodeKey can set one. Each setting tries one wrong PIN, which the TPM
 counts. After too many wrong ones the TPM refuses every PIN, the right one too,
 for a while, and the console says how long; the recovery key still opens.
 The cluster's key opens beta's state as before: a PIN adds a lock to the

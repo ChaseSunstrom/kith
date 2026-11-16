@@ -1025,7 +1025,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   node's encrypted state and nowhere else), so that nobody else can forgive the count;
   where someone else holds it, or the TPM refuses the one kithd keeps (a disk moved, a
   state put back: kithd shows it to the TPM each time, and a refused one shuts the TPM's
-  lockout hierarchy for its recovery time), the PIN is refused. If that state is lost (a
+  lockout hierarchy for its recovery time), the PIN is refused. Setting a PIN again shows
+  the kept authorization to the TPM, and that forgives the wrong tries counted; it lets
+  nobody try the old PIN, which the new one replaces, and only whoever may apply the
+  node's NodeKey can set one. If that state is lost (a
   wipe, or a duress code, which erases the record and with it the state's key), the file
   can no longer be read, and only clearing the TPM in the firmware's settings gives the
   lockout authorization back. Each setting of a PIN tries one wrong PIN, which the TPM
