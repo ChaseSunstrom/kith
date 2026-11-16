@@ -485,7 +485,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   over that namespace's resources only (above). **A container's bounding set is its own
   spec's on any node, cut or not** (the fourteen for a root pod, three for a root that is
   not one, one for a user): the cut is what kithd's other children inherit (a Source's
-  git, dnsmasq, the storage holder, an exec unit's shim, and libcontainer's init before it
+  git, dnsmasq, the storage holder, and libcontainer's init before it
   sets the container's), so no container's `CapBnd` shows it; `ci/vm.sh --test policy`
   reads kithd's own `CapBnd` instead. **It does not limit kithd's own threads**, which keep every
   capability (`CapEff` is not cut; `ci/vm.sh --test policy` reads it): a hole inside kithd,

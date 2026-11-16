@@ -348,7 +348,7 @@ before any of the split:
   spec asks and whatever bug let it ask (a pod with `userNamespaces` has a full bounding
   set inside its own namespace, over that namespace's resources only; a container's own
   bounding set is its spec's on any node, cut or not, and the cut is what kithd's other
-  children inherit: a Source's git, dnsmasq, the storage holder, an exec unit's shim,
+  children inherit: a Source's git, dnsmasq, the storage holder,
   libcontainer's init before its capset): not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
   `BPF`, `SYS_NICE`, `IPC_LOCK`, `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `PERFMON`... But
   kithd's own threads keep every capability (the VM test reads `CapEff` and says so), so

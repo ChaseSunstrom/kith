@@ -1158,8 +1158,8 @@ limits what an exec gives a child: nothing kithd starts by an exec can hold `SYS
 outside the list in the node's own user namespace, whatever its spec asks for (a pod with
 `userNamespaces` has a full bounding set inside its own namespace, over that namespace's
 resources only). A container's own bounding set is its spec's on any node, cut or not; the
-cut is what kithd's other children inherit (a Source's git, dnsmasq, the storage holder, an
-exec unit's shim, libcontainer's init before its capset). kithd's own threads keep every capability, so a hole inside kithd is not
+cut is what kithd's other children inherit (a Source's git, dnsmasq, the storage holder,
+libcontainer's init before its capset). kithd's own threads keep every capability, so a hole inside kithd is not
 held back by this (the split in `docs/adr-privilege.md` is for that), and root without
 `SYS_PTRACE` can still trace root's own processes or write `/proc/sys`: not covered.
 The Node's status says what it kept (`status.policy.capabilities`; `all` where it did not
