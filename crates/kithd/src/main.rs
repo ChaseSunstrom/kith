@@ -170,6 +170,18 @@ struct Args {
     acme: Option<String>,
 }
 
+/// The ports kithd serves on at this node, and what for: none of them is published for a pod.
+fn own_ports(args: &Args) -> Vec<(u16, &'static str)> {
+    let mut own = vec![(args.listen.map_or(7443, |at| at.port()), "API")];
+    own.extend(args.dns.map(|at| (at.port(), "DNS")));
+    own.extend((args.registry_port != 0).then_some((args.registry_port, "registry")));
+    own.extend(args.mesh.map(|port| (port, "mesh")));
+    if args.ingress {
+        own.extend([(80, "ingress"), (443, "ingress")]);
+    }
+    own
+}
+
 fn mesh_options(args: &Args, state: &std::path::Path, port: u16) -> mesh::Options {
     mesh::Options {
         interface: args.mesh_interface.clone(),
@@ -875,7 +887,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone());
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
-            let published = pods::publish(shared.clone(), stopping.clone());
+            let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
                 apart(exits),
                 apart(published),
@@ -1034,6 +1046,26 @@ mod tests {
         assert_eq!(parse("[fd00::1]:7443").unwrap().advertise.unwrap().port(), 7443);
         assert!(parse("10.0.0.5:7443").is_ok());
         assert!(parse("node-b.example.org:7443").is_err() && parse("10.0.0.5").is_err());
+    }
+
+    /// The ports this node serves on are the ones a pod may not publish here.
+    #[test]
+    fn the_ports_kithd_serves_on_are_its_own() {
+        use clap::Parser;
+        let own = |extra: &[&str]| {
+            let args = ["kithd"].iter().chain(extra).copied();
+            super::own_ports(&super::Args::try_parse_from(args).unwrap())
+        };
+        assert_eq!(own(&[]), [(7443, "API"), (5000, "registry")]);
+        let said = own(&[
+            "--listen=0.0.0.0:8443",
+            "--dns=0.0.0.0:5353",
+            "--registry-port=0",
+            "--mesh=51999",
+            "--ingress",
+        ]);
+        let ports: Vec<u16> = said.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports, [8443, 5353, 51999, 80, 443]);
     }
 
     #[test]

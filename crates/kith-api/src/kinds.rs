@@ -1639,6 +1639,10 @@ impl Spec for KindDefinitionSpec {
     }
 }
 
+/// The ports from 1024 kithd serves on unless told otherwise, and what for: never published
+/// for a pod (either protocol). A node refuses those it is told to use instead, too.
+pub const KITHD_PORTS: &[(u16, &str)] = &[(5000, "registry"), (7443, "API"), (51820, "mesh")];
+
 /// The largest WebAssembly module a `KindDefinition` carries, in bytes.
 pub const WASM_LIMIT: usize = 1 << 20;
 
@@ -1858,6 +1862,12 @@ impl Template {
                 if p.port < 1024 {
                     return Err(format!(
                         "{at}: publish: only ports from 1024 (those below are the node's)"
+                    ));
+                }
+                if let Some((_, what)) = KITHD_PORTS.iter().find(|(port, _)| *port == p.port) {
+                    return Err(format!(
+                        "{at}: publish: port {} is kithd's own (its {what}, by default)",
+                        p.port
                     ));
                 }
                 if !published.insert((p.port, p.protocol == Some(Protocol::Udp))) {

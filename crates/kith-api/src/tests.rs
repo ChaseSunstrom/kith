@@ -1588,6 +1588,21 @@ fn an_exit_and_a_published_port_are_checked() {
         ),
         (
             "Workload",
+            template("pod: true,", "{ port: 7443, publish: true }"),
+            "port 7443 is kithd's own (its API",
+        ),
+        (
+            "Workload",
+            template("pod: true,", "{ port: 51820, protocol: udp, publish: true }"),
+            "port 51820 is kithd's own (its mesh",
+        ),
+        (
+            "Workload",
+            template("pod: true,", "{ port: 5000, publish: true }"),
+            "port 5000 is kithd's own (its registry",
+        ),
+        (
+            "Workload",
             template(
                 "pod: true,",
                 "{ port: 8080, publish: true }, { port: 8080, publish: true }",
