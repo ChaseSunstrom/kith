@@ -64,9 +64,10 @@ const BETWEEN_ORDERS: u64 = 3600;
 const WAIT_AT_MOST: u64 = 600;
 
 /// The seconds between two orders for a host: shorter where the last was asked while a worker
-/// had not said it holds the thumbprint, so that worker's 404 holds the host up less.
+/// had not said it holds the thumbprint, so that worker's 404 holds the host up less (four
+/// tries an hour: an authority allows about five failed ones for a host, Let's Encrypt five).
 fn between(hurried: bool) -> u64 {
-    if hurried { WAIT_AT_MOST } else { BETWEEN_ORDERS }
+    if hurried { 900 } else { BETWEEN_ORDERS }
 }
 
 /// Whether orders still wait on `waits`, the ingress workers that have not said their view holds
@@ -1232,7 +1233,7 @@ pub async fn run(
                             return;
                         }
                         // Waited long enough on one that never said: asked anyway, and a host that
-                        // fails so is asked again in ten minutes, not an hour.
+                        // fails so is asked again in fifteen minutes, not an hour.
                         let past = !waits.is_empty();
                         if past && waits != waited {
                             eprintln!(
@@ -1334,7 +1335,8 @@ mod tests {
         assert!(!holds_up(&mut since, &[], 5000));
         assert!(holds_up(&mut since, &silent, 6000));
         assert!(!holds_up(&mut since, &silent, 6000 + WAIT_AT_MOST));
-        assert!(between(true) < between(false) && between(false) == BETWEEN_ORDERS);
+        // (Four tries an hour: an authority allows about five failed ones for a host.)
+        assert_eq!((between(true), between(false)), (900, BETWEEN_ORDERS));
     }
 
     #[test]

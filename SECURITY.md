@@ -827,7 +827,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Node's status, which thumbprint its view holds, and the leader asks the CA for
     nothing until each reachable ingress worker says the right one, for ten minutes at
     most (then it asks, names the workers it did not wait for, and asks again for a host
-    that failed so in ten minutes): a worker that lies there or never says holds orders
+    that failed so in fifteen minutes): a worker that lies there or never says holds orders
     and renewals up for those ten minutes, then fails the challenges the CA sends it, as
     answering the CA's challenge wrongly would (each ingress node is one the CA may ask),
     and gains nothing else. That a worker

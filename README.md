@@ -946,7 +946,7 @@ kith node status                                   # who leads the store, who vo
   start the control nodes with `--acme` (with or without `--ingress`); the one that
   leads orders for the workers' hosts once each ingress worker says its view holds the
   thumbprint (or after ten minutes, naming the workers that did not; a host ordered so is
-  asked again in ten minutes, not an hour), and the worker answers the authority's
+  asked again in fifteen minutes, not an hour), and the worker answers the authority's
   challenges on port 80:
 
   ```sh
