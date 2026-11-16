@@ -345,6 +345,43 @@ fn package_history() {
     assert_eq!(store.history("Workload/default/web").unwrap().len(), HISTORY_LIMIT);
 }
 
+/// A NodeKey keeps its live revision only: a key the cluster forgot is in no earlier one.
+#[test]
+fn node_key_history() {
+    let key = |wrapped: &str| {
+        let id = "ab".repeat(32);
+        one(&format!(
+            "apiVersion: kith.dev/v1\nkind: NodeKey\nmetadata:\n  name: n1\nspec:\n  id: \"{id}\"\n  wrapped: \"{wrapped}\"\n"
+        ))
+    };
+    let wrapped = "c0ffee".repeat(10); // pragma: allowlist secret
+    let mut store = Store::default();
+    store.apply(key(&wrapped)).unwrap();
+    store.apply(key("")).unwrap();
+    let history = store.history("NodeKey/n1").unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].resource.metadata.revision, Some(2));
+    assert!(!serde_json::to_string(&store).unwrap().contains(&wrapped));
+
+    // A batch that is refused puts back what was there, its one revision.
+    let mut bad = one(&workload(""));
+    bad.metadata.name = "Not Valid".into();
+    assert!(store.apply_all(vec![key(&wrapped), bad.clone()]).is_err());
+    assert_eq!(store.history("NodeKey/n1").unwrap().len(), 1);
+    assert!(!serde_json::to_string(&store).unwrap().contains(&wrapped));
+    store.apply(key(&wrapped)).unwrap();
+    assert!(store.apply_all(vec![key(""), bad]).is_err());
+    let history = store.history("NodeKey/n1").unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].resource.spec["wrapped"], json!(wrapped));
+
+    // Other kinds keep theirs.
+    for n in 0..5 {
+        store.apply(one(&workload(&format!("  replicas: {n}\n")))).unwrap();
+    }
+    assert_eq!(store.history("Workload/default/web").unwrap().len(), 5);
+}
+
 #[test]
 fn timestamps() {
     assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");

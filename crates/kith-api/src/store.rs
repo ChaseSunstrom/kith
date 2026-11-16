@@ -151,11 +151,12 @@ impl Store {
                 at: self.clock.unwrap_or_else(now),
                 resource: change.after.clone(),
             });
-            // A Package carries its files (up to 4 MB), so it keeps few revisions.
-            let limit = if change.after.kind == "Package" {
-                PACKAGE_HISTORY_LIMIT
-            } else {
-                HISTORY_LIMIT
+            // A Package carries its files (up to 4 MB), so it keeps few revisions. A NodeKey
+            // keeps its live one alone: a key the cluster forgot is in no earlier revision.
+            let limit = match change.after.kind.as_str() {
+                "Package" => PACKAGE_HISTORY_LIMIT,
+                "NodeKey" => 1,
+                _ => HISTORY_LIMIT,
             };
             while history.len() > limit {
                 history.remove(0);

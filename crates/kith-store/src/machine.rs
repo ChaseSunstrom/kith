@@ -108,6 +108,9 @@ pub struct Machine {
     /// snapshot while it installs another, and the older must not replace the newer.
     saved: Arc<Mutex<Option<LogId<u64>>>>,
     changed: Arc<dyn Fn() + Send + Sync>,
+    /// The index of the last write applied here that took a NodeKey's wrapped key out of
+    /// the store (see [`crate::scrub`]).
+    pub(crate) forgot: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 impl Machine {
@@ -125,6 +128,7 @@ impl Machine {
             state: Arc::new(Mutex::new(state)),
             file,
             changed,
+            forgot: Arc::new(tokio::sync::watch::Sender::new(0)),
         })
     }
 
@@ -212,6 +216,7 @@ impl RaftStateMachine<TypeConfig> for Machine {
         I::IntoIter: OptionalSend,
     {
         let mut replies = Vec::new();
+        let mut forgot = None;
         {
             let mut state = self.state();
             for entry in entries {
@@ -223,6 +228,9 @@ impl RaftStateMachine<TypeConfig> for Machine {
                         let reply = run(&mut state.store, command);
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);
+                        if crate::drops_a_key(&reply) {
+                            forgot = Some(entry.log_id.index);
+                        }
                         reply
                     }
                     EntryPayload::Membership(membership) => {
@@ -232,6 +240,9 @@ impl RaftStateMachine<TypeConfig> for Machine {
                 });
             }
             (self.changed)();
+        }
+        if let Some(index) = forgot {
+            self.forgot.send_replace(index);
         }
         Ok(replies)
     }

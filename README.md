@@ -3367,8 +3367,10 @@ sh ci/vm.sh --test duress              # the new recovery key and the duress cod
 node that is still running restarts within moments, and from then on says at
 its console that it waits. `wipe` cannot be undone: the cluster no longer
 holds the key, and the node, if it still runs, erases what it would need to
-ask for it and powers off. (The wrapped key is still in backups of the store
-made before, which open nothing without the secret on the wiped disk.)
+ask for it and powers off. Every control node then snapshots the store and
+drops its log up to the wipe, so no earlier version or log entry keeps the
+wrapped key. (It is still in copies of a node's state made before, which open
+nothing without the secret on the wiped disk: SECURITY.md says what stays.)
 A node whose key is still on its own disk, as no other node holds it yet,
 opens whatever the cluster says.
 
@@ -3426,9 +3428,10 @@ from a node you can reach as well. Flash may keep old blocks: the record is
 written over with zeros, and what a flash disk keeps of sectors it has
 replaced is not kith's to say. A disk that refuses the write keeps its record:
 the node tries again for as long as it waits and says nothing of it. The
-cluster stops handing the key out and a NodeKey cannot be rolled back, but a
-control node's disk and the cluster's backups still hold earlier versions with
-the wrapped key, which opens nothing without a copy of the erased disk. The record on the disk shows that a code
+cluster stops handing the key out and keeps it in no earlier version, snapshot
+or log entry, but a copy of a control node's state taken before, and the freed
+blocks of its disk until they are written over, still hold the wrapped key,
+which opens nothing without a copy of the erased disk. The record on the disk shows that a code
 exists (not what it is: it holds a public key made from the code). The answer
 at the console is the same; the request to the cluster, the write to the
 disk, and the record that is gone afterwards are there for whoever watches

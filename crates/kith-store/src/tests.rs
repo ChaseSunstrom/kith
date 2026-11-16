@@ -461,3 +461,218 @@ fn settings_are_openrafts_but_for_ours() {
     };
     assert_eq!(format!("{ours:?}"), format!("{theirs:?}"));
 }
+
+/// Raft between replicas in one process. A node that is not in the map is down.
+#[derive(Clone, Default)]
+struct Net(Arc<std::sync::Mutex<std::collections::BTreeMap<u64, crate::Raft>>>);
+
+struct Link(Net, u64);
+
+impl openraft::RaftNetworkFactory<TypeConfig> for Net {
+    type Network = Link;
+
+    async fn new_client(&mut self, target: u64, _: &openraft::BasicNode) -> Link {
+        Link(self.clone(), target)
+    }
+}
+
+type Rpc<A, E = openraft::error::Infallible> =
+    Result<A, openraft::error::RPCError<u64, openraft::BasicNode, openraft::error::RaftError<u64, E>>>;
+
+impl Link {
+    fn raft<E: std::error::Error>(&self) -> Rpc<crate::Raft, E> {
+        let down = || openraft::error::Unreachable::new(&std::io::Error::other("down"));
+        Ok(self.0.0.lock().unwrap().get(&self.1).cloned().ok_or_else(down)?)
+    }
+}
+
+impl openraft::RaftNetwork<TypeConfig> for Link {
+    async fn append_entries(
+        &mut self,
+        rpc: openraft::raft::AppendEntriesRequest<TypeConfig>,
+        _: openraft::network::RPCOption,
+    ) -> Rpc<openraft::raft::AppendEntriesResponse<u64>> {
+        let answer = self.raft()?.append_entries(rpc).await;
+        answer.map_err(|e| openraft::error::RemoteError::new(self.1, e).into())
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        rpc: openraft::raft::InstallSnapshotRequest<TypeConfig>,
+        _: openraft::network::RPCOption,
+    ) -> Rpc<openraft::raft::InstallSnapshotResponse<u64>, openraft::error::InstallSnapshotError> {
+        let answer = self.raft()?.install_snapshot(rpc).await;
+        answer.map_err(|e| openraft::error::RemoteError::new(self.1, e).into())
+    }
+
+    async fn vote(
+        &mut self,
+        rpc: openraft::raft::VoteRequest<u64>,
+        _: openraft::network::RPCOption,
+    ) -> Rpc<openraft::raft::VoteResponse<u64>> {
+        let answer = self.raft()?.vote(rpc).await;
+        answer.map_err(|e| openraft::error::RemoteError::new(self.1, e).into())
+    }
+}
+
+/// What the test below writes as a node's wrapped key.
+const WRAPPED: &str = "5ea1ed0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"; // pragma: allowlist secret
+
+fn node_key(wrapped: &str) -> kith_api::Resource {
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": "kith.dev/v1", "kind": "NodeKey", "metadata": { "name": "n1" },
+        "spec": { "id": "ab".repeat(32), "wrapped": wrapped, "forgotten": wrapped.is_empty() },
+    }))
+    .unwrap()
+}
+
+/// Write `command` through whichever node leads, once one does; the index it is at.
+async fn write(net: &Net, command: Command) -> u64 {
+    for _ in 0..100 {
+        let rafts: Vec<_> = net.0.lock().unwrap().values().cloned().collect();
+        for raft in rafts {
+            let leads = raft.metrics().borrow().current_leader == Some(raft.metrics().borrow().id);
+            if leads && let Ok(written) = raft.client_write(command.clone()).await {
+                written.data.unwrap();
+                return written.log_id.index;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no node led for 10 s");
+}
+
+/// Wait until `raft` has applied `index` and dropped every log entry up to `purged`.
+async fn caught_up(raft: &crate::Raft, index: u64, purged: u64) {
+    let wait = raft.wait(Some(std::time::Duration::from_secs(20)));
+    let done = |m: &openraft::RaftMetrics<u64, openraft::BasicNode>| {
+        let dropped = m.purged.map_or(0, |at| at.index);
+        m.last_applied.is_some_and(|at| at.index >= index) && dropped >= purged
+    };
+    let id = raft.metrics().borrow().id;
+    wait.metrics(done, "applied and purged").await.unwrap_or_else(|e| {
+        panic!("node {id} did not drop the log up to {purged}: {e}");
+    });
+}
+
+/// Whether the snapshot file in `dir`, or an entry its log gives back, holds `text`. The
+/// log's own reader: the file itself keeps freed pages, which are not what is asked here.
+async fn holds(dir: &std::path::Path, text: &str) -> bool {
+    use openraft::RaftLogReader;
+    let snapshot = std::fs::read_to_string(dir.join("snapshot.json")).unwrap_or_default();
+    let mut log = Log::open(&dir.join("log.redb")).unwrap();
+    let entries = log.try_get_log_entries(..).await.unwrap();
+    snapshot.contains(text) || serde_json::to_string(&entries).unwrap().contains(text)
+}
+
+/// A NodeKey whose wrapped key is forgotten: every replica snapshots and drops the log up to
+/// that write, the one that was down when it was made too, and goes on as before.
+#[test]
+fn forgotten_key_is_in_no_snapshot_or_log_entry() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dirs = [Scratch::new(), Scratch::new(), Scratch::new()];
+        let net = Net::default();
+        let start = async |id: u64| {
+            let dir = &dirs[id as usize - 1].0;
+            let replica = crate::open(dir, id, net.clone(), Arc::new(|| {})).await.unwrap();
+            net.0.lock().unwrap().insert(id, replica.raft.clone());
+            replica
+        };
+        let mut replicas = vec![start(1).await, start(2).await, start(3).await];
+        let members = (1..=3).map(|id| (id, openraft::BasicNode::default()));
+        replicas[0]
+            .raft
+            .initialize(members.collect::<std::collections::BTreeMap<_, _>>())
+            .await
+            .unwrap();
+        let resources = vec![node_key(WRAPPED), config("a", "1")];
+        let at = write(&net, Command::Apply { resources, at: 1 }).await;
+        for replica in &replicas {
+            caught_up(&replica.raft, at, 0).await;
+        }
+
+        // One follower is down while the key is forgotten.
+        let leader = replicas[0].raft.metrics().borrow().current_leader.unwrap();
+        let down = replicas.iter().position(|replica| replica.id != leader).unwrap();
+        let replica = replicas.remove(down);
+        net.0.lock().unwrap().remove(&replica.id);
+        replica.raft.shutdown().await.unwrap();
+        drop(replica);
+        let forgot = write(
+            &net,
+            Command::Apply {
+                resources: vec![node_key("")],
+                at: 2,
+            },
+        )
+        .await;
+        for replica in &replicas {
+            caught_up(&replica.raft, forgot, forgot).await;
+            let snapshot = std::fs::read_to_string(dirs[replica.id as usize - 1].0.join("snapshot.json"));
+            assert!(!snapshot.unwrap().contains(WRAPPED));
+        }
+        let last = write(
+            &net,
+            Command::Apply {
+                resources: vec![config("b", "2")],
+                at: 3,
+            },
+        )
+        .await;
+        replicas.push(start(down as u64 + 1).await);
+        for replica in &replicas {
+            caught_up(&replica.raft, last, forgot).await;
+        }
+        let stores = |replicas: &[crate::Replica]| -> Vec<String> {
+            let store = |replica: &crate::Replica| serde_json::to_string(&replica.state.lock().unwrap().store);
+            replicas.iter().map(|replica| store(replica).unwrap()).collect()
+        };
+        let before = stores(&replicas);
+        assert!(
+            before
+                .iter()
+                .all(|store| *store == before[0] && !store.contains(WRAPPED))
+        );
+        assert!(before[0].contains("ConfigMap/default/b"));
+
+        // Stopped, no file holds the key; started again, each reads the same store.
+        for replica in replicas.drain(..) {
+            net.0.lock().unwrap().remove(&replica.id);
+            replica.raft.shutdown().await.unwrap();
+        }
+        for dir in &dirs {
+            assert!(!holds(&dir.0, WRAPPED).await, "{} holds the key", dir.0.display());
+        }
+        for id in 1..=3 {
+            replicas.push(start(id).await);
+        }
+        let after = stores(&replicas);
+        assert!(after.iter().all(|store| *store == before[0]), "each reads what it had");
+        let more = write(
+            &net,
+            Command::Apply {
+                resources: vec![config("c", "3")],
+                at: 4,
+            },
+        )
+        .await;
+        for replica in &replicas {
+            caught_up(&replica.raft, more, forgot).await;
+        }
+        let history = replicas[0]
+            .state
+            .lock()
+            .unwrap()
+            .store
+            .history("NodeKey/n1")
+            .map(<[_]>::len);
+        assert_eq!(history.ok(), Some(1));
+        for replica in replicas {
+            replica.raft.shutdown().await.unwrap();
+        }
+    });
+}

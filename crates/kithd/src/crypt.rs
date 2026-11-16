@@ -54,7 +54,9 @@
 //! entered. Only the public key of a signing key drawn from the code is kept (in the
 //! NodeKey and in the record), so neither says what the code is; the cluster forgets
 //! (`POST /v1/forget`) only for a signature of that key over a number it just gave.
-//! What it does not do: a disk copied beforehand, with its recovery key, still opens;
+//! The store keeps no earlier version of a NodeKey, and every control node snapshots and
+//! drops its log up to the write that forgot a key (kith-store's `scrub`), so no control
+//! node's store keeps the key after it. What it does not do: a disk copied beforehand, with its recovery key, still opens;
 //! flash may keep the record's old blocks; and the record shows that a code exists.
 //!
 //! The cluster's code (`kith node duress --all`) is one code on every NodeKey there is

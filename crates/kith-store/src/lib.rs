@@ -174,6 +174,53 @@ pub fn changed(reply: &Reply) -> Vec<String> {
     }
 }
 
+/// Whether an answer says a NodeKey's wrapped key went out of the store (wiped, forgotten,
+/// replaced or deleted): the store keeps no earlier revision of one, and the node that
+/// applied it then snapshots and drops its log up to there ([`scrub`]).
+fn drops_a_key(reply: &Reply) -> bool {
+    fn wrapped(key: &Resource) -> Option<&str> {
+        let wrapped = key.spec["wrapped"].as_str().filter(|wrapped| !wrapped.is_empty());
+        wrapped.filter(|_| key.kind == "NodeKey")
+    }
+    match reply {
+        Ok(Done::Changes(changes)) => changes.iter().any(|change| {
+            let before = change.before.as_ref().and_then(wrapped);
+            before.is_some() && before != wrapped(&change.after)
+        }),
+        Ok(Done::Deleted(gone)) => wrapped(gone).is_some(),
+        Ok(Done::Nothing) | Err(_) => false,
+    }
+}
+
+/// Snapshot the store at the log's `index` or later, then drop the log up to there: a key
+/// the write at `index` took out of the store is then in no file Raft keeps on this node.
+/// openraft drops a follower's log at once and a leader's once no replication still reads
+/// it: it is asked again while it has not. A node that stops first does it at its next
+/// start, as it applies that write again.
+async fn scrub(raft: &Raft, index: u64) {
+    let wait = || raft.wait(Some(std::time::Duration::from_secs(10)));
+    for _ in 0..10 {
+        // (An error: Raft has stopped.)
+        if raft.trigger().snapshot().await.is_err() {
+            return;
+        }
+        let built =
+            |m: &openraft::RaftMetrics<NodeId, openraft::BasicNode>| m.snapshot.is_some_and(|s| s.index >= index);
+        if wait().metrics(built, "a snapshot").await.is_err() {
+            continue;
+        }
+        if raft.trigger().purge_log(index).await.is_err() {
+            return;
+        }
+        let purged =
+            |m: &openraft::RaftMetrics<NodeId, openraft::BasicNode>| m.purged.is_some_and(|p| p.index >= index);
+        if wait().metrics(purged, "the log dropped").await.is_ok() {
+            return;
+        }
+    }
+    eprintln!("kith-store: the log up to {index}, which holds a key the cluster forgot, could not be dropped");
+}
+
 /// The status of a resource after `node` said `said` of it. Several nodes run replicas of
 /// one Workload: each node's `containers` are kept apart by their `node` and replaced only
 /// by that node, `ready` is counted over all of them, and what the scheduler wrote (`nodes`,
@@ -302,9 +349,18 @@ where
     };
     let log = Log::open(&dir.join("log.redb"))?;
     let machine = Machine::open(dir, changed)?;
+    let mut forgotten = machine.forgot.subscribe();
     let state = machine.state.clone();
     let config = Arc::new(settings().validate().map_err(|e| format!("raft settings: {e}"))?);
     let raft = Raft::new(id, config, network, log, machine).await;
     let raft = raft.map_err(|e| format!("starting the store in {}: {e}", dir.display()))?;
+    let scrubbing = raft.clone();
+    // (Ends when Raft drops the machine, which holds the sender.)
+    tokio::spawn(async move {
+        while forgotten.changed().await.is_ok() {
+            let index = *forgotten.borrow_and_update();
+            scrub(&scrubbing, index).await;
+        }
+    });
     Ok(Replica { raft, state, id })
 }
