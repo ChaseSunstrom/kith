@@ -867,6 +867,14 @@ fn thumbprint_of(store: &Store) -> Option<String> {
 /// status does not yet name the Secret of the certificate that serves them (service key and
 /// what to say). Challenges are answered with the account's thumbprint, or where the account
 /// key is not there (a worker's view) with the one a control node wrote down.
+/// Whether a wake's `look` is used at all: by a node that serves ingress (its listeners take the
+/// certificates) or by the control node that leads (it orders for the workers and keeps the
+/// thumbprint written). Any other node with `--acme` would read and parse every exposed
+/// host's certificate and key at each change of the store, and throw the result away.
+fn looks(serves: bool, worker: bool, leading: bool) -> bool {
+    serves || (!worker && leading)
+}
+
 #[allow(clippy::type_complexity)]
 fn look(
     store: &Store,
@@ -1105,17 +1113,22 @@ pub async fn run(
     let mut saying: Option<(String, Instant)> = None;
     let mut waited = Vec::new();
     loop {
+        let leading = {
+            let metrics = shared.raft.metrics().borrow().clone();
+            metrics.current_leader == Some(metrics.id)
+        };
         let (worker, wanted, (wanting, account, naming)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let worker = crate::access::is_worker(&state.store, &me);
             let mut nodes = state.store.list(Some("Node"));
             let wanted = nodes.any(|node| node.status.as_ref().is_some_and(|s| s["serves"]["ingress"] == true));
-            (worker, wanted, look(&state.store, prefix, &web, worker))
+            let looked = match looks(served.is_some(), worker, leading) {
+                true => look(&state.store, prefix, &web, worker),
+                false => Default::default(),
+            };
+            (worker, wanted, looked)
         };
-        let leads = !worker && {
-            let metrics = shared.raft.metrics().borrow().clone();
-            metrics.current_leader == Some(metrics.id)
-        };
+        let leads = !worker && leading;
         if worker && acme.is_some() && !said {
             said = true;
             eprintln!(
@@ -1442,6 +1455,15 @@ mod tests {
             let _ = write.write_all(b"x").await;
         }
         assert_eq!(reader.await.unwrap().unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn only_a_node_that_serves_or_leads_looks() {
+        // (serves, worker, leading)
+        assert!(looks(true, false, false) && looks(true, true, false) && looks(false, false, true));
+        // A control node that follows and serves nothing, and a worker that serves nothing
+        // (a worker never leads; a view that says it does is no reason to look).
+        assert!(!looks(false, false, false) && !looks(false, true, false) && !looks(false, true, true));
     }
 
     #[test]

@@ -254,8 +254,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   (every PersistentVolumeClaim does, unless it names no storage class) a Volume.
 - **A Release or a Source makes only what its writer may make.** The API writes down
   who applied it (`kith.dev/written-by`, whatever the body said; through another node,
-  whom that node passed on), and a rollback to an older revision is written down as
-  whoever rolls back. Each time the controller renders, every resource is asked for as
+  whom that node passed on), and a rollback to an older revision (of a Release, a Source,
+  a KindDefinition or a Package: each is stamped) is written down as whoever rolls back,
+  not as whoever applied the old revision; a rolled-back Package that says a Repository
+  fetched it is refused, like an apply of one. Each time the controller renders, every resource is asked for as
   that writer would be asked if they applied it themselves, with what it reaches (a
   Backup's Volume and Secret, a Share's Volume, a CronJob's Jobs); each one the render
   drops, for leave to delete it. One refusal and nothing of the render is applied: the
@@ -268,6 +270,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   by the API; an Identity given a new certificate, or made again under the same name,
   has another key, and its Releases and Sources make nothing new and fetch nothing
   until it applies them again. The local socket's have no key.
+- **A custom kind's controller acts as whoever applied its KindDefinition.** The API
+  writes that one down on the KindDefinition as on a Release (name and key print,
+  whatever the body said, a rollback being whoever rolls back), and at each run what
+  the controller's module answered is asked for as that writer would be asked if they
+  applied it, and what it no longer answers, for leave to delete it; where the writer
+  may not, nothing new is made, what was made stays, and the resource's status names
+  the resource, the right and the writer. The writer's rights are asked only when the
+  controller runs: a right taken away from them shows at its next run (nothing new is
+  made between), and a run that was refused is made again when the KindDefinition is
+  applied again, which is the way to mend it. The controller does not act as whoever applied
+  the custom resource it runs for, so a custom kind lets someone ask for a thing without
+  the right to make its parts, as an operator does.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -318,7 +332,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   when next needed, so it costs availability (a pull, or a start that fails while the
   registry cannot be reached), not integrity.
 - **Packages** are taken only with a signature over their name, version and hash, by a
-  key the cluster was told to trust; there is no unsigned way in. A package's WebAssembly
+  key the cluster was told to trust; there is no unsigned way in (but a package pushed by
+  hand, which a Release renders with no more than its pusher's rights, and one from a
+  Repository that has no `publicKey`, which is trusted on the word of whoever answers
+  at its URL). A package's WebAssembly
   runs with limits on memory and time, and its templates with limits on size. A
   template in kith's own language (`.kith`) is evaluated inside kithd: it ends in
   500,000 steps, nested 3,000 deep and 1 MB of output or is refused, and it can read
@@ -932,6 +949,30 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
+  - A Package pushed by hand is rendered with no more than its pusher's rights, besides
+    its Release's writer's: the API writes the pusher down on the Package as on a Release
+    (name and key print, whatever the body said), and each render is asked for as the
+    pusher would be asked if they applied what it makes, and what it no longer makes, for
+    leave to delete it. So one who may push Packages and nothing else cannot publish a
+    version that an admin's `autoUpgrade` Release then renders with the admin's rights;
+    where the pusher may not, nothing new is made, what was installed stays, and the
+    Release's status names the Package, the resource, the namespace and the pusher. A
+    second push of a name and version by another replaces the first, and is held to the
+    second one's rights. A Package with nobody written down (one from before this check),
+    or an Identity gone or made again under the name, makes nothing new until it is
+    pushed again; a Source that makes a Package writes its own writer on it. A Package
+    fetched from a Repository has no pusher, and the pusher check does not apply to it at
+    all: with a `publicKey` the key is what it is trusted by; **with none, it is trusted
+    on the word of whoever answers at the Repository's URL**. So the right to apply a
+    Repository is the rights of every Release that names it, and `apply` on `Package`
+    lets someone have kithd ask any Repository there is. What makes a Package "fetched"
+    is `kith.dev/repository`, which only kithd's own fetcher may write: an apply that
+    carries it is refused, a Source whose repository's files carry it makes nothing new
+    (its status names the resource), and a Release takes it as fetched only when it
+    equals the origin of the Repository the Release names (a print of that Repository's
+    name, URL and key); any other Package is asked of its pusher, and refused when
+    nobody is written down. A Package a Source made before this, with the annotation,
+    stays until deleted.
   - A Release and a Source act as the Identity that applied them while it has the key
     it had then. An Identity made again under the same name has another key, so what
     the old one applied is not acted on as the new one: it makes nothing new, fetches no
@@ -941,7 +982,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   - During an upgrade, a node from before this check neither writes the writer down nor
     checks it; and each Release and Source from before it makes nothing new until it is
     applied again.
-  - A WebAssembly controller still applies what it returns with the node's rights.
+  - A custom kind's WebAssembly controller acts as whoever applied its KindDefinition,
+    with what is said above of a Release's writer (name and key print written down by
+    the API, a Source that makes a KindDefinition writing its own, nothing new for a
+    writer gone or made again, a KindDefinition from before this check making nothing
+    new until it is applied again). So the right to apply a custom kind's resources is
+    the right to what its controller makes of them in that namespace, as far as the
+    definition's writer may make it: whoever may apply the kind in a namespace gets
+    there any ConfigMap, Workload or Secret the definition's writer could apply, and
+    the answer of a module the writer set is the writer's. Admission modules still run
+    on every write of their kind, whoever writes it.
 - **A host that no Namespace keeps goes to whoever exposes it first**, and, with
   `--acme`, has a certificate ordered for it. Keep the hosts you serve with a
   Namespace's `hosts`. Where none is kept, the "first" Service is the one whose oldest
@@ -1087,11 +1137,28 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   console takes no key then); sent to a node's port by whoever has it, it is a wipe
   of a running node as well: the node erases its record and powers off.
   **Forgotten is not gone from every disk.** The cluster stops handing the key out
-  and drops it from the NodeKey, which can no longer be rolled back; the store still
-  keeps the NodeKey's earlier versions (up to 100), and the cluster's log and its
-  backups keep what was written: whoever reads a control node's state or a backup
-  finds the node's key there, wrapped under the secret that was on the erased disk,
-  which opens nothing without a copy of that disk. A change to a NodeKey made in the
+  and drops it from the NodeKey, which can no longer be rolled back. The store keeps no
+  earlier versions of a NodeKey, and every control node, as it applies the write that
+  dropped the key, snapshots the store and drops its Raft log up to that write: the key
+  is then in no control node's snapshot (`snapshot.json`) or log entry. A node that was
+  off does so as it catches up; a leader drops its log once no node it sends to still
+  reads that part, and asks again until then. A node stopped between the snapshot and
+  the drop drops its log as it starts, and a write the cluster refused that carried a
+  NodeKey (in its log as sent) is dropped the same way: whoever may apply NodeKeys can
+  so make every control node snapshot as often as they write, with no limit but that
+  permission. A store kept before this held earlier versions too: a control node cuts
+  them as it starts on this version or takes such a store in (a snapshot sent to it, an
+  import), and drops its log if that still holds a key the store does not. Each log
+  dropped this way is said on kithd's standard error, with the log's index and the
+  NodeKey (a cut of earlier versions alone says nothing). What stays: on a node that
+  came from before the store was replicated, `store.json.imported` in its state, the
+  store as it was then, every NodeKey of that day in it (remove the file; T-0614); a backup or a copy of a
+  control node's state taken before (kith's own backups are of Volumes and hold no
+  store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
+  hears of the change, and on a control node's disk the freed pages of the log file and
+  the blocks of the snapshot it replaced, until something writes over them. Whoever
+  reads those finds the node's key, wrapped under the secret that was on the erased
+  disk, which opens nothing without a copy of that disk. A change to a NodeKey made in the
   same moment (`kith node lock`, a new code) can write the key back for the length
   of one write: it is forgotten again and the change refused, and a waiting node that
   is handed its key after a code tells the cluster again.

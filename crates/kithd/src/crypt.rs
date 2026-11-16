@@ -54,7 +54,9 @@
 //! entered. Only the public key of a signing key drawn from the code is kept (in the
 //! NodeKey and in the record), so neither says what the code is; the cluster forgets
 //! (`POST /v1/forget`) only for a signature of that key over a number it just gave.
-//! What it does not do: a disk copied beforehand, with its recovery key, still opens;
+//! The store keeps no earlier version of a NodeKey, and every control node snapshots and
+//! drops its log up to the write that forgot a key (kith-store's `scrub`), so no control
+//! node's store keeps the key after it. What it does not do: a disk copied beforehand, with its recovery key, still opens;
 //! flash may keep the record's old blocks; and the record shows that a code exists.
 //!
 //! The cluster's code (`kith node duress --all`) is one code on every NodeKey there is
@@ -1005,12 +1007,7 @@ pub async fn keep(
                 }
             }
             (None, _) => {
-                let spec = json!({ "id": id, "wrapped": hex(&wrap(&record.secret, &opened)) });
-                let held = json!({
-                    "apiVersion": "kith.dev/v1", "kind": "NodeKey",
-                    "metadata": { "name": cluster.me.name }, "spec": spec,
-                });
-                let resources = vec![serde_json::from_value(held).expect("a NodeKey")];
+                let resources = vec![to_hold(&cluster.me.name, &id, &record.secret, &opened)];
                 let at = kith_api::store::now();
                 if let Err(e) = shared.submit(Command::Apply { resources, at }).await {
                     eprintln!("kithd: giving the cluster this node's key to hold: {e}");
@@ -1428,6 +1425,16 @@ fn taken(id: &str, nonce: &[u8]) -> bool {
         .position(|(_, of, number)| of == id && number[..] == *nonce);
     let was = at.and_then(|at| given.remove(at));
     was.is_some_and(|(when, ..)| when.elapsed() < FRESH)
+}
+
+/// The NodeKey node `name` gives the cluster to hold: the key of its disk `id`, wrapped
+/// with the `secret` only that disk has.
+fn to_hold(name: &str, id: &str, secret: &[u8], key: &[u8]) -> kith_api::Resource {
+    let held = json!({
+        "apiVersion": "kith.dev/v1", "kind": "NodeKey",
+        "metadata": { "name": name }, "spec": { "id": id, "wrapped": hex(&wrap(secret, key)) },
+    });
+    serde_json::from_value(held).expect("a NodeKey")
 }
 
 /// The NodeKeys a forget of the disk `id` wipes, as they are to be written: the one of
@@ -1964,6 +1971,27 @@ mod tests {
             ]
         );
         assert!(put_back(&kith_store::Done::Nothing).is_empty());
+    }
+
+    /// The store drops its log after a write that takes a wrapped key out (kith-store's
+    /// `wrapped`): it has to read a NodeKey as this writes it as holding one, and one a
+    /// forget writes as holding none.
+    #[test]
+    fn forgotten_key_as_kithd_writes_it_is_seen_by_the_store() {
+        let id = "aa";
+        let mut written = to_hold("a", id, &[7; 32], &[9; 32]);
+        assert!(kith_store::wrapped(&written).is_some_and(|wrapped| unhex(wrapped).is_some()));
+        let (_, own, own_public) = code();
+        written.spec["duress"] = own_public.into();
+        let nonce = [5; 32];
+        let wiped = forgetting(
+            &stored(&[written]),
+            id,
+            &nonce,
+            own.sign(&forget_text(id, &nonce)).as_ref(),
+        );
+        assert_eq!(wiped.len(), 1);
+        assert_eq!(kith_store::wrapped(&wiped[0]), None);
     }
 
     #[test]
