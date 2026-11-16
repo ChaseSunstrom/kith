@@ -89,6 +89,34 @@ fn table(disk: &File, at: u64) -> Result<(Vec<u8>, Vec<u8>), String> {
     }
 }
 
+/// The unique GUIDs of the partitions `disk` (`sectors` long) holds, as text: from its first
+/// table, or from the spare in its last sector when the first does not add up (a power cut in
+/// `widen` leaves one that does not). An error when neither does: nothing is said of a table
+/// that is damaged.
+pub fn guids(disk: &File, sectors: u64) -> Result<Vec<String>, String> {
+    let (header, entries) =
+        table(disk, 1).or_else(|first| table(disk, sectors.saturating_sub(1)).map_err(|_| first))?;
+    let each = u32_at(&header, 84) as usize;
+    Ok(entries
+        .chunks(each)
+        .filter(|entry| entry[..16] != [0; 16])
+        .map(|entry| guid_text(entry[16..32].try_into().expect("sixteen bytes")))
+        .collect())
+}
+
+/// A GUID as its text: its first three fields are little-endian in a table, the rest in order.
+fn guid_text(bytes: [u8; 16]) -> String {
+    let hex = |units: &[u8]| units.iter().map(|unit| format!("{unit:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex(&[bytes[3], bytes[2], bytes[1], bytes[0]]),
+        hex(&[bytes[5], bytes[4]]),
+        hex(&[bytes[7], bytes[6]]),
+        hex(&bytes[8..10]),
+        hex(&bytes[10..16]),
+    )
+}
+
 /// `header` as the copy in sector `me` has it, for `entries` at `entries_at`.
 fn headed(header: &[u8], entries: &[u8], me: u64, other: u64, entries_at: u64, usable: u64) -> Vec<u8> {
     let (mut header, size) = (header.to_vec(), u32_at(header, 12) as usize);
@@ -206,8 +234,10 @@ mod tests {
     fn image(sectors: u64, parts: &[(&str, u64, u64)]) -> Vec<u8> {
         let mut disk: Vec<u8> = (0..sectors * SECTOR).map(|at| (at % 251) as u8).collect();
         let mut entries = vec![0u8; 128 * 128];
-        for (entry, (name, first, last)) in entries.chunks_mut(128).zip(parts) {
+        for (index, (entry, (name, first, last))) in entries.chunks_mut(128).zip(parts).enumerate() {
             entry[..16].fill(7);
+            // The partition's own GUID: 0x41 repeated for the first, 0x42 for the second.
+            entry[16..32].fill(0x41 + index as u8);
             entry[32..40].copy_from_slice(&first.to_le_bytes());
             entry[40..48].copy_from_slice(&last.to_le_bytes());
             for (at, unit) in name.encode_utf16().enumerate() {
@@ -267,6 +297,60 @@ mod tests {
     #[test]
     fn widen_counts_as_a_partition_table_does() {
         assert_eq!(crc(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// `disk` as a file (as a disk device is read), and what `guids` says of it.
+    fn guids_of(disk: &[u8], sectors: u64, test: &str) -> Result<Vec<String>, String> {
+        let path = std::env::temp_dir().join(format!("kith-gpt-{}-{test}", std::process::id()));
+        std::fs::write(&path, disk).unwrap();
+        let file = File::open(&path).unwrap();
+        let said = guids(&file, sectors);
+        std::fs::remove_file(&path).unwrap();
+        said
+    }
+
+    const FIRST: &str = "41414141-4141-4141-4141-414141414141";
+    const SECOND: &str = "42424242-4242-4242-4242-424242424242";
+
+    #[test]
+    fn guid_text_is_written_as_a_gpt_writes_it() {
+        // The EFI system partition's type, which the table holds with its first three fields
+        // little-endian.
+        let bytes = [
+            0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+        ];
+        assert_eq!(guid_text(bytes), "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7");
+    }
+
+    #[test]
+    fn guids_are_the_unique_ones_of_a_disks_partitions() {
+        let disk = image(8192, &PARTS);
+        assert_eq!(guids_of(&disk, 8192, "guids"), Ok(vec![FIRST.into(), SECOND.into()]));
+        // A disk with no partitions has none; a disk with no table has none either.
+        let empty = image(8192, &[]);
+        assert_eq!(guids_of(&empty, 8192, "empty"), Ok(vec![]));
+        assert!(
+            guids_of(&vec![0; 8192 * 512], 8192, "blank")
+                .unwrap_err()
+                .contains("no partition table")
+        );
+    }
+
+    #[test]
+    fn guids_come_from_the_spare_when_the_first_table_is_torn() {
+        // A power cut in `widen` leaves the first copy not adding up, and the spare whole.
+        let mut torn = image(8192, &PARTS);
+        torn[1024 + 128 + 41] ^= 1;
+        assert_eq!(guids_of(&torn, 8192, "spare"), Ok(vec![FIRST.into(), SECOND.into()]));
+    }
+
+    #[test]
+    fn guids_are_none_from_a_table_that_does_not_add_up() {
+        // Both copies damaged: nothing is said of either, not even the parts that still add up.
+        let mut torn = image(8192, &PARTS);
+        torn[1024 + 128 + 41] ^= 1;
+        torn[8191 * 512 - 128 * 128 + 128 + 40] ^= 1;
+        assert!(guids_of(&torn, 8192, "torn").unwrap_err().contains("damaged"));
     }
 
     #[test]

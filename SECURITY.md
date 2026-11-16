@@ -1462,6 +1462,15 @@ kith-lsp. The findings and what became of each are in
 Until that is done, a person who may apply DeviceClaims in some namespace can take a
 node's input devices while no session holds them.
 
+- The installer and the first process: a stick holding a copy of the public root and
+  verity partitions, plus its own config and state, booted as the node. Init now checks,
+  before it reads config or state, that the disk its root is on holds the partition the
+  firmware's `LoaderDevicePartUUID` names (the ESP systemd-boot started), and refuses the
+  root when it does not (T-0647). Left open: firmware told to boot the stick's own ESP
+  boots the stick as another machine, since that stick holds the ESP the firmware names;
+  and a stick whose GPT copies the node's ESP GUID passes, so the check is only as strong
+  as that GUID's secrecy. A kernel started without systemd-boot has no such variable: init
+  goes on, and says so. The rest of that area is in the review doc.
 - Dependencies: checked against the RustSec advisory database with `cargo audit` on
   2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
   fixed by moving to 0.4.4. One warning is ignored in `.cargo/audit.toml`, with the reason
