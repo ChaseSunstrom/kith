@@ -514,8 +514,12 @@ spec:
   and a root of its own and behind the same filter on system calls as every container.
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
-- Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace).
+- On kith OS, where kithd is root, each container of a pod is a user namespace of its
+  own, with users of the node no other container has: its root is not the node's root,
+  and a root-only file of the node it is handed stays shut to it
+  ([what a container is kept from](#what-a-container-is-kept-from); `sh ci/vm.sh --test share`
+  shows it). A pod on the node's network, one given devices or one with a volume of
+  another node keeps the node's users.
 
 ### What a container is given
 
