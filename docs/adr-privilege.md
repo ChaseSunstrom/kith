@@ -328,19 +328,57 @@ before any of the split:
   `api/run.rs`, `crypt.rs`, by `policy.rs`), in words that name the key and the word
   that turns it on; a Node's status says its policy, so the scheduler does not place on a node
   what it would refuse, and `kith get nodes` shows it;
-- where `execUnits`, `vmPaths` and `run` are all off, kithd is to cut its bounding set
-  at start (not built yet: T-0590) to what it and its containers use: the fourteen of a root pod
-  (`container.rs`, `ROOTS`, with `SETPCAP`, `SETFCAP`, `FSETID`, `SYS_CHROOT` and
-  `AUDIT_WRITE` among them) and its own (`SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`,
-  `SYS_BOOT`, `SYS_RESOURCE`, `BPF`); found exactly by the VM tests with a root pod, an
-  unconfined unit and a nested unit, and never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`
-  or `SYS_TIME`;
+- where `execUnits`, `vmPaths` and `run` are all off (each a way to have the node start a
+  process as its root with every capability), kithd cuts its bounding set at start,
+  before its runtime or any thread but the first process's console and power-button
+  readers (a thread keeps the set it was made with), to the fourteen of a root pod
+  (`container.rs`, `ROOTS`: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`,
+  `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE`,
+  `SETFCAP`). The list is `KEPT` in `policy.rs`; a capability joins it only for a child
+  that kithd execs (a container's process, the exec shim, a helper) and fails for want of
+  it, with that child named there, as `ci/vm.sh --test policy` finds (a root pod, an
+  unconfined unit and a nested unit, two nodes on the mesh). None does so far: what
+  kithd itself needs (`SYS_ADMIN` for mounts, namespaces, cgroups and the loop and mapper
+  devices; `NET_ADMIN` for links and nftables; `SYS_BOOT` to power off; `BPF` for the
+  cgroup filters) it does in its own threads, which the bounding set does not limit.
+  **What this does and does not do.** The bounding set limits only what an exec gives a
+  child (a root child's permitted set becomes the bounding set); `PR_CAPBSET_DROP` does
+  not touch kithd's own permitted and effective sets. So nothing kithd starts by an exec
+  can hold a capability outside the list in the node's own user namespace, whatever its
+  spec asks and whatever bug let it ask (a pod with `userNamespaces` has a full bounding
+  set inside its own namespace, over that namespace's resources only; a container's own
+  bounding set is its spec's on any node, cut or not, and the cut is what kithd's other
+  children inherit: a Source's git, dnsmasq, the storage holder,
+  libcontainer's init before its capset): not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`, `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`,
+  `BPF`, `SYS_NICE`, `IPC_LOCK`, `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `PERFMON`... But
+  kithd's own threads keep every capability (the VM test reads `CapEff` and says so), so
+  **a hole inside kithd is not held back by this**: that is the split's job ("Order of
+  work after Step A" below, T-0334). Neither is every effect covered: root without `SYS_PTRACE` can still
+  trace root's own processes, and root can write `/proc/sys` with file permissions alone.
+  Untried on a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off
+  already leaves no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a
+  memlock limit, which the list does not have); no VM test runs either.
+  kithd execs itself only as the exec shim, for exec units (which the policy that cuts has
+  off); a container is not started through it: libcontainer forks, clones and execs it, and
+  sets the container's own sets from its spec (the fourteen of a root pod, three for a root
+  that is not one, one for a user) over the cut's, so no container reads the cut. No serving
+  process has the bounding set for its permitted set, and what needs `SYS_PTRACE`
+  (`storage::unlinked` reads `/proc/PID/fd`; `setns` into a container that is not root's)
+  runs in kithd's own threads, which keep it. (`Handle::in_dev` only plugs an input device
+  into a container.)
+- the node's status says what it kept (`status.policy.capabilities`; `all` where it was
+  not cut, which includes a kithd that is not root). A kithd that cannot cut as root
+  does not start;
 - no system call filter on the single process. The filter is the serving part's.
 
-Built so far: the keys and their refusals, the Node's status, and the scheduler reading
-it (a label of its own making for each key a node allows, required of what asks for it).
-Not yet: the bounding set and the installer's question. Until then a hardened node holds
-every capability.
+Built so far: the keys and their refusals, the Node's status, the scheduler reading
+it (a label of its own making for each key a node allows, required of what asks for it)
+and the bounding set. Not yet: the installer's question.
+
+An update is taken by a node that has cut: `KITH_NODE_POLICY=no-exec-units,no-vm-paths,no-run
+sh ci/vm.sh --test rollout` runs the release test with the nodes so started, which is
+the smallest honest way to show it (an update inside `--test policy` would build and sign
+a second image, and double its length).
 
 What Step A buys by itself: a certificate of the cluster that is stolen, or a hole in
 the store, is no longer root on a node whose owner said so. A hole in a parser is still

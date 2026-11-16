@@ -639,15 +639,20 @@ fn strip_node_keys(kept: &std::path::Path) -> Result<(), String> {
 }
 
 fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
+    let first_process = boot.is_some();
+    // Before anything is run or served: what this node's owner has it refuse.
+    let node_policy = policy::read(args.node_policy.as_deref(), first_process)?;
+    // And, where it refuses every way to be root with all the kernel's capabilities, before
+    // the runtime or any other thread: a thread keeps the bounding set it was made with.
+    // (Only the threads of `init::early`, which read and write and start nothing, are older.)
+    policy::cut(&node_policy)?;
+    policy::set(node_policy);
     // One thread for everything that is awaited: kithd forks containers, and a small idle
     // footprint is the point (§3.2). (What blocks goes to a thread of its own for as long as it does.)
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("starting: {e}"))?;
-    let first_process = boot.is_some();
-    // Before anything is run or served: what this node's owner has it refuse.
-    policy::set(policy::read(args.node_policy.as_deref(), first_process)?);
     let sealed = boot.as_mut().and_then(|boot| boot.sealed.take());
     // As the first process, SIGTERM and Ctrl-Alt-Del are heard from the start: the kernel
     // drops what process 1 does not handle. (Anywhere else the default, which ends kithd, stays until serving.)

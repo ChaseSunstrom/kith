@@ -473,8 +473,29 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   scheduler places a Workload or Job only on nodes whose status says they allow what it
   asks for; that is for placing, not a defence (a node's status is its own word, and each
   node refuses by its own policy whatever it was sent). Not done yet: a VM's kernel and
-  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use; and
-  a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
+  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use. Where
+  `exec-units`, `vm-paths` and `run` are all off (every way for the store to start a
+  process as the node's root with all its capabilities), kithd also cuts its bounding set
+  at start to the fourteen a root pod keeps (`KEPT` in `crates/kithd/src/policy.rs`). The
+  bounding set limits what an exec gives a child, so nothing kithd starts by an exec can
+  hold a capability outside that list in the node's own user namespace, whatever its spec
+  asks for and whatever bug let it ask: not `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or
+  `SYS_TIME`, nor `SYS_ADMIN`, `SYS_BOOT`, `BPF` or the rest (the node's status lists what
+  it kept). A pod with `userNamespaces` has a full bounding set inside its own namespace,
+  over that namespace's resources only (above). **A container's bounding set is its own
+  spec's on any node, cut or not** (the fourteen for a root pod, three for a root that is
+  not one, one for a user): the cut is what kithd's other children inherit (a Source's
+  git, dnsmasq, the storage holder, and libcontainer's init before it
+  sets the container's), so no container's `CapBnd` shows it; `ci/vm.sh --test policy`
+  reads kithd's own `CapBnd` instead. **It does not limit kithd's own threads**, which keep every
+  capability (`CapEff` is not cut; `ci/vm.sh --test policy` reads it): a hole inside kithd,
+  or a stolen certificate that reaches a hole there, is not held back by this. That is
+  the split's job (`docs/adr-privilege.md`, T-0334). Nor does it say an effect is impossible: root
+  without `SYS_PTRACE` can still trace root's own processes (the same user), and root can
+  write `/proc/sys` with file permissions alone; neither is covered by the cut. Untried on
+  a cut node: a VM (qemu would be exec'd with the fourteen; `vm-paths` off already leaves
+  no VM of use) and a passthrough device (vfio may want `IPC_LOCK` or a memlock limit,
+  which the list does not have); no VM test runs either. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container that keeps the node's
   users and is not root is still the node's user of its number, with whatever files on
   the node that user owns; one that would be of root's group (its image says `1001:0`,
