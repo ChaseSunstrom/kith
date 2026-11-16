@@ -45,7 +45,7 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
 
 /// Blocks that are not a whole resource, and so are not checked: two `spec:` parts shown
 /// inside a list, and the installer's file.
-const PARTS: usize = 3;
+const PARTS: usize = 4;
 
 #[test]
 fn readme_examples_are_taken_by_this_build() {

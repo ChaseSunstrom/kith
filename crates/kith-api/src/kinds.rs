@@ -19,6 +19,57 @@ macro_rules! spec {
     )*};
 }
 
+/// One an image may be signed by: a public key's text, or an identity that signed without a
+/// kept key (cosign's default). docs/adr-keyless.md says what is checked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum Signer {
+    Key(String),
+    Identity(Identity),
+}
+
+// (Not serde's untagged reading: it says only that nothing matched, not what is wrong.)
+impl<'de> Deserialize<'de> for Signer {
+    fn deserialize<D: serde::Deserializer<'de>>(reader: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        match serde_json::Value::deserialize(reader)? {
+            serde_json::Value::String(key) => Ok(Signer::Key(key)),
+            said @ serde_json::Value::Object(_) => serde_json::from_value(said)
+                .map(Signer::Identity)
+                .map_err(|e| D::Error::custom(format!("signedBy: an identity: {e}"))),
+            _ => Err(D::Error::custom(
+                "signedBy: each is a public key's text, or an identity: { issuer, subject, authority, log }",
+            )),
+        }
+    }
+}
+
+spec! {
+    /// Whom an authority certified, signed in at an issuer, and the authority's certificates
+    /// and the transparency log's key that say so: nothing of these is fetched.
+    pub struct Identity {
+        /// Where the signer signed in, e.g. `https://token.actions.githubusercontent.com`.
+        pub issuer: String,
+        /// The email address or URI the certificate names, matched whole.
+        pub subject: String,
+        /// The authority's root certificate and its intermediates, PEM: 1 to 4.
+        pub authority: Vec<String>,
+        /// The log's public key, PEM (ECDSA P-256).
+        pub log: String,
+    }
+}
+
+impl Signer {
+    /// As a node is handed it: the key's text, or the identity's JSON.
+    pub fn text(&self) -> String {
+        match self {
+            Signer::Key(key) => key.clone(),
+            Signer::Identity(identity) => serde_json::to_string(identity).unwrap_or_default(),
+        }
+    }
+}
+
 /// An amount of CPU, memory or storage: `2`, `500m`, `2Gi`, `1.5G`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
@@ -165,8 +216,8 @@ spec! {
         /// by whole parts; empty, or left out, for every image a node pulls.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         pub prefix: String,
-        /// Public keys, as a container's `signedBy` takes them: at least one.
-        pub signed_by: Vec<String>,
+        /// Public keys or identities, as a container's `signedBy` takes them: at least one.
+        pub signed_by: Vec<Signer>,
     }
 
     pub struct UpdatePolicy {
@@ -340,11 +391,12 @@ spec! {
     pub struct Container {
         pub name: String,
         pub image: String,
-        /// Public keys, one of which the image must be signed by, as `cosign sign --key`
-        /// signs: each a PEM file's text or the base64 in it (ECDSA P-256 or Ed25519).
-        /// With none, an image is run whoever made it.
+        /// Who the image must be signed by, one of these: a public key, as `cosign sign --key`
+        /// signs (a PEM file's text or the base64 in it: ECDSA P-256 or Ed25519); or an
+        /// identity, as cosign signs without a kept key. With none, an image is run whoever
+        /// made it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub signed_by: Vec<String>,
+        pub signed_by: Vec<Signer>,
         /// When to ask the registry what `image` points at. Defaults to `ifNotPresent`.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub pull_policy: Option<PullPolicy>,
@@ -1285,13 +1337,43 @@ macro_rules! no_checks {
     ($($spec:ty),* $(,)?) => { $(impl Spec for $spec {})* };
 }
 
-/// Why `keys` are not ones an image can be said to be signed by (a container's `signedBy`, or a
-/// Cluster's rule's): too many, or one that is not a public key's text.
-fn not_keys(keys: &[String]) -> Option<String> {
-    if keys.len() > 16 {
+/// Why `signers` are not ones an image can be said to be signed by (a container's `signedBy`,
+/// or a Cluster's rule's): too many, or one that is not a public key's text or an identity.
+fn not_keys(signers: &[Signer]) -> Option<String> {
+    if signers.len() > 16 {
         return Some("signedBy: at most 16 keys".into());
     }
-    keys.iter().find_map(|key| {
+    // (Read as P-256 keys are below: a log's key is one.)
+    let p256 = |text: &str| {
+        let lines = text.lines().filter(|line| !line.trim_start().starts_with("-----"));
+        let text: String = lines.flat_map(str::chars).filter(|c| !c.is_whitespace()).collect();
+        text.starts_with("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE") && text.len() == 124
+    };
+    let identity = |identity: &Identity| {
+        let name = |text: &str| !text.is_empty() && text.len() <= 1024 && !text.chars().any(char::is_control);
+        let who: String = identity.subject.chars().take(40).collect();
+        let cert =
+            |cert: &String| cert.len() <= 8 << 10 && cert.trim_start().starts_with("-----BEGIN CERTIFICATE-----");
+        if !name(&identity.issuer) || !name(&identity.subject) {
+            Some("signedBy: an identity names its issuer and its subject (each at most 1024 characters)".to_string())
+        } else if identity.authority.is_empty() || identity.authority.len() > 4 || !identity.authority.iter().all(cert)
+        {
+            Some(format!(
+                "signedBy: the identity `{who}` gives its authority as 1 to 4 PEM certificates of at most 8 KiB"
+            ))
+        } else if !p256(&identity.log) {
+            Some(format!(
+                "signedBy: the identity `{who}`'s log is not an ECDSA P-256 public key"
+            ))
+        } else {
+            None
+        }
+    };
+    signers.iter().find_map(|signer| {
+        let key = match signer {
+            Signer::Key(key) => key,
+            Signer::Identity(said) => return identity(said),
+        };
         // The two kinds of key there are start their files the same way each: told
         // here by that and their length, and read in full by the node that pulls.
         let lines = key.lines().filter(|line| !line.trim_start().starts_with("-----"));

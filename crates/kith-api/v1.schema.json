@@ -1546,9 +1546,9 @@
         "signedBy": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/Signer"
           },
-          "description": "Public keys, one of which the image must be signed by, as `cosign sign --key`\nsigns: each a PEM file's text or the base64 in it (ECDSA P-256 or Ed25519).\nWith none, an image is run whoever made it."
+          "description": "Who the image must be signed by, one of these: a public key, as `cosign sign --key`\nsigns (a PEM file's text or the base64 in it: ECDSA P-256 or Ed25519); or an\nidentity, as cosign signs without a kept key. With none, an image is run whoever\nmade it."
         },
         "pullPolicy": {
           "anyOf": [
@@ -2309,6 +2309,38 @@
         "cloudHypervisor"
       ]
     },
+    "Identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "description": "Where the signer signed in, e.g. `https://token.actions.githubusercontent.com`."
+        },
+        "subject": {
+          "type": "string",
+          "description": "The email address or URI the certificate names, matched whole."
+        },
+        "authority": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "The authority's root certificate and its intermediates, PEM: 1 to 4."
+        },
+        "log": {
+          "type": "string",
+          "description": "The log's public key, PEM (ECDSA P-256)."
+        }
+      },
+      "required": [
+        "issuer",
+        "subject",
+        "authority",
+        "log"
+      ],
+      "description": "Whom an authority certified, signed in at an issuer, and the authority's certificates\nand the transparency log's key that say so: nothing of these is fetched."
+    },
     "IdentitySpec": {
       "type": "object",
       "additionalProperties": false,
@@ -2345,9 +2377,9 @@
         "signedBy": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/Signer"
           },
-          "description": "Public keys, as a container's `signedBy` takes them: at least one."
+          "description": "Public keys or identities, as a container's `signedBy` takes them: at least one."
         }
       },
       "required": [
@@ -3608,6 +3640,17 @@
         "volume"
       ],
       "description": "A Volume given to machines that are not nodes: over NFS by the volume's node, and\nover SMB by the `nas` package's file server."
+    },
+    "Signer": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/Identity"
+        }
+      ],
+      "description": "One an image may be signed by: a public key's text, or an identity that signed without a\nkept key (cosign's default). docs/adr-keyless.md says what is checked."
     },
     "SourceSpec": {
       "type": "object",

@@ -743,9 +743,23 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   alias in DNS is not), so only a rule with no prefix makes every pulled image a signed
   one. A cluster Image is under no rule and signed by no one: whoever may apply an
   Image and write a Volume in a namespace runs what they packed. Containers already
-  running when a rule is applied are not stopped. A signature is checked against keys
-  only: no certificate, no transparency log, so a signing key that leaks signs until
-  it is taken out of every rule and template.
+  running when a rule is applied are not stopped. A signature by a key: a signing key
+  that leaks signs until it is taken out of every rule and template.
+- **An image signed without a kept key** (cosign's default) is run where a rule or a
+  template names an identity: an issuer, a subject, the authority's certificates and the
+  log's key, all given and nothing fetched (docs/adr-keyless.md has each byte checked).
+  What it proves: the authority certified that subject, signed in at that issuer, for a
+  key that signed this image's digest, and the log promised under its key that it saw
+  that signature while the certificate was good. What it does not:
+  - who runs the authority and the log is the owner's choice of trust; an authority and a
+    log that lie together are not caught, and neither is one that gives a certificate to
+    someone who took over the subject's account at the issuer;
+  - there is no revocation: a ten-minute certificate is bounded by the log's time only;
+  - the log's inclusion proof and the certificate's own log proof (its SCT) are not
+    checked: offline, with no witness, they add nothing the log's promise does not;
+  - a log of Rekor v2 (an inclusion proof and a time from a timestamp authority, no
+    promise) is not read: such a signature is refused, naming it;
+  - an attestation (an in-toto statement of another kind) is never taken as a signature.
 - **A control node that is taken is the cluster taken, until its Node is deleted.** It has the
   whole store, every Secret in it, and a node's rights (a worker has less: below). `kith delete node/NAME` ends
   what it can ask for: each node looks a node certificate's name up in its own copy of

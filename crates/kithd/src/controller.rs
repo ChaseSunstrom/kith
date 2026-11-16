@@ -2308,11 +2308,12 @@ async fn start(
             // (An Image of the cluster is made on a node from a Volume, by whoever may apply an
             // Image in its namespace: no one signs it, and no rule has it.)
             let own = |local: &kith_runtime::Local| local.namespace(&c.image).is_some();
+            let named: Vec<String> = c.signed_by.iter().map(kith_api::kinds::Signer::text).collect();
             let signed_by = match runtime.images.local.as_ref().is_some_and(own) {
-                true => c.signed_by.clone(),
+                true => named,
                 false => {
                     let rules = image_rules(&shared.store.lock().expect("a handler panicked holding the store").store);
-                    signers(&rules, &c.image, &c.signed_by)?
+                    signers(&rules, &c.image, &named)?
                 }
             };
             let image = runtime
@@ -2376,8 +2377,11 @@ fn image_rules(store: &kith_api::store::Store) -> Vec<(String, Vec<String>)> {
         .list(Some("Cluster"))
         .filter_map(|cluster| cluster.spec["images"].as_array());
     let rule = |rule: &Value| {
+        // (Keys and identities alike, as a node is handed them: what is neither is left out,
+        // and a rule left with none runs nothing under it.)
         let keys = rule["signedBy"].as_array().into_iter().flatten();
-        let keys = keys.filter_map(Value::as_str).map(String::from).collect();
+        let signer = |said: &Value| serde_json::from_value::<kith_api::kinds::Signer>(said.clone()).ok();
+        let keys = keys.filter_map(signer).map(|signer| signer.text()).collect();
         // (A rule's registry by its one name, as an image's is read: `ghcr.io:443/acme` is `ghcr.io/acme`.)
         let prefix = rule["prefix"].as_str().unwrap_or_default();
         let prefix = match prefix.split_once('/') {
@@ -2511,6 +2515,32 @@ mod tests {
             Ok(vec![other.clone()])
         );
         assert_eq!(signers(&[], "ghcr.io/acme/tool", &[]), Ok(vec![]));
+    }
+
+    /// An identity (signed without a kept key) in a rule is narrowed by a template's as a key
+    /// is: the same identity written out otherwise is the same one, and another is not.
+    #[test]
+    fn image_rules_hold_identities_as_they_hold_keys() {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let root = params.self_signed(&key).unwrap().pem();
+        let log = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .unwrap()
+            .public_key_pem();
+        let identity = |subject: &str, root: &str| {
+            json!({ "issuer": "https://issuer.test", "subject": subject, "authority": [root], "log": log }).to_string()
+        };
+        let ours = identity("dev@example.test", &root);
+        let rules = vec![("ghcr.io".to_string(), vec![ours.clone()])];
+        let same = identity("dev@example.test", &root.replace('\n', "\r\n"));
+        assert_eq!(signers(&rules, "ghcr.io/acme/tool", &[same]), Ok(vec![ours.clone()]));
+        assert!(signers(&rules, "ghcr.io/acme/tool", &[identity("them@example.test", &root)]).is_err());
+        assert_eq!(signers(&rules, "ghcr.io/acme/tool", &[]), Ok(vec![ours]));
+        // An older kithd keeps a rule's strings only: a rule of identities alone is then a rule
+        // of no key, and runs nothing under it.
+        let older = vec![("ghcr.io".to_string(), Vec::new())];
+        assert!(signers(&older, "ghcr.io/acme/tool", &[]).is_err());
     }
 
     /// A template's own keys narrow a rule's and cannot replace or widen them; a key is the

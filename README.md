@@ -393,6 +393,27 @@ spec:
   node counts as signed only by the keys a signature of it was found by; `pullPolicy:
   never` with a key the node has not checked it against does not start. With no
   `signedBy` and no rule of the cluster's (next), an image is run whoever made it.
+- **Signed without a kept key** (cosign's default: `cosign sign IMAGE`, no `--key`).
+  `signedBy` may name an identity in place of a key: whom the authority certified and
+  where they signed in, with the authority's certificates and the transparency log's
+  key. Nothing of these is built in or fetched: you give the roots you trust, as below
+  for the public Sigstore instance (its trusted root's Fulcio certificates and Rekor key,
+  e.g. from `cosign trusted-root create`, or the files Sigstore publishes):
+
+  ```yaml
+  signedBy:
+    - issuer: https://token.actions.githubusercontent.com
+      subject: https://github.com/acme/tool/.github/workflows/release.yml@refs/heads/main
+      authority: [ "-----BEGIN CERTIFICATE-----\n…", "-----BEGIN CERTIFICATE-----\n…" ]
+      log: "-----BEGIN PUBLIC KEY-----\n…"
+  ```
+
+  The signature is looked for as a bundle among the image's referrers (cosign 3) and
+  under the tag `sha256-DIGEST.sig` (older cosigns). It is run only if the signature is
+  by a certificate from that authority, for code signing, naming exactly that subject
+  and issuer, valid when the log promised (under its key) that it saw the signature,
+  and the log's entry is of that very signature. What this proves and what it does not:
+  [SECURITY.md](SECURITY.md#what-is-not-defended) and [docs/adr-keyless.md](docs/adr-keyless.md).
   Whatever its `pullPolicy`, a cluster Image of this node's own registry is asked for
   again before it starts (see above).
 - **Keys named once, for the cluster.** A `Cluster`'s `spec.images` says which keys
@@ -423,9 +444,10 @@ spec:
   that reads rules: an older one runs an image as before. Up to 32 rules, 16 keys each;
   a rule by mistake stops new containers under it from starting (the refusal names
   the rule), and taking it out of the `Cluster` is the way back. Not under any rule:
-  a cluster Image (packed from a Volume on a node, signed by no one). Not read: cosign's
-  keyless signatures (certificates), a transparency log, and signatures kept as OCI
-  referrers. `spec.images` is all kithd reads of a `Cluster` today: its `domain`, `voters`,
+  a cluster Image (packed from a Volume on a node, signed by no one). A rule may name
+  identities as a template may (above); an older kithd refuses such a rule, or keeps
+  only its keys and runs nothing a rule of identities alone covers. Not read yet: a log
+  of Rekor v2 (no promise, a time from a timestamp authority). `spec.images` is all kithd reads of a `Cluster` today: its `domain`, `voters`,
   `updatePolicy`, `mesh` and `values` are kept and not acted on, and `kith lint`, `kith
   diff` and `kith apply` say so of each one a file sets.
 - **What it still reaches.** The node's network (and so every port on its loopback, and
@@ -438,10 +460,8 @@ spec:
   on the node's network, one given devices or one with a volume of another node, and a
   pod's `/sys` is the node's, bound in (a user namespace may mount no other); the filter is a
   list of what is refused, not of what is allowed, so a call the kernel gains later is let
-  through until it is named here; signatures with a certificate instead of a key
-  (cosign's keyless signing), a transparency log, and signatures kept as referrers of the
-  image (cosign's newer bundle format) are not read; keys are named by each template,
-  not once for a cluster or a registry; an `exec` unit is none of this: it is a process
+  through until it is named here; a log of Rekor v2 is not read (its signatures are
+  refused, naming it); an `exec` unit is none of this: it is a process
   of the host. The user namespace of the first kind (kithd as your service) has been run;
   the kith OS kind has been run in VMs for pods as root, serving port 80, and its
   id-mapped volumes beside one of another node.

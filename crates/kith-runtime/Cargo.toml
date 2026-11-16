@@ -26,6 +26,9 @@ caps = "0.5"
 # Image signatures. (Both in the tree already: rustls verifies with ring.)
 ring = "0.17"
 base64 = "0.22"
+# A keyless signature's certificate, checked to its authority at the log's time (in the
+# tree through rustls).
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["ring", "std"] }
 # Whether a file has extended attributes (one that has is never shared). In the tree already
 # through libcontainer's pathrs.
 rustix = { version = "1", default-features = false, features = ["fs", "std"] }
@@ -33,6 +36,8 @@ rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 seccompiler = "0.5"
 
 [dev-dependencies]
+# An authority and its certificates, made in the tests (in the tree through kithd).
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 
 [lints]

@@ -1192,6 +1192,65 @@ fn cluster_fields_nothing_reads_are_named() {
     assert!(read(other).not_acted_on().is_empty());
 }
 
+/// An identity among a rule's signers (signed without a kept key): its issuer, its subject,
+/// its authority's certificates and its log's key, each checked for its shape when the
+/// Cluster is applied; and what is neither a key nor an identity refused.
+#[test]
+fn keyless_identities_in_image_rules_are_checked_when_a_cluster_is_applied() {
+    let cluster = |images: &str| {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  images: {images}\n");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let p256 = format!("MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE{}==", "A".repeat(86));
+    let cert = "\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\"";
+    let identity = |issuer: &str, subject: &str, authority: &str, log: &str| {
+        format!(
+            "[{{ prefix: ghcr.io, signedBy: [{{ issuer: \"{issuer}\", subject: \"{subject}\", authority: {authority}, log: {log} }}] }}]"
+        )
+    };
+    let issuer = "https://token.actions.githubusercontent.com";
+    let subject = "https://github.com/acme/tool/.github/workflows/release.yml@refs/heads/main";
+    let good = identity(issuer, subject, &format!("[{cert}]"), &p256);
+    cluster(&good).unwrap_or_else(|e| panic!("{good}: {e}"));
+    // A key and an identity, side by side.
+    let both = good.replace("signedBy: [", &format!("signedBy: [{p256}, "));
+    cluster(&both).unwrap_or_else(|e| panic!("{both}: {e}"));
+    for (bad, why) in [
+        (
+            identity("", subject, &format!("[{cert}]"), &p256),
+            "names its issuer and its subject",
+        ),
+        (
+            identity(issuer, "", &format!("[{cert}]"), &p256),
+            "names its issuer and its subject",
+        ),
+        (identity(issuer, subject, "[]", &p256), "1 to 4 PEM certificates"),
+        (
+            identity(issuer, subject, &format!("[{}]", [cert; 5].join(", ")), &p256),
+            "1 to 4 PEM certificates",
+        ),
+        (
+            identity(issuer, subject, "[cosign.pub]", &p256),
+            "1 to 4 PEM certificates",
+        ),
+        (
+            identity(issuer, subject, &format!("[{cert}]"), "rekor.pub"),
+            "log is not an ECDSA P-256 public key",
+        ),
+        // (An identity with a field it does not know, or without one, is neither.)
+        (good.replace("log:", "logs:"), "signedBy"),
+        (
+            "[{ prefix: ghcr.io, signedBy: [{ issuer: x, subject: y }] }]".to_string(),
+            "signedBy",
+        ),
+    ] {
+        let said = cluster(&bad).err().unwrap_or_default();
+        assert!(said.contains(why), "{bad}: expected `{why}`, got `{said}`");
+    }
+}
+
 /// The Cluster's rules for whose signatures images are taken by: a prefix that is a registry
 /// or a registry and a path, keys of the shape a template's are, and no more than 32 rules.
 #[test]

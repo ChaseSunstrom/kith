@@ -4,9 +4,11 @@
 //! own repository under the tag `sha256-HEX.sig`: a manifest whose layers are each a small
 //! JSON text naming that digest, with the signature over the text's bytes in the layer's
 //! annotations. (`cosign sign --key cosign.key IMAGE` writes that.)
-//
-// ponytail: keys only. No certificates (cosign's keyless signing), no transparency log,
-// no signatures kept as referrers (cosign's newer bundle format): each when asked for.
+//!
+//! A signature made without a kept key (cosign's default) is checked against an identity
+//! instead: see [`crate::keyless`]. cosign 3 keeps it as a bundle among the image's
+//! referrers; older cosigns keep it under the same tag, with its certificate and the log's
+//! promise in the layer's annotations.
 
 use crate::{Result, err};
 use base64::Engine;
@@ -18,6 +20,12 @@ use oci_client::{Client, Reference};
 use ring::signature::{ECDSA_P256_SHA256_ASN1, ED25519, UnparsedPublicKey, VerificationAlgorithm};
 
 const SIGNATURE: &str = "dev.cosignproject.cosign/signature";
+const CERTIFICATE: &str = "dev.sigstore.cosign/certificate";
+const PROMISE: &str = "dev.sigstore.cosign/bundle";
+/// The most of a bundle that is read: cosign's are some 5 kB.
+const BUNDLE: usize = 64 << 10;
+/// The longest the signatures of one image are looked for.
+const LOOKING: std::time::Duration = std::time::Duration::from_secs(60);
 /// The most of a signed text that is read: cosign's are some 250 bytes.
 const TEXT: usize = 16 << 10;
 /// The most signatures of one image that are looked at.
@@ -31,17 +39,30 @@ const P256: &[u8] = &[
 ];
 const ED: &[u8] = &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
 
-/// A key an image may be signed by.
+/// A key an image may be signed by, or an identity it may be signed as without a kept key.
 pub struct Key {
-    /// The key as it is remembered: its file's base64, with nothing around it.
+    /// The key as it is remembered: its file's base64, with nothing around it; or the
+    /// identity's names and a hash of all it was given.
     pub id: String,
-    algorithm: &'static dyn VerificationAlgorithm,
-    key: Vec<u8>,
+    kind: Kind,
+}
+
+enum Kind {
+    Public(&'static dyn VerificationAlgorithm, Vec<u8>),
+    Identity(crate::keyless::Identity),
 }
 
 /// Reads a public key: a PEM file's text (`-----BEGIN PUBLIC KEY-----` …), or its base64
-/// alone. ECDSA on P-256 (what `cosign generate-key-pair` makes) or Ed25519.
+/// alone. ECDSA on P-256 (what `cosign generate-key-pair` makes) or Ed25519. Or an identity,
+/// as its JSON text (`{"issuer": …, "subject": …, "authority": […], "log": …}`).
 pub fn key(said: &str) -> Result<Key> {
+    if said.trim_start().starts_with('{') {
+        let identity = crate::keyless::identity(said)?;
+        return Ok(Key {
+            id: identity.id.clone(),
+            kind: Kind::Identity(identity),
+        });
+    }
     let lines = said.lines().filter(|line| !line.trim_start().starts_with("-----"));
     let id: String = lines.flat_map(str::chars).filter(|c| !c.is_whitespace()).collect();
     let der = STANDARD.decode(&id).ok();
@@ -59,7 +80,10 @@ pub fn key(said: &str) -> Result<Key> {
             ));
         }
     };
-    Ok(Key { id, algorithm, key })
+    Ok(Key {
+        id,
+        kind: Kind::Public(algorithm, key),
+    })
 }
 
 /// Whether a registry said it has no such manifest (and not: that it could not say).
@@ -81,8 +105,118 @@ fn absent(e: &OciDistributionError) -> bool {
 /// manifests it was picked from. An error says what was found instead.
 pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], keys: &[Key]) -> Result<String> {
     let mut found = Vec::new();
+    // (A registry that answers slowly, or never, is not waited on for ever.)
+    let looked = tokio::time::timeout(LOOKING, look(client, reference, digests, keys, &mut found)).await;
+    match looked {
+        Ok(Ok(Some(by))) => return Ok(by),
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(None)) => {}
+        Err(_) => found.push(format!(
+            "its signatures were looked for for {} s, and that is the most",
+            LOOKING.as_secs()
+        )),
+    }
+    found.dedup();
+    err(format!(
+        "image `{reference}` ({}) is not signed by a key its template or the Cluster's rule for it names: {}",
+        digests.last().copied().unwrap_or_default(),
+        found.join("; ")
+    ))
+}
+
+/// Whether `signed` is by one of `identities`: the first that it is by, or why not (in `found`).
+fn by_identity(
+    signed: &crate::keyless::Signed,
+    digest: &str,
+    identities: &[(&Key, &crate::keyless::Identity)],
+    found: &mut Vec<String>,
+    kept: &str,
+) -> Option<String> {
+    for (key, identity) in identities {
+        match crate::keyless::check(signed, digest, identity) {
+            Ok(()) => return Some(key.id.clone()),
+            Err(why) => found.push(format!("{kept}: {why}")),
+        }
+    }
+    None
+}
+
+/// cosign 3's bundles among `digest`'s referrers: the identity one is by.
+async fn referred(
+    client: &Client,
+    reference: &Reference,
+    digest: &str,
+    identities: &[(&Key, &crate::keyless::Identity)],
+    found: &mut Vec<String>,
+) -> Option<String> {
+    let (registry, repository) = (reference.registry().to_string(), reference.repository().to_string());
+    let subject = Reference::with_digest(registry.clone(), repository.clone(), digest.to_string());
+    // (A registry with no referrers of it, or that cannot say, has none: the tag is looked at next.)
+    let index = client
+        .pull_referrers(&subject, Some(crate::keyless::BUNDLE))
+        .await
+        .ok()?;
+    // Bundles only, whatever else the registry answered with, and of a bundle's size.
+    let bundles = index.manifests.iter().filter(|described| {
+        described.artifact_type.as_deref() == Some(crate::keyless::BUNDLE)
+            && described.size <= BUNDLE as i64
+            && crate::image::sha256_hex(&described.digest).is_ok()
+    });
+    for described in bundles.take(SIGNATURES) {
+        let at = Reference::with_digest(registry.clone(), repository.clone(), described.digest.clone());
+        let Ok((OciManifest::Image(manifest), _)) = client.pull_manifest(&at, &RegistryAuth::Anonymous).await else {
+            continue;
+        };
+        if manifest.subject.as_ref().map(|subject| subject.digest.as_str()) != Some(digest) {
+            found.push("a bundle among its referrers says it is of another image".into());
+            continue;
+        }
+        let Some(layer) = manifest
+            .layers
+            .first()
+            .filter(|layer| layer.media_type == crate::keyless::BUNDLE)
+        else {
+            continue;
+        };
+        let mut room = vec![0u8; BUNDLE];
+        let mut into = std::io::Cursor::new(&mut room[..]);
+        if client.pull_blob(&at, layer, &mut into).await.is_err() {
+            continue;
+        }
+        let bytes = &into.get_ref()[..into.position() as usize];
+        match crate::keyless::bundle(bytes) {
+            Ok(signed) => {
+                if let Some(by) = by_identity(&signed, digest, identities, found, "a bundle among its referrers") {
+                    return Some(by);
+                }
+            }
+            Err(why) => found.push(format!("a bundle among its referrers: {why}")),
+        }
+    }
+    None
+}
+
+async fn look(
+    client: &Client,
+    reference: &Reference,
+    digests: &[&str],
+    keys: &[Key],
+    found: &mut Vec<String>,
+) -> Result<Option<String>> {
+    let identities: Vec<_> = keys
+        .iter()
+        .filter_map(|key| match &key.kind {
+            Kind::Identity(identity) => Some((key, identity)),
+            Kind::Public(..) => None,
+        })
+        .collect();
     for digest in digests {
         let hex = crate::image::sha256_hex(digest)?;
+        if !identities.is_empty()
+            && let Some(by) = referred(client, reference, digest, &identities, found).await
+        {
+            return Ok(Some(by));
+        }
         let (registry, repository) = (reference.registry().to_string(), reference.repository().to_string());
         let at = Reference::with_tag(registry, repository, format!("sha256-{hex}.sig"));
         let manifest = match client.pull_manifest(&at, &RegistryAuth::Anonymous).await {
@@ -100,7 +234,8 @@ pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], ke
         };
         let mut others = 0;
         for layer in manifest.layers.iter().take(SIGNATURES) {
-            let signature = layer.annotations.as_ref().and_then(|notes| notes.get(SIGNATURE));
+            let note = |name: &str| layer.annotations.as_ref().and_then(|notes| notes.get(name));
+            let signature = note(SIGNATURE);
             let Some(signature) = signature.and_then(|signature| STANDARD.decode(signature).ok()) else {
                 continue;
             };
@@ -111,10 +246,28 @@ pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], ke
                 continue;
             }
             let text = &into.get_ref()[..into.position() as usize];
-            let signed = |key: &&Key| {
-                UnparsedPublicKey::new(key.algorithm, &key.key)
+            // Made without a kept key: its certificate and the log's promise are with it.
+            if let Some(cert) = note(CERTIFICATE) {
+                if identities.is_empty() {
+                    others += 1;
+                    continue;
+                }
+                let kept = "a signature there made without a kept key";
+                match crate::keyless::tagged(text, signature, cert, note(PROMISE).map(String::as_str)) {
+                    Ok(signed) => {
+                        if let Some(by) = by_identity(&signed, digest, &identities, found, kept) {
+                            return Ok(Some(by));
+                        }
+                    }
+                    Err(why) => found.push(format!("{kept}: {why}")),
+                }
+                continue;
+            }
+            let signed = |key: &&Key| match &key.kind {
+                Kind::Public(algorithm, public) => UnparsedPublicKey::new(*algorithm, public)
                     .verify(text, &signature)
-                    .is_ok()
+                    .is_ok(),
+                Kind::Identity(_) => false,
             };
             let Some(by) = keys.iter().find(signed) else {
                 others += 1;
@@ -124,7 +277,7 @@ pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], ke
             // signature of this image if it names this digest, wherever else it is kept.
             let said: serde_json::Value = serde_json::from_slice(text).unwrap_or_default();
             match said["critical"]["image"]["docker-manifest-digest"].as_str() {
-                Some(of) if of == *digest => return Ok(by.id.clone()),
+                Some(of) if of == *digest => return Ok(Some(by.id.clone())),
                 of => found.push(format!(
                     "a signature by a named key there is of another image ({})",
                     of.unwrap_or("it names none")
@@ -135,11 +288,7 @@ pub async fn signer(client: &Client, reference: &Reference, digests: &[&str], ke
             found.push(format!("{others} signature(s) there, none by a key that is named"));
         }
     }
-    err(format!(
-        "image `{reference}` ({}) is not signed by a key its template or the Cluster's rule for it names: {}",
-        digests.last().copied().unwrap_or_default(),
-        found.join("; ")
-    ))
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -186,7 +335,9 @@ mod tests {
                     let request = String::from_utf8_lossy(&request).to_string();
                     let path = request.split(' ').nth(1).unwrap_or_default().to_string();
                     noted.lock().unwrap().push(path.clone());
-                    let found = served.lock().unwrap().get(&path).cloned();
+                    // (What is asked of the referrers API is filtered by kind: one answer here.)
+                    let without = path.split('?').next().unwrap_or_default();
+                    let found = served.lock().unwrap().get(without).cloned();
                     let (status, kind, body) = match found {
                         Some(("broken", body)) => ("500 Internal Server Error", "text/plain", body),
                         Some((kind, body)) => ("200 OK", kind, body),
@@ -293,6 +444,31 @@ mod tests {
                 serde_json::json!({ SIGNATURE: signature }),
             );
             self.manifest(name, &tag, b"{}", (layer.0, layer.1.as_bytes(), layer.2));
+        }
+
+        /// `bundle` kept as cosign 3 keeps it: a manifest among the image `of`'s referrers.
+        fn refer(&self, name: &str, of: &str, bundle: &[u8]) {
+            const MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+            let kind = crate::keyless::BUNDLE;
+            let mut config = self.blob(name, b"{}");
+            config["mediaType"] = "application/vnd.oci.empty.v1+json".into();
+            let mut layer = self.blob(name, bundle);
+            layer["mediaType"] = kind.into();
+            let subject = serde_json::json!({ "mediaType": MANIFEST, "digest": of, "size": 1 });
+            let manifest = serde_json::json!({
+                "schemaVersion": 2, "mediaType": MANIFEST, "artifactType": kind,
+                "config": config, "layers": [layer], "subject": subject,
+            })
+            .to_string();
+            let digest = digest(manifest.as_bytes());
+            self.put(format!("/v2/{name}/manifests/{digest}"), MANIFEST, manifest.as_bytes());
+            let index = serde_json::json!({
+                "schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": [{ "mediaType": MANIFEST, "digest": digest, "size": manifest.len(), "artifactType": kind }],
+            })
+            .to_string();
+            let at = format!("/v2/{name}/referrers/{of}");
+            self.put(at, "application/vnd.oci.image.index.v1+json", index.as_bytes());
         }
 
         fn asked(&self, part: &str) -> usize {
@@ -447,6 +623,93 @@ mod tests {
             assert!(said.contains("is not a public key kith can check"), "{bad}: {said}");
         }
         assert_eq!(registry.asked(""), asked);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn keyless_signed_images_run_for_the_identity_named_and_no_others() {
+        use crate::keyless::tests::{Authority, ISSUED, Log, Making, WHO, named};
+        let dir = std::env::temp_dir().join(format!("kith-keyless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (store, registry) = (ImageStore::new(&dir).unwrap(), Registry::start());
+        let name = |image: &str| format!("{}/{image}:1", registry.at);
+        let refused = |pulled: Result<crate::Image>| pulled.err().map(|e| e.to_string()).unwrap_or_default();
+        let (authority, log) = (Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+
+        // A bundle among its referrers, by the identity named: it runs, as signed by it.
+        let (image, _) = registry.image("referred", "by a workflow");
+        registry.refer(
+            "referred",
+            &image,
+            Making::new(&authority, &log, &image).bundle().to_string().as_bytes(),
+        );
+        let pulled = store
+            .pull_signed(&name("referred"), PullPolicy::Always, std::slice::from_ref(&who))
+            .await
+            .unwrap();
+        assert_eq!(pulled.signed_by, [key(&who).unwrap().id]);
+        assert_eq!(
+            (registry.asked("/referrers/"), registry.asked("/manifests/sha256-")),
+            (1, 0)
+        );
+        // Named by a key only, it does not.
+        let (_, pem) = ecdsa();
+        let said = refused(
+            store
+                .pull_signed(&name("referred"), PullPolicy::Always, std::slice::from_ref(&pem))
+                .await,
+        );
+        assert!(said.contains("no signature in its repository"), "{said}");
+        // Nor for someone else.
+        let them = named("someone@example.test", ISSUED, &authority, &log);
+        let said = refused(
+            store
+                .pull_signed(&name("referred"), PullPolicy::Always, std::slice::from_ref(&them))
+                .await,
+        );
+        assert!(
+            said.contains(&format!(
+                "a bundle among its referrers: it was signed by {WHO} ({ISSUED})"
+            )),
+            "{said}"
+        );
+
+        // Kept under the tag, as cosign 2 keeps it: it runs too.
+        let (image, _) = registry.image("tagged", "by a workflow, the old way");
+        let (text, notes) = Making::new(&authority, &log, &image).tagged();
+        let tag = format!("{}.sig", image.replace(':', "-"));
+        registry.manifest(
+            "tagged",
+            &tag,
+            b"{}",
+            ("application/vnd.dev.cosign.simplesigning.v1+json", &text, notes),
+        );
+        let pulled = store
+            .pull_signed(&name("tagged"), PullPolicy::Always, std::slice::from_ref(&who))
+            .await
+            .unwrap();
+        assert_eq!(pulled.signed_by, [key(&who).unwrap().id]);
+        // And a key named alongside does not count its signature as the key's.
+        let said = refused(
+            store
+                .pull_signed(&name("tagged"), PullPolicy::Always, std::slice::from_ref(&pem))
+                .await,
+        );
+        assert!(
+            said.contains("1 signature(s) there, none by a key that is named"),
+            "{said}"
+        );
+
+        // A rule of identities alone, and an image nobody signed: it does not run.
+        let (_, layer) = registry.image("plain", "anyone's");
+        let said = refused(
+            store
+                .pull_signed(&name("plain"), PullPolicy::Always, std::slice::from_ref(&who))
+                .await,
+        );
+        assert!(said.contains("no signature in its repository"), "{said}");
+        assert_eq!(registry.asked(&layer), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
