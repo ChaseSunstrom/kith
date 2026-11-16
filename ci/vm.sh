@@ -952,9 +952,12 @@ EOF
             done
 
             # A file it removed and holds open, with no name to find: charged all the same.
-            quota Workload unlinked "$storage" "~/fill:209715200"
+            # ("~" is ci/pod.rs's word for a file written, then removed: no home folder.)
+            # shellcheck disable=SC2088
+            held="~/fill:209715200"
+            quota Workload unlinked "$storage" "$held"
             done_ Workload unlinked
-            stopped unlinked "~/fill:209715200" "$limit"
+            stopped unlinked "$held" "$limit"
             gone Workload unlinked
             ok unlinked
 
