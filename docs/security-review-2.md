@@ -27,7 +27,7 @@ Two other checks were done alongside:
 
 ## Findings with their status
 
-- H1 Templates: a lazily repeated list is expanded by a serializing filter or output before fuel is charged, and a panic or stack overflow in a render ends kithd. task: T-0645
+- H1 Templates: a lazily repeated list is expanded by a serializing filter or output before fuel is charged, and a panic or stack overflow in a render ends kithd. fixed: a_template_that_grows_past_its_limits_is_refused (T-0645)
 - H2 Devices: no grant ties a Device or a Seat to a namespace, so any namespace's applier claims an unheld Seat or a keyboard. task: T-0646
 - H3 kith-lang: the walk from a file's value to its resources charged no steps (2^60 for a shared list sixty deep). fixed: limits_hold_a_file_that_gives_a_list_shared_many_times
 
@@ -38,7 +38,11 @@ In detail:
   `{{ }}` output before any fuel is charged. A 1 MB string becomes 100 GB, and kithd is
   killed for running out of memory. The author of a Package can do this, and so can a
   Release's writer through `values`. Release builds abort on panic, so a panic or a native
-  stack overflow during a render ends kithd too.
+  stack overflow during a render ends kithd too. Measured: a 100 kB string in a Release's
+  `values`, repeated 3,000 times and written out by `toYaml`, took kithd's peak from
+  54 MB to 935 MB. Fixed by rendering in a kithd of its own with its memory, CPU, time
+  and answer held (`crates/kithd/src/releases.rs`, `render_shim`); the same Release is now
+  refused as wanting more memory, and kithd's peak grows by less than 64 MB.
 - **H2** (`crates/kithd/src/claims.rs`, lines 85, 282 and 307; read).
   - What can be claimed: a Seat nobody holds, a keyboard, a sound card or a vfio GPU.
   - The per-namespace exclusion that SECURITY.md describes holds only while a holder is
@@ -131,14 +135,14 @@ In detail:
 
 - M1 Fuel lets a template hold about 32 MB of strings, and the 1 MiB output limit is
   checked only after the whole output exists (`kith-packages/src/lib.rs:36`, `:292`).
-  (Read; part of T-0645.)
+  (Read; now bounded by the render process's 256 MB, T-0645.)
 - M2 Nothing caps the number of resources, or the total size, a Package renders to
   (`lib.rs:299`). (Read; queued with the Source's M1.)
 - M3 Renders run on threads with the default 2 MiB stack, and 500 levels of macro
-  recursion may not fit. A stack overflow ends kithd (`kithd/src/releases.rs:644`). (Read;
-  part of T-0645.)
+  recursion may not fit. A stack overflow ends kithd (`kithd/src/releases.rs`, line 644). (Read;
+  fixed by T-0645: it ends only the render process.)
 - M4 The JoinError handling around a render never runs in release builds, because they
-  abort on panic (`releases.rs:645`). (Read; part of T-0645.)
+  abort on panic (`releases.rs`, line 645). (Read; fixed by T-0645: it ends only the render process.)
 - L1 minijinja's `range` with a negative step overflows. It panics in debug builds only.
   (Read.)
 - L2 The `debug()` global writes out the whole context without charging fuel. (Read;

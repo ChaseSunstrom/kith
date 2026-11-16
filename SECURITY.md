@@ -1434,16 +1434,19 @@ against what a Package may write, template memory, devices and seats, and kith-l
 kith-lsp. The findings and what became of each are in
 [docs/security-review-2.md](docs/security-review-2.md). Three were HIGH:
 
-- One is fixed: a kith-lang file whose shared lists took 2^60 steps to walk.
-- Two have their own tasks:
-  - a Package template can grow a value past any limit before it is charged, and a
-    render that panics ends kithd (T-0645);
-  - Devices and Seats are not given to namespaces, so anyone who may apply in any
-    namespace can claim a Seat nobody holds, or a keyboard (T-0646).
+- Two are fixed:
+  - a kith-lang file whose shared lists took 2^60 steps to walk;
+  - a Package template could grow a value past any limit before it was charged, and a
+    render that panicked ended kithd. Templates are now rendered in a kithd started
+    again for the purpose (`kithd --kith-render`). It has no environment and holds 256 MB
+    of memory, 20 s of CPU, 30 s in all and 32 MB of answer. A render that passes any of
+    these, panics or overflows its stack ends only that process, and the Release says
+    which limit it hit (T-0645).
+- One has its own task: Devices and Seats are not given to namespaces, so anyone who may
+  apply in any namespace can claim a Seat nobody holds, or a keyboard (T-0646).
 
-Until those two are done, a Package or Release from someone you do not trust can stop
-kithd, and so can its `values`. And a person who may apply DeviceClaims in some namespace
-can take a node's input devices while no session holds them.
+Until that is done, a person who may apply DeviceClaims in some namespace can take a
+node's input devices while no session holds them.
 
 - Dependencies: checked against the RustSec advisory database with `cargo audit` on
   2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
