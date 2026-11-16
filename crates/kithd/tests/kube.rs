@@ -58,7 +58,7 @@ impl Cluster {
         let child = Command::new(env!("CARGO_BIN_EXE_kithd"))
             .current_dir(&dir)
             .args(["--state", "state", "--socket", "kithd.sock", "--name", "alpha"])
-            .args(["--listen", &format!("127.0.0.1:{port}")])
+            .args(["--listen", &format!("127.0.0.1:{port}"), "--registry-port", "0"])
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
