@@ -456,7 +456,7 @@ mod tests {
         }
         // The guard is there with the tunnel, and no pod (whose table is another).
         assert!(crate::pod::has_table(crate::pod::INET, GUARD).unwrap());
-        assert!(!crate::pod::has_table(crate::pod::INET, "kith-pods").unwrap());
+        assert!(!crate::pod::tables().unwrap());
         ensure(7, &tunnel).unwrap();
         forget().unwrap();
         // Two exits of one address (a provider gives each the same): taking one away

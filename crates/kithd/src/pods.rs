@@ -193,6 +193,19 @@ pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result
     }
 }
 
+/// Make the node's tables for its pods again where they are gone while pods run (`nft flush
+/// ruleset`, say): else an exit's pods would reach the node itself, kithd's API among it.
+pub fn guard_again(shared: &Shared) {
+    let pods = shared.pods.lock().expect("nothing panics holding the pods");
+    if pods.made.is_empty() || kith_mesh::pod::tables().unwrap_or(true) {
+        return;
+    }
+    eprintln!("kithd: the tables of this node's pods are gone: made again");
+    if let Err(e) = kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &pods.mesh) {
+        eprintln!("kithd: making the tables of this node's pods again: {e}");
+    }
+}
+
 /// A socket made in pod `id`'s namespace, and never the node's: a pod gone is an error.
 fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Result<T> + Send) -> std::io::Result<T> {
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
@@ -213,14 +226,14 @@ fn inside<T: Send>(shared: &Shared, id: &str, make: impl FnOnce() -> std::io::Re
 // and says nothing of it but kithd's log.
 pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
-    // (Each port's pod, its id and number, and its relay.)
-    type Relay = ((String, u16), tokio::task::JoinHandle<()>);
+    // (Each port's pod, and its relay.)
+    type Relay = (Asker, tokio::task::JoinHandle<()>);
     let mut open: BTreeMap<(bool, u16), Relay> = BTreeMap::new();
     let mut said = std::collections::BTreeSet::new();
     loop {
         let mut asked = published(&shared);
         let mut refused = refuse_own(&mut asked, &own);
-        let held = open.iter().map(|(port, (pod, _))| (*port, pod.0.clone())).collect();
+        let held = open.iter().map(|(port, (pod, _))| (*port, pod.clone())).collect();
         let wanted = chosen(asked, &held, &mut refused);
         for refused in refused {
             if said.insert(refused.clone()) {
@@ -236,8 +249,10 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
             kept
         });
         for (port, pod) in wanted {
-            open.entry(port)
-                .or_insert_with(|| (pod.clone(), tokio::spawn(relay(shared.clone(), pod, port))));
+            open.entry(port).or_insert_with(|| {
+                let (id, number, _) = pod.clone();
+                (pod, tokio::spawn(relay(shared.clone(), (id, number), port)))
+            });
         }
         tokio::select! {
             _ = generation.changed() => {}
@@ -252,7 +267,7 @@ pub async fn publish(shared: Arc<Shared>, own: Vec<(u16, &'static str)>, mut sto
 /// Take out of `wanted` the ports below 1024 and those kithd serves on itself here (`own`:
 /// either protocol), each with why, for the log. (The apply refuses them too, but only
 /// kithd's defaults, and a Workload stored by an older kithd was not asked.)
-fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<(String, u16)>>, own: &[(u16, &str)]) -> Vec<String> {
+fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<Asker>>, own: &[(u16, &str)]) -> Vec<String> {
     let mut refused = Vec::new();
     wanted.retain(|&(_, port), pods| {
         let why = match own.iter().find(|(served, _)| *served == port) {
@@ -260,7 +275,7 @@ fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<(String, u16)>>, own: &[(u1
             None if port < 1024 => "those below 1024 are the node's".to_string(),
             None => return true,
         };
-        for (id, _) in pods.iter() {
+        for (id, _, _) in pods.iter() {
             refused.push(format!("kithd: pod {id}: port {port} is not published: {why}"));
         }
         false
@@ -271,23 +286,43 @@ fn refuse_own(wanted: &mut BTreeMap<(bool, u16), Vec<(String, u16)>>, own: &[(u1
 /// At most this many ports of a node published at once: each is a listener of kithd's.
 const PORTS: usize = 64;
 
+/// A pod asking for a published port: its id, its number, and its namespace.
+type Asker = (String, u16, String);
+
 /// Which of the pods asking for each port (`asked`, in the store's order) has it: the one
-/// that had it (`held`, by its id) while it asks still, else the first; and at most
-/// [`PORTS`] ports, those held first. Why each other is not published goes to `refused`.
-/// (A pod that came later, or of a namespace whose name sorts first, takes no port.)
+/// that had it (`held`) while it asks still, else the first of the namespace that had it,
+/// else the first where all that ask are of one namespace; and at most [`PORTS`] ports,
+/// those held first. Why each other is not published goes to `refused`. (A pod that came
+/// later, or of a namespace whose name sorts first, takes no port; and where pods of two
+/// namespaces ask for a port none had, after a restart say, none has it: the apply refuses
+/// that, but not a Release's or a Source's writing.)
 fn chosen(
-    asked: BTreeMap<(bool, u16), Vec<(String, u16)>>,
-    held: &BTreeMap<(bool, u16), String>,
+    asked: BTreeMap<(bool, u16), Vec<Asker>>,
+    held: &BTreeMap<(bool, u16), Asker>,
     refused: &mut Vec<String>,
-) -> BTreeMap<(bool, u16), (String, u16)> {
+) -> BTreeMap<(bool, u16), Asker> {
     let (old, new): (Vec<_>, Vec<_>) = asked.into_iter().partition(|(port, _)| held.contains_key(port));
     let mut wanted = BTreeMap::new();
     for ((udp, port), pods) in old.into_iter().chain(new) {
-        let had = pods.iter().find(|(id, _)| held.get(&(udp, port)) == Some(id));
-        let Some(has) = had.or(pods.first()).cloned() else {
+        let had = held.get(&(udp, port));
+        let namespace = match (had, pods.first()) {
+            (Some(had), _) if pods.iter().any(|pod| pod.2 == had.2) => Some(&had.2),
+            (_, Some(first)) if pods.iter().all(|pod| pod.2 == first.2) => Some(&first.2),
+            _ => None,
+        };
+        let Some(namespace) = namespace else {
+            for (id, _, _) in &pods {
+                let why = "pods of more than one namespace ask for it";
+                refused.push(format!("kithd: pod {id}: port {port} is not published: {why}"));
+            }
             continue;
         };
-        for (id, _) in pods.iter().filter(|(id, _)| *id != has.0) {
+        let ours = pods.iter().filter(|pod| pod.2 == *namespace);
+        let still = ours.clone().find(|pod| had.is_some_and(|had| had.0 == pod.0));
+        let Some(has) = still.or_else(|| ours.clone().next()).cloned() else {
+            continue;
+        };
+        for (id, _, _) in pods.iter().filter(|pod| pod.0 != has.0) {
             refused.push(format!(
                 "kithd: pod {id}: port {port} is not published: pod {} of this node has it",
                 has.0
@@ -335,19 +370,17 @@ pub fn unshared(store: &kith_api::store::Store, resources: &[kith_api::Resource]
     let others: Vec<_> = stored
         .filter(|other| !keys.contains(&other.key()))
         .chain(resources.iter().filter(|r| publishing(r)))
-        .map(|other| (namespace(other), other.kind.as_str(), ports_of(other)))
+        .map(|other| (namespace(other), ports_of(other)))
         .collect();
     for (resource, ports) in asking {
         for (udp, port) in ports {
+            // (Not said whose: a namespace learns nothing of another's by it.)
             let taken = others
                 .iter()
-                .find(|(of, _, theirs)| *of != namespace(resource) && theirs.contains(&(udp, port)));
-            if let Some((_, kind, _)) = taken {
+                .any(|(of, theirs)| *of != namespace(resource) && theirs.contains(&(udp, port)));
+            if taken {
                 let protocol = if udp { "UDP" } else { "TCP" };
-                return Err(format!(
-                    "{}: {protocol} port {port} is published by a {kind} of another namespace",
-                    resource.key()
-                ));
+                return Err(format!("{}: {protocol} port {port} is not available", resource.key()));
             }
         }
     }
@@ -355,8 +388,8 @@ pub fn unshared(store: &kith_api::store::Store, resources: &[kith_api::Resource]
 }
 
 /// The pods of this node that ask for each published port (UDP, and the number), in the
-/// store's order, each with its number.
-fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<(String, u16)>> {
+/// store's order.
+fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<Asker>> {
     let mut asked = Vec::new();
     {
         let state = shared.store.lock().expect("nothing panics holding the store");
@@ -375,17 +408,21 @@ fn published(shared: &Shared) -> BTreeMap<(bool, u16), Vec<(String, u16)>> {
             let ports: Vec<(bool, u16)> = ports.map(|p| (udp(p), p.port)).collect();
             if template.pod == Some(true) && !ports.is_empty() {
                 let key = resource.key();
+                let namespace = resource.metadata.namespace.clone().unwrap_or_default();
                 let ids = (0..replicas).map(|replica| crate::controller::pod_of(&key, replica));
-                asked.extend(ids.map(|id| (id, ports.clone())));
+                asked.extend(ids.map(|id| (id, namespace.clone(), ports.clone())));
             }
         }
     }
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let mut wanted: BTreeMap<_, Vec<_>> = BTreeMap::new();
-    for (id, ports) in asked {
+    for (id, namespace, ports) in asked {
         let Some(pod) = pods.made.get(&id) else { continue };
         for port in ports {
-            wanted.entry(port).or_default().push((id.clone(), pod.number));
+            wanted
+                .entry(port)
+                .or_default()
+                .push((id.clone(), pod.number, namespace.clone()));
         }
     }
     wanted
@@ -410,11 +447,12 @@ async fn relay(shared: Arc<Shared>, (id, number): (String, u16), (udp, port): (b
                         Ok(socket)
                     })
                 };
-                datagrams(at, AT_ONCE, to_pod).await
+                datagrams(at, &RELAYED, to_pod).await
             }
             false => {
-                let to_pod = || inside(&shared, &id, TcpSocket::new_v4);
-                connections(at, (own, port).into(), IDLE, to_pod).await
+                let (shared, id) = (shared.clone(), id.clone());
+                let to_pod = move || inside(&shared, &id, TcpSocket::new_v4);
+                connections(at, (own, port).into(), (FIRST, IDLE), &RELAYED, to_pod).await
             }
         };
         if let Err(e) = done
@@ -428,60 +466,80 @@ async fn relay(shared: Arc<Shared>, (id, number): (String, u16), (udp, port): (b
     }
 }
 
-/// At most this many connections, or senders, a published port at once.
-const AT_ONCE: usize = 128;
+/// The connections, or senders, each published port has of its own: however many another
+/// port's clients hold, these are its.
+const OWN: usize = 2;
 
-/// At most this many connections and senders all of a node's published ports at once: a
-/// connection holds two files, a sender one, so with [`PORTS`] listeners they hold 448 at
-/// most of the 1024 kithd may (it never raises RLIMIT_NOFILE), and the rest of it has room.
-static RELAYED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(192);
+/// The connections and senders all of a node's published ports share, past their own: a
+/// connection holds two files, a sender one, so with [`PORTS`] listeners and their own the
+/// relays hold 448 files at most. kithd never raises RLIMIT_NOFILE (1024), and its
+/// listeners, these relays, its API and ingress all take of it.
+static RELAYED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+
+/// A connection's or a sender's room: of its port's own, or of the node's.
+type Room = Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::SemaphorePermit<'static>>;
+
+/// Room of the port's `own` first, else of the `node`'s; none, if neither has any.
+fn room_of(own: &Arc<tokio::sync::Semaphore>, node: &'static tokio::sync::Semaphore) -> Option<Room> {
+    let own = own.clone().try_acquire_owned().map(Ok);
+    own.or_else(|_| node.try_acquire().map(Err)).ok()
+}
+
+/// How long a connection of a published port is given to reach the pod, and then for the
+/// first bytes either way, before [`IDLE`] applies: one that says nothing holds no room long.
+const FIRST: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long a connection of a published port is kept with nothing passed either way.
 const IDLE: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Pass each connection to `at` on to `to` through a socket `to_pod` makes.
+/// Pass each connection to `at` on to `to` through a socket `to_pod` makes, each given
+/// `first`, then `idle` (see [`FIRST`]), and room of `node`'s past the port's own.
 async fn connections(
     at: std::net::SocketAddr,
     to: std::net::SocketAddr,
-    idle: std::time::Duration,
-    to_pod: impl Fn() -> std::io::Result<TcpSocket>,
+    (first, idle): (std::time::Duration, std::time::Duration),
+    node: &'static tokio::sync::Semaphore,
+    to_pod: impl Fn() -> std::io::Result<TcpSocket> + Clone + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(at).await?;
-    let room = Arc::new(tokio::sync::Semaphore::new(AT_ONCE));
+    let own = Arc::new(tokio::sync::Semaphore::new(OWN));
     // (Each connection's task is this one's: ended with it, as the port is unpublished.)
     let mut passing = tokio::task::JoinSet::new();
     loop {
         while passing.try_join_next().is_some() {}
-        let (Ok(held), Ok(node)) = (room.clone().acquire_owned().await, RELAYED.acquire().await) else {
-            return Ok(());
-        };
         let Ok((from, _)) = listener.accept().await else {
             // (Out of files for now, say: a moment later.)
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         };
-        let socket = to_pod();
+        // (No room, of the port's own or the node's: this one is ended at once, and none
+        // waits on another port's clients.)
+        let Some(room) = room_of(&own, node) else { continue };
+        let to_pod = to_pod.clone();
         passing.spawn(async move {
-            let _held = (held, node);
-            if let Ok(socket) = socket
-                && let Ok(Ok(to)) = tokio::time::timeout(idle, socket.connect(to)).await
+            let _room = room;
+            // (Made in the pod's namespace, by a thread of its own: not this task's.)
+            let socket = tokio::task::spawn_blocking(to_pod).await;
+            if let Ok(Ok(socket)) = socket
+                && let Ok(Ok(to)) = tokio::time::timeout(first, socket.connect(to)).await
             {
-                pass(from, to, idle).await;
+                pass(from, to, first, idle).await;
             }
         });
     }
 }
 
 /// Pass bytes both ways between `a` and `b`, and each one's end to the other, until both
-/// have ended, one fails, or nothing has passed for `idle`.
-async fn pass(mut a: TcpStream, mut b: TcpStream, idle: std::time::Duration) {
+/// have ended, one fails, or nothing has passed for `first` (before any byte has), then `idle`.
+async fn pass(mut a: TcpStream, mut b: TcpStream, first: std::time::Duration, idle: std::time::Duration) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut a_read, mut a_write) = a.split();
     let (mut b_read, mut b_write) = b.split();
     let (mut a_open, mut b_open) = (true, true);
     let (mut of_a, mut of_b) = (vec![0; 16 << 10], vec![0; 16 << 10]);
+    let mut quiet = first;
     while a_open || b_open {
-        let read = tokio::time::timeout(idle, async {
+        let read = tokio::time::timeout(quiet, async {
             tokio::select! {
                 read = a_read.read(&mut of_a), if a_open => (true, read),
                 read = b_read.read(&mut of_b), if b_open => (false, read),
@@ -499,9 +557,12 @@ async fn pass(mut a: TcpStream, mut b: TcpStream, idle: std::time::Duration) {
                 *open = false;
                 write.shutdown().await
             }
-            Ok(length) => tokio::time::timeout(idle, write.write_all(&buffer[..length]))
-                .await
-                .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+            Ok(length) => {
+                quiet = idle;
+                tokio::time::timeout(idle, write.write_all(&buffer[..length]))
+                    .await
+                    .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into()))
+            }
             Err(e) => Err(e),
         };
         if passed.is_err() {
@@ -510,23 +571,19 @@ async fn pass(mut a: TcpStream, mut b: TcpStream, idle: std::time::Duration) {
     }
 }
 
-/// Pass each datagram to `at` on through a socket `to_pod` makes, one per sender (at most
-/// `room`), and its answers back.
+/// Pass each datagram to `at` on through a socket `to_pod` makes, one per sender (as many
+/// as the port has room for, of its own and of `node`'s), and its answers back.
 async fn datagrams(
     at: std::net::SocketAddr,
-    room: usize,
+    node: &'static tokio::sync::Semaphore,
     to_pod: impl Fn() -> std::io::Result<std::net::UdpSocket> + Clone + Send + 'static,
 ) -> std::io::Result<()> {
     let outside = Arc::new(tokio::net::UdpSocket::bind(at).await?);
+    let own = Arc::new(tokio::sync::Semaphore::new(OWN));
     // Per sender, a socket of the pod's own, which takes the answers back to it, when it was
-    // last heard from, and its room of the node's. (Its task is this one's: stopped with it,
-    // which lets go of the port at once.)
-    type Sender = (
-        Arc<tokio::net::UdpSocket>,
-        tokio::task::AbortHandle,
-        u64,
-        tokio::sync::SemaphorePermit<'static>,
-    );
+    // last heard from, and its room. (Its task is this one's: stopped with it, which lets
+    // go of the port at once.)
+    type Sender = (Arc<tokio::net::UdpSocket>, tokio::task::AbortHandle, u64, Room);
     let mut senders: BTreeMap<std::net::SocketAddr, Sender> = BTreeMap::new();
     let mut answering = tokio::task::JoinSet::new();
     let mut buffer = vec![0; 65_536];
@@ -544,13 +601,11 @@ async fn datagrams(
                 inner.clone()
             }
             None => {
-                // (Full, the port's room or the node's: the sender heard from longest ago is
-                // forgotten, not this one.)
-                let room_of_node = loop {
-                    if senders.len() < room
-                        && let Ok(permit) = RELAYED.try_acquire()
-                    {
-                        break Some(permit);
+                // (No room, of the port's own or the node's: the sender of this port heard
+                // from longest ago is forgotten, not this one.)
+                let room = loop {
+                    if let Some(room) = room_of(&own, node) {
+                        break Some(room);
                     }
                     let oldest = senders.iter().min_by_key(|(_, sender)| sender.2).map(|(at, _)| *at);
                     match oldest.and_then(|oldest| senders.remove(&oldest)) {
@@ -558,7 +613,7 @@ async fn datagrams(
                         None => break None,
                     }
                 };
-                let Some(room_of_node) = room_of_node else { continue };
+                let Some(room) = room else { continue };
                 // (Made in the pod's namespace, by a thread of its own: not this task's.)
                 let made = tokio::task::spawn_blocking(to_pod.clone()).await;
                 let made = made.map_err(std::io::Error::other).and_then(|made| made);
@@ -576,7 +631,7 @@ async fn datagrams(
                         let _ = outside.send_to(&buffer[..length], from).await;
                     }
                 });
-                senders.insert(from, (inner.clone(), answers, heard, room_of_node));
+                senders.insert(from, (inner.clone(), answers, heard, room));
                 inner
             }
         };
@@ -611,10 +666,11 @@ mod tests {
     /// and the log says which and why.
     #[test]
     fn a_port_kithd_serves_on_is_not_published() {
+        let pod = |id: &str, number| (id.to_string(), number, "n".to_string());
         let mut wanted = BTreeMap::from([
-            ((false, 8443), vec![("a".to_string(), 2)]),
-            ((true, 6881), vec![("b".to_string(), 3)]),
-            ((true, 1023), vec![("c".to_string(), 4)]),
+            ((false, 8443), vec![pod("a", 2)]),
+            ((true, 6881), vec![pod("b", 3)]),
+            ((true, 1023), vec![pod("c", 4)]),
         ]);
         let refused = refuse_own(&mut wanted, &[(8443, "API"), (5353, "DNS")]);
         assert_eq!(wanted.into_keys().collect::<Vec<_>>(), [(true, 6881)]);
@@ -636,10 +692,10 @@ mod tests {
     /// keeps it, at its new address; and a node publishes [`PORTS`] at most, those it has first.
     #[test]
     fn a_published_port_stays_with_the_pod_that_has_it() {
-        let pod = |id: &str, number| (id.to_string(), number);
+        let pod = |id: &str, number| (id.to_string(), number, id[..1].to_string());
         let mut refused = Vec::new();
         let asked = BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 3)])]);
-        let held = BTreeMap::from([((false, 8080), "b/y-0".to_string())]);
+        let held = BTreeMap::from([((false, 8080), pod("b/y-0", 3))]);
         let wanted = chosen(asked, &held, &mut refused);
         assert_eq!(wanted[&(false, 8080)], pod("b/y-0", 3));
         assert!(refused[0].contains("pod a/x-0: port 8080") && refused[0].contains("pod b/y-0"));
@@ -654,13 +710,32 @@ mod tests {
             .map(|n| ((false, 2000 + n), vec![pod("p", 2)]))
             .collect();
         asked.insert((true, 9000), vec![pod("q", 3)]);
-        let held = BTreeMap::from([((true, 9000), "q".to_string())]);
+        let held = BTreeMap::from([((true, 9000), pod("q", 3))]);
         refused.clear();
         let wanted = chosen(asked, &held, &mut refused);
         assert_eq!(wanted.len(), PORTS);
         assert!(wanted.contains_key(&(true, 9000)));
         assert_eq!(refused.len(), 2, "{refused:?}");
         assert!(refused.iter().all(|why| why.contains("ports at most")), "{refused:?}");
+    }
+
+    /// A port no pod has (kithd started again, say) is published for none where pods of two
+    /// namespaces ask for it, whatever wrote them; a namespace whose pod had it keeps it for
+    /// another pod of its own, over another namespace's.
+    #[test]
+    fn a_port_two_namespaces_ask_for_is_kept_or_none_has_it() {
+        let pod = |id: &str, number| (id.to_string(), number, id[..1].to_string());
+        let mut refused = Vec::new();
+        let asked = || BTreeMap::from([((false, 8080), vec![pod("a/x-0", 2), pod("b/y-0", 3)])]);
+        assert!(chosen(asked(), &BTreeMap::new(), &mut refused).is_empty());
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(
+            refused.iter().all(|why| why.contains("more than one namespace")),
+            "{refused:?}"
+        );
+        // (Its pod gone, another of its namespace has it.)
+        let held = BTreeMap::from([((false, 8080), pod("b/z-0", 4))]);
+        assert_eq!(chosen(asked(), &held, &mut refused)[&(false, 8080)], pod("b/y-0", 3));
     }
 
     /// A port another namespace's Workload or Job publishes is refused at apply; one of the
@@ -679,10 +754,7 @@ mod tests {
         let mut store = kith_api::store::Store::default();
         store.apply(workload("media", "web", tcp.clone())).unwrap();
         let refused = unshared(&store, &[workload("other", "web", tcp.clone())]).unwrap_err();
-        assert!(
-            refused.contains("TCP port 8080 is published by a Workload of another namespace"),
-            "{refused}"
-        );
+        assert!(refused.ends_with("TCP port 8080 is not available"), "{refused}");
         unshared(&store, &[workload("media", "second", tcp.clone())]).unwrap();
         unshared(&store, &[workload("other", "web", udp)]).unwrap();
         // (In one apply too; and the stored one changed by it is not counted.)
@@ -696,8 +768,16 @@ mod tests {
         .unwrap();
     }
 
-    /// An echo server standing for a pod's UDP port, and a relay of it at a free port.
-    fn udp_relay(room: usize) -> (std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+    /// A node's room of its own for its tests' relays, of `room` connections or senders.
+    fn node(room: usize) -> &'static tokio::sync::Semaphore {
+        Box::leak(Box::new(tokio::sync::Semaphore::new(room)))
+    }
+
+    /// An echo server standing for a pod's UDP port, and a relay of it at a free port, with
+    /// room of `node`'s past its own.
+    fn udp_relay(
+        node: &'static tokio::sync::Semaphore,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
         let pod = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let pod_at = pod.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -714,7 +794,7 @@ mod tests {
             let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
             socket.connect(pod_at).map(|()| socket)
         };
-        (at, tokio::spawn(datagrams(at, room, to_pod)))
+        (at, tokio::spawn(datagrams(at, node, to_pod)))
     }
 
     /// Whether `sender`'s datagrams to `at` are answered, asked again for up to two seconds.
@@ -737,9 +817,9 @@ mod tests {
     /// is forgotten for it (else a few spoofed senders would shut the port to everyone).
     #[tokio::test]
     async fn a_new_udp_sender_takes_the_place_of_the_oldest() {
-        let (at, relay) = udp_relay(2);
+        let (at, relay) = udp_relay(node(0));
         let mut senders = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..=OWN {
             let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             assert!(answered(&sender, at).await, "sender {} is answered", senders.len());
             senders.push(sender);
@@ -748,9 +828,11 @@ mod tests {
     }
 
     /// A TCP echo server standing for a pod's port, and a relay of it at a free port whose
-    /// connections end after `idle` with nothing passed.
+    /// connections end after `first`, then `idle`, with nothing passed, with room of `node`'s.
     async fn tcp_relay(
+        first: std::time::Duration,
         idle: std::time::Duration,
+        node: &'static tokio::sync::Semaphore,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
         let pod = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let pod_at = pod.local_addr().unwrap();
@@ -765,22 +847,31 @@ mod tests {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let at = listener.local_addr().unwrap();
         drop(listener);
-        (at, tokio::spawn(connections(at, pod_at, idle, TcpSocket::new_v4)))
+        let times = (first, idle);
+        (
+            at,
+            tokio::spawn(connections(at, pod_at, times, node, TcpSocket::new_v4)),
+        )
     }
 
-    /// Connect to `at` (tried again while the relay starts) and see one line echoed.
-    async fn echoed(at: std::net::SocketAddr) -> TcpStream {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// Connect to `at`, tried again while the relay starts.
+    async fn connected(at: std::net::SocketAddr) -> TcpStream {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut stream = loop {
+        loop {
             match TcpStream::connect(at).await {
-                Ok(stream) => break stream,
+                Ok(stream) => return stream,
                 Err(_) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
                 Err(e) => panic!("{at}: {e}"),
             }
-        };
+        }
+    }
+
+    /// Connect to `at` and see one line echoed.
+    async fn echoed(at: std::net::SocketAddr) -> TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = connected(at).await;
         stream.write_all(b"hello").await.unwrap();
         let mut buffer = [0; 5];
         stream.read_exact(&mut buffer).await.unwrap();
@@ -799,7 +890,7 @@ mod tests {
     /// A port unpublished (its relay stopped) ends the connections it passed on, too.
     #[tokio::test]
     async fn a_connection_ends_when_its_port_is_unpublished() {
-        let (at, relay) = tcp_relay(std::time::Duration::from_secs(600)).await;
+        let (at, relay) = tcp_relay(FIRST, IDLE, node(1)).await;
         let mut stream = echoed(at).await;
         relay.abort();
         let _ = relay.await;
@@ -809,17 +900,51 @@ mod tests {
     /// A connection nothing passes on for its idle time is ended (and its room given back).
     #[tokio::test]
     async fn an_idle_connection_ends() {
-        let (at, relay) = tcp_relay(std::time::Duration::from_millis(300)).await;
+        let (at, relay) = tcp_relay(FIRST, std::time::Duration::from_millis(300), node(1)).await;
         let mut stream = echoed(at).await;
         assert!(ended(&mut stream).await, "the idle connection was kept");
         relay.abort();
+    }
+
+    /// A connection that says nothing, nor its pod, is ended after the short time it is
+    /// given, not the long one of one that has.
+    #[tokio::test]
+    async fn a_silent_connection_ends_soon() {
+        let (at, relay) = tcp_relay(std::time::Duration::from_millis(300), IDLE, node(1)).await;
+        let mut stream = connected(at).await;
+        assert!(ended(&mut stream).await, "the silent connection was kept");
+        // (One that has said something is kept past it.)
+        let mut stream = echoed(at).await;
+        assert!(
+            !ended(&mut stream).await,
+            "a connection was ended as silent after its first bytes"
+        );
+        relay.abort();
+    }
+
+    /// Clients that fill one published port, its own room and all the node's, leave another
+    /// port its own: it still answers, and the next client of the full one is ended at once.
+    #[tokio::test]
+    async fn a_full_port_leaves_another_its_own() {
+        let node = node(1);
+        let (full, full_relay) = tcp_relay(FIRST, IDLE, node).await;
+        let (other, other_relay) = tcp_relay(FIRST, IDLE, node).await;
+        let mut held = Vec::new();
+        for _ in 0..=OWN {
+            held.push(echoed(full).await);
+        }
+        let mut turned_away = connected(full).await;
+        assert!(ended(&mut turned_away).await, "a connection past all the room was kept");
+        echoed(other).await;
+        full_relay.abort();
+        other_relay.abort();
     }
 
     /// A published UDP port stopped (its pod gone) is free at once for the pod made again,
     /// though a sender's answers were still awaited.
     #[tokio::test]
     async fn a_udp_port_stopped_is_free_at_once() {
-        let (at, relay) = udp_relay(AT_ONCE);
+        let (at, relay) = udp_relay(node(1));
         let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         assert!(answered(&sender, at).await);
         relay.abort();

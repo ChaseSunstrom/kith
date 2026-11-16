@@ -201,8 +201,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   (`inet kith-exits`, made, whole, before each tunnel is) is dropped, to the node itself
   or passed on, unless it answers a connection sent out by it: the provider's end
   reaches nothing of the node's, with a pod or none. These rules are the kernel's, so
-  they hold with kithd stopped or killed; a node that starts again makes them again
-  before any pod or tunnel. The pod's DNS is the exit's, through the tunnel. When a tunnel is made again or goes, the connections its pods had are
+  they hold with kithd stopped or killed; a node that starts again makes `inet kith-exits`
+  again before its first tunnel, and `kith-pods` before its first pod. Taken away by hand
+  while pods run (`nft flush ruleset`), they are made again within a minute: until then an
+  exit's pod may reach the node's services. The pod's DNS is the exit's, through the tunnel. When a tunnel is made again or goes, the connections its pods had are
   forgotten (conntrack), so none goes on by an older path. A pod names an exit only from
   a namespace the Exit lists: refused at apply, and again by the node before it starts
   one. Its replicas are placed on the Exit's node, and every other node refuses to start
@@ -225,13 +227,20 @@ Only the newest version is fixed. There are no security releases of older ones.
   kernel's lets anything else in. No port below 1024 is published, nor kithd's own
   (5000, 7443 and 51820 are refused at apply; the ports the node was started with, its
   DNS and ingress among them, by the node, which says so in its log). A connection ends
-  after 10 minutes with nothing sent either way, or when its port is no longer published;
-  a port takes 128 at once and a node 192 in all, and a new UDP sender past that takes the
-  place of the one heard from longest ago. A pod publishes 8 ports at most and a node 64,
-  so kithd runs out of files for none of it. A port another namespace's Workload or Job
-  publishes is refused at apply, and on a node the pod that has a port keeps it while it
-  asks, so one namespace's pod never takes another's (one written through the log, by a
-  Release or Source, is not asked at apply: there the node's first pod has it).
+  after 10 seconds if nothing has been sent either way yet, after 10 minutes with nothing
+  sent once something has, or when its port is no longer published. Each port has 2
+  connections or UDP senders of its own, and the node's ports share 64 more, taken after a
+  connection is accepted: a client that fills one port and all that the node shares leaves
+  each other port its 2, and a connection past that is ended at once. A new UDP sender
+  past that takes the place of the one of its port heard from longest ago. A pod publishes
+  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
+  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
+  node with many clients of its API or ingress besides can still run out. A port another
+  namespace's Workload or Job publishes is refused at apply, and on a node the pod that
+  has a port keeps it while it asks, another pod of its namespace after it, so one
+  namespace's pod never takes another's; where pods of two namespaces ask for a port no
+  pod has (one written through the log, by a Release or Source, is not asked at apply, and
+  a node that starts again has none), none of them has it.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is

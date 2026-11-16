@@ -215,10 +215,12 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
     let mut generation = shared.generation.subscribe();
     loop {
+        crate::pods::guard_again(&shared);
         tend(&shared, wanted(&shared));
         tokio::select! {
             _ = generation.changed() => {}
-            // (Again now and then: a tunnel someone took away by hand is made again.)
+            // (Again now and then: a tunnel, or the pods' tables, someone took away by hand
+            // is made again.)
             () = tokio::time::sleep(Duration::from_secs(60)) => {}
             _ = stopping.changed() => return,
         }

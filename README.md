@@ -593,8 +593,10 @@ spec:
   alone, and sees each client as that address, not the client's. No port below 1024 is
   published, nor one kithd serves on (5000, 7443 and 51820 are refused when applied, and
   the node's DNS, ingress and other ports by the node, in its log). A connection ends
-  after 10 minutes with nothing sent; a port takes 128 at once (a node 192 in all), and
-  past that a new UDP sender takes the place of the one heard from longest ago.
+  after 10 seconds if nothing is sent either way, after 10 minutes with nothing sent once
+  something has been; each port has 2 connections or UDP senders of its own and the
+  node's ports share 64 more, and past that a new UDP sender takes the place of the one
+  heard from longest ago.
 - **What an Exit is.** It is cluster-wide: whoever may write one decides which namespaces'
   pods leave through it, so a Role scoped to a namespace cannot. Only the Exit's node is
   sent the Exit and its Secret. `Endpoint` has to be an address, not a name (a name would

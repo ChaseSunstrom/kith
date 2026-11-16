@@ -400,6 +400,11 @@ fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str) -> Resul
     Ok(guard)
 }
 
+/// Whether the tables [`node`] makes are there (gone with `nft flush ruleset`, say).
+pub fn tables() -> Result<bool> {
+    has_table(INET, "kith-pods")
+}
+
 // ---- nftables, as the kernel takes it (nfnetlink): a few attributes by hand ----
 
 const NESTED: u16 = 0x8000;
@@ -895,5 +900,6 @@ mod tests {
         });
         // A second time changes nothing (what the first left is taken away and made again).
         assert!(node_with(range, true, masquerade, "kith0").unwrap());
+        assert!(tables().unwrap());
     }
 }
