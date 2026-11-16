@@ -328,3 +328,92 @@ fn json_is_read_with_its_own_types() {
         assert_eq!(ours, said, "{field}: {sent}");
     }
 }
+
+/// A file taken apart at random is refused or read: it never panics (in kithd a panic
+/// ends kithd) and never takes long, whatever a client sends. 3,000 files from a fixed
+/// seed; the one that fails is printed.
+#[test]
+fn a_file_taken_apart_at_random() {
+    const WHOLE: &str = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata:\n  name: web # a comment\n  labels: { app: \"web\", 'tier': front }\nspec:\n  replicas: 2\n  template:\n    containers:\n      - name: c\n        image: busybox:1.36\n        args: [sh, -c, \"echo é𝄞 \\u00e9\"]\n        env: |\n          a\n          b\n        cpu: 0.5\n        on: -1e3\n---\n[1, {a: [b, ~, null, true]}, >-\n  folded\n]\n...\n";
+    let pieces = [
+        "\"",
+        "'",
+        "\\",
+        "é",
+        "𝄞",
+        "{",
+        "}",
+        "[",
+        "]",
+        ":",
+        ": ",
+        ",",
+        "-",
+        "- ",
+        "#",
+        "\n",
+        " ",
+        "  ",
+        "\t",
+        "&a ",
+        "*a",
+        "!!str ",
+        "!x ",
+        "|",
+        ">",
+        "---",
+        "...",
+        "?",
+        "%YAML 1.2\n",
+        "\\u",
+        "\\U0010FFFF",
+        "0x1",
+        "1e9999",
+        "\r",
+        "\u{feff}",
+        "\u{0}",
+    ];
+    // (An LCG: the same files every run.)
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = |below: usize| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) as usize % below
+    };
+    let begun = std::time::Instant::now();
+    for _ in 0..3000 {
+        let mut src: Vec<char> = WHOLE.chars().collect();
+        for _ in 0..1 + next(4) {
+            let at = next(src.len().max(1));
+            match next(4) {
+                0 if at < src.len() => drop(src.remove(at)),
+                0 | 1 => src
+                    .splice(at.min(src.len())..at.min(src.len()), pieces[next(pieces.len())].chars())
+                    .for_each(drop),
+                2 => src.extend(std::iter::repeat_n('[', next(300))),
+                _ => src.truncate(at.max(1)),
+            }
+        }
+        let src: String = src.into_iter().collect();
+        let one = std::time::Instant::now();
+        let read = std::panic::catch_unwind(|| {
+            if let Ok(docs) = parse(&src) {
+                for doc in &docs {
+                    if let Ok(json) = from_node::<Json>(doc) {
+                        let again = to_string(&json);
+                        let back = from_str::<Json>(&again);
+                        assert_eq!(back.as_ref().ok(), Some(&json), "written as {again:?}");
+                    }
+                }
+            }
+        });
+        assert!(read.is_ok(), "this file panics: {src:?}");
+        assert!(one.elapsed() < std::time::Duration::from_secs(1), "slow: {src:?}");
+    }
+    assert!(
+        begun.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        begun.elapsed()
+    );
+}

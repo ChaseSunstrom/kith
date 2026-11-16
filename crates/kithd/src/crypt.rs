@@ -2391,7 +2391,11 @@ mod tests {
                     if let Some(copy) = whole {
                         disk.write_all_at(&wrote[copy..copy + ROOM], AT + copy as u64).unwrap();
                     }
-                    let range = if from_end { ROOM - 512 * sectors..ROOM } else { 0..512 * sectors };
+                    let range = if from_end {
+                        ROOM - 512 * sectors..ROOM
+                    } else {
+                        0..512 * sectors
+                    };
                     let at = part + range.start;
                     disk.write_all_at(&wrote[at..part + range.end], AT + at as u64).unwrap();
                     let read = Record::read(&path).unwrap().unwrap();
@@ -2403,12 +2407,17 @@ mod tests {
         let disk = fresh(&old);
         disk.write_all_at(&vec![0; 2 * ROOM], AT).unwrap();
         let text = old.text();
-        let unsummed: String = text.lines().filter(|line| !line.starts_with("sum: ")).map(|line| format!("{line}\n")).collect();
+        let unsummed: String = text
+            .lines()
+            .filter(|line| !line.starts_with("sum: "))
+            .map(|line| format!("{line}\n"))
+            .collect();
         disk.write_all_at(unsummed.as_bytes(), AT).unwrap();
         assert_eq!(Record::read(&path), Ok(Some(old.clone())));
         // Both copies damaged: said, not taken as no record.
         disk.write_all_at(b"kith-lock v1\nsum: 00\nsecret: 07", AT).unwrap();
-        disk.write_all_at(b"kith-lock v1\nsum: 00\nsecret: 07", AT + ROOM as u64).unwrap();
+        disk.write_all_at(b"kith-lock v1\nsum: 00\nsecret: 07", AT + ROOM as u64)
+            .unwrap();
         assert!(Record::read(&path).unwrap_err().contains("damaged"));
         std::fs::remove_file(&path).unwrap();
     }
@@ -2498,7 +2507,8 @@ mod tests {
         disk.write_all_at(b"kith-lock v1\nsecret: zz\n\0", AT).unwrap();
         let path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&disk));
         assert_eq!(Record::read(Path::new(&path)).unwrap().unwrap().tpm, held.tpm);
-        disk.write_all_at(b"kith-lock v1\nsecret: zz\n\0", AT + ROOM as u64).unwrap();
+        disk.write_all_at(b"kith-lock v1\nsecret: zz\n\0", AT + ROOM as u64)
+            .unwrap();
         assert!(Record::read(Path::new(&path)).is_err());
         disk.write_all_at(&[0; 2 * ROOM], AT).unwrap();
         assert_eq!(Record::read(Path::new(&path)), Ok(None));

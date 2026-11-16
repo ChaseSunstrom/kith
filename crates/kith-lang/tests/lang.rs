@@ -611,7 +611,10 @@ fn limits_hold_a_file_that_gives_a_list_shared_many_times() {
     std::thread::spawn(move || {
         let g = "fn g(x, n) = if n == 0 then x else g([x, x], n - 1);";
         // (Given whole, and inside a resource, where its nulls are left out.)
-        for src in [format!("{g} g(null, 60)"), format!("{g} {{ kind: \"ConfigMap\", a: g(null, 60) }}")] {
+        for src in [
+            format!("{g} g(null, 60)"),
+            format!("{g} {{ kind: \"ConfigMap\", a: g(null, 60) }}"),
+        ] {
             sent.send(gives(&src)).unwrap();
         }
     });

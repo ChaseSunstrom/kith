@@ -1426,14 +1426,30 @@ told a caller with no right whether the object was there; and a body in protobuf
 of empty fields cost far more to read than its length. Not read then: how deep a
 strategic merge patch may nest, and the YAML reader's limits for a Source's manifests.
 
-### Not reviewed
+### Review 2 (2026-11-16)
 
-- The mesh: WireGuard keys, who becomes a peer, what a peer may send.
-- The installer and the first process (`kithd install`, `kithd` as init).
-- Applying a Source against what a Package says it may write.
-- How much memory a template's filters can use.
-- Devices and seats.
-- Dependencies: no advisory database was checked (`cargo audit` and `cargo deny` were
-  not run).
-- Anything that takes running it: fuzzing the YAML reader, the DNS server, the tar and
-  image readers, the API's bodies. (T-0234.)
+These areas were left out of the review above. On 2026-11-16 each was read whole by a
+reviewer of its own: the mesh, the installer and the first process, a Source's apply
+against what a Package may write, template memory, devices and seats, and kith-lang and
+kith-lsp. The findings and what became of each are in
+[docs/security-review-2.md](docs/security-review-2.md). Three were HIGH:
+
+- One is fixed: a kith-lang file whose shared lists took 2^60 steps to walk.
+- Two have their own tasks:
+  - a Package template can grow a value past any limit before it is charged, and a
+    render that panics ends kithd (T-0645);
+  - Devices and Seats are not given to namespaces, so anyone who may apply in any
+    namespace can claim a Seat nobody holds, or a keyboard (T-0646).
+
+Until those two are done, a Package or Release from someone you do not trust can stop
+kithd, and so can its `values`. And a person who may apply DeviceClaims in some namespace
+can take a node's input devices while no session holds them.
+
+- Dependencies: checked against the RustSec advisory database with `cargo audit` on
+  2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
+  fixed by moving to 0.4.4. One warning is ignored in `.cargo/audit.toml`, with the reason
+  beside it: `paste`, which is unmaintained but has no known flaw and runs only while
+  netlink-packet-core builds.
+- Fuzzing: kith-yaml and kith-lang each have a test that feeds them 3,000 damaged files
+  from a fixed seed. Neither may panic or exceed its limits. Not yet run this way: the DNS
+  server, the tar and image readers, and the API's bodies.

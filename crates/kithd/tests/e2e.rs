@@ -2959,3 +2959,50 @@ spec:
         "it ran `kith schema`"
     );
 }
+
+/// A Package whose template grows a value far past what it gives (a list repeated
+/// lazily, written out whole): the Release says it was refused, and kithd, which renders
+/// it in a kithd of its own with its memory held, neither grew by it nor stopped (T-0645,
+/// review-2 templates H1). (Some 600 MB, were it rendered in kithd itself.)
+#[test]
+fn a_template_that_grows_past_its_limits_is_refused() {
+    let daemon = Daemon::start("release-grows");
+    let package = daemon.dir.join("big");
+    std::fs::create_dir_all(package.join("templates")).unwrap();
+    std::fs::write(package.join("package.yaml"), "name: big\nversion: 1.0.0\n").unwrap();
+    // (Small with its own values, as `kith package push` renders it; the Release's are not.)
+    std::fs::write(package.join("values.yaml"), "s: x\nn: 1\n").unwrap();
+    let grows = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\n\
+                 spec: { data: { a: '{{ ([values.s] * values.n) | toYaml | length }}' } }\n";
+    std::fs::write(package.join("templates/map.yaml"), grows).unwrap();
+    daemon.ok(&["package", "push", "big"]);
+    let peak = |daemon: &Daemon| {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", daemon.child.id())).unwrap();
+        let line = status
+            .lines()
+            .find(|line| line.starts_with("VmHWM:"))
+            .unwrap()
+            .to_string();
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap()
+    };
+    let before = peak(&daemon);
+    let s = "x".repeat(100_000);
+    daemon.apply(&format!(
+        "apiVersion: kith.dev/v1\nkind: Release\nmetadata: {{ name: big }}\nspec: {{ package: {{ name: big }}, values: {{ s: {s}, n: 3000 }} }}\n"
+    ));
+    wait_for("the release to say it was refused", || {
+        daemon.status("Release/big")["state"] == "error"
+    });
+    // kithd answers, and its peak grew by less than 64 MB; the status says why.
+    daemon.ok(&["get", "Package/big-1.0.0"]);
+    let after = peak(&daemon);
+    assert!(
+        after < before + (64 << 10),
+        "kithd's peak went from {before} kB to {after} kB"
+    );
+    let said = daemon.status("Release/big")["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(said.contains("more memory"), "{said}");
+}

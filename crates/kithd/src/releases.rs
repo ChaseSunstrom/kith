@@ -162,6 +162,7 @@ pub fn stamp(store: &Store, resource: &Resource) -> Stamp {
 }
 
 /// A render to do.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Job {
     files: BTreeMap<String, String>,
     layers: Vec<Value>,
@@ -171,7 +172,7 @@ struct Job {
     kinds: BTreeMap<String, bool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Output {
     version: String,
     resources: Vec<Resource>,
@@ -346,6 +347,90 @@ fn render(job: &Job) -> Result<Output, String> {
         resources: rendered.resources,
         notes: rendered.notes,
     })
+}
+
+/// The first argument kithd is started again with to render one Release ([`render_shim`]).
+pub const RENDER: &str = "--kith-render";
+/// What a render may have: the address space of the kithd it runs in, its CPU time, the
+/// time it takes, and how much it answers.
+const RENDER_MEMORY: u64 = 256 << 20;
+const RENDER_CPU: u64 = 20;
+const RENDER_TIME: Duration = Duration::from_secs(30);
+const RENDER_ANSWER: u64 = 32 << 20;
+
+/// Started again to render ([`RENDER`])? Then a [`Job`] is read on stdin, its [`Output`]
+/// or why not written on stdout, and this never returns. A package is someone else's
+/// code: what it grows to, a panic, a stack it overflows end only this kithd.
+pub fn render_shim() {
+    use nix::sys::resource::{Resource, setrlimit};
+    if std::env::args_os().nth(1).as_deref() != Some(std::ffi::OsStr::new(RENDER)) {
+        return;
+    }
+    // (Held before anything of the package is read; one that cannot be held renders nothing.)
+    let held = [
+        (Resource::RLIMIT_AS, RENDER_MEMORY),
+        (Resource::RLIMIT_CPU, RENDER_CPU),
+        (Resource::RLIMIT_CORE, 0),
+    ];
+    if held
+        .into_iter()
+        .any(|(what, most)| setrlimit(what, most, most).is_err())
+    {
+        std::process::exit(2);
+    }
+    let job: Result<Job, String> = serde_json::from_reader(std::io::stdin().lock()).map_err(|e| e.to_string());
+    let answer = job.and_then(|job| render(&job));
+    let written = serde_json::to_writer(std::io::stdout().lock(), &answer);
+    std::process::exit(i32::from(written.is_err()));
+}
+
+/// Render `job` in a kithd started again for it ([`render_shim`]), held to
+/// [`RENDER_MEMORY`], [`RENDER_CPU`] and [`RENDER_TIME`].
+async fn apart(job: &Job) -> Result<Output, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let sent = serde_json::to_vec(job).map_err(|e| e.to_string())?;
+    let mut command = tokio::process::Command::new("/proc/self/exe");
+    command
+        .arg(RENDER)
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    // (Its exit is this one's to collect, not the orphan reaper's.)
+    let spawned = kith_runtime::spawn_awaited(|| command.spawn(), tokio::process::Child::id);
+    let (mut child, _awaited) = spawned.map_err(|e| format!("rendering: {e}"))?;
+    let (mut input, output) = (child.stdin.take(), child.stdout.take());
+    let talk = async {
+        if let Some(mut input) = input.take() {
+            // (One that stops reading has stopped: what it says next is why.)
+            let _ = input.write_all(&sent).await;
+        }
+        let mut answer = Vec::new();
+        if let Some(output) = output {
+            output.take(RENDER_ANSWER + 1).read_to_end(&mut answer).await?;
+        }
+        Ok::<_, std::io::Error>((answer, child.wait().await?))
+    };
+    let (answer, ended) = match tokio::time::timeout(RENDER_TIME, talk).await {
+        Err(_) => return Err(format!("rendering took more than {} s", RENDER_TIME.as_secs())),
+        Ok(talked) => talked.map_err(|e| format!("rendering: {e}"))?,
+    };
+    if answer.len() as u64 > RENDER_ANSWER {
+        return Err(format!("rendering gave more than {} MB", RENDER_ANSWER >> 20));
+    }
+    match serde_json::from_slice::<Result<Output, String>>(&answer) {
+        Ok(rendered) if ended.success() => rendered,
+        _ => Err(match std::os::unix::process::ExitStatusExt::signal(&ended) {
+            Some(nix::libc::SIGXCPU) => format!("rendering took more than {RENDER_CPU} s of CPU"),
+            Some(_) => format!(
+                "rendering stopped ({ended}): it wanted more memory than the {} MB it has, \
+                 a deeper stack, or it panicked",
+                RENDER_MEMORY >> 20
+            ),
+            None => format!("rendering stopped ({ended})"),
+        }),
+    }
 }
 
 /// The Releases whose render is missing or out of date.
@@ -643,12 +728,10 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                 renders.retain(|key, _| state.store.get(key).is_some());
                 pending(&state.store, &renders)
             };
-            // (Off the threads everything else waits on: a package is someone else's code.
-            // One at a time, so that one that panics takes only its own render with it.)
+            // (Each in a kithd of its own, one at a time: a package is someone else's code, and
+            // what it grows to, a panic or a stack it overflows ends only that one.)
             for (key, inputs, job) in jobs {
-                let rendered = tokio::task::spawn_blocking(move || render(&job)).await;
-                let rendered = rendered.unwrap_or_else(|e| Err(format!("rendering stopped: {e}")));
-                renders.insert(key, (inputs, rendered));
+                renders.insert(key, (inputs, apart(&job).await));
             }
             let plan = {
                 let state = shared.store.lock().expect("nothing panics holding the store");

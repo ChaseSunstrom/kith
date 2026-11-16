@@ -259,6 +259,8 @@ fn main() -> ExitCode {
     }
     // Started again by the runtime as an exec unit's helper? Then this never returns.
     kith_runtime::exec_shim();
+    // Started again to render a package's templates? Then this never returns either.
+    releases::render_shim();
     let first = init::is_init();
     let mut boot = first.then(init::early);
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {

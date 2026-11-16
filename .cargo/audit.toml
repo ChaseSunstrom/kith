@@ -1,0 +1,7 @@
+# What `cargo audit` is told to pass over, each with why (SECURITY.md, "Dependencies").
+[advisories]
+ignore = [
+    # paste is unmaintained (no flaw known): a proc-macro netlink-packet-core uses while
+    # it builds; none of it is in kithd or kith. Gone when netlink-packet-core drops it.
+    "RUSTSEC-2024-0436",
+]
