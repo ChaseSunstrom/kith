@@ -947,3 +947,35 @@ fn forgotten_key_refused_write_is_in_no_log_entry() {
         assert!(!holds(&dir.0, WRAPPED).await);
     });
 }
+
+/// A store brought in over one that holds a NodeKey the new one lacks: the log, which has the
+/// write of that key still, is dropped up to the Import as it is applied, with no restart.
+/// (kithd brings a store in only where there is none; this holds for a caller that does not.)
+#[test]
+fn import_over_a_key_scrubs_the_log() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = Scratch::new();
+        let net = Net::default();
+        let replica = crate::open(&dir.0, 1, net.clone(), Arc::new(|| {})).await.unwrap();
+        net.0.lock().unwrap().insert(1, replica.raft.clone());
+        let members = [(1, openraft::BasicNode::default())];
+        replica
+            .raft
+            .initialize(members.into_iter().collect::<std::collections::BTreeMap<_, _>>())
+            .await
+            .unwrap();
+        let resources = vec![node_key(WRAPPED), config("a", "1")];
+        write(&net, Command::Apply { resources, at: 1 }).await;
+        let mut store = Store::default();
+        store.apply(config("b", "2")).unwrap();
+        let imported = write(&net, Command::Import { store }).await;
+        caught_up(&replica.raft, imported, imported).await;
+        replica.raft.shutdown().await.unwrap();
+        drop(replica);
+        assert!(!holds(&dir.0, WRAPPED).await);
+    });
+}
