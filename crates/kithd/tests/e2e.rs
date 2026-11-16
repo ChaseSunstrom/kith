@@ -188,15 +188,16 @@ fn a_held_request_does_not_hold_a_stop() {
     let g = watch_request(&daemon, "")["generation"].as_u64().unwrap();
     let mut held = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
     held.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: x\r\n").unwrap();
-    let (answered, told) = std::thread::scope(|scope| {
-        let watch = scope.spawn(|| watch_request(&daemon, &format!("?after={g}&wait=20")));
-        std::thread::sleep(Duration::from_millis(500));
-        Command::new("kill")
-            .arg(daemon.child.id().to_string())
-            .status()
-            .unwrap();
-        (watch.join().unwrap(), Instant::now())
-    });
+    // The watch is sent, and the stop only once kithd has answered a request sent after it:
+    // kithd takes connections in order, so by then it holds the watch. (A stop sent after a
+    // fixed wait could reach kithd first on a loaded machine, and the watch never be answered.)
+    let watch = watch_send(&daemon, &format!("?after={g}&wait=20"));
+    watch_request(&daemon, "");
+    Command::new("kill")
+        .arg(daemon.child.id().to_string())
+        .status()
+        .unwrap();
+    let (answered, told) = (watch_read(watch), Instant::now());
     assert_eq!(answered["generation"], g, "{answered}");
     // (Three seconds is what it waits; a loaded machine is given eight.)
     let ended = loop {
@@ -972,13 +973,22 @@ spec:
 
 /// `GET /v1/watch` over the raw socket: (status line, JSON body).
 fn watch_request(daemon: &Daemon, query: &str) -> serde_json::Value {
-    use std::io::{Read, Write};
+    watch_read(watch_send(daemon, query))
+}
+
+fn watch_send(daemon: &Daemon, query: &str) -> std::os::unix::net::UnixStream {
+    use std::io::Write;
     let mut stream = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
     write!(
         stream,
         "GET /v1/watch{query} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
+    stream
+}
+
+fn watch_read(mut stream: std::os::unix::net::UnixStream) -> serde_json::Value {
+    use std::io::Read;
     let mut reply = String::new();
     stream.read_to_string(&mut reply).unwrap();
     let (head, body) = reply.split_once("\r\n\r\n").unwrap();
