@@ -103,6 +103,12 @@ impl Node {
             .current_dir(dir)
             .args(["--state", "state", "--socket", "kithd.sock", "--name", name])
             .args(["--listen", &format!("{host}:{port}")])
+            // (No registry unless a test names one: every node would else try port 5000.)
+            .args(if args.contains(&"--registry-port") {
+                Vec::new()
+            } else {
+                vec!["--registry-port", "0"]
+            })
             .args(args)
             .stdin(Stdio::null())
             .spawn()
@@ -144,7 +150,10 @@ impl Node {
     }
 
     fn stop(&mut self) {
-        let _ = Command::new("kill").arg(self.child.id().to_string()).status();
+        let _ = Command::new("kill")
+            .arg(self.child.id().to_string())
+            .stderr(Stdio::null())
+            .status();
         let _ = self.child.wait();
     }
 }
@@ -443,6 +452,7 @@ fn the_store_survives_its_leader() {
     // The leader dies without a word: the two that are left pick one of themselves and go on.
     let _ = Command::new("kill")
         .args(["-9", &alpha.child.id().to_string()])
+        .stderr(Stdio::null())
         .status();
     let _ = alpha.child.wait();
     std::fs::write(beta.dir.join("after.yaml"), config("after")).unwrap();
