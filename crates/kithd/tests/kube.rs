@@ -118,7 +118,7 @@ impl Cluster {
         let out = Command::new(kith)
             .args(args)
             .current_dir(&self.dir)
-            .env("KITH_SOCKET", self.dir.join("kithd.sock"))
+            .env("KITH_SOCKET", "kithd.sock")
             .env_remove("KITH_STORE")
             .output()
             .unwrap();
