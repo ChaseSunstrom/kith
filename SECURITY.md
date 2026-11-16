@@ -1027,8 +1027,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   so make every control node snapshot as often as they write, with no limit but that
   permission. A store kept before this held earlier versions too: a control node cuts
   them as it starts on this version or takes such a store in (a snapshot sent to it, an
-  import), and drops its log if that held them. Each drop says so on kithd's standard error, with
-  the log's index and the NodeKey. What stays: a backup or a copy of a
+  import), and drops its log if that still holds a key the store does not. Each log
+  dropped this way is said on kithd's standard error, with the log's index and the
+  NodeKey (a cut of earlier versions alone says nothing). What stays: on a node that
+  came from before the store was replicated, `store.json.imported` in its state, the
+  store as it was then, every NodeKey of that day in it (remove the file; T-0614); a backup or a copy of a
   control node's state taken before (kith's own backups are of Volumes and hold no
   store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
   hears of the change, and on a control node's disk the freed pages of the log file and
