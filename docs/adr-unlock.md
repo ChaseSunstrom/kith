@@ -346,10 +346,17 @@ The refusal says which bound failed and the shortest PIN this TPM's M and I woul
 kithd does not change M or I itself ("Open"). R is read and said, not bounded: only kithd
 holds the lockout authorization, and 32 random bytes are not guessed.
 
-The settings are said again in the NodeKey's status at each start where a PIN is asked. The
-number of wrong PINs before the right one is refused is M less the count at that moment. It
-is said when the PIN is set ("this TPM refuses every PIN after M wrong ones, and allows one
-more every I seconds").
+The number of wrong PINs before the right one is refused is M less the count at that moment.
+It is said when the PIN is set ("this TPM refuses every PIN after M wrong ones, and allows
+one more every I seconds"). The bound holds for random digits only: a date or 123456 is
+among the first guesses. Each setting of a PIN tries one wrong PIN, which the TPM counts, to
+learn that the TPM counts at all.
+
+Where kithd took the lockout authorization, it keeps it only in this node's encrypted state.
+If that state is lost (wiped, or its key erased by a duress code), only clearing the TPM in
+the firmware's settings gives it back. The owner decides this knowingly: `--untried-tpm`'s
+help and the refusal without it say so. The flag is the owner's word, not a lock: whoever
+may apply a NodeKey at the node can send it.
 
 Unverified, and in the owner's checklist: whether a TPM restarted after a shutdown that was
 not orderly counts that as a wrong try (Part 1, dictionary attack protection), so that a
@@ -624,7 +631,10 @@ The changes, in that order:
   checked. If that fails, write the old blob back and say why.
 - **PIN on:** check the bounds and take the lockout authorization (its file in the state is
   written before TPM2_HierarchyChangeAuth, so a value the TPM took is never one kithd lost);
-  write `tpm-pin:` beside `tpm:`; read back; open it; then write the record without `tpm:`.
+  write `tpm-pin:` in place of `tpm:` in one write; read back; open it. One write, so no
+  record ever opens by the TPM alone while the status says a PIN guards it; a record read
+  with both lines (an older kithd's) drops `tpm:`. If the read-back does not open, the old
+  record is written back.
 - **PIN changed:** a new k2 and W beside the old line; read back; open with the new PIN; then
   the old line goes. **PIN off:** `tpm-pin:` goes, and `tpm:` comes only if the NodeKey says
   `seal: true`, written and opened before.

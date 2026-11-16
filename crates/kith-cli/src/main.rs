@@ -453,7 +453,12 @@ enum NodeCommand {
     Pin {
         name: String,
         /// Say that this machine's TPM has not been tried as docs/adr-unlock.md's "On hardware: the
-        /// owner's checklist" says: no PIN is set without it, as none has yet run on a real TPM
+        /// owner's checklist" says: no PIN is set without it, as none has yet run on a real TPM. It is
+        /// the owner's word, not a lock: whoever may apply a NodeKey at NAME can send it. With it,
+        /// kithd takes the TPM's lockout authorization where it is empty and keeps it only in NAME's
+        /// encrypted state: if that state is lost, only clearing the TPM gives it back. Each setting
+        /// tries one wrong PIN, which the TPM counts. Use random digits (a date is among the first
+        /// guesses)
         #[arg(long, conflicts_with = "off")]
         untried_tpm: bool,
         /// Take it away: the node asks the cluster again (its TPM alone opens it only if sealed)
@@ -1480,7 +1485,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             if !off && !untried_tpm {
                 return fail(
-                    "a PIN has run against a software TPM only, never yet against a machine's own: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm",
+                    "a PIN has run against a software TPM only, never yet against a machine's own: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm. Know first: where the TPM's lockout authorization is empty, kithd takes the TPM's lockout authorization and keeps it only in the node's encrypted state; if that state is lost, only clearing the TPM gives it back. And each setting of a PIN tries one wrong PIN, which the TPM counts. Make the PIN random digits: a date or 123456 is among the first guesses",
                 );
             }
             // (Read here, unseen, never from the command line; for the kithd asked, which takes

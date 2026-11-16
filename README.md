@@ -3577,16 +3577,23 @@ only with that PIN typed at its console, where it takes the recovery key, and
 no longer by itself. A copy of the disk opens on no other machine, and on this
 one only while its system is the one sealed to. The TPM counts each wrong PIN:
 beta refuses a PIN that this TPM's lockout would let be guessed one time in a
-hundred in a year (it names the shortest it takes), and takes the TPM's lockout
-authorization, kept in its state alone, so that nobody else can forgive the
-count. After too many wrong ones the TPM refuses every PIN, the right one too,
+hundred in a year (it names the shortest it takes). That holds for random
+digits only: a date or 123456 is among the first guesses, so pick them at
+random. Setting a PIN takes the TPM's lockout authorization where it is empty,
+kept in beta's encrypted state alone, so that nobody else can forgive the
+count; if that state is lost, only clearing the TPM in the firmware's settings
+gives the authorization back. Each setting tries one wrong PIN, which the TPM
+counts. After too many wrong ones the TPM refuses every PIN, the right one too,
 for a while, and the console says how long; the recovery key still opens.
 The cluster's key opens beta's state as before: a PIN adds a lock to the
-machine alone, not to the cluster's way. `--off` takes it away. It has run
-against a software TPM only, never on a real one, and is refused without
-`--untried-tpm`, the owner saying so, until the checklist in
-docs/adr-unlock.md ("On hardware: the owner's checklist") has run on the
-machine.
+machine alone, not to the cluster's way. `--off` takes it away. After an
+update that moves the PCRs the PIN opens nothing until it is set again (a seal
+for the next system is not built yet), and locking beta, then unlocking it,
+drops the PIN. It has run against a software TPM only, never on a real one,
+and is refused without `--untried-tpm`, the owner saying so, until the
+checklist in docs/adr-unlock.md ("On hardware: the owner's checklist") has run
+on the machine. That flag is a word, not a lock: whoever may apply a NodeKey at
+beta can send it.
 
 What is and is not protected:
 

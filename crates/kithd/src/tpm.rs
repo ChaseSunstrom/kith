@@ -62,7 +62,6 @@ const POLICY_PCR: u32 = 0x17f;
 const POLICY_AUTH_VALUE: u32 = 0x16b;
 const GET_CAPABILITY: u32 = 0x17a;
 const HIERARCHY_CHANGE_AUTH: u32 = 0x129;
-#[cfg(test)]
 const DA_RESET: u32 = 0x139;
 #[cfg(test)]
 const DA_PARAMETERS: u32 = 0x13a;
@@ -79,8 +78,8 @@ pub const NOT_THE_PIN: &str =
     "the TPM refuses that PIN: it is not the one this node's key was sealed with (each wrong one is counted)";
 pub const LOCKED_OUT: &str = "the TPM refuses every PIN for now: too many wrong ones were tried";
 /// What setting a PIN is refused with when somebody other than kithd took the lockout's
-/// authorization: it could forgive every wrong PIN.
-pub const CLEAR_FIRST: &str = "somebody holds this TPM's lockout authorization, and kithd does not: whoever does could forgive every wrong PIN. Clear the TPM in the firmware's settings first";
+/// authorization, or the one kithd keeps is not the TPM's: it could forgive every wrong PIN.
+pub const CLEAR_FIRST: &str = "somebody holds this TPM's lockout authorization, and kithd does not (it keeps none, or the TPM refused the one it keeps; a refused one also shuts the TPM's lockout hierarchy for its recovery time): whoever does could forgive every wrong PIN. Clear the TPM in the firmware's settings first";
 /// A year, in seconds: what a PIN's guesses are counted over.
 const YEAR: u32 = 31_536_000;
 /// A session's kinds; its cipher (AES, 128 bits, CFB); and what it does for one command:
@@ -677,43 +676,56 @@ impl<T: Read + Write> Tpm<T> {
     pub fn guard(
         &mut self,
         digits: usize,
-        held: bool,
+        held: Option<&[u8]>,
         kept: Option<&[u8]>,
         keep: impl FnOnce(&[u8]) -> Result<(), String>,
     ) -> Result<Lockout, String> {
         let lockout = self.lockout()?;
         bounded(digits, lockout.max, lockout.interval)?;
         if lockout.set {
-            return if held { Ok(lockout) } else { Err(CLEAR_FIRST.into()) };
+            // Kept is not proof (a disk moved, a state put back): the TPM is shown it, by
+            // forgiving its count (the PIN it guards is being set anew). A wrong one shuts
+            // the lockout hierarchy for its recovery time, as CLEAR_FIRST says.
+            let held = held.filter(|held| held.len() == 32).ok_or(CLEAR_FIRST)?;
+            self.as_lockout(kept, DA_RESET, 0, Vec::new(), [held, held])
+                .map_err(|_| CLEAR_FIRST)?;
+            return self.lockout();
         }
         // (A TPM drops an authorization's last zero bytes: none is last.)
         let mut auth = Zeroizing::new(crate::crypt::random::<32>());
         auth[31] |= 1;
         keep(&auth[..])?;
-        let parent = self.parent(kept)?;
-        let session = self.start(&parent, HMAC);
-        self.flush(parent.handle);
-        let session = session?;
-        let on = (LOCKOUT, &LOCKOUT.to_be_bytes()[..]);
         let mut given = sized(&auth[..]);
-        let taken = self.authorized(
-            HIERARCHY_CHANGE_AUTH,
-            on,
-            &session,
-            DECRYPT,
-            given.clone(),
-            [&[], &auth[..]],
-        );
+        let taken = self.as_lockout(kept, HIERARCHY_CHANGE_AUTH, DECRYPT, given.clone(), [&[], &auth[..]]);
         given.zeroize();
-        if taken.is_err() {
-            self.flush(session.handle);
-        }
         taken?;
         let lockout = self.lockout()?;
         if !lockout.set {
             return Err("the TPM did not take the lockout's authorization it was given".into());
         }
         Ok(lockout)
+    }
+
+    /// `command` on the lockout hierarchy, authorized by `auth` in a session salted to the
+    /// storage key (`kept`: its name), so no authorization crosses the bus in plain.
+    fn as_lockout(
+        &mut self,
+        kept: Option<&[u8]>,
+        command: u32,
+        crypt: u8,
+        parameters: Vec<u8>,
+        auth: [&[u8]; 2],
+    ) -> Result<Vec<u8>, String> {
+        let parent = self.parent(kept)?;
+        let session = self.start(&parent, HMAC);
+        self.flush(parent.handle);
+        let session = session?;
+        let on = (LOCKOUT, &LOCKOUT.to_be_bytes()[..]);
+        let done = self.authorized(command, on, &session, crypt, parameters, auth);
+        if done.is_err() {
+            self.flush(session.handle);
+        }
+        done
     }
 }
 
@@ -1118,13 +1130,13 @@ pub(crate) mod tests {
 
         let mut kept = None;
         let refused = tpm
-            .guard(6, false, None, |_| panic!("kept for a PIN refused"))
+            .guard(6, None, None, |_| panic!("kept for a PIN refused"))
             .unwrap_err();
         assert!(
             refused.contains("the shortest PIN these settings take is 8 digits"),
             "{refused}"
         );
-        tpm.guard(8, false, None, |auth| {
+        tpm.guard(8, None, None, |auth| {
             kept = Some(auth.to_vec());
             Ok(())
         })
@@ -1132,12 +1144,15 @@ pub(crate) mod tests {
         let auth = kept.expect("the lockout's authorization, kept before the TPM was told it");
         assert_eq!(auth.len(), 32);
         assert!(tpm.lockout().unwrap().set, "the TPM holds it");
-        // Held by kithd: taken as it is. Held by somebody else: refused.
-        tpm.guard(8, true, None, |_| panic!("made again")).unwrap();
-        assert_eq!(
-            tpm.guard(8, false, None, |_| panic!("made again")),
-            Err(CLEAR_FIRST.into())
-        );
+        // Held by kithd: the TPM takes it again. Held by somebody else (kithd keeps none, or
+        // not 32 bytes): refused, the TPM not asked.
+        tpm.guard(8, Some(&auth), None, |_| panic!("made again")).unwrap();
+        for held in [None, Some(&auth[..31])] {
+            assert_eq!(
+                tpm.guard(8, held, None, |_| panic!("made again")),
+                Err(CLEAR_FIRST.into())
+            );
+        }
 
         let (pin, key): (&[u8], Vec<u8>) = (b"40917253", (0..32).collect());
         let (sealed, name) = tpm.seal_pin(&key, pin, None).unwrap();
@@ -1163,5 +1178,14 @@ pub(crate) mod tests {
         // Forgiven by the lockout's authorization kithd keeps: the PIN opens again.
         as_lockout(&mut tpm, DA_RESET, &auth, &[]);
         assert_eq!(tpm.unseal_pin(&sealed, pin, name).as_ref(), Ok(&key));
+        // A file of 32 bytes kept that are not the TPM's (a disk moved, a state put back):
+        // the TPM is asked and says no, so refused. (Last: the TPM then shuts its lockout
+        // hierarchy for its recovery time.)
+        let mut other = auth.clone();
+        other[0] ^= 1;
+        assert_eq!(
+            tpm.guard(8, Some(&other), None, |_| panic!("made again")),
+            Err(CLEAR_FIRST.into())
+        );
     }
 }

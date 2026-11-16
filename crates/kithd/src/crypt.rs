@@ -884,7 +884,8 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
 fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
     let pin = record.pin.clone().filter(|_| !shut);
     Record {
-        tpm: record.tpm.clone().filter(|_| seal),
+        // (Beside a PIN, a plain seal would open the state with no PIN typed.)
+        tpm: record.tpm.clone().filter(|_| seal && pin.is_none()),
         parent: record.parent.clone().filter(|_| seal || pin.is_some()),
         pass: record.pass.clone().filter(|_| !shut),
         pin,
@@ -968,9 +969,9 @@ fn lockout_kept() -> PathBuf {
 
 /// The state's key under this machine's TPM and `pin` (docs/adr-unlock.md, "TPM plus PIN"):
 /// the TPM's lockout bounds checked and its authorization taken where it is empty (kept at
-/// `kept` first); `tpm-pin:` written beside `tpm:`, read back and opened by the PIN; then the
-/// record without `tpm:`, whose seal would open the state with no PIN. The record as it now
-/// is, and the TPM's lockout settings. Where a step fails, the record stays as it was.
+/// `kept` first); `tpm-pin:` written in place of `tpm:` (whose seal would open the state with
+/// no PIN), read back and opened by the PIN. The record as it now is, and the TPM's lockout
+/// settings. Where a step fails, the record is put back as it was.
 fn pin_sealed<T: std::io::Read + std::io::Write>(
     tpm: &mut crate::tpm::Tpm<T>,
     record: &Record,
@@ -993,7 +994,13 @@ fn pin_sealed<T: std::io::Read + std::io::Write>(
         let kept = file.and_then(|mut file| std::io::Write::write_all(&mut file, auth).and_then(|()| file.sync_all()));
         kept.map_err(|e| format!("keeping the TPM's lockout authorization in the state: {e}"))
     };
-    let lockout = tpm.guard(pin.len(), kept.exists(), record.parent.as_deref(), keep)?;
+    let held = std::fs::read(kept).ok().map(zeroize::Zeroizing::new);
+    let lockout = tpm.guard(
+        pin.len(),
+        held.as_deref().map(|h| &h[..]),
+        record.parent.as_deref(),
+        keep,
+    )?;
     let k1 = k1_of(opened);
     let (k1_sealed, parent) = tpm.seal(&k1[..], record.parent.as_deref())?;
     let k2 = zeroize::Zeroizing::new(random::<32>());
@@ -1004,12 +1011,15 @@ fn pin_sealed<T: std::io::Read + std::io::Write>(
         k2: k2_sealed,
         wrapped: wrap(&both, opened),
     };
-    let beside = Record {
+    // (One write, `tpm:` gone with it: written beside it first, a power cut between would
+    // leave a node that opens by its TPM alone while it says a PIN guards it.)
+    let alone = Record {
+        tpm: None,
         pin: Some(seal),
         parent: Some(parent),
         ..record.clone()
     };
-    let beside = tried(record, &beside, config, |back| {
+    let alone = tried(record, &alone, config, |back| {
         let seal = back.pin.clone().unwrap_or_default();
         let k1 = zeroize::Zeroizing::new(tpm.unseal(&seal.k1, back.parent.as_deref())?);
         let k2 = zeroize::Zeroizing::new(tpm.unseal_pin(&seal.k2, pin, back.parent.as_deref())?);
@@ -1019,13 +1029,6 @@ fn pin_sealed<T: std::io::Read + std::io::Write>(
             .map(drop)
             .ok_or("the PIN's seal gave another key back".into())
     })?;
-    let alone = Record {
-        tpm: None,
-        ..beside.clone()
-    };
-    // (Read back as written is all that is asked: what opens it was opened just now. Else
-    // the record goes back to what it was before, not to both lines.)
-    let alone = tried(record, &alone, config, |_| Ok(()))?;
     Ok((alone, lockout))
 }
 
@@ -1242,7 +1245,8 @@ pub async fn keep(
                 };
                 for (name, set) in [
                     ("passphrase", record.pass.is_some()),
-                    ("pin", record.pin.is_some()),
+                    // (Not while a plain seal is beside it: that opens with no PIN.)
+                    ("pin", record.pin.is_some() && record.tpm.is_none()),
                     ("recoverySeen", record.seen),
                     ("duress", record.duress.is_some()),
                     ("duressAll", record.duress_all.is_some()),
@@ -1858,7 +1862,7 @@ pub struct PinGiven {
 }
 
 /// What a PIN asked for without the owner's word is refused with.
-const UNTRIED: &str = "a PIN has run against a software TPM only, never yet against this machine's: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm";
+const UNTRIED: &str = "a PIN has run against a software TPM only, never yet against this machine's: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm. Know first: where the TPM's lockout authorization is empty, kithd takes the TPM's lockout authorization and keeps it only in this node's encrypted state; if that state is lost, only clearing the TPM gives it back. And each setting of a PIN tries one wrong PIN, which the TPM counts. Make the PIN random digits: a date or 123456 is among the first guesses";
 
 /// `POST /v1/lock/NAME/pin {pin, untried}` (`kith node pin`): NAME's state opens with its
 /// TPM and the PIN from then on, typed at its console, and with its TPM alone no more; with
@@ -2219,6 +2223,10 @@ mod tests {
         };
         for (name, typed, untried, named) in [
             ("a", "40917253", false, "On hardware: the owner's checklist"),
+            // (What the owner's word lets kithd do to the TPM, said where it is asked for.)
+            ("a", "40917253", false, "kithd takes the TPM's lockout authorization"),
+            ("a", "40917253", false, "only clearing the TPM gives it back"),
+            ("a", "40917253", false, "each setting of a PIN tries one wrong PIN"),
             ("a", "4091725x", true, "a PIN is 6 to 32 digits"),
             ("a", "40917", true, "a PIN is 6 to 32 digits"),
             ("b", "40917262", true, "ask node b itself"),
@@ -2265,6 +2273,13 @@ mod tests {
         assert_eq!((left.tpm, left.parent, left.pin), (None, None, None));
         let left = ways_left(&record, true, true);
         assert_eq!((left.tpm, left.parent), (record.tpm.clone(), record.parent.clone()));
+        // Both lines (a power cut while an earlier kithd set the PIN): `tpm:` would open the
+        // state with no PIN typed, so it goes, sealed or not.
+        let left = ways_left(&record, true, false);
+        assert_eq!(
+            (left.tpm, left.parent, left.pin),
+            (None, record.parent.clone(), record.pin.clone())
+        );
     }
 
     async fn pin_route(shared: Arc<Shared>, name: String, given: Json<PinGiven>) -> (StatusCode, String) {
