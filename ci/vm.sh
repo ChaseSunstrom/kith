@@ -699,7 +699,7 @@ EOF
             grep -qE 'where: nameserver 10\.77\.0\.1 from 10\.77\.[0-9]+\.[0-9]+' "$work/at-n2.out" || fail "the pod on n2 is not in the range of --pod-range: $(cat "$work/at-n2.out")"
             # And one pod on n2 asks this machine, from behind its node's address: the node
             # sends it as its own only if the masquerade rule matches the range it was told.
-            pinned=on-n2
+            pinned='on-n2'
             asks egress 10.0.2.2 $((port + 9))
             pinned=''
             grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
