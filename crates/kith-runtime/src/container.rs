@@ -342,7 +342,7 @@ pub const NODE_ROOT: &str = "would be the node's root";
 
 /// What root keeps in a container that is `as_image`, where kithd is root: what Docker and
 /// containerd give by default. Nothing in it reaches out of the container's namespaces.
-const ROOTS: [Capability; 14] = [
+pub const ROOTS: [Capability; 14] = [
     Capability::Chown,
     Capability::DacOverride,
     Capability::Fsetid,

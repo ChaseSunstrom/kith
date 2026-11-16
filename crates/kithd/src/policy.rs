@@ -54,6 +54,138 @@ pub const KEYS: [(&str, &str, &str); 10] = [
     ),
 ];
 
+/// The keys that, all off, let kithd give up capabilities for good: each is a way for the
+/// store to have this node start a process as its root with every capability the kernel has
+/// (an exec unit, a VM's qemu with the paths it is told, `/v1/run`). With none of them, what
+/// kithd starts is a container (which gets its own list) or kithd's own helpers.
+const BOUNDED_BY: [&str; 3] = ["execUnits", "vmPaths", "run"];
+
+/// What a hardened node keeps in its bounding set (docs/adr-privilege.md, "Step A"): the
+/// number the kernel gives each capability, its name, and why kithd or what it starts holds
+/// it. A capability joins this list only when a VM test (`ci/vm.sh --test policy`) fails
+/// for want of it, with the line that says why. Never SYS_MODULE, SYS_RAWIO, SYS_PTRACE or
+/// SYS_TIME: the rest of the kernel's list is gone from kithd and everything it starts.
+pub const KEPT: [(u32, &str, &str); 19] = [
+    (0, "CHOWN", "a root pod: chown of what it owns (ROOTS)"),
+    (
+        1,
+        "DAC_OVERRIDE",
+        "a root pod: files of other owners in its own view (ROOTS)",
+    ),
+    (
+        3,
+        "FOWNER",
+        "a root pod: chmod and utimes of files of other owners (ROOTS)",
+    ),
+    (4, "FSETID", "a root pod: set-id bits kept on write (ROOTS)"),
+    (5, "KILL", "a root pod: signals to processes of other users (ROOTS)"),
+    (
+        6,
+        "SETGID",
+        "a root pod: setgid, and the group of a unit that drops to a user (ROOTS)",
+    ),
+    (
+        7,
+        "SETUID",
+        "a root pod: setuid, and the user of a unit that drops to one (ROOTS)",
+    ),
+    (
+        8,
+        "SETPCAP",
+        "a root pod: dropping its own capabilities; and kithd's, to drop them in each container (ROOTS)",
+    ),
+    (10, "NET_BIND_SERVICE", "a root pod: ports below 1024 (ROOTS)"),
+    (
+        12,
+        "NET_ADMIN",
+        "kithd: links, addresses, routes and nftables of pods and the mesh",
+    ),
+    (
+        13,
+        "NET_RAW",
+        "a root pod (ROOTS), and kithd: the raw sockets of DHCP and the mesh's probes",
+    ),
+    (18, "SYS_CHROOT", "a root pod: chroot (ROOTS)"),
+    (
+        21,
+        "SYS_ADMIN",
+        "kithd: mounts, namespaces, setns, pivot_root, cgroups, devices, the loop and mapper devices",
+    ),
+    (22, "SYS_BOOT", "kithd: powering off and restarting the machine"),
+    (
+        24,
+        "SYS_RESOURCE",
+        "kithd: raising limits (memory locks, queues) for what it starts",
+    ),
+    (27, "MKNOD", "a root pod: device nodes of its own (ROOTS)"),
+    (29, "AUDIT_WRITE", "a root pod: audit records of a login (ROOTS)"),
+    (31, "SETFCAP", "a root pod: file capabilities (ROOTS)"),
+    (
+        39,
+        "BPF",
+        "kithd: the programs that filter a cgroup's devices and connections",
+    ),
+];
+
+/// The bounding set a node with this policy cuts itself to, as a mask of capability numbers:
+/// none where any of the keys of [`BOUNDED_BY`] is on, which is as a node was before.
+pub fn kept_mask(policy: &Policy) -> Option<u64> {
+    BOUNDED_BY
+        .iter()
+        .all(|key| !policy.allows(key))
+        .then(|| KEPT.iter().fold(0, |mask, (number, _, _)| mask | 1 << number))
+}
+
+/// The capabilities kithd cut itself to, as a mask; unset where it did not.
+static CUT: OnceLock<u64> = OnceLock::new();
+
+/// Cuts the bounding set of the calling thread, and so of everything it starts, to what
+/// [`kept_mask`] says, if the policy says anything: every number the kernel has (read from
+/// `/proc/sys/kernel/cap_last_cap`, so one a later kernel adds is cut too) that is not kept.
+/// Call it from `main`'s thread before the runtime or any other thread is made: a thread
+/// that exists keeps its own set. Does nothing where kithd is not root (there is nothing to
+/// bound); the node's status says what it holds either way.
+pub fn cut(policy: &Policy) -> Result<(), String> {
+    let Some(kept) = kept_mask(policy) else {
+        return Ok(());
+    };
+    if !nix::unistd::getuid().is_root() {
+        return Ok(());
+    }
+    let last = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .map_err(|e| format!("cutting the bounding set: /proc/sys/kernel/cap_last_cap: {e}"))?;
+    let last: u32 = last
+        .trim()
+        .parse()
+        .map_err(|_| format!("cutting the bounding set: cap_last_cap says {:?}", last.trim()))?;
+    for cap in (0..=last).filter(|cap| *cap >= 64 || kept >> cap & 1 == 0) {
+        kith_dm_sys::bounding_drop(cap)
+            .map_err(|e| format!("cutting the bounding set: dropping capability {cap}: {e}"))?;
+    }
+    CUT.set(kept).expect("the bounding set is cut once, at start");
+    // (Said once, from what the kernel now says, for whoever reads the console.)
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let bounding = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapBnd:"))
+        .unwrap_or("?")
+        .trim();
+    eprintln!("kithd: capability bounding set cut: CapBnd {bounding}");
+    Ok(())
+}
+
+/// What the node's status says it holds: the names of what it kept, or `all` where it was not cut.
+fn held() -> Vec<&'static str> {
+    match CUT.get() {
+        None => vec!["all"],
+        Some(kept) => KEPT
+            .iter()
+            .filter(|(number, _, _)| kept >> number & 1 == 1)
+            .map(|(_, name, _)| *name)
+            .collect(),
+    }
+}
+
 /// The classes of Device a policy may name (`devices=gpu+input`), as a Device's spec does.
 const CLASSES: [(&str, DeviceClass); 7] = [
     ("gpu", DeviceClass::Gpu),
@@ -140,7 +272,8 @@ impl Policy {
             .is_none_or(|allowed| name.is_some_and(|name| allowed.contains(name)))
     }
 
-    /// As a Node's status says it: every key, and the classes of Device. Null where
+    /// As a Node's status says it: every key, the classes of Device, and the capabilities
+    /// kithd holds (`all`, or the names of what a hardened node kept: [`KEPT`]). Null where
     /// everything is allowed: a node with no policy says nothing.
     pub fn status(&self) -> serde_json::Value {
         if *self == Policy::default() {
@@ -155,6 +288,7 @@ impl Policy {
             Some(allowed) => allowed.iter().copied().collect(),
         };
         said.insert("devices".into(), devices.into());
+        said.insert("capabilities".into(), held().into());
         said.into()
     }
 
@@ -282,7 +416,8 @@ mod tests {
         assert!(all.status().is_null());
         // Every key is said in a Node's status, by its name in the record.
         let one: Policy = "no-run".parse().unwrap();
-        assert_eq!(one.status().as_object().unwrap().len(), KEYS.len() + 1);
+        assert_eq!(one.status().as_object().unwrap().len(), KEYS.len() + 2);
+        assert_eq!(one.status()["capabilities"], serde_json::json!(["all"]));
         assert_eq!(
             (&one.status()["run"], &one.status()["vms"]),
             (&false.into(), &true.into())
@@ -292,6 +427,81 @@ mod tests {
         assert!(read(Some("hardned"), false).is_err());
         assert_eq!(read(Some("hardned"), true), Ok(Policy::hardened()));
         assert_eq!(read(None, true), Ok(Policy::default()));
+    }
+
+    #[test]
+    fn bounding_set_is_kept_only_where_every_way_to_be_root_is_off() {
+        let kept = |words: &str| kept_mask(&words.parse().unwrap());
+        // Any one of the three on, or no policy: as before, nothing is cut.
+        for on in [
+            "",
+            "hardened,exec-units",
+            "hardened,vm-paths",
+            "hardened,run",
+            "no-exec-units,no-run",
+        ] {
+            assert_eq!(kept(on), None, "{on}");
+        }
+        let mask = kept("no-exec-units,no-vm-paths,no-run").unwrap();
+        assert_eq!(kept("hardened"), Some(mask));
+        // The other keys are the owner's own: a root pod, an unconfined unit, VMs still run.
+        assert_eq!(kept("no-exec-units,no-vm-paths,no-run,vms,unconfined"), Some(mask));
+        let has = |name: &str| mask >> KEPT.iter().find(|(_, kept, _)| *kept == name).unwrap().0 & 1 == 1;
+        for never in ["SYS_MODULE", "SYS_RAWIO", "SYS_PTRACE", "SYS_TIME"] {
+            assert!(KEPT.iter().all(|(_, name, _)| *name != never), "{never}");
+        }
+        // Every capability of a root pod is kept; each numbered once, in order, with its reason.
+        for cap in kith_runtime::ROOTS {
+            let name = cap.to_string();
+            assert!(has(name.strip_prefix("CAP_").unwrap_or(&name)), "{name}");
+        }
+        assert!(
+            ["SYS_ADMIN", "NET_ADMIN", "NET_RAW", "SYS_BOOT", "SYS_RESOURCE", "BPF"]
+                .into_iter()
+                .all(has)
+        );
+        assert!(KEPT.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(KEPT.iter().all(|(number, _, why)| *number < 64 && !why.is_empty()));
+        assert_eq!(mask.count_ones() as usize, KEPT.len());
+    }
+
+    /// The bounding set is a thread's own: one made here is cut and read, and the others are not.
+    #[test]
+    fn bounding_set_is_cut_to_what_is_kept() {
+        let status = |thread: &str| {
+            let text = std::fs::read_to_string(format!("/proc/{thread}/status")).unwrap();
+            let field = |name: &str| {
+                let line = text.lines().find_map(|line| line.strip_prefix(name)).unwrap();
+                u64::from_str_radix(line.trim(), 16).unwrap()
+            };
+            (field("CapBnd:"), field("CapEff:"))
+        };
+        let (before, _) = status("self");
+        let mask = kept_mask(&Policy::hardened()).unwrap();
+        let cut = std::thread::spawn(move || {
+            let (bounding, effective) = status("thread-self");
+            if effective >> 8 & 1 == 0 {
+                return None; // not root: no CAP_SETPCAP to drop with
+            }
+            let last: u32 = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            for cap in (0..=last).filter(|cap| mask >> cap & 1 == 0) {
+                kith_dm_sys::bounding_drop(cap).unwrap();
+            }
+            Some((bounding, status("thread-self").0))
+        });
+        if let Some((was, now)) = cut.join().unwrap() {
+            assert_eq!(now, was & mask);
+            for gone in [16, 17, 19, 25] {
+                // SYS_MODULE, SYS_RAWIO, SYS_PTRACE, SYS_TIME
+                assert_eq!(now >> gone & 1, 0, "{gone}");
+            }
+            // (Another thread's, here the test's, is as it was.)
+            assert_eq!(status("self").0, before);
+        }
     }
 
     #[test]

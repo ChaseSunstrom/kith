@@ -17,7 +17,8 @@ mod seccomp;
 pub mod signed;
 
 pub use container::{
-    Awaited, Handle, Mount, NODE_ROOT, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans, spawn_awaited, tune,
+    Awaited, Handle, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans,
+    spawn_awaited, tune,
 };
 pub use image::{Image, ImageStore, Local, PullPolicy, registry, repository};
 pub use seccomp::REFUSED;

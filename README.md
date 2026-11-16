@@ -1053,6 +1053,14 @@ What a node refuses is not run there, and the Workload says why:
 this node's policy refuses exec units: processes of the node's root, with all of /dev (execUnits is off: `--node-policy exec-units` where the node's kithd is started allows it)
 ```
 
+Where `exec-units`, `vm-paths` and `run` are all off (nothing the cluster asks can start
+a process as the node's root with every capability), kithd cuts its bounding set at
+start to what a root pod and it use: never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or
+`SYS_TIME`, nor the rest of what is not on its list (`KEPT` in `crates/kithd/src/policy.rs`
+says why each is). A hole in kithd or a stolen certificate is root there without them.
+The Node's status says what it kept (`status.policy.capabilities`; `all` where it did not
+cut: a kithd that is not root, or one of the three still on).
+
 `kith get node/NAME -o yaml` shows a node's policy under `status.policy` once it has
 one. A node with none does everything, as before. The scheduler reads it: a Workload or
 Job that asks for what a node refuses is placed on the nodes that allow it, and waits,

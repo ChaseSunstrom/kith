@@ -403,8 +403,16 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   scheduler places a Workload or Job only on nodes whose status says they allow what it
   asks for; that is for placing, not a defence (a node's status is its own word, and each
   node refuses by its own policy whatever it was sent). Not done yet: a VM's kernel and
-  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use; and
-  a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
+  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use. Where
+  `exec-units`, `vm-paths` and `run` are all off (every way for the store to start a
+  process as the node's root with all its capabilities), kithd also cuts its bounding set
+  at start to the fourteen of a root pod and what it uses itself (`SYS_ADMIN`, `NET_ADMIN`,
+  `SYS_BOOT`, `SYS_RESOURCE`, `BPF`; `KEPT` in `crates/kithd/src/policy.rs` says why each):
+  never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE` or `SYS_TIME`, so a hole in kithd or a
+  stolen certificate of the cluster loads no module, reads no raw memory or port, traces
+  no process and sets no clock on that node (the node's status lists what it kept). It is
+  still root with what is left: `SYS_ADMIN` is a great deal, and a hole in a parser is
+  still all of that until the split. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container that keeps the node's
   users and is not root is still the node's user of its number, with whatever files on
   the node that user owns, and may be of group 0, which reads what a Volume's files give

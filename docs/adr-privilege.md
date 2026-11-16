@@ -328,19 +328,37 @@ before any of the split:
   `api/run.rs`, `crypt.rs`, by `policy.rs`), in words that name the key and the word
   that turns it on; a Node's status says its policy, so the scheduler does not place on a node
   what it would refuse, and `kith get nodes` shows it;
-- where `execUnits`, `vmPaths` and `run` are all off, kithd is to cut its bounding set
-  at start (not built yet: T-0590) to what it and its containers use: the fourteen of a root pod
-  (`container.rs`, `ROOTS`, with `SETPCAP`, `SETFCAP`, `FSETID`, `SYS_CHROOT` and
-  `AUDIT_WRITE` among them) and its own (`SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`,
-  `SYS_BOOT`, `SYS_RESOURCE`, `BPF`); found exactly by the VM tests with a root pod, an
-  unconfined unit and a nested unit, and never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`
-  or `SYS_TIME`;
+- where `execUnits`, `vmPaths` and `run` are all off (each a way to have the node start a
+  process as its root with every capability), kithd cuts its bounding set at start,
+  before its runtime or any thread but the first process's console and power-button
+  readers (a thread keeps the set it was made with), to what it and its containers use:
+  the fourteen of a root pod (`container.rs`, `ROOTS`: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`,
+  `FSETID`, `KILL`, `SETGID`, `SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`,
+  `SYS_CHROOT`, `MKNOD`, `AUDIT_WRITE`, `SETFCAP`) and its own (`SYS_ADMIN` for mounts,
+  namespaces, cgroups and the loop and mapper devices; `NET_ADMIN` for links, routes and
+  nftables; `SYS_BOOT` to power off; `SYS_RESOURCE` for limits; `BPF` for the cgroup
+  filters). The list is `KEPT` in `policy.rs`, each with its reason: nineteen, and
+  `ci/vm.sh --test policy` (a root pod, an unconfined unit and a nested unit, two nodes
+  on the mesh, each reading its own `CapBnd`) passes with them; one more joins it only
+  when that test fails for want of it. Never `SYS_MODULE`,
+  `SYS_RAWIO`, `SYS_PTRACE` or `SYS_TIME`, nor any other the kernel has: a hole in kithd,
+  or a stolen certificate, is root on that node without them, and without the rest of
+  the list as well (no loading a module, no raw access to memory or ports, no tracing a
+  process, no setting the clock, no `SYS_NICE`, `NET_BROADCAST`, `IPC_LOCK`, `LINUX_IMMUTABLE`,
+  `AUDIT_CONTROL`, `MAC_*`, `SYSLOG`, `WAKE_ALARM`, `PERFMON`, `CHECKPOINT_RESTORE`...).
+  The node's status says what it kept (`status.policy.capabilities`; `all` where it was
+  not cut, which includes a kithd that is not root). A kithd that cannot cut as root
+  does not start;
 - no system call filter on the single process. The filter is the serving part's.
 
-Built so far: the keys and their refusals, the Node's status, and the scheduler reading
-it (a label of its own making for each key a node allows, required of what asks for it).
-Not yet: the bounding set and the installer's question. Until then a hardened node holds
-every capability.
+Built so far: the keys and their refusals, the Node's status, the scheduler reading
+it (a label of its own making for each key a node allows, required of what asks for it)
+and the bounding set. Not yet: the installer's question.
+
+An update is taken by a node that has cut: `KITH_NODE_POLICY=no-exec-units,no-vm-paths,no-run
+sh ci/vm.sh --test rollout` runs the release test with the nodes so started, which is
+the smallest honest way to show it (an update inside `--test policy` would build and sign
+a second image, and double its length).
 
 What Step A buys by itself: a certificate of the cluster that is stolen, or a hole in
 the store, is no longer root on a node whose owner said so. A hole in a parser is still

@@ -172,10 +172,14 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
                     keys.len() <= 16
                         && keys.iter().all(|(key, value)| match value {
                             Value::Bool(_) => key.len() <= 32,
-                            Value::Array(classes) => {
-                                key == "devices"
-                                    && classes.len() <= 8
-                                    && classes.iter().all(|c| c.as_str().is_some_and(|c| c.len() <= 16))
+                            // (The classes of Device, or the capabilities it holds, by name.)
+                            Value::Array(names) => {
+                                let most = match key.as_str() {
+                                    "devices" => 8,
+                                    "capabilities" => 64,
+                                    _ => 0,
+                                };
+                                names.len() <= most && names.iter().all(|c| c.as_str().is_some_and(|c| c.len() <= 24))
                             }
                             _ => false,
                         })
@@ -733,12 +737,18 @@ spec: { volume: there, every: 1d }
         assert!(try_as(&store, "w-b", theirs).is_err());
         // Its own policy, as a node says it; nothing else under that name, and not another node's.
         let policy = |said: Value| patch_of("Node/w", json!({ "policy": said }));
-        for said in [json!({ "run": false, "vms": true, "devices": ["gpu"] }), Value::Null] {
+        for said in [
+            json!({ "run": false, "vms": true, "devices": ["gpu"] }),
+            json!({ "run": false, "capabilities": ["CHOWN", "SYS_ADMIN"] }),
+            Value::Null,
+        ] {
             assert!(try_as(&store, "w", policy(said.clone())).is_ok(), "{said}");
         }
         for said in [
             json!({ "run": "no" }),
             json!({ "devices": [1] }),
+            json!({ "devices": vec!["gpu"; 9] }),
+            json!({ "capabilities": [1] }),
             json!({ "other": ["gpu"] }),
             json!("hardened"),
         ] {

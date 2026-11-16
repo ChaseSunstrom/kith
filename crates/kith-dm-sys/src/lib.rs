@@ -292,6 +292,17 @@ pub fn netns_cookie() -> Result<u64> {
     }
 }
 
+/// `prctl(PR_CAPBSET_DROP, cap)`: takes capability number `cap` out of the bounding set of
+/// the calling thread (and so of what it starts afterwards). The set is per thread: a thread
+/// made before this keeps its own. Needs CAP_SETPCAP.
+pub fn bounding_drop(cap: u32) -> Result<()> {
+    // SAFETY: PR_CAPBSET_DROP takes the capability number and reads no memory.
+    if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, libc::c_ulong::from(cap), 0, 0, 0) } < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Makes the part of this program that is written only while it starts (the addresses set
 /// right at its start: tables of functions, the table of its own addresses) read-only, as the
 /// loader of a program that is not static does. A static program of musl's sets those addresses

@@ -32,6 +32,9 @@
 #                               in turn losing power, then all at once; what was acknowledged is on all three
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept
+#   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
+#                               cut its bounding set, and a pod that is root, a container with no filter
+#                               and a sandbox inside a container still run
 #
 # Nothing needs root, and the VM never writes to a disk image: it runs `-snapshot`
 # (writes go to a temporary file), and a path under /dev is refused. Where there is no
@@ -176,7 +179,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    kept, and the one n2 let through while it was cut off is refused
                    when it reaches the leader, which decided again; needs what
                    --test rollout needs
-  --help           this text
+  --test policy    instead: two nodes on the mesh started with --node-policy
+                   no-exec-units,no-vm-paths,no-run. Expected: each says what it
+                   kept of the bounding set (never SYS_MODULE, SYS_RAWIO,
+                   SYS_PTRACE or SYS_TIME), kithd's own CapBnd agrees, and a pod
+                   that is root, a container with no system call filter and a
+                   sandbox inside a container (bubblewrap) all run; needs what
+                   --test pods needs, less socat
+  --help          this text
 
 Without --initrd it builds kithd for x86_64-unknown-linux-musl (with zig as the C
 compiler when there is no musl-gcc: ci/musl.sh) and needs cpio and zstd.
@@ -198,7 +208,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos | access) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos, access" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos | access | policy) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos, access, policy" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -234,7 +244,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = policy ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -243,6 +253,8 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
+        fi
+        if [ "$test" = pods ] || [ "$test" = policy ]; then
             bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
         fi
         [ "$time" -gt 60 ] || time=900
@@ -254,7 +266,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         # worker: two, on the mesh; services: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os https=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
         # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
@@ -262,6 +274,9 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
         [ "$test" != worker ] || inside=80
+        # (policy: no way left to be root with all of the kernel's capabilities, so kithd gives up the rest.
+        # QEMU reads a comma in -smbios as the end of a value, so each one here is doubled.)
+        [ "$test" != policy ] || more='--mesh --node-policy no-exec-units,,no-vm-paths,,no-run'
         # A container image the nodes have without asking anybody (they reach no registry
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
@@ -288,7 +303,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 for tag in serve again; do
                     printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
                 done
-                if [ "$test" = pods ]; then
+                if [ "$test" = pods ] || [ "$test" = policy ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
                     # pod, for a user who is not root: a sandbox started inside a container.
                     digest=$(printf sandbox | sha256sum | cut -d ' ' -f 1)
@@ -332,6 +347,9 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         public=$("$root/target/debug/kith" package keygen "$work/key")
         KITH_RELEASE_KEY=$public sh "$root/os/build.sh" --out "$work/base" >&2
         base=$work/base lan=--lan-releases
+        # (KITH_NODE_POLICY: the nodes' policy, so that an update is taken by nodes that have
+        # cut their bounding set: no-exec-units,no-vm-paths,no-run.)
+        [ -z "${KITH_NODE_POLICY:-}" ] || lan="$lan --node-policy $(printf '%s' "$KITH_NODE_POLICY" | sed 's/,/,,/g')"
         # Two releases, both signed: one that runs, and one whose root is not the one its
         # verity tree was made for. The nodes fetch them from this machine.
         KITH_OS_VERSION=9.0.0-next sh "$root/os/build.sh" --out "$work/next" >&2
@@ -1014,6 +1032,84 @@ EOF
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: two nodes on the mesh and three pods of one Workload on them, each with an address of its own on the mesh and its IPv4 one from its node's range (the second node's from --pod-range, the first's the default; a pod on each said which at its node's DNS), each listening on port 80 as root and writing to its root; a pod of a user who is not root found their Service by its short name and by its Kubernetes one at the node's DNS, was answered by all three through it, reached this machine from behind its node's address, and wrote what it heard to /dev/stdout by name; $stock; a pod that is root made /dev/null again and read it, and could neither make nor read its node's disk; a container that asked for user namespaces started a sandbox of its own in it (bubblewrap: a user namespace, with a /proc and a /dev made in it), one that did not ask started none, and one that is the node's root was not started; a keyboard plugged in while a container held the seat was one more node it could open, and gone from it when pulled, with nothing started again; an app that was a client of the seat was answered on the socket the seat's session listened on in the seat's directory and could make no file there, and one of another user was not let in; a pod past its limit on what it writes, one past it with a file it removed and held open, and one filling its node's state disk past the reserve, were replaced, said why and started again from an empty root; the image of a Workload deleted went from its node once unused for its grace, and that of a running one stayed and its pods answered"
+            exit 0
+        fi
+        if [ "$test" = policy ]; then
+            # Two nodes whose policy turns off exec units, VM paths and /v1/run: nothing the
+            # store can ask starts a process as the node's root with every capability, so kithd
+            # cut its bounding set at start (README, SECURITY.md). All else is allowed, and
+            # what is allowed still runs: a pod that is root, a container with no filter on its
+            # system calls, and a sandbox inside a container.
+            held() { # each node: "NAME CAPABILITY CAPABILITY ..." as its own status says
+                any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    if r["kind"] == "Node":
+        print(r["metadata"]["name"], *((r.get("status") or {}).get("policy") or {}).get("capabilities", ["-"]))
+'
+            }
+            waited=0
+            until [ "$(held | grep -c '^n[0-9] [^-]')" = 2 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the two nodes did not both say what they hold: $(held)"
+                sleep 1
+            done
+            held >"$work/held"
+            echo "vm.sh: what the nodes hold: $(tr '\n' ';' <"$work/held")" >&2
+            for n in n1 n2; do
+                line=$(grep "^$n " "$work/held") || fail "the node $n did not say what it holds: $(cat "$work/held")"
+                case " $line " in *' all '*) fail "the node $n was not cut: $line" ;; esac
+                for forbidden in SYS_MODULE SYS_RAWIO SYS_PTRACE SYS_TIME; do
+                    case " $line " in *" $forbidden "*) fail "the node $n kept $forbidden: $line" ;; esac
+                done
+                case " $line " in *' SYS_ADMIN '*) ;; *) fail "the node $n says it kept nothing it needs: $line" ;; esac
+                # (And what the kernel says of kithd itself, which it said on its console once
+                # it had cut: no bit of SYS_MODULE (16), SYS_RAWIO (17), SYS_PTRACE (19) or SYS_TIME (25).)
+                bounding=$(grep -ao 'kithd: capability bounding set cut: CapBnd [0-9a-f]*' "$work/${n}.log" | tail -n 1) || fail "the node $n did not say its bounding set was cut"
+                bounding=${bounding##* }
+                python3 -c 'import sys; m = int(sys.argv[1], 16); sys.exit(any(m >> b & 1 for b in (16, 17, 19, 25)) or not m >> 21 & 1)' "$bounding" || fail "the bounding set of kithd on $n is $bounding"
+                echo "vm.sh: kithd on $n: CapBnd $bounding" >&2
+            done
+
+            # A Job of one container, on a node by a Volume of that node: NAME, the node, the container.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n1"},"spec":{"node":"n1","path":"pod"}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on-n2"},"spec":{"node":"n2","path":"pod"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the volumes that put a pod on each node were not applied"
+            job() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"box","volumeMounts":[{"volume":"on-$2","path":"/state"}],$3}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+                waited=0
+                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 180 ] || fail "waited for the Job $1; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$1" >"$work/$1.out" 2>/dev/null || true
+                any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
+                printf '%s\n' "$line" | grep -Eq '^[0-9]+ succeeded' || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
+            }
+            # A pod that is root, on the joined node.
+            job rooted n2 '"image":"kith.test/pod:1","command":["/bin/pod","tell"]'
+            grep -q 'tell: started uid 0 ' "$work/rooted.out" || fail "the pod that is root did not start as root: $(cat "$work/rooted.out" "$work/rooted.err")"
+            # A container with no filter on its system calls.
+            job open n1 '"image":"kith.test/pod:1","seccomp":{"unconfined":true},"command":["/bin/pod","tell"]'
+            grep -q 'tell: started uid 0 ' "$work/open.out" || fail "the container with no filter did not start: $(cat "$work/open.out" "$work/open.err")"
+            # A sandbox inside a container (bubblewrap, in a user namespace of its own).
+            job boxed n1 '"image":"kith.test/sandbox:1","userNamespaces":true,"command":["/bin/bwrap","--unshare-user","--uid","0","--gid","0","--unshare-pid","--ro-bind","/","/","--proc","/proc","--dev","/dev","/bin/pod","self"]'
+            grep -q 'nested: pid 2, uid 0' "$work/boxed.out" || fail "the sandbox did not say where it found itself: $(cat "$work/boxed.out" "$work/boxed.err")"
+
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: two nodes on the mesh whose policy turns off exec units, VM paths and /v1/run cut their bounding set (kithd's own CapBnd had none of SYS_MODULE, SYS_RAWIO, SYS_PTRACE or SYS_TIME, and each node's status named what it kept) and ran a pod that is root (on the joined node), a container with no filter on its system calls and a sandbox inside a container"
             exit 0
         fi
         if [ "$test" = kube ]; then
