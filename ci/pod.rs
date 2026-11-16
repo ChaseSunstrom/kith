@@ -398,15 +398,32 @@ fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
             let at_fdcwd = -100i64 as u64;
             how(syscall(469, [at_fdcwd, name.as_ptr() as u64, attr.as_ptr() as u64, 24, 0]))
         }
-        // statfs(2): of a project's directory, its limit and what it holds.
-        "#" => {
+        // statfs(2): of a project's directory, its limit and what it holds, in bytes ("#") or
+        // in files ("%").
+        "#" | "%" => {
             let mut fs = [0u64; 15];
             let got = syscall(137, [name.as_ptr() as u64, fs.as_mut_ptr() as u64, 0, 0, 0]);
             if got < 0 {
                 return how(got);
             }
             let block = fs[1];
-            format!("size {} used {} free {}", fs[2] * block, (fs[2] - fs[3]) * block, fs[3] * block)
+            match op {
+                "#" => format!("size {} used {} free {}", fs[2] * block, (fs[2] - fs[3]) * block, fs[3] * block),
+                _ => format!("files {} held {}", fs[5], fs[5] - fs[6]),
+            }
+        }
+        // Empty files in a directory (made first), up to that many: how many, and why no more.
+        "*" => {
+            if let Err(e) = std::fs::create_dir_all(a) {
+                return e.to_string();
+            }
+            let most: u64 = b.parse().expect("how many files");
+            for made in 0..most {
+                if let Err(e) = std::fs::File::create(format!("{a}/{made}")) {
+                    return format!("made {made}, then: {e}");
+                }
+            }
+            format!("made {most}")
         }
         "s" => {
             std::thread::sleep(Duration::from_secs(a.parse().expect("seconds")));

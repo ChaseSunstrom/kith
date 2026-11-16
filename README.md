@@ -509,7 +509,10 @@ spec:
   root) the limit is held at the write instead: each pod is a project of its own, a write
   past its limit fails (EDQUOT), in its root (a copy-up of an image's file too) and its
   scratch, with the node's users or its own; only what kithd itself writes there is
-  counted (SECURITY.md); its units say it reached it, and kithd says at start and
+  counted (SECURITY.md); with its bytes a pod gets its share of the disk's files (the
+  share its limit is of the disk's bytes, 4096 at least), and a new file past it fails
+  the same way: one of very many small files needs a larger `storage`; its units say it
+  reached it, and kithd says at start and
   in the Node's status which way it holds limits. Elsewhere it is counted, not held at
   the write: between two counts a fast writer
   can pass it, a removed file held only by a descriptor in flight on a socket counts
@@ -594,7 +597,8 @@ spec:
   kithd listen on that port of each of the node's IPv4 addresses and pass each connection
   or datagram to the pod; the replies go back the same way, not through the tunnel. The
   pod of a node that has a port keeps it; another of the same namespace waits for it to
-  go (kithd's log says so), and one of another namespace is refused when applied. A pod
+  go (kithd's log says so), and one of another namespace is refused when applied; the
+  node remembers whose each port is, kithd started again or not. A pod
   publishes 8 ports at most, a node 64. `publish` works for any pod, not only an exit's. The app is reached at the
   pod's own address, so it must listen on all of them (`0.0.0.0`), not on 127.0.0.1
   alone, and sees each client as that address, not the client's. No port below 1024 is

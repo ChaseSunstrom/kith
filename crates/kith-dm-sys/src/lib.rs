@@ -184,19 +184,22 @@ pub fn projects_held(on: &Path) -> bool {
 /// two times, and which of them are meant.
 const DQBLK: usize = 72;
 
-/// What sets a project's limit on space to `bytes` (none, for 0), and on nothing else.
-fn limit_request(bytes: u64) -> [u8; DQBLK] {
+/// What sets a project's limits on space to `bytes` and on files to `files` (none, for 0),
+/// and on nothing else.
+fn limit_request(bytes: u64, files: u64) -> [u8; DQBLK] {
     let mut request = [0u8; DQBLK];
     request[0..8].copy_from_slice(&bytes.div_ceil(1024).to_ne_bytes());
-    // QIF_BLIMITS
-    request[64..68].copy_from_slice(&1u32.to_ne_bytes());
+    request[24..32].copy_from_slice(&files.to_ne_bytes());
+    // QIF_BLIMITS | QIF_ILIMITS
+    request[64..68].copy_from_slice(&5u32.to_ne_bytes());
     request
 }
 
-/// Hold project `id` on the file system `on` is on to `bytes` of it (0: no limit).
-pub fn set_project_limit(on: &Path, id: u32, bytes: u64) -> Result<()> {
+/// Hold project `id` on the file system `on` is on to `bytes` of it and to `files` files
+/// (0: no limit), both in one call.
+pub fn set_project_limit(on: &Path, id: u32, bytes: u64, files: u64) -> Result<()> {
     // Q_SETQUOTA
-    quota(on, 0x80_0008, id, &mut limit_request(bytes))
+    quota(on, 0x80_0008, id, &mut limit_request(bytes, files))
 }
 
 /// The bytes and files project `id` holds of the file system `on` is on: as the kernel
@@ -209,12 +212,14 @@ pub fn project_usage(on: &Path, id: u32) -> Result<(u64, u64)> {
     Ok((at(16), at(40)))
 }
 
-/// The limit project `id` is held to on the file system `on` is on, in bytes (0: none).
-pub fn project_limit(on: &Path, id: u32) -> Result<u64> {
+/// The limits project `id` is held to on the file system `on` is on, in bytes and in files
+/// (0: none).
+pub fn project_limit(on: &Path, id: u32) -> Result<(u64, u64)> {
     let mut answer = [0u8; DQBLK];
     // Q_GETQUOTA
     quota(on, 0x80_0007, id, &mut answer)?;
-    Ok(u64::from_ne_bytes(answer[0..8].try_into().unwrap()).saturating_mul(1024))
+    let at = |from: usize| u64::from_ne_bytes(answer[from..from + 8].try_into().unwrap());
+    Ok((at(0).saturating_mul(1024), at(24)))
 }
 
 /// Tell the kernel that partition `number` (from 1) of `disk`, which starts at byte `start`,
@@ -777,15 +782,18 @@ mod tests {
         assert!(grow(Path::new("/nowhere/at/all"), 1).is_err());
     }
 
-    /// A project's limit is asked for in whole KiB, rounded up, and as a limit on space alone.
+    /// A project's limits are asked for in whole KiB, rounded up, and in files, as hard
+    /// limits on space and on files alone (no soft limit, no use, no time).
     #[test]
     fn project_limits_are_laid_out_as_the_kernel_reads_them() {
-        let request = limit_request(64 << 20);
+        let request = limit_request(64 << 20, 8192);
         assert_eq!(request[0..8], (64u64 << 10).to_ne_bytes());
-        assert_eq!(request[8..64], [0; 56]);
-        assert_eq!(request[64..68], 1u32.to_ne_bytes());
-        assert_eq!(limit_request(1)[0..8], 1u64.to_ne_bytes());
-        assert_eq!(limit_request(0)[0..8], 0u64.to_ne_bytes());
+        assert_eq!(request[8..24], [0; 16]);
+        assert_eq!(request[24..32], 8192u64.to_ne_bytes());
+        assert_eq!(request[32..64], [0; 32]);
+        assert_eq!(request[64..68], 5u32.to_ne_bytes());
+        assert_eq!(limit_request(1, 0)[0..8], 1u64.to_ne_bytes());
+        assert_eq!(limit_request(0, 0)[0..8], 0u64.to_ne_bytes());
     }
 
     /// What keeps no projects says so: no limit is set or read there, and none is held.
@@ -795,7 +803,7 @@ mod tests {
         for on in [proc, nowhere] {
             assert!(!projects_held(on), "{on:?}");
             assert!(project(on).is_err() && set_project(on, 7, true).is_err(), "{on:?}");
-            assert!(set_project_limit(on, 7, 1 << 20).is_err() && project_usage(on, 7).is_err());
+            assert!(set_project_limit(on, 7, 1 << 20, 4096).is_err() && project_usage(on, 7).is_err());
         }
         // (Never through a link: what it points at is not the directory named.)
         let dir = std::env::temp_dir().join(format!("kith-project-{}", std::process::id()));
@@ -822,14 +830,17 @@ mod tests {
         assert_eq!(project(&dir).unwrap(), (4243, false));
         set_project(&dir, 4242, true).unwrap();
         assert_eq!(project(&dir).unwrap(), (4242, true));
-        set_project_limit(&dir, 4242, 1 << 20).unwrap();
+        set_project_limit(&dir, 4242, 1 << 20, 3).unwrap();
+        assert_eq!(project_limit(&dir, 4242).unwrap(), (1 << 20, 3));
         std::fs::write(dir.join("some"), vec![1u8; 64 << 10]).unwrap();
         File::open(dir.join("some")).unwrap().sync_all().unwrap();
         let (bytes, files) = project_usage(&dir, 4242).unwrap();
         assert!(bytes >= 64 << 10 && files >= 2, "{bytes} {files}");
         assert!(std::fs::write(dir.join("more"), vec![1u8; 2 << 20]).is_err());
+        // (The directory, and two files made: its three. No fourth is.)
+        assert!(File::create(dir.join("fourth")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
-        set_project_limit(&on, 4242, 0).unwrap();
+        set_project_limit(&on, 4242, 0, 0).unwrap();
     }
 
     /// Ids that are not its own are mapped by root alone, and a mapped mount of nothing,
