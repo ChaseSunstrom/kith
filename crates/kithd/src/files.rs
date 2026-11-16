@@ -155,7 +155,7 @@ pub fn sweep(bases: &[&Path], keep: &BTreeSet<String>) {
                     if id != 0
                         && kith_dm_sys::project_usage(base, id).is_ok_and(|(bytes, files)| bytes + files == 0) =>
                 {
-                    let _ = kith_dm_sys::set_project_limit(base, id, 0);
+                    let _ = kith_dm_sys::set_project_limit(base, id, 0, 0);
                 }
                 Ok(()) => {}
             }

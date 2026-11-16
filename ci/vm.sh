@@ -157,7 +157,10 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    own limit, not that one's; a pod of 64 MiB writing 200 MiB
                    is stopped at its limit by the kernel, in its root, its scratch
                    and a file it removed and holds open, and is not replaced, while
-                   one beside it loses no write; a pod with the node's users is
+                   one beside it loses no write; a pod of 64 MiB making empty files
+                   is stopped at the files its limit lets it (its share of the
+                   disk's, 4096 at least) and says so, while one beside it makes
+                   all of its own; a pod with the node's users is
                    stopped in its root too, and in both kinds a file of the image
                    copied up near the limit is refused whole, the file unchanged;
                    a pod cannot move its files out of
@@ -1254,6 +1257,33 @@ EOF
             gone Workload unlinked
             ok unlinked
 
+            # A pod of 64 MiB making empty files, beside one making 100: the first is stopped at
+            # the files its limit lets it on this disk (its share of the disk's files, 4096 at
+            # least), as statfs of its root says them; the one beside it makes all of its own;
+            # and the first's status says it holds them all, in files.
+            quota Workload many "$storage" '*/many:1000000' '%/'
+            quota Workload few "$storage" '*/few:100'
+            done_ Workload many
+            done_ Workload few
+            got=$(result many '*/many:1000000')
+            made=$(printf '%s\n' "$got" | sed -n 's/^made \([0-9]*\), then: .* (os error 122)$/\1/p')
+            [ -n "$made" ] && [ "$made" -ge 1 ] || fail "many: making files said \"$got\": not stopped at the kernel's quota"
+            got=$(result many '%/')
+            most=$(printf '%s\n' "$got" | sed -n 's/^files \([0-9]*\) held [0-9]*$/\1/p')
+            [ -n "$most" ] && [ "$most" -ge 4096 ] && [ "$made" -le "$most" ] && [ "$got" = "files $most held $most" ] \
+                || fail "many: it made $made files, and statfs of its root said \"$got\": not held at a file limit of 4096 or more"
+            expect few '*/few:100' 'made 100' "a pod beside one at its file limit made no file"
+            waited=0
+            until line=$(units Workload many) && printf '%s\n' "$line" | grep -Eq 'reached its storage limit: its pod holds [0-9]+ files outside its volumes'; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "many's status does not say it holds all its files: $line"
+                sleep 1
+            done
+            gone Workload many
+            gone Workload few
+            echo "vm.sh: files: stopped after $made files made, at the $most its 64 MiB let it; $line" >&2
+            ok files
+
             # The root of a pod with the node's users (a NodeWorkload's): its overlay was mounted
             # by the node's root with every capability, CAP_SYS_RESOURCE too, which lets a writer
             # past a project's hard limit. The kernel leaves that one out of the credentials an
@@ -1346,7 +1376,7 @@ EOF
             gone Workload image
             ok image
 
-            for case in said again write scratch unlinked nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image; do
+            for case in said again write scratch unlinked files nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image; do
                 grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
             done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"

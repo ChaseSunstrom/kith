@@ -238,9 +238,16 @@ Only the newest version is fixed. There are no security releases of older ones.
   node with many clients of its API or ingress besides can still run out. A port another
   namespace's Workload or Job publishes is refused at apply, and on a node the pod that
   has a port keeps it while it asks, another pod of its namespace after it, so one
-  namespace's pod never takes another's; where pods of two namespaces ask for a port no
-  pod has (one written through the log, by a Release or Source, is not asked at apply, and
-  a node that starts again has none), none of them has it.
+  namespace's pod never takes another's. The node keeps which namespace has each port in
+  a file of its own (`published.json` in its state, not the store), and holds the port to
+  that namespace for as long as a Workload or Job of it asks for the port: across a restart
+  of kithd, and while the pod that had it is made again, a pod of another namespace that
+  asks for it (one written through the log, by a Release or Source, is not asked at apply)
+  neither takes it nor stops it, and kithd's log says it was refused. After a restart
+  nothing is let go until the node's store is as new as it was. Where pods of two
+  namespaces ask for a port the node has kept for neither (a first start, a file that
+  cannot be read, a node whose state is new), none of them has it. Whoever can write the
+  node's state can write that file, as they can everything else of the node's.
 - **The Kubernetes API** (`/api`, `/apis`) is behind the same layer as `/v1`. A request
   is checked as the kith kind and namespace it comes to, by the Roles of the
   certificate's Identity; a write is asked for before anything is said of what is
@@ -544,8 +551,18 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   system call refusal applies to every container. A state disk from before has no project
   quotas and is counted as before. A pod whose scratch held files from before projects is
   counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
-  a pod's own directories hold). The quota holds bytes, not files: there is no limit on
-  how many files a pod makes (T-0605), and each costs the disk an inode. **Stopped at the
+  a pod's own directories hold). The quota holds files too: a pod with
+  `resources.storage` may make its share of the state disk's files (inodes), the same
+  share its limit is of the disk's bytes, and 4096 at least, set in the same call as its
+  bytes; a new file past it fails (EDQUOT) and its units say it holds them all. So pods
+  whose limits fit the disk cannot together take every file of it (where a share is under
+  4096 the floor is more than the share, and enough such pods can). A pod of very many
+  small files gets more with a larger `storage`: there is no field for files alone. **Not
+  held in files:** a pod with no `resources.storage` (it has no limit of either kind, and
+  is replaced only when the disk runs low on bytes), a pod on a state disk without
+  project quotas, and an unconfined pod that moved its files out of its project (the 10 s
+  count is of bytes); a pod started by a kithd from before this keeps a project with no
+  file limit until one of its containers is started again. **Stopped at the
   limit:** every write a pod's own processes make outside its Volumes: a new file or an
   append in its container's root, a file of its image copied up to be changed (refused
   whole, the image's file left as it was), its disk scratch, and a file it removed and

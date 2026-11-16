@@ -1777,6 +1777,8 @@ impl Controller {
                     finished: true,
                     again: false,
                     held: held && !unconfined,
+                    files: 0,
+                    most: 0,
                 };
                 (pod, roots, cgroups)
             })
@@ -1796,8 +1798,8 @@ impl Controller {
                     // is counted.
                     let usage = pod.held.then(|| storage::Projects::usage(&state, &pod.id)).flatten();
                     pod.held = usage.is_some();
-                    if let Some(bytes) = usage {
-                        pod.bytes = bytes;
+                    if let Some((bytes, files, most)) = usage {
+                        (pod.bytes, pod.files, pod.most) = (bytes, files, most);
                         return pod;
                     }
                     let until = storage::Until {
