@@ -363,10 +363,10 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   and a pod's that keeps them has fourteen.
   A user namespace is also more of the kernel to get wrong: a flaw in its code is a way
   out that a container without one did not have. The root of a container's namespace
-  owns, in its id-mapped volumes, what the node's root owns there, as before. One of the fourteen makes device nodes (in a pod that keeps
-  the node's users: in a namespace of its own the kernel makes it none); the device
-  filter on the pod's cgroup is what keeps it from the node's disks. Containers that are not pods
-  share the node's network, and an
+  owns, in its id-mapped volumes, what the node's root owns there, as before. One of the
+  fourteen makes device nodes (in a pod that keeps the node's users: in a namespace of its
+  own the kernel makes it none); the device filter on the pod's cgroup is what keeps it
+  from the node's disks. Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.

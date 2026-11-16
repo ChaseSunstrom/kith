@@ -329,9 +329,10 @@ spec:
   namespace alone, and a `runAsUser` of 65536 or more is refused. Its image and its
   volumes are mounted id-mapped: a file its user 1000 makes is user 1000's on the disk, as
   before, and no owner on the disk is changed to fit its range. Id-mapped mounts are
-  Linux 5.12's (btrfs's 5.15, tmpfs's 6.3; kith OS's own kernel, 6.18, has them all); a kernel or file system that refuses one
-  fails the container's start rather than run it as the node's users. Any port of the pod's own
-  network is anyone's in it, so its root still serves port 80. The rest keep the node's
+  Linux 5.12's (btrfs's 5.15, tmpfs's 6.3; kith OS's own kernel, 6.18, has them all); a
+  kernel or file system that refuses one fails the container's start rather than run it as
+  the node's users. Any port of the pod's own network is anyone's in it, so its root still
+  serves port 80. The rest keep the node's
   users, so that `runAsUser: 0` is the node's root with three capabilities (to send
   signals, to take a port below 1024, to write the audit log): a container on the node's
   network (a port it serves is below 1024 as often as not, and no capability of a user
@@ -1990,8 +1991,8 @@ spec:
   write, not to make a second node of); all else is refused. So a pod that is root there
   and keeps the node's users (one given devices, say), which has the capability to make
   device nodes, makes none for its node's disk and opens none; one in a user namespace of
-  its own makes no device node at all, as below. (A pod that made a node for itself before, `/dev/net/tun` or `/dev/fuse`, is
-  refused now: write a `Device` for the node, `class: other` with its `path`, and claim
+  its own makes no device node at all, as below. (A pod that made a node for itself
+  before, `/dev/net/tun` or `/dev/fuse`, is refused now: write a `Device` for the node, `class: other` with its `path`, and claim
   it.) A container whose device filter cannot be loaded is not started. Where kithd is
   your own service there is no filter and none is needed: a container there is in a user
   namespace, where the kernel lets no one make a device node, and it has the nodes in its
