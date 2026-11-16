@@ -1016,11 +1016,28 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   console takes no key then); sent to a node's port by whoever has it, it is a wipe
   of a running node as well: the node erases its record and powers off.
   **Forgotten is not gone from every disk.** The cluster stops handing the key out
-  and drops it from the NodeKey, which can no longer be rolled back; the store still
-  keeps the NodeKey's earlier versions (up to 100), and the cluster's log and its
-  backups keep what was written: whoever reads a control node's state or a backup
-  finds the node's key there, wrapped under the secret that was on the erased disk,
-  which opens nothing without a copy of that disk. A change to a NodeKey made in the
+  and drops it from the NodeKey, which can no longer be rolled back. The store keeps no
+  earlier versions of a NodeKey, and every control node, as it applies the write that
+  dropped the key, snapshots the store and drops its Raft log up to that write: the key
+  is then in no control node's snapshot (`snapshot.json`) or log entry. A node that was
+  off does so as it catches up; a leader drops its log once no node it sends to still
+  reads that part, and asks again until then. A node stopped between the snapshot and
+  the drop drops its log as it starts, and a write the cluster refused that carried a
+  NodeKey (in its log as sent) is dropped the same way: whoever may apply NodeKeys can
+  so make every control node snapshot as often as they write, with no limit but that
+  permission. A store kept before this held earlier versions too: a control node cuts
+  them as it starts on this version or takes such a store in (a snapshot sent to it, an
+  import), and drops its log if that still holds a key the store does not. Each log
+  dropped this way is said on kithd's standard error, with the log's index and the
+  NodeKey (a cut of earlier versions alone says nothing). What stays: on a node that
+  came from before the store was replicated, `store.json.imported` in its state, the
+  store as it was then, every NodeKey of that day in it (remove the file; T-0614); a backup or a copy of a
+  control node's state taken before (kith's own backups are of Volumes and hold no
+  store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
+  hears of the change, and on a control node's disk the freed pages of the log file and
+  the blocks of the snapshot it replaced, until something writes over them. Whoever
+  reads those finds the node's key, wrapped under the secret that was on the erased
+  disk, which opens nothing without a copy of that disk. A change to a NodeKey made in the
   same moment (`kith node lock`, a new code) can write the key back for the length
   of one write: it is forgotten again and the change refused, and a waiting node that
   is handed its key after a code tells the cluster again.
