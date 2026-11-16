@@ -1471,6 +1471,13 @@ node's input devices while no session holds them.
   and a stick whose GPT copies the node's ESP GUID passes, so the check is only as strong
   as that GUID's secrecy. A kernel started without systemd-boot has no such variable: init
   goes on, and says so. The rest of that area is in the review doc.
+- Fixed: install answers over plain http could be changed by anyone on the LAN (the
+  disk, the join token and address, `releaseKey`; review 2 installer M2). A
+  `kith.install` URL over plain `http` is now taken only with the answers' SHA-256 in
+  its fragment (`#sha256=`). Without one the installer refuses before it fetches, and
+  answers that do not hash to the pin are refused naming both digests. https is as it
+  was (T-0648).
+
 - Dependencies: checked against the RustSec advisory database with `cargo audit` on
   2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
   fixed by moving to 0.4.4. One warning is ignored in `.cargo/audit.toml`, with the reason

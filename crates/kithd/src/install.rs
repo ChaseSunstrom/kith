@@ -3,8 +3,9 @@
 //! has it, see os/build.sh): kithd, as the first process, serves nothing and instead
 //!
 //! 1. lists the machine's disks, never the one it was started from;
-//! 2. takes answers: from the URL after `kith.install=`, else from `kith-install.yaml` on
-//!    the installer's ESP, else from whoever sits at the console;
+//! 2. takes answers: from the URL after `kith.install=` (over plain http only with its
+//!    SHA-256 pinned in the fragment), else from `kith-install.yaml` on the installer's
+//!    ESP, else from whoever sits at the console;
 //! 3. copies the image the installer carries (its `payload` partition) to the chosen
 //!    disk, reads it back, and writes what it was told of the node (hostname, address,
 //!    kithd's arguments) into the new disk's `config` partition, which `init` reads at
@@ -23,6 +24,7 @@
 // the disk, which makes both right (`gpt`).
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
@@ -553,8 +555,53 @@ pub async fn run(source: String) -> ! {
     }
 }
 
+/// The pin in a URL of answers: `#sha256=` and the SHA-256 of the answers, 64 hex digits in
+/// either case. Returns the address to fetch (the URL before its fragment) and the pin in
+/// lower case. Plain http needs a pin: anyone on its path could change the answers.
+fn pinned(url: &str) -> Result<(&str, Option<String>), String> {
+    let (address, fragment) = match url.split_once('#') {
+        Some((address, fragment)) => (address, Some(fragment)),
+        None => (url, None),
+    };
+    if !address.starts_with("http://") && !address.starts_with("https://") {
+        return Err(format!("{address} is not an http or https address"));
+    }
+    let pin = match fragment {
+        Some(fragment) => {
+            let digest = fragment
+                .strip_prefix("sha256=")
+                .filter(|digest| digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            Some(
+                digest
+                    .ok_or_else(|| format!("the pin of {address} is not `#sha256=` and 64 hex digits"))?
+                    .to_ascii_lowercase(),
+            )
+        }
+        None if address.starts_with("http://") => {
+            return Err(format!(
+                "{address} is plain http with no pin: add `#sha256=` and the answers' digest (`sha256sum FILE`), or use https"
+            ));
+        }
+        None => None,
+    };
+    Ok((address, pin))
+}
+
+/// The answers must be the ones pinned: a refusal names both digests.
+fn verified(pin: &str, answers: &[u8]) -> Result<(), String> {
+    let got = crate::pki::hex(&Sha256::digest(answers));
+    if got == pin {
+        return Ok(());
+    }
+    Err(format!(
+        "the answers hash to {got}, not the {pin} their URL pins: refused"
+    ))
+}
+
 /// The answers at `url`. The network may take a moment to be there.
 async fn fetched(url: &str) -> Result<String, String> {
+    // (Refused before any connection: an unpinned http answer is never fetched.)
+    let (address, pin) = pinned(url)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -564,7 +611,7 @@ async fn fetched(url: &str) -> Result<String, String> {
     for _ in 0..12 {
         // (No more of it is taken than answers can be: this machine has only its memory.)
         let got = async {
-            let mut from = client.get(url).send().await?.error_for_status()?;
+            let mut from = client.get(address).send().await?.error_for_status()?;
             let mut text = Vec::new();
             while let Some(more) = from.chunk().await? {
                 text.extend_from_slice(&more);
@@ -575,13 +622,19 @@ async fn fetched(url: &str) -> Result<String, String> {
             Ok::<_, reqwest::Error>(text)
         };
         match got.await {
-            Ok(text) if text.len() <= 64 << 10 => return Ok(String::from_utf8_lossy(&text).into_owned()),
-            Ok(_) => return Err(format!("{url} is too long to be answers")),
+            Ok(text) if text.len() <= 64 << 10 => {
+                // (Checked as they came, before any text is made of them; a changed answer is refused, not asked for again.)
+                if let Some(pin) = &pin {
+                    verified(pin, &text)?;
+                }
+                return Ok(String::from_utf8_lossy(&text).into_owned());
+            }
+            Ok(_) => return Err(format!("{address} is too long to be answers")),
             Err(e) => last = e.to_string(),
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
-    Err(format!("no answers from {url}: {last}"))
+    Err(format!("no answers from {address}: {last}"))
 }
 
 #[cfg(test)]
@@ -885,5 +938,54 @@ mod tests {
                 .contains("no partition table")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn answers_are_pinned_by_the_sha256_in_their_url() {
+        let yaml = b"disk: sda\n";
+        let hash = crate::pki::hex(&Sha256::digest(yaml));
+        // What is fetched is the address before the fragment; the pin is the digest of the answers.
+        let url = format!("http://10.0.2.2/alpha.yaml#sha256={hash}");
+        let (address, pin) = pinned(&url).unwrap();
+        assert_eq!(
+            (address, pin.as_deref()),
+            ("http://10.0.2.2/alpha.yaml", Some(hash.as_str()))
+        );
+        // Upper-case digits name the same digest; https needs no pin and is taken as it was.
+        let (_, upper) = pinned(&format!("https://files.example/a.yaml#sha256={}", hash.to_uppercase())).unwrap();
+        assert_eq!(upper.as_deref(), Some(hash.as_str()));
+        assert_eq!(
+            pinned("https://files.example/a.yaml").unwrap(),
+            ("https://files.example/a.yaml", None)
+        );
+        // Plain http with no pin is refused, and the refusal says how to pin.
+        assert!(pinned("http://10.0.2.2/alpha.yaml").unwrap_err().contains("#sha256="));
+        // A pin that is not `sha256=` and 64 hex digits, and an address that is not http(s), are refused.
+        for bad in [
+            format!("https://files.example/a.yaml#sha256={}", &hash[..63]),
+            format!("https://files.example/a.yaml#sha256={hash}0"),
+            format!("https://files.example/a.yaml#sha256={}g", &hash[..63]),
+            format!("https://files.example/a.yaml#md5={}", &hash[..32]),
+            format!("https://files.example/a.yaml#{hash}"),
+            "https://files.example/a.yaml#".to_string(),
+            format!("https://files.example/a.yaml#sha256={hash}#more"),
+            format!("ftp://files.example/a.yaml#sha256={hash}"),
+        ] {
+            assert!(pinned(&bad).is_err(), "{bad} is refused");
+        }
+        // The answers must hash to the pin; a refusal names both hashes.
+        assert!(verified(&hash, yaml).is_ok());
+        let other = b"disk: nvme0n1\n";
+        let refused = verified(&hash, other).unwrap_err();
+        assert!(refused.contains(&hash) && refused.contains(&crate::pki::hex(&Sha256::digest(other))));
+    }
+
+    #[tokio::test]
+    async fn unpinned_http_answers_are_refused_before_any_fetch() {
+        // Nothing listens on this port: a fetch would retry for a minute, not return at once.
+        let started = std::time::Instant::now();
+        let why = fetched("http://127.0.0.1:9/alpha.yaml").await.unwrap_err();
+        assert!(why.contains("#sha256="), "{why}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

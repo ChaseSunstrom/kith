@@ -418,3 +418,36 @@ fn readme_shows_the_language_as_it_is() {
         "README.md lists a builtin there is not"
     );
 }
+
+/// Install answers over plain http are pinned by their sha256: the README shows the pin
+/// and how to make it, SECURITY.md says the installer refuses without one, and the review
+/// says M2 is fixed by the tests that hold it.
+#[test]
+fn readme_shows_the_install_pin_and_the_review_says_m2_is_fixed() {
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let readme = flat(README);
+    for said in [
+        "kith.install=http://10.0.2.2/alpha.yaml#sha256=",
+        "`sha256sum alpha.yaml`",
+        "refuses plain `http`",
+    ] {
+        assert!(readme.contains(said), "README.md install text does not say {said:?}");
+    }
+    let security = flat(&std::fs::read_to_string(root().join("SECURITY.md")).unwrap());
+    assert!(
+        security.contains("`kith.install` URL over plain `http`") && security.contains("(T-0648)"),
+        "SECURITY.md does not say the installer's answers over plain http are pinned (T-0648)"
+    );
+    let review = std::fs::read_to_string(root().join("docs/security-review-2.md")).unwrap();
+    let m2 = review
+        .split("\n- M2 Install answers")
+        .nth(1)
+        .expect("docs/security-review-2.md: the installer's M2")
+        .split("\n- ")
+        .next()
+        .unwrap_or_default();
+    assert!(
+        m2.contains("fixed: ") && m2.contains("(T-0648)"),
+        "docs/security-review-2.md does not say M2 is fixed (T-0648):\n{m2}"
+    );
+}
