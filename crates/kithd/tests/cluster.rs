@@ -585,7 +585,34 @@ fn forgotten_key_is_on_no_control_nodes_disk() {
             node.dir.display()
         );
         assert!(store_holds(node, &again), "{}", node.dir.display());
+        // And no file of its state holds them, whatever kithd keeps there (the imported
+        // store was such a file once): each read whole, as bytes.
+        let held = files_holding(&node.dir.join("state"), &[&first, &second]);
+        assert!(held.is_empty(), "a forgotten key is still in {held:?}");
+        // (The walk reads what is there: the key the cluster holds again is found.)
+        assert!(
+            !files_holding(&node.dir.join("state"), &[&again]).is_empty(),
+            "{}",
+            node.dir.display()
+        );
     }
+}
+
+/// The files under `dir` whose bytes hold one of `texts`.
+fn files_holding(dir: &Path, texts: &[&str]) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            found.extend(files_holding(&path, texts));
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            let holds = |text: &&str| bytes.windows(text.len()).any(|part| part == text.as_bytes());
+            if texts.iter().any(holds) {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 #[test]
