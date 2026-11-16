@@ -24,6 +24,8 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
+#   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
+#                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
 #                               for Kubernetes; what they make runs, rolls out, keeps its data and is waited for
 #   sh ci/vm.sh --test worker   two nodes, one a worker: it runs what is placed on it with its Secret, its
@@ -145,6 +147,21 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    kithd passes its bytes; on the node's own network, the kernel
                    sends its connections straight to the pod. Needs rustc for
                    x86_64-unknown-linux-musl
+  --test quota     instead: one node as for services, its state disk made with project
+                   quotas (as os/build.sh makes it). Expected: kithd says it holds
+                   pods' storage limits at the write; a pod of 64Ki removed and the
+                   node started again, the pod given its id after it is held to its
+                   own limit, not that one's; a pod of 64 MiB writing 200 MiB
+                   is stopped at its limit by the kernel, in its root, its scratch
+                   and a file it removed and holds open, and is not replaced, while
+                   one beside it loses no write; a pod with the node's users is
+                   stopped in its root too, and in both kinds a file of the image
+                   copied up near the limit is refused whole, the file unchanged;
+                   a pod cannot move its files out of
+                   its project (in a user namespace the kernel refuses, as the node's
+                   root its filter does; unconfined it can, and is counted and
+                   replaced); what it changes of its image is charged to it. Needs
+                   rustc for x86_64-unknown-linux-musl, and socat
   --test kube      instead: two nodes as for pods, and kubectl (KITH_KUBECTL, or the
                    one on PATH) and helm (KITH_HELM, several with colons between, or
                    the one on PATH) asking the first as the cluster's admin: the
@@ -212,7 +229,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos | access | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos, access, tunnel" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | quota | kube | worker | chaos | access | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, quota, kube, worker, chaos, access, tunnel" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -248,13 +265,14 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = tunnel ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = tunnel ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
         kubectl=${KITH_KUBECTL:-$(command -v kubectl || true)}
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
+        [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
             bwrap=$(command -v bwrap) || skip "no bwrap (bubblewrap) to start a sandbox inside a container with"
@@ -272,12 +290,15 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         fail() { tail -n 30 "$work"/n?.log || true; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
-        # worker: two, on the mesh; services: one, on the mesh.)
+        # worker: two, on the mesh; services and quota: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = tunnel ]; then
-        others=2 more=--mesh
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = tunnel ]; then
+        others=2 more=--mesh project=''
         [ "$test" != services ] || others=''
+        # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
+        # as a node's state from before had none: kithd counts what their pods write.)
+        [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
         # (tunnel: one node, whose card out reaches nothing but this machine's forwards, to
         # its API and to its pod's web port published on it; and what both its cards carry,
         # kept. The UDP port published is asked from the node's LAN by ci/lan_probe.py: QEMU's
@@ -320,6 +341,16 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 for tag in serve again; do
                     printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
                 done
+                if [ "$test" = quota ]; then
+                    # (quota: files of the image that a pod's root is made of, for it to change:
+                    # one larger than its limit, others to rename over and to link. Not zeros,
+                    # which mkfs keeps no blocks for.)
+                    mkdir -p "$image/rootfs/data" "$image/rootfs/tree"
+                    head -c 12582912 /dev/urandom >"$image/rootfs/big"
+                    head -c 1048576 /dev/urandom >"$image/rootfs/data/small"
+                    head -c 1048576 /dev/urandom >"$image/rootfs/data/other"
+                    echo leaf >"$image/rootfs/tree/leaf"
+                fi
                 if [ "$test" = pods ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
                     # pod, for a user who is not root: a sandbox started inside a container.
@@ -350,12 +381,13 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 fi
                 sfdisk -l -o Start,Sectors,Name "$1" | awk '$3 == "state" { print $1, $2 }' >"$work/state.at"
                 read -r state_start state_sectors <"$work/state.at"
-                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 "$work/state.img" "$((state_sectors / 2))k" >&2
+                mkfs.ext4 -q -d "$work/seed" -E root_owner=0:0 $project "$work/state.img" "$((state_sectors / 2))k" >&2
             fi
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
             # (Room for an image that is pulled: the state grows to the disk's end at the first start.)
-            case $test${KITH_E2E:-} in pods1 | kube1) truncate -s 2G "$1" ;; esac
+            # (quota: room for what its pods write.)
+            case $test${KITH_E2E:-} in pods1 | kube1 | quota*) truncate -s 2G "$1" ;; esac
         }
       elif [ "$test" = rollout ]; then
         # The nodes run an image built with the release key: the first release they take
@@ -989,8 +1021,302 @@ EOF
                 fi
                 checked="$checked${checked:+; }$job: ${said#check: }, reached $reached"
             done
+            # (Its state disk has no project quotas, as a node's from before: kithd says it counts.)
+            grep -aq "kithd: pods' storage limits are held by a count every 10 s of what each pod wrote" "$work/n1.log" \
+                || fail "kithd did not say it counts what pods write on a state disk with no project quotas: $(grep -a 'storage limits' "$work/n1.log")"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
+            exit 0
+        fi
+        if [ "$test" = quota ]; then
+            # Each case that held says `quota: ok: CASE`; at the end every one must have.
+            : >"$work/oks"
+            ok() { echo "quota: ok: $1"; echo "$1" >>"$work/oks"; }
+            # KIND NAME MORE STEP ...: a pod that runs `pod quota STEP ...` (ci/pod.rs), MORE more
+            # of its container; what it said is in $work/NAME.out once it is done.
+            quota() {
+                kind=$1 name=$2 extra=$3
+                shift 3
+                steps=$(printf '"%s",' "$@")
+                spec='"replicas":1,'
+                [ "$kind" = Workload ] || spec='"selector":{},'
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"$kind","metadata":{"name":"$name"},"spec":{$spec"template":{"pod":true,"containers":[
+  {"name":"quota","image":"kith.test/pod:1","command":["/bin/pod","quota",${steps%,}]$extra}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the $kind $name was not applied"
+            }
+            done_() { # KIND NAME: wait for it to have said all it does
+                waited=0
+                until grep -q 'quota: done' "$work/$2.out" 2>/dev/null; do
+                    for replica in 0 1 2 3; do
+                        any GET "/v1/logs/$1/default/$2?replica=$replica" >"$work/$2.out" 2>/dev/null && grep -q 'quota: done' "$work/$2.out" && break
+                    done
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for the $1 $2 to be done; it says: $(units "$1" "$2"): $(cat "$work/$2.out" 2>/dev/null)"
+                    sleep 1
+                done
+            }
+            gone() { api 1 DELETE "/v1/resources/$1/default/$2" >/dev/null || fail "the $1 $2 was not deleted"; }
+            # What NAME said of STEP (its log comes as JSON: the lines are in its strings).
+            result() {
+                python3 -c '
+import json, sys
+def strings(v):
+    if isinstance(v, str):
+        yield v
+    for x in (v.values() if isinstance(v, dict) else v if isinstance(v, list) else []):
+        yield from strings(x)
+try:
+    log = json.load(open(sys.argv[1]))
+except ValueError:
+    sys.exit(1)
+said = [l[len(sys.argv[2]) + 1:] for s in strings(log) for l in s.splitlines() if l.startswith(sys.argv[2] + " ")]
+print(said[-1] if said else "nothing", end="")
+' "$work/$1.out" "quota: $2"
+            }
+            expect() { # NAME STEP PATTERN (grep -E, all of what it said) WHAT-IT-SHOWS
+                got=$(result "$1" "$2")
+                printf '%s\n' "$got" | grep -Eqx "$3" || fail "$1: $2 said \"$got\": $4"
+            }
+            stopped() { # NAME STEP LIMIT: the write failed at the kernel's quota, at most LIMIT in
+                got=$(result "$1" "$2")
+                wrote=$(printf '%s\n' "$got" | sed -n 's/^failed after \([0-9]*\): .* (os error 122)$/\1/p')
+                [ -n "$wrote" ] && [ "$wrote" -le "$3" ] || fail "$1: $2 said \"$got\": not stopped at the write at its limit of $3 bytes"
+            }
+            used() { # NAME STEP LIMIT: statfs of its project's directory says its limit, and no more used
+                got=$(result "$1" "$2")
+                case $got in "size $3 used "*) ;; *) fail "$1: $2 said \"$got\": its project's limit is not $3" ;; esac
+                got=${got#size $3 used }
+                [ "${got%% *}" -le "$3" ] || fail "$1: $2 holds ${got%% *} bytes, past its limit of $3"
+            }
+            free() { # NAME: what the state disk has free, as a pod with a Volume there sees it
+                quota Workload "$1" ',"volumeMounts":[{"volume":"free","path":"/free"}]' '#/free'
+                done_ Workload "$1"
+                gone Workload "$1"
+                got=$(result "$1" '#/free')
+                printf '%s\n' "${got##* }" | grep -Eqx '[0-9]+' || fail "$1: #/free said \"$got\""
+                echo "${got##* }"
+            }
+
+            # kithd says once how it holds pods' limits, and the Node says it too.
+            grep -aq "kithd: pods' storage limits are held at the write, by the state disk's project quota" "$work/n1.log" \
+                || fail "kithd did not say it holds pods' storage limits at the write: $(grep -a 'storage limits' "$work/n1.log")"
+            waited=0
+            until storage=$(any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    if r["kind"] == "Node" and r["metadata"]["name"] == "n1":
+        print(((r.get("status") or {}).get("os") or {}).get("storage", ""), end="")
+') && [ -n "$storage" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Node n1 did not say how it holds pods' storage limits"
+                sleep 1
+            done
+            [ "$storage" = "at the write, by the state disk's project quota" ] || fail "the Node n1 says its pods' limits are held $storage"
+            ok said
+
+            # An id given again: a pod of 64Ki (the first given a project, so the lowest id) runs
+            # and is removed; kithd starts again, and gives the next pod the lowest id with nothing
+            # in it, the same. That pod, whose image and scratch it changes are past 64Ki, starts
+            # and is held to its own limit, not the one before.
+            # What this does not show: that the stale limit is cleared. kithd sets a project's
+            # limit before anything is put in it, but kithd is root with CAP_SYS_RESOURCE, and
+            # the kernel lets such a writer past a hard limit (dquot.c, ignore_hardlimit): with
+            # the 64Ki left on the id, the pod's start passes all the same. (Run against a kithd
+            # that left it, this case held too.) It shows an id given again, and its new limit.
+            quota Workload tiny ',"resources":{"storage":"64Ki"}' '?/' '+/fill:131072'
+            done_ Workload tiny
+            stopped tiny '+/fill:131072' 65536
+            was=$(result tiny '?/')
+            printf '%s\n' "$was" | grep -Eqx 'project [1-9][0-9]*' || fail "tiny: its root is in no project of its own: $was"
+            gone Workload tiny
+            # (Its replica directory goes at kithd's next pass once its unit has; a kithd that
+            # starts with it there gives ids past it.)
+            waited=0
+            while [ -n "$(units Workload tiny)" ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the Workload tiny was not removed: $(units Workload tiny)"
+                sleep 1
+            done
+            sleep 10
+            # Started again as a machine is when its power button is pressed: kithd stops, and
+            # the node comes back up from its disk.
+            echo 'sendkey ctrl-alt-delete' | socat - "unix-connect:$work/keys1" >/dev/null || fail "QEMU's monitor of n1 did not answer"
+            waited=0
+            until [ "$(grep -ac "kithd: pods' storage limits are held at the write" "$work/n1.log")" -ge 2 ] && any GET /v1/resources >/dev/null 2>&1; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "n1 did not start again holding pods' limits at the write: $(grep -a 'storage limits\|reboot:' "$work/n1.log")"
+                sleep 1
+            done
+            grep -aq 'reboot: Restarting system' "$work/n1.log" || fail "n1 did not restart: its console says no 'reboot: Restarting system'"
+            quota Workload again ',"resources":{"storage":"64Mi"},"volumeMounts":[{"scratch":"work","path":"/work"}]' '?/' '^/big' '+/work/fill:1048576' '+/fill:209715200' '#/'
+            done_ Workload again
+            expect again '?/' "$was" "the pod after kithd started again was not given the removed pod's id, so no id was given again"
+            expect again '^/big' ok "a file of its image past the last limit of its id was not copied up"
+            expect again '+/work/fill:1048576' 'wrote 1048576' "its scratch was held to the last limit of its id"
+            stopped again '+/fill:209715200' 67108864
+            used again '#/' 67108864
+            waited=0
+            until line=$(units Workload again) && [ "${line%% *}" = 1 ]; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the Workload again is not ready: $line"
+                sleep 1
+            done
+            gone Workload again
+            echo "vm.sh: again: $was given again after kithd started again; held to 64 MiB, not 64Ki" >&2
+            ok again
+
+            # A pod of 64 MiB writing 200 MiB, in its root and then its scratch, beside one writing
+            # 32 MiB: the first is stopped at the write, the second loses none, and the disk loses
+            # no more than both their limits let them (and 4 MiB of kithd's own). It is in a user
+            # namespace of its own (a Workload's pod, with a network of its own), so its root's
+            # overlay was mounted by that namespace's root; its scratch it writes itself.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"free"},"spec":{"node":"n1","path":"free"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Volume free was not applied"
+            limit=67108864 storage=',"resources":{"storage":"64Mi"}'
+            for case in write scratch; do
+                to=/fill more=$storage
+                [ "$case" = write ] || { to=/work/fill more="$storage,\"volumeMounts\":[{\"scratch\":\"work\",\"path\":\"/work\"}]"; }
+                before=$(free "before-$case")
+                quota Workload "big-$case" "$more" '@' "+$to:209715200" "#${to%/fill}/"
+                quota Workload "small-$case" "$more" "+$to:33554432"
+                done_ Workload "big-$case"
+                done_ Workload "small-$case"
+                after=$(free "after-$case")
+                expect "big-$case" '@' '0 [1-9][0-9]* [0-9]+' "a Workload's pod with a network of its own has the node's users"
+                stopped "big-$case" "+$to:209715200" "$limit"
+                used "big-$case" "#${to%/fill}/" "$limit"
+                expect "small-$case" "+$to:33554432" 'wrote 33554432' "a pod beside one at its limit lost a write"
+                [ $((before - after)) -le $((limit + 33554432 + 4194304)) ] || fail "$case: the state disk lost $((before - after)) bytes to two pods of 64 MiB, one writing 32 MiB"
+                # Its status says it holds all it may, and it is not replaced for it.
+                waited=0
+                until line=$(units Workload "big-$case") && printf '%s\n' "$line" | grep -q 'reached its storage limit'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 60 ] || fail "big-$case's status does not say it reached its storage limit: $line"
+                    sleep 1
+                done
+                sleep 12
+                any GET "/v1/logs/Workload/default/big-$case?replica=0" >"$work/big-$case.out" 2>/dev/null || true
+                [ "$(grep -o 'quota: done' "$work/big-$case.out" | wc -l)" = 1 ] || fail "big-$case was started again: $(cat "$work/big-$case.out")"
+                ! grep -aq 'replaced: its pod wrote' "$work/n1.log" || fail "a pod held to its limit was replaced: $(grep -a 'replaced: its pod wrote' "$work/n1.log")"
+                gone Workload "big-$case"
+                gone Workload "small-$case"
+                echo "vm.sh: $case: stopped at $wrote bytes of 200 MiB; the disk lost $((before - after)) bytes; $line" >&2
+                ok "$case"
+            done
+
+            # A file it removed and holds open, with no name to find: charged all the same.
+            quota Workload unlinked "$storage" "~/fill:209715200"
+            done_ Workload unlinked
+            stopped unlinked "~/fill:209715200" "$limit"
+            gone Workload unlinked
+            ok unlinked
+
+            # The root of a pod with the node's users (a NodeWorkload's): its overlay was mounted
+            # by the node's root with every capability, CAP_SYS_RESOURCE too, which lets a writer
+            # past a project's hard limit. The kernel leaves that one out of the credentials an
+            # overlay writes its upper layer with (fs/overlayfs/super.c, "Never override disk
+            # quota limits"), so it is held all the same: a new file past its limit, and, in both
+            # kinds of pod, a file of its image copied up near its limit (12 MiB with 8 of 16
+            # written), refused whole and left as the image has it.
+            quota NodeWorkload nodewrite "$storage" '@' '+/fill:209715200' '#/'
+            copy=',"resources":{"storage":"16Mi"}'
+            quota Workload copyup "$copy" '+/pad:8388608' '^/big' '=/big' '+/fill:16777216' '#/'
+            quota NodeWorkload nodecopyup "$copy" '@' '+/pad:8388608' '^/big' '=/big' '+/fill:16777216' '#/'
+            done_ NodeWorkload nodewrite
+            expect nodewrite '@' '0 0 4294967295' "a NodeWorkload's pod does not have the node's users"
+            stopped nodewrite '+/fill:209715200' "$limit"
+            used nodewrite '#/' "$limit"
+            echo "vm.sh: nodewrite: the node's root stopped at $wrote bytes of 200 MiB in its root" >&2
+            gone NodeWorkload nodewrite
+            ok nodewrite
+            for name in copyup nodecopyup; do
+                kind=Workload
+                [ "$name" = copyup ] || kind=NodeWorkload
+                done_ "$kind" "$name"
+                [ "$kind" = Workload ] || expect "$name" '@' '0 0 4294967295' "a NodeWorkload's pod does not have the node's users"
+                expect "$name" '+/pad:8388608' 'wrote 8388608' "a pod of 16 MiB could not write 8 MiB"
+                expect "$name" '^/big' '.* \(os error 122\)' "a file of its image of 12 MiB was copied up with 8 MiB of 16 written"
+                expect "$name" '=/big' 'size 12582912' "a copy-up refused at its limit changed the file of its image"
+                stopped "$name" '+/fill:16777216' 16777216
+                used "$name" '#/' 16777216
+                echo "vm.sh: $name: the copy-up of 12 MiB failed: $(result "$name" '^/big'); /big $(result "$name" '=/big'); then stopped at $wrote" >&2
+                gone "$kind" "$name"
+                ok "$name"
+            done
+
+            # Moving its files out of its project: in a user namespace the kernel refuses; as the
+            # node's root (a NodeWorkload's pod) its filter does; unconfined nothing does, and
+            # what it then writes is counted, and it is replaced for it.
+            quota Workload userns '' '+/esc:1' '0/esc' '!/esc' '?/esc'
+            quota NodeWorkload noderoot '' '+/esc:1' '0/esc' '!/esc' '?/esc'
+            done_ Workload userns
+            done_ NodeWorkload noderoot
+            for step in 0/esc '!/esc'; do
+                expect userns "$step" '.* \(os error 22\)' "a pod in a user namespace moved its file out of its project"
+                expect noderoot "$step" '.* \(os error 1\)' "a pod as the node's root moved its file out of its project"
+            done
+            expect userns '?/esc' 'project [1-9][0-9]*' "its file is not in its pod's project"
+            expect noderoot '?/esc' 'project [1-9][0-9]*' "its file is not in its pod's project"
+            gone Workload userns
+            gone NodeWorkload noderoot
+            ok userns
+            ok noderoot
+            quota NodeWorkload unconfined "$storage,\"seccomp\":{\"unconfined\":true}" '+/esc:1' '0/esc' '?/esc' '+/esc:104857600'
+            done_ NodeWorkload unconfined
+            expect unconfined 0/esc ok "an unconfined pod as the node's root could not move its file out of its project"
+            expect unconfined '?/esc' 'project 0' "an unconfined pod's file stayed in its project"
+            expect unconfined '+/esc:104857600' 'wrote 104857600' "a file out of its project took less than it wrote"
+            waited=0
+            until grep -aq 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 67108864' "$work/n1.log"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "an unconfined pod that wrote past its limit out of its project was not replaced"
+                sleep 1
+            done
+            gone NodeWorkload unconfined
+            ok unconfined
+
+            # Its file linked and renamed to elsewhere: another file system (its Volume; another
+            # pod's root is not in its).
+            quota Workload elsewhere ',"volumeMounts":[{"volume":"free","path":"/free"}]' '+/mine:1' '&/mine:/free/linked' '>/mine:/free/moved'
+            done_ Workload elsewhere
+            expect elsewhere '&/mine:/free/linked' '.* \(os error 18\)' "a pod linked a file of its root into a Volume"
+            expect elsewhere '>/mine:/free/moved' '.* \(os error 18\)' "a pod moved a file of its root into a Volume"
+            gone Workload elsewhere
+            ok elsewhere
+
+            # What it changes of its image is charged to it: a file of its image larger than its
+            # limit, appended to; a directory renamed; a file renamed over one; one linked; one
+            # removed; then it fills the rest.
+            quota Workload image ',"resources":{"storage":"8Mi"}' '?/' '^/big' '>/tree:/moved' '+/new:1048576' '>/new:/data/small' '?/data/small' '&/data/other:/linked' '?/linked' '-/big' '+/fill:16777216' '#/'
+            done_ Workload image
+            its=$(result image '?/')
+            expect image '?/' 'project [1-9][0-9]*' "its root is in no project of its own"
+            expect image '^/big' '.* \(os error 122\)' "a file of its image larger than its limit was copied up whole"
+            expect image '>/tree:/moved' 'ok|.* \(os error 18\)' "a directory of its image renamed"
+            expect image '>/new:/data/small' ok "a file renamed over one of its image"
+            expect image '?/data/small' "$its" "a file renamed over one of its image left its project"
+            expect image '&/data/other:/linked' ok "a file of its image linked"
+            expect image '?/linked' "$its" "a file of its image linked is not charged to it"
+            expect image '-/big' ok "a file of its image removed"
+            stopped image '+/fill:16777216' 8388608
+            used image '#/' 8388608
+            gone Workload image
+            ok image
+
+            for case in said again write scratch unlinked nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image; do
+                grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
+            done
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; a pod with the node's users was stopped in its root too, and in both kinds a file of the image copied up near the limit was refused whole and left unchanged; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
             exit 0
         fi
         if [ "$test" = pods ]; then
@@ -2260,7 +2586,7 @@ disk.seek(at["state"] + 1080)
 state = "plain" if disk.read(2) == b"\x53\xef" else "sealed"
 disk.seek(at["config"] + (512 << 10))
 record = disk.read(4096)
-print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
+print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"\nkey: " in record else "held", *["tpm"] * (b"\ntpm: " in record), *["tpm-parent"] * (b"\ntpm-parent: " in record), *["tpm-pin"] * (b"\ntpm-pin: " in record), *["passphrase"] * (b"\npassphrase: " in record), *["seen"] * (b"\nseen: yes\n" in record), *["duress"] * (b"\nduress: " in record))' "$1"
                 }
                 lock() { api POST "/v1/lock/kith-000902?do=$1"; }
                 up() { # LOG: the machine's state is open and it serves
@@ -2276,9 +2602,10 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                 if [ -n "$sealing" ]; then
                     tpm=''
                     mkdir "$work/tpm"
-                    own() { # LOG [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept)
-                        machine=$1
+                    own() { # LOG [away] [more of QEMU's arguments]: the machine from its disk, with its TPM (the same at every start: its state is kept); away: without its card, so no node is in reach
+                        machine=$1 card=1
                         shift
+                        [ "${1:-}" != away ] || { card='' && shift; }
                         [ -z "$tpm" ] || kill "$tpm" 2>/dev/null || true
                         rm -f "$work/tpm.sock"
                         swtpm socket --tpm2 --tpmstate "dir=$work/tpm" --ctrl "type=unixio,path=$work/tpm.sock" >/dev/null 2>&1 &
@@ -2290,8 +2617,9 @@ print(state, "none" if not record.startswith(b"kith-lock v1\n") else "key" if b"
                             [ "$tries" -lt 50 ] || fail "swtpm did not start"
                             sleep 0.1
                         done
+                        [ -n "$card" ] || set -- -nic none "$@"
+                        [ -z "$card" ] || set -- -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac" "$@"
                         vm "$machine" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
-                            -netdev "socket,id=n,connect=127.0.0.1:$((port + 8))" -device "virtio-net-pci,netdev=n,mac=$mac" \
                             -chardev "socket,id=tpmc,path=$work/tpm.sock" -tpmdev emulator,id=tpm0,chardev=tpmc -device tpm-tis,tpmdev=tpm0 "$@"
                     }
                     off() { # the machine's power cut
@@ -2391,7 +2719,78 @@ with open(sys.argv[1], "r+b") as disk:
                     told '"sealed": *false'
                     off
                     [ "$(says "$work/beta.disk")" = 'sealed held' ] || fail "the machine's disk, read from outside, once its seal was taken back: $(says "$work/beta.disk")"
-                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none"
+                    # A PIN, asked of the machine itself at its own address (no node passes one
+                    # on): refused unless the owner says this TPM is untried (swtpm's is: 3
+                    # wrong PINs, then one more every 1000 seconds, which 8 digits are enough
+                    # for). (Its second card has no ROM, so the firmware starts as before.)
+                    own beta9 -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 2))-10.0.2.15:7443" -device virtio-net-pci,netdev=u,romfile=
+                    up beta9
+                    pin=40917253
+                    api POST /v1/lock/kith-000902/pin -H 'Content-Type: application/json' -d "{\"pin\":\"$pin\",\"untried\":true}" | grep -qF 'ask node kith-000902 itself' || fail "a PIN was passed on by the other node"
+                    given() { # JSON: to the machine itself
+                        curl -s --max-time 60 --cacert "$work/ca.pem" --cert "$work/cert.pem" --key "$work/key.pem" --resolve "kith:$((port + 2)):127.0.0.1" \
+                            -X POST -H 'Content-Type: application/json' -d "$1" "https://kith:$((port + 2))/v1/lock/kith-000902/pin"
+                    }
+                    tries=0
+                    until said=$(given "{\"pin\":\"$pin\"}") && [ -n "$said" ]; do
+                        tries=$((tries + 1))
+                        [ "$tries" -lt 150 ] || fail "the machine does not answer at its own address"
+                        sleep 0.2
+                    done
+                    printf '%s' "$said" | grep -qF 'On hardware' || fail "a PIN was taken without the owner saying the TPM is untried: $said"
+                    given '{"pin":"4091","untried":true}' | grep -qF 'a PIN is 6 to 32 digits' || fail "a PIN of 4 digits was not refused"
+                    said=$(given "{\"pin\":\"$pin\",\"untried\":true}")
+                    printf '%s' "$said" | grep -q '"pin": *true' || fail "the machine took no PIN: $said"
+                    hears beta9 "this machine's TPM and its PIN open its state; its TPM alone no longer does"
+                    ! api GET /v1/resources | grep -qF "$pin" || fail "the PIN is in the store"
+                    off
+                    [ "$(says "$work/beta.disk")" = 'sealed held tpm-parent tpm-pin' ] || fail "the disk of the machine with a PIN, read from outside: $(says "$work/beta.disk")"
+                    ! grep -aqF "$pin" "$work/beta.disk" "$work/alpha.log" "$work/beta9.log" || fail "the PIN is on the machine's disk or was said by a node"
+                    # Away from its cluster it asks at its console: its PIN opens it.
+                    own pin1 away
+                    hears pin1 'Or type its PIN, or the recovery key, here: neither is shown'
+                    hears pin1 'still locked'
+                    ! grep -aqF 'state on' "$work/pin1.log" || fail "a machine away from its cluster opened its state before its PIN was typed"
+                    types() { printf '%s\n' "$2" | socat - "unix-connect:$work/$1.tty" >/dev/null; }
+                    types pin1 "$pin"
+                    hears pin1 'kithd: init: opened with its PIN'
+                    hears pin1 'kithd: init: state on /dev/dm-'
+                    off
+                    # Started again: a wrong PIN opens nothing and is counted, until the TPM
+                    # refuses every PIN, the right one too, and says for how long. (Setting
+                    # the PIN tried a wrong one; a TPM cut off after a PIN was used counts
+                    # one more: how many are left here is not known beforehand.)
+                    answered() { grep -acF -e "kithd: init: that does not open this node's state" -e 'kithd: init: the TPM refuses every PIN for now' "$work/$1.log" || true; }
+                    after() { # LOG N: the console answered more than N lines
+                        tries=0
+                        until [ "$(answered "$1")" -gt "$2" ]; do
+                            tries=$((tries + 1))
+                            [ "$tries" -lt 150 ] || fail "the console answered no more than $2 lines"
+                            sleep 0.2
+                        done
+                    }
+                    own pin2 away
+                    hears pin2 'Or type its PIN, or the recovery key, here: neither is shown'
+                    hears pin2 'still locked'
+                    wrong=0
+                    until grep -aqF 'the TPM refuses every PIN for now' "$work/pin2.log"; do
+                        [ "$wrong" -lt 4 ] || fail "the TPM refused no PIN after $wrong wrong ones"
+                        types pin2 40917250
+                        after pin2 "$wrong"
+                        wrong=$((wrong + 1))
+                    done
+                    types pin2 "$pin"
+                    after pin2 "$wrong"
+                    [ "$(grep -acF 'the TPM refuses every PIN for now' "$work/pin2.log")" -ge 2 ] || fail "the right PIN, typed while the TPM refused every PIN, was not refused"
+                    grep -aqF 'the next is taken within 1000 seconds' "$work/pin2.log" || fail "the console did not say when the TPM takes a PIN again"
+                    ! grep -aqF 'state on' "$work/pin2.log" || fail "a PIN opened the state while the TPM refused every PIN"
+                    # The recovery key opens it all the same, and no console showed a PIN.
+                    types pin2 "${recovery##* }"
+                    hears pin2 'kithd: init: opened with the recovery key'
+                    hears pin2 'kithd: init: state on /dev/dm-'
+                    ! grep -aqF -e "$pin" -e 40917250 "$work/pin1.log" "$work/pin2.log" || fail "the machine's console showed a PIN as it was typed"
+                    off
+                    echo "vm.sh: ok: a machine with its state encrypted, told to seal its key, said why not without a TPM; with one (swtpm) it sealed the key, and started again with no node asked; started with a word of its config partition changed, then with its boot file changed, then with a command line beside the boot file's, the TPM refused the key each time, the node was asked and the key sealed anew; locked, it dropped the seal, restarted and waited until unlocked, then sealed again; the seal taken back, its disk holds none; a PIN not passed on by the other node, given at its own address (once the owner said the TPM is untried), away from its cluster it opened with that PIN, then refused $wrong wrong ones until its TPM refused every PIN, the right one too, and the recovery key opened it all the same"
                     exit 0
                 fi
                 api GET /v1/resources/NodeKey/kith-000902 | grep -q '"wrapped"' || fail "the cluster holds no key for the machine"

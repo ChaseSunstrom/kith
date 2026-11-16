@@ -509,9 +509,37 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   starting a pod and making its rules (the rules come first; nothing shows the order
   holds under a kill), and names a pod's own resolver library cached before its exit
   changed.
-- **What a replica writes outside its Volumes is counted, not held at the write.** Its
-  containers' writable roots and its disk scratch share the node's state disk, with no
-  quota. kithd counts them about every 10 seconds (each pod with a `resources.storage`
+- **What a replica writes outside its Volumes is held at the write where the state disk
+  keeps project quotas, and counted elsewhere.** Its containers' writable roots and its
+  disk scratch share the node's state disk. Where the state disk keeps project quotas (a
+  kith OS state disk made since T-0598, mounted with `prjquota`, and kithd root), each pod
+  is given a project of its own, its limit set to its `resources.storage` before anything
+  is put in it, and its replica directory, scratch and roots in it: a write past
+  `resources.storage` fails at once (EDQUOT), and its units say it reached its limit.
+  kithd says at start, and in the Node's status, which way it holds limits. A pod cannot
+  move its files out of its project; an unconfined pod can, and is counted every 10 s as
+  before. A container that keeps the node's users can no longer change file flags or
+  projects (chattr, FS_IOC_SETFLAGS/FSSETXATTR, file_setattr fail with EPERM). The x32
+  system call refusal applies to every container. A state disk from before has no project
+  quotas and is counted as before. A pod whose scratch held files from before projects is
+  counted every 10 s until it is replaced. `resources.storage` must be at least 64Ki (what
+  a pod's own directories hold). The quota holds bytes, not files: there is no limit on
+  how many files a pod makes (T-0605), and each costs the disk an inode. **Stopped at the
+  limit:** every write a pod's own processes make outside its Volumes: a new file or an
+  append in its container's root, a file of its image copied up to be changed (refused
+  whole, the image's file left as it was), its disk scratch, and a file it removed and
+  holds open; in a pod with a user namespace of its own and in one with the node's users
+  alike. (The root is an overlay that libcontainer's first process mounts, as the node's
+  root with every capability for a pod with the node's users; the kernel leaves
+  CAP_SYS_RESOURCE out of the credentials an overlay writes with, so they are held too.
+  `sh ci/vm.sh --test quota` shows each.) **Only counted:** what kithd itself writes into
+  a pod's project (a new container's root directories: kithd is root, whose writes the
+  kernel lets past a hard limit: 64 KiB past the limit is let be, and further the pod is
+  replaced at the next count, about every 10 seconds, its project's usage read, not
+  walked), an unconfined pod's file moved out of its project, and a scratch from before
+  projects (both walked and replaced as on a disk with no quotas, below). A project id is given again once nothing on the disk is
+  left in it, its new limit set first. Elsewhere,
+  with no quota, kithd counts them about every 10 seconds (each pod with a `resources.storage`
   limit, and every pod while the disk has less than twice its reserve free) and replaces
   a replica past its limit, and, while the disk is under its reserve (`--storage-reserve`,
   5% of it and at most 1 GiB unless said where kithd is root, none where it is not), the
@@ -563,8 +591,7 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   one may end early at what the other took, for the next count to go on with. When the pod
   is gone its replica directory is removed whole, in one call that is none of the above: a
   stop does not cut it short, and it keeps a directory open for each level it is deep in, so
-  a chain of directories deeper than kithd may have files open is not removed by it. A limit held at
-  the write (an ext4 project quota on each root) is not done.
+  a chain of directories deeper than kithd may have files open is not removed by it.
 - **Whoever may apply a Volume and a Workload in a namespace reads and writes every
   file of that namespace's Volumes**, with `kith volume get` and `put` as with a workload
   that mounts them: an encrypted Volume's too, while it is open. A put's `size` bound
@@ -1081,6 +1108,41 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A node with a PIN** (`kith node pin NAME --untried-tpm`, off unless given; the line
+  `tpm-pin:` of its lock record) opens its state with its TPM and a PIN of 6 to 32 digits
+  typed at its console, and no longer by its TPM alone: its record holds a half of the key
+  sealed to the PCRs above (no guess counted) and a half the TPM gives only for the PIN,
+  counting each wrong one. Who opens what: the cluster's key still opens it, as before (a
+  PIN adds a way, it closes none), and so does the recovery key; a copy of the disk on
+  another machine opens by neither half. The guesses are bounded by the TPM, not by kith:
+  kithd refuses a PIN unless the TPM's lockout lets through at most one in a hundred of the
+  PINs of that length in a year (its M wrong ones at once, then one every I seconds). That
+  bound is for a PIN of random digits: a date, or 123456, is among the first guesses, so
+  choose the digits at random. Setting a PIN makes kithd take the TPM's lockout
+  authorization where it is empty (32 random bytes, kept in a file of its own in the
+  node's encrypted state and nowhere else), so that nobody else can forgive the count;
+  where someone else holds it, or the TPM refuses the one kithd keeps (a disk moved, a
+  state put back: kithd shows it to the TPM each time, and a refused one shuts the TPM's
+  lockout hierarchy for its recovery time), the PIN is refused. Setting a PIN again shows
+  the kept authorization to the TPM, and that forgives the wrong tries counted; it lets
+  nobody try the old PIN, which the new one replaces, and only whoever may apply the
+  node's NodeKey can set one. If that state is lost (a
+  wipe, or a duress code, which erases the record and with it the state's key), the file
+  can no longer be read, and only clearing the TPM in the firmware's settings gives the
+  lockout authorization back. Each setting of a PIN tries one wrong PIN, which the TPM
+  counts. The bound assumes the machine stays powered; whether a TPM counts a start after
+  a power cut as a wrong try is unchecked, on swtpm and on hardware. Anyone at the console
+  can type M wrong PINs and lock the PIN for a while; the console says so and when the
+  next is taken. After an update that moves the PCRs, the PIN opens nothing until it is
+  set again (a seal for the next system is not built: docs/adr-unlock.md, step 4); and a
+  node locked, then unlocked, has no PIN until it is set again. The PIN is asked of the node it is for alone, at its
+  own address over TLS or its own socket: unlike a passphrase, no node passes one on (a
+  relay would see it in plain), and a relayed PIN stays refused until the owner says
+  otherwise. It is kept by no node, the store or the audit log, nor shown as it is typed; kithd zeroes its own copies, not the
+  ones the HTTP and JSON layers made on the way. It has run against a software TPM only:
+  `--untried-tpm` is the owner saying so, until docs/adr-unlock.md's checklist has run on
+  that machine. It is a word, not a lock: whoever may apply a NodeKey at that node can
+  send the field.
 - **A running encrypted node has its key in memory.** The encryption keeps a disk
   that is off, or away from its cluster. While the node runs, the key of its state is
   in the kernel's memory (dm-crypt's) and in kithd's, for as long as it runs: kithd

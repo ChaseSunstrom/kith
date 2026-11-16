@@ -658,6 +658,8 @@ spec: {role: gone, subjects: [bob]}
             "/v1/volumes/default/a",
             "/v1/volumes/default/a/files/more",
             "/v1/lock/n1",
+            // (A PIN is asked of its node alone: docs/adr-unlock.md "Open".)
+            "/v1/lock/n2/pin",
             "/v1/backups/default/a",
             "/apis/logs/v1/x",
             "/ui/logs/x",

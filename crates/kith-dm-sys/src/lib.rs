@@ -1,7 +1,8 @@
 //! Device-mapper by ioctl (linux/dm-ioctl.h): what `dmsetup create` and `dmsetup remove`
 //! do, for a machine with no dmsetup. One mapping of one dm-crypt target. And two more
 //! things such a machine has no tool for: a file as a block device (`losetup`), and an ext4
-//! file system grown where it is mounted (`resize2fs`). And what has no tool anywhere but
+//! file system grown where it is mounted (`resize2fs`), and a directory's project held to a
+//! limit of its space (`chattr -p`, `setquota -P`). And what has no tool anywhere but
 //! a container runtime: the program a cgroup asks which devices its processes may open
 //! (`bpf(2)`), and a mount whose owners are seen through a user namespace
 //! (`mount_setattr(2)`), with such a namespace to see them through.
@@ -115,6 +116,105 @@ pub fn attach(file: &File) -> Result<(File, PathBuf)> {
 pub fn grow(mounted: &Path, blocks: u64) -> Result<()> {
     // EXT4_IOC_RESIZE_FS: _IOW('f', 16, __u64)
     ioctl(&File::open(mounted)?, 0x4008_6610, &mut blocks.to_ne_bytes()).map(drop)
+}
+
+/// `struct fsxattr`: flags, two sizes, the project (12 bytes in), one more size.
+const FSXATTR: usize = 28;
+/// FS_XFLAG_PROJINHERIT: what is made in a directory is of its project.
+const INHERIT: u32 = 0x200;
+
+/// The project of `dir` (ext4's, as `chattr -p` and `lsattr -p` know it), and whether
+/// what is made in it is of the project too.
+pub fn project(dir: &Path) -> Result<(u32, bool)> {
+    let mut attr = [0u8; FSXATTR];
+    // FS_IOC_FSGETXATTR: _IOR('X', 31, struct fsxattr)
+    ioctl(&opened(dir)?, 0x801c_581f, &mut attr)?;
+    let flags = u32::from_ne_bytes(attr[0..4].try_into().unwrap());
+    Ok((
+        u32::from_ne_bytes(attr[12..16].try_into().unwrap()),
+        flags & INHERIT != 0,
+    ))
+}
+
+/// Put the directory `dir` in project `id`, and with `inherit` what is made in it from now on
+/// too (what it holds already stays as it is). Root's alone to do, outside a user namespace,
+/// on a file system that keeps projects: elsewhere it is refused.
+pub fn set_project(dir: &Path, id: u32, inherit: bool) -> Result<()> {
+    let dir = opened(dir)?;
+    let mut attr = [0u8; FSXATTR];
+    ioctl(&dir, 0x801c_581f, &mut attr)?;
+    let flags = u32::from_ne_bytes(attr[0..4].try_into().unwrap());
+    let flags = if inherit { flags | INHERIT } else { flags & !INHERIT };
+    attr[0..4].copy_from_slice(&flags.to_ne_bytes());
+    attr[12..16].copy_from_slice(&id.to_ne_bytes());
+    // FS_IOC_FSSETXATTR: _IOW('X', 32, struct fsxattr)
+    ioctl(&dir, 0x401c_5820, &mut attr).map(drop)
+}
+
+/// A directory by itself: never what a link in its place points at.
+fn opened(dir: &Path) -> Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    File::options()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+}
+
+/// quotactl_fd(2) of a project on the file system `on` is on, with `bytes` as what it reads
+/// or writes (each command's own size, which the caller gives).
+fn quota(on: &Path, command: u32, id: u32, bytes: &mut [u8]) -> Result<()> {
+    // QCMD(command, PRJQUOTA)
+    let command = (command << 8) | 2;
+    let on = opened(on)?;
+    // SAFETY: the kernel reads and writes no more than the command's struct, which `bytes`
+    // is at least the size of, and which lives past the call.
+    let said = unsafe { libc::syscall(libc::SYS_quotactl_fd, on.as_raw_fd(), command, id, bytes.as_mut_ptr()) };
+    if said < 0 { Err(Error::last_os_error()) } else { Ok(()) }
+}
+
+/// Whether the file system `on` is on holds each project to its limit: it has projects, and
+/// is mounted to enforce them (ext4's `-O quota,project` and `prjquota`).
+pub fn projects_held(on: &Path) -> bool {
+    // Q_XGETQSTAT into `struct fs_quota_stat`, whose flags (2 bytes in) say FS_QUOTA_PDQ_ENFD.
+    let mut stat = [0u8; 128];
+    quota(on, 0x5805, 0, &mut stat).is_ok() && u16::from_ne_bytes([stat[2], stat[3]]) & 0x20 != 0
+}
+
+/// `struct if_dqblk`: limits and use of space (1 KiB blocks; use in bytes) and of files,
+/// two times, and which of them are meant.
+const DQBLK: usize = 72;
+
+/// What sets a project's limit on space to `bytes` (none, for 0), and on nothing else.
+fn limit_request(bytes: u64) -> [u8; DQBLK] {
+    let mut request = [0u8; DQBLK];
+    request[0..8].copy_from_slice(&bytes.div_ceil(1024).to_ne_bytes());
+    // QIF_BLIMITS
+    request[64..68].copy_from_slice(&1u32.to_ne_bytes());
+    request
+}
+
+/// Hold project `id` on the file system `on` is on to `bytes` of it (0: no limit).
+pub fn set_project_limit(on: &Path, id: u32, bytes: u64) -> Result<()> {
+    // Q_SETQUOTA
+    quota(on, 0x80_0008, id, &mut limit_request(bytes))
+}
+
+/// The bytes and files project `id` holds of the file system `on` is on: as the kernel
+/// counts them as they are written, with what is deleted but still open.
+pub fn project_usage(on: &Path, id: u32) -> Result<(u64, u64)> {
+    let mut answer = [0u8; DQBLK];
+    // Q_GETQUOTA
+    quota(on, 0x80_0007, id, &mut answer)?;
+    let at = |from: usize| u64::from_ne_bytes(answer[from..from + 8].try_into().unwrap());
+    Ok((at(16), at(40)))
+}
+
+/// The limit project `id` is held to on the file system `on` is on, in bytes (0: none).
+pub fn project_limit(on: &Path, id: u32) -> Result<u64> {
+    let mut answer = [0u8; DQBLK];
+    // Q_GETQUOTA
+    quota(on, 0x80_0007, id, &mut answer)?;
+    Ok(u64::from_ne_bytes(answer[0..8].try_into().unwrap()).saturating_mul(1024))
 }
 
 /// Tell the kernel that partition `number` (from 1) of `disk`, which starts at byte `start`,
@@ -664,6 +764,61 @@ mod tests {
     fn grow_refusals_are_errors() {
         assert!(grow(Path::new("/proc"), 1 << 20).is_err());
         assert!(grow(Path::new("/nowhere/at/all"), 1).is_err());
+    }
+
+    /// A project's limit is asked for in whole KiB, rounded up, and as a limit on space alone.
+    #[test]
+    fn project_limits_are_laid_out_as_the_kernel_reads_them() {
+        let request = limit_request(64 << 20);
+        assert_eq!(request[0..8], (64u64 << 10).to_ne_bytes());
+        assert_eq!(request[8..64], [0; 56]);
+        assert_eq!(request[64..68], 1u32.to_ne_bytes());
+        assert_eq!(limit_request(1)[0..8], 1u64.to_ne_bytes());
+        assert_eq!(limit_request(0)[0..8], 0u64.to_ne_bytes());
+    }
+
+    /// What keeps no projects says so: no limit is set or read there, and none is held.
+    #[test]
+    fn project_refusals_are_errors() {
+        let (proc, nowhere) = (Path::new("/proc"), Path::new("/nowhere/at/all"));
+        for on in [proc, nowhere] {
+            assert!(!projects_held(on), "{on:?}");
+            assert!(project(on).is_err() && set_project(on, 7, true).is_err(), "{on:?}");
+            assert!(set_project_limit(on, 7, 1 << 20).is_err() && project_usage(on, 7).is_err());
+        }
+        // (Never through a link: what it points at is not the directory named.)
+        let dir = std::env::temp_dir().join(format!("kith-project-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(".", dir.join("link")).unwrap();
+        assert!(set_project(&dir.join("link"), 7, true).is_err() && project(&dir.join("link")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// On a file system that holds projects (as root: the VM test's, ci/vm.sh --test quota),
+    /// a directory's project is set, its limit holds and its use is counted. Skipped by name
+    /// where there is none.
+    #[test]
+    fn projects_hold_where_the_file_system_keeps_them() {
+        let on = std::env::temp_dir();
+        if !projects_held(&on) {
+            eprintln!("projects_hold_where_the_file_system_keeps_them: skipped: {on:?} holds no projects");
+            return;
+        }
+        let dir = on.join(format!("kith-project-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        set_project(&dir, 4243, false).unwrap();
+        assert_eq!(project(&dir).unwrap(), (4243, false));
+        set_project(&dir, 4242, true).unwrap();
+        assert_eq!(project(&dir).unwrap(), (4242, true));
+        set_project_limit(&dir, 4242, 1 << 20).unwrap();
+        std::fs::write(dir.join("some"), vec![1u8; 64 << 10]).unwrap();
+        File::open(dir.join("some")).unwrap().sync_all().unwrap();
+        let (bytes, files) = project_usage(&dir, 4242).unwrap();
+        assert!(bytes >= 64 << 10 && files >= 2, "{bytes} {files}");
+        assert!(std::fs::write(dir.join("more"), vec![1u8; 2 << 20]).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        set_project_limit(&on, 4242, 0).unwrap();
     }
 
     /// Ids that are not its own are mapped by root alone, and a mapped mount of nothing,

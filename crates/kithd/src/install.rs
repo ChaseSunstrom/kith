@@ -403,7 +403,8 @@ pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
                 if lines.send(String::from_utf8_lossy(&line).trim().to_string()).is_err() {
                     return;
                 }
-                line.clear();
+                // (What was typed may be a PIN or a passphrase: no copy outlives its use.)
+                zeroize::Zeroize::zeroize(&mut line);
             }
         });
     }

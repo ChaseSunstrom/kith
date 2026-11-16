@@ -59,6 +59,15 @@
 //!                              device's in /sys that only the node's root opens; `=PATH`
 //!                              says what the file holds; `:80` says whether port 80 binds;
 //!                              stays: then wait
+//!   pod quota STEP ...         (`sh ci/vm.sh --test quota`) say `quota: STEP RESULT` for each
+//!                              step, then `quota: done`, and wait: `+FILE:BYTES` writes BYTES
+//!                              to FILE, held open after; `~FILE:BYTES` the same with FILE
+//!                              removed first; `^FILE` adds a byte to it; `-FILE` removes it;
+//!                              `>A:B` renames A to B; `&A:B` links B to A; `?FILE` says its
+//!                              project; `0FILE` sets that to 0 by ioctl, `!FILE` by
+//!                              file_setattr(2); `#DIR` says size, used and free bytes there
+//!                              (statfs); `=FILE` says its size; `@` says the first line of
+//!                              its uid_map; `sN` sleeps N seconds
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -296,6 +305,123 @@ fn files(path: &std::path::Path, found: &mut Vec<String>) {
     }
 }
 
+/// A system call by x86-64's number, asked of the kernel itself: this file has only std.
+/// What it answers: 0 or more, or minus an errno.
+fn syscall(number: i64, args: [u64; 5]) -> i64 {
+    let mut said = number;
+    unsafe {
+        std::arch::asm!(
+            "syscall",
+            inlateout("rax") said,
+            in("rdi") args[0],
+            in("rsi") args[1],
+            in("rdx") args[2],
+            in("r10") args[3],
+            in("r8") args[4],
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    said
+}
+
+/// `ok`, or what the errno a system call answered says.
+fn how(said: i64) -> String {
+    match said {
+        0.. => "ok".to_string(),
+        e => std::io::Error::from_raw_os_error(-e as i32).to_string(),
+    }
+}
+
+/// `ok` or what failed.
+fn went<T>(done: std::io::Result<T>) -> String {
+    done.map_or_else(|e| e.to_string(), |_| "ok".to_string())
+}
+
+/// Write `bytes` to `out`, 64 KiB a write, then sync: `wrote N`, or `failed after N` and why.
+fn fill(out: &mut std::fs::File, bytes: u64) -> String {
+    let chunk = [7u8; 64 << 10];
+    let mut wrote = 0;
+    while wrote < bytes {
+        match out.write(&chunk[..chunk.len().min((bytes - wrote) as usize)]) {
+            Ok(0) => return format!("failed after {wrote}: it wrote nothing"),
+            Ok(n) => wrote += n as u64,
+            Err(e) => return format!("failed after {wrote}: {e}"),
+        }
+    }
+    match out.sync_all() {
+        Ok(()) => format!("wrote {wrote}"),
+        Err(e) => format!("failed after {wrote} at the sync: {e}"),
+    }
+}
+
+/// One step of `pod quota`, and what came of it.
+fn quota(step: &str, held: &mut Vec<std::fs::File>) -> String {
+    use std::os::fd::AsRawFd;
+    let (op, rest) = step.split_at(1);
+    let (a, b) = rest.split_once(':').unwrap_or((rest, ""));
+    let name = std::ffi::CString::new(a).expect("a path");
+    match op {
+        "+" | "~" => {
+            let mut out = match std::fs::OpenOptions::new().create(true).append(true).open(a) {
+                Ok(out) => out,
+                Err(e) => return e.to_string(),
+            };
+            if op == "~" && let Err(e) = std::fs::remove_file(a) {
+                return format!("not removed: {e}");
+            }
+            let said = fill(&mut out, b.parse().expect("how many bytes"));
+            held.push(out);
+            said
+        }
+        "^" => went(std::fs::OpenOptions::new().append(true).open(a).and_then(|mut f| f.write_all(b"x"))),
+        "-" => went(std::fs::remove_file(a).or_else(|_| std::fs::remove_dir_all(a))),
+        ">" => went(std::fs::rename(a, b)),
+        "&" => went(std::fs::hard_link(a, b)),
+        // Its project, and setting it to 0: FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR (struct
+        // fsxattr, its project at byte 12), or file_setattr(2) (struct file_attr, at 16).
+        "?" | "0" => {
+            let file = match std::fs::File::open(a) {
+                Ok(file) => file,
+                Err(e) => return e.to_string(),
+            };
+            let mut attr = [0u32; 7];
+            let got = syscall(16, [file.as_raw_fd() as u64, 0x801c_581f, attr.as_mut_ptr() as u64, 0, 0]);
+            if got < 0 || op == "?" {
+                return if got < 0 { how(got) } else { format!("project {}", attr[3]) };
+            }
+            attr[3] = 0;
+            how(syscall(16, [file.as_raw_fd() as u64, 0x401c_5820, attr.as_ptr() as u64, 0, 0]))
+        }
+        "!" => {
+            let attr = [0u32; 6];
+            let at_fdcwd = -100i64 as u64;
+            how(syscall(469, [at_fdcwd, name.as_ptr() as u64, attr.as_ptr() as u64, 24, 0]))
+        }
+        // statfs(2): of a project's directory, its limit and what it holds.
+        "#" => {
+            let mut fs = [0u64; 15];
+            let got = syscall(137, [name.as_ptr() as u64, fs.as_mut_ptr() as u64, 0, 0, 0]);
+            if got < 0 {
+                return how(got);
+            }
+            let block = fs[1];
+            format!("size {} used {} free {}", fs[2] * block, (fs[2] - fs[3]) * block, fs[3] * block)
+        }
+        "s" => {
+            std::thread::sleep(Duration::from_secs(a.parse().expect("seconds")));
+            "ok".to_string()
+        }
+        "=" => std::fs::metadata(a).map_or_else(|e| e.to_string(), |meta| format!("size {}", meta.len())),
+        // Whose users it has: the first line of its uid_map ("0 0 4294967295", the node's).
+        "@" => match std::fs::read_to_string("/proc/self/uid_map") {
+            Ok(map) => map.lines().next().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" "),
+            Err(e) => e.to_string(),
+        },
+        _ => panic!("pod quota: no step {step}"),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -439,20 +565,8 @@ fn main() {
             let device = (major & 0xfff) << 8 | minor & 0xff | (minor & !0xff) << 12 | (major & !0xfff) << 32;
             let mode: u64 = if *kind == "b" { 0o060600 } else { 0o020600 };
             let name = std::ffi::CString::new(*path).expect("a path");
-            // mknod(2), by x86-64's number for it, asked of the kernel itself: this file has
-            // only std, which makes no device nodes. What it answers: 0, or minus an errno.
-            let mut made: i64 = 133;
-            unsafe {
-                std::arch::asm!(
-                    "syscall",
-                    inlateout("rax") made,
-                    in("rdi") name.as_ptr(),
-                    in("rsi") mode,
-                    in("rdx") device,
-                    lateout("rcx") _,
-                    lateout("r11") _,
-                );
-            }
+            // mknod(2): std makes no device nodes.
+            let made = syscall(133, [name.as_ptr() as u64, mode, device, 0, 0]);
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
             println!("node: made {made}, read {read:?}");
         }
@@ -747,6 +861,16 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(60));
             }
         }
+        ["quota", steps @ ..] => {
+            let mut held = Vec::new();
+            for step in steps {
+                println!("quota: {step} {}", quota(step, &mut held));
+            }
+            println!("quota: done");
+            loop {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+        }
         ["dns", address] => {
             let address: std::net::Ipv4Addr = address.parse().expect("an IPv4 address");
             std::thread::spawn(move || {
@@ -776,6 +900,6 @@ fn main() {
                 }
             }
         }
-        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod probe | pod knock TO | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
+        _ => panic!("pod serve [FILE] | pod ask HOST PORT [HOST PORT ...] | pod lookup NAME... | pod seen DIR [SOCKET] | pod call SOCKET | pod self | pod node b|c NUMBERS PATH | pod put FILE TEXT | pod tell [PATH ...] | pod echo | pod check HOST PORT | pod fill FILE BYTES [unlinked] | pod quota STEP... | pod probe | pod knock TO | pod init SCRIPT | pod dns ADDRESS | pod shout TO WHAT"),
     }
 }
