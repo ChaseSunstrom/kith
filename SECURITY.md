@@ -148,7 +148,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   ports below 1024 would need the node's to be anyone's, and they stay root's), a
   NodeWorkload's, one given devices, and one with its image or a volume on a file system
   that takes no id-mapped mount (a volume of another node, over NFS); `hostUsers` in its
-  status says which. A `runAsUser` of 65536 or more is refused for a shifted one. Its
+  status says which. A node mounts another node's shared Volume nosuid and nodev, so a
+  set-uid file or a device node a workload on the other node wrote is not honoured on this
+  node (it stays executable: containers run programs from their volumes). A `runAsUser` of 65536 or more is refused for a shifted one. Its
   `/sys` is the node's, bound in, as a user namespace may mount no other.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
@@ -208,7 +210,11 @@ Only the newest version is fixed. There are no security releases of older ones.
   makes is written down as the Source's writer. Rights lost later stop the next render,
   not what is installed; a writer whose Identity is gone, or a Release or Source with no
   writer written down (one from before this check), makes nothing until it is applied
-  again.
+  again. The writer is its name and the print of the Identity's `publicKey`
+  (`kith.dev/written-key`, SHA-256 as a node's certificate is kept), also written
+  by the API; an Identity given a new certificate, or made again under the same name,
+  has another key, and its Releases and Sources make nothing new and fetch nothing
+  until it applies them again. The local socket's have no key.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed
   its manifest's digest, which is found out before a layer is fetched; every layer is
   then fetched by the digest that manifest names. An image already on the node counts as
@@ -855,8 +861,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     one Repository: whoever has it can have kithd ask any Repository there is.
   - A Source's writer is trusted for whatever its repository's authors push, up to the
     writer's own rights.
-  - An Identity deleted and made again under the same name is the same writer: what
-    the old one applied renders with the new one's rights.
+  - A Release and a Source act as the Identity that applied them while it has the key
+    it had then. An Identity made again under the same name has another key, so what
+    the old one applied is not acted on as the new one: it makes nothing new, fetches no
+    Package, and says to apply it again; what was installed stays. The same after a
+    new certificate for the Identity (a certificate lasts ten years). A Source that
+    makes a Release writes the Source's name and print on it.
   - During an upgrade, a node from before this check neither writes the writer down nor
     checks it; and each Release and Source from before it makes nothing new until it is
     applied again.
@@ -950,6 +960,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A running encrypted node has its key in memory.** The encryption keeps a disk
+  that is off, or away from its cluster. While the node runs, the key of its state is
+  in the kernel's memory (dm-crypt's) and in kithd's, for as long as it runs: kithd
+  keeps it to give the cluster its NodeKey again, to seal it to the TPM again, and to
+  wrap it under a new recovery key or passphrase. So whoever is root on the node, reads
+  its RAM, or finds a hole that reads kithd's memory has the key. The copies kithd
+  makes on the way to the TPM are not wiped after use, because the one it keeps is
+  there anyway; a kithd that does not hold the key is a design not built yet (T-0609).
 - **The offline unlock gives up that the key is not on the machine.** A node that
   opens its encrypted state with no node in reach has its key on its own disk again:
   sealed to its TPM (above), or, with `kith node passphrase` (off unless one is given),

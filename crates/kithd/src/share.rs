@@ -320,7 +320,8 @@ pub async fn mount(state: &Path, dir: &Dir, prefix: Ipv6Addr, me: &str) -> Resul
                 Some(from.as_str()),
                 &target,
                 Some("nfs4"),
-                MsFlags::empty(),
+                // A set-uid file or a device node another node's workload wrote is not honoured on this node (a container's own bind is nosuid and nodev already); no noexec: containers run programs from their volumes.
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
                 Some(options.as_str()),
             )
         }
