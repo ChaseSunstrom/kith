@@ -180,6 +180,15 @@ impl Store {
         cut
     }
 
+    /// Take every NodeKey out, with its history: whether there was one. For a copy of the
+    /// store that is kept aside (the replicated store holds the NodeKeys, and forgets them).
+    pub fn drop_node_keys(&mut self) -> bool {
+        let before = self.resources.len();
+        self.resources
+            .retain(|_, history| !history.iter().any(|r| r.resource.kind == "NodeKey"));
+        self.resources.len() != before
+    }
+
     /// Apply several resources, all or nothing: if one is refused the store is left as it was.
     pub fn apply_all(&mut self, desired: Vec<Resource>) -> Result<Vec<Change>, Error> {
         self.staged(desired, false)

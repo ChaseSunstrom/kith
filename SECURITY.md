@@ -1213,8 +1213,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   import), and drops its log if that still holds a key the store does not. Each log
   dropped this way is said on kithd's standard error, with the log's index and the
   NodeKey (a cut of earlier versions alone says nothing). What stays: on a node that
-  came from before the store was replicated, `store.json.imported` in its state, the
-  store as it was then, every NodeKey of that day in it (remove the file; T-0614); a backup or a copy of a
+  came from before the store was replicated, `store.json.imported` in its state holds
+  no NodeKey (kithd cuts them, and their history, out of it as it keeps it, and at each
+  start for one an earlier version kept; a file that is not a store is left as it is
+  and said on standard error), but a disk that took no write, or a copy or backup of
+  that file from before, has what it had; a backup or a copy of a
   control node's state taken before (kith's own backups are of Volumes and hold no
   store), a worker's `view.json` (a worker is sent its own NodeKey) until the worker
   hears of the change, and on a control node's disk the freed pages of the log file and
