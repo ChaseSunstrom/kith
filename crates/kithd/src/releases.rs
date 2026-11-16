@@ -517,8 +517,13 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
         let status = match done {
             Ok((output, done)) => {
                 (step.apply, step.delete) = (done.apply, done.delete);
+                // (Following the newest from a Repository its writer may not fetch from: said on
+                // every pass, or it would be said only once a Package is missing.)
+                let following = release.spec["autoUpgrade"] == true && release.spec["package"]["repo"].is_string();
+                let unlooked = following.then(|| supplied(store, release).err()).flatten();
+                let message = unlooked.map(|why| format!("no newer Package is looked for: {why}"));
                 json!({
-                    "state": "installed", "message": null, "version": output.version,
+                    "state": "installed", "message": message, "version": output.version,
                     "resources": done.kept, "notes": output.notes, "observedRevision": release.metadata.revision,
                 })
             }
@@ -1308,7 +1313,17 @@ mod tests {
             .insert(REPOSITORY.into(), origin(&store, "hub").unwrap());
         store.apply(here).unwrap();
         settle(&mut store, &mut renders);
-        assert_eq!(said(&store).0, json!("installed"), "{}", said(&store).1);
+        let (state, message) = said(&store);
+        assert_eq!(state, json!("installed"), "{message}");
+        // Following the newest, it says no newer one is looked for, and why (T-0575).
+        assert!(
+            message.contains("no newer Package is looked for") && message.contains("bob may not apply Package"),
+            "{message}"
+        );
+        // Not following the newest, there is nothing to look for, and nothing said.
+        apply(&mut store, &as_bob.replace("autoUpgrade: true", "autoUpgrade: false"));
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store), (json!("installed"), String::new()));
     }
 
     /// What a Release installs by its writer's rights is for that Identity's key: one made
