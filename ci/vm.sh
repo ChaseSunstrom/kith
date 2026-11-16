@@ -18,6 +18,8 @@
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
 #                               found by their Service's name and reaching out from behind their node
+#   sh ci/vm.sh --test poddns   two nodes on the mesh: a pod of a node with no --dns finds a name outside
+#                               the cluster through its node's upstream, a second kithd with its own
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
@@ -121,6 +123,11 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    needs rustc for x86_64-unknown-linux-musl, bwrap and socat. With
                    KITH_E2E=1 also three pods of
                    nginx as it is shipped, pulled from mirror.gcr.io
+  --test poddns    instead: two nodes on the mesh, the first started without --dns but with
+                   --dns-upstream the second, which serves DNS too and forwards what it does
+                   not know to an outside resolver (ci/outside-dns.py, on this machine); a pod
+                   on the first finds outside.example.test through both. KITH_POD_NOUPSTREAM=1
+                   starts neither with an upstream: the control, where the name is not found
   --test services  instead: one node on the mesh with ci/pod.rs as a container image
                    already there: a pod that sends back every byte it is sent, its
                    Service, and a Job on the same node sending through that Service
@@ -179,7 +186,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | services | kube | worker | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, services, kube, worker, chaos" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | kube | worker | chaos) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, kube, worker, chaos" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -215,7 +222,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -235,7 +242,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         # worker: two, on the mesh; services: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
         others=2 more=--mesh
         [ "$test" != services ] || others=''
         # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
@@ -395,7 +402,16 @@ EOF
 
         # Nobody can log in to these nodes: the first says a token on its console, and
         # who sends it back is the cluster's admin; the others join with tokens it asks for.
-        node 1 --claim
+        # (poddns: the first node asks the second for names it does not know, and the second asks an
+        # outside resolver on this machine; KITH_POD_NOUPSTREAM=1 gives both an upstream that answers
+        # nothing, the control. Neither asks the network out there.)
+        first='' joined=''
+        if [ "$test" = poddns ]; then
+            first='--dns-upstream 10.9.0.2:5353'
+            joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))"
+            [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
+        fi
+        node 1 "--claim ${first:-}"
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
             && [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' -d '{"token":"x","name":"root"}' "https://127.0.0.1:$((port + 1))/v1/claim")" = 403 ]; do
@@ -412,7 +428,7 @@ EOF
             asks=/v1/tokens
             [ "$test" != worker ] || asks='/v1/tokens?trust=worker'
             join=$(api 1 POST "$asks" | field token) || fail "no join token over TLS"
-            node "$n" "--join 10.9.0.1:7443 --token $join"
+            node "$n" "--join 10.9.0.1:7443 --token $join ${joined:-}"
         done
         # What a resource's units say: "HOW-MANY-ARE-READY STATE ADDRESS ADDRESS ... and
         # what it says" (`none` for a unit with no address of its own).
@@ -433,6 +449,45 @@ for r in found:
         print(ready, status.get("state", "-"), *sorted(u.get("address", "none") for u in units), *said)
 ' "$1" "$2"
         }
+        if [ "$test" = poddns ]; then
+            # The outside resolver is this machine's (ci/outside-dns.py): what the second node asks
+            # for a name no node knows. The first node's pods ask the second, which has no such name.
+            # (A SERVFAIL, when an upstream did not answer in time, is "Try again" to the pod, and musl
+            # does not retry it: so the Job may run again (`retries`), up to the deadline below.)
+            python3 "$root/ci/outside-dns.py" $((port + 9)) >/dev/null 2>"$work/outside-dns.log" &
+            vms="$vms $!"
+            sleep 1
+            # The second node's DNS is up once it says so: until then node 1 asks a port nothing
+            # listens on and the pod gets SERVFAIL ("Try again"), so the Job waits for that line.
+            waited=0
+            until grep -aq 'serving DNS on 0.0.0.0:5353' "$work/n2.log" 2>/dev/null; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 180 ] || fail "the second node did not serve DNS: $(tail -n 3 "$work/n2.log" 2>/dev/null)"
+                sleep 1
+            done
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"lookup"},"spec":{"retries":4,"template":{"pod":true,"containers":[
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","lookup","outside.example.test"]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job lookup was not applied"
+            waited=0
+            until line=$(units Job lookup) && case $line in *' succeeded'* | *' failed'*) true ;; *) false ;; esac; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 240 ] || fail "waited for the Job lookup; it says: $line"
+                sleep 1
+            done
+            any GET "/v1/logs/Job/default/lookup" >"$work/lookup.out" || fail "what the Job lookup wrote could not be read"
+            echo "vm.sh: the Job lookup: $line; its pod wrote: $(cat "$work/lookup.out")" >&2
+            if [ "${KITH_POD_NOUPSTREAM:-}" = 1 ]; then
+                grep -q 'outside.example.test: failed' "$work/lookup.out" || fail "the control found a name with no upstream: $(cat "$work/lookup.out")"
+                echo "vm.sh: ok: control: with an upstream that answers nothing, a pod did not find outside.example.test" >&2
+                exit 0
+            fi
+            # (What the Job wrote comes back as JSON, so the quotes around the address are \" in it.)
+            grep -Fq 'outside.example.test: [\"198.51.100.7\"]' "$work/lookup.out" || fail "the pod did not find outside.example.test through its node's upstream: $(cat "$work/lookup.out") (the outside resolver's stderr: $(cat "$work/outside-dns.log"))"
+            echo "vm.sh: ok: a pod of a node started without --dns found outside.example.test (198.51.100.7) through its node's upstream, a second kithd, which asked an outside resolver" >&2
+            exit 0
+        fi
         if [ "$test" = worker ]; then
             monitor() { echo "$2" | socat - "unix-connect:$work/keys$1" >/dev/null; } # N COMMAND
             # What listens on port 80 of node N's own network says (the word of the Secret it

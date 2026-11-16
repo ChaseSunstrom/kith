@@ -449,6 +449,8 @@ spec:
   (`--mesh`), so every node reaches it and Services send to it. What it asks outside
   the cluster leaves from behind its node's address. It is told this node's DNS, with
   the search list Kubernetes gives: `web` and `web.default.svc.cluster.local` are the Service.
+  A pod's names outside the cluster are asked of its node's resolvers: they need a resolver
+  on the node (in `/etc/resolv.conf`) or `--dns-upstream`, and `--dns` is not needed for them.
 - **A root file system to write.** Each container may write its own (what it writes
   goes when it does), unless it says `readOnlyRoot: true`.
 - **What it may write.** `resources: { storage: 1Gi }` on a container bounds what its
