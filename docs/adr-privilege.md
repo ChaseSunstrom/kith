@@ -331,10 +331,10 @@ before any of the split:
   or `SYS_TIME`;
 - no system call filter on the single process. The filter is the serving part's.
 
-Built so far: the keys and their refusals, and the Node's status. Not yet: the scheduler
-reading a Node's policy, the bounding set, the installer's question. Until they are, a
-replica placed on a node that refuses it stays there and is not run, and a hardened node
-holds every capability.
+Built so far: the keys and their refusals, the Node's status, and the scheduler reading
+it (a label of its own making for each key a node allows, required of what asks for it).
+Not yet: the bounding set and the installer's question. Until then a hardened node holds
+every capability.
 
 What Step A buys by itself: a certificate of the cluster that is stolen, or a hole in
 the store, is no longer root on a node whose owner said so. A hole in a parser is still

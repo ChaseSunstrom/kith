@@ -1002,12 +1002,13 @@ this node's policy refuses exec units: processes of the node's root, with all of
 ```
 
 `kith get node/NAME -o yaml` shows a node's policy under `status.policy` once it has
-one. A node with none does everything, as before. Not yet: the scheduler does not read
-it, so a replica placed on a node that refuses it stays there and is not run; give such
-Workloads a `placement` that names the nodes that take them. And a VM's kernel and disks
-are paths on the node today, so `vms` without `vm-paths` runs no VM of use. A word kithd does not know ends
-its start (on kith OS the node runs `hardened` instead, and says so on its console). What
-this is and is not a defence against: [SECURITY.md](SECURITY.md).
+one. A node with none does everything, as before. The scheduler reads it: a Workload or
+Job that asks for what a node refuses is placed on the nodes that allow it, and waits,
+saying so, when none does. (A NodeWorkload's copy, a claimed Device and a Volume belong
+to one node: there the node itself says why it runs nothing.) A VM's kernel and disks are
+paths on the node today, so `vms` without `vm-paths` runs no VM of use. A word kithd does
+not know ends its start (on kith OS the node runs `hardened` instead, and says so on its
+console). What this is and is not a defence against: [SECURITY.md](SECURITY.md).
 
 ## Restarting a node on purpose
 

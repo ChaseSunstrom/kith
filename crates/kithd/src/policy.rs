@@ -159,43 +159,59 @@ impl Policy {
     }
 
     /// Why a template is not run on this node, if its policy refuses any of it: one line
-    /// for each key, naming the key and where it is set. `pci` says a claim of the replica
-    /// holds a PCI device (which a VM of it would be handed).
+    /// for each key, naming the key and where it is set ([`needs`]).
     pub fn refuses(&self, template: &Template, pci: bool) -> Vec<String> {
-        let mut why = Vec::new();
-        let mut refuse = |key: &str| why.extend(self.refusal(key));
-        if !template.exec.is_empty() {
-            refuse("execUnits");
-        }
-        let unconfined =
-            |seccomp: &kith_api::kinds::Seccomp| seccomp.unconfined == Some(true) || !seccomp.allow.is_empty();
-        if template
-            .containers()
-            .any(|c| c.seccomp.as_ref().is_some_and(unconfined))
-        {
-            refuse("unconfined");
-        }
-        if template.containers().next().is_some() && template.pod != Some(true) {
-            refuse("nodeNetwork");
-        }
-        if !template.vms.is_empty() {
-            refuse("vms");
-            let paths = |vm: &kith_api::kinds::VmUnit| {
-                let other = vm
-                    .hypervisor
-                    .as_ref()
-                    .is_some_and(|h| *h != kith_api::kinds::Hypervisor::Qemu);
-                other || vm.kernel.is_some() || vm.initrd.is_some() || vm.firmware.is_some() || !vm.disks.is_empty()
-            };
-            if template.vms.iter().any(paths) {
-                refuse("vmPaths");
-            }
-            if pci {
-                refuse("passthrough");
-            }
-        }
-        why
+        let needs = needs(template, pci).into_iter();
+        needs.filter_map(|key| self.refusal(key)).collect()
     }
+
+    /// The policy a Node's status says it has (`status.policy`, as [`Policy::status`] wrote
+    /// it): the keys it says are off. For the scheduler, which places nothing on a node
+    /// that says it refuses it; no node is trusted by it (a node that says otherwise than
+    /// it does only has replicas it does not run).
+    pub fn said(status: &serde_json::Value) -> Policy {
+        let off = KEYS.iter().map(|(_, key, _)| *key);
+        Policy {
+            off: off.filter(|key| status[key] == false).collect(),
+            devices: None,
+        }
+    }
+}
+
+/// The keys a template needs on to run on a node: one for each thing of it a node's policy
+/// may refuse. `pci` says a claim of the replica holds a PCI device (which a VM of it
+/// would be handed).
+pub fn needs(template: &Template, pci: bool) -> Vec<&'static str> {
+    let unconfined = |seccomp: &kith_api::kinds::Seccomp| seccomp.unconfined == Some(true) || !seccomp.allow.is_empty();
+    let paths = |vm: &kith_api::kinds::VmUnit| {
+        let other = vm
+            .hypervisor
+            .as_ref()
+            .is_some_and(|h| *h != kith_api::kinds::Hypervisor::Qemu);
+        other || vm.kernel.is_some() || vm.initrd.is_some() || vm.firmware.is_some() || !vm.disks.is_empty()
+    };
+    let vms = !template.vms.is_empty();
+    let asked = [
+        ("execUnits", !template.exec.is_empty()),
+        (
+            "unconfined",
+            template
+                .containers()
+                .any(|c| c.seccomp.as_ref().is_some_and(unconfined)),
+        ),
+        (
+            "nodeNetwork",
+            template.containers().next().is_some() && template.pod != Some(true),
+        ),
+        ("vms", vms),
+        ("vmPaths", vms && template.vms.iter().any(paths)),
+        ("passthrough", vms && pci),
+    ];
+    asked
+        .into_iter()
+        .filter(|(_, asked)| *asked)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// `--node-policy`: words with commas between, read left to right. `hardened` turns every

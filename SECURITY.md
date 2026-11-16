@@ -374,11 +374,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   could call the node's disk a GPU). `hardened` is all of them off, with a GPU the only
   Device. What a node refuses is not run there and the Workload's status says which word
   refused it; the Node's status says its policy. Every word is on where nothing is said:
-  **a node with no policy is as before, and the paragraph above is all there is.** Not
-  done yet: the scheduler does not read a node's policy, so a replica placed on a node
-  that refuses it stays there, not run, and says why; a VM's kernel and disks are paths
-  on the node today, so `vms` without `vm-paths` runs no VM of use; and a hardened node
-  still holds every capability itself. A pod on a hardened node can still be root inside
+  **a node with no policy is as before, and the paragraph above is all there is.** The
+  scheduler places a Workload or Job only on nodes whose status says they allow what it
+  asks for; that is for placing, not a defence (a node's status is its own word, and each
+  node refuses by its own policy whatever it was sent). Not done yet: a VM's kernel and
+  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use; and
+  a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
   a user namespace of its own, with what that gives (above), and a container held to
   `runAsNonRoot` may still be of group 0, which reads what a Volume's files give that
   group. The policy is no defence against whoever can write the node's config partition
