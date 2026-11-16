@@ -138,6 +138,18 @@ Only the newest version is fixed. There are no security releases of older ones.
   `no_new_privs`, on a read-only image, behind a seccomp filter that refuses some forty
   system calls: mounting, new namespaces, loading modules, bpf, perf, io_uring, keyrings,
   another process's memory, the clock. An image that names root as its user gets nobody.
+  On kith OS a pod's container (a network namespace of its own) is a user namespace whose
+  ids 0 to 65535 are a range of the node's ids no other container has, so its root
+  (`runAsUser: 0`) is not the node's root: a root-only file of the node is not its, and
+  its capabilities count only for what is its namespace's (not even the pod's network,
+  which the node's root made: any port there is anyone's, as kith-mesh sets it per pod).
+  Its image and its volumes are mounted id-mapped, so owners on disk are what they were.
+  Not shifted, and so the node's users as before: a container on the node's network (its
+  ports below 1024 would need the node's to be anyone's, and they stay root's), a
+  NodeWorkload's, one given devices, and one with its image or a volume on a file system
+  that takes no id-mapped mount (a volume of another node, over NFS); `hostUsers` in its
+  status says which. A `runAsUser` of 65536 or more is refused for a shifted one. Its
+  `/sys` is the node's, bound in, as a user namespace may mount no other.
   A container whose template says `userNamespaces: true` (off unless said: a sandbox
   inside it, as Steam's runtime and Flatpak start) may make namespaces and mount in them,
   and nothing in its `/proc` is covered; it is refused to a container that is the node's
@@ -344,11 +356,17 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   unconfined: true }`, `pod: true`, `userNamespaces: true`. That last gives a user who is
   not root the kernel's code for a namespace's root (mounting, a network of its own),
   where much of what has made a user the node's root was found; the other refused calls
-  stay refused inside. On kith OS there is no user namespace, so `runAsUser: 0`
-  there is the node's root with three capabilities, and root in a pod is the node's root
-  with fourteen (T-0280). One of the fourteen makes device nodes; the device filter on
-  the pod's cgroup is what keeps it from the node's disks. Containers that are not pods
-  share the node's network, and an
+  stay refused inside. On kith OS a pod's container is a user namespace of its own, so
+  its root, with fourteen capabilities, is not the node's; but in one that keeps the
+  node's users (one on the node's network, a NodeWorkload's, one given devices, one with
+  a volume of another node) `runAsUser: 0` is the node's root with three capabilities,
+  and a pod's that keeps them has fourteen.
+  A user namespace is also more of the kernel to get wrong: a flaw in its code is a way
+  out that a container without one did not have. The root of a container's namespace
+  owns, in its id-mapped volumes, what the node's root owns there, as before. One of the
+  fourteen makes device nodes (in a pod that keeps the node's users: in a namespace of its
+  own the kernel makes it none); the device filter on the pod's cgroup is what keeps it
+  from the node's disks. Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.

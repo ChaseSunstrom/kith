@@ -266,22 +266,21 @@ if [ -n "$test" ] && [ "$test" != init ]; then
                 cp "$(sh "$root/ci/musl.sh")/kith" "$image/rootfs/bin/kith"
                 echo '{}' >"$image/config.json"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkith:1"
-                if [ "$test" != share ]; then
-                    # And what those tests' pods run (ci/pod.rs), as an image that names no
-                    # user, as one that names a user who is not root, and as two that say
-                    # what to start (an image nothing more is said of, as a chart has one).
-                    rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
-                    digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
-                    image=$work/seed/runtime/images/$digest
-                    mkdir -p "$image/rootfs/bin"
-                    cp "$work/pod" "$image/rootfs/bin/pod"
-                    echo '{}' >"$image/config.json"
-                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
-                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
-                    for tag in serve again; do
-                        printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
-                    done
-                fi
+                # And what those tests' pods run (ci/pod.rs), as an image that names no user,
+                # as one that names a user who is not root, and as two that say what to start
+                # (an image nothing more is said of, as a chart has one). (share: what a
+                # container's ids are, and what it sees of files.)
+                rustc --edition 2024 -O -C panic=abort --target x86_64-unknown-linux-musl -o "$work/pod" "$root/ci/pod.rs" >&2
+                digest=$(printf pod | sha256sum | cut -d ' ' -f 1)
+                image=$work/seed/runtime/images/$digest
+                mkdir -p "$image/rootfs/bin"
+                cp "$work/pod" "$image/rootfs/bin/pod"
+                echo '{}' >"$image/config.json"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
+                printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
+                for tag in serve again; do
+                    printf '{"digest":"sha256:%s","entrypoint":["/bin/pod","serve"],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:$tag"
+                done
                 if [ "$test" = pods ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
                     # pod, for a user who is not root: a sandbox started inside a container.
@@ -750,12 +749,13 @@ EOF
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
                 printf '%s\n' "$line" | grep -Eq "$4" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
             }
-            # What holds a container to its devices: a pod that is root may make device nodes,
-            # and makes /dev/null again and reads it; its node's own disk it may neither make
-            # nor read. (NAME, block or character, and where /sys has the device's numbers.)
+            # What holds a container to its devices: a pod that is root is root of a user
+            # namespace of its own on kith OS, where the kernel makes no device node, not even
+            # /dev/null again; its node's own disk it may neither make nor read. (NAME, block
+            # or character, and where /sys has the device's numbers.)
             makes() { job "$1" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"node\",\"$2\",\"$3\",\"/dev/made\"]" '^[0-9]+ succeeded'; }
             makes null c /sys/class/mem/null/dev
-            grep -q 'node: made 0, read Ok(0)' "$work/null.out" || fail "a pod that is root could not make /dev/null again and read it: $(cat "$work/null.out" "$work/null.err")"
+            grep -q 'node: made -1, read Err' "$work/null.out" || fail "a pod that is root made a device node in a user namespace of its own: $(cat "$work/null.out" "$work/null.err")"
             makes disk b /sys/class/block/vda/dev
             grep -q 'node: made -1, read Err' "$work/disk.out" || fail "a pod that is root was not kept from its node's disk: $(cat "$work/disk.out" "$work/disk.err")"
 
@@ -1154,10 +1154,11 @@ EOF
             }
             refused() { # NAME FILE: the Job failed because FILE was there already
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
-                grep -q "/data/$2: File exists" "$work/$1.err" || fail "the Job $1 did not fail for /data/$2 being there: $(cat "$work/$1.err")"
+                grep -q "/data/$2: File exists" "$work/$1.err" || fail "the Job $1 did not fail for /data/$2 being there: $(cat "$work/$1.err"); it says: $(job "$1")"
             }
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"data"},"spec":{"node":"n1","path":"all","shared":true}},
+ {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"roots"},"spec":{"node":"n1","path":"all","shared":true}},
  {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on1"},"spec":{"node":"n1","path":"own"}},
  {"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"on2"},"spec":{"node":"n2","path":"own"}}]
 EOF
@@ -1167,7 +1168,7 @@ EOF
             run write on2 from-n2
             until_job write succeeded
             grep -aq 'kithd: mounted volume default/data from node n1' "$work/n2.log" || fail "the second node did not say it mounted the volume"
-            grep -aq 'kithd: serving 1 shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
+            grep -aq 'kithd: serving [0-9]* shared volume' "$work/n1.log" || fail "the first node did not say it serves the volume"
             run again on1 from-n2
             until_job again failed
             refused again from-n2
@@ -1196,6 +1197,80 @@ EOF
             user root 0
             until_job root succeeded
 
+            # A container on the node's network keeps the node's users (a port it serves is
+            # under 1024 as often as not, and no capability of a user namespace reaches that
+            # network), and the node's ports under 1024 stay its root's.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"node-ids"},"spec":{"retries":0,"template":{"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","ids","=/proc/sys/net/ipv4/ip_unprivileged_port_start"],"runAsUser":0,
+   "volumeMounts":[{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job node-ids was not applied"
+            until_job node-ids succeeded
+            said=$(any GET /v1/logs/Job/default/node-ids | field data) || fail "what the Job node-ids said could not be read"
+            printf '%s\n' "$said" | grep -q '^ids: map 0 0 4294967295$' || fail "a container on the node's network did not keep the node's users: $said"
+            printf '%s\n' "$said" | grep -q '^ids: =/proc/sys/net/ipv4/ip_unprivileged_port_start holds Ok("1024")$' || fail "the node's ports under 1024 are not its root's alone: $said"
+
+            # A pod's root is not the node's: its ids are a range of the node's of its own (two
+            # running at once never share one), the node's own files (its /sys) are nobody's
+            # to it, a file there only the node's root opens does not open, and port 80 of its
+            # own network is still its to bind. Its
+            # volume's files are owned on disk as before: read on the second node through NFS
+            # (which takes no id-mapped mount: that container keeps the node's users, and says
+            # so), what containers on the first made is root's, or nobody's, as they were. (Root
+            # writes a volume of its own: the Jobs made data nobody's, and a Workload's root has
+            # no capability to write what is another's.)
+            sees() { # NAME REPLICA UNTIL: what a replica of the Workload said, once it said UNTIL
+                waited=0
+                until said=$(any GET "/v1/logs/Workload/default/$1?replica=$2" 2>/dev/null | field data) && printf '%s\n' "$said" | grep -q "$3"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "replica $2 of the Workload $1 did not say what it sees: $said"
+                    sleep 1
+                done
+                printf '%s\n' "$said"
+            }
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ids"},"spec":{"replicas":2,"template":{"pod":true,"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays",":80","/sys","root-only","+/roots/by-root"],"runAsUser":0,
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots"},{"volume":"on1","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload ids was not applied"
+            range() { # REPLICA: the first id of its range
+                said=$(sees ids "$1" '^ids: +/roots/by-root /') || exit 1
+                printf '%s\n' "$said" | grep -q '^ids: :80 binds Ok(())$' || fail "a pod's root did not bind port 80 of its own network: $said"
+                printf '%s\n' "$said" | grep -q '^ids: /sys /sys owner 65534 opens Ok' || fail "the node's /sys is not nobody's to a container: $said"
+                printf '%s\n' "$said" | grep -q '^ids: root-only /sys/.* owner 65534 opens Err(PermissionDenied)' || fail "a container's root opened a file only the node's root does: $said"
+                printf '%s\n' "$said" | grep -q '^ids: +/roots/by-root /roots/by-root owner 0 opens Ok' || fail "a container's root did not make a file of its own in its volume: $said"
+                printf '%s\n' "$said" | sed -n 's/^ids: map 0 \([0-9]*\) 65536$/\1/p' | grep -E '^[1-9][0-9]{4,}$' || fail "replica $1 of the Workload ids has no range of its own: $said"
+            }
+            first=$(range 0) || exit 1
+            second=$(range 1) || exit 1
+            [ "$first" -ge 65536 ] && [ "$second" -ge 65536 ] && [ "$first" != "$second" ] || fail "two containers have the ranges $first and $second"
+            echo "vm.sh: two containers' ids start at $first and $second of the node's" >&2
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"owners"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"run","image":"kith.test/pod:1","command":["/bin/pod","stays","/roots/by-root","/data/from-n1","/data/from-n2"],
+   "volumeMounts":[{"volume":"data","path":"/data"},{"volume":"roots","path":"/roots","readOnly":true},{"volume":"on2","path":"/here"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload owners was not applied"
+            said=$(sees owners 0 '^ids: /data/from-n2 ') || exit 1
+            for made in roots/by-root:0 data/from-n1:65534 data/from-n2:65534; do
+                printf '%s\n' "$said" | grep -q "^ids: /${made%:*} /${made%:*} owner ${made#*:} opens Ok" || fail "/${made%:*} is not ${made#*:}'s on disk: $said"
+            done
+            printf '%s\n' "$said" | grep -q '^ids: map 0 0 4294967295$' || fail "a container with a volume through NFS did not keep the node's users: $said"
+            any GET /v1/resources >"$work/all.json" || fail "the resources could not be read"
+            python3 - "$work/all.json" <<'EOF' || fail "the units do not say whose users they have: $(cat "$work/all.json")"
+import json, sys
+
+found = json.load(open(sys.argv[1]))
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+said = {r["metadata"]["name"]: [c.get("hostUsers") for c in (r.get("status") or {}).get("containers", [])] for r in found if r["kind"] == "Workload"}
+sys.exit(0 if said.get("ids") == [False, False] and said.get("owners") == [True] else 1)
+EOF
+            for made in ids owners; do
+                any DELETE "/v1/resources/Workload/default/$made" >/dev/null || fail "the Workload $made was not deleted"
+            done
+
             # From outside the mesh (this machine, through the node's other card) there is no
             # NFS server to talk to: it listens on the mesh address alone.
             python3 - "$((port + 5))" <<'EOF' || fail "the first node's NFS port answered an address outside the mesh"
@@ -1220,7 +1295,7 @@ EOF
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Shares were not applied"
             waited=0
-            until grep -aq 'kithd: serving 1 shared volume.*; 2 Share(s) to the addresses they name' "$work/n1.log"; do
+            until grep -aq 'kithd: serving [0-9]* shared volume.*; 2 Share(s) to the addresses they name' "$work/n1.log"; do
                 waited=$((waited + 1))
                 [ "$waited" -lt 60 ] || fail "the first node did not say it serves the Shares"
                 sleep 1
@@ -1293,7 +1368,7 @@ EOF
             ! dd if="$work/n2.raw" bs=512 skip="$state_start" count="$state_sectors" status=none | grep -aq kith-volume || fail "the encrypted volume's file system is in the clear on its node's disk"
 
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there"
+            echo "vm.sh: ok: two nodes on the mesh; a file made in a shared volume by a container on the node that does not hold it was there for one on the node that does, and the other way round; nothing answered NFS from outside the mesh until a Share named this machine, which then made a directory in the Share's volume, could not write a read-only Share, and saw nothing else; an encrypted volume was made on the second node with its key kept by the first, its file system not to be seen on the node's disk, closed when the node was told to restart and opened again with the key the first node handed back, what was written in it still there; a pod's root was not the node's (two at once had ranges of ids of their own, the node's /sys was nobody's to them, a file only the node's root opens did not open, and each bound port 80 of its own network) while a container on the node's network kept the node's users and the node's ports under 1024 stayed its root's, and what containers made in a volume was owned on disk as before"
             exit 0
         fi
         until_says "three nodes, each saying what it runs" "^- 0 [^,? ]+,[^,? ]+,[^,? ]+ "
