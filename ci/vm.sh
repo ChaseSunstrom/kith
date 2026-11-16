@@ -252,7 +252,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
         # worker: two, on the mesh; services: one, on the mesh.)
-        others='2 3' more='' inside=2049 lan='' base=$root/target/os
+        others='2 3' more='' inside=2049 lan='' base=$root/target/os https=''
         seed() { :; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = kube ] || [ "$test" = worker ]; then
         others=2 more=--mesh
@@ -358,7 +358,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none \
                 -machine q35 -bios "$firmware" -drive "file=$work/n$1.raw,format=raw,if=virtio" -device qemu-xhci,id=usb \
                 -netdev "socket,id=lan,mcast=230.0.0.1:$((port + 8)),localaddr=127.0.0.1" -device "virtio-net-pci,netdev=lan,mac=52:54:00:00:09:0$1" \
-                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
+                -netdev "user,id=out,hostfwd=tcp:127.0.0.1:$((port + $1))-:7443,hostfwd=tcp:127.0.0.1:$((port + 4 + $1))-:$inside${https:+,hostfwd=tcp:127.0.0.1:$((port + 10 + $1))-:443}" -device "virtio-net-pci,netdev=out,mac=52:54:00:00:0a:0$1" \
                 -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=n$1 kith.ip=10.9.0.$1/24 -- --listen 0.0.0.0:7443 --advertise 10.9.0.$1:7443 $more $lan ${2:-}" \
                 -serial "file:$work/n$1.log" -monitor "unix:$work/keys$1,server,nowait" </dev/null >/dev/null 2>&1 &
             vms="$vms $!"
@@ -594,8 +594,69 @@ EOF
                 [ "$waited" -lt 120 ] || fail "the Workload that was deleted still answers on the worker"
                 sleep 1
             done
+            # The worker is made an ingress worker: its owner says so in its Node (what the
+            # control node that admits a node writes there from a token of `kith node token
+            # --worker --ingress`), and it starts again with --ingress, port 443 reached from
+            # this machine. A host is exposed with a certificate applied by hand (no ACME
+            # authority is reached from here: tests/cluster.rs orders one from a stand-in).
+            unplaced=the-word-of-a-secret-nothing-places
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=shop.example.test \
+                -addext subjectAltName=DNS:shop.example.test -keyout "$work/shop.key" -out "$work/shop.crt" 2>/dev/null \
+                || fail "openssl made no certificate"
+            api 1 GET /v1/resources | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+node = next(r for r in found if r["kind"] == "Node" and r["metadata"]["name"] == "n2")
+crt, key = (open(path).read() for path in sys.argv[1:3])
+def secret(name, data):
+    return {"apiVersion": "kith.dev/v1", "kind": "Secret", "metadata": {"name": name}, "spec": {"data": data}}
+json.dump([
+    {"apiVersion": "kith.dev/v1", "kind": "Node", "metadata": {"name": "n2"}, "spec": {**node["spec"], "ingress": True}},
+    secret("tls-shop.example.test", {"tls.crt": crt, "tls.key": key}),
+    secret("unplaced", {"word": sys.argv[3]}),
+    {"apiVersion": "kith.dev/v1", "kind": "Service", "metadata": {"name": "shop"}, "spec": {
+        "selector": {"app": "shop"}, "ports": [{"port": 80}], "expose": {"host": "shop.example.test", "via": "edge"}}},
+], open(sys.argv[4], "w"))
+' "$work/shop.crt" "$work/shop.key" "$unplaced" "$work/apply.json" || fail "the worker's Node was not read"
+            api 1 POST /v1/apply "$work/apply.json" >/dev/null || fail "the worker's Node, the certificate and the Service were not applied"
+            # Its view now holds the host's key (its Node says ingress, so the control node sends
+            # it): its disk has it, and the Secret nothing places is on the control node's alone.
+            line=$(sed -n 2p "$work/shop.key")
+            waited=0
+            until grep -aqF "$line" "$work/n2.raw" && grep -aqF "$unplaced" "$work/n1.raw"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the host's key is not on the ingress worker's disk, or the Secret nothing places is on no disk"
+                sleep 1
+            done
+            sleep 2
+            monitor 2 quit
+            sleep 2
+            https=1
+            node 2 --ingress
+            # It answers the host over TLS with that certificate, and no other host. (s_client
+            # says "Verify return code: 0 (ok)" after a handshake that failed too: a certificate
+            # sent, and one that verified, is what says it answered.)
+            handshake() { # HOST
+                openssl s_client -connect "127.0.0.1:$((port + 12))" -servername "$1" -CAfile "$work/shop.crt" \
+                    -verify_hostname "$1" -verify_return_error </dev/null 2>/dev/null
+            }
+            answers() { handshake "$1" | grep -q 'BEGIN CERTIFICATE' && handshake "$1" | grep -q 'Verify return code: 0 (ok)'; } # HOST
+            waited=0
+            until answers shop.example.test; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "the ingress worker did not answer shop.example.test over TLS: $(handshake shop.example.test | tail -n 5)"
+                sleep 1
+            done
+            # (Unverified: a host nothing exposes is sent no certificate at all, not one that fails.)
+            ! openssl s_client -connect "127.0.0.1:$((port + 12))" -servername other.example.test </dev/null 2>/dev/null \
+                | grep -q 'BEGIN CERTIFICATE' || fail "the ingress worker sent a certificate for a host nothing exposes"
+            echo "vm.sh: the ingress worker answers its host over TLS with the certificate it was sent" >&2
+            # Its disk has no Secret that is neither a tls- one nor placed on it.
+            ! grep -aqF "$unplaced" "$work/n2.raw" || fail "a Secret nothing places is on the ingress worker's disk"
+            ! grep -aqF "$other" "$work/n2.raw" || fail "the Secret of what runs on the control node is on the ingress worker's disk"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: two nodes, one let in as a worker: its Node says it is sent a view; a Workload placed on it ran with its Secret; its disk has that Secret and never had the Secret of what runs on the control node; its API answered no person; with the control node paused it said so and ran on; started again meanwhile it ran nothing until the control node was back, then what it ran; a deleted Workload left it"
+            echo "vm.sh: ok: two nodes, one let in as a worker: its Node says it is sent a view; a Workload placed on it ran with its Secret; its disk has that Secret and never had the Secret of what runs on the control node; its API answered no person; with the control node paused it said so and ran on; started again meanwhile it ran nothing until the control node was back, then what it ran; a deleted Workload left it; made an ingress worker it answered its host over TLS, with the host's key on its disk and no Secret nothing places on it"
             exit 0
         fi
         if [ "$test" = services ]; then

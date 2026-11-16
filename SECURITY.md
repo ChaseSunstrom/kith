@@ -19,7 +19,7 @@ Only the newest version is fixed. There are no security releases of older ones.
 | Who | How kith knows them | What they can do |
 | --- | --- | --- |
 | The admin of a node | Whoever can open kithd's unix socket (mode 0600, kithd's user) | Everything in the cluster |
-| A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | A control node (what a node is unless its Node says `trust: worker`): everything in the cluster. Control nodes replicate the whole store, Secrets included, and run what they are told: **a control node is trusted as much as the admin.** A worker: what is placed on it, what every node reads to run a cluster, and to write what it says of itself (see "A node that is taken") |
+| A node | A certificate of the cluster's CA for `NAME.node.kith`, while its Node is in the store and names that certificate's key | A control node (what a node is unless its Node says `trust: worker`): everything in the cluster. Control nodes replicate the whole store, Secrets included, and run what they are told: **a control node is trusted as much as the admin.** A worker: what is placed on it, what every node reads to run a cluster (an ingress worker: the exposed hosts' certificates and keys too), and to write what it says of itself (see "A node that is taken") |
 | An Identity | A certificate for `NAME.user.kith` whose key is the one in its `Identity` | What its Roles say, by kind, verb and namespace |
 | A workload | Nothing: it is a process on a node | What its container, machine or sandbox lets it reach (see "What is not defended") |
 | Anyone who reaches a node's port | Nothing | Fetch the CA certificate, spend a join token, ask for a locked disk's key by its id |
@@ -509,9 +509,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   or a Namespace decides which names those are, and the answer is only as private as the zone's `clients`.
   Once a house's resolver forwards the zone to a node, the client kithd sees is that resolver: `clients`
   must name it, and then no longer tells one device of the house from another. Which nodes are answered
-  is each node's own word (`status.serves`, and the address it joined from): a worker that is sent the
-  whole store can say it serves ingress and is then answered beside the others; a worker that runs from
-  a view cannot.
+  is each node's own word (`status.serves`, and the address it joined from): an ingress worker (its
+  Node says `ingress`, below) or a worker that is sent the whole store can say it serves ingress and is
+  then answered beside the others; any other worker cannot.
 - **An app of a seat is in its session.** A workload with a claim on a seat that says
   `access: client` is given the seat's directory, where the session's Wayland and
   PipeWire sockets are, and connects as any program the session started would: it can
@@ -571,13 +571,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     write is not held to it, and that the node has the key is its own word in its
     Node's status). `trust: control` on a Secret covers what a unit is given, not a
     Backup's S3 Secret, an ingress `tls-` Secret or the ACME account, which the node
-    doing that work reads.
+    doing that work reads; on a host's `tls-` Secret it keeps it from ingress
+    workers too, which then do not serve that host.
 
     What a worker may write is a list the control node it writes to holds it to,
     against that node's own store: what it says of the replicas the scheduler gave it
     (how many are ready is counted again; a unit's address has to be in the worker's
-    own part of the mesh), `os` and `mesh` in its own Node's status (not a mesh key
-    another Node says, which would cut both off), its own NodeKey once, the Devices
+    own part of the mesh), `os`, `mesh`, `serves` and `thumbprint` in its own Node's
+    status (not a mesh key another Node says, which would cut both off; a thumbprint
+    in a thumbprint's shape), its own NodeKey once, the Devices
     and Seats whose `spec.node` is the worker (under a name that starts with the
     worker's own, with the labels discovery writes and no other, the node and the
     class among them its own), the status of an Image or a Backup of
@@ -599,9 +601,9 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     has one, whatever time it says it synced. A worker's `status.serves` (the DNS port
     it says it answers, and ingress) is its own word and nothing more: a control node
     does not probe it, and nothing outside the cluster acts on it yet. A worker that
-    runs from a view is refused the word that it serves ingress; one that is sent the
-    whole store (`kith node token --worker --ingress`, or a worker from before views)
-    may say it, and any worker may say it answers DNS. A Node's address
+    runs from a view is refused the word that it serves ingress unless its Node says
+    `ingress` (an ingress worker, below); one that is sent the whole store (a worker
+    from before views) may say it, and any worker may say it answers DNS. A Node's address
     on the LAN is the one the admitting control node saw at join, not the node's word.
 
     A worker keeps a view of the store, not the store (`docs/adr-workers.md`). A
@@ -645,19 +647,54 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     Node's status then says `view`, which only a control node writes, and the node
     that leads sends it no more. What it copied before, it has, and what its kithd's
     memory held is there until kithd starts again. Such a node does not become a
-    control node again by a change to its Node: delete it and join it again. **A
-    worker that serves ingress (`--ingress`) is still sent the whole store**, every
-    Secret in it: it reads the hosts' `tls-` Secrets and the ACME account. The node
-    the internet reaches holds no less as a worker, until ingress is built for
-    views. Which of the two a new worker is, is its token's maker's to say, not the
-    node's: `kith node token --worker` lets in only a node that runs from a view,
-    and one that says it cannot is refused; `kith node token --worker --ingress`
-    lets in one that is sent the store. **A worker from before views that never
+    control node again by a change to its Node: delete it and join it again.
+
+    **An ingress worker** (`kith node token --worker --ingress`) runs from a view as
+    any worker does, and its view holds what serving the cluster's hosts needs too:
+    the `tls-` Secret (certificate and key) of every host a Service exposes (so whoever
+    may apply a Service with `expose.host` in a namespace decides that this namespace's
+    `tls-HOST` Secret is sent to every ingress worker: of that namespace only, and never
+    one with `trust: control`), and the
+    ConfigMap `kith-system/acme`, the ACME account's thumbprint, with which it
+    answers a CA's challenges. Never the account's key (`kith-system/acme-account`),
+    whatever names it: a control node started with `--acme` orders and renews every
+    certificate, writes the Secrets and the thumbprint, and the worker writes none of
+    them (refused: `a worker writes only what it says of itself`). It says, in its own
+    Node's status, which thumbprint its view holds, and the leader asks the CA for
+    nothing until each reachable ingress worker says the right one: a worker that lies
+    there holds up every order and renewal, as answering the CA's challenge wrongly
+    would (each ingress node is one the CA may ask), and gains nothing else. That a worker
+    serves ingress is its token's maker's to say, not the node's: the control node
+    that admits it writes `ingress` into its Node's spec from the token, never from
+    what the joining node asks, and only a worker whose Node says it may say in its
+    status that it serves ingress. A worker joined with `kith node token --worker` that
+    is started with `--ingress` is refused at the join, and at a later start
+    (`kith node token --worker --ingress`, the message says). **A worker that serves
+    ingress from before this** (one that was sent the whole store to serve it, whose
+    Node does not say `ingress`) goes on being sent the store: its kithd says so at
+    every start, and each control node that sends it the store says so once, with the
+    node's name and what to do: delete its Node and join it again with an ingress
+    worker's token, or set `ingress: true` in its Node's spec (it then asks for a
+    view and erases its copy, as above; what it copied before, it has).
+
+    When an ingress worker is taken: delete its Node (it is then sent nothing more
+    and asks for nothing), then have every certificate whose key it held replaced:
+    delete each host's `tls-` Secret and the control node orders a new one, with a
+    new key, within a minute (`kith get secret` lists them; it held every exposed
+    host's, and those of hosts it was sent before). The old certificates stay valid at the CA until they
+    expire or are revoked there (kith revokes none), so whoever has the key can
+    pose as those hosts to a client whose way to them they can be on until then.
+
+    **A worker from before views that never
     asks for a view goes on being sent the store**: `kith get node NAME -o yaml`
     shows `view: true` in the status of one that is not, and a worker without it
     that should have it is deleted and joined again. A worker told to follow only control nodes older than views says so
     (`this control node is older than workers: update it`) and, if it has the store,
-    keeps it.
+    keeps it. Control nodes older than ingress workers know nothing of `ingress` in
+    a Node: one that admits a node writes none (the node is then a worker that is
+    sent the whole store to serve ingress, and is warned about as above), and one
+    that a worker with a view follows sends it no certificate and refuses its word
+    that it serves ingress. Update every control node before an ingress worker joins.
 
     What a taken worker still has: every Node's address and mesh key; the Cluster's
     and every Namespace's settings and `values` (a password written into values is
@@ -666,7 +703,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     and ConfigMaps of what is placed on it, and of what was placed on it before, so
     change those Secrets; on every worker a NodeWorkload selects, that one's
     Secrets; the files of every Volume on it or that it is a replica of, and their
-    backups and images. And within its list it can lie: about its own units and its
+    backups and images; and an ingress worker, **the certificate and key of every
+    host a Service exposes** (it can pose as each of them until the certificate is
+    replaced and has expired) and the ACME account's thumbprint (it can answer a CA's
+    challenge for any name, which orders nothing without the account's key). And
+    within its list it can lie: about its own units and its
     own Node; about its Devices, so
     it can say it has a card a claim in any namespace selects and have that Workload,
     **with its Secrets**, placed on it and sent to it (a selector alone keeps nothing

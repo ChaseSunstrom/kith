@@ -164,12 +164,12 @@ struct Args {
     #[arg(long, env = "KITH_INGRESS", requires = "mesh")]
     ingress: bool,
     /// Get the certificates for exposed hosts from this ACME directory (Let's Encrypt
-    /// if none is named); giving this agrees to that authority's terms
+    /// if none is named); giving this agrees to that authority's terms. On control nodes:
+    /// one that serves ingress orders for itself, and the leader for the workers that do
     #[arg(
         long,
         env = "KITH_ACME",
         value_name = "URL",
-        requires = "ingress",
         num_args = 0..=1,
         default_missing_value = "https://acme-v02.api.letsencrypt.org/directory"
     )]
@@ -449,8 +449,8 @@ async fn membership(
                 }
                 None => None,
             };
-            // (A node that serves ingress reads Secrets a view does not have: it is sent the store.)
-            let joined = cluster::request_join(address, token, &name, port, mesh, !args.ingress).await?;
+            // (A worker runs from a view; one that serves ingress says so, as its token must.)
+            let joined = cluster::request_join(address, token, &name, port, mesh, args.ingress).await?;
             if let Some((through, certificate)) = joined.view.clone() {
                 let first = view::Upstream {
                     name: through,
@@ -725,11 +725,20 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         &state,
         std::time::Duration::from_secs(args.lost_after),
     ))?;
-    if args.ingress && shared.view.borrow().is_some() {
+    // A viewed worker serves ingress only where its Node says so (as the join of a token for
+    // an ingress worker wrote it): only then is its view sent the hosts' certificates. (Its
+    // Node not in the view yet: its first view is still to come, and says.)
+    let unsaid = args.ingress && shared.view.borrow().is_some() && {
+        let me = shared.members.me();
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let node = state.store.get(&format!("Node/{me}"));
+        node.is_some_and(|node| node.spec["ingress"] != true)
+    };
+    if unsaid {
         return Err(
-            "--ingress: this node is a worker that runs from a view of the store, and a host's certificate is a \
-             Secret a view does not have: serve ingress on a control node, or delete this node and join it again \
-             with --ingress (it is then sent the whole store)"
+            "--ingress: this node is a worker that joined without a token for an ingress worker, so it is sent no \
+             host's certificate: delete this node and join it again with a token from \
+             `kith node token --worker --ingress`, or serve ingress on a control node"
                 .into(),
         );
     }
@@ -915,7 +924,9 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         };
         let ingress = async {
-            if args.ingress {
+            // (A control node with --acme alone orders for the workers that serve ingress.)
+            if args.ingress || args.acme.is_some() {
+                let strays = args.ingress.then_some(strays);
                 ingress::run(shared.clone(), args.acme.clone(), strays, stopping.clone()).await;
             }
         };

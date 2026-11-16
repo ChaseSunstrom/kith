@@ -386,8 +386,9 @@ enum NodeCommand {
         /// store, and nothing that asks for control nodes is placed on it
         #[arg(long)]
         worker: bool,
-        /// That worker serves ingress (`kithd --ingress`): it is sent the whole store, every
-        /// Secret in it, where a worker is sent only what is placed on it
+        /// That worker serves ingress (`kithd --ingress`): besides what is placed on it, it is
+        /// sent the certificate (and key) of every exposed host and the ACME account's
+        /// thumbprint, never the account key; a control node with `--acme` orders its certificates
         #[arg(long, requires = "worker")]
         ingress: bool,
     },
