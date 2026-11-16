@@ -1373,8 +1373,9 @@ fn spec_shifted(
         return Err("runAsNonRoot: this container would be root (its image names no other user, or names root): say who with runAsUser".into());
     }
     let shift = shift.filter(|_| uid.is_root());
-    if unit.no_node_root && user == 0 && uid.is_root() && shift.is_none() {
-        return Err(format!("this container {NODE_ROOT}: its user is root and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser").into());
+    if unit.no_node_root && (user == 0 || group == 0) && uid.is_root() && shift.is_none() {
+        let which = if user == 0 { "user" } else { "group" };
+        return Err(format!("this container {NODE_ROOT}: its {which} is root's and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser").into());
     }
     let mut spec = match shift {
         _ if !uid.is_root() => Spec::rootless(uid.as_raw(), gid.as_raw()),
@@ -2045,6 +2046,39 @@ mod tests {
             ..Unit::default()
         };
         assert!(spec_of("a", &image, &user, "/kith/a", Path::new("/b"), root, Gid::from_raw(0)).is_ok());
+        // Nor of root's group: a pod takes its image's `1001:0` as it is, and with the node's
+        // users that is the node's group 0. With a range of its own, or told who to be, it is made.
+        let grouped = Image {
+            user: Some("1001:0".into()),
+            ..image.clone()
+        };
+        let unit = Unit {
+            no_node_root: true,
+            user: None,
+            ..pod.clone()
+        };
+        let made = |unit: &Unit, shift| {
+            spec_shifted(
+                "a",
+                &grouped,
+                unit,
+                "/kith/a",
+                Path::new("/b"),
+                (root, Gid::from_raw(0)),
+                shift,
+            )
+        };
+        let refused = made(&unit, None).unwrap_err().to_string();
+        assert!(
+            refused.contains(NODE_ROOT) && refused.contains("its group is root's"),
+            "{refused}"
+        );
+        assert!(made(&unit, Some(100_000)).is_ok());
+        let told = Unit {
+            user: Some(1001),
+            ..unit.clone()
+        };
+        assert!(made(&told, None).is_ok());
         // No filter, or some of it, only as the unit says.
         let (uid, gid) = (Uid::from_raw(0), Gid::from_raw(0));
         let unit = Unit {

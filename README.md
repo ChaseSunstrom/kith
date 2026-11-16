@@ -521,8 +521,12 @@ spec:
   and a root of its own and behind the same filter on system calls as every container.
 - Where kithd is not root (a service of your user) a pod shares the node's network
   like any replica, and its root is root of a user namespace only.
-- Not yet: on kith OS a pod's root is the node's root held in by its namespaces, its
-  capabilities and the filter (no user namespace).
+- On kith OS, where kithd is root, each container of a pod is a user namespace of its
+  own, with users of the node no other container has: its root is not the node's root,
+  and a root-only file of the node it is handed stays shut to it
+  ([what a container is kept from](#what-a-container-is-kept-from); `sh ci/vm.sh --test share`
+  shows it). A pod on the node's network, one given devices or one with a volume of
+  another node keeps the node's users.
 
 ### What a container is given
 
@@ -1395,11 +1399,24 @@ spec:
   refused, and the Repository's status says so (`state: error`, `message`).
   A newer version that does not check out is passed over for the newest
   that does (the status says which). A Repository without a `publicKey`
-  takes packages as they come. Change a Repository's `url` or `publicKey`
+  takes packages as they come: they are trusted on the word of whoever answers
+  at its `url`. Change a Repository's `url` or `publicKey`
   and what was fetched before is no longer taken for its: it is fetched and
   checked again.
 - A Package keeps its last 3 revisions (other kinds keep 100), because it
   carries its files; push a new version rather than rolling far back.
+- A Release renders a Package pushed by hand with no more than its pusher's
+  rights, besides its own writer's: what the Package makes, and what it no longer
+  makes, is asked of whoever pushed it, as of whoever applied the Release. Where
+  the pusher may not, nothing new is made, what was installed stays, and the
+  Release's status says whose right fell short. A Package pushed before kithd
+  wrote the pusher down renders nothing new until it is pushed again. One fetched
+  from a Repository has no pusher, and this check does not apply to it: it is
+  trusted by the Repository's key (with none, on the word of whoever answers at its
+  `url`), so whoever may apply a Repository gives the rights of every Release that
+  names it. Only kithd's fetcher says a Package was fetched (`kith.dev/repository`):
+  an apply or a Source's file that carries it is refused, and a Release takes it as
+  fetched only from the Repository it names.
 - A version is fetched once: pushing it to the registry again changes
   nothing here. A registry can also keep quiet about newer versions; the
   signature says a package is the publisher's, not that it is the newest.
@@ -1857,6 +1874,14 @@ kept in history and rolled back like the rest of the cluster's state.
   call starts from a fresh instance: nothing is remembered between calls.
 - Whoever may write KindDefinitions may run code in every namespace through
   them: grant that as you would grant admin.
+- A controller acts as whoever applied its KindDefinition (kith writes that one
+  down, name and key, on the KindDefinition), not as whoever applied a resource
+  of the kind: what it answers is made, and what it no longer answers removed,
+  only where that one may apply and delete it in the resource's namespace, and the
+  resource's status says whose right fell short. So the right to apply a custom
+  kind's resources is the right to what its controller makes of them in that
+  namespace. A KindDefinition applied before this makes nothing new until it is
+  applied again.
 
 Things to know: a rollback is asked of admission too (what it refuses does
 not come back; what it would change comes back as it was); a delete is not
@@ -3421,8 +3446,10 @@ sh ci/vm.sh --test duress              # the new recovery key and the duress cod
 node that is still running restarts within moments, and from then on says at
 its console that it waits. `wipe` cannot be undone: the cluster no longer
 holds the key, and the node, if it still runs, erases what it would need to
-ask for it and powers off. (The wrapped key is still in backups of the store
-made before, which open nothing without the secret on the wiped disk.)
+ask for it and powers off. Every control node then snapshots the store and
+drops its log up to the wipe, so no earlier version or log entry keeps the
+wrapped key. (It is still in copies of a node's state made before, which open
+nothing without the secret on the wiped disk: SECURITY.md says what stays.)
 A node whose key is still on its own disk, as no other node holds it yet,
 opens whatever the cluster says.
 
@@ -3480,9 +3507,10 @@ from a node you can reach as well. Flash may keep old blocks: the record is
 written over with zeros, and what a flash disk keeps of sectors it has
 replaced is not kith's to say. A disk that refuses the write keeps its record:
 the node tries again for as long as it waits and says nothing of it. The
-cluster stops handing the key out and a NodeKey cannot be rolled back, but a
-control node's disk and the cluster's backups still hold earlier versions with
-the wrapped key, which opens nothing without a copy of the erased disk. The record on the disk shows that a code
+cluster stops handing the key out and keeps it in no earlier version, snapshot
+or log entry, but a copy of a control node's state taken before, and the freed
+blocks of its disk until they are written over, still hold the wrapped key,
+which opens nothing without a copy of the erased disk. The record on the disk shows that a code
 exists (not what it is: it holds a public key made from the code). The answer
 at the console is the same; the request to the cluster, the write to the
 disk, and the record that is gone afterwards are there for whoever watches

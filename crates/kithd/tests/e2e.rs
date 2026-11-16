@@ -106,7 +106,10 @@ impl Daemon {
 
     /// SIGTERM, as systemd would, and wait for it to finish cleaning up.
     fn stop(&mut self) {
-        let _ = Command::new("kill").arg(self.child.id().to_string()).status();
+        let _ = Command::new("kill")
+            .arg(self.child.id().to_string())
+            .stderr(Stdio::null())
+            .status();
         let _ = self.child.wait();
     }
 }
