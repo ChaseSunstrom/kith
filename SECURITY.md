@@ -376,6 +376,42 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
   nothing more is in the way. Do not give them to someone you would not give a shell on
   the node.
+
+  **A node's owner can refuse them for that node, whatever the cluster says.** The
+  cluster's store is what tells a node what to run, so whoever holds an admin's
+  credential, a control node, or a hole in what serves the store, has every node's root
+  through the list above. `kithd --node-policy` is given where a node's kithd is started
+  (on kith OS among its arguments on the config partition, which the installer writes
+  and no API reaches), is never read from the store, and turns off, each by its own
+  word: `exec` units (`no-exec-units`); containers that would be the node's root, which
+  is root in one that keeps the node's users, not root in a pod's range of its own
+  (`no-root-containers`); `seccomp` unconfined or with
+  refused calls allowed back (`no-unconfined`); containers on the node's own network
+  (`no-node-network`); VMs (`no-vms`), a VM's kernel, firmware or disks as paths on the
+  node or another hypervisor than qemu (`no-vm-paths`), PCI devices handed to a VM
+  (`no-passthrough`); a Volume of `kith-system`, which is a directory anywhere on the
+  node (`no-host-paths`); `POST /v1/run` (`no-run`); the cluster wiping this node or
+  setting its duress codes (`no-wipe`: a wipe from the cluster then leaves its lock
+  record, and it opens next with its recovery key alone); and the classes of Device a
+  DeviceClaim hands out (`devices=gpu+input`). Where the classes are named, a Device is
+  what the node itself finds its hardware to be: one whose class, path or further nodes
+  the store says otherwise, or one written by hand, is not handed out there (the store
+  could call the node's disk a GPU). `hardened` is all of them off, with a GPU the only
+  Device. What a node refuses is not run there and the Workload's status says which word
+  refused it; the Node's status says its policy. Every word is on where nothing is said:
+  **a node with no policy is as before, and the paragraph above is all there is.** The
+  scheduler places a Workload or Job only on nodes whose status says they allow what it
+  asks for; that is for placing, not a defence (a node's status is its own word, and each
+  node refuses by its own policy whatever it was sent). Not done yet: a VM's kernel and
+  disks are paths on the node today, so `vms` without `vm-paths` runs no VM of use; and
+  a hardened node still holds every capability itself. A pod on a hardened node can still be root inside
+  a user namespace of its own, with what that gives (above), and a container that keeps the node's
+  users and is not root is still the node's user of its number, with whatever files on
+  the node that user owns, and may be of group 0, which reads what a Volume's files give
+  that group. The policy is no defence against whoever can write the node's config partition
+  or kithd's arguments and environment where it is started (`KITH_NODE_POLICY` and the
+  command line say it too), or is root on the node already.
+  (T-0334, docs/adr-privilege.md.)
 - **Whoever may apply a Workload or a Job in a namespace reads that namespace's Secrets
   and ConfigMaps**, without the right to `get` them: a template names one in `env`, in
   `envFrom` or as files, and its container is given what it holds. (Another

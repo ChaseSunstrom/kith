@@ -110,6 +110,10 @@ pub struct Answers {
     /// server on the LAN).
     #[serde(default, rename = "lanReleases")]
     pub lan_releases: bool,
+    /// What the cluster may have this node do as its root: `hardened`, or the words of
+    /// `--node-policy` with commas between (policy.rs). Without, everything, as before.
+    #[serde(default, rename = "nodePolicy")]
+    pub node_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -187,6 +191,18 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     }
     if answers.lan_releases {
         words.push("--lan-releases".into());
+    }
+    // (Read here by the parser kithd reads it with: a word it does not know is refused now,
+    // not at the node's first start, where it would run hardened and say so to nobody.)
+    let policy: String = answers
+        .node_policy
+        .iter()
+        .flat_map(|policy| policy.split_whitespace())
+        .collect();
+    if !policy.is_empty() {
+        let said = policy.parse::<crate::policy::Policy>();
+        said.map_err(|e| e.replace("--node-policy", "`nodePolicy`"))?;
+        words.push(format!("--node-policy {policy}"));
     }
     match &answers.join {
         Some(join) => {
@@ -723,6 +739,25 @@ mod tests {
         ] {
             let told = answers(&format!("disk: sda\nreleaseKey: {bad}\n")).unwrap();
             assert!(plan(&told, &two, 300 << 20, 1 << 20).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn node_policy_given_at_install_is_on_the_nodes_line_and_a_wrong_word_installs_nothing() {
+        let one = [disk("sda", 8)];
+        let told = answers("disk: sda\nnodePolicy: 'hardened, node-network'\n").unwrap();
+        let (_, config) = plan(&told, &one, 300 << 20, 1 << 20).unwrap();
+        let (_, args) = crate::init::configured(&config);
+        let policy = args.iter().position(|arg| arg == "--node-policy").unwrap();
+        assert_eq!(args[policy + 1], "hardened,node-network");
+        assert_eq!(args.last().unwrap(), "--claim");
+        // None said: none on the line, and the node does everything, as before.
+        let (_, config) = plan(&answers("disk: sda\n").unwrap(), &one, 300 << 20, 1 << 20).unwrap();
+        assert!(!config.contains("node-policy"), "{config}");
+        for bad in ["hardned", "'hardened --claim'", "devices=gpus"] {
+            let told = answers(&format!("disk: sda\nnodePolicy: {bad}\n")).unwrap();
+            let why = plan(&told, &one, 300 << 20, 1 << 20).unwrap_err();
+            assert!(why.contains("`nodePolicy`"), "{bad}: {why}");
         }
     }
 

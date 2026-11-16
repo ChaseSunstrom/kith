@@ -501,9 +501,18 @@ pub fn served(store: &Store, me: &str) -> Vec<Dir> {
 // could swap a part for a link; the mount follows the final path. A kernel that has openat2
 // with RESOLVE_BENEATH would close it: bind from a file descriptor.
 pub fn host_dir(state: &Path, dir: &Dir) -> Result<PathBuf, String> {
+    host_dir_under(state, dir, &crate::policy::get())
+}
+
+/// [`host_dir`], under a node's policy: one that has `hostPaths` off makes and mounts no
+/// directory of the node's own that the store names.
+fn host_dir_under(state: &Path, dir: &Dir, policy: &crate::policy::Policy) -> Result<PathBuf, String> {
     check_path(&dir.namespace, &dir.path)?;
     let made = |path: &Path, e: std::io::Error| format!("cannot make {}: {e}", path.display());
     if dir.namespace == SYSTEM {
+        if let Some(why) = policy.refusal("hostPaths") {
+            return Err(why);
+        }
         let path = PathBuf::from(&dir.path);
         std::fs::create_dir_all(&path).map_err(|e| made(&path, e))?;
         return Ok(path);
@@ -953,6 +962,13 @@ spec: { node: a, path: tiny, size: 1Gi }
                 .unwrap_err()
                 .contains("absolute")
         );
+        // A node whose owner turned that off makes none, and says which word did; a Volume
+        // under the state directory is made as before.
+        let hardened = crate::policy::Policy::hardened();
+        let never = state.join("never");
+        let why = host_dir_under(&state, &dir(SYSTEM, never.to_str().unwrap()), &hardened).unwrap_err();
+        assert!(why.contains("hostPaths is off") && !never.exists(), "{why}");
+        assert!(host_dir_under(&state, &dir("shop", "kept"), &hardened).is_ok());
         let _ = std::fs::remove_dir_all(&state);
     }
 

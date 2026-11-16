@@ -1021,6 +1021,47 @@ certificates last ten years and cannot be renewed (a node's stops being taken wh
 an Identity's when the Identity is), and `kith` itself
 only talks to the kithd on its own machine.
 
+## What a node refuses, whatever the cluster says
+
+A node runs what the cluster's store tells it, and some of that is the node's own root: an
+`exec` unit, a container that is root, a VM from a path on the node. Whoever holds an
+admin's credential has every node through them. A node's owner can turn each off for that
+node, where its kithd is started and nowhere else:
+
+```sh
+kithd --node-policy hardened              # none of it, and a GPU the only Device handed out
+kithd --node-policy hardened,node-network # the same, but containers that are no pod
+kithd --node-policy no-exec-units,no-run  # everything but exec units and `kith run`
+```
+
+The words: `exec-units`, `root-containers` (off: no container is root unless it has a
+range of ids of its own, as a pod's has on kith OS), `unconfined` (a `seccomp` that is unconfined or allows refused calls
+back), `node-network` (containers that are no pod), `vms`, `vm-paths` (a VM's kernel,
+firmware or disks as paths on the node, or another hypervisor than qemu), `passthrough`,
+`host-paths` (a Volume in `kith-system`, whose path is anywhere on the node), `run`
+(`kith run`), `wipe` (the cluster erasing this node's key, or setting its duress codes)
+and `devices=gpu+input` (the classes of Device a DeviceClaim hands out; `all`, or nothing
+after the `=` for none; with classes named, only Devices the node listed itself are
+handed out, not ones written by hand). `no-` before a word turns it off, and they are
+read left to right. On kith OS they go with kithd's other arguments at the end of what
+the config partition says (` -- --node-policy hardened`); elsewhere `KITH_NODE_POLICY`
+does too.
+
+What a node refuses is not run there, and the Workload says why:
+
+```
+this node's policy refuses exec units: processes of the node's root, with all of /dev (execUnits is off: `--node-policy exec-units` where the node's kithd is started allows it)
+```
+
+`kith get node/NAME -o yaml` shows a node's policy under `status.policy` once it has
+one. A node with none does everything, as before. The scheduler reads it: a Workload or
+Job that asks for what a node refuses is placed on the nodes that allow it, and waits,
+saying so, when none does. (A NodeWorkload's copy, a claimed Device and a Volume belong
+to one node: there the node itself says why it runs nothing.) A VM's kernel and disks are
+paths on the node today, so `vms` without `vm-paths` runs no VM of use. A word kithd does
+not know ends its start (on kith OS the node runs `hardened` instead, and says so on its
+console). What this is and is not a defence against: [SECURITY.md](SECURITY.md).
+
 ## Restarting a node on purpose
 
 To restart or upgrade a node without losing its work, drain it first. A drain
@@ -3218,6 +3259,7 @@ join:                         # without it the node starts a new cluster
 encrypt: true                 # its state under a key the cluster holds: see "Encrypted state"
 releaseKey: $KEY              # kith OS releases signed by this key only: see "Rolling a release"
 lanReleases: true             # releases may come from a server on the node's private ranges
+nodePolicy: hardened          # what the cluster may not have this node do: see "What a node refuses, whatever the cluster says"
 ```
 
 Then nothing is asked, and nothing confirmed: a stick with answers on it
