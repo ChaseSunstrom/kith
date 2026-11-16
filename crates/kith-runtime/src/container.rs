@@ -258,6 +258,10 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
     Ok(())
 }
 
+/// The words of the refusal of a `no_node_root` unit that would be root, by which whoever
+/// set it knows the refusal for its own.
+pub const NODE_ROOT: &str = "would be the node's root";
+
 /// What root keeps in a container that is `as_image`, where kithd is root: what Docker and
 /// containerd give by default. Nothing in it reaches out of the container's namespaces.
 const ROOTS: [Capability; 14] = [
@@ -1281,7 +1285,7 @@ fn spec_shifted(
     }
     let shift = shift.filter(|_| uid.is_root());
     if unit.no_node_root && user == 0 && uid.is_root() && shift.is_none() {
-        return Err("this container would be the node's root: its user is root and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser".into());
+        return Err(format!("this container {NODE_ROOT}: its user is root and it keeps the node's users (it has a device, the node's network, `hostUsers`, or its image or a volume is on a file system that takes no id-mapped mount): say who with runAsUser").into());
     }
     let mut spec = match shift {
         _ if !uid.is_root() => Spec::rootless(uid.as_raw(), gid.as_raw()),
@@ -1937,7 +1941,7 @@ mod tests {
             };
             let made = spec_shifted("a", &image, &unit, "/kith/a", Path::new("/b"), (kithd, Gid::from_raw(0)), shift);
             assert_eq!(made.is_err(), refused, "{kithd} {shift:?}");
-            assert!(made.err().is_none_or(|e| e.to_string().contains("the node's root")));
+            assert!(made.err().is_none_or(|e| e.to_string().contains(NODE_ROOT)));
         }
         let user = Unit {
             no_node_root: true,

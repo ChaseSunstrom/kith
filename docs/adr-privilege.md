@@ -328,8 +328,8 @@ before any of the split:
   `api/run.rs`, `crypt.rs`, by `policy.rs`), in words that name the key and the word
   that turns it on; a Node's status says its policy, so the scheduler does not place on a node
   what it would refuse, and `kith get nodes` shows it;
-- where `execUnits`, `vmPaths` and `run` are all off, kithd cuts its bounding set at
-  start to what it and its containers use: the fourteen of a root pod
+- where `execUnits`, `vmPaths` and `run` are all off, kithd is to cut its bounding set
+  at start (not built yet: T-0590) to what it and its containers use: the fourteen of a root pod
   (`container.rs`, `ROOTS`, with `SETPCAP`, `SETFCAP`, `FSETID`, `SYS_CHROOT` and
   `AUDIT_WRITE` among them) and its own (`SYS_ADMIN`, `NET_ADMIN`, `NET_RAW`,
   `SYS_BOOT`, `SYS_RESOURCE`, `BPF`); found exactly by the VM tests with a root pod, an

@@ -2186,7 +2186,7 @@ async fn start(
                 .map_err(|e| e.to_string())?;
             let created = runtime.create(id, &image, &unit, log("out")?, log("err")?);
             // The runtime says what the container would be; here whose word refused it.
-            let whose = |e: kith_runtime::Error| match e.to_string().contains("would be the node's root") {
+            let whose = |e: kith_runtime::Error| match e.to_string().contains(kith_runtime::NODE_ROOT) {
                 true => format!(
                     "this node's policy refuses containers that are the node's root (rootContainers is off: `--node-policy root-containers` where the node's kithd is started allows them): {e}"
                 ),
