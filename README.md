@@ -1570,9 +1570,16 @@ Four example packages show the shape ([`packages/hyprland`](packages/hyprland),
 
 ```sh
 kith get seat                       # office-pc-seat0
+kith get seat office-pc-seat0 -o yaml > seat.yaml   # add under metadata.labels: kith.dev/namespaces: desktop
+kith apply -f seat.yaml             # the seat is given to the namespace desktop
 kith package render packages/hyprland --name office -n desktop \
   --set seat=office-pc-seat0 --set image=registry.example/me/hyprland:1 | kith apply -f -
 ```
+
+- The seat must name the namespace the session is in (`desktop` above) in its
+  `kith.dev/namespaces` label, or the session's claim is refused and its `status.message`
+  says so: a seat nobody labelled is `kith-system`'s alone ([Who may claim
+  what](#claiming-hardware)).
 
 - Each session package renders a `DeviceClaim` for the seat (exclusive) and a
   `Workload` of one replica that holds it; see [Hardware](#hardware) for what
@@ -2259,6 +2266,17 @@ spec:
   it holds together.
 - `kith get deviceclaim render -o yaml` shows `status.node`, `status.devices` and
   `status.holders`; a claim that comes to nothing has a `status.message` instead.
+- **Who may claim what.** A `Device` or `Seat` is given to namespaces by its label
+  `kith.dev/namespaces`, a comma-separated list (`default, desktop`). A claim in namespace
+  N reaches it only if the label lists N, or N is `kith-system`, the cluster's own. With no
+  label, a `gpu` is open to every namespace, and every other `Device` (`input`, `audio`,
+  `camera`, `display`, `usb`, `other`) and every `Seat` is `kith-system`'s alone. A seat
+  claim, `access: client` included, is checked against the Seat's label, not its devices'.
+  The label is an admin's: `kith get seat NAME -o yaml`, add it under `metadata.labels`,
+  `kith apply -f`. Discovery keeps it, and a worker cannot add, change or drop it. Taking
+  it away refuses a claim at the next pass, and its `status.message` says why (`Seat X is
+  not given to namespace N`). A `Device` or `Seat` made before this label had no label, so
+  it is `kith-system`'s until one is set.
 - **A share of a GPU's vram.** A `shared` claim may say `share: { vram: 512Mi }`: what it
   asks for of each Device it holds, counted against the Device's `vram` label (a node writes
   it from the card's total vram). A workload's shares add up; a share that does not fit

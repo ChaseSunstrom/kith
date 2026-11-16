@@ -211,7 +211,7 @@ spec: { node: a, class: gpu, path: /dev/dri/card0 }
 ---
 apiVersion: kith.dev/v1
 kind: Seat
-metadata: { name: a-seat0 }
+metadata: { name: a-seat0, labels: { kith.dev/namespaces: default } }
 spec: { node: a, devices: [a-gpu-card0], reserve: { cpu: 2, memory: 4Gi } }
 ---
 apiVersion: kith.dev/v1

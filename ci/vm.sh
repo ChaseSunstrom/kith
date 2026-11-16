@@ -1541,6 +1541,18 @@ EOF
             sandbox rooted ',"runAsUser":0,"userNamespaces":true' 'userNamespaces: this container is the node.s root'
             ! grep -q nested "$work/rooted.out" || fail "the node's root was let make a user namespace: $(cat "$work/rooted.out")"
 
+            # The seat is kith-system's until its label names the namespace that claims it: the
+            # node's discovered Seat is given to default here, as an admin would label it.
+            any GET /v1/resources >"$work/seat.json" || fail "the resources could not be read"
+            python3 -c '
+import json, sys
+found = [r for r in json.load(open(sys.argv[1])) if r.get("kind") == "Seat" and r["metadata"]["name"] == "n1-seat0"]
+assert len(found) == 1, "no Seat n1-seat0"
+found[0]["metadata"].pop("revision", None)
+found[0]["metadata"].setdefault("labels", {})["kith.dev/namespaces"] = "default"
+json.dump(found, open(sys.argv[2], "w"))
+' "$work/seat.json" "$work/seat-label.json" || fail "the seat n1-seat0 was not found to label: $(cat "$work/seat.json")"
+            any POST /v1/apply "$work/seat-label.json" >/dev/null || fail "the seat n1-seat0 was not given to the namespace default"
             # A session's input: a keyboard plugged in while a container holds the seat is
             # one more node in its /dev that it can open, and nothing is started again for it.
             cat >"$work/apply.json" <<EOF

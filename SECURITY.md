@@ -722,7 +722,8 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   It is given no input device and not the GPU's card (on NVIDIA's driver it has the
   driver's own nodes, all but the one that sets a screen's mode), and cannot write the
   seat's directory. kith puts nothing between an app and the session. What decides who
-  gets in is the namespace: a client is placed only while a workload of its own
+  gets in is the seat's `kith.dev/namespaces` label, which must name the claim's namespace
+  (or the seat is kith-system's), and then the namespace: a client is placed only while a workload of its own
   namespace holds the seat, so whoever may apply a DeviceClaim and a Workload in the
   session's namespace can put a program in that session, without waiting for the seat
   as a second holder would, and nobody of another namespace can, unless the session's
@@ -1448,7 +1449,7 @@ against what a Package may write, template memory, devices and seats, and kith-l
 kith-lsp. The findings and what became of each are in
 [docs/security-review-2.md](docs/security-review-2.md). Three were HIGH:
 
-- Two are fixed:
+- Three are fixed:
   - a kith-lang file whose shared lists took 2^60 steps to walk;
   - a Package template could grow a value past any limit before it was charged, and a
     render that panicked ended kithd. Templates are now rendered in a kithd started
@@ -1456,11 +1457,16 @@ kith-lsp. The findings and what became of each are in
     of memory, 20 s of CPU, 30 s in all and 32 MB of answer. A render that passes any of
     these, panics or overflows its stack ends only that process, and the Release says
     which limit it hit (T-0645).
-- One has its own task: Devices and Seats are not given to namespaces, so anyone who may
-  apply in any namespace can claim a Seat nobody holds, or a keyboard (T-0646).
-
-Until that is done, a person who may apply DeviceClaims in some namespace can take a
-node's input devices while no session holds them.
+  - Devices and Seats are given to namespaces (T-0646). A DeviceClaim in namespace N
+    reaches a Device or Seat only if its `kith.dev/namespaces` label lists N (comma-separated),
+    or N is `kith-system`. A Device with no such label is kith-system's alone, except a GPU,
+    which every namespace may claim as before. A Seat is kith-system's alone unless its label
+    names the namespace, and a seat claim, `access: client` included, is checked against the
+    Seat's own label, not its devices'. Taking the label away refuses the claim at the next
+    pass. The label is an admin's: discovery keeps it, and a worker can neither add, change
+    nor drop it. Seats and non-GPU Devices with no label are refused to every namespace but
+    kith-system after the upgrade, until someone labels them (`kith get seat NAME -o yaml`,
+    add the label, `kith apply -f`).
 
 - Dependencies: checked against the RustSec advisory database with `cargo audit` on
   2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
