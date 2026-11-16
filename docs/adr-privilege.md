@@ -249,6 +249,7 @@ policy:
   vms: true
   vmPaths: true          # a VM's disk, kernel or firmware as a path on the node; another program than qemu
   passthrough: true      # PCI devices handed to a VM
+  hostPaths: true        # a Volume of kith-system: a directory anywhere on the node, as its path says
   run: true              # POST /v1/run
   wipe: true             # a NodeKey of the store may erase this node, or change its duress keys
 ```
@@ -258,6 +259,11 @@ right: `no-exec-units` turns one off, `exec-units` turns it on again,
 `devices=gpu+input` names the classes handed out. A word that is no word of the policy
 ends the start; on kith OS, where an ended start is a machine starting again for ever,
 the node runs hardened instead and says so.
+
+Where `devices` names classes, a Device is what the node's own look at its hardware
+finds: the store says what class a Device is and what its path is, so a node that went
+by the store's word would hand out its disk to whoever wrote "gpu" beside it. A Device
+written by hand is then not handed out on that node.
 
 `--node-policy hardened` is all of them off (`devices=gpu`). The list has one key for every
 item of "What the split does not change"; a new way for the store to be root on a node
@@ -324,6 +330,11 @@ before any of the split:
   unconfined unit and a nested unit, and never `SYS_MODULE`, `SYS_RAWIO`, `SYS_PTRACE`
   or `SYS_TIME`;
 - no system call filter on the single process. The filter is the serving part's.
+
+Built so far: the keys and their refusals, and the Node's status. Not yet: the scheduler
+reading a Node's policy, the bounding set, the installer's question. Until they are, a
+replica placed on a node that refuses it stays there and is not run, and a hardened node
+holds every capability.
 
 What Step A buys by itself: a certificate of the cluster that is stolen, or a hole in
 the store, is no longer root on a node whose owner said so. A hole in a parser is still

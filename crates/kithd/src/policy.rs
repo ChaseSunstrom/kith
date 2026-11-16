@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 /// Each key: the word that names it in `--node-policy`, as a Node's status and the design
 /// record name it, and what it lets the store have this node do. A new way for the store
 /// to be root on a node gets a row here in the same change.
-pub const KEYS: [(&str, &str, &str); 9] = [
+pub const KEYS: [(&str, &str, &str); 10] = [
     (
         "exec-units",
         "execUnits",
@@ -41,6 +41,11 @@ pub const KEYS: [(&str, &str, &str); 9] = [
         "a virtual machine's kernel, firmware or disks as paths on the node, or another hypervisor than qemu",
     ),
     ("passthrough", "passthrough", "PCI devices handed to a virtual machine"),
+    (
+        "host-paths",
+        "hostPaths",
+        "a Volume of kith-system: a directory anywhere on the node, as its path says",
+    ),
     ("run", "run", "POST /v1/run"),
     (
         "wipe",
@@ -86,7 +91,7 @@ pub fn read(text: Option<&str>, first: bool) -> Result<Policy, String> {
 
 /// Set once at start, before anything is run.
 pub fn set(policy: Policy) {
-    let _ = POLICY.set(policy);
+    POLICY.set(policy).expect("the policy is set once, at start");
 }
 
 /// This node's policy: everything allowed where none was set.
@@ -109,6 +114,23 @@ impl Policy {
             "{key} is no key of the policy"
         );
         !self.off.contains(key)
+    }
+
+    /// Does it name the classes of Device handed out? Then a Device is what this node
+    /// finds itself, never what the store says one is (`devices::as_found`).
+    pub fn names_devices(&self) -> bool {
+        self.devices.is_some()
+    }
+
+    /// Why what `key` names is not done on this node, where its policy has it off: the key,
+    /// and the word that turns it on where the node's kithd is started.
+    pub fn refusal(&self, key: &str) -> Option<String> {
+        let (word, _, what) = KEYS.iter().find(|(_, known, _)| *known == key).expect("a key of KEYS");
+        (!self.allows(key)).then(|| {
+            format!(
+                "this node's policy refuses {what} ({key} is off: `--node-policy {word}` where the node's kithd is started allows it)"
+            )
+        })
     }
 
     pub fn device(&self, class: &DeviceClass) -> bool {
@@ -141,14 +163,7 @@ impl Policy {
     /// holds a PCI device (which a VM of it would be handed).
     pub fn refuses(&self, template: &Template, pci: bool) -> Vec<String> {
         let mut why = Vec::new();
-        let mut refuse = |key: &str| {
-            let (word, _, what) = KEYS.iter().find(|(_, known, _)| *known == key).expect("a key of KEYS");
-            if !self.allows(key) {
-                why.push(format!(
-                    "this node's policy refuses {what} ({key} is off: `--node-policy {word}` where the node's kithd is started allows it)"
-                ));
-            }
-        };
+        let mut refuse = |key: &str| why.extend(self.refusal(key));
         if !template.exec.is_empty() {
             refuse("execUnits");
         }

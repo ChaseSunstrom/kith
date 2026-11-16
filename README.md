@@ -986,11 +986,14 @@ The words: `exec-units`, `root-containers` (off: every container is held to
 `runAsNonRoot`), `unconfined` (a `seccomp` that is unconfined or allows refused calls
 back), `node-network` (containers that are no pod), `vms`, `vm-paths` (a VM's kernel,
 firmware or disks as paths on the node, or another hypervisor than qemu), `passthrough`,
-`run` (`kith run`), `wipe` (the cluster erasing this node's key, or setting its duress
-codes) and `devices=gpu+input` (the classes of Device a DeviceClaim hands out; `all`, or
-nothing after the `=` for none). `no-` before a word turns it off, and they are read left
-to right. On kith OS they go with kithd's other arguments at the end of what the config
-partition says (` -- --node-policy hardened`); elsewhere `KITH_NODE_POLICY` does too.
+`host-paths` (a Volume in `kith-system`, whose path is anywhere on the node), `run`
+(`kith run`), `wipe` (the cluster erasing this node's key, or setting its duress codes)
+and `devices=gpu+input` (the classes of Device a DeviceClaim hands out; `all`, or nothing
+after the `=` for none; with classes named, only Devices the node listed itself are
+handed out, not ones written by hand). `no-` before a word turns it off, and they are
+read left to right. On kith OS they go with kithd's other arguments at the end of what
+the config partition says (` -- --node-policy hardened`); elsewhere `KITH_NODE_POLICY`
+does too.
 
 What a node refuses is not run there, and the Workload says why:
 

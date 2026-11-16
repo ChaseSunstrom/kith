@@ -659,9 +659,16 @@ impl Controller {
         // Devices they come to (`granted` knows no other node's).
         // And, the same way, the Volumes of this node they mount.
         // And what its seats ask of each workload's cgroups here (a guarantee, or holding back).
-        let (resources, granted, mounted, tunes): (Vec<Resource>, _, _, _) = {
+        // (Where this node's policy names the classes of Device it hands out, a Device is what
+        // the node finds itself: looked for before the store is held.)
+        let node_policy = crate::policy::get();
+        let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+        let found = me.filter(|_| node_policy.names_devices());
+        let found = found.map(|me| crate::devices::scan(Path::new("/sys"), me));
+        let (resources, granted, mounted, tunes, found): (Vec<Resource>, _, _, _, _) = {
             let file_store = shared.store.lock().expect("a handler panicked holding the store");
             let store = &file_store.store;
+            let found = found.map(|found| crate::devices::as_found(store, &found));
             let kinds = ["Workload", "NodeWorkload", "Job"];
             let resources = kinds
                 .into_iter()
@@ -677,10 +684,10 @@ impl Controller {
                 granted.unwrap_or_default(),
                 mounted.unwrap_or_default(),
                 tunes.unwrap_or_default(),
+                found,
             )
         };
         let mut wanted: BTreeMap<String, Slot> = BTreeMap::new();
-        let node_policy = crate::policy::get();
         // Per Workload, NodeWorkload or Job key: things to say in its status that belong to no unit.
         let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut owners = BTreeSet::new();
@@ -717,11 +724,13 @@ impl Controller {
             // whatever the store says (docs/adr-privilege.md): said where a replica is this
             // node's to run.
             let mut refused = node_policy.refuses(&template, !crate::vm::pci(&devices).is_empty());
-            let kept = |(_, class): &&(String, kith_api::kinds::DeviceClass)| !node_policy.device(class);
+            let kept = |(name, class): &&(String, kith_api::kinds::DeviceClass)| {
+                !node_policy.device(class) || found.as_ref().is_some_and(|found| !found.contains(name))
+            };
             let kept: Vec<&str> = classes.iter().filter(kept).map(|(name, _)| name.as_str()).collect();
             if !kept.is_empty() {
                 refused.push(format!(
-                    "this node's policy hands out no Device of the class of {} (`--node-policy devices=…` where the node's kithd is started names the classes it does)",
+                    "this node's policy hands out no Device of the class of {}, or it is not what this node finds its own hardware to be (`--node-policy devices=…` where the node's kithd is started names the classes it does)",
                     kept.join(", ")
                 ));
             }
