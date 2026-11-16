@@ -288,10 +288,10 @@ Only the newest version is fixed. There are no security releases of older ones.
   the controller's module answered is asked for as that writer would be asked if they
   applied it, and what it no longer answers, for leave to delete it; where the writer
   may not, nothing new is made, what was made stays, and the resource's status names
-  the resource, the right and the writer. The writer's rights are asked only when the
-  controller runs: a right taken away from them shows at its next run (nothing new is
-  made between), and a run that was refused is made again when the KindDefinition is
-  applied again, which is the way to mend it. The controller does not act as whoever applied
+  the resource, the right and the writer. The writer's rights are asked when the
+  controller runs, and it runs again when what they are read from changes (the writer's
+  Identity, a Role, a RoleBinding) or the KindDefinition is applied again: a right granted
+  or taken away shows then (nothing new is made between). The controller does not act as whoever applied
   the custom resource it runs for, so a custom kind lets someone ask for a thing without
   the right to make its parts, as an operator does.
 - **An image whose template names keys** (`signedBy`) is run only if one of them signed

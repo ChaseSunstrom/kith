@@ -150,9 +150,29 @@ impl Shared {
 }
 
 /// What a run answered for: the resource's revision, the definition's (the controller acts
-/// as whoever applied it: applied again, a refused run is made again), the module, and the
-/// revision of each thing it owns. The same again is not asked again.
-type Stamp = (releases::Stamp, releases::Stamp, [u8; 32], Vec<(String, Option<u64>)>);
+/// as whoever applied it: applied again, a refused run is made again), what that one's rights
+/// are read from ([`rights`]), the module, and the revision of each thing it owns. The same
+/// again is not asked again.
+type Stamp = (
+    releases::Stamp,
+    (releases::Stamp, u64),
+    [u8; 32],
+    Vec<(String, Option<u64>)>,
+);
+
+/// What the rights of `definition`'s writer are read from, as one number: its Identity, and
+/// every Role and RoleBinding. (A right granted later is a reason to run again what was refused.)
+fn rights(store: &Store, definition: &Resource) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let writer = definition.metadata.annotations.get(releases::WRITER);
+    let identity = writer.and_then(|writer| store.get(&format!("Identity/{writer}")));
+    let read = store.list(Some("Role")).chain(store.list(Some("RoleBinding")));
+    let mut hasher = std::hash::DefaultHasher::new();
+    for resource in read.chain(identity) {
+        (resource.key(), releases::stamp(store, resource)).hash(&mut hasher);
+    }
+    hasher.finish()
+}
 
 struct Job {
     key: String,
@@ -170,7 +190,7 @@ fn due(store: &Store, seen: &BTreeMap<String, Stamp>) -> Vec<Job> {
             continue;
         };
         let digest = wasm::digest(&wasm);
-        let defined = releases::stamp(store, definition);
+        let defined = (releases::stamp(store, definition), rights(store, definition));
         for resource in store.list(definition.spec["kind"].as_str()) {
             let key = resource.key();
             let recorded = releases::recorded(resource);
@@ -602,6 +622,50 @@ mod tests {
             store.apply(resource.unwrap()).unwrap();
         }
         assert_eq!(due(&store, &seen).len(), 1, "applied again, the controller runs again");
+    }
+
+    /// ... and so is a change to what its writer's rights are read from: a Role granted later
+    /// shows without the definition being applied again. Someone else's Identity is no reason.
+    #[test]
+    fn controller_retry_a_refused_run_is_made_again_when_its_writers_rights_change() {
+        let key = "GameServer/play/one";
+        let with_module = KIND.replace(
+            "schema: { type: object }",
+            "schema: { type: object }, controller: { wasm: AAEC }",
+        );
+        let mut store = bob_defines("ConfigMap", false);
+        for resource in Resource::from_source(&releases::by_bob(&with_module, 0)).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let mut seen = BTreeMap::new();
+        let ran = |store: &Store, seen: &mut BTreeMap<String, Stamp>| {
+            let jobs = due(store, seen);
+            assert_eq!(jobs.len(), 1);
+            seen.insert(key.to_string(), jobs.into_iter().next().unwrap().stamp);
+            assert!(due(store, seen).is_empty());
+        };
+        ran(&store, &mut seen);
+        let apply = |store: &mut Store, source: &str| {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        };
+        let carol = "apiVersion: kith.dev/v1\nkind: Identity\nmetadata: { name: carol }\nspec: {}\n";
+        apply(&mut store, carol);
+        assert!(due(&store, &seen).is_empty(), "another Identity is not the writer's");
+        let role = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: play }\n\
+                    spec: { rules: [{ kinds: [ConfigMap, Secret], verbs: [apply], namespaces: [play] }] }\n";
+        apply(&mut store, role);
+        ran(&store, &mut seen);
+        let binding = "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: more }\n\
+                       spec: { role: play, subjects: ['group:ops'] }\n";
+        apply(&mut store, binding);
+        ran(&store, &mut seen);
+        let bob = store.get("Identity/bob").unwrap().clone();
+        let mut bob = serde_json::to_value(bob).unwrap();
+        bob["spec"]["groups"] = json!(["ops"]);
+        store.apply(serde_json::from_value(bob).unwrap()).unwrap();
+        ran(&store, &mut seen);
     }
 
     /// Admission modules are asked of custom kinds only: the kinds the API stamps with their
