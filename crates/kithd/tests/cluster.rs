@@ -816,7 +816,7 @@ fn volume_files_go_in_and_come_out_through_another_node() {
     let piped = Command::new("sh")
         .args(["-c", &piped])
         .current_dir(&alpha.dir)
-        .env("KITH_SOCKET", alpha.dir.join("kithd.sock"))
+        .env("KITH_SOCKET", "kithd.sock")
         .output()
         .unwrap();
     let err = String::from_utf8_lossy(&piped.stderr);
