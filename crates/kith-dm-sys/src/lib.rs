@@ -209,6 +209,14 @@ pub fn project_usage(on: &Path, id: u32) -> Result<(u64, u64)> {
     Ok((at(16), at(40)))
 }
 
+/// The limit project `id` is held to on the file system `on` is on, in bytes (0: none).
+pub fn project_limit(on: &Path, id: u32) -> Result<u64> {
+    let mut answer = [0u8; DQBLK];
+    // Q_GETQUOTA
+    quota(on, 0x80_0007, id, &mut answer)?;
+    Ok(u64::from_ne_bytes(answer[0..8].try_into().unwrap()).saturating_mul(1024))
+}
+
 /// Tell the kernel that partition `number` (from 1) of `disk`, which starts at byte `start`,
 /// is now `length` bytes long: the disk's partition table says so already, and a disk in
 /// use is one whose table the kernel will not read again by itself.

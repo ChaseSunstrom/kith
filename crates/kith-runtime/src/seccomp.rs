@@ -234,7 +234,8 @@ mod tests {
         );
         assert_eq!(said_to(&[], false, NATIVE, FILE_SETATTR, [0, 0]), ALLOW);
         // Reading them, and every other ioctl, goes through.
-        for through in [0x801c_581f, 0x8008_6601, libc::TIOCGWINSZ as u64, libc::FIONREAD as u64] {
+        // (FS_IOC_FSGETXATTR, FS_IOC_GETFLAGS, TIOCGWINSZ, FIONREAD.)
+        for through in [0x801c_581f, 0x8008_6601, 0x5413, 0x541b] {
             assert_eq!(ioctl(true, through), ALLOW, "{through:#x}");
         }
         assert_eq!(said_to(&[], true, NATIVE, libc::SYS_read, [0, FSSETXATTR]), ALLOW);

@@ -1867,13 +1867,23 @@ impl Template {
             if c.run_as_non_root == Some(true) && c.run_as_user == Some(0) {
                 return Err(format!("{at}: runAsNonRoot, and runAsUser: 0 is root"));
             }
-            if let Some(storage) = c.resources.as_ref().and_then(|r| r.storage.as_ref())
-                && storage.bytes().is_none()
-            {
-                return Err(format!(
-                    "{at}: resources.storage: `{}` is not a whole number of bytes from 1 to 2^53 - 1",
-                    String::from(storage.clone())
-                ));
+            if let Some(storage) = c.resources.as_ref().and_then(|r| r.storage.as_ref()) {
+                let said = String::from(storage.clone());
+                match storage.bytes() {
+                    None => {
+                        return Err(format!(
+                            "{at}: resources.storage: `{said}` is not a whole number of bytes from 1 to 2^53 - 1"
+                        ));
+                    }
+                    // What the directories kithd makes for a pod's containers hold by
+                    // themselves (4 KiB each): a limit under it fails them, not the pod's writes.
+                    Some(bytes) if bytes < 64 << 10 => {
+                        return Err(format!(
+                            "{at}: resources.storage: `{said}` is less than 64Ki, which a pod's own directories hold"
+                        ));
+                    }
+                    Some(_) => {}
+                }
             }
             for mount in &c.volume_mounts {
                 mount

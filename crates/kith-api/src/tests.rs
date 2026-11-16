@@ -1476,6 +1476,11 @@ fn storage_limit_is_bytes_a_container_may_write() {
             "{ containers: [{ name: c, image: i, resources: { storage: 9007199254740992 } }] }",
             "from 1 to 2^53 - 1",
         ),
+        // (Less than the directories kithd makes a pod's containers would hold by themselves.)
+        (
+            "{ containers: [{ name: c, image: i, resources: { storage: 4Ki } }] }",
+            "container `c`: resources.storage: `4Ki` is less than 64Ki",
+        ),
         (
             "{ containers: [{ name: c, image: i, resources: { storage: lots } }] }",
             "invalid quantity `lots`",
