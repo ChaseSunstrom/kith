@@ -59,9 +59,18 @@ fn same_writer(store: &Store, owner: &Resource, caller: &crate::access::Caller) 
     }
     Err(format!(
         "{} was applied by an earlier Identity named {name}, or by {name} before it had the key it has now, \
-         so it makes nothing new: apply it again",
-        owner.key()
+         so it makes nothing new: {}",
+        owner.key(),
+        again(owner)
     ))
+}
+
+/// How `owner`'s writer mends what is said of it: a Package is pushed, the rest applied.
+fn again(owner: &Resource) -> &'static str {
+    match owner.kind.as_str() {
+        "Package" => "push it again",
+        _ => "apply it again",
+    }
 }
 
 /// For tests: the key `nth` (of two, made once) of the Identity bob, as a PEM and its print.
@@ -471,10 +480,10 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
     let mut plan = Plan::default();
     for release in store.list(Some("Release")) {
         let key = release.key();
-        let output = match inputs(store, release) {
-            Err(e) => Err(e),
-            Ok((now, ..)) => match renders.get(&key) {
-                Some((had, output)) if *had == now => output.clone(),
+        let (output, package) = match inputs(store, release) {
+            Err(e) => (Err(e), None),
+            Ok((now, package, _)) => match renders.get(&key) {
+                Some((had, output)) if *had == now => (output.clone(), Some(package)),
                 // (Not rendered yet: next time.)
                 _ => continue,
             },
@@ -484,6 +493,19 @@ fn plan(store: &Store, renders: &Renders) -> Plan {
             let done = reconcile(store, &key, &recorded(release), &output.resources, true)?;
             // (Asked on every pass: a writer that loses a right is told at once.)
             writer_may(store, release, &output.resources, &done.delete)?;
+            // And of whoever pushed the Package it came from: no more than its pusher, besides
+            // the Release's writer. One the Repository the Release names supplied has none: that
+            // Repository's key (or, with none, its address) is its trust. Any other, annotated
+            // or not, is asked of its writer, and refused when none is written down.
+            let origin = release.spec["package"]["repo"]
+                .as_str()
+                .and_then(|repo| origin(store, repo));
+            let fetched = |package: &Resource| {
+                origin.is_some() && package.metadata.annotations.get(REPOSITORY) == origin.as_ref()
+            };
+            if let Some(package) = package.filter(|package| !fetched(package)) {
+                writer_may(store, package, &output.resources, &done.delete)?;
+            }
             Ok((output, done))
         });
         let mut step = Step {
@@ -535,12 +557,14 @@ pub fn writer_may(store: &Store, owner: &Resource, resources: &[Resource], gone:
     let Some(writer) = owner.metadata.annotations.get(WRITER) else {
         return Err(format!(
             "nobody is written down as having applied {key} (it was applied before kithd wrote that down), \
-             so it makes nothing new: apply it again"
+             so it makes nothing new: {}",
+            again(owner)
         ));
     };
     let Some(caller) = Caller::named(writer) else {
         return Err(format!(
-            "{key} was applied by {writer}, as whom kithd makes nothing: apply it again"
+            "{key} was applied by {writer}, as whom kithd makes nothing: {}",
+            again(owner)
         ));
     };
     same_writer(store, owner, &caller)?;
@@ -713,7 +737,21 @@ mod tests {
         for (path, source) in templates {
             files.insert(format!("templates/{path}"), (*source).to_string());
         }
-        Package::from_files(files).unwrap().resource().unwrap()
+        // (Pushed through the local socket: the API server writes down who pushes one.)
+        let mut package = Package::from_files(files).unwrap().resource().unwrap();
+        package
+            .metadata
+            .annotations
+            .insert(WRITER.into(), "local socket".into());
+        package
+    }
+
+    /// `package(..)` as bob pushed it with his key `nth`.
+    fn pushed_by_bob(mut package: Resource, nth: usize) -> Resource {
+        let notes = &mut package.metadata.annotations;
+        notes.insert(WRITER.into(), "bob".into());
+        notes.insert(KEY.into(), bobs_key(nth).1);
+        package
     }
 
     const MAP: &str = "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: {{ name }} }\n\
@@ -1358,5 +1396,207 @@ mod tests {
         assert_eq!(owned(&store), 2, "nothing is taken away or made");
         let (state, message) = again(&mut store, &by_bob(&more, 1));
         assert_eq!((state, owned(&store)), (json!("installed"), 1), "{message}");
+    }
+
+    /// A Package is rendered with no more than its pusher's rights, besides its Release
+    /// writer's: one who may push Packages and nothing else cannot publish a version an
+    /// admin's autoUpgrade Release then renders with the admin's rights (T-0550).
+    #[test]
+    fn package_rights_a_package_makes_nothing_its_pusher_may_not() {
+        let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: x }\nspec: { data: { k: v } }\n";
+        let owned = |store: &Store| store.list(None).filter(|resource| owner(resource).is_some()).count();
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "ConfigMap");
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 2));
+
+        // bob pushes 2.0.0, which makes a Secret: the Release (the local socket's, which
+        // may) follows the newest, and gets none of it.
+        let two = package("2.0.0", &[("map.yaml", MAP), ("x.yaml", secret)]);
+        store.apply(pushed_by_bob(two, 0)).unwrap();
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(
+            message.contains("Package/maps-2.0.0")
+                && message.contains("Secret/shop/x")
+                && message.contains("bob may not apply Secret in namespace shop"),
+            "{message}"
+        );
+        assert_eq!(owned(&store), 2, "what was installed stays, nothing new");
+        assert!(store.get("Secret/shop/x").is_none());
+
+        // The same for a version the Release names, pushed again by one without rights.
+        let pinned = RELEASE
+            .replace("autoUpgrade: true, ", "")
+            .replace("name: maps }", "name: maps, version: 3.0.0 }");
+        store.apply(package("3.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, &pinned);
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, "installed", "{}", said(&store).1);
+        let three = package("3.0.0", &[("map.yaml", MAP), ("x.yaml", secret)]);
+        store.apply(pushed_by_bob(three, 0)).unwrap();
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(message.contains("Package/maps-3.0.0"), "{message}");
+        assert!(store.get("Secret/shop/x").is_none());
+
+        // What a Package's pusher may not delete stays as well: bob may apply, not delete.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: { name: shop }\n\
+             spec: { rules: [{ kinds: [ConfigMap], verbs: [apply], namespaces: [shop] }] }\n---\n\
+             apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: { name: bob-shop }\nspec: { role: shop, subjects: [bob] }\n",
+        );
+        bob_is(&mut store, 0);
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!(owned(&store), 2);
+        let fewer = RELEASE.replace("extra: true", "extra: false");
+        store
+            .apply(pushed_by_bob(package("1.0.0", &[("map.yaml", MAP)]), 0))
+            .unwrap();
+        apply(&mut store, &fewer);
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(
+            message.contains("bob may not delete ConfigMap in namespace shop"),
+            "{message}"
+        );
+        assert_eq!(owned(&store), 2);
+        // Pushed again through the local socket: it goes on.
+        store.apply(package("1.0.0", &[("map.yaml", MAP)])).unwrap();
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 1));
+    }
+
+    /// The pusher check is skipped only for a Package that carries the origin of the
+    /// Repository its Release names: a Package annotated for another Repository, or for
+    /// one that is not there, or met by a Release that names none, is no fetched one, and
+    /// is asked of its pusher (T-0550).
+    #[test]
+    fn package_origin_only_the_named_repositorys_own_is_taken_as_fetched() {
+        const HUB: &str = "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\n\
+                           spec: { url: 'oci://127.0.0.1:1/kith' }\n";
+        let secret = "apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: x }\nspec: { data: { k: v } }\n";
+        let annotated = |origin: String| {
+            let mut package = pushed_by_bob(package("1.0.0", &[("map.yaml", MAP), ("x.yaml", secret)]), 0);
+            package.metadata.annotations.insert(REPOSITORY.into(), origin);
+            package
+        };
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(&mut store, HUB);
+        bob(&mut store, "ConfigMap");
+        let hubs = origin(&store, "hub").unwrap();
+
+        // A Release that names no Repository does not take one a Repository supplied.
+        store.apply(annotated(hubs.clone())).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(message.contains("there is no Package maps"), "{message}");
+        assert!(store.get("Secret/shop/x").is_none());
+
+        // One that names a Repository that is not there takes an annotation it cannot
+        // match, and is asked of the pusher.
+        store.apply(annotated(String::new())).unwrap();
+        apply(
+            &mut store,
+            &RELEASE.replace("name: maps }", "name: maps, repo: ghost }"),
+        );
+        settle(&mut store, &mut renders);
+        let (state, message) = said(&store);
+        assert_eq!(state, "error", "{message}");
+        assert!(store.get("Secret/shop/x").is_none(), "{message}");
+
+        // The Repository it names, and its own origin: a fetched one, not asked of a pusher.
+        store.apply(annotated(hubs)).unwrap();
+        apply(&mut store, &RELEASE.replace("name: maps }", "name: maps, repo: hub }"));
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, "installed", "{}", said(&store).1);
+        assert!(store.get("Secret/shop/x").is_some());
+    }
+
+    /// A Package's writer is its name and its key's print: the local socket's renders as
+    /// before; nobody written down, a node, one gone or made again under the name, makes
+    /// nothing new and says to push it again; one fetched from a Repository has no pusher,
+    /// the Repository's key is what it is trusted by.
+    #[test]
+    fn package_writer_a_package_is_acted_on_for_the_pusher_it_had() {
+        let owned = |store: &Store| store.list(None).filter(|resource| owner(resource).is_some()).count();
+        let plain = || package("1.0.0", &[("map.yaml", MAP)]);
+        let fewer = RELEASE.replace("extra: true", "extra: false");
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        bob(&mut store, "ConfigMap");
+        store.apply(plain()).unwrap();
+        apply(&mut store, RELEASE);
+        settle(&mut store, &mut renders);
+        assert_eq!((said(&store).0, owned(&store)), (json!("installed"), 2));
+
+        let mut again = |store: &mut Store, package: Resource, release: &str| {
+            store.apply(package).unwrap();
+            apply(store, release);
+            settle(store, &mut renders);
+            said(store)
+        };
+        // Nobody written down, or a node: nothing new, and how to mend it.
+        for written in [None, Some("node n1")] {
+            let mut package = plain();
+            package.metadata.annotations.remove(WRITER);
+            if let Some(written) = written {
+                package.metadata.annotations.insert(WRITER.into(), written.into());
+            }
+            let (state, message) = again(&mut store, package, &fewer);
+            assert_eq!(state, "error", "{message}");
+            assert!(
+                message.contains("Package/maps-1.0.0") && message.contains("push it again"),
+                "{message}"
+            );
+            assert_eq!(owned(&store), 2);
+        }
+        // bob, with the key he had: as he may.
+        let (state, message) = again(&mut store, pushed_by_bob(plain(), 0), &fewer);
+        assert_eq!((state, owned(&store)), (json!("installed"), 1), "{message}");
+
+        // bob made again under the name, or gone.
+        bob_is(&mut store, 1);
+        let (state, message) = again(&mut store, pushed_by_bob(plain(), 0), RELEASE);
+        assert_eq!(state, "error", "{message}");
+        assert!(
+            message.contains("an earlier Identity named bob") && message.contains("push it again"),
+            "{message}"
+        );
+        assert_eq!(owned(&store), 1);
+        store.delete("Identity/bob").unwrap();
+        let (_, message) = again(&mut store, pushed_by_bob(plain(), 0), RELEASE);
+        assert!(message.contains("there is no Identity bob"), "{message}");
+        assert_eq!(owned(&store), 1);
+        // Pushed again by the new bob: it goes on.
+        bob_is(&mut store, 1);
+        let (state, message) = again(&mut store, pushed_by_bob(plain(), 1), RELEASE);
+        assert_eq!((state, owned(&store)), (json!("installed"), 2), "{message}");
+
+        // A Package a Repository supplied has no pusher: the Repository's key is its trust.
+        let (mut store, mut renders) = (Store::default(), Renders::new());
+        apply(
+            &mut store,
+            "apiVersion: kith.dev/v1\nkind: Repository\nmetadata: { name: hub }\nspec: { url: 'oci://127.0.0.1:1/kith' }\n",
+        );
+        let mut here = plain();
+        here.metadata.annotations.remove(WRITER);
+        here.metadata
+            .annotations
+            .insert(REPOSITORY.into(), origin(&store, "hub").unwrap());
+        store.apply(here).unwrap();
+        apply(&mut store, &RELEASE.replace("name: maps }", "name: maps, repo: hub }"));
+        settle(&mut store, &mut renders);
+        assert_eq!(said(&store).0, json!("installed"), "{}", said(&store).1);
     }
 }

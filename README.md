@@ -1392,11 +1392,24 @@ spec:
   refused, and the Repository's status says so (`state: error`, `message`).
   A newer version that does not check out is passed over for the newest
   that does (the status says which). A Repository without a `publicKey`
-  takes packages as they come. Change a Repository's `url` or `publicKey`
+  takes packages as they come: they are trusted on the word of whoever answers
+  at its `url`. Change a Repository's `url` or `publicKey`
   and what was fetched before is no longer taken for its: it is fetched and
   checked again.
 - A Package keeps its last 3 revisions (other kinds keep 100), because it
   carries its files; push a new version rather than rolling far back.
+- A Release renders a Package pushed by hand with no more than its pusher's
+  rights, besides its own writer's: what the Package makes, and what it no longer
+  makes, is asked of whoever pushed it, as of whoever applied the Release. Where
+  the pusher may not, nothing new is made, what was installed stays, and the
+  Release's status says whose right fell short. A Package pushed before kithd
+  wrote the pusher down renders nothing new until it is pushed again. One fetched
+  from a Repository has no pusher, and this check does not apply to it: it is
+  trusted by the Repository's key (with none, on the word of whoever answers at its
+  `url`), so whoever may apply a Repository gives the rights of every Release that
+  names it. Only kithd's fetcher says a Package was fetched (`kith.dev/repository`):
+  an apply or a Source's file that carries it is refused, and a Release takes it as
+  fetched only from the Repository it names.
 - A version is fetched once: pushing it to the registry again changes
   nothing here. A registry can also keep quiet about newer versions; the
   signature says a package is the publisher's, not that it is the newest.
@@ -1853,6 +1866,14 @@ kept in history and rolled back like the rest of the cluster's state.
   call starts from a fresh instance: nothing is remembered between calls.
 - Whoever may write KindDefinitions may run code in every namespace through
   them: grant that as you would grant admin.
+- A controller acts as whoever applied its KindDefinition (kith writes that one
+  down, name and key, on the KindDefinition), not as whoever applied a resource
+  of the kind: what it answers is made, and what it no longer answers removed,
+  only where that one may apply and delete it in the resource's namespace, and the
+  resource's status says whose right fell short. So the right to apply a custom
+  kind's resources is the right to what its controller makes of them in that
+  namespace. A KindDefinition applied before this makes nothing new until it is
+  applied again.
 
 Things to know: a rollback is asked of admission too (what it refuses does
 not come back; what it would change comes back as it was); a delete is not

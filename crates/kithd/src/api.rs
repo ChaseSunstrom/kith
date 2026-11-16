@@ -366,9 +366,10 @@ fn writer(caller: &Caller) -> &Caller {
     }
 }
 
-/// `resources` with each Release and Source written down as `caller`'s, and, for an
-/// Identity, the print of the key it has in `store`: what the client said of either is
-/// not taken. (None, as the local socket's: it acts for no key.)
+/// `resources` with each Release, Source, KindDefinition (its controller acts as the writer) and
+/// Package (a Release renders it with no more than its pusher's rights) written down as
+/// `caller`'s, and, for an Identity, the print of the key it has in `store`: what the client
+/// said of either is not taken. (None, as the local socket's: it acts for no key.)
 fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<Resource> {
     let who = writer(caller);
     let print = match who {
@@ -376,7 +377,10 @@ fn stamped(store: &Store, caller: &Caller, mut resources: Vec<Resource>) -> Vec<
         _ => None,
     };
     for resource in &mut resources {
-        if matches!(resource.kind.as_str(), "Release" | "Source") {
+        if matches!(
+            resource.kind.as_str(),
+            "Release" | "Source" | "KindDefinition" | "Package"
+        ) {
             let annotations = &mut resource.metadata.annotations;
             annotations.insert(crate::releases::WRITER.into(), who.to_string());
             match &print {
@@ -680,8 +684,12 @@ async fn rollback(
         let why = "a NodeKey is not rolled back: `kith node lock`, `unlock`, `seal` and `wipe` change it";
         return Err(ApiError::Store(Error::Invalid(why.into())));
     }
-    // Going back to a Release's or a Source's revision is applying it: as whoever goes back.
-    if key.starts_with("Release/") || key.starts_with("Source/") {
+    // Going back to a revision of what is acted on for its writer (a Release, a Source, a
+    // KindDefinition, a Package) is applying it: as whoever goes back.
+    if ["Release/", "Source/", "KindDefinition/", "Package/"]
+        .iter()
+        .any(|kind| key.starts_with(kind))
+    {
         let Json(was) = read(&shared, |store| {
             let history = store.history(&key)?;
             let was = history.iter().find(|was| was.resource.metadata.revision == Some(to));
@@ -1103,6 +1111,64 @@ spec: {size: 1Gi}
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Going back to a KindDefinition's or a Package's revision is applying it too: the
+    /// restored one carries whoever goes back, name and key print, not the writer it had
+    /// (else a rollback would act with an earlier writer's rights) (T-0545, T-0550).
+    #[tokio::test]
+    async fn rollback_writer_a_definition_and_a_package_go_back_as_whoever_goes_back() {
+        use crate::releases::{KEY, WRITER, bob_is, bobs_key};
+        let dir = std::env::temp_dir().join(format!("kithd-back-writer-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        {
+            let mut state = shared.store.lock().unwrap();
+            bob_is(&mut state.store, 0);
+            let role = "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: makers}\n\
+                        spec: {rules: [{kinds: [KindDefinition, Package], verbs: [apply]}]}\n---\n\
+                        apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: bob-makers}\n\
+                        spec: {role: makers, subjects: [bob]}\n";
+            for resource in kith_api::Resource::from_source(role).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let made = |files: &str, schema: &str| {
+            let text = format!(
+                "apiVersion: kith.dev/v1\nkind: Package\nmetadata: {{name: maps-1.0.0}}\n\
+                 spec: {{version: 1.0.0, files: {{package.yaml: '{files}'}}}}\n---\n\
+                 apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: {{name: gameserver}}\n\
+                 spec: {{group: games.example.com, version: v1, kind: GameServer, schema: {{type: {schema}}}}}\n"
+            );
+            Resource::from_source(&text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        let within = Duration::from_secs(30);
+        for (files, schema) in [("a", "object"), ("b", "string")] {
+            let by_admin = applied(&shared, &Caller::Admin, made(files, schema));
+            tokio::time::timeout(within, by_admin).await.unwrap().ok().unwrap();
+        }
+        let bob = Caller::Identity("bob".into());
+        for key in ["Package/maps-1.0.0", "KindDefinition/gameserver"] {
+            let was = |key: &str| {
+                let state = shared.store.lock().unwrap();
+                let annotations = state.store.get(key).unwrap().metadata.annotations.clone();
+                (annotations.get(WRITER).cloned(), annotations.get(KEY).cloned())
+            };
+            assert_eq!(was(key).0.as_deref(), Some("local socket"), "{key}");
+            let back = rollback(
+                State(shared.clone()),
+                Extension(bob.clone()),
+                Path(key.to_string()),
+                Query(RollbackOptions { to: 1 }),
+            );
+            let Json(back) = tokio::time::timeout(within, back).await.unwrap().ok().unwrap();
+            assert_eq!(back.after.metadata.revision, Some(3), "{key}");
+            assert_eq!(was(key), (Some("bob".into()), Some(bobs_key(0).1)), "{key}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The print of the writer Identity's key is written beside its name, whatever the
     /// client sent for it: through a node too, in a dry run and in an apply; the local
     /// socket's has none (T-0551).
@@ -1151,6 +1217,90 @@ spec: {size: 1Gi}
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A KindDefinition is written down as its applier's too, name and key print, whatever
+    /// the client sent: its controller acts as that one (T-0545).
+    #[test]
+    fn controller_writer_the_server_writes_who_applied_a_kind_definition() {
+        use crate::releases::{KEY, WRITER, bob_is, bobs_key};
+        let mut store = Store::default();
+        bob_is(&mut store, 0);
+        let sent = "apiVersion: kith.dev/v1\nkind: KindDefinition\n\
+                    metadata: {name: g, annotations: {'kith.dev/written-by': 'local socket', 'kith.dev/written-key': 'forged'}}\n\
+                    spec: {group: games.example.com, version: v1, kind: GameServer, schema: {type: object}}\n";
+        let sent: Vec<Resource> = Resource::from_source(sent)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let by = |caller: &Caller| {
+            let made = stamped(&store, caller, sent.clone());
+            let annotations = &made[0].metadata.annotations;
+            (annotations.get(WRITER).cloned(), annotations.get(KEY).cloned())
+        };
+        let (name, print) = by(&Caller::Identity("bob".into()));
+        assert_eq!((name.as_deref(), print), (Some("bob"), Some(bobs_key(0).1)));
+        assert_eq!(by(&Caller::Admin), (Some("local socket".into()), None));
+    }
+
+    /// A Package is written down as its pusher's, name and key print, whatever the client
+    /// sent: a Release renders it with no more than that one's rights (T-0550).
+    #[test]
+    fn package_writer_the_server_writes_who_pushed_a_package() {
+        use crate::releases::{KEY, WRITER, bob_is, bobs_key};
+        let mut store = Store::default();
+        bob_is(&mut store, 0);
+        let sent = "apiVersion: kith.dev/v1\nkind: Package\n\
+                    metadata: {name: maps-1.0.0, annotations: {'kith.dev/written-by': 'local socket', 'kith.dev/written-key': 'forged'}}\n\
+                    spec: {version: 1.0.0, files: {}}\n";
+        let sent: Vec<Resource> = Resource::from_source(sent)
+            .unwrap()
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        let by = |caller: &Caller| {
+            let made = stamped(&store, caller, sent.clone());
+            let annotations = &made[0].metadata.annotations;
+            (annotations.get(WRITER).cloned(), annotations.get(KEY).cloned())
+        };
+        let (name, print) = by(&Caller::Identity("bob".into()));
+        assert_eq!((name.as_deref(), print), (Some("bob"), Some(bobs_key(0).1)));
+        assert_eq!(by(&Caller::Admin), (Some("local socket".into()), None));
+    }
+
+    /// Only kithd's fetcher says a Package came from a Repository (`kith.dev/repository`):
+    /// applied by hand, even by the local socket, or dry-run, it is refused (T-0550).
+    #[tokio::test]
+    async fn package_origin_a_client_cannot_say_a_repository_sent_a_package() {
+        let dir = std::env::temp_dir().join(format!("kithd-package-origin-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let sent = "apiVersion: kith.dev/v1\nkind: Package\n\
+                    metadata: {name: maps-1.0.0, annotations: {'kith.dev/repository': 'https://registry.example.com'}}\n\
+                    spec: {version: 1.0.0, files: {}}\n";
+        let sent = || -> Vec<Resource> {
+            Resource::from_source(sent)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let within = std::time::Duration::from_secs(30);
+        let refused = tokio::time::timeout(within, applied(&shared, &Caller::Admin, sent()))
+            .await
+            .unwrap();
+        let planned = tokio::time::timeout(within, plan(&shared, &Caller::Admin, sent()))
+            .await
+            .unwrap();
+        for answer in [refused.map(drop), planned.map(drop)] {
+            let Err(ApiError::Store(Error::Invalid(why))) = answer else {
+                panic!("a Package that says a Repository sent it was taken");
+            };
+            assert!(why.contains("apply it without"), "{why}");
+        }
+        assert!(shared.store.lock().unwrap().store.get("Package/maps-1.0.0").is_none());
     }
 
     /// A watch ends (401) once its Identity is deleted or given another key while it waits,
