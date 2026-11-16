@@ -914,6 +914,14 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   the node seals again for whatever system the cluster then handed the key to. A node
   taken back to a kithd older than the `tpm-parent:` line loses that line, so its next
   seal trusts the bus once again. And all of it has run against a software TPM only.
+- **A running encrypted node has its key in memory.** The encryption keeps a disk
+  that is off, or away from its cluster. While the node runs, the key of its state is
+  in the kernel's memory (dm-crypt's) and in kithd's, for as long as it runs: kithd
+  keeps it to give the cluster its NodeKey again, to seal it to the TPM again, and to
+  wrap it under a new recovery key or passphrase. So whoever is root on the node, reads
+  its RAM, or finds a hole that reads kithd's memory has the key. The copies kithd
+  makes on the way to the TPM are not wiped after use, because the one it keeps is
+  there anyway; a kithd that does not hold the key is a design not built yet (T-0609).
 - **The offline unlock gives up that the key is not on the machine.** A node that
   opens its encrypted state with no node in reach has its key on its own disk again:
   sealed to its TPM (above), or, with `kith node passphrase` (off unless one is given),
