@@ -945,7 +945,9 @@ kith node status                                   # who leads the store, who vo
   kithd started with `--ingress`. Its certificates are ordered by a control node:
   start the control nodes with `--acme` (with or without `--ingress`); the one that
   leads orders for the workers' hosts once each ingress worker says its view holds the
-  thumbprint, and the worker answers the authority's challenges on port 80:
+  thumbprint (or after ten minutes, naming the workers that did not; a host ordered so is
+  asked again in ten minutes, not an hour), and the worker answers the authority's
+  challenges on port 80:
 
   ```sh
   kithd --acme ...                         # on each control node

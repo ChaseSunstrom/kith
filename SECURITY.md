@@ -825,9 +825,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     certificate, writes the Secrets and the thumbprint, and the worker writes none of
     them (refused: `a worker writes only what it says of itself`). It says, in its own
     Node's status, which thumbprint its view holds, and the leader asks the CA for
-    nothing until each reachable ingress worker says the right one: a worker that lies
-    there holds up every order and renewal, as answering the CA's challenge wrongly
-    would (each ingress node is one the CA may ask), and gains nothing else. That a worker
+    nothing until each reachable ingress worker says the right one, for ten minutes at
+    most (then it asks, names the workers it did not wait for, and asks again for a host
+    that failed so in ten minutes): a worker that lies there or never says holds orders
+    and renewals up for those ten minutes, then fails the challenges the CA sends it, as
+    answering the CA's challenge wrongly would (each ingress node is one the CA may ask),
+    and gains nothing else. That a worker
     serves ingress is its token's maker's to say, not the node's: the control node
     that admits it writes `ingress` into its Node's spec from the token, never from
     what the joining node asks, and only a worker whose Node says it may say in its

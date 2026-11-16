@@ -59,6 +59,25 @@ pub(crate) const THUMBPRINT: &str = "kith-system/acme";
 /// A host is asked a certificate for once in this many seconds at most, so that a setup
 /// that cannot work does not use up what the authority allows.
 const BETWEEN_ORDERS: u64 = 3600;
+/// How long the leader waits on an ingress worker that does not say its view holds the account's
+/// thumbprint (one that hangs, or was taken, never says it) before it orders anyway.
+const WAIT_AT_MOST: u64 = 600;
+
+/// The seconds between two orders for a host: shorter where the last was asked while a worker
+/// had not said it holds the thumbprint, so that worker's 404 holds the host up less.
+fn between(hurried: bool) -> u64 {
+    if hurried { WAIT_AT_MOST } else { BETWEEN_ORDERS }
+}
+
+/// Whether orders still wait on `waits`, the ingress workers that have not said their view holds
+/// the thumbprint, at `now`: up to [`WAIT_AT_MOST`] from when this wait began (`since`).
+fn holds_up(since: &mut Option<u64>, waits: &[String], now: u64) -> bool {
+    if waits.is_empty() {
+        *since = None;
+        return false;
+    }
+    now.saturating_sub(*since.get_or_insert(now)) < WAIT_AT_MOST
+}
 /// How many connections from outside at a time on each port; one over it is hung up on.
 const CONNECTIONS: usize = 1024;
 /// How many of them one source may hold at a time on a port (a source: an IPv4 address,
@@ -963,7 +982,7 @@ async fn say(shared: &Shared, service: &str, tls: Value) -> bool {
     said.is_ok()
 }
 
-/// Order a certificate for `host`, unless one was asked for within the hour.
+/// Order a certificate for `host`, unless one was asked for within `between` seconds.
 async fn order(
     shared: &Shared,
     directory: &str,
@@ -971,12 +990,13 @@ async fn order(
     host: &str,
     of: &Exposed,
     tried: &mut BTreeMap<String, u64>,
+    between: u64,
 ) {
     let me = shared.members.me();
-    // (Whatever the store says or cannot be told: this node asks once an hour at most.)
+    // (Whatever the store says or cannot be told: this node asks once in that time at most.)
     if tried
         .get(host)
-        .is_some_and(|tried| now().saturating_sub(*tried) < BETWEEN_ORDERS)
+        .is_some_and(|tried| now().saturating_sub(*tried) < between)
     {
         return;
     }
@@ -985,7 +1005,7 @@ async fn order(
         let status = state.store.get(&of.service).and_then(|service| service.status.clone());
         status.and_then(|status| status["tls"]["at"].as_u64())
     };
-    if asked.is_some_and(|asked| now().saturating_sub(asked) < BETWEEN_ORDERS) {
+    if asked.is_some_and(|asked| now().saturating_sub(asked) < between) {
         return;
     }
     tried.insert(host.to_string(), now());
@@ -1114,6 +1134,8 @@ pub async fn run(
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut generation = shared.generation.subscribe();
     let mut tried = BTreeMap::new();
+    // (Since when orders wait on a worker; the hosts last ordered without waiting on one.)
+    let (mut since, mut hurried) = (None, std::collections::BTreeSet::<String>::new());
     let mut said = false;
     // (What this worker last said its view holds, and when; the workers the last order waited on.)
     let mut saying: Option<(String, Instant)> = None;
@@ -1199,19 +1221,38 @@ pub async fn run(
                             &shared.store.lock().expect("nothing panics holding the store").store,
                             &print,
                         );
-                        if !waits.is_empty() {
+                        if holds_up(&mut since, &waits, now()) {
                             if waits != waited {
                                 eprintln!(
-                                    "kithd: ingress: no certificate is asked for until each ingress worker's view holds the ACME account's thumbprint; waiting on: {}",
+                                    "kithd: ingress: no certificate is asked for until each ingress worker's view holds the ACME account's thumbprint (ten minutes at most); waiting on: {}",
                                     waits.join(", ")
                                 );
                             }
                             waited = waits;
                             return;
                         }
-                        waited.clear();
+                        // Waited long enough on one that never said: asked anyway, and a host that
+                        // fails so is asked again in ten minutes, not an hour.
+                        let past = !waits.is_empty();
+                        if past && waits != waited {
+                            eprintln!(
+                                "kithd: ingress: certificates are asked for without waiting longer on {}, whose view has not said it holds the ACME account's thumbprint for ten minutes (a challenge there may fail)",
+                                waits.join(", ")
+                            );
+                        }
+                        waited = waits;
                         for (host, of) in &wanting {
-                            order(&shared, directory, &account, host, of, &mut tried).await;
+                            let before = tried.get(host).copied();
+                            let pause = between(hurried.contains(host));
+                            order(&shared, directory, &account, host, of, &mut tried, pause).await;
+                            // (What the pause after an order is: set by how that order was asked.)
+                            if tried.get(host).copied() != before {
+                                if past {
+                                    hurried.insert(host.clone());
+                                } else {
+                                    hurried.remove(host);
+                                }
+                            }
                         }
                     }
                 }
@@ -1277,6 +1318,24 @@ async fn listen(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker that never says its view holds the thumbprint holds orders up for
+    /// [`WAIT_AT_MOST`], not for ever; one that answers ends the wait, and a new one starts
+    /// its own. Ordered past such a worker, a host is asked again sooner than an hour.
+    #[test]
+    fn a_worker_that_never_answers_holds_orders_up_for_a_while_only() {
+        let silent = vec!["edge".to_string()];
+        let mut since = None;
+        assert!(holds_up(&mut since, &silent, 1000));
+        assert!(holds_up(&mut since, &silent, 1000 + WAIT_AT_MOST - 1));
+        assert!(!holds_up(&mut since, &silent, 1000 + WAIT_AT_MOST));
+        assert!(!holds_up(&mut since, &silent, 1000 + 10 * WAIT_AT_MOST));
+        // It answered: nothing waits, and the next wait is counted from its own start.
+        assert!(!holds_up(&mut since, &[], 5000));
+        assert!(holds_up(&mut since, &silent, 6000));
+        assert!(!holds_up(&mut since, &silent, 6000 + WAIT_AT_MOST));
+        assert!(between(true) < between(false) && between(false) == BETWEEN_ORDERS);
+    }
 
     #[test]
     fn hosts_and_certificate_times() {
