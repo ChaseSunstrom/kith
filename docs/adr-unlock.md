@@ -1,7 +1,9 @@
 # The ways into a node's encrypted state, and what each leaves open
 
-Status: decided, not built (T-0189 step 1). Steps 2 to 5 build it, in the order of "Steps,
-in order". A security review reads this record before any code is written. Nothing in this
+Status: decided (T-0189 step 1). Steps 2 (the session, T-0585) and 3 (TPM plus PIN, T-0612)
+are built and have run against swtpm only; `kith node pin` is refused unless the owner passes
+`--untried-tpm`, which says the owner's checklist has not run on that machine's TPM. Steps 4
+and 5 are not built. They follow "Steps, in order". A security review reads this record before any code is written. Nothing in this
 task runs on a real TPM, a real FIDO2 key or a real disk: a software TPM (swtpm) and VM disk
 files only. What the owner would run on hardware is the checklist near the end. Every claim
 about the TPM that tpm.rs does not already exercise against swtpm is marked "unverified" where
@@ -101,7 +103,7 @@ something: every row stands beside the others, and any one way is enough.
 | The TPM's seal, today | nothing | opens by itself started as it is, and then only the running system stands between; a probe on a discrete TPM's bus reads the key as it is unsealed | nothing | opens: it holds the virtual TPM's seeds and can set its PCRs |
 | A passphrase | guessed offline, without limit, at Argon2id's cost a try | the same | nothing; a node that relayed it when it was given saw it | as a copied disk |
 | The seal over the salted session | nothing | as the seal; a probe that only listens reads nothing; one that resets the TPM and replays the measurements still gets the key (not defended); one put in before the seal was made reads everything | nothing | opens |
-| TPM plus PIN | nothing | M guesses at once, then one every I seconds: at most 1% of the PINs in a year (the bounds below); a PIN seen as it is typed opens (a camera, or a boot file changed to record it: the boot file is not signed); a TPM whose secrets are read out gives up the PIN's object too | nothing; a node that relayed the PIN when it was set saw it | opens: it reads the PIN's object out of the TPM's state |
+| TPM plus PIN | nothing | M guesses at once, then one every I seconds: at most 1% of the PINs in a year (the bounds below); a PIN seen as it is typed opens (a camera, or a boot file changed to record it: the boot file is not signed); a TPM whose secrets are read out gives up the PIN's object too | nothing; a node that relayed the PIN when it was set would see it (as built, T-0612, none relays one) | opens: it reads the PIN's object out of the TPM's state |
 | A seal for the next system | nothing | as the seal it stands for; and a copy of an older record, written back with the older signed system it was sealed for, opens (no seal can be taken back) | nothing more than today: a seal is made only for a boot file in an update the release key signed, and no node holds that key | opens |
 | Sealing again after opening another way | nothing | as the seal | nothing: a node seals again only at a start where a node of the cluster handed its key out | opens |
 | FIDO2 (deferred) | nothing | opens with a touch if the key is with the machine | nothing | opens: it reads the VM's memory |
@@ -301,6 +303,13 @@ console's, reads digits from those keys whatever their caps say. It is given to 
 passphrase is: `kith node pin NAME` asks for it, and it goes over the cluster's TLS to that
 node alone, kept by no node, nor by the store or the audit log. The NodeKey says
 `seal: "pin"`, which an older kithd reads as "not sealed" ("The lock record").
+
+As built (T-0612): asked of the named node alone, at its own address over TLS. Another node
+refuses it and passes it on to none, saying to ask that node itself (whether one may is the
+owner's decision, "Open"; the CLI asks the kithd it reaches). The NodeKey is not told `seal: "pin"`: its status
+says `"pin": true`, and `seal` stays the owner's word for the TPM alone. A PIN given again
+replaces the line (written, read back, opened, as "PIN on"), not beside the old one. The
+settings are said when the PIN is set, not again at each start.
 
 ### The lockout bounds
 
@@ -675,8 +684,13 @@ All against swtpm, in VMs on disk files. None on a real TPM, a real FIDO2 key or
 `sh ci/vm.sh --test tpm` (OVMF and swtpm, real firmware events, VM disk files):
 
 - Today's flow, through the session.
-- PIN: set with an 8-digit PIN, M = 3, I = 40 s. Restart, the PIN typed on the serial console,
-  open. Three wrong PINs, and the right one refused. Forty seconds later, the right one opens.
+- PIN (as built, T-0612): an 8-digit PIN refused through the other node, then set at
+  the node's own address; refused without `untried` and refused at 4 digits; swtpm's own settings (M = 3, I = R = 1,000 s) taken. The
+  record reads `tpm-pin:` and no `tpm:`; the PIN is in no disk file and no log. Started with no
+  network, the PIN typed on the serial console opens it. Started again, wrong PINs until the
+  TPM refuses every one, then the right one refused, the console saying when the next is taken;
+  the recovery key opens it. (Waiting out I is left to the unit test, at I = 40 s, and to the
+  owner's checklist.)
 - Update (criterion 4): two releases built with different versions, signed by a test release
   key. The node takes the second with its peers off. It restarts and opens by `tpm-next:` with
   no node asked, and `tpm:` holds the new seal once the slot is good. Then a third release,
@@ -719,6 +733,12 @@ on swtpm. None is settled on hardware by this task.
 
 Items 1 to 5 and 19 are settled on swtpm by step 2 (T-0585); they stay listed, as no hardware
 TPM has run them.
+
+Items 6, 7, 9, 10 and 11 are settled on swtpm by step 3 (T-0612), as
+`tpm_pin_opens_with_its_pin_and_counts_each_wrong_one` runs them: a wrong PIN is refused with 0x98E and counted, the M-th locks every PIN out with
+0x921, the properties read back as set (swtpm's own, unset: M = 3, I = R = 1,000 s), the
+lockout authorization is taken encrypted where empty, and that authorization, not an empty one,
+resets the count. Item 8 is not: kithd refuses an M or an I of 0 before the TPM is asked.
 
 1. TPM2_StartAuthSession (Part 3) with an ECC tpmKey: the salt is KDFe(SHA-256, Z, "SECRET",
    the caller's x, the key's x) (Part 1, ECDH secret sharing). swtpm accepted it as written.
@@ -802,7 +822,9 @@ Decisions that are the owner's:
 - **Whether the cluster's key may open a PIN node's copy of the disk.** As built it may: the
   cluster's way is as it is, and a PIN adds a way, it closes none.
 - **Whether `kith node pin` may be asked through a relay node**, or only of the node itself.
-  Until decided: only of the node itself, and at its console.
+  As built (T-0612): only of the node itself; a relayed PIN is refused until the owner says
+  otherwise (a relay would see the PIN in plain, though it could already hand out the node's
+  key). Passing it on as `kith node passphrase` is passed would be a few lines.
 - **A node with no seal put back by three restarts** ("A seal across a signed update"): the
   old system, or held on the trial slot until someone comes.
 - **What a plan with `allowDowngrade` does to `tpm-next:`.** Until decided: nothing is

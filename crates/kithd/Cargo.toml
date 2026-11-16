@@ -57,6 +57,9 @@ sha2 = "0.11"
 # The TPM's sessions encrypt what crosses its bus in AES-128-CFB (tpm.rs): ring has no AES
 # block alone. The block cipher only; CFB is a few lines in tpm.rs.
 aes = { version = "0.9", default-features = false }
+# A PIN and the TPM's lockout authorization are zeroed once used (crypt.rs, tpm.rs); in the
+# tree already, through rustls.
+zeroize = "1"
 
 [dev-dependencies]
 # (A clock a test owns: the waiting console answers at a fixed time.)

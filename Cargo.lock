@@ -1494,6 +1494,7 @@ dependencies = [
  "tokio-rustls",
  "wasmi",
  "wat",
+ "zeroize",
 ]
 
 [[package]]

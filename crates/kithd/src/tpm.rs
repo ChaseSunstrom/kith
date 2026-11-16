@@ -29,6 +29,7 @@ use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use ring::{agreement, hmac};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use zeroize::{Zeroize, Zeroizing};
 
 /// What a key is sealed to, in the SHA-256 bank: 0 the firmware; 4 what it started (the
 /// boot loader, and the boot file with the kernel and its command line); 7 whether Secure
@@ -58,8 +59,30 @@ const START_SESSION: u32 = 0x176;
 const PCR_READ: u32 = 0x17e;
 const PCR_EXTEND: u32 = 0x182;
 const POLICY_PCR: u32 = 0x17f;
+const POLICY_AUTH_VALUE: u32 = 0x16b;
+const GET_CAPABILITY: u32 = 0x17a;
+const HIERARCHY_CHANGE_AUTH: u32 = 0x129;
+#[cfg(test)]
+const DA_RESET: u32 = 0x139;
+#[cfg(test)]
+const DA_PARAMETERS: u32 = 0x13a;
+/// The lockout hierarchy: whoever holds its authorization can forgive wrong PINs, and set
+/// how many are let through.
+const LOCKOUT: u32 = 0x4000_000a;
 /// What a policy session that the PCRs do not satisfy is refused with.
 const POLICY_FAILED: u32 = 0x99d;
+/// What a wrong authorization of something counted against guesses is refused with (the
+/// first session's), and what every one is while the TPM is locked out.
+const AUTH_FAIL: u32 = 0x98e;
+const IN_LOCKOUT: u32 = 0x921;
+pub const NOT_THE_PIN: &str =
+    "the TPM refuses that PIN: it is not the one this node's key was sealed with (each wrong one is counted)";
+pub const LOCKED_OUT: &str = "the TPM refuses every PIN for now: too many wrong ones were tried";
+/// What setting a PIN is refused with when somebody other than kithd took the lockout's
+/// authorization: it could forgive every wrong PIN.
+pub const CLEAR_FIRST: &str = "somebody holds this TPM's lockout authorization, and kithd does not: whoever does could forgive every wrong PIN. Clear the TPM in the firmware's settings first";
+/// A year, in seconds: what a PIN's guesses are counted over.
+const YEAR: u32 = 31_536_000;
 /// A session's kinds; its cipher (AES, 128 bits, CFB); and what it does for one command:
 /// the first parameter crosses encrypted (`DECRYPT`, for the TPM to decrypt), the answer's
 /// first does (`ENCRYPT`). Neither continues the session: it ends with that command.
@@ -169,6 +192,47 @@ fn password() -> Vec<u8> {
     [&9u32.to_be_bytes()[..], &PASSWORD.to_be_bytes(), &[0; 5]].concat()
 }
 
+/// The TPM's count of wrong authorizations (a PIN's), and what it does with them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lockout {
+    /// Somebody holds the lockout hierarchy's authorization (it is not empty).
+    pub set: bool,
+    /// It refuses every PIN until `interval` has passed.
+    pub locked: bool,
+    pub counter: u32,
+    /// M: the wrong ones it lets through; I: the seconds after which it forgets one; R: the
+    /// seconds the lockout hierarchy waits after a wrong authorization of its own.
+    pub max: u32,
+    pub interval: u32,
+    pub recovery: u32,
+}
+
+/// What a PIN of `digits` digits is under a TPM that lets `max` wrong ones through and
+/// forgets one every `interval` seconds: refused unless a year of guessing at that pace
+/// tries no more than one in a hundred of its PINs. The refusal names the bound it fails,
+/// and the shortest PIN those settings take.
+pub fn bounded(digits: usize, max: u32, interval: u32) -> Result<(), String> {
+    if !(6..=32).contains(&digits) {
+        return Err(format!("a PIN is 6 to 32 digits, not {digits}"));
+    }
+    if max == 0 || interval == 0 {
+        return Err(format!(
+            "this TPM's lockout bounds no guessing (it counts {max} wrong PINs, and forgets one every {interval} seconds): a PIN needs both above 0"
+        ));
+    }
+    let guesses = u128::from(max) + u128::from(YEAR.div_ceil(interval));
+    let room = |digits: usize| 10u128.pow(digits as u32) / 100;
+    if guesses <= room(digits) {
+        return Ok(());
+    }
+    // (At most 2^32 + a year's seconds: 12 digits always take them.)
+    let shortest = (digits..=32).find(|digits| guesses <= room(*digits)).unwrap_or(32);
+    Err(format!(
+        "this TPM lets {max} wrong PINs through and one more every {interval} seconds: {guesses} guesses in a year, more than one in a hundred of the {} PINs of {digits} digits; the shortest PIN these settings take is {shortest} digits",
+        10u128.pow(digits as u32)
+    ))
+}
+
 /// The PCRs as the TPM is told them: one bank, and a bit for each.
 fn selection() -> Vec<u8> {
     let mut bits = [0u8; 3];
@@ -233,6 +297,8 @@ impl<T: Read + Write> Tpm<T> {
             0 if tag == SESSIONS && reply[0..2] != SESSIONS.to_be_bytes() => Err(UNSESSIONED.into()),
             0 => Ok(reply[10..whole].to_vec()),
             POLICY_FAILED => Err("the TPM does not give the key: this is not the system it was sealed for".into()),
+            AUTH_FAIL => Err(NOT_THE_PIN.into()),
+            IN_LOCKOUT => Err(LOCKED_OUT.into()),
             refused => Err(format!("the TPM refuses (its code {refused:#x})")),
         }
     }
@@ -351,7 +417,10 @@ impl<T: Read + Write> Tpm<T> {
 
     /// `command` on `handle` (`name` its name, as computed here), authorized by `session`,
     /// which also encrypts its first parameter (`DECRYPT`) or its answer's (`ENCRYPT`): the
-    /// answer's parameters, its HMAC checked before they are decrypted or used.
+    /// answer's parameters, its HMAC checked before they are decrypted or used. `auth`:
+    /// the authorization of what is on `handle` when the command is sent, and when it is
+    /// answered (a command that changes it answers under the new one); both empty but for a
+    /// PIN, or the lockout's.
     fn authorized(
         &mut self,
         command: u32,
@@ -359,13 +428,17 @@ impl<T: Read + Write> Tpm<T> {
         session: &Session,
         crypt: u8,
         mut parameters: Vec<u8>,
+        auth: [&[u8]; 2],
     ) -> Result<Vec<u8>, String> {
         let nonce = crate::crypt::random::<32>();
+        // (What a session authorizes with, and encrypts under: its key and that authorization.)
+        let value = |auth: &[u8]| Zeroizing::new([&session.key[..], auth].concat());
+        let (asked_with, answered_with) = (value(auth[0]), value(auth[1]));
         if crypt == DECRYPT {
-            let key = kdfa(&session.key, b"CFB", &nonce, &session.nonce);
+            let key = kdfa(&asked_with, b"CFB", &nonce, &session.nonce);
             cfb(&key, first(&mut parameters)?, true);
         }
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &session.key);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &asked_with);
         let asked = Sha256::digest([&command.to_be_bytes()[..], name, &parameters].concat());
         let proof = hmac::sign(&key, &[&asked[..], &nonce, &session.nonce, &[crypt]].concat());
         let auth = [
@@ -395,9 +468,10 @@ impl<T: Read + Write> Tpm<T> {
             return Err(PLAIN.into());
         }
         let told = [&answered[..], theirs, &nonce, attributes].concat();
+        let key = hmac::Key::new(hmac::HMAC_SHA256, &answered_with);
         hmac::verify(&key, &told, proof).map_err(|_| FORGED)?;
         if crypt == ENCRYPT {
-            let key = kdfa(&session.key, b"CFB", theirs, &nonce);
+            let key = kdfa(&answered_with, b"CFB", theirs, &nonce);
             cfb(&key, first(&mut parameters)?, false);
         }
         Ok(parameters)
@@ -438,29 +512,72 @@ impl<T: Read + Write> Tpm<T> {
     /// the one it was sealed under before, if it was.
     pub fn seal(&mut self, key: &[u8], kept: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), String> {
         let parent = self.parent(kept)?;
-        let made = self.sealed(key, &parent);
+        let made = self.sealed(key, &parent, None);
         self.flush(parent.handle);
         Ok((made?, parent.name))
     }
 
-    fn sealed(&mut self, key: &[u8], parent: &Parent) -> Result<Vec<u8>, String> {
-        let policy = self.policy()?;
+    /// `key` sealed under `pin` (its digits, as typed), whatever the PCRs: only a policy
+    /// session told the PIN (PolicyAuthValue) has it back, and the TPM counts each wrong PIN
+    /// toward its lockout. Before it is given back: it opens with the PIN, and one wrong PIN
+    /// tried is counted (a TPM that did not count one would let the PIN be guessed without
+    /// end). What to keep, and the storage key's name, as [`Tpm::seal`] gives them.
+    pub fn seal_pin(&mut self, key: &[u8], pin: &[u8], kept: Option<&[u8]>) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let parent = self.parent(kept)?;
+        let made = self.sealed(key, &parent, Some(pin));
+        self.flush(parent.handle);
+        let (made, name) = (made?, parent.name);
+        if self.unseal_pin(&made, pin, Some(&name))? != key {
+            return Err("the TPM gave back another key than the one sealed under the PIN".into());
+        }
+        let before = self.lockout()?.counter;
+        // (The last digit moved by one: another PIN of the same length.)
+        let mut wrong = Zeroizing::new(pin.to_vec());
+        if let Some(last) = wrong.last_mut() {
+            *last = b'0' + (last.wrapping_sub(b'0') + 1) % 10;
+        }
+        match self.unseal_pin(&made, &wrong, Some(&name)) {
+            Err(why) if why == NOT_THE_PIN || why == LOCKED_OUT => {}
+            Err(why) => return Err(why),
+            Ok(_) => return Err("the TPM gave the key for a wrong PIN".into()),
+        }
+        if self.lockout()?.counter <= before {
+            return Err(
+                "this TPM did not count a wrong PIN: it would let the PIN be guessed without end, so none is set"
+                    .into(),
+            );
+        }
+        Ok((made, name))
+    }
+
+    /// `key` sealed under `parent`: to the PCRs as they are now, or to `pin`.
+    fn sealed(&mut self, key: &[u8], parent: &Parent, pin: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let (policy, attributes) = match pin {
+            // Data kept under a hash, of this TPM and this parent only, with no password (so
+            // none to guess, and no guess counted): the policy alone opens it.
+            None => (self.policy()?, 0x0000_0412u32),
+            // Of this TPM and this parent only, its password the PIN, and each wrong one
+            // counted; no password alone opens it, only a policy session told it.
+            Some(_) => {
+                let told = [&[0; 32][..], &POLICY_AUTH_VALUE.to_be_bytes()].concat();
+                (Sha256::digest(told).into(), 0x0000_0012)
+            }
+        };
         let session = self.start(parent, HMAC)?;
-        let secret = [sized(&[]), sized(key)].concat();
-        // Data kept under a hash, of this TPM and this parent only, with no password (so
-        // none to guess, and no guess counted): the policy alone opens it.
+        let secret = Zeroizing::new([sized(pin.unwrap_or_default()), sized(key)].concat());
         let public = [
             &0x0008u16.to_be_bytes()[..],
             &SHA256.to_be_bytes(),
-            &0x0000_0412u32.to_be_bytes(),
+            &attributes.to_be_bytes(),
             &sized(&policy),
             &NULL.to_be_bytes(),
             &sized(&[]),
         ]
         .concat();
         let parameters = [sized(&secret), sized(&public), sized(&[]), 0u32.to_be_bytes().into()].concat();
+        let parameters = Zeroizing::new(parameters);
         let on = (parent.handle, &parent.name[..]);
-        let made = self.authorized(CREATE, on, &session, DECRYPT, parameters);
+        let made = self.authorized(CREATE, on, &session, DECRYPT, parameters.to_vec(), [&[], &[]]);
         if made.is_err() {
             // (One that did its command ended with it.)
             self.flush(session.handle);
@@ -474,33 +591,129 @@ impl<T: Read + Write> Tpm<T> {
     /// sealed for; `kept`: the storage key's name when it was sealed, if it was kept.
     pub fn unseal(&mut self, sealed: &[u8], kept: Option<&[u8]>) -> Result<Vec<u8>, String> {
         let parent = self.parent(kept)?;
-        let key = self.opened(sealed, &parent);
+        let key = self.opened(sealed, &parent, None);
         self.flush(parent.handle);
         key
     }
 
-    fn opened(&mut self, sealed: &[u8], parent: &Parent) -> Result<Vec<u8>, String> {
+    /// The key that was sealed as `sealed` under `pin`, if this is the TPM it was sealed
+    /// with and `pin` the PIN; a wrong one is [`NOT_THE_PIN`], and counted; while the TPM
+    /// counts too many, every one is [`LOCKED_OUT`].
+    pub fn unseal_pin(&mut self, sealed: &[u8], pin: &[u8], kept: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        let parent = self.parent(kept)?;
+        let key = self.opened(sealed, &parent, Some(pin));
+        self.flush(parent.handle);
+        key
+    }
+
+    fn opened(&mut self, sealed: &[u8], parent: &Parent, pin: Option<&[u8]>) -> Result<Vec<u8>, String> {
         // Its name, from its public area as kept (the TPM loads nothing else under it).
         let mut kept = Reply(sealed);
         kept.sized(false)?;
         let named = name(kept.sized(false)?);
         let body = [&parent.handle.to_be_bytes()[..], &password(), sealed].concat();
         let item = Reply(&self.run(SESSIONS, LOAD, &body)?).number()?;
-        let key = self.shown((item, &named), parent);
+        let key = self.shown((item, &named), parent, pin);
         self.flush(item);
         key
     }
 
-    /// The PCRs shown to a policy session, and what the TPM then gives of `item`.
-    fn shown(&mut self, item: (u32, &[u8]), parent: &Parent) -> Result<Vec<u8>, String> {
+    /// The PCRs shown to a policy session (or, for one sealed under a PIN, the PIN), and
+    /// what the TPM then gives of `item`.
+    fn shown(&mut self, item: (u32, &[u8]), parent: &Parent, pin: Option<&[u8]>) -> Result<Vec<u8>, String> {
         let session = self.start(parent, POLICY)?;
-        let pcrs = [&session.handle.to_be_bytes()[..], &sized(&[]), &selection()].concat();
-        let given = self.run(NO_SESSIONS, POLICY_PCR, &pcrs);
-        let given = given.and_then(|_| self.authorized(UNSEAL, item, &session, ENCRYPT, Vec::new()));
+        let handle = session.handle.to_be_bytes();
+        let given = match pin {
+            None => {
+                let pcrs = [&handle[..], &sized(&[]), &selection()].concat();
+                self.run(NO_SESSIONS, POLICY_PCR, &pcrs)
+            }
+            Some(_) => self.run(NO_SESSIONS, POLICY_AUTH_VALUE, &handle),
+        };
+        let pin = pin.unwrap_or_default();
+        let given = given.and_then(|_| self.authorized(UNSEAL, item, &session, ENCRYPT, Vec::new(), [pin, pin]));
         if given.is_err() {
             self.flush(session.handle);
         }
         Ok(Reply(&given?).sized(false)?.to_vec())
+    }
+
+    /// What the TPM says of its lockout now (TPM2_GetCapability, its variable properties).
+    pub fn lockout(&mut self) -> Result<Lockout, String> {
+        let asked = [6u32, 0x200, 18].map(u32::to_be_bytes).concat();
+        let told = self.run(NO_SESSIONS, GET_CAPABILITY, &asked)?;
+        let mut told = Reply(&told);
+        told.take(1)?;
+        if told.number()? != 6 {
+            return Err("the TPM answered another question than its properties".into());
+        }
+        let mut properties = Vec::new();
+        for _ in 0..told.number()? {
+            properties.push((told.number()?, told.number()?));
+        }
+        let value = |asked: u32| {
+            let found = properties.iter().find(|(property, _)| *property == asked);
+            found
+                .map(|(_, value)| *value)
+                .ok_or_else(|| format!("the TPM does not say its property {asked:#x}"))
+        };
+        let permanent = value(0x200)?;
+        Ok(Lockout {
+            set: permanent & 1 << 2 != 0,
+            locked: permanent & 1 << 9 != 0,
+            counter: value(0x20e)?,
+            max: value(0x20f)?,
+            interval: value(0x210)?,
+            recovery: value(0x211)?,
+        })
+    }
+
+    /// The TPM's lockout, made ready for a PIN of `digits` digits: its settings checked
+    /// ([`bounded`]), and its authorization taken where nobody holds it. That one is made
+    /// here, given to `keep` (which writes it into the state) before the TPM is told it, in
+    /// a session salted to the storage key (`kept`: its name, as with a seal), and then read
+    /// back. `held`: kithd keeps one already; where somebody holds it and kithd does not,
+    /// [`CLEAR_FIRST`].
+    pub fn guard(
+        &mut self,
+        digits: usize,
+        held: bool,
+        kept: Option<&[u8]>,
+        keep: impl FnOnce(&[u8]) -> Result<(), String>,
+    ) -> Result<Lockout, String> {
+        let lockout = self.lockout()?;
+        bounded(digits, lockout.max, lockout.interval)?;
+        if lockout.set {
+            return if held { Ok(lockout) } else { Err(CLEAR_FIRST.into()) };
+        }
+        // (A TPM drops an authorization's last zero bytes: none is last.)
+        let mut auth = Zeroizing::new(crate::crypt::random::<32>());
+        auth[31] |= 1;
+        keep(&auth[..])?;
+        let parent = self.parent(kept)?;
+        let session = self.start(&parent, HMAC);
+        self.flush(parent.handle);
+        let session = session?;
+        let on = (LOCKOUT, &LOCKOUT.to_be_bytes()[..]);
+        let mut given = sized(&auth[..]);
+        let taken = self.authorized(
+            HIERARCHY_CHANGE_AUTH,
+            on,
+            &session,
+            DECRYPT,
+            given.clone(),
+            [&[], &auth[..]],
+        );
+        given.zeroize();
+        if taken.is_err() {
+            self.flush(session.handle);
+        }
+        taken?;
+        let lockout = self.lockout()?;
+        if !lockout.set {
+            return Err("the TPM did not take the lockout's authorization it was given".into());
+        }
+        Ok(lockout)
     }
 }
 
@@ -630,6 +843,13 @@ pub(crate) mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
             let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    impl Software {
+        /// The way to it again, once the last one was let go (it answers one at a time).
+        pub(crate) fn wire(&self) -> Wire {
+            Wire::new(UnixStream::connect(self.1.join("tpm")).unwrap())
         }
     }
 
@@ -836,5 +1056,112 @@ pub(crate) mod tests {
             assert_eq!(tpm.unseal(&sealed, Some(&name)).err().as_deref(), Some(refused));
         }
         assert!(tpm.unseal(&sealed, Some(&name)) == Ok(key));
+    }
+
+    /// A command on the lockout hierarchy with its authorization in plain, as the owner's
+    /// tools send it (kithd sends it none of these).
+    pub(crate) fn as_lockout<T: Read + Write>(tpm: &mut Tpm<T>, command: u32, auth: &[u8], parameters: &[u8]) {
+        let password = [&PASSWORD.to_be_bytes()[..], &sized(&[]), &[0], &sized(auth)].concat();
+        let body = [
+            &LOCKOUT.to_be_bytes()[..],
+            &(password.len() as u32).to_be_bytes(),
+            &password,
+            parameters,
+        ]
+        .concat();
+        tpm.run(SESSIONS, command, &body).unwrap();
+    }
+
+    /// The lockout's settings, as the owner sets them before kithd takes its authorization:
+    /// `max` wrong PINs let through, one forgotten every `interval` seconds.
+    pub(crate) fn lockout_set<T: Read + Write>(tpm: &mut Tpm<T>, max: u32, interval: u32) {
+        let parameters = [max, interval, 60].map(u32::to_be_bytes).concat();
+        as_lockout(tpm, DA_PARAMETERS, &[], &parameters);
+    }
+
+    /// The bounds a PIN is held to: its length, and the lockout's settings for it.
+    #[test]
+    fn tpm_pin_bounds_name_what_they_refuse() {
+        assert!(bounded(6, 10, 86_400).is_ok(), "10 + 365 guesses a year, of a million");
+        for (digits, max, interval, named) in [
+            (5, 10, 86_400, "6 to 32 digits, not 5"),
+            (33, 10, 86_400, "6 to 32 digits, not 33"),
+            (8, 0, 40, "both above 0"),
+            (8, 3, 0, "both above 0"),
+            (6, 3, 40, "the shortest PIN these settings take is 8 digits"),
+            (7, 3, 40, "788403 guesses in a year"),
+            (11, u32::MAX, 1, "the shortest PIN these settings take is 12 digits"),
+        ] {
+            let refused = bounded(digits, max, interval).unwrap_err();
+            assert!(refused.contains(named), "{digits} {max} {interval}: {refused}");
+        }
+        assert!(bounded(8, 3, 40).is_ok());
+        assert!(bounded(12, u32::MAX, 1).is_ok());
+    }
+
+    /// Against a software TPM: a key sealed under a PIN opens with it, whatever the PCRs; a
+    /// wrong one is counted, and once the TPM counts M of them, the right one is refused as
+    /// well, until whoever holds the lockout's authorization (kithd, which took it where it
+    /// was empty) forgives them. Its settings too loose for a PIN that short: refused. The
+    /// PIN and the lockout's authorization cross the bus encrypted.
+    #[test]
+    fn tpm_pin_opens_with_its_pin_and_counts_each_wrong_one() {
+        let Some((_software, wire)) = software() else { return };
+        let mut tpm = Tpm(wire);
+        measured(&mut tpm);
+        lockout_set(&mut tpm, 3, 40);
+        let lockout = tpm.lockout().unwrap();
+        assert_eq!(
+            (lockout.set, lockout.counter, lockout.max, lockout.interval),
+            (false, 0, 3, 40)
+        );
+
+        let mut kept = None;
+        let refused = tpm
+            .guard(6, false, None, |_| panic!("kept for a PIN refused"))
+            .unwrap_err();
+        assert!(
+            refused.contains("the shortest PIN these settings take is 8 digits"),
+            "{refused}"
+        );
+        tpm.guard(8, false, None, |auth| {
+            kept = Some(auth.to_vec());
+            Ok(())
+        })
+        .unwrap();
+        let auth = kept.expect("the lockout's authorization, kept before the TPM was told it");
+        assert_eq!(auth.len(), 32);
+        assert!(tpm.lockout().unwrap().set, "the TPM holds it");
+        // Held by kithd: taken as it is. Held by somebody else: refused.
+        tpm.guard(8, true, None, |_| panic!("made again")).unwrap();
+        assert_eq!(
+            tpm.guard(8, false, None, |_| panic!("made again")),
+            Err(CLEAR_FIRST.into())
+        );
+
+        let (pin, key): (&[u8], Vec<u8>) = (b"40917253", (0..32).collect());
+        let (sealed, name) = tpm.seal_pin(&key, pin, None).unwrap();
+        let name = Some(&name[..]);
+        assert_eq!(tpm.lockout().unwrap().counter, 1, "the wrong PIN tried when it was set");
+        assert_eq!(tpm.unseal_pin(&sealed, pin, name).as_ref(), Ok(&key));
+        // Not by its PCRs: a PIN's seal is the PIN's alone.
+        extend(&mut tpm, MEASURED.into(), 0xee);
+        assert_eq!(tpm.unseal_pin(&sealed, pin, name).as_ref(), Ok(&key));
+        assert!(!holds(&tpm.0.sent, pin), "the PIN crossed the bus as typed");
+        assert!(
+            !holds(&tpm.0.sent, &auth),
+            "the lockout's authorization crossed the bus in plain"
+        );
+        assert!(!holds(&tpm.0.got(), &key), "the key crossed the bus in plain");
+
+        assert_eq!(tpm.unseal_pin(&sealed, b"40917254", name), Err(NOT_THE_PIN.into()));
+        assert_eq!(tpm.lockout().unwrap().counter, 2);
+        assert_eq!(tpm.unseal_pin(&sealed, b"00000000", name), Err(NOT_THE_PIN.into()));
+        let lockout = tpm.lockout().unwrap();
+        assert!(lockout.locked && lockout.counter == 3, "{lockout:?}");
+        assert_eq!(tpm.unseal_pin(&sealed, pin, name), Err(LOCKED_OUT.into()));
+        // Forgiven by the lockout's authorization kithd keeps: the PIN opens again.
+        as_lockout(&mut tpm, DA_RESET, &auth, &[]);
+        assert_eq!(tpm.unseal_pin(&sealed, pin, name).as_ref(), Ok(&key));
     }
 }

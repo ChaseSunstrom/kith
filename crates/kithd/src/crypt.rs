@@ -106,6 +106,9 @@ pub struct Record {
     /// line cannot be read, which still counts as one: the seal is then not opened.
     parent: Option<Vec<u8>>,
     pass: Option<Pass>,
+    /// The key under this machine's TPM and a PIN; empty when the line cannot be read,
+    /// which opens nothing.
+    pin: Option<PinSeal>,
     /// Whether somebody was shown this disk's recovery key, or typed it.
     seen: bool,
     /// The public keys of the duress codes the cluster made for this node, and for all.
@@ -123,6 +126,44 @@ struct Pass {
     wrapped: Vec<u8>,
 }
 
+/// The key under the TPM and a PIN (docs/adr-unlock.md, "TPM plus PIN"): `k1` sealed to the
+/// system this machine runs (drawn from the key, so made again with no PIN), `k2` sealed
+/// under the PIN (each wrong one counted by the TPM), and the key wrapped under both.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PinSeal {
+    k1: Vec<u8>,
+    k2: Vec<u8>,
+    wrapped: Vec<u8>,
+}
+
+impl PinSeal {
+    fn parse(line: &str) -> Option<PinSeal> {
+        let mut words = line.split_whitespace().map(unhex);
+        let (k1, k2, wrapped) = (words.next()??, words.next()??, words.next()??);
+        Some(PinSeal { k1, k2, wrapped })
+    }
+
+    fn text(&self) -> String {
+        format!("{} {} {}", hex(&self.k1), hex(&self.k2), hex(&self.wrapped))
+    }
+}
+
+/// k1 of the state whose key is `key`: what the TPM seals to the system (never kept).
+fn k1_of(key: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    let drawn = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]).extract(key);
+    let mut k1 = zeroize::Zeroizing::new([0; 32]);
+    let filled = drawn
+        .expand(&[b"kith-lock tpm-pin pcr"], hkdf::HKDF_SHA256)
+        .and_then(|k1_of| k1_of.fill(&mut k1[..]));
+    filled.expect("32 bytes are within what HKDF gives");
+    k1
+}
+
+/// What can be a PIN: 6 to 32 digits.
+fn pin_shaped(line: &str) -> bool {
+    (6..=32).contains(&line.len()) && line.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// What a passphrase given now costs to try: 19 MiB and 2 passes, in one lane (OWASP's
 /// floor for Argon2id; a record says its own, so this can rise).
 const COST: (u32, u32) = (19 << 10, 2);
@@ -135,13 +176,14 @@ fn chosen(passphrase: &str) -> bool {
 
 /// How a state was opened at a start: by its owner (the key was still on the disk, or its
 /// passphrase was typed), by the recovery key typed (so somebody has it), by the cluster's
-/// answer, or by the machine's own TPM.
+/// answer, by the machine's own TPM, or by its TPM and the PIN typed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum By {
     Owner,
     Recovery,
     Cluster,
     Tpm,
+    Pin,
 }
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
@@ -267,6 +309,7 @@ impl Record {
                 "tpm-parent" => record.parent = Some(unhex(value).filter(|name| name.len() == 34).unwrap_or_default()),
                 // (One that cannot be read opens nothing: the node asks as if it had none.)
                 "passphrase" => record.pass = Pass::parse(value),
+                "tpm-pin" => record.pin = Some(PinSeal::parse(value).unwrap_or_default()),
                 "seen" => record.seen = true,
                 // (One that cannot be a key is none: nothing typed is then a duress code.)
                 "duress" => record.duress = unhex(value).filter(|key| key.len() == 32),
@@ -296,6 +339,9 @@ impl Record {
         }
         if let Some(pass) = &self.pass {
             text += &format!("passphrase: {}\n", pass.text());
+        }
+        if let Some(pin) = &self.pin {
+            text += &format!("tpm-pin: {}\n", pin.text());
         }
         if self.seen {
             text += "seen: yes\n";
@@ -430,6 +476,7 @@ pub fn seal(image: &File, disk: &Path) -> Result<String, String> {
         tpm: None,
         parent: None,
         pass: None,
+        pin: None,
         peers: Vec::new(),
         seen: false,
         duress: None,
@@ -520,10 +567,72 @@ enum Typed {
     Opens(Vec<u8>, By),
     Duress(ring::signature::Ed25519KeyPair),
     Wrong,
+    /// Not tried: what is said instead of [`WRONG`] (the TPM refuses every PIN for now).
+    Refused(String),
 }
 
-/// (Off the thread that asks the cluster: a passphrase costs its tries.)
-fn judged(record: &Record, line: &str) -> Typed {
+/// What opens the key by a PIN typed (its digits): [`by_pin`].
+type Pin = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, String> + Send + Sync>;
+
+/// The PIN's way in, once this system's k1 opened: k2 from `tpm` under the PIN typed, then
+/// the key unwrapped from W under both. While the TPM refuses every PIN, the refusal says
+/// within how long the next is taken.
+fn by_pin<T: std::io::Read + std::io::Write + Send + 'static>(
+    tpm: crate::tpm::Tpm<T>,
+    seal: &PinSeal,
+    k1: zeroize::Zeroizing<[u8; 32]>,
+    parent: Option<Vec<u8>>,
+) -> Pin {
+    let (tpm, k2, wrapped) = (std::sync::Mutex::new(tpm), seal.k2.clone(), seal.wrapped.clone());
+    Arc::new(move |pin| {
+        let mut tpm = tpm
+            .lock()
+            .map_err(|_| "the TPM was left by a thread that failed".to_string())?;
+        match tpm.unseal_pin(&k2, pin, parent.as_deref()) {
+            Ok(k2) => {
+                let k2 = zeroize::Zeroizing::new(k2);
+                let both = zeroize::Zeroizing::new([&k1[..], &k2[..]].concat());
+                unwrap(&both, &wrapped).ok_or("the TPM gave the PIN's half, and the key is not under it".into())
+            }
+            Err(why) if why == crate::tpm::LOCKED_OUT => Err(match tpm.lockout() {
+                Ok(lockout) => format!("{why}: the next is taken within {} seconds", lockout.interval),
+                Err(_) => why,
+            }),
+            Err(why) => Err(why),
+        }
+    })
+}
+
+/// Whether a PIN is asked at all, by `seal`: only once the TPM gave k1, so the system that
+/// runs is the one it was sealed to (no PIN typed into another is counted, or heard). Else
+/// why not, as said at the console.
+fn pin_way<T: std::io::Read + std::io::Write + Send + 'static>(
+    seal: &PinSeal,
+    parent: Option<&[u8]>,
+    tpm: impl FnOnce() -> Result<crate::tpm::Tpm<T>, String>,
+) -> Result<Pin, String> {
+    if *seal == PinSeal::default() {
+        return Err("the lock record's tpm-pin: line cannot be read: no PIN is asked".into());
+    }
+    if parent.is_none_or(|name| name.len() != 34) {
+        return Err(
+            "the lock record's tpm-pin: line has no tpm-parent: line it can be checked by: no PIN is asked".into(),
+        );
+    }
+    let mut tpm = tpm().map_err(|why| format!("no PIN is asked: {why}"))?;
+    let k1 = tpm
+        .unseal(&seal.k1, parent)
+        .map_err(|why| format!("this system is not the one the PIN's seal names, so no PIN is asked: {why}"))?;
+    let (k1, mut held) = (zeroize::Zeroizing::new(k1), zeroize::Zeroizing::new([0; 32]));
+    if k1.len() != held.len() {
+        return Err("the PIN's seal gave a key of another length: no PIN is asked".into());
+    }
+    held.copy_from_slice(&k1);
+    Ok(by_pin(tpm, seal, held, parent.map(<[u8]>::to_vec)))
+}
+
+/// (Off the thread that asks the cluster: a passphrase costs its tries, a PIN the TPM's.)
+fn judged(record: &Record, line: &str, pin: Option<&Pin>) -> Typed {
     let code = typed(line);
     if let Some(key) = code.as_ref().and_then(|recovery| unwrap(recovery, &record.recovery)) {
         return Typed::Opens(key, By::Recovery);
@@ -538,8 +647,22 @@ fn judged(record: &Record, line: &str) -> Typed {
     }
     // (Only what can be a passphrase is tried.)
     let pass = record.pass.as_ref().filter(|_| chosen(line));
-    let opened = pass.and_then(|pass| pass.open(line));
-    opened.map_or(Typed::Wrong, |key| Typed::Opens(key, By::Owner))
+    if let Some(key) = pass.and_then(|pass| pass.open(line)) {
+        return Typed::Opens(key, By::Owner);
+    }
+    // (And a PIN last: a wrong one is counted. One the TPM refuses is said so, as the
+    // right one is refused then too.)
+    match pin.filter(|_| pin_shaped(line)).map(|pin| pin(line.as_bytes())) {
+        Some(Ok(key)) => Typed::Opens(key, By::Pin),
+        Some(Err(why)) if why.starts_with(crate::tpm::LOCKED_OUT) => Typed::Refused(why),
+        Some(Err(why)) if why != crate::tpm::NOT_THE_PIN => {
+            // (Not the PIN's fault: the TPM failed. Said where the machine logs, not as
+            // an answer: the console answers it as every line that opens nothing.)
+            eprintln!("kithd: init: a PIN could not be tried: {why}");
+            Typed::Wrong
+        }
+        _ => Typed::Wrong,
+    }
 }
 
 /// A duress code that was typed: its key, for the cluster to be told with.
@@ -550,42 +673,49 @@ type Duressed = tokio::sync::watch::Sender<Option<Arc<ring::signature::Ed25519Ke
 /// same words whatever it was, and the next is judged meanwhile: a duress code does not
 /// wait behind the answer to a wrong key. For a duress code the record is `erase`d
 /// first (whether it is: tried again for as long as it is not) and `forget` is given its
-/// key; nothing typed opens from then on.
+/// key; nothing typed opens from then on. A PIN is tried by `pin`, if this node has one;
+/// what was typed is zeroed once judged.
 async fn console(
     mut record: Record,
     lines: std::sync::mpsc::Receiver<String>,
     say: impl Fn(&str),
     erase: impl Fn() -> bool,
     forget: &Duressed,
+    mut pin: Option<Pin>,
 ) -> (Vec<u8>, By) {
     let (mut answers, mut erased) = (std::collections::VecDeque::new(), true);
     loop {
         while let Ok(line) = lines.try_recv() {
+            let line = zeroize::Zeroizing::new(line);
             if line.is_empty() {
                 continue;
             }
-            answers.push_back(tokio::time::Instant::now() + ANSWER);
-            let judge = record.clone();
-            let judged = tokio::task::spawn_blocking(move || judged(&judge, &line)).await;
+            let due = tokio::time::Instant::now() + ANSWER;
+            let (judge, by) = (record.clone(), pin.clone());
+            let judged = tokio::task::spawn_blocking(move || judged(&judge, &line, by.as_ref())).await;
             let gone = forget.borrow().is_some();
-            match judged.unwrap_or(Typed::Wrong) {
+            let answer = match judged.unwrap_or(Typed::Wrong) {
                 Typed::Opens(key, by) if !gone => return (key, by),
                 Typed::Duress(pair) if !gone => {
                     erased = erase();
                     // (And from memory: what was typed before no longer opens either.)
-                    (record.recovery, record.pass) = (Vec::new(), None);
+                    (record.recovery, record.pass, pin) = (Vec::new(), None, None);
                     forget.send_replace(Some(Arc::new(pair)));
+                    WRONG.to_string()
                 }
-                _ => {}
-            }
+                Typed::Refused(why) if !gone => format!("kithd: init: {why}"),
+                _ => WRONG.to_string(),
+            };
+            answers.push_back((due, answer));
         }
         erased = erased || erase();
         let next = tokio::time::Instant::now() + Duration::from_millis(100);
         match answers.front() {
-            Some(&due) if due <= next => {
+            Some(&(due, _)) if due <= next => {
                 tokio::time::sleep_until(due).await;
-                answers.pop_front();
-                say(WRONG);
+                if let Some((_, answer)) = answers.pop_front() {
+                    say(&answer);
+                }
             }
             _ => tokio::time::sleep_until(next).await,
         }
@@ -608,16 +738,22 @@ fn echo(shown: bool) {
 }
 
 /// The key, from the cluster or from whoever types the recovery key or the node's
-/// passphrase: asked until one gives it. And which did.
-async fn fetched(record: &Record, config: &Path, join: Option<&String>) -> (Vec<u8>, By) {
+/// passphrase, or its PIN (where `pin` tries one): asked until one gives it. And which did.
+async fn fetched(record: &Record, config: &Path, join: Option<&String>, pin: Option<Pin>) -> (Vec<u8>, By) {
     let (client, lines, id) = (client(), crate::install::keyboard(), record.id());
-    let pass = record.pass.as_ref();
+    let (pass, hidden) = (record.pass.as_ref(), record.pass.is_some() || pin.is_some());
+    let asks = match (pass.is_some(), pin.is_some()) {
+        (true, true) => "its PIN, its passphrase, or the recovery key, here: none is shown",
+        (false, true) => "its PIN, or the recovery key, here: neither is shown",
+        (true, false) => "its passphrase, or the recovery key, here: neither is shown",
+        (false, false) => "the recovery key here",
+    };
     let (forget, mut forgetting) = tokio::sync::watch::channel(None);
     // (Said nowhere: a duress code looks like a wrong key, whatever became of it. A disk
     // that did not take it is written again, ten times a second, while this node waits.)
     let erased = || erase(config).is_ok();
     // (Read all the while: a peer that does not answer takes its time to say so.)
-    let console = console(record.clone(), lines, |said| eprintln!("{said}"), erased, &forget);
+    let console = console(record.clone(), lines, |said| eprintln!("{said}"), erased, &forget, pin);
     let cluster = async {
         let (mut said, mut told) = (String::new(), false);
         loop {
@@ -648,27 +784,24 @@ async fn fetched(record: &Record, config: &Path, join: Option<&String>) -> (Vec<
             }
         }
     };
-    eprintln!(
-        "kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type {}.)",
-        if pass.is_some() {
-            "its passphrase, or the recovery key, here: neither is shown"
-        } else {
-            "the recovery key here"
-        }
-    );
-    // (A passphrase is not for whoever looks at the screen.)
-    if pass.is_some() {
+    eprintln!("kithd: init: this node's state is encrypted: asking the cluster for its key. (Or type {asks}.)");
+    // (A passphrase or a PIN is not for whoever looks at the screen.)
+    if hidden {
         echo(false);
     }
     let fetched = tokio::select! {
         key = cluster => (key, By::Cluster),
         (key, by) = console => {
-            let with = if by == By::Recovery { "the recovery key" } else { "its passphrase" };
+            let with = match by {
+                By::Recovery => "the recovery key",
+                By::Pin => "its PIN",
+                _ => "its passphrase",
+            };
             eprintln!("kithd: init: opened with {with}");
             (key, by)
         }
     };
-    if pass.is_some() {
+    if hidden {
         echo(true);
     }
     fetched
@@ -709,7 +842,18 @@ pub async fn open(record: &Record, config: &Path, join: Option<&String>) -> Resu
             if let Some(Err(why)) = refused {
                 eprintln!("kithd: init: {why}");
             }
-            fetched(record, config, join).await
+            let pin =
+                record
+                    .pin
+                    .as_ref()
+                    .and_then(|seal| match pin_way(seal, record.parent.as_deref(), crate::tpm::open) {
+                        Ok(pin) => Some(pin),
+                        Err(why) => {
+                            eprintln!("kithd: init: {why}");
+                            None
+                        }
+                    });
+            fetched(record, config, join, pin).await
         }
     };
     let mapped = kith_dm_sys::crypt("kith-state", &device, 0, sectors, &key);
@@ -730,6 +874,20 @@ fn renewed(record: &Record, opened: &[u8]) -> (Record, String) {
         ..record.clone()
     };
     (with, shown(&recovery))
+}
+
+/// The ways in `record` the cluster's word leaves: the TPM's seal while it says `seal`; a
+/// passphrase and a PIN until the node is locked or forgotten (`shut`). The storage key's
+/// name stays while either seal it checks may: a PIN's seal is checked by it as well.
+fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
+    let pin = record.pin.clone().filter(|_| !shut);
+    Record {
+        tpm: record.tpm.clone().filter(|_| seal),
+        parent: record.parent.clone().filter(|_| seal || pin.is_some()),
+        pass: record.pass.clone().filter(|_| !shut),
+        pin,
+        ..record.clone()
+    }
 }
 
 /// What a `tpm-parent:` line that cannot be read is: present, so the seal beside it is not
@@ -755,6 +913,23 @@ fn sealed_anew<T: std::io::Read + std::io::Write>(
         parent: Some(parent),
         ..record.clone()
     };
+    tried(record, &with, config, |back| {
+        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref())?;
+        (key == opened)
+            .then_some(())
+            .ok_or("the TPM gave another key back".into())
+    })
+}
+
+/// `with` written in place of `record` in one write, read back, and `opens` asked of what
+/// was read: the record as it now is. When it does not read back or open, `record` is
+/// written back as it was.
+fn tried(
+    record: &Record,
+    with: &Record,
+    config: &Path,
+    opens: impl FnOnce(&Record) -> Result<(), String>,
+) -> Result<Record, String> {
     let disk = File::options().read(true).write(true).open(config);
     let disk = disk.map_err(|e| format!("writing the lock record: {e}"))?;
     let back = with.write(&disk, AT).and_then(|()| Record::read(config));
@@ -769,30 +944,94 @@ fn sealed_anew<T: std::io::Read + std::io::Write>(
         })
         .ok_or("the lock record did not read back as written".into())
     });
-    let opens = back.and_then(|back| {
-        let key = tpm.unseal(back.tpm.as_deref().unwrap_or_default(), back.parent.as_deref());
-        key.map(|key| (key, back))
-    });
-    match opens {
-        Ok((key, back)) if key == opened => Ok(back),
-        opens => {
-            let why = opens.err().unwrap_or("the TPM gave another key back".into());
-            match record.write(&disk, AT) {
-                Ok(()) => Err(format!(
-                    "the new seal did not open as written ({why}): the old one stays"
-                )),
-                Err(e) => Err(format!(
-                    "the new seal did not open as written ({why}), and the old record could not be put back ({e})"
-                )),
-            }
-        }
+    let why = match back.and_then(|back| opens(&back).map(|()| back)) {
+        Ok(back) => return Ok(back),
+        Err(why) => why,
+    };
+    match record.write(&disk, AT) {
+        Ok(()) => Err(format!(
+            "the new seal did not open as written ({why}): the old one stays"
+        )),
+        Err(e) => Err(format!(
+            "the new seal did not open as written ({why}), and the old record could not be put back ({e})"
+        )),
     }
 }
 
+/// Where kithd keeps the TPM's lockout authorization, once it set it: in the state, which
+/// only an opened node reads.
+fn lockout_kept() -> PathBuf {
+    Path::new(init::STATE).join("tpm-lockout")
+}
+
+/// The state's key under this machine's TPM and `pin` (docs/adr-unlock.md, "TPM plus PIN"):
+/// the TPM's lockout bounds checked and its authorization taken where it is empty (kept at
+/// `kept` first); `tpm-pin:` written beside `tpm:`, read back and opened by the PIN; then the
+/// record without `tpm:`, whose seal would open the state with no PIN. The record as it now
+/// is, and the TPM's lockout settings. Where a step fails, the record stays as it was.
+fn pin_sealed<T: std::io::Read + std::io::Write>(
+    tpm: &mut crate::tpm::Tpm<T>,
+    record: &Record,
+    opened: &[u8],
+    pin: &[u8],
+    config: &Path,
+    kept: &Path,
+) -> Result<(Record, crate::tpm::Lockout), String> {
+    if record.parent.as_ref().is_some_and(|name| name.len() != 34) {
+        return Err(UNREAD.into());
+    }
+    let keep = |auth: &[u8]| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(kept);
+        let kept = file.and_then(|mut file| std::io::Write::write_all(&mut file, auth).and_then(|()| file.sync_all()));
+        kept.map_err(|e| format!("keeping the TPM's lockout authorization in the state: {e}"))
+    };
+    let lockout = tpm.guard(pin.len(), kept.exists(), record.parent.as_deref(), keep)?;
+    let k1 = k1_of(opened);
+    let (k1_sealed, parent) = tpm.seal(&k1[..], record.parent.as_deref())?;
+    let k2 = zeroize::Zeroizing::new(random::<32>());
+    let (k2_sealed, _) = tpm.seal_pin(&k2[..], pin, Some(&parent))?;
+    let both = zeroize::Zeroizing::new([&k1[..], &k2[..]].concat());
+    let seal = PinSeal {
+        k1: k1_sealed,
+        k2: k2_sealed,
+        wrapped: wrap(&both, opened),
+    };
+    let beside = Record {
+        pin: Some(seal),
+        parent: Some(parent),
+        ..record.clone()
+    };
+    let beside = tried(record, &beside, config, |back| {
+        let seal = back.pin.clone().unwrap_or_default();
+        let k1 = zeroize::Zeroizing::new(tpm.unseal(&seal.k1, back.parent.as_deref())?);
+        let k2 = zeroize::Zeroizing::new(tpm.unseal_pin(&seal.k2, pin, back.parent.as_deref())?);
+        let both = zeroize::Zeroizing::new([&k1[..], &k2[..]].concat());
+        let key = unwrap(&both, &seal.wrapped).map(zeroize::Zeroizing::new);
+        key.filter(|key| key[..] == *opened)
+            .map(drop)
+            .ok_or("the PIN's seal gave another key back".into())
+    })?;
+    let alone = Record {
+        tpm: None,
+        ..beside.clone()
+    };
+    // (Read back as written is all that is asked: what opens it was opened just now. Else
+    // the record goes back to what it was before, not to both lines.)
+    let alone = tried(record, &alone, config, |_| Ok(()))?;
+    Ok((alone, lockout))
+}
+
 /// What its owner asks of this node's record: a passphrase to give its state (none: to take
-/// away), or a new recovery key.
+/// away), a PIN (the same), or a new recovery key.
 enum Change {
     Passphrase(Option<String>),
+    Pin(Option<zeroize::Zeroizing<String>>),
     Recovery,
 }
 
@@ -902,16 +1141,13 @@ pub async fn keep(
                 // (And the duress codes the cluster made: known here with no node in reach.)
                 let public = |field: &str| spec[field].as_str().and_then(unhex).filter(|key| key.len() == 32);
                 let left = Record {
-                    tpm: record.tpm.clone().filter(|_| seal),
-                    parent: record.parent.clone().filter(|_| seal),
-                    pass: record.pass.clone().filter(|_| !shut),
                     duress: if wipes { public("duress") } else { record.duress.clone() },
                     duress_all: if wipes {
                         public("duressAll")
                     } else {
                         record.duress_all.clone()
                     },
-                    ..record.clone()
+                    ..ways_left(&record, seal, shut)
                 };
                 if left != record && write(&left) {
                     if left.tpm != record.tpm {
@@ -922,12 +1158,23 @@ pub async fn keep(
                             "kithd: the cluster no longer hands this node's key out: its passphrase no longer opens its state"
                         );
                     }
+                    if left.pin != record.pin {
+                        eprintln!(
+                            "kithd: the cluster no longer hands this node's key out: its PIN no longer opens its state"
+                        );
+                    }
                     (record.tpm, record.parent, record.pass) = (left.tpm, left.parent, left.pass);
+                    record.pin = left.pin;
                     (record.duress, record.duress_all) = (left.duress, left.duress_all);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
                 // the node would open by its TPM, locked or not. And so a passphrase.)
-                if locked && was_locked == Some(false) && record.tpm.is_none() && record.pass.is_none() {
+                if locked
+                    && was_locked == Some(false)
+                    && record.tpm.is_none()
+                    && record.pass.is_none()
+                    && record.pin.is_none()
+                {
                     // (This node's store may be behind, just after an unlock: a peer that
                     // still hands the key out says it is not locked, or not yet.)
                     let mut stale = false;
@@ -964,8 +1211,12 @@ pub async fn keep(
                     write(&record);
                 }
                 // (Once the key is off the disk: beside it, a seal keeps nothing. A seal of
-                // the old form, with no storage key's name, is made again with it.)
-                let due = seal && record.key.is_none() && !(fits && record.tpm.is_some() && record.parent.is_some());
+                // the old form, with no storage key's name, is made again with it. Beside a
+                // PIN, none: it would open the state with no PIN typed.)
+                let due = seal
+                    && record.key.is_none()
+                    && record.pin.is_none()
+                    && !(fits && record.tpm.is_some() && record.parent.is_some());
                 if due && unsealed.is_none() {
                     let tpm = crate::tpm::open();
                     let kept = tpm.and_then(|mut tpm| sealed_anew(&mut tpm, &record, &opened, &config));
@@ -989,6 +1240,7 @@ pub async fn keep(
                 };
                 for (name, set) in [
                     ("passphrase", record.pass.is_some()),
+                    ("pin", record.pin.is_some()),
                     ("recoverySeen", record.seen),
                     ("duress", record.duress.is_some()),
                     ("duressAll", record.duress_all.is_some()),
@@ -1055,6 +1307,35 @@ pub async fn keep(
                     let _ = done.send(with.map(|with| {
                         record = with;
                         None
+                    }));
+                }
+                Change::Pin(None) => {
+                    // (The record's `tpm:` comes back by itself where the NodeKey says seal.)
+                    let with = Record { pin: None, ..record.clone() };
+                    let wrote = write(&with);
+                    if wrote {
+                        record = with;
+                    }
+                    let _ = done.send(wrote.then_some(None).ok_or("the lock record could not be written".into()));
+                }
+                Change::Pin(Some(_)) if shut => {
+                    let _ = done.send(Err("the cluster does not hand this node's key out (locked, or forgotten): unlock it first".into()));
+                }
+                Change::Pin(Some(pin)) => {
+                    // (Off the threads that serve: the TPM takes its time.)
+                    let (now, key, at) = (record.clone(), opened.clone(), config.clone());
+                    let made = tokio::task::spawn_blocking(move || {
+                        let mut tpm = crate::tpm::open()?;
+                        pin_sealed(&mut tpm, &now, &key, pin.as_bytes(), &at, &lockout_kept())
+                    });
+                    let made = made.await.unwrap_or_else(|_| Err("sealing under the PIN failed".into()));
+                    let _ = done.send(made.map(|(with, lockout)| {
+                        record = with;
+                        eprintln!("kithd: this machine's TPM and its PIN open its state; its TPM alone no longer does");
+                        Some(format!(
+                            "this TPM refuses every PIN after {} wrong ones, and allows one more every {} seconds",
+                            lockout.max, lockout.interval
+                        ))
                     }));
                 }
             },
@@ -1560,6 +1841,65 @@ pub async fn pass(
     }
 }
 
+#[derive(serde::Deserialize)]
+pub struct PinGiven {
+    pin: Option<String>,
+    /// The owner's word that this machine's TPM is not yet known to hold to its lockout:
+    /// a PIN is set nowhere without it.
+    #[serde(default)]
+    untried: bool,
+}
+
+/// What a PIN asked for without the owner's word is refused with.
+const UNTRIED: &str = "a PIN has run against a software TPM only, never yet against this machine's: run \"On hardware: the owner's checklist\" in docs/adr-unlock.md on it, then give the PIN with --untried-tpm";
+
+/// `POST /v1/lock/NAME/pin {pin, untried}` (`kith node pin`): NAME's state opens with its
+/// TPM and the PIN from then on, typed at its console, and with its TPM alone no more; with
+/// no PIN in the body, no longer. For who may apply NodeKeys, and only with `untried`: no
+/// TPM of a machine has yet been shown to hold to its lockout (docs/adr-unlock.md). Asked of
+/// NAME alone, over TLS: no node passes it on. The PIN is kept nowhere: not in the store,
+/// nor in the audit log. The answer says the TPM's lockout.
+pub async fn pin(
+    State(shared): State<Arc<Shared>>,
+    Extension(caller): Extension<Caller>,
+    Named(name): Named<String>,
+    Json(given): Json<PinGiven>,
+) -> Response {
+    let kind = |_: &_| vec![("NodeKey".to_string(), None)];
+    if let Err(refused) = crate::api::permit(&shared, &caller, kith_api::kinds::Verb::Apply, kind) {
+        return refused.into_response();
+    }
+    let pin = given.pin.map(zeroize::Zeroizing::new);
+    let what = if pin.is_some() { "pin" } else { "no pin" };
+    let done = async {
+        if pin.is_some() && !given.untried {
+            return Err(UNTRIED.to_string());
+        }
+        if pin.as_ref().is_some_and(|pin| !pin_shaped(pin)) {
+            let why = "a PIN is 6 to 32 digits and nothing else (the row above the letters, which a starting machine's console reads as digits whatever its layout)";
+            return Err(why.to_string());
+        }
+        let cluster = shared.cluster.as_ref();
+        let cluster = cluster.ok_or("this node is in no cluster: the key of its state is its own to keep")?;
+        // ponytail: never passed on, as the PIN would cross the node passing it in plain;
+        // whether one may be is the owner's call (docs/adr-unlock.md "Open").
+        if name != cluster.me.name {
+            return Err(format!(
+                "a PIN is passed on by no node: ask node {name} itself, at its own API address"
+            ));
+        }
+        changed(&name, Change::Pin(pin.clone())).await
+    }
+    .await;
+    shared
+        .audit
+        .record(&caller, what, vec![format!("NodeKey/{name}")], done.clone().map(drop));
+    match done {
+        Ok(lockout) => Json(json!({ "node": name, "pin": pin.is_some(), "lockout": lockout })).into_response(),
+        Err(why) => refuse(StatusCode::CONFLICT, why).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1707,6 +2047,226 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    fn holds(bytes: &[u8], secret: &[u8]) -> bool {
+        bytes.windows(secret.len()).any(|window| window == secret)
+    }
+
+    /// Against a software TPM (docs/adr-unlock.md, "TPM plus PIN"): a PIN too short for the
+    /// TPM's lockout is refused and nothing is changed; one it bounds is sealed, `tpm-pin:`
+    /// written and `tpm:` dropped, the lockout's authorization kept for kithd alone. At the
+    /// console the PIN opens, a wrong one is counted by the TPM, and once it counted M the
+    /// right one is refused too, saying when the next is taken; the recovery key still opens.
+    /// A system other than the one sealed to is asked no PIN.
+    #[test]
+    fn tpm_pin_opens_the_state_and_the_tpm_counts_each_wrong_one() {
+        use crate::tpm::{CLEAR_FIRST, LOCKED_OUT, Tpm, tests};
+        use std::os::unix::fs::PermissionsExt;
+        let Some((software, wire)) = tests::software() else {
+            return;
+        };
+        let mut tpm = Tpm(wire);
+        tests::measured(&mut tpm);
+        tests::lockout_set(&mut tpm, 3, 40);
+        let (key, recovery): ([u8; 64], [u8; 16]) = (random(), random());
+        let (sealed, parent) = tpm.seal(&key, None).unwrap();
+        let at = |what: &str| std::env::temp_dir().join(format!("kith-crypt-pin-{what}-{}", std::process::id()));
+        let (path, kept, elsewhere) = (at("disk"), at("lockout"), at("elsewhere"));
+        let _ = std::fs::remove_file(&kept);
+        std::fs::write(&path, vec![0; AT as usize + ROOM]).unwrap();
+        let record = Record {
+            secret: vec![7; 32],
+            recovery: wrap(&recovery, &key),
+            tpm: Some(sealed),
+            parent: Some(parent),
+            ..Record::default()
+        };
+        record
+            .write(&File::options().read(true).write(true).open(&path).unwrap(), AT)
+            .unwrap();
+
+        // 3 wrong ones, one forgotten every 40 seconds: 6 digits are too few.
+        let refused = pin_sealed(&mut tpm, &record, &key, b"409172", &path, &kept).unwrap_err();
+        assert!(
+            refused.contains("the shortest PIN these settings take is 8 digits"),
+            "{refused}"
+        );
+        assert!(!kept.exists() && !tpm.lockout().unwrap().set);
+        assert_eq!(Record::read(&path), Ok(Some(record.clone())));
+
+        let pin = "40917253";
+        let (with, lockout) = pin_sealed(&mut tpm, &record, &key, pin.as_bytes(), &path, &kept).unwrap();
+        assert_eq!((lockout.max, lockout.interval, lockout.set), (3, 40, true));
+        assert!(with.tpm.is_none() && with.pin.is_some() && with.parent == record.parent);
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+        let file = std::fs::metadata(&kept).unwrap();
+        assert_eq!((file.len(), file.permissions().mode() & 0o777), (32, 0o600));
+        let disk = std::fs::read(&path).unwrap();
+        assert!(!holds(&disk, pin.as_bytes()) && !holds(&disk, hex(pin.as_bytes()).as_bytes()));
+        // Its lockout authorization held, and not by this node (it keeps none): refused.
+        let other = pin_sealed(&mut tpm, &with, &key, pin.as_bytes(), &path, &elsewhere);
+        assert_eq!(other.map(drop), Err(CLEAR_FIRST.to_string()));
+        assert!(!elsewhere.exists());
+        assert_eq!(Record::read(&path), Ok(Some(with.clone())));
+
+        // At the console. (Setting it tried one wrong PIN, to see the TPM count it: 1.)
+        let seal = with.pin.clone().unwrap();
+        let Tpm(wire) = tpm;
+        let way = pin_way(&seal, with.parent.as_deref(), || Ok(Tpm(wire))).unwrap();
+        let opens = |line: &str| judged(&with, line, Some(&way));
+        assert!(matches!(opens(pin), Typed::Opens(opened, By::Pin) if opened == key));
+        assert!(matches!(opens("40917254"), Typed::Wrong));
+        // (Not a PIN's shape: not tried, not counted.)
+        assert!(matches!(opens("40917"), Typed::Wrong) && matches!(opens("4091725x"), Typed::Wrong));
+        assert!(matches!(opens("00000000"), Typed::Wrong));
+        match opens(pin) {
+            Typed::Refused(why) => assert_eq!(why, format!("{LOCKED_OUT}: the next is taken within 40 seconds")),
+            _ => panic!("the right PIN opened while the TPM refused every PIN"),
+        }
+        assert!(matches!(opens(&shown(&recovery)), Typed::Opens(opened, By::Recovery) if opened == key));
+        drop(way);
+
+        // Another system (a PCR moved): no PIN is asked, so none is counted.
+        let mut tpm = Tpm(software.wire());
+        tests::measured(&mut tpm);
+        let counted = tpm.lockout().unwrap().counter;
+        let Tpm(wire) = tpm;
+        let refused = pin_way(&seal, with.parent.as_deref(), || Ok(Tpm(wire))).err().unwrap();
+        assert!(
+            refused.contains("this system is not the one the PIN's seal names"),
+            "{refused}"
+        );
+        assert_eq!(Tpm(software.wire()).lockout().unwrap().counter, counted);
+        for file in [&path, &kept] {
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    /// The PIN is answered at the console as anything else that opens nothing, never
+    /// repeated; one the TPM refuses (every one is, for now) is said so, with when the next
+    /// is taken; what is not a PIN's shape is not tried at all.
+    #[tokio::test(start_paused = true)]
+    async fn pin_kept_nowhere_at_the_console() {
+        let (key, recovery): ([u8; 64], [u8; 16]) = (random(), random());
+        let record = Record {
+            secret: vec![7; 32],
+            recovery: wrap(&recovery, &key),
+            ..Record::default()
+        };
+        let tried = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, opened) = (tried.clone(), key.to_vec());
+        let pin: Pin = Arc::new(move |typed: &[u8]| {
+            seen.lock().unwrap().push(String::from_utf8_lossy(typed).to_string());
+            match typed {
+                b"40917253" => Err(format!(
+                    "{}: the next is taken within 40 seconds",
+                    crate::tpm::LOCKED_OUT
+                )),
+                b"11111111" => Ok(opened.clone()),
+                _ => Err(crate::tpm::NOT_THE_PIN.into()),
+            }
+        });
+        let said = std::cell::RefCell::new(Vec::new());
+        let say = |line: &str| said.borrow_mut().push(line.to_string());
+        let (told, _) = tokio::sync::watch::channel(None);
+        let (type_it, lines) = std::sync::mpsc::channel();
+        for line in ["40917254", "40917253", "12345", "4091725x"] {
+            type_it.send(line.to_string()).unwrap();
+        }
+        let waiting = console(record.clone(), lines, &say, &|| true, &told, Some(pin.clone()));
+        assert!(tokio::time::timeout(Duration::from_secs(60), waiting).await.is_err());
+        let refused = format!(
+            "kithd: init: {}: the next is taken within 40 seconds",
+            crate::tpm::LOCKED_OUT
+        );
+        assert_eq!(*said.borrow(), [WRONG, refused.as_str(), WRONG, WRONG]);
+        assert_eq!(*tried.lock().unwrap(), ["40917254", "40917253"]);
+        let (type_it, lines) = std::sync::mpsc::channel();
+        type_it.send("11111111".to_string()).unwrap();
+        let opened = console(record, lines, &say, &|| true, &told, Some(pin)).await;
+        assert_eq!(opened, (key.to_vec(), By::Pin));
+        for typed in ["40917254", "40917253", "11111111"] {
+            assert!(
+                !said.borrow().iter().any(|line| line.contains(typed)),
+                "{typed} was said"
+            );
+        }
+    }
+
+    /// `kith node pin`: refused unless the owner says this machine's TPM is untried, naming
+    /// the checklist; refused for what is no PIN, without saying it back; for another node,
+    /// refused, and passed on to no node (whether a node may pass a PIN on is the owner's
+    /// call, docs/adr-unlock.md "Open"). The audit log says a PIN was asked for, never which.
+    #[tokio::test]
+    async fn pin_kept_nowhere_by_the_api() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let (a, b, x) = (node(&ca, "a"), node(&ca, "b"), node(&ca, "x"));
+        let (taken, to_x) = answering_as(&x).await;
+        let there = at("b", &taken, Some(crate::pki::print_of(&b.cert).unwrap()));
+        let shared = shared_with("pin", a, &[there]).await;
+        let ask = |name: &str, pin: &str, untried: bool| {
+            let given = Json(PinGiven {
+                pin: Some(pin.into()),
+                untried,
+            });
+            pin_route(shared.clone(), name.to_string(), given)
+        };
+        for (name, typed, untried, named) in [
+            ("a", "40917253", false, "On hardware: the owner's checklist"),
+            ("a", "4091725x", true, "a PIN is 6 to 32 digits"),
+            ("a", "40917", true, "a PIN is 6 to 32 digits"),
+            ("b", "40917262", true, "ask node b itself"),
+        ] {
+            let (status, said) = ask(name, typed, untried).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{said}");
+            assert!(said.contains(named) && !said.contains(typed), "{said}");
+        }
+        // Taking a PIN away is asked of the node itself as well.
+        let off = Json(PinGiven {
+            pin: None,
+            untried: false,
+        });
+        let (status, said) = pin_route(shared.clone(), "b".into(), off).await;
+        assert!(
+            status == StatusCode::CONFLICT && said.contains("ask node b itself"),
+            "{said}"
+        );
+        assert_eq!(to_x.load(Ordering::SeqCst), 0, "x was sent the PIN");
+        let audit = serde_json::to_string(&shared.audit.tail(100).unwrap()).unwrap();
+        assert!(audit.contains("\"pin\"") && audit.contains("NodeKey/b"), "{audit}");
+        for typed in ["40917253", "4091725x", "40917262"] {
+            assert!(!audit.contains(typed), "{typed} is in the audit log");
+        }
+    }
+
+    /// The cluster's word takes the TPM's seal away (not `seal`): a PIN's seal stays, and
+    /// with it the storage key's name it is checked by (a VM lost it so, and was asked no
+    /// PIN). Locked: the PIN goes, and the name with it.
+    #[test]
+    fn tpm_pin_keeps_its_storage_key_name_when_the_seal_goes() {
+        let record = Record {
+            tpm: Some(vec![5; 40]),
+            parent: Some(vec![6; 34]),
+            pin: Some(PinSeal::default()),
+            ..Record::default()
+        };
+        let left = ways_left(&record, false, false);
+        assert_eq!(
+            (left.tpm, left.parent, left.pin),
+            (None, record.parent.clone(), record.pin.clone())
+        );
+        let left = ways_left(&record, false, true);
+        assert_eq!((left.tpm, left.parent, left.pin), (None, None, None));
+        let left = ways_left(&record, true, true);
+        assert_eq!((left.tpm, left.parent), (record.tpm.clone(), record.parent.clone()));
+    }
+
+    async fn pin_route(shared: Arc<Shared>, name: String, given: Json<PinGiven>) -> (StatusCode, String) {
+        let answer = pin(State(shared), Extension(Caller::Admin), Named(name), given).await;
+        let status = answer.status();
+        let body = axum::body::to_bytes(answer.into_body(), 1 << 16).await.unwrap();
+        (status, String::from_utf8_lossy(&body).to_string())
+    }
+
     /// A record that would not fit its room is refused, naming the line that would be cut;
     /// only whole `peers:` entries are left out to make it fit.
     #[test]
@@ -1753,8 +2313,18 @@ mod tests {
             seen: true,
             duress: Some(vec![6; 32]),
             duress_all: Some(vec![8; 32]),
+            pin: Some(PinSeal {
+                k1: vec![1; 200],
+                k2: vec![2; 200],
+                wrapped: vec![3; 104],
+            }),
             peers: vec!["10.0.0.1:7443".into(), "[fd00::2]:7443".into()],
         };
+        // A tpm-pin: that cannot be read counts as there, and asks no PIN; the rest is read.
+        let unread = b"kith-lock v1\nsecret: 0707070707070707070707070707070707070707070707070707070707070707\ntpm-pin: 00 zz\nduress: 0606\n"; // pragma: allowlist secret
+        let unread = Record::parse(unread).unwrap();
+        assert_eq!(unread.pin, Some(PinSeal::default()));
+        assert!(pin_way::<File>(&PinSeal::default(), Some(&[0; 34]), || unreachable!()).is_err());
         // A record from before these lines has none of them; a duress line that cannot be
         // a key is none.
         let old =
@@ -1900,7 +2470,7 @@ mod tests {
         // A wrong key, the duress code, the recovery key itself, a wrong passphrase: all
         // typed before the first is answered.
         let (_open, lines) = keyboard(&[&wrong, &duress, &shown(&recovery), "correct horse batterz"]);
-        let waiting = console(record.clone(), lines, &say, &erase, &told);
+        let waiting = console(record.clone(), lines, &say, &erase, &told, None);
         let opened = tokio::time::timeout(Duration::from_secs(60), waiting).await;
         assert!(opened.is_err(), "after a duress code nothing typed opens the state");
         // Each is answered with the same words, ANSWER after it was read, the duress code
@@ -1925,7 +2495,7 @@ mod tests {
             std::future::pending::<()>().await
         };
         let opened = tokio::select! {
-            opened = console(record.clone(), lines, &say, &erase, &told) => opened,
+            opened = console(record.clone(), lines, &say, &erase, &told, None) => opened,
             () = later => unreachable!(),
         };
         assert_eq!(opened, (key.to_vec(), By::Recovery));
@@ -1933,7 +2503,7 @@ mod tests {
         assert_eq!(erased.get(), 3);
         // A record that names no duress code takes that code for a wrong key.
         let none = Record { duress: None, ..record };
-        assert!(matches!(judged(&none, &duress), Typed::Wrong));
+        assert!(matches!(judged(&none, &duress, None), Typed::Wrong));
     }
 
     #[test]
@@ -2071,10 +2641,10 @@ mod tests {
             recovery: wrap(&old, &key),
             ..Record::default()
         };
-        assert!(matches!(judged(&record, &shown(&old)), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&record, &shown(&old), None), Typed::Opens(opened, By::Recovery) if opened == key));
         let (with, new) = renewed(&record, &key);
-        assert!(matches!(judged(&with, &new), Typed::Opens(opened, By::Recovery) if opened == key));
-        assert!(matches!(judged(&with, &shown(&old)), Typed::Wrong));
+        assert!(matches!(judged(&with, &new, None), Typed::Opens(opened, By::Recovery) if opened == key));
+        assert!(matches!(judged(&with, &shown(&old), None), Typed::Wrong));
         // Whoever asked was shown it; nothing else of the record changed, and the key
         // shown is not in it.
         assert!(with.seen && !record.seen && new != shown(&old));
