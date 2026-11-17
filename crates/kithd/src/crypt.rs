@@ -97,6 +97,11 @@ use std::time::Duration;
 pub const AT: u64 = 512 << 10;
 const ROOM: usize = 4096;
 const FIRST: &str = "kith-lock v1";
+/// What an erased lock record's room begins with (see `erase`).
+const TOMBSTONE: &[u8] = b"kith-lock erased\n";
+/// What [`Record::read`] says of an erased record: init powers off on it, as a restart would
+/// find the same.
+pub const ERASED: &str = "this node's lock record was erased (a duress code or a wipe): its state cannot be opened";
 /// `sum: ` and the SHA-256 of the lines after it, in hex: a record cut part way is not taken.
 const SUM_LINE: usize = "sum: \n".len() + 64;
 
@@ -391,6 +396,9 @@ impl Record {
             (Ok(()), None) if record.starts_with(FIRST.as_bytes()) || copy.starts_with(FIRST.as_bytes()) => {
                 return Err("this node's state is encrypted, and its lock record is damaged".into());
             }
+            (Ok(()), None) if record.starts_with(TOMBSTONE) || copy.starts_with(TOMBSTONE) => {
+                return Err(ERASED.into());
+            }
             (Ok(()), record) => record,
             (Err(_), _) => None,
         })
@@ -565,10 +573,14 @@ fn from_disk(disk: &File, at: u64) -> &File {
 fn erase(config: &Path) -> std::io::Result<()> {
     let disk = File::options().read(true).write(true).open(config)?;
     let mut back = [1; 2 * ROOM];
-    disk.write_all_at(&[0; 2 * ROOM], AT)?;
+    // (A tombstone in both places, no secret in it: `Record::read` says it was erased.)
+    let mut tomb = [0; 2 * ROOM];
+    tomb[..TOMBSTONE.len()].copy_from_slice(TOMBSTONE);
+    tomb[ROOM..ROOM + TOMBSTONE.len()].copy_from_slice(TOMBSTONE);
+    disk.write_all_at(&tomb, AT)?;
     disk.sync_all()?;
     from_disk(&disk, AT).read_exact_at(&mut back, AT)?;
-    match back == [0; 2 * ROOM] {
+    match back == tomb {
         true => Ok(()),
         false => Err(std::io::Error::other("the lock record is still on the disk")),
     }
@@ -2516,7 +2528,26 @@ mod tests {
         many.write(&disk, AT).unwrap();
         assert!(Record::read(Path::new(&path)).unwrap().is_some());
         erase(Path::new(&path)).unwrap();
+        assert_eq!(Record::read(Path::new(&path)), Err(ERASED.to_string()));
+    }
+
+    #[test]
+    fn an_erased_record_says_so() {
+        let path = std::env::temp_dir().join(format!("kith-crypt-erased-{}", std::process::id()));
+        let disk = File::options().read(true).write(true).create(true).truncate(true).open(&path);
+        let disk = disk.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        disk.set_len(AT + 2 * ROOM as u64).unwrap();
+        let path = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&disk));
+        // Never written: no record. Erased: the record is gone, and says so, in either place.
         assert_eq!(Record::read(Path::new(&path)), Ok(None));
+        erase(Path::new(&path)).unwrap();
+        assert_eq!(Record::read(Path::new(&path)), Err(ERASED.to_string()));
+        let mut bytes = vec![0; 2 * ROOM];
+        disk.read_exact_at(&mut bytes, AT).unwrap();
+        assert!(bytes.starts_with(TOMBSTONE) && bytes[ROOM..].starts_with(TOMBSTONE));
+        disk.write_all_at(&[0; ROOM], AT).unwrap();
+        assert_eq!(Record::read(Path::new(&path)), Err(ERASED.to_string()));
     }
 
     #[test]
