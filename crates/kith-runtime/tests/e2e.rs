@@ -49,6 +49,17 @@ async fn rig(name: &str) -> Option<(Runtime, kith_runtime::Image, std::path::Pat
     Some((rt, image, dir))
 }
 
+/// A process that writes to stderr and exits 1 at once keeps what it wrote: its err file is the
+/// log a restarting pod keeps (kithd opens `{id}.err` for each unit and passes it through).
+#[tokio::test]
+async fn a_pod_that_exits_at_once_keeps_its_stderr() {
+    let Some((rt, image, dir)) = rig("exits-at-once").await else {
+        return;
+    };
+    let (code, out, err) = sh(&rt, &image, &dir, "exits", script("echo oops >&2; exit 1"));
+    assert_eq!((code, out.as_str(), err.as_str()), (1, "", "oops\n"));
+}
+
 /// What every container gets with nothing said: no way to more privileges, no user 0, no capabilities.
 #[tokio::test]
 async fn hardened() {

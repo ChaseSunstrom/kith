@@ -2282,6 +2282,41 @@ mod tests {
         );
     }
 
+    /// A container's /tmp is a fresh tmpfs over the image's own: sticky, with no suid and no
+    /// devices, wherever kithd runs. A pod (`as_image`) whose image names no user is user 0 of
+    /// its own namespace where kithd is not root: its doc says "root included", and this pins
+    /// that, so a change to the default shows here.
+    #[test]
+    fn tmp_is_a_fresh_tmpfs_and_a_pod_without_an_image_user_is_root() {
+        use nix::unistd::{Gid, Uid};
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let pod = Unit {
+            as_image: true,
+            ..Unit::default()
+        };
+        for kithd in [0, 1000] {
+            let (uid, gid) = (Uid::from_raw(kithd), Gid::from_raw(kithd));
+            for unit in [Unit::default(), pod.clone()] {
+                let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+                let mounts = made.mounts().clone().unwrap();
+                let tmp: Vec<_> = mounts.iter().filter(|m| m.destination() == Path::new("/tmp")).collect();
+                assert_eq!(tmp.len(), 1, "one /tmp, mounted over the image's own");
+                assert_eq!(tmp[0].typ().as_deref(), Some("tmpfs"));
+                assert_eq!(tmp[0].options().as_ref().unwrap(), &["nosuid", "nodev", "mode=1777"]);
+            }
+            let made = spec_of("a", &image, &pod, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+            let user = made.process().as_ref().unwrap().user();
+            assert_eq!(
+                (user.uid(), user.gid()),
+                (0, 0),
+                "a pod whose image names no user is root"
+            );
+        }
+    }
+
     #[test]
     fn a_volume_is_a_bind_mount_in_the_spec_and_read_only_when_asked() {
         let made = mounted(vec![bind("/srv/data", "/data", false), bind("/srv/ro", "/ro/x", true)]).unwrap();
