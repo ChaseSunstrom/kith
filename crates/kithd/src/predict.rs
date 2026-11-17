@@ -95,7 +95,10 @@ pub fn authenticode(pe: &[u8]) -> Result<Hash, String> {
         sum += size;
     }
     // Anything after the sections but the certificate table.
-    let tail = pe.len().checked_sub(sum + cert_size).ok_or_else(|| bad("certificate table"))?;
+    let tail = pe
+        .len()
+        .checked_sub(sum + cert_size)
+        .ok_or_else(|| bad("certificate table"))?;
     hashed.update(take(pe, sum, tail)?);
     Ok(hashed.finalize().into())
 }
@@ -122,12 +125,20 @@ pub fn parse_log(log: &[u8]) -> Result<Vec<Event>, String> {
         let mut next = at + 12;
         for _ in 0..le32(log, at + 8)? {
             let alg = le16(log, next)?;
-            let len = sizes.iter().find(|s| s.0 == alg).map(|s| s.1).ok_or("a digest of an unknown algorithm")?;
+            let len = sizes
+                .iter()
+                .find(|s| s.0 == alg)
+                .map(|s| s.1)
+                .ok_or("a digest of an unknown algorithm")?;
             if len > MAX_DIGEST {
                 return Err("a digest too long".into());
             }
             if alg == ALG_SHA256 as usize {
-                digest = Some(take(log, next + 2, len)?.try_into().map_err(|_| "a SHA-256 digest of the wrong size")?);
+                digest = Some(
+                    take(log, next + 2, len)?
+                        .try_into()
+                        .map_err(|_| "a SHA-256 digest of the wrong size")?,
+                );
             }
             next += 2 + len;
         }
@@ -135,7 +146,11 @@ pub fn parse_log(log: &[u8]) -> Result<Vec<Event>, String> {
         take(log, 0, at)?;
         if kind != EV_NO_ACTION as usize {
             let digest = digest.ok_or("an event with no SHA-256 digest")?;
-            events.push(Event { pcr: pcr as u32, kind: kind as u32, digest });
+            events.push(Event {
+                pcr: pcr as u32,
+                kind: kind as u32,
+                digest,
+            });
         }
     }
     Ok(events)
@@ -150,7 +165,9 @@ fn extend(pcr: &Hash, digest: &Hash) -> Hash {
 pub fn replay(events: &[Event]) -> Result<[Hash; PCRS], String> {
     let mut pcrs = [[0u8; 32]; PCRS];
     for e in events {
-        let pcr = pcrs.get_mut(e.pcr as usize).ok_or("an event for a PCR the TPM does not have")?;
+        let pcr = pcrs
+            .get_mut(e.pcr as usize)
+            .ok_or("an event for a PCR the TPM does not have")?;
         *pcr = extend(pcr, &e.digest);
     }
     Ok(pcrs)
@@ -212,15 +229,17 @@ mod tests {
             put(&mut head, table + 40 * i + 20, &start.to_le_bytes());
         }
         let (a, b, overlay) = ([0xAAu8; 0x200], [0xBBu8; 0x100], b"overlay");
-        let mut hashed = [&head[..CHECKSUM], &head[CHECKSUM + 4..CERT_ENTRY], &head[CERT_ENTRY + 8..]].concat();
+        let mut hashed = [
+            &head[..CHECKSUM],
+            &head[CHECKSUM + 4..CERT_ENTRY],
+            &head[CERT_ENTRY + 8..],
+        ]
+        .concat();
         hashed.extend_from_slice(&[&a[..], &b[..], &overlay[..]].concat());
         put(&mut head, CHECKSUM, &[noise; 4]);
         put(&mut head, CERT_ENTRY, &(0x600u32).to_le_bytes());
         put(&mut head, CERT_ENTRY + 4, &(cert.len() as u32).to_le_bytes());
-        (
-            [&head[..], &a[..], &b[..], &overlay[..], cert].concat(),
-            hashed,
-        )
+        ([&head[..], &a[..], &b[..], &overlay[..], cert].concat(), hashed)
     }
 
     #[test]
@@ -265,7 +284,14 @@ mod tests {
             spec.extend_from_slice(&len.to_le_bytes());
         }
         spec.push(0);
-        let mut out = [&0u32.to_le_bytes()[..], &3u32.to_le_bytes(), &[0; 20], &(spec.len() as u32).to_le_bytes(), &spec].concat();
+        let mut out = [
+            &0u32.to_le_bytes()[..],
+            &3u32.to_le_bytes(),
+            &[0; 20],
+            &(spec.len() as u32).to_le_bytes(),
+            &spec,
+        ]
+        .concat();
         let mut one = |pcr: u32, kind: u32, digest: Hash, data: &[u8]| {
             out.extend_from_slice(&pcr.to_le_bytes());
             out.extend_from_slice(&kind.to_le_bytes());
@@ -285,7 +311,9 @@ mod tests {
     }
 
     fn chain(digests: &[Hash]) -> Hash {
-        digests.iter().fold([0; 32], |pcr, d| Sha256::digest([&pcr[..], &d[..]].concat()).into())
+        digests
+            .iter()
+            .fold([0; 32], |pcr, d| Sha256::digest([&pcr[..], &d[..]].concat()).into())
     }
 
     fn sha(s: &str) -> Hash {
@@ -298,7 +326,14 @@ mod tests {
         let bytes = log(&[(0, 1, a), (4, 0x8000_0003, b), (7, 1, c), (4, 0x8000_0003, d)]);
         let events = parse_log(&bytes).unwrap();
         assert_eq!(events.len(), 4, "the NO_ACTION event is not an extend");
-        assert_eq!(events[1], Event { pcr: 4, kind: 0x8000_0003, digest: b });
+        assert_eq!(
+            events[1],
+            Event {
+                pcr: 4,
+                kind: 0x8000_0003,
+                digest: b
+            }
+        );
         let pcrs = replay(&events).unwrap();
         assert_eq!(pcrs[4], chain(&[b, d]));
         assert_eq!(pcrs[0], chain(&[a]));
@@ -306,9 +341,19 @@ mod tests {
         assert_eq!(explains(&events, &[(4, chain(&[b, d])), (7, chain(&[c]))]), Ok(()));
         // a start the log does not describe
         assert_eq!(explains(&events, &[(4, chain(&[b]))]), Err(UNEXPLAINED.into()));
-        assert_eq!(explains(&events, &[(4, chain(&[b, d])), (7, [0; 32])]), Err(UNEXPLAINED.into()));
+        assert_eq!(
+            explains(&events, &[(4, chain(&[b, d])), (7, [0; 32])]),
+            Err(UNEXPLAINED.into())
+        );
         // an event for a PCR the TPM has not, a log that is not crypto-agile, a cut one
-        assert!(replay(&[Event { pcr: 24, kind: 1, digest: a }]).is_err());
+        assert!(
+            replay(&[Event {
+                pcr: 24,
+                kind: 1,
+                digest: a
+            }])
+            .is_err()
+        );
         let mut old = bytes.clone();
         old[32] = b'X';
         assert!(parse_log(&old).is_err());
@@ -333,12 +378,20 @@ mod tests {
         let (r, n) = (authenticode(&running).unwrap(), authenticode(&new).unwrap());
         assert_ne!(r, n);
         let (fw, other) = (sha("firmware"), sha("other"));
-        let bytes = log(&[(4, 0x8000_0003, fw), (4, 0x8000_0003, r), (4, 0x8000_0003, other), (7, 1, r)]);
+        let bytes = log(&[
+            (4, 0x8000_0003, fw),
+            (4, 0x8000_0003, r),
+            (4, 0x8000_0003, other),
+            (7, 1, r),
+        ]);
         let read = chain(&[fw, r, other]);
         // the event for the running file is the new file's, and PCR 7 is not touched
         assert_eq!(predict_pcr4(&bytes, &read, &running, &new), Ok(chain(&[fw, n, other])));
         // a log that is not this start's predicts nothing
-        assert_eq!(predict_pcr4(&bytes, &chain(&[fw, r]), &running, &new), Err(UNEXPLAINED.into()));
+        assert_eq!(
+            predict_pcr4(&bytes, &chain(&[fw, r]), &running, &new),
+            Err(UNEXPLAINED.into())
+        );
         // no event for the running boot file
         let (elsewhere, _) = pe(2, &[]);
         let mut moved = elsewhere.clone();
@@ -346,10 +399,16 @@ mod tests {
         assert_eq!(predict_pcr4(&bytes, &read, &moved, &new), Err(NO_BOOT_FILE.into()));
         // the running file's digest in PCR 7 only is no event of PCR 4
         let seven = log(&[(4, 1, fw), (7, 1, r)]);
-        assert_eq!(predict_pcr4(&seven, &chain(&[fw]), &running, &new), Err(NO_BOOT_FILE.into()));
+        assert_eq!(
+            predict_pcr4(&seven, &chain(&[fw]), &running, &new),
+            Err(NO_BOOT_FILE.into())
+        );
         // two events for it: which one is the boot file is not known
         let twice = log(&[(4, 1, r), (4, 1, r)]);
-        assert_eq!(predict_pcr4(&twice, &chain(&[r, r]), &running, &new), Err(NO_BOOT_FILE.into()));
+        assert_eq!(
+            predict_pcr4(&twice, &chain(&[r, r]), &running, &new),
+            Err(NO_BOOT_FILE.into())
+        );
         // a new file that is not a PE
         assert!(predict_pcr4(&bytes, &read, &running, b"not a PE").is_err());
     }
