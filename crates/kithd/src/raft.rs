@@ -637,7 +637,12 @@ impl Shared {
             let asked = crate::blobs::put_first(&state.store, resources)
                 .and_then(|()| crate::exits::admitted(&state.store, resources))
                 .and_then(|()| crate::pods::unshared(&state.store, resources))
-                .and_then(|()| crate::access::runs_as(&state.store, resources));
+                .and_then(|()| crate::access::runs_as(&state.store, resources))
+                .and_then(|()| {
+                    self.cluster.as_ref().map_or(Ok(()), |cluster| {
+                        crate::services::unclaimed(&state.store, crate::mesh::prefix(&cluster.me.ca), resources)
+                    })
+                });
             asked.map_err(Error::Invalid)?;
         }
         self.write_as(command, who).await.map(|(done, _)| done)

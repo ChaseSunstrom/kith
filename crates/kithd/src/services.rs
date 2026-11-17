@@ -106,6 +106,43 @@ pub fn addresses(store: &Store, prefix: Ipv6Addr) -> BTreeMap<String, Ipv6Addr> 
     services.map(|service| (service.key(), address(service))).collect()
 }
 
+/// Refuse an Apply with a Service whose mesh address another Service has, stored or in the
+/// same Apply: two names can hash to one address (48 bits), and then their connections go to
+/// one another's backends. (Not said whose: a namespace learns nothing of another's by it.)
+pub fn unclaimed(store: &Store, prefix: Ipv6Addr, resources: &[Resource]) -> Result<(), String> {
+    unclaimed_with(store, resources, |namespace, name| {
+        kith_mesh::service_address(prefix, namespace, name)
+    })
+}
+
+/// [`unclaimed`] with the address of a Service given by `address`, so a test can make two
+/// collide.
+fn unclaimed_with(
+    store: &Store,
+    resources: &[Resource],
+    address: impl Fn(&str, &str) -> Ipv6Addr,
+) -> Result<(), String> {
+    let batch: Vec<&Resource> = resources.iter().filter(|resource| resource.kind == "Service").collect();
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let of = |service: &Resource| address(&namespace(service), &service.metadata.name);
+    let claims: Vec<(String, Ipv6Addr)> = store
+        .list(Some("Service"))
+        .chain(batch.iter().copied())
+        .map(|service| (service.key(), of(service)))
+        .collect();
+    for service in &batch {
+        let (key, mine) = (service.key(), of(service));
+        if claims.iter().any(|(other, theirs)| *other != key && *theirs == mine) {
+            return Err(format!(
+                "Service {key} would have the mesh address another Service has (an address comes from a Service's namespace and name): pick another name"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The replicas of `workload` with every unit ready, and the node each runs on.
 fn ready_on(workload: &Resource) -> Vec<(String, u32)> {
     let mut replicas: BTreeMap<(u64, &str), bool> = BTreeMap::new();
@@ -2432,4 +2469,71 @@ spec:
         );
         assert!(each > 0 && shared > 0 && frames >= 2 * shared);
     }
+}
+
+/// A Service `name` in `namespace`, as an Apply has it.
+#[cfg(test)]
+fn service(namespace: &str, name: &str) -> Resource {
+    let text = format!(
+        "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ namespace: {namespace}, name: {name} }}\nspec: {{ selector: {{ app: web }}, ports: [{{ port: 80 }}] }}"
+    );
+    Resource::from_source(&text)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap()
+}
+
+/// An Apply of a Workload and no Service.
+#[cfg(test)]
+fn no_service() -> Vec<Resource> {
+    let text = "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: { name: web }\nspec:\n  template:\n    containers: [{ name: main, image: example.org/web }]";
+    Resource::from_source(text)
+        .unwrap()
+        .into_iter()
+        .map(Result::unwrap)
+        .collect()
+}
+
+// (Here, not in `tests`: the criteria name them `services::<name>`.)
+#[test]
+fn a_service_whose_address_is_anothers_is_refused() {
+    // (Every name gets the one address here, so any two Services clash.)
+    let one = |_: &str, _: &str| Ipv6Addr::LOCALHOST;
+    let mut store = Store::default();
+    store.apply(service("tenant-x", "vault")).unwrap();
+    // One stored, one in the Apply.
+    let refused = unclaimed_with(&store, &[service("media", "web")], one).unwrap_err();
+    assert!(
+        refused.contains("would have the mesh address another Service has"),
+        "{refused}"
+    );
+    assert!(refused.starts_with("Service Service/media/web would"), "{refused}");
+    assert!(!refused.contains("tenant-x") && !refused.contains("vault"), "{refused}");
+    // Two in one Apply.
+    let both = [service("tenant-x", "vault"), service("media", "web")];
+    let refused = unclaimed_with(&Store::default(), &both, one).unwrap_err();
+    assert!(refused.starts_with("Service Service/tenant-x/vault would"), "{refused}");
+    assert!(!refused.contains("media") && !refused.contains("web"), "{refused}");
+}
+
+#[test]
+fn a_service_applied_again_under_its_own_key_is_no_clash() {
+    let one = |_: &str, _: &str| Ipv6Addr::LOCALHOST;
+    let mut store = Store::default();
+    store.apply(service("media", "web")).unwrap();
+    unclaimed_with(&store, &[service("media", "web")], one).unwrap();
+    // With the real addresses too, and an Apply with no Service at all.
+    let prefix = kith_mesh::prefix(b"test");
+    unclaimed(&store, prefix, &[service("media", "web")]).unwrap();
+    unclaimed(&store, prefix, &no_service()).unwrap();
+}
+
+#[test]
+fn a_batch_with_no_service_is_never_asked() {
+    let asked = |_: &str, _: &str| -> Ipv6Addr { panic!("an address was asked for") };
+    let mut store = Store::default();
+    store.apply(service("media", "web")).unwrap();
+    unclaimed_with(&store, &no_service(), asked).unwrap();
 }
