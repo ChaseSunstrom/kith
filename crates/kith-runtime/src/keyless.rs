@@ -25,6 +25,20 @@ const P256: &[u8] = &[
 ];
 /// The most certificates an identity's authority is given as.
 const AUTHORITY: usize = 4;
+/// RFC 3161's OIDs: id-kp-timeStamping (1.3.6.1.5.5.7.3.8), SignedData (1.2.840.113549.1.7.2),
+/// TSTInfo (1.2.840.113549.1.9.16.1.4), the signed attribute messageDigest
+/// (1.2.840.113549.1.9.4), SHA-256 and SHA-384 (2.16.840.1.101.3.4.2.1 and .2).
+const TIME_STAMPING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x08];
+const SIGNED_DATA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02];
+const TST_INFO: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x10, 0x01, 0x04];
+const MESSAGE_DIGEST: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x04];
+const SHA256_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01];
+const SHA384_OID: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02];
+#[cfg(test)]
+const CONTENT_TYPE: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x03];
+/// The most bytes of a timestamp, and certificates in it, that are read.
+const STAMP: usize = 64 * 1024;
+const STAMP_CERTS: usize = 8;
 
 /// Who an image may be signed by without a kept key: whom the authority certified, as whom
 /// the issuer signed them in, and the authority's certificates and the log's key that say so.
@@ -126,6 +140,10 @@ pub struct Signed {
     /// Whether the payload is an in-toto statement (a bundle's) or cosign's simple text.
     statement: bool,
     promise: Option<Promise>,
+    /// A Rekor v2 bundle's RFC 3161 timestamp (a DER TimeStampResp) over the signature, and the
+    /// time it was found to give once `timestamp` checked it against the TSA.
+    stamp: Option<Vec<u8>>,
+    stamped: Option<i64>,
 }
 
 /// A number protobuf's JSON writes as a string (int64), or a JSON number.
@@ -184,8 +202,11 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let stamp = base64(&material["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"]);
     let promise = match entries {
         [] => None,
+        // Rekor v2's: no promise, the timestamp is what says when.
+        [entry, ..] if stamp.is_some() && entry["inclusionPromise"].is_null() => None,
         [entry, ..] => {
             let promise = &entry["inclusionPromise"]["signedEntryTimestamp"];
             let read = || {
@@ -198,7 +219,7 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
                 })
             };
             Some(read().ok_or(match promise.is_null() {
-                true => "its log entry has no promise from the log (a log of Rekor v2, which kith does not read yet)",
+                true => "its log entry has no promise from the log, nor has the bundle a timestamp (a log of Rekor v2)",
                 false => "its log entry is not one kith can read",
             })?)
         }
@@ -210,6 +231,8 @@ pub fn bundle(bytes: &[u8]) -> std::result::Result<Signed, String> {
         payload,
         statement: true,
         promise,
+        stamp,
+        stamped: None,
     })
 }
 
@@ -247,33 +270,24 @@ pub fn tagged(
         payload: payload.to_vec(),
         statement: false,
         promise,
+        stamp: None,
+        stamped: None,
     })
 }
 
 /// Whether `signed` is a signature of the image `digest` by `who`; why not, if not.
 pub fn check(signed: &Signed, digest: &str, who: &Identity) -> std::result::Result<(), String> {
-    let promise = signed.promise.as_ref().ok_or("it has no entry in a log")?;
-    // The log's promise, by the log's key: the time is now the log's word.
-    if promise.log_id != who.log_id {
-        return Err(format!(
-            "its log entry is from another log (key id {})",
-            shown(&promise.log_id)
-        ));
-    }
-    let promised = format!(
-        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
-        STANDARD.encode(&promise.body),
-        promise.time,
-        promise.log_id,
-        promise.index
-    );
-    let log = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &who.log);
-    if log.verify(promised.as_bytes(), &promise.signature).is_err() {
-        return Err("its log entry's promise is not signed by the log's key".into());
-    }
-    // The entry the log promised is this signature, by this certificate, of this payload.
-    entry(signed, &promise.body)?;
-    // The certificate, from the authority, for code signing, when the log saw it.
+    // When it was signed: the log's word (its promise, checked here), or else a timestamp's
+    // (checked against its TSA by `timestamp` before this).
+    let (time, said) = match (&signed.promise, signed.stamped) {
+        (Some(promise), _) => {
+            promised(signed, promise, who)?;
+            (promise.time, "the log saw it")
+        }
+        (None, Some(time)) => (time, "the timestamp is of"),
+        (None, None) => return Err("it has no entry in a log".into()),
+    };
+    // The certificate, from the authority, for code signing, at that time.
     let cert = CertificateDer::from(signed.cert.as_slice());
     let leaf = webpki::EndEntityCert::try_from(&cert).map_err(|e| format!("its certificate cannot be read ({e})"))?;
     // The authority's roots (those that sign themselves) are where a chain ends; the rest are
@@ -287,13 +301,13 @@ pub fn check(signed: &Signed, digest: &str, who: &Identity) -> std::result::Resu
         .collect();
     let intermediates: Vec<CertificateDer> = intermediates.into_iter().cloned().collect();
     let algorithms = [webpki::ring::ECDSA_P256_SHA256, webpki::ring::ECDSA_P384_SHA384];
-    let at = u64::try_from(promise.time).map_err(|_| "its log entry's time is before 1970")?;
+    let at = u64::try_from(time).map_err(|_| "its signing time is before 1970")?;
     let when = UnixTime::since_unix_epoch(std::time::Duration::from_secs(at));
     let usage = webpki::KeyUsage::required(CODE_SIGNING);
     if let Err(e) = leaf.verify_for_usage(&algorithms, &anchors, &intermediates, when, usage, None, None) {
         return Err(match e {
             webpki::Error::CertNotValidYet { .. } | webpki::Error::CertExpired { .. } => {
-                format!("the log saw it at {at}, outside its certificate's time")
+                format!("{said} {at}, outside its certificate's time")
             }
             webpki::Error::RequiredEkuNotFoundContext(_) => "its certificate is not for code signing".into(),
             e => format!("its certificate is not from the authority named ({e:?})"),
@@ -313,6 +327,257 @@ pub fn check(signed: &Signed, digest: &str, who: &Identity) -> std::result::Resu
         return Err("its signature is not by its certificate's key".into());
     }
     of(signed, digest)
+}
+
+/// That a log's `promise` is by the log `who` names, of this signature (and so when it was
+/// seen is the log's word).
+fn promised(signed: &Signed, promise: &Promise, who: &Identity) -> std::result::Result<(), String> {
+    if promise.log_id != who.log_id {
+        return Err(format!(
+            "its log entry is from another log (key id {})",
+            shown(&promise.log_id)
+        ));
+    }
+    let promised = format!(
+        r#"{{"body":"{}","integratedTime":{},"logID":"{}","logIndex":{}}}"#,
+        STANDARD.encode(&promise.body),
+        promise.time,
+        promise.log_id,
+        promise.index
+    );
+    let log = UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &who.log);
+    if log.verify(promised.as_bytes(), &promise.signature).is_err() {
+        return Err("its log entry's promise is not signed by the log's key".into());
+    }
+    // The entry the log promised is this signature, by this certificate, of this payload.
+    entry(signed, &promise.body)
+}
+
+/// Checks a Rekor v2 bundle's RFC 3161 timestamp against the root `tsa` (a certificate's
+/// DER) of the timestamp authority a rule names; on success the bundle is taken to have been
+/// signed at the timestamp's time (`check` then holds its certificate to that), which is
+/// returned. Why not, if not.
+// (Nothing calls it until a rule can name the TSA's root: T-0564.)
+#[allow(dead_code)]
+pub fn timestamp(signed: &mut Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
+    let time = stamped(signed, tsa)?;
+    signed.stamped = Some(time);
+    Ok(time)
+}
+
+/// What an RFC 3161 timestamp (a TimeStampResp) holds, read and not yet checked.
+struct Stamp<'a> {
+    /// The certificates it carries, each whole.
+    certs: Vec<&'a [u8]>,
+    /// The TSTInfo (DER) it says, and the digest of it that the signed attributes say.
+    content: &'a [u8],
+    message_digest: &'a [u8],
+    algorithm: &'static ring::digest::Algorithm,
+    /// The signed attributes as what is signed: a SET OF, not the [0] they are written as.
+    attributes: Vec<u8>,
+    signature: &'a [u8],
+    /// The SHA-256 the TSTInfo says it is of, and its time (seconds since 1970).
+    imprint: &'a [u8],
+    time: i64,
+}
+
+/// One DER element of kind `tag` at the start of `input`: its contents, and what follows.
+fn expect(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (got, contents, rest) = element(input)?;
+    (got == tag).then_some((contents, rest))
+}
+
+/// Seconds since 1970 of a GeneralizedTime as DER has it: YYYYMMDDHHMMSS, a fraction of a
+/// second perhaps, and Z.
+fn unix(text: &[u8]) -> Option<i64> {
+    let text = text.strip_suffix(b"Z")?;
+    let (whole, fraction) = match text.iter().position(|&byte| byte == b'.') {
+        Some(at) => (text.get(..at)?, text.get(at + 1..)?),
+        None => (text, &[][..]),
+    };
+    let digits = |part: &[u8]| part.iter().all(u8::is_ascii_digit);
+    if whole.len() != 14 || !digits(whole) || !digits(fraction) || (fraction.is_empty() && text.len() != 14) {
+        return None;
+    }
+    let number = |from: usize, to: usize| {
+        let part = whole.get(from..to)?;
+        Some(part.iter().fold(0i64, |n, &digit| n * 10 + i64::from(digit - b'0')))
+    };
+    let (year, month, day) = (number(0, 4)?, number(4, 6)?, number(6, 8)?);
+    let (hour, minute, second) = (number(8, 10)?, number(10, 12)?, number(12, 14)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let longest = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let longest = *longest.get(usize::try_from(month - 1).ok()?)?;
+    if year < 1970 || !(1..=longest).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    // Days since 1970-01-01 (the civil calendar's, March first as a year's start).
+    let y = if month <= 2 { year - 1 } else { year };
+    let (era, yoe) = (y / 400, y % 400);
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Reads a TimeStampResp: granted, a SignedData of one SignerInfo with signed attributes and
+/// a TSTInfo of a SHA-256 imprint. None for anything else, or bytes cut or past its end.
+fn stamp(der: &[u8]) -> Option<Stamp<'_>> {
+    if der.len() > STAMP {
+        return None;
+    }
+    let (response, rest) = expect(der, 0x30)?;
+    let (status, token) = expect(response, 0x30)?;
+    let (status, _) = expect(status, 0x02)?;
+    // (Granted, or granted with modifications.)
+    if !rest.is_empty() || !matches!(status, [0] | [1]) {
+        return None;
+    }
+    let (token, rest) = expect(token, 0x30)?;
+    let (kind, explicit) = expect(token, 0x06)?;
+    let (explicit, _) = expect(explicit, 0xa0)?;
+    let (signed, _) = expect(explicit, 0x30)?;
+    if !rest.is_empty() || kind != SIGNED_DATA {
+        return None;
+    }
+    let (_version, rest) = expect(signed, 0x02)?;
+    let (_algorithms, rest) = expect(rest, 0x31)?;
+    let (encap, rest) = expect(rest, 0x30)?;
+    let (kind, encap) = expect(encap, 0x06)?;
+    let (encap, _) = expect(encap, 0xa0)?;
+    let (content, _) = expect(encap, 0x04)?;
+    if kind != TST_INFO {
+        return None;
+    }
+    let mut certs = Vec::new();
+    let mut rest = rest;
+    if let Some((0xa0, mut left, after)) = element(rest) {
+        while !left.is_empty() {
+            let (0x30, _, after) = element(left)? else { return None };
+            if certs.len() == STAMP_CERTS {
+                return None;
+            }
+            certs.push(left.get(..left.len() - after.len())?);
+            left = after;
+        }
+        rest = after;
+    }
+    // (Revocation lists, if any, are not read.)
+    if let Some((0xa1, _, after)) = element(rest) {
+        rest = after;
+    }
+    let (infos, rest) = expect(rest, 0x31)?;
+    let (info, more) = expect(infos, 0x30)?;
+    if !rest.is_empty() || !more.is_empty() {
+        return None;
+    }
+    let (_version, rest) = expect(info, 0x02)?;
+    let (_sid, _, rest) = element(rest)?;
+    let (hash, rest) = expect(rest, 0x30)?;
+    let (oid, _) = expect(hash, 0x06)?;
+    let algorithm = match oid {
+        SHA256_OID => &ring::digest::SHA256,
+        SHA384_OID => &ring::digest::SHA384,
+        _ => return None,
+    };
+    let (0xa0, attributes, after) = element(rest)? else {
+        return None;
+    };
+    let written = rest.get(..rest.len() - after.len())?;
+    let attributes_der = [&[0x31][..], written.get(1..)?].concat();
+    let (_signature_algorithm, after) = expect(after, 0x30)?;
+    let (signature, _) = expect(after, 0x04)?;
+    // The attribute messageDigest, once.
+    let mut digest = None;
+    for attribute in elements(attributes) {
+        let (0x30, attribute) = attribute? else { return None };
+        let (oid, values) = expect(attribute, 0x06)?;
+        if oid == MESSAGE_DIGEST {
+            let (values, _) = expect(values, 0x31)?;
+            let (value, _) = expect(values, 0x04)?;
+            if digest.replace(value).is_some() {
+                return None;
+            }
+        }
+    }
+    // The TSTInfo: its imprint, hashed with SHA-256, and its time.
+    let (tst, _) = expect(content, 0x30)?;
+    let (_version, tst) = expect(tst, 0x02)?;
+    let (_policy, _, tst) = element(tst)?;
+    let (imprint, tst) = expect(tst, 0x30)?;
+    let (_serial, tst) = expect(tst, 0x02)?;
+    let (time, _) = expect(tst, 0x18)?;
+    let (hashed_with, imprint) = expect(imprint, 0x30)?;
+    let (oid, _) = expect(hashed_with, 0x06)?;
+    let (hashed, _) = expect(imprint, 0x04)?;
+    if oid != SHA256_OID {
+        return None;
+    }
+    Some(Stamp {
+        certs,
+        content,
+        message_digest: digest?,
+        algorithm,
+        attributes: attributes_der,
+        signature,
+        imprint: hashed,
+        time: unix(time)?,
+    })
+}
+
+/// Whether `signed`'s timestamp is of the signature, by a certificate that chains to `tsa`
+/// for timestamping at the time it gives; that time.
+fn stamped(signed: &Signed, tsa: &[u8]) -> std::result::Result<i64, String> {
+    let der = signed.stamp.as_deref().ok_or("it has no timestamp")?;
+    let read = stamp(der).ok_or("its timestamp cannot be read")?;
+    let carried: Vec<CertificateDer> = read.certs.iter().map(|der| CertificateDer::from(*der)).collect();
+    // The signer is the certificate whose key signed the attributes.
+    let algorithms = [
+        webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::ECDSA_P384_SHA384,
+        webpki::ring::ECDSA_P256_SHA384,
+        webpki::ring::ECDSA_P384_SHA256,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+    ];
+    let by = |cert: &webpki::EndEntityCert| {
+        let signed = |algorithm| cert.verify_signature(algorithm, &read.attributes, read.signature);
+        algorithms.iter().any(|&algorithm| signed(algorithm).is_ok())
+    };
+    let signer = carried
+        .iter()
+        .find(|der| webpki::EndEntityCert::try_from(*der).is_ok_and(|cert| by(&cert)))
+        .ok_or("its timestamp's signature is not by its certificate's key")?;
+    let leaf = webpki::EndEntityCert::try_from(signer)
+        .map_err(|e| format!("its timestamp's certificate cannot be read ({e})"))?;
+    // The attributes are of this content.
+    if ring::digest::digest(read.algorithm, read.content).as_ref() != read.message_digest {
+        return Err("its timestamp's signed attributes are not of its content".into());
+    }
+    // The signer chains to the TSA's root, for timestamping, when it says.
+    let root = CertificateDer::from(tsa);
+    let anchor =
+        webpki::anchor_from_trusted_cert(&root).map_err(|_| "the timestamp authority's root is no certificate")?;
+    let others: Vec<CertificateDer> = carried.iter().filter(|der| *der != signer).cloned().collect();
+    let at = u64::try_from(read.time).map_err(|_| "its timestamp is of before 1970")?;
+    let when = UnixTime::since_unix_epoch(std::time::Duration::from_secs(at));
+    let usage = webpki::KeyUsage::required(TIME_STAMPING);
+    let chain = [webpki::ring::ECDSA_P256_SHA256, webpki::ring::ECDSA_P384_SHA384];
+    if let Err(e) = leaf.verify_for_usage(&chain, &[anchor], &others, when, usage, None, None) {
+        return Err(match e {
+            webpki::Error::CertNotValidYet { .. } | webpki::Error::CertExpired { .. } => {
+                format!("its timestamp is of {at}, outside its authority's certificate's time")
+            }
+            webpki::Error::RequiredEkuNotFoundContext(_) => {
+                "its timestamp's certificate is not for timestamping".into()
+            }
+            e => format!("its timestamp is not from the authority named ({e:?})"),
+        });
+    }
+    // The imprint is a hash of this signature (the one the timestamp is for).
+    if read.imprint != sha256(&signed.signature) {
+        return Err("its timestamp is of another signature".into());
+    }
+    Ok(read.time)
 }
 
 /// That what was signed says it is a signature of the image `digest` (and not, say, an
@@ -1046,5 +1311,259 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert_eq!(said, "its log entry's promise is not signed by the log's key");
+    }
+
+    /// One DER element: `tag`, its length, `body`.
+    fn der(tag: u8, body: Vec<u8>) -> Vec<u8> {
+        let len = match body.len() {
+            n if n < 0x80 => vec![n as u8],
+            n => vec![0x82, (n >> 8) as u8, n as u8],
+        };
+        [vec![tag], len, body].concat()
+    }
+
+    /// A GeneralizedTime, `secs` after the tests' start (within January).
+    fn generalized(secs: u64) -> String {
+        format!(
+            "202601{:02}{:02}{:02}{:02}Z",
+            1 + secs / 86_400,
+            secs / 3_600 % 24,
+            secs / 60 % 60,
+            secs % 60
+        )
+    }
+
+    /// A TimeStampResp as a TSA writes one: a TSTInfo of the hash of `imprint`, made `at`
+    /// (seconds after the start), signed by `key` whose certificate is `cert`. `fault` says
+    /// what it gets wrong: "digest" (the signed attributes' messageDigest) or "signature".
+    fn response(cert: &[u8], key: &KeyPair, imprint: &[u8], at: u64, fault: &str) -> Vec<u8> {
+        let oid = |bytes: &[u8]| der(0x06, bytes.to_vec());
+        let int = |n: u8| der(0x02, vec![n]);
+        let sha256_alg = der(0x30, [oid(SHA256_OID), vec![0x05, 0]].concat());
+        let tst = der(
+            0x30,
+            [
+                int(1),
+                oid(&[0x2a, 0x03, 0x04]),
+                der(0x30, [sha256_alg.clone(), der(0x04, sha256(imprint))].concat()),
+                int(7),
+                der(0x18, generalized(at).into_bytes()),
+            ]
+            .concat(),
+        );
+        let digest = sha256(if fault == "digest" { b"another content" } else { &tst });
+        let attrs = [
+            der(0x30, [oid(CONTENT_TYPE), der(0x31, oid(TST_INFO))].concat()),
+            der(0x30, [oid(MESSAGE_DIGEST), der(0x31, der(0x04, digest))].concat()),
+        ]
+        .concat();
+        let over = der(0x31, attrs.clone());
+        let signature = sign(
+            key,
+            if fault == "signature" {
+                b"another attributes"
+            } else {
+                &over
+            },
+        );
+        let sid = der(0x30, [der(0x30, vec![]), int(1)].concat());
+        let ecdsa = der(0x30, oid(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]));
+        let info = der(
+            0x30,
+            [
+                int(1),
+                sid,
+                sha256_alg.clone(),
+                der(0xa0, attrs),
+                ecdsa,
+                der(0x04, signature),
+            ]
+            .concat(),
+        );
+        let encap = der(0x30, [oid(TST_INFO), der(0xa0, der(0x04, tst))].concat());
+        let signed = der(
+            0x30,
+            [
+                int(3),
+                der(0x31, sha256_alg),
+                encap,
+                der(0xa0, cert.to_vec()),
+                der(0x31, info),
+            ]
+            .concat(),
+        );
+        let token = der(0x30, [oid(SIGNED_DATA), der(0xa0, signed)].concat());
+        der(0x30, [der(0x30, int(0)), token].concat())
+    }
+
+    /// A bundle of Rekor v2's kind: no promise from the log, and the TSA's timestamp over its
+    /// signature instead (made by `tsa`'s certificate `cert`, `at` seconds after the start).
+    fn v2(made: &Making, cert: &[u8], key: &KeyPair, imprint: Option<&[u8]>, at: u64, fault: &str) -> Value {
+        let mut bundle = made.bundle();
+        let signature = STANDARD
+            .decode(bundle["dsseEnvelope"]["signatures"][0]["sig"].as_str().unwrap())
+            .unwrap();
+        let stamp = response(cert, key, imprint.unwrap_or(&signature), at, fault);
+        bundle["verificationMaterial"]["tlogEntries"][0]["inclusionPromise"] = Value::Null;
+        bundle["verificationMaterial"]["timestampVerificationData"] =
+            serde_json::json!({ "rfc3161Timestamps": [{ "signedTimestamp": STANDARD.encode(stamp) }] });
+        bundle
+    }
+
+    /// A bundle with a timestamp from the TSA root given is taken at the timestamp's time
+    /// (and its certificate held to that time, not to a log's).
+    #[test]
+    fn a_rekor_v2_bundle_takes_its_time_from_the_tsa() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let who = named(WHO, ISSUED, &authority, &log);
+        // The signer's certificate: START + 120 to START + 720. The TSA's: START + 100 to + 700.
+        let made = Making {
+            at: START + 120,
+            ..Making::new(&authority, &log, DIGEST)
+        };
+        let (cert, key) = tsa.leaf(
+            START + 100,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
+        let taken = |bundle: &Value| -> std::result::Result<i64, String> {
+            let mut signed = super::bundle(bundle.to_string().as_bytes())?;
+            // Untimed until the TSA is asked.
+            assert_eq!(
+                check(&signed, DIGEST, &identity(&who).unwrap()),
+                Err("it has no entry in a log".into())
+            );
+            let time = timestamp(&mut signed, &tsa.root)?;
+            check(&signed, DIGEST, &identity(&who).unwrap())?;
+            Ok(time)
+        };
+        // Made at START + 300: in both certificates' time.
+        assert_eq!(taken(&v2(&made, &cert, &key, None, 300, "")), Ok((START + 300) as i64));
+        // Made at START + 110: the TSA's certificate is good, the signer's is not yet.
+        let early = v2(&made, &cert, &key, None, 110, "");
+        let said = taken(&early).unwrap_err();
+        assert!(said.contains("outside its certificate's time"), "{said}");
+        // Without any timestamp a promise-less entry is still Rekor v2, unread.
+        let mut bare = made.bundle();
+        bare["verificationMaterial"]["tlogEntries"][0]["inclusionPromise"] = Value::Null;
+        let said = super::bundle(bare.to_string().as_bytes()).err().unwrap();
+        assert!(said.contains("Rekor v2"), "{said}");
+    }
+
+    #[test]
+    fn timestamps_that_are_not_the_tsas_are_refused() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let refused = |bundle: &Value, root: &CertificateDer, why: &str| {
+            let mut signed = super::bundle(bundle.to_string().as_bytes()).unwrap();
+            let said = timestamp(&mut signed, root).unwrap_err();
+            assert!(said.contains(why), "expected `{why}`, got `{said}`");
+        };
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let mut signed = super::bundle(good.to_string().as_bytes()).unwrap();
+        assert_eq!(timestamp(&mut signed, &tsa.root), Ok((START + 60) as i64));
+        // Another TSA: its root is not the one given.
+        refused(&good, &Authority::new().root, "not from the authority named");
+        // Another signature's imprint.
+        refused(
+            &v2(&made, &cert, &key, Some(b"another signature"), 60, ""),
+            &tsa.root,
+            "is of another signature",
+        );
+        // A time outside the TSA certificate's own, after and before.
+        refused(
+            &v2(&made, &cert, &key, None, 3_600, ""),
+            &tsa.root,
+            "outside its authority's certificate's time",
+        );
+        let (late, late_key) = tsa.leaf(
+            START + 7_200,
+            "tsa@example.test",
+            ISSUED,
+            ExtendedKeyUsagePurpose::TimeStamping,
+        );
+        refused(
+            &v2(&made, &late, &late_key, None, 60, ""),
+            &tsa.root,
+            "outside its authority's certificate's time",
+        );
+        // Signed attributes whose signature is not the certificate's, or whose digest is not
+        // of the content.
+        refused(
+            &v2(&made, &cert, &key, None, 60, "signature"),
+            &tsa.root,
+            "not by its certificate's key",
+        );
+        refused(
+            &v2(&made, &cert, &key, None, 60, "digest"),
+            &tsa.root,
+            "not of its content",
+        );
+        // A certificate that is not for timestamping.
+        let (code, code_key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::CodeSigning);
+        refused(
+            &v2(&made, &code, &code_key, None, 60, ""),
+            &tsa.root,
+            "not for timestamping",
+        );
+        // A root that is no certificate; a timestamp that is none; one cut short.
+        refused(&good, &CertificateDer::from(&[1u8, 2, 3][..]), "is no certificate");
+        let mut none = good.clone();
+        none["verificationMaterial"]["timestampVerificationData"] = Value::Null;
+        let said = super::bundle(none.to_string().as_bytes()).err().unwrap();
+        assert!(said.contains("Rekor v2"), "{said}");
+        let response = response(&cert, &key, b"x", 60, "");
+        for cut in [0, 1, 5, response.len() / 2, response.len() - 1] {
+            let mut cuts = super::bundle(good.to_string().as_bytes()).unwrap();
+            cuts.stamp = Some(response[..cut].to_vec());
+            let said = timestamp(&mut cuts, &tsa.root).unwrap_err();
+            assert!(said.contains("cannot be read"), "{cut}: {said}");
+        }
+    }
+
+    /// The reader fed every cut and 2000 altered responses: it says why not, never panics.
+    #[test]
+    fn the_timestamp_reader_survives_damaged_bytes() {
+        let (authority, tsa, log) = (Authority::new(), Authority::new(), Log::new());
+        let made = Making::new(&authority, &log, DIGEST);
+        let (cert, key) = tsa.leaf(START, "tsa@example.test", ISSUED, ExtendedKeyUsagePurpose::TimeStamping);
+        let good = v2(&made, &cert, &key, None, 60, "");
+        let signed = super::bundle(good.to_string().as_bytes()).unwrap();
+        let response = signed.stamp.clone().unwrap();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut inputs: Vec<Vec<u8>> = (0..response.len()).map(|cut| response[..cut].to_vec()).collect();
+        for _ in 0..2_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut altered = response.clone();
+            let at = (seed >> 33) as usize % altered.len();
+            altered[at] = (seed >> 13) as u8;
+            if seed & 7 == 0 {
+                altered.truncate(at + 1);
+                altered.extend_from_slice(&seed.to_be_bytes()[..(seed as usize >> 5) % 8]);
+            }
+            inputs.push(altered);
+        }
+        let mut read = 0;
+        for input in inputs {
+            read += usize::from(stamp(&input).is_some());
+            let mut damaged = super::bundle(good.to_string().as_bytes()).unwrap();
+            damaged.stamp = Some(input);
+            let _ = timestamp(&mut damaged, &tsa.root);
+        }
+        // (Some alterations leave it readable, say a byte of the certificate's name: they
+        // are refused by the checks, not the reader. None of the cuts is readable.)
+        assert!(stamp(&response).is_some());
+        assert!(read < 2_000, "{read}");
+        // Times as GeneralizedTime: leap days and the ends of the range.
+        assert_eq!(unix(b"19700101000000Z"), Some(0));
+        assert_eq!(unix(b"20240229120000.5Z"), Some(1_709_208_000));
+        assert_eq!(unix(b"20230229120000Z"), None);
+        assert_eq!(unix(b"20260101000000"), None);
+        assert_eq!(unix(b"2026010100000Z"), None);
+        assert_eq!(unix(b"20261301000000Z"), None);
     }
 }

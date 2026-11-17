@@ -153,9 +153,14 @@ the hash covering all four fields, the way a key is remembered by its id.
   log saw the certificate within its validity.
 - **Revocation.** There is none for a ten-minute certificate. The time from the log is
   what bounds it.
-- **Rekor v2 (no promise; a timestamp authority's RFC 3161 token instead).** It is refused,
-  naming it, and captured as its own task. cosign 3 still logs to Rekor v1 by default on
-  the public instance (sigstore blog, "Rekor v2 GA", Oct 2025).
+- **Rekor v2 (no promise; a timestamp authority's RFC 3161 token instead).** Without a
+  timestamp it is refused, naming it. `keyless::timestamp` reads the token in the bundle
+  (`timestampVerificationData`) and takes its genTime as the signing time when the TSA's
+  signature over the signed attributes, their messageDigest, the SHA-256 imprint of the
+  signature, and a chain to the TSA root given (EKU timeStamping, valid at genTime) all
+  hold; the log's inclusion proof is not read. The rule field that carries the TSA root is
+  T-0564's. cosign 3 still logs to Rekor v1 by default on the public instance (sigstore
+  blog, "Rekor v2 GA", Oct 2025).
 - **A log that lies along with the authority.** This is not caught: who runs them is the
   owner's choice of trust, and README and SECURITY.md say so.
 
