@@ -378,15 +378,26 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// (`kx`), to another pod, and to the mesh (link `mesh`), and nothing of theirs reaches
 /// the node itself but answers to what it asked of them. (What comes in by a tunnel is
 /// [`crate::exit::guard`]'s, made before the tunnel is.)
-pub fn node(range: Range, guarded: bool, mesh: &str) -> Result<bool> {
-    node_with(range, guarded, true, mesh)
+/// What comes by each of `pods`' links is passed only from that pod's own addresses; the
+/// caller makes this again whenever the pods change.
+pub fn node(range: Range, guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
+    node_with(range, guarded, true, mesh, pods)
 }
 
-fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str) -> Result<bool> {
+/// A pod this node serves: its number, whether it leaves by an exit (its link is then
+/// [`crate::exit::link`]'s, not [`link_of`]'s), and its address on the mesh, if it has one
+/// (its IPv4 address is [`addresses`]').
+pub struct Served {
+    pub number: u16,
+    pub exit: bool,
+    pub v6: Option<Ipv6Addr>,
+}
+
+fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
     crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
-    nat(range, guard, masquerade, mesh)?;
+    nat(range, guard, masquerade, mesh, pods)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -517,21 +528,15 @@ fn l4proto(protocol: u8) -> Vec<u8> {
     [expression("meta", &[number(2, 16), number(1, 1)]), is(&[protocol])].concat()
 }
 
-/// The packet's source has no route back through the link it came in by: fib (flags 1,
-/// the source, and 8, the input link; result 1, the output link's index) gives 0, none.
-fn no_route_back() -> Vec<u8> {
-    let fib = expression("fib", &[number(1, 1), number(2, 1), number(3, 1 | 8)]);
-    [fib, is(&0u32.to_ne_bytes())].concat()
-}
-
 /// The guard of the pod links (`kp*`, an exit's `kpx` among them), each rule as (chain,
-/// expressions). `check` (prerouting) drops what comes by a pod's link from a source with no
-/// route back through it. `in` (what comes to the node): an answer to what the node asked
-/// is passed; an exit's pod (`kpx`) gets nothing more, its DNS and Services among them;
-/// any pod gets DNS at the gateway (UDP and TCP, port 53) and TCP to a Service (IPv6, bytes
-/// 6..10 all ff); the rest is dropped. An answer is the state of a connection seen both ways
-/// or made by one, or IPv6's neighbour discovery (not tracked).
-fn pod_guard_rules(range: Range) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+/// expressions). `check` (prerouting, first): what comes by a pod's link is passed only from
+/// that pod's own IPv4 or IPv6 address, the link's name whole; the rest of `kp*` is dropped.
+/// `in` (what comes to the node): an answer to what the node asked is passed; an exit's pod
+/// (`kpx`) gets nothing more, its DNS and Services among them; any pod gets DNS at the
+/// gateway (UDP and TCP, port 53) and TCP to a Service (IPv6, bytes 6..10 all ff); the rest
+/// is dropped. An answer is the state of a connection seen both ways or made by one, or
+/// IPv6's neighbour discovery (not tracked).
+fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
     let gateway = range.gateway().octets();
     let dns = |protocol: u8| {
         vec![
@@ -543,8 +548,26 @@ fn pod_guard_rules(range: Range) -> Vec<(&'static str, Vec<Vec<u8>>)> {
             verdict(1),
         ]
     };
-    vec![
-        ("check", vec![came_by(b"kp"), no_route_back(), verdict(0)]),
+    let mut rules = Vec::new();
+    for served in pods {
+        let link = if served.exit {
+            crate::exit::link(served.number)
+        } else {
+            link_of(served.number)
+        };
+        // (Whole, with its end: `kp1` is not `kp10`.)
+        let named = [link_name(6), is(&[link.as_bytes(), &[0]].concat())].concat();
+        let (v4, _) = addresses(range, None, served.number);
+        rules.push((
+            "check",
+            vec![named.clone(), nfproto(2), at(1, 12, &v4.octets()), verdict(1)],
+        ));
+        if let Some(v6) = served.v6 {
+            rules.push(("check", vec![named, nfproto(10), at(1, 8, &v6.octets()), verdict(1)]));
+        }
+    }
+    rules.push(("check", vec![came_by(b"kp"), verdict(0)]));
+    rules.extend([
         ("in", vec![came_by(b"kp"), state(2 | 4 | 64), verdict(1)]),
         ("in", vec![came_by(b"kpx"), verdict(0)]),
         ("in", dns(17)),
@@ -560,13 +583,14 @@ fn pod_guard_rules(range: Range) -> Vec<(&'static str, Vec<Vec<u8>>)> {
             ],
         ),
         ("in", vec![came_by(b"kp"), verdict(0)]),
-    ]
+    ]);
+    rules
 }
 
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
-/// comes in from or goes out to a pod's link.
-fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
+/// comes in from or goes out to a pod's link. Whole, for `pods` as they are now.
+fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<()> {
     let mut batch = Batch::new("kith-pods");
     batch.table(IP);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
@@ -597,7 +621,7 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
     batch.chain(INET, "check", "filter", 0, (-100i32) as u32, None);
     // What comes to the node itself (hook 1): the pods' rules, see `pod_guard_rules`.
     batch.chain(INET, "in", "filter", 1, 0, Some(1));
-    for (chain, rule) in pod_guard_rules(range) {
+    for (chain, rule) in pod_guard_rules(range, pods) {
         batch.rule(INET, chain, &rule);
     }
     let to = |name: &[u8]| [link_name(7), is(name)].concat();
@@ -892,26 +916,48 @@ mod tests {
         bytes.windows(part.len()).any(|window| window == part)
     }
 
-    /// What comes by a pod's link (any `kp*`, an exit's among them) from a source that no
-    /// route back through that link reaches is dropped at prerouting, by the check: a pod
-    /// sends with its own addresses only, whatever the family.
+    /// What comes by a pod's link is passed at prerouting only from that pod's own addresses
+    /// (its link's name whole, and its IPv4 or IPv6 source), and the rest of `kp*` (an exit's
+    /// `kpx` among it) is dropped. A pod sends with its own addresses only, whatever the family.
     #[test]
     fn a_pod_link_has_a_reverse_path_check() {
-        let rules = pod_guard_rules(range("198.18.16.0/20").unwrap());
-        let check: Vec<Vec<u8>> = rules
+        let range = range("198.18.16.0/20").unwrap();
+        let net = crate::node_net(crate::prefix(b"test"), "alpha");
+        let pods = [
+            Served {
+                number: 2,
+                exit: false,
+                v6: addresses(range, Some(net), 2).1,
+            },
+            Served {
+                number: 3,
+                exit: true,
+                v6: None,
+            },
+        ];
+        let check: Vec<Vec<u8>> = pod_guard_rules(range, &pods)
             .iter()
             .filter(|(chain, _)| *chain == "check")
             .map(|(_, rule)| rule.concat())
             .collect();
-        let [reverse] = check.as_slice() else {
-            panic!("one rule in check, not {}", check.len())
+        let [pod2_v4, pod2_v6, exit3_v4, rest] = check.as_slice() else {
+            panic!("four rules in check, not {}", check.len())
         };
-        assert!(reverse.starts_with(&came_by(b"kp")), "what comes by a pod's link");
-        assert!(
-            reverse.ends_with(&verdict(0)),
-            "is dropped when no route back is through it"
+        let (v4, v6) = (
+            addresses(range, None, 2).0.octets(),
+            addresses(range, Some(net), 2).1.unwrap().octets(),
         );
-        assert!(contains(reverse, b"fib\0"), "by the route back to its source (fib)");
+        let kp2 = [link_name(6), is(b"kp2\0")].concat();
+        assert_eq!(pod2_v4, &[kp2.clone(), nfproto(2), at(1, 12, &v4), verdict(1)].concat());
+        assert_eq!(pod2_v6, &[kp2, nfproto(10), at(1, 8, &v6), verdict(1)].concat());
+        let kpx3 = [link_name(6), is(b"kpx3\0")].concat();
+        let v4_3 = addresses(range, None, 3).0.octets();
+        assert_eq!(exit3_v4, &[kpx3, nfproto(2), at(1, 12, &v4_3), verdict(1)].concat());
+        assert_eq!(
+            rest,
+            &[came_by(b"kp"), verdict(0)].concat(),
+            "the rest of kp* is dropped"
+        );
     }
 
     /// What answers the node is passed, an exit's pod gets nothing more, and any pod reaches
@@ -920,7 +966,7 @@ mod tests {
     #[test]
     fn pods_reach_only_dns_and_the_services_of_their_node() {
         let range = range("198.18.16.0/20").unwrap();
-        let input: Vec<Vec<u8>> = pod_guard_rules(range)
+        let input: Vec<Vec<u8>> = pod_guard_rules(range, &[])
             .into_iter()
             .filter(|(chain, _)| *chain == "in")
             .map(|(_, rule)| rule.concat())
@@ -966,13 +1012,13 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, false, "kith0") {
+        let masquerade = match node(range, false, "kith0", &[]) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, false, false, "kith0").unwrap());
+            assert!(node_with(range, false, false, "kith0", &[]).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
@@ -983,6 +1029,15 @@ mod tests {
                 (namespace, listener, v4, v6.unwrap())
             })
             .into();
+        // The pods' own addresses are the node's to pass by their links: made again with them.
+        let served: Vec<Served> = [2, 3]
+            .map(|number| Served {
+                number,
+                exit: false,
+                v6: addresses(range, Some(net), number).1,
+            })
+            .into();
+        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
         // Each says who it is to whoever connects, and who that was.
         let serve = |listener: &TcpListener, says: &str| {
             let (mut stream, from) = listener.accept().unwrap();
@@ -1074,7 +1129,7 @@ mod tests {
         assert!(connect(0, (range.gateway(), 53).into()).is_ok(), "DNS at the gateway");
         assert!(connect(0, (service, 80).into()).is_ok(), "a Service's address");
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, true, masquerade, "kith0").unwrap());
+        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
         assert!(tables().unwrap());
     }
 }

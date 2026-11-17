@@ -80,7 +80,7 @@ impl Pods {
         let failed = |e: std::io::Error| format!("the pod's network: {e}");
         let range = range();
         if self.made.is_empty() {
-            let guarded = kith_mesh::pod::node(range, Path::new(GUARDED).exists(), &self.mesh).map_err(failed)?;
+            let guarded = self.serve().map_err(failed)?;
             if guarded {
                 let _ = std::fs::write(GUARDED, "");
             }
@@ -121,6 +121,12 @@ impl Pods {
                 dir,
             };
             self.made.insert(id.into(), pod);
+            if let Err(e) = self.serve() {
+                if let Some(pod) = self.made.remove(id) {
+                    let _ = std::fs::remove_dir_all(&pod.dir);
+                }
+                return Err(failed(e));
+            }
             self.moved.notify_one();
         }
         let pod = &self.made[id];
@@ -149,6 +155,10 @@ impl Pods {
             kept
         });
         if self.made.len() < before {
+            // (Rebuilt without the pods gone, so their links' rules go with them.)
+            if let Err(e) = self.serve() {
+                eprintln!("kithd: making the tables of this node's pods again: {e}");
+            }
             self.moved.notify_one();
         }
     }
@@ -168,6 +178,25 @@ impl Pods {
         } else {
             vec![pod.address, v4]
         }
+    }
+
+    /// The node's tables, made again for the pods now made: each pod's link passes its own
+    /// addresses and nothing else (`kith_mesh::pod::node`). Fails closed: a link with no rule
+    /// is dropped.
+    fn serve(&self) -> std::io::Result<bool> {
+        let served: Vec<kith_mesh::pod::Served> = self
+            .made
+            .values()
+            .map(|pod| kith_mesh::pod::Served {
+                number: pod.number,
+                exit: pod.exit.is_some(),
+                v6: match pod.address {
+                    IpAddr::V6(v6) => Some(v6),
+                    IpAddr::V4(_) => None,
+                },
+            })
+            .collect();
+        kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &self.mesh, &served)
     }
 }
 
@@ -201,7 +230,7 @@ pub fn guard_again(shared: &Shared) {
         return;
     }
     eprintln!("kithd: the tables of this node's pods are gone: made again");
-    if let Err(e) = kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &pods.mesh) {
+    if let Err(e) = pods.serve() {
         eprintln!("kithd: making the tables of this node's pods again: {e}");
     }
 }
