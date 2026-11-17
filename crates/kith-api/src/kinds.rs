@@ -2277,10 +2277,10 @@ impl Spec for AccessLevelSpec {
                 return Err(format!("services: `{service}` is not namespace/name or `*`"));
             }
         }
-        if let Some(dns) = &self.dns {
-            if dns.parse::<std::net::IpAddr>().is_err() {
-                return Err(format!("dns: `{dns}` is not an IP address"));
-            }
+        if let Some(dns) = &self.dns
+            && dns.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(format!("dns: `{dns}` is not an IP address"));
         }
         // (The internet is by the home's connection or by one Exit, and a peer that sends
         // everything here needs a resolver.)
