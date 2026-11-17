@@ -168,7 +168,9 @@ fn members(
     };
     let mut members: Vec<Member> = store.list(Some("Node")).filter_map(member).collect();
     // One key is one node: of the nodes that say the same key, the first by name is the node and
-    // the later ones are left out, so a copied key cannot knock out the real node.
+    // the later ones are left out, so every node agrees on one peer for the key. (A copier named
+    // before the real node still takes the key from it, as both were left out before: it cannot
+    // read what is sent to the key, and a node writes only its own status, T-0649.)
     members.sort_by(|a, b| a.name.cmp(&b.name));
     let mut seen = BTreeSet::new();
     members.retain(|member| seen.insert(member.key));
