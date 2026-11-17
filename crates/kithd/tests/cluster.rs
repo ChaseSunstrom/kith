@@ -74,13 +74,22 @@ impl Node {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(test).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let node = Node {
+        let mut node = Node {
             child: Node::spawn_in(ns, host, &dir, name, port, args),
             dir,
             port,
             host: host.to_string(),
         };
-        wait_for("kithd to serve", || node.dir.join("kithd.sock").exists());
+        // Fail at once if kithd exited (a socket path it could not bind, say), not after the wait.
+        wait_for("kithd to serve", || {
+            if let Some(status) = node.child.try_wait().unwrap() {
+                panic!(
+                    "kithd exited ({status}) before serving {}",
+                    node.dir.join("kithd.sock").display()
+                );
+            }
+            node.dir.join("kithd.sock").exists()
+        });
         node
     }
 
@@ -406,6 +415,21 @@ fn deleted_first_node_is_not_made_again_by_its_restart() {
     std::thread::sleep(Duration::from_secs(8));
     let names: Vec<_> = beta.nodes().into_iter().map(|(name, _)| name).collect();
     assert_eq!(names, ["beta"]);
+}
+
+/// A node starts, and answers, in a folder whose path is longer than a Unix socket's address holds
+/// (107 bytes): a lane's checks run under its worktree's target, and that path is longer still.
+#[test]
+fn a_node_starts_and_answers_under_a_path_longer_than_a_socket_holds() {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let padding = 160usize.saturating_sub(base.as_os_str().len() + "/alpha".len());
+    let test = format!("a_node_starts_under_a_long_path_{}", "p".repeat(padding));
+    let alpha = Node::start(&test, "alpha", &[]);
+    assert!(alpha.dir.as_os_str().len() > 150, "{}", alpha.dir.display());
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    assert_eq!(alpha.nodes(), [("alpha".to_string(), alpha.address())]);
 }
 
 /// Whether a stopped node's store holds `text` anywhere: its snapshot or a log entry.
@@ -881,7 +905,8 @@ fn volume_files_go_in_and_come_out_through_another_node() {
     let piped = format!("{0} volume get data - | {0} volume put copy -", kith.display());
     let piped = Command::new("sh")
         .args(["-c", &piped])
-        .env("KITH_SOCKET", beta.dir.join("kithd.sock"))
+        .current_dir(&beta.dir)
+        .env("KITH_SOCKET", "kithd.sock")
         .output()
         .unwrap();
     let said = String::from_utf8_lossy(&piped.stdout);

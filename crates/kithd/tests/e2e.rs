@@ -34,13 +34,22 @@ impl Daemon {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let daemon = Daemon {
+        let mut daemon = Daemon {
             child: Daemon::spawn(&dir, args),
             dir,
             args,
             kith: kithd.with_file_name("kith"),
         };
-        wait_for("kithd to serve", || daemon.dir.join("kithd.sock").exists());
+        // Fail at once if kithd exited (a socket path it could not bind, say), not after the wait.
+        wait_for("kithd to serve", || {
+            if let Some(status) = daemon.child.try_wait().unwrap() {
+                panic!(
+                    "kithd exited ({status}) before serving {}",
+                    daemon.dir.join("kithd.sock").display()
+                );
+            }
+            daemon.dir.join("kithd.sock").exists()
+        });
         daemon
     }
 
@@ -55,8 +64,7 @@ impl Daemon {
             } else {
                 vec!["--registry-port", "0"]
             })
-            .arg("--socket")
-            .arg(dir.join("kithd.sock"))
+            .args(["--socket", "kithd.sock"])
             .args(args)
             .stdin(Stdio::null())
             .spawn()
@@ -128,6 +136,16 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Connect to the socket kithd serves in `dir`, named through an fd of the folder: the path the
+/// kernel gets is `/proc/self/fd/N/kithd.sock`, short whatever the folder's own path is (a Unix
+/// socket's path holds 107 bytes, and a builder worktree's TMPDIR can be longer than that).
+fn connect(dir: &Path) -> std::os::unix::net::UnixStream {
+    use std::os::fd::AsRawFd;
+    let folder = std::fs::File::open(dir).unwrap();
+    let path = format!("/proc/self/fd/{}/kithd.sock", folder.as_raw_fd());
+    std::os::unix::net::UnixStream::connect(path).unwrap()
+}
+
 const CONFIG: &str = "\
 apiVersion: kith.dev/v1
 kind: ConfigMap
@@ -153,7 +171,7 @@ fn a_second_signal_ends_a_stopping_kithd() {
         .spawn()
         .unwrap();
     wait_for("kithd to serve", || dir.join("kithd.sock").exists());
-    let mut held = std::os::unix::net::UnixStream::connect(dir.join("kithd.sock")).unwrap();
+    let mut held = connect(&dir);
     held.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: x\r\n").unwrap();
     std::thread::sleep(Duration::from_millis(500));
     let mut told = |wait: Duration| {
@@ -186,7 +204,7 @@ fn a_held_request_does_not_hold_a_stop() {
     use std::io::Write;
     let mut daemon = Daemon::start("held-request");
     let g = watch_request(&daemon, "")["generation"].as_u64().unwrap();
-    let mut held = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
+    let mut held = connect(&daemon.dir);
     held.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: x\r\n").unwrap();
     // The watch is sent, and the stop only once kithd has answered a request sent after it:
     // kithd takes connections in order, so by then it holds the watch. (A stop sent after a
@@ -214,6 +232,19 @@ fn a_held_request_does_not_hold_a_stop() {
         ended.is_some_and(|ended| ended.success()),
         "kithd waited for a request that was never finished: {ended:?}"
     );
+}
+
+/// A daemon serves from a folder whose path is longer than a Unix socket path may be (a builder
+/// worktree's TMPDIR is): its socket is still made, and a `kith` reaches it.
+#[test]
+fn a_daemon_answers_under_a_path_longer_than_a_socket_holds() {
+    let prefix = "a_daemon_answers_under_a_long_path_";
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let padding = 160usize.saturating_sub(base.as_os_str().len() + 1 + prefix.len());
+    let daemon = Daemon::start(&format!("{prefix}{}", "p".repeat(padding)));
+    assert!(daemon.dir.as_os_str().len() > 150, "{}", daemon.dir.display());
+    daemon.ok(&["get", "node"]);
+    let _held = connect(&daemon.dir);
 }
 
 #[test]
@@ -280,20 +311,16 @@ fn api_through_the_cli() {
 
     // A second kithd on the same socket refuses to start; the socket is the owner's alone.
     let second = Command::new(env!("CARGO_BIN_EXE_kithd"))
-        .arg("--state")
-        .arg(daemon.dir.join("state"))
-        .arg("--socket")
-        .arg(daemon.dir.join("kithd.sock"))
+        .current_dir(&daemon.dir)
+        .args(["--state", "state", "--socket", "kithd.sock"])
         .output()
         .unwrap();
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains("already serving"));
     // So does one on another socket but the same state: it says who has it instead of waiting.
     let second = Command::new(env!("CARGO_BIN_EXE_kithd"))
-        .arg("--state")
-        .arg(daemon.dir.join("state"))
-        .arg("--socket")
-        .arg(daemon.dir.join("other.sock"))
+        .current_dir(&daemon.dir)
+        .args(["--state", "state", "--socket", "other.sock"])
         .output()
         .unwrap();
     assert!(!second.status.success());
@@ -542,7 +569,7 @@ fn readme_first_run_is_what_happens() {
                         .current_dir(&dir)
                         .args(["--state", "state", "--registry-port", "0", "--socket"]);
                     let child = command
-                        .arg(dir.join("kithd.sock"))
+                        .arg("kithd.sock")
                         .stdin(Stdio::null())
                         .stderr(log)
                         .spawn()
@@ -978,7 +1005,7 @@ fn watch_request(daemon: &Daemon, query: &str) -> serde_json::Value {
 
 fn watch_send(daemon: &Daemon, query: &str) -> std::os::unix::net::UnixStream {
     use std::io::Write;
-    let mut stream = std::os::unix::net::UnixStream::connect(daemon.dir.join("kithd.sock")).unwrap();
+    let mut stream = connect(&daemon.dir);
     write!(
         stream,
         "GET /v1/watch{query} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n\r\n"
@@ -1037,7 +1064,8 @@ fn watch_reports_changes() {
     // `kith get -w`: the table, then the rows that change.
     let mut watcher = Command::new(&daemon.kith)
         .args(["get", "-w", "configmap"])
-        .env("KITH_SOCKET", daemon.dir.join("kithd.sock"))
+        .current_dir(&daemon.dir)
+        .env("KITH_SOCKET", "kithd.sock")
         .env_remove("KITH_STORE")
         .stdout(Stdio::piped())
         .spawn()
@@ -2590,8 +2618,7 @@ fn claim_makes_the_first_admin_over_tls() {
         Command::new(kithd)
             .current_dir(&dir)
             .args(["--state", "state", "--name", "alpha", "--listen", &listen, "--claim"])
-            .arg("--socket")
-            .arg(dir.join("kithd.sock"))
+            .args(["--socket", "kithd.sock"])
             .stdin(Stdio::null())
             .stderr(std::fs::File::create(dir.join(said)).unwrap())
             .spawn()

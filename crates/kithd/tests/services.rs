@@ -39,8 +39,17 @@ impl Node {
             .stdin(Stdio::null())
             .spawn()
             .unwrap();
-        let node = Node { child, dir };
-        wait_for("kithd to serve", || node.dir.join("kithd.sock").exists());
+        let mut node = Node { child, dir };
+        // Fail at once if kithd exited, not after the wait.
+        wait_for("kithd to serve", || {
+            if let Some(status) = node.child.try_wait().unwrap() {
+                panic!(
+                    "kithd exited ({status}) before serving {}",
+                    node.dir.join("kithd.sock").display()
+                );
+            }
+            node.dir.join("kithd.sock").exists()
+        });
         node
     }
 
@@ -83,10 +92,15 @@ impl Node {
     /// How long its API takes to answer, half the time or less (the median of many).
     fn answers_in(&self) -> Duration {
         use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        // The socket is reached through an fd of its folder, so the path the kernel gets stays
+        // short (a Unix socket's path holds 107 bytes; a long TMPDIR can pass that).
+        let folder = std::fs::File::open(&self.dir).unwrap();
+        let path = format!("/proc/self/fd/{}/kithd.sock", folder.as_raw_fd());
         let mut took: Vec<Duration> = (0..200)
             .map(|_| {
                 let asked = Instant::now();
-                let mut api = std::os::unix::net::UnixStream::connect(self.dir.join("kithd.sock")).unwrap();
+                let mut api = std::os::unix::net::UnixStream::connect(&path).unwrap();
                 api.write_all(b"GET /v1/resources HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n\r\n")
                     .unwrap();
                 let mut reply = Vec::new();
