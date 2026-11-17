@@ -25,6 +25,7 @@ use axum::routing::{get, post};
 use axum::serve::IncomingStream;
 use axum::{Json, Router};
 use kith_store::Command;
+use kith_store::openraft::error::{CheckIsLeaderError, RaftError};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -1083,12 +1084,28 @@ fn node_key(name: &str) -> String {
     format!("Node/{name}")
 }
 
+/// How long [`register_first`] waits for the store to hold what the cluster committed.
+const WAIT_FOR_STORE: Duration = Duration::from_secs(30);
+
+/// Whether a node that is not the leader has applied all its log holds, and that is of the term it
+/// is in, with a leader known: a restart in the same term leaves what it applied (up to its
+/// snapshot) in that term too, with entries of the term behind it, a delete of its Node among them.
+fn applied_what_it_holds(
+    m: &kith_store::openraft::RaftMetrics<kith_store::NodeId, kith_store::openraft::BasicNode>,
+) -> bool {
+    let applied = |log: &kith_store::openraft::LogId<_>| {
+        log.leader_id.term == m.current_term && Some(log.index) >= m.last_log_index
+    };
+    m.current_leader.is_some() && m.last_applied.as_ref().is_some_and(applied)
+}
+
 /// [`register`] for the node the cluster started on, at each start, and the only way it is called for it:
 /// it makes its Node only while the store holds no Node at all (the start that made the cluster, or one
 /// that ended before its Node was in), so a node deleted stays deleted across its restart. False: its Node
 /// is gone, or is a joiner's under the name (another certificate), and nothing was written.
-/// It waits for the store to have all the log of the term it is in applied first: until then a Node
-/// that is there may not show.
+/// It waits first for the store to have applied what the cluster committed (on the leader, Raft's
+/// linearizable read; on any other node, all the log it holds, of the term it is in): until then a
+/// Node that is there may not show, and one deleted may.
 pub async fn register_first(
     shared: &Shared,
     name: &str,
@@ -1097,13 +1114,21 @@ pub async fn register_first(
     print: &str,
     more: serde_json::Value,
 ) -> Result<bool, kith_api::store::Error> {
-    let caught_up = |m: &kith_store::openraft::RaftMetrics<_, _>| {
-        m.current_leader.is_some() && m.last_applied.is_some_and(|log| log.leader_id.term == m.current_term)
-    };
-    let wait = shared.raft.wait(Some(Duration::from_secs(30)));
-    wait.metrics(caught_up, "the log of this term applied")
-        .await
-        .map_err(|e| kith_api::store::Error::Io(format!("no leader to say what the store holds: {e}")))?;
+    let unsaid =
+        |e: &dyn std::fmt::Display| kith_api::store::Error::Io(format!("no leader to say what the store holds: {e}"));
+    // The leader: its store has what a quorum says is committed once the read index is applied.
+    let read = tokio::time::timeout(WAIT_FOR_STORE, shared.raft.ensure_linearizable());
+    match read.await.map_err(|e| unsaid(&e))? {
+        Ok(_) => {}
+        // Not the leader (yet): wait for the log it holds to be applied, with a leader known.
+        Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(_))) => {
+            let wait = shared.raft.wait(Some(WAIT_FOR_STORE));
+            wait.metrics(applied_what_it_holds, "everything its log holds applied")
+                .await
+                .map_err(|e| unsaid(&e))?;
+        }
+        Err(e) => return Err(unsaid(&e)),
+    }
     let (has_none, own) = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
         let own = state.store.get(&node_key(name)).map(|node| {
@@ -2185,6 +2210,86 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::Poll;
+
+    /// A node that restarts in the term it left (a leader comes back as leader at once, in the same
+    /// term) has applied only up to its snapshot until Raft applies the log it holds past it: a Node
+    /// deleted in that log is not to be put back on what the snapshot says.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_same_term_restart_does_not_bring_back_a_deleted_node() {
+        // What a follower restarted in term 1 shows before Raft applies the 501 entries its log
+        // holds past its snapshot (the delete of its Node among them): a leader, and an applied
+        // entry of this term, which is the snapshot's. (A leader's restart in one term cannot be
+        // held there by a test: Raft applies its log as it starts, before `replica` returns.)
+        let at = |term, index| {
+            Some(kith_store::openraft::LogId::new(
+                kith_store::openraft::CommittedLeaderId::new(term, 1),
+                index,
+            ))
+        };
+        let mut m = kith_store::openraft::RaftMetrics::new_initial(1);
+        (m.current_term, m.current_leader, m.last_log_index) = (1, Some(2), Some(505));
+        m.last_applied = at(1, 4);
+        assert!(
+            !applied_what_it_holds(&m),
+            "the snapshot's entry is of the term, with the log behind it"
+        );
+        m.last_applied = at(1, 505);
+        assert!(applied_what_it_holds(&m));
+        m.current_leader = None;
+        assert!(!applied_what_it_holds(&m), "no leader known");
+        (m.current_leader, m.current_term) = (Some(2), 2);
+        assert!(
+            !applied_what_it_holds(&m),
+            "the entry applied is of a term before this one"
+        );
+
+        let ca = pki::Ca::create().unwrap();
+        let a = pinned_peer::node(&ca, "a");
+        let dir = std::env::temp_dir().join(format!("kithd-same-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        async fn put(shared: &Shared) -> Result<bool, kith_api::store::Error> {
+            register_first(shared, "a", "127.0.0.1:1", 1, "p", serde_json::Value::Null).await
+        }
+        let open = |ca| async {
+            let cluster = Cluster::new(a.clone(), Some(ca)).unwrap();
+            crate::replica(Some(cluster), &dir, Duration::from_secs(300))
+                .await
+                .unwrap()
+        };
+        let shared = open(ca).await;
+        assert!(put(&shared).await.unwrap());
+        // Another Node, so the store is not empty (the one case where it is made again), a snapshot
+        // that has both, and past it the delete of its own and a long run of writes.
+        let other = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: b}\nspec: {}\n";
+        let other = kith_api::Resource::from_source(other).unwrap().remove(0).unwrap();
+        let apply = Command::Apply {
+            resources: vec![other],
+            at: kith_api::store::now(),
+        };
+        shared.submit(apply).await.unwrap();
+        let at = shared.raft.metrics().borrow().last_applied.unwrap().index;
+        shared.raft.trigger().snapshot().await.unwrap();
+        let wait = shared.raft.wait(Some(Duration::from_secs(20)));
+        let built = |m: &kith_store::openraft::RaftMetrics<_, _>| m.snapshot.is_some_and(|s| s.index >= at);
+        wait.metrics(built, "a snapshot").await.unwrap();
+        let delete = Command::Delete { key: "Node/a".into() };
+        shared.submit(delete).await.unwrap();
+        // (Fewer than the 1000 that make Raft snapshot by itself, which would take the delete in.)
+        for n in 0..500 {
+            let statuses = vec![(
+                "Node/b".to_string(),
+                serde_json::Map::from_iter([("n".into(), n.into())]),
+            )];
+            shared.submit(Command::Patch { statuses }).await.unwrap();
+        }
+        shared.raft.shutdown().await.unwrap();
+        drop(shared);
+
+        let shared = open(pki::Ca::create().unwrap()).await;
+        assert!(!put(&shared).await.unwrap());
+        assert!(shared.store.lock().unwrap().store.get("Node/a").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_evicted_nodes_key_stands_for_no_node() {
