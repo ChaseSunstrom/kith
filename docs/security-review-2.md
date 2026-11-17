@@ -92,6 +92,8 @@ In detail:
   (a kernel started without systemd-boot) init goes on and says so.
 - M2 Install answers fetched over `http://` can be changed by anyone on the LAN: the
   disk, the join address and token, and `releaseKey` (`kithd/src/install.rs:557`). (Read.)
+  fixed: answers_are_pinned_by_the_sha256_in_their_url and
+  unpinned_http_answers_are_refused_before_any_fetch (T-0648)
   task: T-0648
 - M3 If an install with `encrypt` fails after the image is written, the disk is left
   bootable and unencrypted, while the installer says nothing was installed

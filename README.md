@@ -3475,9 +3475,12 @@ Without anyone there, put the answers on the stick, as `kith-install.yaml` on
 its first partition (FAT: any system can write it), or at a URL given on the
 kernel command line (`kith.install=https://10.0.0.2/alpha.yaml`; a hypervisor
 gives it as the SMBIOS string `io.systemd.stub.kernel-cmdline-extra=`). Over
-plain `http` whoever sits between the machine and the URL can change the
-answers, and so name the disk and the cluster: use it on a network that is
-yours alone.
+plain `http` whoever sits between the machine and the URL could change the
+answers (the disk, the join token, the release key), so the URL carries their
+digest: `kith.install=http://10.0.2.2/alpha.yaml#sha256=HEX`, where HEX is what
+`sha256sum alpha.yaml` prints (64 hex digits, either case). The installer
+refuses plain `http` without that pin before it fetches anything, and refuses
+answers that do not hash to it, naming both digests. `https` needs no pin.
 
 ```yaml
 disk: nvme0n1        # or `only`: the one disk of a machine that has one
