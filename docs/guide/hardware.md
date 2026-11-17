@@ -11,7 +11,10 @@ its `spec` has `node`, `class` and the device node as `path`. The class is `gpu`
 - **Labels** (a selector can name them). All: `kith.dev/node`, `class`, `kith.dev/discovered:
   "true"`. GPUs and USB devices also `vendor`, `model`; a GPU `driver` and, where known, `vram`
   in bytes; inputs and sound cards `model`. An input also `identity`, a hash of its name, port,
-  serial and ids: another device behind the same event index is taken from its holder.
+  serial and ids: another device behind the same event index is taken from its holder. A USB
+  device also `bus`, its port (`1-2`), and `serial`, a hash of its serial where it says one:
+  its ids are the stick's own to say, so name one stick by `serial` or `bus` with
+  `kith.dev/node`; another serial (or none) in its port takes it from its holder.
 - `NODE-seat0` is a `Seat` naming the node's displays, inputs, sound cards and GPUs. What
   carries `kith.dev/discovered` is kept in step (rewritten if you edit it, deleted when the
   hardware goes); a `Device` or `Seat` you wrote yourself is never touched.

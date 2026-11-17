@@ -21,7 +21,7 @@ const DISCOVERED: &str = "kith.dev/discovered";
 
 /// Every label discovery writes. A worker's Device may carry these and no other
 /// (`crate::worker`): one added here is one a control node takes from a worker.
-pub(crate) const LABELS: [&str; 10] = [
+pub(crate) const LABELS: [&str; 12] = [
     DISCOVERED,
     "kith.dev/node",
     "class",
@@ -32,17 +32,26 @@ pub(crate) const LABELS: [&str; 10] = [
     "vram",
     "function",
     "identity",
+    "serial",
+    "bus",
 ];
 const EVERY: Duration = Duration::from_secs(30);
 
 /// Who an input device is, behind the event index the kernel gives the next one at once: 16 hex
 /// of a hash of its name, where it is plugged (phys), its serial (uniq) and its ids.
 fn identity(device: &Path) -> String {
-    use sha2::{Digest, Sha256};
     let parts =
         ["name", "phys", "uniq", "id/vendor", "id/product"].map(|part| read(&device.join(part)).unwrap_or_default());
-    let hash = Sha256::digest(parts.join("\0"));
-    hash[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+    hashed(&parts.join("\0"))
+}
+
+/// 16 hex of `text`'s sha256: a label that tells two apart and says neither.
+fn hashed(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text)[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The names in `dir`, sorted; none if it is not there.
@@ -192,6 +201,10 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
         }
         let mut labels = vec![("vendor", vendor)];
         labels.extend(id(&dir.join("idProduct")).map(|model| ("model", model)));
+        // What the stick says of itself (its ids, its serial) any stick can say: where it is
+        // plugged (`bus`, the port's path) it cannot. The serial, hashed, tells two apart.
+        labels.extend(read(&dir.join("serial")).map(|serial| ("serial", hashed(&serial))));
+        labels.push(("bus", name.clone()));
         found.push(("usb", name, Some(format!("/dev/bus/usb/{bus:03}/{device:03}")), labels));
     }
     // PCI devices set aside for virtual machines (bound to `vfio-pci`): they have no device
@@ -451,10 +464,13 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
     (apply, gone, held)
 }
 
-/// Whether `live` and `new` both say who they are, and say someone else.
+/// Whether `live` said who it is (an input's identity, a stick's serial) and `new` says another,
+/// or nothing: a stick that keeps its serial to itself is not the one that told it.
 fn identity_changed(live: &Resource, new: &Resource) -> bool {
-    let of = |device: &Resource| device.metadata.labels.get("identity").cloned();
-    matches!((of(live), of(new)), (Some(was), Some(now)) if was != now)
+    ["identity", "serial"].iter().any(|label| {
+        let was = live.metadata.labels.get(*label);
+        was.is_some() && was != new.metadata.labels.get(*label)
+    })
 }
 
 /// What to say of the names held: each once, and again only when what is held changes.
@@ -1162,6 +1178,56 @@ mod tests {
         let (apply, gone, _) = changes(&store, "n1", &scan(&root, "n1"));
         assert_eq!(gone, [granted.key()]);
         assert!(!apply.iter().any(|r| r.key() == granted.key()), "{apply:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_usb_device_is_labelled_with_its_hashed_serial_and_its_port() {
+        let root = tree("usb-serial");
+        laptop(&root);
+        put(&root, "bus/usb/devices/1-2/serial", "ABC123\n");
+        let found = scan(&root, "n1");
+        let labels = &get(&found, "n1-usb-1-2").metadata.labels;
+        let serial = &labels["serial"];
+        assert!(
+            serial.len() == 16 && serial.chars().all(|c| c.is_ascii_hexdigit()),
+            "{serial}"
+        );
+        assert!(!serial.contains("abc123"));
+        assert_eq!(labels["bus"], "1-2");
+        // A stick that says no serial has no serial label, and still its port.
+        std::fs::remove_file(root.join("bus/usb/devices/1-2/serial")).unwrap();
+        let found = scan(&root, "n1");
+        let labels = &get(&found, "n1-usb-1-2").metadata.labels;
+        assert!(!labels.contains_key("serial"));
+        assert_eq!(labels["bus"], "1-2");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_usb_stick_with_another_serial_in_the_same_port_is_taken_away() {
+        let root = tree("usb-swap");
+        laptop(&root);
+        put(&root, "bus/usb/devices/1-2/serial", "ABC123\n");
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        store.apply(node("n1", "worker")).unwrap();
+        for resource in &found {
+            store.apply(resource.clone()).unwrap();
+        }
+        let mut granted = get(&found, "n1-usb-1-2").clone();
+        granted
+            .metadata
+            .labels
+            .insert("kith.dev/namespaces".into(), "ops".into());
+        store.apply(granted.clone()).unwrap();
+        let (apply, gone, _) = changes(&store, "n1", &scan(&root, "n1"));
+        assert!(gone.is_empty() && apply.is_empty(), "{gone:?} {apply:?}");
+        // Another stick with the same ids, in the same port: another serial, or none at all.
+        put(&root, "bus/usb/devices/1-2/serial", "XYZ999\n");
+        assert_eq!(changes(&store, "n1", &scan(&root, "n1")).1, [granted.key()]);
+        std::fs::remove_file(root.join("bus/usb/devices/1-2/serial")).unwrap();
+        assert_eq!(changes(&store, "n1", &scan(&root, "n1")).1, [granted.key()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -945,8 +945,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     **with its Secrets**, placed on it and sent to it (a selector alone keeps nothing
     off a worker: `trust: control` on
     the Secret or in the template's placement does), and a claim whose selector
-    names no node and came to one node's Devices then matches two nodes' and is
-    refused until it says `kith.dev/node`; it can hold or spoil the Volumes on it.
+    names no node and came to one node's Devices then matches two nodes' and goes
+    to the lower-named one unless it says `kith.dev/node`; it can hold or spoil the
+    Volumes on it. A selector over a USB stick's `vendor` and `model` describes a stick,
+    any stick that says those ids: it is not an identity. Its hashed `serial` and its
+    port (`bus`) with `kith.dev/node` name one, and a stick with another serial (or
+    none) in its port is taken from its holder.
     A discovered Device's or Seat's name is the node's with the longest name that
     starts it (`w-b-gpu-card0` is node `w-b`'s, not node `w`'s): a worker is refused
     another node's; a node that finds a name of its own held says so in its log and

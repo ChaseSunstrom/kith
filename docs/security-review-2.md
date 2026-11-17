@@ -173,7 +173,7 @@ In detail:
   device straight away. A claim on a gamepad gets a keyboard plugged in its place
   (`kithd/src/devices.rs:149`, `controller.rs:509`). (Read.) fixed: a_device_taken_by_another_behind_the_same_index_is_deleted_not_kept (T-0652)
 - M2 A USB Device is known only by its vendor and product, both of which the stick
-  reports itself (`devices.rs:168`). (Read.) task: T-0653
+  reports itself (`devices.rs:168`). (Read.) fixed: a_usb_stick_with_another_serial_in_the_same_port_is_taken_away (T-0653)
 - L1 A selector with no node fails when a matching stick is plugged into another node
   (`claims.rs:116`). (Read.) fixed: a_selector_with_no_node_claims_on_the_lowest_node_that_matches (T-0667)
 - L2 A Device's `path` is checked only for being a character device under `/dev`, so
