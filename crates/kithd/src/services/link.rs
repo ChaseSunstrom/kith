@@ -143,10 +143,23 @@ impl Shared {
             remote_end: false,
         };
         state.streams.insert(id, entry);
-        let guard = Arc::new(Guard { shared: self.clone(), id });
+        let guard = Arc::new(Guard {
+            shared: self.clone(),
+            id,
+        });
         Stream {
-            tx: Tx { guard: guard.clone(), window, ended: false },
-            rx: Rx { guard, inbox, queued, owed: 0, done: None },
+            tx: Tx {
+                guard: guard.clone(),
+                window,
+                ended: false,
+            },
+            rx: Rx {
+                guard,
+                inbox,
+                queued,
+                owed: 0,
+                done: None,
+            },
         }
     }
 
@@ -170,7 +183,12 @@ impl Shared {
             let _ = entry.events.send(Event::Reset);
         }
         drop(state);
-        for task in self.tasks.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).iter() {
+        for task in self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
             task.abort();
         }
     }
@@ -202,7 +220,9 @@ impl Shared {
                 let _ = entry.events.send(Event::Data(bytes));
             }
             Kind::End => {
-                let Some(entry) = state.streams.get_mut(&id) else { return };
+                let Some(entry) = state.streams.get_mut(&id) else {
+                    return;
+                };
                 if std::mem::replace(&mut entry.remote_end, true) {
                     drop(state);
                     return self.reset(id);
@@ -279,7 +299,11 @@ pub fn link<T: AsyncRead + AsyncWrite + Send + 'static>(io: T, odd: bool) -> (Li
     let (frames, waits) = mpsc::unbounded_channel();
     let (accepting, incoming) = mpsc::channel(ACCEPTING);
     let shared = Arc::new(Shared {
-        state: Mutex::new(State { streams: HashMap::new(), next: if odd { 1 } else { 2 }, closed: false }),
+        state: Mutex::new(State {
+            streams: HashMap::new(),
+            next: if odd { 1 } else { 2 },
+            closed: false,
+        }),
         frames,
         counts: Default::default(),
         tasks: Mutex::new(Vec::new()),
@@ -341,10 +365,15 @@ impl Link {
     pub fn open(&self) -> io::Result<Stream> {
         let mut state = self.0.state();
         if state.closed || state.streams.len() >= MAX_STREAMS {
-            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "the link is down or full"));
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the link is down or full",
+            ));
         }
         let id = state.next;
-        state.next = id.checked_add(2).ok_or_else(|| io::Error::other("the link has no stream numbers left"))?;
+        state.next = id
+            .checked_add(2)
+            .ok_or_else(|| io::Error::other("the link has no stream numbers left"))?;
         let stream = self.0.stream(&mut state, id);
         drop(state);
         self.0.send(id, Kind::Open, Vec::new());
@@ -358,7 +387,10 @@ impl Link {
 
     /// Frames and writes so far: how many frames share a write.
     pub fn counts(&self) -> (u64, u64) {
-        (self.0.counts.0.load(Ordering::Relaxed), self.0.counts.1.load(Ordering::Relaxed))
+        (
+            self.0.counts.0.load(Ordering::Relaxed),
+            self.0.counts.1.load(Ordering::Relaxed),
+        )
     }
 
     /// Streams not yet over both ways.
@@ -382,7 +414,11 @@ impl Tx {
             if self.ended {
                 return Err(io::ErrorKind::BrokenPipe.into());
             }
-            let credit = self.window.acquire_many(chunk.len() as u32).await.map_err(|_| reset_error())?;
+            let credit = self
+                .window
+                .acquire_many(chunk.len() as u32)
+                .await
+                .map_err(|_| reset_error())?;
             credit.forget();
             self.guard.shared.send(self.guard.id, Kind::Data, chunk.to_vec());
         }
@@ -396,7 +432,9 @@ impl Tx {
         }
         let (shared, id) = (&self.guard.shared, self.guard.id);
         let mut state = shared.state();
-        let Some(entry) = state.streams.get_mut(&id) else { return };
+        let Some(entry) = state.streams.get_mut(&id) else {
+            return;
+        };
         entry.local_end = true;
         if entry.remote_end {
             state.streams.remove(&id);
@@ -422,7 +460,9 @@ impl Rx {
         }
         let owed = std::mem::take(&mut self.owed);
         if owed > 0 {
-            self.guard.shared.send(self.guard.id, Kind::Credit, (owed as u32).to_be_bytes().to_vec());
+            self.guard
+                .shared
+                .send(self.guard.id, Kind::Credit, (owed as u32).to_be_bytes().to_vec());
         }
         match self.inbox.recv().await {
             Some(Event::Data(bytes)) => {
@@ -576,9 +616,18 @@ mod tests {
             let Stream { tx, rx } = near.open().unwrap();
             (tx, rx)
         };
-        let Stream { tx: _slow_far_tx, rx: mut slow_far } = incoming.accept().await.unwrap();
-        let Stream { tx: mut busy, rx: mut busy_rx } = near.open().unwrap();
-        let Stream { tx: mut busy_far, rx: mut busy_far_rx } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: _slow_far_tx,
+            rx: mut slow_far,
+        } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: mut busy,
+            rx: mut busy_rx,
+        } = near.open().unwrap();
+        let Stream {
+            tx: mut busy_far,
+            rx: mut busy_far_rx,
+        } = incoming.accept().await.unwrap();
 
         // The slow stream's sender: as much as it can, in chunks, counted as they pass.
         let sent = Arc::new(AtomicUsize::new(0));
@@ -595,7 +644,10 @@ mod tests {
         // It stops at its window (never past it) and waits: nobody reads it.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let held = sent.load(Ordering::SeqCst);
-        assert!(held > 0 && held <= WINDOW, "{held} bytes passed with a window of {WINDOW}");
+        assert!(
+            held > 0 && held <= WINDOW,
+            "{held} bytes passed with a window of {WINDOW}"
+        );
 
         // Another stream on the same link answers at once meanwhile, both ways.
         timeout(WAIT, async {
@@ -611,7 +663,10 @@ mod tests {
         assert_eq!(sent.load(Ordering::SeqCst), held, "it went on past its window");
 
         // Read, and it goes on to its end, all of it.
-        let bytes = timeout(WAIT, all(&mut slow_far)).await.expect("no credit given back").unwrap();
+        let bytes = timeout(WAIT, all(&mut slow_far))
+            .await
+            .expect("no credit given back")
+            .unwrap();
         assert_eq!(bytes.len(), 3 * WINDOW / 1000 * 1000);
         sender.await.unwrap();
     }
@@ -652,7 +707,10 @@ mod tests {
     async fn an_end_is_passed_on_and_the_other_way_goes_on() {
         let ((near, _), (_far, mut incoming)) = pair();
         let Stream { mut tx, mut rx } = near.open().unwrap();
-        let Stream { tx: mut far_tx, rx: mut far_rx } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: mut far_tx,
+            rx: mut far_rx,
+        } = incoming.accept().await.unwrap();
         tx.write(b"request").await.unwrap();
         tx.end();
         assert_eq!(timeout(WAIT, all(&mut far_rx)).await.unwrap().unwrap(), b"request");
@@ -669,9 +727,18 @@ mod tests {
     async fn a_reset_is_passed_on_to_both_halves_and_no_other_stream() {
         let ((near, _), (_far, mut incoming)) = pair();
         let Stream { mut tx, mut rx } = near.open().unwrap();
-        let Stream { tx: mut far_tx, rx: mut far_rx } = incoming.accept().await.unwrap();
-        let Stream { tx: mut other, rx: mut other_rx } = near.open().unwrap();
-        let Stream { tx: mut other_far, rx: mut other_far_rx } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: mut far_tx,
+            rx: mut far_rx,
+        } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: mut other,
+            rx: mut other_rx,
+        } = near.open().unwrap();
+        let Stream {
+            tx: mut other_far,
+            rx: mut other_far_rx,
+        } = incoming.accept().await.unwrap();
         tx.write(b"some").await.unwrap();
         tx.reset();
         // Its own side and the far side: errors, not an end.
@@ -699,13 +766,20 @@ mod tests {
         assert!(timeout(WAIT, all(&mut far_rx)).await.unwrap().is_err());
         // Both ends passed: dropping then sends nothing, and the streams are forgotten.
         let Stream { mut tx, mut rx } = near.open().unwrap();
-        let Stream { tx: mut far_tx, rx: mut far_rx } = incoming.accept().await.unwrap();
+        let Stream {
+            tx: mut far_tx,
+            rx: mut far_rx,
+        } = incoming.accept().await.unwrap();
         tx.end();
         far_tx.end();
         assert!(all(&mut far_rx).await.unwrap().is_empty() && all(&mut rx).await.unwrap().is_empty());
-        timeout(WAIT, async { while near.streams() + far.streams() > 0 { tokio::task::yield_now().await } })
-            .await
-            .expect("a finished stream kept in the table");
+        timeout(WAIT, async {
+            while near.streams() + far.streams() > 0 {
+                tokio::task::yield_now().await
+            }
+        })
+        .await
+        .expect("a finished stream kept in the table");
     }
 
     #[tokio::test]
@@ -751,7 +825,10 @@ mod tests {
             assert_eq!(timeout(WAIT, reader).await.unwrap().unwrap(), 200 * 100);
         }
         let (frames, writes) = near.counts();
-        assert!(frames >= 20 * 200 && frames > writes * 2, "{frames} frames in {writes} writes");
+        assert!(
+            frames >= 20 * 200 && frames > writes * 2,
+            "{frames} frames in {writes} writes"
+        );
         let _ = far;
     }
 

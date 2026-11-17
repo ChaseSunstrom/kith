@@ -2441,7 +2441,10 @@ spec:
             frames as f64 / writes.max(1) as f64
         );
         assert!(each > 0 && shared > 0 && frames >= 2 * shared as u64);
-        assert!(frames * 2 >= writes * 3, "fewer than 1.5 frames to a write: {frames} in {writes}");
+        assert!(
+            frames * 2 >= writes * 3,
+            "fewer than 1.5 frames to a write: {frames} in {writes}"
+        );
     }
 }
 
