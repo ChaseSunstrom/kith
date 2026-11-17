@@ -43,15 +43,17 @@ spec:
     deviceClaims: [render]
 ```
 
-- The workload runs only on the node of the Devices its claims reach. Claims that reach two
-  nodes hold nothing (the status says so): add `kith.dev/node` to the selector.
+- The workload runs only on the node of the Devices its claims reach. A selector that matches
+  Devices on several nodes takes those of the lowest-named node; add `kith.dev/node` to fix the
+  node. Claims that reach two nodes hold nothing (the status says so).
 - One workload holds a Device at a time. A second exclusive holder waits (`unschedulable`:
   `waiting for DeviceClaim render, held by Workload/default/renderer`) and takes over when the
   first is gone. `shared` claims may have any number of holders, none beside an exclusive one.
   `kith get deviceclaim render -o yaml` shows `status.node`, `devices`, `holders` or `message`.
 - A container gets its Devices' nodes in its own `/dev`, beside `null`, `zero`, `full`,
   `random`, `urandom`, `tty`; a GPU brings its render node (`/dev/dri/renderD*`). A missing
-  Device or claim stops the unit and says which.
+  Device or claim stops the unit and says which. `/dev/mem`, `/dev/kmem`, `/dev/port` and
+  `/dev/tpm*` are given to no pod, whatever a Device says.
 - **On kith OS** a device filter on each container's cgroup checks every open and `mknod`: it
   lets through the usual few, the terminals of the container's own `/dev/pts` and each device it
   was given, and refuses the rest, even to a root pod. A pod that made its own node

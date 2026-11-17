@@ -304,6 +304,17 @@ fn deep_values_do_not_end_the_process() {
 }
 
 #[test]
+fn debug_is_not_a_template_function() {
+    // (debug() writes out the whole context, at no cost in fuel.)
+    let mut package = example();
+    package
+        .templates
+        .insert("templates/said.yaml".into(), "a: {{ debug() | tojson }}".into());
+    let err = package.render(SHOP, &[]).unwrap_err();
+    assert!(err.contains("unknown function"), "{err}");
+}
+
+#[test]
 fn desktop_packages_lint_and_render() {
     let load = |name: &str| {
         let dir = format!("{}/../../packages/{name}", env!("CARGO_MANIFEST_DIR"));

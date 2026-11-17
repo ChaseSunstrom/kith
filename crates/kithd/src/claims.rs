@@ -133,7 +133,7 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
     if names.is_empty() {
         return Err(format!("{what} gives no Device"));
     }
-    let mut nodes = BTreeSet::new();
+    let mut on = Vec::new();
     for name in &names {
         let device = store.get(&format!("Device/{name}"));
         let device = device.ok_or(format!("there is no Device {name}"))?;
@@ -146,18 +146,20 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
         }
         let spec: DeviceSpec =
             serde_json::from_value(device.spec.clone()).map_err(|e| format!("Device {name}: {e}"))?;
-        nodes.insert(spec.node);
+        on.push((spec.node, name.clone()));
     }
-    let nodes: BTreeSet<&str> = nodes.iter().map(String::as_str).collect();
+    // A selector over Devices on several nodes takes those of the lowest-named: one like them
+    // plugged in on another node does not break it (kith.dev/node names the node). It can
+    // move to a lower-named node that gets one.
+    if what == "the selector" {
+        let lowest = on.iter().map(|(node, _)| node.clone()).min();
+        on.retain(|(node, _)| Some(node) == lowest.as_ref());
+    }
+    let nodes: BTreeSet<&str> = on.iter().map(|(node, _)| node.as_str()).collect();
     if nodes.len() > 1 {
-        let add = if what == "the selector" {
-            ": add kith.dev/node"
-        } else {
-            ""
-        };
-        return Err(format!("{what} matches devices on nodes {}{add}", list(&nodes)));
+        return Err(format!("{what} matches devices on nodes {}", list(&nodes)));
     }
-    let mut devices = names;
+    let mut devices: Vec<String> = on.iter().map(|(_, name)| name.clone()).collect();
     devices.sort();
     devices.dedup();
     let client = claim.access == Some(Access::Client);
@@ -759,6 +761,16 @@ spec: { node: b, devices: [b-keyboard] }
         );
     }
 
+    #[test]
+    fn a_selector_with_no_node_claims_on_the_lowest_node_that_matches() {
+        // A GPU on a and one on b: the selector takes a's, so one like it plugged in on another
+        // node does not break the claim (kith.dev/node names the node).
+        assert_eq!(
+            claimed(OPEN, "ops", "{ selector: { class: gpu } }"),
+            Ok(("a".into(), vec!["a-gpu-card0".into()]))
+        );
+    }
+
     /// A GPU labelled for `dev`, and an unlabelled USB port, on `b`. Seat `b-seat1` (for `ops` and
     /// `dev`) lists both; seat `b-seat2` (for `ops`) lists the unlabelled one.
     const LABELLED_SEATS: &str = "
@@ -984,10 +996,7 @@ spec: { node: b, devices: [b-usb0] }
         let mut store = store(&source);
         let claims = settle(&mut store);
         let why = |n: u8| claims.owners[&format!("Workload/default/w{n}")].clone().unwrap_err();
-        assert_eq!(
-            why(1),
-            "DeviceClaim any-gpu: the selector matches devices on nodes a and b: add kith.dev/node"
-        );
+        assert!(claims.owners["Workload/default/w1"].is_ok());
         assert!(claims.owners["Workload/default/w2"].is_ok());
         assert_eq!(why(3), "DeviceClaim none: the selector gives no Device");
         assert_eq!(why(4), "DeviceClaim ghost: there is no Device nowhere");
@@ -1001,9 +1010,12 @@ spec: { node: b, devices: [b-usb0] }
                 .status
                 .clone()
         };
-        let said = status("any-gpu").unwrap();
+        let said = status("none").unwrap();
         assert!(
-            said["message"].as_str().unwrap().contains("add kith.dev/node"),
+            said["message"]
+                .as_str()
+                .unwrap()
+                .contains("the selector gives no Device"),
             "{said}"
         );
         assert_eq!(said.as_object().unwrap().len(), 1);

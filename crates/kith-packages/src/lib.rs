@@ -240,6 +240,8 @@ impl Package {
         // (With `namespace()` a loop can nest a value in itself as deep as it has fuel,
         // deeper than there is stack to write the value out, or even to let go of it.)
         environment.remove_global("namespace");
+        // (And `debug()` writes out the whole context, at no cost in fuel.)
+        environment.remove_global("debug");
         // What a template writes is put down as it is (`name: {{ name }}-page`); a value
         // that could be anything is quoted where it is used: `{{ values.page | tojson }}`.
         environment.set_auto_escape_callback(|_| minijinja::AutoEscape::None);

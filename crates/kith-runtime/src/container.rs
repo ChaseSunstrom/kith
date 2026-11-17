@@ -1658,6 +1658,11 @@ fn device_nodes(
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let (mut nodes, mut allowed) = (Vec::new(), Vec::new());
     for path in paths {
+        // Not the machine's memory and I/O ports, nor its TPM, whatever a Device says.
+        let name = path.to_str().unwrap_or_default();
+        if ["/dev/mem", "/dev/kmem", "/dev/port"].contains(&name) || name.starts_with("/dev/tpm") {
+            return Err(format!("{name} is given to no pod").into());
+        }
         // Device nodes live in `/dev`: a path from a resource is not trusted to point elsewhere,
         // by `..` or by a link (`/dev/disk/by-id/…`, `/dev/stdin`): it must be its own real path.
         let real = fs::canonicalize(path).map_err(|e| format!("device {}: {e}", path.display()))?;
@@ -1719,6 +1724,17 @@ mod tests {
     /// Held by a test that takes ranges: those being taken are the process's, and a test that
     /// asks which is the lowest free must not meet another's.
     static RANGE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn device_nodes_refuse_mem_kmem_port_and_tpm() {
+        for path in ["/dev/mem", "/dev/kmem", "/dev/port", "/dev/tpm0", "/dev/tpmrm0"] {
+            let err = device_nodes(&[PathBuf::from(path)], None).unwrap_err().to_string();
+            assert!(err.contains("is given to no pod"), "{path}: {err}");
+        }
+        // (One that is not: refused only for want of the node, if this machine has none.)
+        let err = device_nodes(&[PathBuf::from("/dev/memory")], None).map(|_| ());
+        assert!(err.is_err_and(|e| !e.to_string().contains("is given to no pod")));
+    }
 
     #[test]
     fn spec_limits_and_namespaces() {
