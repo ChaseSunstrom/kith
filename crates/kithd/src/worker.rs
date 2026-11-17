@@ -440,6 +440,10 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
             if namespaces(resource) != live.and_then(namespaces) {
                 return Err(refused(&key, "its kith.dev/namespaces label is an admin's to set"));
             }
+            // A Device's class is what its hardware was found to be: a live one keeps the class it has.
+            if live.is_some_and(|live| live.spec["class"] != resource.spec["class"]) {
+                return Err(refused(&key, "its class is the one its hardware was found with"));
+            }
             match crate::devices::whose(store, &resource.metadata.name) {
                 theirs if theirs.contains(&node) => Ok(()),
                 theirs if theirs.is_empty() => Err(refused(&key, "it is not one this node's hardware made")),
@@ -483,6 +487,10 @@ fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
     let discovered = live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true");
     let made_here = live.metadata.annotations.get(MADE_ON).is_some_and(|on| on == who.name);
     match live.kind.as_str() {
+        // (A Device or Seat an admin gave namespaces is kept while its hardware is gone: a worker does not delete it.)
+        "Device" | "Seat" if live.metadata.labels.contains_key(crate::claims::NAMESPACES) => {
+            Err(refused(key, "its kith.dev/namespaces label is an admin's: it is kept"))
+        }
         "Device" | "Seat" if discovered && live.spec["node"] == who.name => Ok(()),
         "Blob" if made_here => Ok(()),
         _ => Err(refused(key, "it is not this node's to delete")),
@@ -1087,6 +1095,41 @@ spec: { volume: there, every: 1d }
         assert!(try_as(&store, "w", apply(seat("w-seat1", Some("ops")))).is_err());
         // Without the label, a worker's own Device is as it was.
         assert!(try_as(&store, "w", apply(device("w-gpu-card1", None))).is_ok());
+    }
+
+    /// A worker deletes none of its Devices that carry the label, and changes the class of none
+    /// of its live Devices: what an admin gave a Device, and what a claim's selector reads, is kept.
+    #[test]
+    fn a_worker_neither_deletes_a_labelled_device_nor_changes_a_live_devices_class() {
+        let mut store = store();
+        let device = |name: &str, class: &str, labelled: bool| -> Resource {
+            let mut labels = json!({ DISCOVERED: "true", "kith.dev/node": "w", "class": class });
+            if labelled {
+                labels["kith.dev/namespaces"] = "ops".into();
+            }
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Device",
+                "metadata": { "name": name, "labels": labels },
+                "spec": { "node": "w", "class": class, "path": "/dev/dri/card0" },
+            }))
+            .unwrap()
+        };
+        let apply = |resource: Resource| Command::Apply {
+            resources: vec![resource],
+            at: 0,
+        };
+        let delete = |key: &str| Command::Delete { key: key.into() };
+        store.apply(device("w-gpu-card0", "gpu", true)).unwrap();
+        store.apply(device("w-gpu-card1", "gpu", false)).unwrap();
+        // Its labelled Device is not the worker's to delete; its unlabelled one is.
+        assert!(try_as(&store, "w", delete("Device/w-gpu-card0")).is_err());
+        assert!(try_as(&store, "w", delete("Device/w-gpu-card1")).is_ok());
+        // A live Device keeps its class, whatever its label says (the two are written together).
+        assert!(try_as(&store, "w", apply(device("w-gpu-card1", "display", false))).is_err());
+        assert!(try_as(&store, "w", apply(device("w-gpu-card0", "display", true))).is_err());
+        assert!(try_as(&store, "w", apply(device("w-gpu-card1", "gpu", false))).is_ok());
+        // A Device the store does not have yet may be of any class its node finds.
+        assert!(try_as(&store, "w", apply(device("w-gpu-card2", "display", false))).is_ok());
     }
 
     #[test]

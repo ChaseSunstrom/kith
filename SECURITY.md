@@ -1462,9 +1462,11 @@ kith-lsp. The findings and what became of each are in
     or N is `kith-system`. A Device with no such label is kith-system's alone, except a GPU,
     which every namespace may claim as before. A Seat is kith-system's alone unless its label
     names the namespace, and a seat claim, `access: client` included, is checked against the
-    Seat's own label, not its devices'. Taking the label away refuses the claim at the next
-    pass. The label is an admin's: discovery keeps it, and a worker can neither add, change
-    nor drop it. Seats and non-GPU Devices with no label are refused to every namespace but
+    Seat's own label and against the label of each of its Devices that has one: a Device
+    labelled for other namespaces refuses it, and an unlabelled one follows the Seat's label
+    (T-0655). Taking the label away refuses the claim at the next pass. The label is an
+    admin's: discovery keeps it, and a worker can neither add, change nor drop it. A labelled
+    Device or Seat whose hardware is gone is kept with its label, and a worker does not delete it. Seats and non-GPU Devices with no label are refused to every namespace but
     kith-system after the upgrade, until someone labels them (`kith get seat NAME -o yaml`,
     add the label, `kith apply -f`).
 

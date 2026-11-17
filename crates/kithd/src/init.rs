@@ -140,10 +140,31 @@ pub fn configured(text: &str) -> (String, Vec<String>) {
     )
 }
 
+/// The slaves of dm-0, the verity device the root is: the one this system runs from.
+const ROOT_SLAVES: &str = "/sys/block/dm-0/slaves";
+
+/// The entries of `dir`, sorted; none if it is not there.
+fn sorted(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut all: Vec<_> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    all.sort();
+    all
+}
+
+/// The slave of dm-0 that the root is on: the first by name, so the same one every time. `booted`
+/// and `labelled` both take it here.
+fn root_slave(slaves: &std::path::Path) -> Option<std::path::PathBuf> {
+    sorted(slaves).into_iter().next()
+}
+
 /// The disk this system runs from (`vda`), where its root is a verity device.
 pub fn booted() -> Option<String> {
-    let under = std::fs::read_dir("/sys/block/dm-0/slaves").ok()?.flatten().next()?;
-    disk(&under.path())?.into_string().ok()
+    let under = root_slave(std::path::Path::new(ROOT_SLAVES))?;
+    disk(&under)?.into_string().ok()
 }
 
 fn static_ip(value: &str) -> Option<(Ipv4Addr, u8, Option<Ipv4Addr>)> {
@@ -261,22 +282,14 @@ fn disk(partition: &std::path::Path) -> Option<std::ffi::OsString> {
 /// a partition of the disk the root is on will do: a stick with a partition named `state`
 /// must not become the node's store, nor one named `root-b` its next system.
 pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
-    let entries = |dir: &str| -> Vec<std::path::PathBuf> {
-        let mut all: Vec<_> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        all.sort();
-        all
-    };
-    let ours = entries("/sys/block/dm-0/slaves").first().and_then(|under| disk(under));
-    entries("/sys/class/block").into_iter().find_map(|device| {
-        let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
-        let name = partition(&uevent, label)?;
-        (ours.is_none() || disk(&device) == ours).then(|| std::path::Path::new("/dev").join(name))
-    })
+    let ours = root_slave(std::path::Path::new(ROOT_SLAVES)).and_then(|under| disk(&under));
+    sorted(std::path::Path::new("/sys/class/block"))
+        .into_iter()
+        .find_map(|device| {
+            let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
+            let name = partition(&uevent, label)?;
+            (ours.is_none() || disk(&device) == ours).then(|| std::path::Path::new("/dev").join(name))
+        })
 }
 
 /// The firmware's variables, and the one systemd-boot sets to the partition GUID of the ESP it
@@ -870,6 +883,25 @@ mod tests {
             (ext4_blocks(&superblock), ext4_blocks(&superblock[..100])),
             (None, None)
         );
+    }
+
+    /// `booted` and `labelled` read the same slave of dm-0: the first by name, whatever order the
+    /// directory lists them in, so the disk of the root is the one a partition label must be on.
+    #[test]
+    fn booted_and_labelled_read_the_same_slave_of_dm0() {
+        let root = std::env::temp_dir().join(format!("kith-init-{}-slaves", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let slaves = root.join("slaves");
+        std::fs::create_dir_all(&slaves).unwrap();
+        for (disk_name, part) in [("vdb", "vdb2"), ("vda", "vda3")] {
+            let dir = root.join("devices").join(disk_name).join(part);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(&dir, slaves.join(part)).unwrap();
+        }
+        let first = root_slave(&slaves).expect("a slave of dm-0");
+        assert_eq!(first.file_name().and_then(|n| n.to_str()), Some("vda3"));
+        assert_eq!(disk(&first).and_then(|d| d.into_string().ok()).as_deref(), Some("vda"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

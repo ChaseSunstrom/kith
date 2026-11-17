@@ -417,7 +417,12 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
         let no_more = of != node && !nodes.contains(&of);
         discovered(live) && !worker && (no_more || misnamed())
     };
-    let gone = live.filter(|live| ours(live, node) && !found.iter().any(|new| new.key() == live.key()) || left(live));
+    // (A Device or Seat an admin gave namespaces is kept while its hardware is gone, so the label
+    // is there when it is found again: only a node that is gone or misnamed takes it away.)
+    let labelled = |live: &Resource| live.metadata.labels.contains_key(crate::claims::NAMESPACES);
+    let gone = live.filter(|live| {
+        ours(live, node) && !labelled(live) && !found.iter().any(|new| new.key() == live.key()) || left(live)
+    });
     let gone: Vec<String> = gone.map(Resource::key).collect();
     // (What this pass takes away holds nothing: the name is listed at the next.)
     held.retain(|(key, _)| !gone.contains(key));
@@ -1025,6 +1030,53 @@ mod tests {
         });
         assert!(!lost, "a pass writes the Device back without the label");
         assert!(gone.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A labelled Device is kept while its hardware is gone: deleted, it would take its label
+    /// with it, and found again it would come back without the namespaces it was given.
+    #[test]
+    fn a_labelled_device_is_kept_while_its_hardware_is_gone() {
+        let root = tree("kept");
+        laptop(&root);
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        store.apply(node("n1", "worker")).unwrap();
+        for resource in &found {
+            store.apply(resource.clone()).unwrap();
+        }
+        let mut labelled = get(&found, "n1-gpu-card0").clone();
+        labelled
+            .metadata
+            .labels
+            .insert("kith.dev/namespaces".into(), "ops".into());
+        store.apply(labelled.clone()).unwrap();
+        // Its card is gone: it stays, and nothing else of the store is deleted.
+        let without: Vec<Resource> = found
+            .iter()
+            .filter(|r| r.metadata.name != "n1-gpu-card0")
+            .cloned()
+            .collect();
+        let (_, gone, _) = changes(&store, "n1", &without);
+        assert!(gone.is_empty(), "{gone:?}");
+        // Found again, with a driver it did not have: written back with the label it has.
+        let mut back = found.clone();
+        back.iter_mut()
+            .find(|r| r.metadata.name == "n1-gpu-card0")
+            .unwrap()
+            .metadata
+            .labels
+            .insert("driver".into(), "radeon".into());
+        let (apply, gone, _) = changes(&store, "n1", &back);
+        assert!(gone.is_empty());
+        let written = apply
+            .iter()
+            .find(|r| r.key() == labelled.key())
+            .expect("found again, it is written");
+        assert_eq!(
+            written.metadata.labels.get("kith.dev/namespaces").map(String::as_str),
+            Some("ops")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
