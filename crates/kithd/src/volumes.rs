@@ -1012,11 +1012,10 @@ spec: { node: a, path: tiny, size: 1Gi }
         );
     }
 
-    /// The example in the README's Storage section is a real one: it applies, binds and places.
+    /// The first example of the Storage guide is a real one: it applies, binds and places.
     #[test]
     fn the_readme_volume_example_applies_binds_and_places() {
-        let readme = include_str!("../../../README.md");
-        let section = readme.split("\n## Storage\n").nth(1).expect("a Storage section");
+        let section = include_str!("../../../docs/guide/storage.md");
         let example = section.split("```yaml\n").nth(1).and_then(|s| s.split("```").next());
         let mut store = Store::default();
         let nodes = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: n1 }\nspec: {}\n---\n";

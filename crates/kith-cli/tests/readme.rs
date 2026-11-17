@@ -1,15 +1,58 @@
-//! README.md says what exists: these fail when it stops being so.
+//! README.md and the guides in docs/guide/ say what exists: these fail when they stop
+//! being so. (Below, "the README" is all of them: the front page and its guides.)
 //
 // ponytail: this reads what can be read by a program: the examples, one count, the
 // links, the paths, and phrases that were once stale. Whether a sentence is true is
 // still read by a person; a markdown parser if the fences ever nest. An example is
 // read and validated as `kith lint` does without a store: what only a KindDefinition
-// or another resource could refuse is not seen.
+// or another resource could refuse is not seen. Links between pages and their headings
+// are held by ci/doclinks.py.
 
 use kith_api::{KINDS, Resource};
 use std::path::Path;
 
-const README: &str = include_str!("../../../README.md");
+macro_rules! docs {
+    ($($path:literal),* $(,)?) => {
+        /// Each page, by its path from the repository's root.
+        const DOCS: &[(&str, &str)] = &[$(($path, include_str!(concat!("../../../", $path)))),*];
+        /// All of them, one after the other.
+        const README: &str = concat!($(include_str!(concat!("../../../", $path)), "\n"),*);
+    };
+}
+
+docs!(
+    "README.md",
+    "docs/guide/workloads.md",
+    "docs/guide/cluster.md",
+    "docs/guide/access.md",
+    "docs/guide/packages.md",
+    "docs/guide/kubernetes.md",
+    "docs/guide/api.md",
+    "docs/guide/hardware.md",
+    "docs/guide/storage.md",
+    "docs/guide/ui.md",
+    "docs/guide/os.md",
+    "docs/guide/development.md",
+);
+
+#[test]
+fn every_guide_is_read() {
+    let mut there: Vec<String> = std::fs::read_dir(root().join("docs/guide"))
+        .unwrap()
+        .map(|entry| format!("docs/guide/{}", entry.unwrap().file_name().to_string_lossy()))
+        .collect();
+    there.sort();
+    let mut read: Vec<&str> = DOCS
+        .iter()
+        .map(|(path, _)| *path)
+        .filter(|path| path.starts_with("docs/"))
+        .collect();
+    read.sort();
+    assert_eq!(
+        there, read,
+        "a page in docs/guide/ that these tests do not read, or one that is gone"
+    );
+}
 
 fn root() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
@@ -324,39 +367,40 @@ fn readme_carries_the_measured_comparison() {
 #[test]
 fn readme_links_and_paths_lead_somewhere() {
     let mut seen = 0;
-    // [text](path) and <img src="path">, where the path is a file of this repository.
-    for (open, close) in [("](", ')'), ("src=\"", '"')] {
-        for (at, _) in README.match_indices(open) {
-            let rest = &README[at + open.len()..];
-            let link = &rest[..rest.find(close).unwrap_or(0)];
-            let path = link.split('#').next().unwrap();
-            if let Some(heading) = link.strip_prefix('#') {
-                // (As GitHub names a heading: lower case, spaces to hyphens, the rest dropped.)
-                let named = |line: &str| {
-                    let title = line.trim_start_matches('#').trim().to_lowercase().replace(' ', "-");
-                    title
-                        .chars()
-                        .filter(|c| c.is_alphanumeric() || "-_".contains(*c))
-                        .collect::<String>()
-                };
-                // (A `#` line inside a fence is a comment of the example, not a heading.)
-                let mut fenced = false;
-                let found = README.lines().any(|line| {
-                    fenced ^= line.trim_start().starts_with("```");
-                    !fenced && line.starts_with('#') && named(line) == heading
-                });
-                assert!(found, "README.md links to its heading {link}, and has none");
+    // [text](path) and <img src="path">, where the path is a file of this repository,
+    // from the page's own folder.
+    for (page, text) in DOCS {
+        let folder = root().join(page).parent().unwrap().to_path_buf();
+        for (open, close) in [("](", ')'), ("src=\"", '"')] {
+            for (at, _) in text.match_indices(open) {
+                let rest = &text[at + open.len()..];
+                let link = &rest[..rest.find(close).unwrap_or(0)];
+                let path = link.split('#').next().unwrap();
+                if let Some(heading) = link.strip_prefix('#') {
+                    // (As GitHub names a heading: lower case, spaces to hyphens, the rest dropped.)
+                    let named = |line: &str| {
+                        let title = line.trim_start_matches('#').trim().to_lowercase().replace(' ', "-");
+                        title
+                            .chars()
+                            .filter(|c| c.is_alphanumeric() || "-_".contains(*c))
+                            .collect::<String>()
+                    };
+                    // (A `#` line inside a fence is a comment of the example, not a heading.)
+                    let mut fenced = false;
+                    let found = text.lines().any(|line| {
+                        fenced ^= line.trim_start().starts_with("```");
+                        !fenced && line.starts_with('#') && named(line) == heading
+                    });
+                    assert!(found, "{page} links to its heading {link}, and has none");
+                    seen += 1;
+                    continue;
+                }
+                if path.is_empty() || link.contains("://") || link.starts_with("mailto:") {
+                    continue;
+                }
+                assert!(folder.join(path).exists(), "{page} links to {link}, which is not there");
                 seen += 1;
-                continue;
             }
-            if path.is_empty() || link.contains("://") || link.starts_with("mailto:") {
-                continue;
-            }
-            assert!(
-                root().join(path).exists(),
-                "README.md links to {link}, which is not there"
-            );
-            seen += 1;
         }
     }
     // The Layout table: each row's first cell is a path.

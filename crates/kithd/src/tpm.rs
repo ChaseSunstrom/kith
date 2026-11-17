@@ -848,14 +848,14 @@ pub(crate) mod tests {
         }
     }
 
-    /// README.md and SECURITY.md name the PCRs a key is sealed to: these.
+    /// The kith OS guide and SECURITY.md name the PCRs a key is sealed to: these.
     #[test]
     fn tpm_pcrs_are_the_ones_the_documents_name() {
         let (last, first) = PCRS.split_last().unwrap();
         let first: Vec<String> = first.iter().map(u8::to_string).collect();
         let named = format!("PCRs {} and {last}", first.join(", "));
         for (name, text) in [
-            ("README.md", include_str!("../../../README.md")),
+            ("docs/guide/os.md", include_str!("../../../docs/guide/os.md")),
             ("SECURITY.md", include_str!("../../../SECURITY.md")),
         ] {
             assert!(text.contains(&named), "{name} does not say: {named}");
@@ -865,8 +865,8 @@ pub(crate) mod tests {
                 "{name} says the key crosses the bus in plain"
             );
         }
-        let readme = include_str!("../../../README.md");
-        assert!(readme.contains("What the seal does not cover"));
+        let guide = include_str!("../../../docs/guide/os.md");
+        assert!(guide.contains("What the seal does not cover"));
     }
 
     /// A software TPM, ended and its files removed with the test.

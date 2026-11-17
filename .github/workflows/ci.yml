@@ -23,6 +23,8 @@ jobs:
       # A software TPM: kithd's test of its TPM commands is not let to check nothing here.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools swtpm
       - run: cargo fmt --all --check
+      # Every link between the README and docs/guide/, and to each heading, goes somewhere.
+      - run: python3 ci/doclinks.py --self-test && python3 ci/doclinks.py
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # A container of a kithd that is not root goes beside kithd's own cgroup, which has to be the
