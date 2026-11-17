@@ -18,6 +18,9 @@
 // redirected segment through a worker): 74k kept requests a second where this has 81k.
 
 mod connect;
+// (Not wired yet: the trial in `tests` runs through it; T-0326's next step asks it of the nodes.)
+#[allow(dead_code)]
+mod link;
 
 use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
@@ -2318,58 +2321,11 @@ spec:
         const CLIENTS: usize = 20;
         const REQUEST: usize = 100;
         const FOR: Duration = Duration::from_secs(3);
-        static WRITES: AtomicUsize = AtomicUsize::new(0);
-        static FRAMES: AtomicUsize = AtomicUsize::new(0);
-
-        /// One link for every one of `locals`: a frame is which of them, a length and bytes.
-        async fn link(link: TcpStream, locals: Vec<TcpStream>) {
-            link.set_nodelay(true).unwrap();
-            let (from, mut to) = link.into_split();
-            let (waiting, mut waits) = mpsc::unbounded_channel::<Vec<u8>>();
-            let mut outs = Vec::new();
-            for (id, local) in locals.into_iter().enumerate() {
-                local.set_nodelay(true).unwrap();
-                let (mut read, write) = local.into_split();
-                outs.push(write);
-                let waiting = waiting.clone();
-                tokio::spawn(async move {
-                    let mut chunk = [0; 4096];
-                    while let Ok(n @ 1..) = read.read(&mut chunk).await {
-                        let mut frame = (id as u16).to_be_bytes().to_vec();
-                        frame.extend_from_slice(&(n as u16).to_be_bytes());
-                        frame.extend_from_slice(&chunk[..n]);
-                        if waiting.send(frame).is_err() {
-                            return;
-                        }
-                    }
-                });
-            }
-            // The one writer: whatever waits, of every stream, in one write.
-            tokio::spawn(async move {
-                let mut frames = Vec::new();
-                while waits.recv_many(&mut frames, 256).await > 0 {
-                    FRAMES.fetch_add(frames.len(), Ordering::Relaxed);
-                    WRITES.fetch_add(1, Ordering::Relaxed);
-                    if to.write_all(&frames.concat()).await.is_err() {
-                        return;
-                    }
-                    frames.clear();
-                }
-            });
-            let mut from = BufReader::new(from);
-            while let Ok(id) = from.read_u16().await {
-                let Ok(size) = from.read_u16().await else { return };
-                let mut bytes = vec![0; usize::from(size)];
-                if from.read_exact(&mut bytes).await.is_err() || outs[usize::from(id)].write_all(&bytes).await.is_err()
-                {
-                    return;
-                }
-            }
-        }
 
         /// Requests answered in [`FOR`] by `CLIENTS` clients through two nodes, `shared`
-        /// (one link) or with a connection between the nodes for each.
-        fn run(shared: bool) -> usize {
+        /// (one link, of [`link`](super::link)'s streams: the frames and writes of both
+        /// its ends are in `links`) or with a connection between the nodes for each.
+        fn run(shared: bool, links: &Arc<Mutex<Vec<link::Link>>>) -> usize {
             let on = |name: &str| thread(format!("trial-{name}")).unwrap();
             let (near, far, replicas, clients) = (on("near"), on("far"), on("replica"), on("clients"));
             let bound = |on: &tokio::runtime::Handle| {
@@ -2396,14 +2352,16 @@ spec:
                 replica.set_nodelay(true).unwrap();
                 replica
             };
+            let far_links = links.clone();
             far.spawn(async move {
                 if shared {
                     let (from, _) = there.accept().await.unwrap();
-                    let mut all = Vec::new();
-                    for _ in 0..CLIENTS {
-                        all.push(to_replica().await);
+                    from.set_nodelay(true).unwrap();
+                    let (link, mut incoming) = link::link(from, false);
+                    far_links.lock().unwrap().push(link);
+                    while let Some(stream) = incoming.accept().await {
+                        tokio::spawn(async move { stream.join(to_replica().await).await });
                     }
-                    link(from, all).await;
                 } else {
                     while let Ok((mut from, _)) = there.accept().await {
                         from.set_nodelay(true).unwrap();
@@ -2413,13 +2371,21 @@ spec:
                     }
                 }
             });
+            let near_links = links.clone();
             near.spawn(async move {
                 let mut all = Vec::new();
                 for _ in 0..CLIENTS {
                     all.push(here.accept().await.unwrap().0);
                 }
                 if shared {
-                    link(TcpStream::connect(there_at).await.unwrap(), all).await;
+                    let to = TcpStream::connect(there_at).await.unwrap();
+                    to.set_nodelay(true).unwrap();
+                    let (link, _) = link::link(to, true);
+                    near_links.lock().unwrap().push(link.clone());
+                    for client in all {
+                        let stream = link.open().unwrap();
+                        tokio::spawn(stream.join(client));
+                    }
                 } else {
                     for mut client in all {
                         client.set_nodelay(true).unwrap();
@@ -2453,10 +2419,17 @@ spec:
             answered.load(Ordering::Relaxed)
         }
 
-        let each = run(false);
-        let shared = run(true);
-        // (Both ways on the link: a request and its answer are a frame each.)
-        let (writes, frames) = (WRITES.load(Ordering::Relaxed), FRAMES.load(Ordering::Relaxed));
+        let each = run(false, &Arc::default());
+        let links = Arc::default();
+        let shared = run(true, &links);
+        // (Both ends of the link write: a request and its answer are a frame each, and
+        // the credit that gives their window back, and an open and an end for each client.)
+        let (frames, writes) = links
+            .lock()
+            .unwrap()
+            .iter()
+            .map(link::Link::counts)
+            .fold((0, 0), |(f, w), (frames, writes)| (f + frames, w + writes));
         let secs = FOR.as_secs() as usize;
         println!(
             "a connection for each client: {} requests a second, one write for each request each way",
@@ -2467,7 +2440,8 @@ spec:
             shared / secs,
             frames as f64 / writes.max(1) as f64
         );
-        assert!(each > 0 && shared > 0 && frames >= 2 * shared);
+        assert!(each > 0 && shared > 0 && frames >= 2 * shared as u64);
+        assert!(frames * 2 >= writes * 3, "fewer than 1.5 frames to a write: {frames} in {writes}");
     }
 }
 
