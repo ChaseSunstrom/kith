@@ -603,6 +603,25 @@ fn f(x, y = [..[1, 2], x]) = { ..{ a: x }, "k${x}": y, n: -x % 3 };
     }
 }
 
+/// A closure that holds the one before it, as many as a file can say (`let f = |x| f;`
+/// to its size limit), is let go of without a recursion as deep as the chain: it ends,
+/// it does not overflow the evaluator's stack (review-2 lang L1).
+#[test]
+fn limits_hold_a_file_that_chains_closures() {
+    let link = "let f = |x| f;\n";
+    let src = format!(
+        "{}{{ kind: \"ConfigMap\", a: 1 }}",
+        link.repeat(((1 << 20) - 64) / link.len())
+    );
+    let (sent, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sent.send(gives(&src)).unwrap());
+    let said = got.recv_timeout(std::time::Duration::from_secs(60)).expect("it ends");
+    assert!(
+        said.as_ref().map_or_else(|e| !e.contains("a bug in kith"), |_| true),
+        "{said:?}"
+    );
+}
+
 /// A file's value is taken apart into resources by its steps too: a list that holds
 /// itself twice, sixty deep, is a few steps to make and 2^60 to walk (review-2 lang H1).
 #[test]
