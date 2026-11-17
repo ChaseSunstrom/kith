@@ -2,13 +2,10 @@
 
 ## kubectl and Helm, as they are
 
-kithd answers the Kubernetes API on the port it answers its own (`/api` and
-`/apis` beside `/v1`), so `kubectl` and `helm` (3 and 4) work against a kith
-cluster with the manifests and charts you already have. Nothing is rewritten and
-nothing is migrated. And nothing of Kubernetes runs: there is no API server, no
-etcd and no kubelet behind it, and kith never starts, packages or fetches one.
-kithd holds each object as the kith resource it means, and gives it back as it
-was sent.
+kithd answers the Kubernetes API on its own port (`/api` and `/apis` beside `/v1`), so `kubectl`
+and `helm` (3 and 4) work against a kith cluster with the manifests and charts you already have,
+nothing rewritten or migrated. Nothing of Kubernetes runs: no API server, etcd or kubelet. kithd
+holds each object as the kith resource it means, and gives it back as it was sent.
 
 A kubeconfig is an Identity's certificate ([Who may do what](access.md#who-may-do-what)):
 
@@ -46,136 +43,74 @@ helm install site ./chart --wait
 | Deployment, StatefulSet | a Workload whose replicas are pods (`pod: true`: [a pod](workloads.md#a-replica-as-a-pod)) |
 | DaemonSet | a NodeWorkload |
 | Job, CronJob | a Job, a CronJob (its Jobs are made by the clock, in UTC, a missed minute made up within `startingDeadlineSeconds`; the last three that succeeded and three that failed are kept, or `successfulJobsHistoryLimit` and `failedJobsHistoryLimit`) |
-| Service | a Service |
+| Service, Namespace | a Service, a Namespace |
 | Ingress | `expose` on the Service behind each host, its `Prefix` and `Exact` paths as `paths`; the Ingress itself is kept to be read back. Refused by name: a path that is a pattern, an annotation that rewrites or matches by pattern, and one that keeps clients out (`auth-*`, an allow or deny list, a snippet, middlewares), which kith's edge would not honour |
 | ConfigMap, Secret | a ConfigMap, a Secret (Helm keeps its releases in Secrets: they are kith Secrets) |
 | PersistentVolumeClaim | a VolumeClaim that says `provision: true`: a Volume is made for it on a node |
-| Namespace | a Namespace |
 | ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, PodDisruptionBudget, IngressClass | kept as sent (a `KubeObject`), read back, and said to give nothing |
 | Pod, ReplicaSet, Node, Event | made for reading from what kith runs: `kubectl get pods`, `describe`, `logs` (a pod's name says what runs it, so a Deployment and a Job of one name make two: a Deployment's or StatefulSet's pods are `NAME-0`, a Job's `NAME-j0` and a DaemonSet's `NAME-n0`) |
 
-What works, by the real clients in the tests (`sh ci/kube.sh`, and
-`sh ci/kube.sh --vm` for what needs pods that run):
+What works, by the real clients in the tests (`sh ci/kube.sh`, and `sh ci/kube.sh --vm` for what
+needs pods that run):
 
-- **kubectl**: `apply` (client-side and `--server-side`), `create` (deployment,
-  job, `job --from=cronjob/…`, cronjob, configmap, secret, namespace,
-  serviceaccount), `get` (tables, `-o yaml|json|wide|name|jsonpath`, `-A`,
-  `--watch`, `get all`), `describe`, `diff`, `replace`, `patch` (strategic and
-  merge), `label`, `annotate`, `scale`, `expose`, `set image`, `rollout status`,
-  `rollout restart`, `wait`, `logs` (`-f`, `--tail`, of a pod, a Deployment or a
-  Job), `delete`.
-- **helm**: `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`,
-  `history`, `get manifest`, each with and without `--wait`, into a namespace it
-  creates.
-- **Field managers**: `kubectl apply --server-side` keeps who set which field (in
-  `metadata.managedFields`, up to 64 managers an object). Two managers that apply
-  one object each keep their own fields; a second manager's different value for a
-  field the first set is a `409 Conflict` in Kubernetes's words, unless it says
-  `--force-conflicts` (it then takes the field). A field a manager leaves out of its
-  next apply goes, when no other manager has it. Fields are owned by their exact
-  path, a list that has no one key to merge by is owned whole, and only an apply makes
-  a manager (a `replace` or a `patch` takes a field from whoever had it). Applying
-  onto an object that exists, or replacing one, needs `get` as well as `apply`, as a
-  patch does. `kubectl get namespaces` and `get nodes` show an AGE: the time of the
-  oldest revision the store kept, which is when it was made unless the history was
-  trimmed or the node is a worker that runs from a view and holds only what the view
-  carried (an implicit namespace, one that only holds objects, has none).
-- **Watches**: `kubectl get --watch` reads what the store says changed, so one
-  change among 2000 objects makes and compares one object, not 2000 (what it shows
-  is what a list shows: the same Roles apply to every read). It reads the kind again
-  when it cannot know what changed: on a worker node that runs from a view, after a
-  change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys,
-  after the store was replaced, and for Namespaces.
-- **GitOps**: a [Source](packages.md#sources-gitops) follows a repository of Kubernetes
-  manifests as they are; a file's objects are read exactly as the API reads them.
-
-Every field of an object is accounted for, by one table
-(`crates/kith-kube/src/lib.rs`): it is carried into the kith resource, or it is
-taken and a `Warning:` says it changes nothing (kubectl prints it), or the
-object is refused with a status that names the field. Nothing is dropped in
-silence, and `kubectl get -o yaml` gives back what was sent.
+| Client | What works |
+|---|---|
+| kubectl | `apply` (client-side and `--server-side`), `create` (deployment, job, `job --from=cronjob/…`, cronjob, configmap, secret, namespace, serviceaccount), `get` (tables, `-o yaml\|json\|wide\|name\|jsonpath`, `-A`, `--watch`, `get all`), `describe`, `diff`, `replace`, `patch` (strategic and merge), `label`, `annotate`, `scale`, `expose`, `set image`, `rollout status`, `rollout restart`, `wait`, `logs` (`-f`, `--tail`, of a pod, a Deployment or a Job), `delete` |
+| helm | `install`, `upgrade`, `rollback`, `uninstall`, `list`, `status`, `history`, `get manifest`, each with and without `--wait`, into a namespace it creates |
+| Field managers | `kubectl apply --server-side` keeps who set which field (`metadata.managedFields`, up to 64 managers an object). Managers that apply one object each keep their own fields; a second manager's different value for a field the first set is a `409 Conflict` in Kubernetes's words, unless it says `--force-conflicts` (it then takes the field). A field a manager leaves out of its next apply goes, when no other manager has it. Fields are owned by their exact path, a list with no one key to merge by is owned whole, and only an apply makes a manager (a `replace` or a `patch` takes a field from whoever had it). Applying onto an object that exists, or replacing one, needs `get` as well as `apply`, as a patch does |
+| AGE | `kubectl get namespaces` and `get nodes` show the time of the oldest revision the store kept: when it was made, unless the history was trimmed or the node is a worker that runs from a view and holds only what the view carried (an implicit namespace, one that only holds objects, has none) |
+| Watches | `kubectl get --watch` reads what the store says changed, so one change among 2000 objects makes and compares one object, not 2000 (it shows what a list shows: the same Roles apply). It reads the kind again when it cannot know what changed: on a worker node that runs from a view, after a change to an Identity, a Role or a RoleBinding, after more than 4096 changed keys, after the store was replaced, and for Namespaces |
+| GitOps | a [Source](packages.md#sources-gitops) follows a repository of Kubernetes manifests as they are; a file's objects are read exactly as the API reads them |
+| Every field | accounted for by one table (`crates/kith-kube/src/lib.rs`): carried into the kith resource, or taken with a `Warning:` that it changes nothing (kubectl prints it), or the object is refused with a status that names the field. Nothing is dropped in silence, and `kubectl get -o yaml` gives back what was sent |
 
 Not answered, each refused in words:
 
-- `exec`, `attach`, `port-forward`, `cp` and `kubectl run` (a pod alone); `kubectl top`.
-- A write to a resource's `/status` (a controller's, or `kubectl patch --subresource=status`):
-  `status is kithd's own`, written from what runs and not taken from a client. Reading it works.
-- CustomResourceDefinitions, and so other people's operators; admission
-  webhooks; NetworkPolicy, HorizontalPodAutoscaler.
-- What it is not, and is not meant to become: kith is not a conformant Kubernetes
-  (the conformance tests are not run and would not pass). It takes no CNI, CSI
-  or device plugin (a pod's network, a volume and a device are kith's own), and
-  serves no aggregated API. It never starts, fetches or packages Kubernetes
-  itself: what needs the real thing needs a real cluster.
-- Of a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`,
-  added capabilities (kith gives no Workload these, by any API); a `projected` or
-  `downwardAPI` volume, a mode for one item of a volume, `subPath` of a claim or of an
-  `emptyDir`, and an initContainer with a `restartPolicy` (a sidecar). What a chart
-  commonly says is carried, as [kith's own fields](workloads.md#what-a-container-is-given):
-  volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`,
-  `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage`
-  with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised
-  to it).
-- A StatefulSet with a claim template and more than one replica; a CronJob in a
-  time zone other than UTC; `kubectl rollout undo` (use `kith rollback`).
-- `kubectl delete pod` (a pod is its owner's replica) and `--cascade=orphan`;
-  `kubectl patch --type json`; `kubectl logs --previous`, `--since` and
-  `--timestamps` (a unit's output is kept as it was written, not when).
+| What | Note |
+|---|---|
+| A write to a resource's `/status` (a controller's, or `kubectl patch --subresource=status`) | `status is kithd's own`, written from what runs, not taken from a client. Reading works |
+| `exec`, `attach`, `port-forward`, `cp`, `kubectl run` (a pod alone), `kubectl top`; CustomResourceDefinitions (so other people's operators), admission webhooks, NetworkPolicy, HorizontalPodAutoscaler | |
+| What it is not, and is not meant to become | kith is not a conformant Kubernetes (the conformance tests are not run and would not pass). It takes no CNI, CSI or device plugin (a pod's network, a volume and a device are kith's own), serves no aggregated API, and never starts, fetches or packages Kubernetes: what needs the real thing needs a real cluster |
+| In a pod: `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, `privileged`, added capabilities | kith gives no Workload these, by any API |
+| In a pod: a `projected` or `downwardAPI` volume, a mode for one item of a volume, `subPath` of a claim or of an `emptyDir`, an initContainer with a `restartPolicy` (a sidecar) | What a chart commonly says is carried, as [kith's own fields](workloads.md#what-a-container-is-given): volumes from a ConfigMap, a Secret or an `emptyDir`, `envFrom`, `fieldRef`, `initContainers`, `runAsNonRoot`, dropped capabilities, and `limits.ephemeral-storage` with a disk `emptyDir`'s `sizeLimit` as `resources.storage` (either under 64Ki raised to it) |
+| A StatefulSet with a claim template and more than one replica; a CronJob in a time zone other than UTC; `kubectl rollout undo` | use `kith rollback` |
+| `kubectl delete pod` (a pod is its owner's replica), `--cascade=orphan`, `kubectl patch --type json`, `kubectl logs --previous`, `--since`, `--timestamps` | a unit's output is kept as it was written, not when |
 
-What it costs: it is in the one kithd there is, and added 0.38 MB to it (the
-budget of 13 MB is not raised; kithd is 10.92 MB today). With pods and CronJobs, kithd
-with nothing to do holds 7.8 MB of memory, as it did before them (`python3
-ci/budgets.py`: 7.80 MB four times running, 7.75 MB before; between 7.4 and 8.2 on
-a machine busy with other work). A node that no Kubernetes client asks runs none
-of it.
+What it costs: it is in the one kithd there is and added 0.38 MB to it (the budget of 13 MB is
+not raised; kithd is 10.92 MB today). With pods and CronJobs kithd with nothing to do holds
+7.8 MB of memory, as before (`python3 ci/budgets.py`); a node no client asks runs none of it.
 
-Who may do what is kith's own: a request on `/api` is checked as the same
-request on `/v1` would be, for the kith kind it means, by the Roles bound to the
-certificate's Identity (a `kubectl patch`, which is answered with the whole
-object, needs `get` as well as `apply`; a CronJob needs `apply` on Job, a
-PersistentVolumeClaim on Volume). Kubernetes's Roles and ServiceAccounts are kept
-and give nothing. What kith's own files made is not shown as a Kubernetes object, and is
-not written over through this API.
+Who may do what is kith's own: a request on `/api` is checked as the same request on `/v1`
+would be, for the kith kind it means, by the Roles bound to the certificate's Identity (a
+`kubectl patch` needs `get` as well as `apply`; a CronJob needs `apply` on Job, a
+PersistentVolumeClaim on Volume). Kubernetes's Roles and ServiceAccounts give nothing. What
+kith's own files made is not shown as a Kubernetes object, nor written over through this API.
 
 ## Importing from Kubernetes and Helm
 
-`kith import k8s -f manifests.yaml` (`-f -` reads stdin; `-f` may repeat; a
-`List` is unwrapped) prints the kith resources the manifests translate to.
-`kith import helm ./chart --name shop -n store -f values.yaml` runs your
-installed `helm template` and translates what it prints (no helm: pipe
-`helm template ... | kith import k8s -f -`). Review the output, then
-`kith apply -f` it.
+`kith import k8s -f manifests.yaml` (`-f -` reads stdin; `-f` may repeat; a `List` is unwrapped)
+prints the kith resources the manifests translate to. `kith import helm ./chart --name shop -n
+store -f values.yaml` runs your installed `helm template` and translates what it prints (no
+helm: pipe `helm template ... | kith import k8s -f -`). Review the output, then `kith apply -f`
+it.
 
 | Kubernetes | kith |
 |---|---|
 | Deployment, StatefulSet | Workload with `pod: true` (a StatefulSet's `volumeClaimTemplates` each become a VolumeClaim `<template>-<name>-0`; with more than one replica that is refused) |
-| DaemonSet | NodeWorkload |
-| Service | Service |
+| DaemonSet, Service | NodeWorkload, Service |
 | Ingress | `expose: {host, via: edge, paths}` on the Service behind each host (the one behind `/`, else the first named) |
 | ConfigMap, Secret | ConfigMap, Secret (`data` decoded from base64: the output holds the plain text) |
 | PersistentVolumeClaim | VolumeClaim, with `provision: true` unless it says `storageClassName: ""` |
 | Job, CronJob | Job, CronJob (`startingDeadlineSeconds`, `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` are kept to; a `timeZone` other than UTC is refused) |
-
-Nothing is dropped silently. Every field that is not carried over is named on
-stderr by path: one that kith has nothing for (`hostNetwork`, an unknown kind, an
-object that would not validate), such as
-`not translated: Deployment/web: spec.template.spec.hostNetwork not translated`,
-and one that is taken and changes nothing (an `affinity`, most of a
-`securityContext`). It is the table of fields
-[the Kubernetes API](#kubectl-and-helm-as-they-are) answers by.
-Status, `managedFields`, `uid`, `resourceVersion` and Helm's own labels are
-ignored, not reported. Exit status: 0 everything translated, 1 something is
-in the report (the output is still printed), 2 the input could not be read.
-`nodeSelector` becomes a placement requirement, and a pod template's labels
-are added to the workload's, since kith Services select on those.
+| `nodeSelector`, a pod template's labels | a placement requirement; the labels are added to the workload's, since kith Services select on those |
+| Not carried over | named on stderr by path, by the table [the Kubernetes API](#kubectl-and-helm-as-they-are) answers by: a field kith has nothing for (`hostNetwork`, an unknown kind, an object that would not validate), such as `not translated: Deployment/web: spec.template.spec.hostNetwork not translated`, and one taken that changes nothing (an `affinity`, most of a `securityContext`). Status, `managedFields`, `uid`, `resourceVersion` and Helm's own labels are ignored, not reported |
+| Exit status | 0 everything translated, 1 something is in the report (the output is still printed), 2 the input could not be read |
 
 ### From a docker-compose file
 
-`kith import compose docker-compose.yml --node n1 -n media` prints the stack as
-kith resources, the same way: review, then `kith apply -f` it. kith does not
-run compose; this is a translation, once. kith's YAML has no anchors or merge
-keys, and no variables: `docker compose config` prints a file with both
-written out, and a value that still holds a `$` is refused by name.
+`kith import compose docker-compose.yml --node n1 -n media` prints the stack as kith resources,
+the same way: review, then `kith apply -f` it. It is a translation, once; kith does not run
+compose. kith's YAML has no anchors, merge keys or variables: `docker compose config` writes them
+out, and a value that still holds a `$` is refused by name.
 
 | compose | kith |
 |---|---|
@@ -186,26 +121,14 @@ written out, and a value that still holds a `$` is refused by name.
 | `environment`, `command`, `entrypoint`, `working_dir`, `user` | the same fields of the container |
 | `restart` | `restartPolicy` |
 | `healthcheck` with `curl` or `wget` of an http address on localhost | a `readiness` probe with its interval, timeout and retries |
-
-Refused by path and name, as `kith import k8s` does: `privileged`, `cap_add`,
-`sysctls`, `devices` (a [DeviceClaim](hardware.md#claiming-hardware) is how kith gives
-hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port
-published on the node's own address, a `depends_on` condition (kith waits for
-nothing: an app retries), two networks in one file (a namespace is one
-network), an absolute host path (kith takes one in `kith-system` only, and
-never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that
-would make one name, and every key it does not know. A variable whose name
-reads as a secret (`PASSWORD`, `TOKEN`, `KEY`) is carried and said: it is in
-the output as plain text, and a Secret with `envFrom` keeps it out of the
-Workload. (The other way, a tool that writes Kubernetes YAML of the file and
-then `kith import k8s`, is two steps and was not tried here.)
+| refused by path and name, as `kith import k8s` does | `privileged`, `cap_add`, `sysctls`, `devices` (a [DeviceClaim](hardware.md#claiming-hardware) is how kith gives hardware), `network_mode: host`, `env_file`, `tmpfs`, a UDP port, a port published on the node's own address, a `depends_on` condition (kith waits for nothing: an app retries), two networks in one file (a namespace is one network), an absolute host path (kith takes one in `kith-system` only, and never `/`, `/proc`, `/sys`, `/dev` or a docker socket), two volumes that would make one name, and every key it does not know |
+| a variable named like a secret (`PASSWORD`, `TOKEN`, `KEY`) | carried and said: it is in the output as plain text, and a Secret with `envFrom` keeps it out of the Workload |
 
 ## Coming from Proxmox or docker compose
 
-A guest on a hypervisor is a whole system with one job. On kith the job is a Workload
-from the same image the guest would have run, its data a Volume, its name a Service;
-the system around it is not carried, because kith OS is that part. What each kind of
-guest becomes, and what is still missing:
+A guest on a hypervisor is a whole system with one job. On kith the job is a Workload from the
+same image the guest would have run, its data a Volume, its name a Service; the system around it
+is kith OS. What each kind of guest becomes, and what is still missing:
 
 | A guest that is | Becomes | Today |
 |---|---|---|
@@ -223,18 +146,15 @@ guest becomes, and what is still missing:
 Moving a guest's data, one guest at a time:
 
 1. Stop the app in the guest, so its files are whole.
-2. Apply the Volume its Workload will mount (`kith apply -f app.yaml`; the Workload may
-   wait with `replicas: 0`).
-3. From a machine that reaches both, send the directory:
-   `ssh GUEST tar -cf - -C /var/lib/app . | kith volume put app-data -`
-   (or `kith volume put app-data ./a-copy` for a copy you already have). It says how many
-   files went in and names any link it left out; see
-   [Files in and out of a volume](storage.md#files-in-and-out-of-a-volume) for what it refuses.
-4. Start the Workload and look at the app. The files are its user's whatever they were
-   in the guest.
+2. Apply the Volume its Workload will mount (`kith apply -f app.yaml`; the Workload may wait with
+   `replicas: 0`).
+3. From a machine that reaches both, send the directory: `ssh GUEST tar -cf - -C /var/lib/app . |
+   kith volume put app-data -` (or `kith volume put app-data ./a-copy`). It says how many files
+   went in and names any link it left out; see [Files in and out of a
+   volume](storage.md#files-in-and-out-of-a-volume) for what it refuses.
+4. Start the Workload and look at the app. The files are its user's whatever they were in the
+   guest. Keep the old guest stopped, not deleted, until the new one has run a week.
 
-Keep the old guest stopped, not deleted, until the new one has run a week.
-
-kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI,
-virtio disk and network), and that is the way to try it beside what runs today. It is
-tested in QEMU, not on Proxmox itself.
+kith does not need the hypervisor gone first: a kith OS image boots as a guest (UEFI, virtio
+disk and network), the way to try it beside what runs today. It is tested in QEMU, not on
+Proxmox itself.
