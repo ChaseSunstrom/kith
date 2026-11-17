@@ -344,7 +344,9 @@ fn readme_carries_the_measured_comparison() {
         .filter(|line| !line.is_empty())
         .collect();
     assert!(said.len() > 6, "ci/compare.txt has no table: {measured}");
-    let section = README
+    // (README.md alone: the guides after it are not its last section.)
+    let section = DOCS[0]
+        .1
         .split("\n## Beside k3s\n")
         .nth(1)
         .expect("README.md: ## Beside k3s");
