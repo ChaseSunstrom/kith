@@ -169,7 +169,11 @@ fn readme_and_security_say_who_may_claim_a_device_or_seat() {
         ),
         ("README.md", flat(README), "every `Seat` is `kith-system`'s alone"),
         ("README.md", flat(README), "its `status.message` says why"),
-        ("SECURITY.md", flat(&security), "Devices and Seats are given to namespaces (T-0646)"),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "Devices and Seats are given to namespaces (T-0646)",
+        ),
         (
             "SECURITY.md",
             flat(&security),

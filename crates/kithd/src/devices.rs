@@ -387,7 +387,10 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
                 // (The namespaces an admin gave it are theirs to set: a pass keeps the label there is.)
                 let mut wanted = new.clone();
                 if let Some(namespaces) = live.metadata.labels.get(crate::claims::NAMESPACES) {
-                    wanted.metadata.labels.insert(crate::claims::NAMESPACES.into(), namespaces.clone());
+                    wanted
+                        .metadata
+                        .labels
+                        .insert(crate::claims::NAMESPACES.into(), namespaces.clone());
                 }
                 if live.metadata.labels != wanted.metadata.labels || live.spec != wanted.spec {
                     apply.push(wanted);
@@ -1011,7 +1014,10 @@ mod tests {
         let mut store = Store::default();
         store.apply(node("n1", "worker")).unwrap();
         let mut labelled = found[0].clone();
-        labelled.metadata.labels.insert("kith.dev/namespaces".into(), "ops".into());
+        labelled
+            .metadata
+            .labels
+            .insert("kith.dev/namespaces".into(), "ops".into());
         store.apply(labelled.clone()).unwrap();
         let (apply, gone, _) = changes(&store, "n1", &found);
         let lost = apply.iter().any(|r| {
