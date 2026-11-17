@@ -378,15 +378,26 @@ pub fn make(range: Range, number: u16, v6: Option<Ipv6Addr>, exit: Option<u16>) 
 /// (`kx`), to another pod, and to the mesh (link `mesh`), and nothing of theirs reaches
 /// the node itself but answers to what it asked of them. (What comes in by a tunnel is
 /// [`crate::exit::guard`]'s, made before the tunnel is.)
-pub fn node(range: Range, guarded: bool, mesh: &str) -> Result<bool> {
-    node_with(range, guarded, true, mesh)
+/// What comes by each of `pods`' links is passed only from that pod's own addresses; the
+/// caller makes this again whenever the pods change.
+pub fn node(range: Range, guarded: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
+    node_with(range, guarded, true, mesh, pods)
 }
 
-fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str) -> Result<bool> {
+/// A pod this node serves: its number, whether it leaves by an exit (its link is then
+/// [`crate::exit::link`]'s, not [`link_of`]'s), and its address on the mesh, if it has one
+/// (its IPv4 address is [`addresses`]').
+pub struct Served {
+    pub number: u16,
+    pub exit: bool,
+    pub v6: Option<Ipv6Addr>,
+}
+
+fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
     crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
-    nat(range, guard, masquerade, mesh)?;
+    nat(range, guard, masquerade, mesh, pods)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
     for link in std::fs::read_dir("/proc/sys/net/ipv6/conf")?.flatten() {
@@ -492,10 +503,94 @@ fn marked() -> Vec<u8> {
     [mark, expression("ct", &[number(2, 3), number(4, 1)])].concat()
 }
 
+/// The bytes `bytes` are at `offset` into the packet's header `base` (1: network, 2:
+/// transport), compared in register 1.
+fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
+    let load = expression(
+        "payload",
+        &[
+            number(1, 1),
+            number(2, base),
+            number(3, offset),
+            number(4, bytes.len() as u32),
+        ],
+    );
+    [load, is(bytes)].concat()
+}
+
+/// The packet's family is `family` (meta nfproto: 2 IPv4, 10 IPv6).
+fn nfproto(family: u8) -> Vec<u8> {
+    [expression("meta", &[number(2, 15), number(1, 1)]), is(&[family])].concat()
+}
+
+/// The packet's transport protocol is `protocol` (meta l4proto: 6 TCP, 17 UDP).
+fn l4proto(protocol: u8) -> Vec<u8> {
+    [expression("meta", &[number(2, 16), number(1, 1)]), is(&[protocol])].concat()
+}
+
+/// The guard of the pod links (`kp*`, an exit's `kpx` among them), each rule as (chain,
+/// expressions). `check` (prerouting, first): what comes by a pod's link is passed only from
+/// that pod's own IPv4 or IPv6 address, the link's name whole; the rest of `kp*` is dropped.
+/// `in` (what comes to the node): an answer to what the node asked is passed; an exit's pod
+/// (`kpx`) gets nothing more, its DNS and Services among them; any pod gets DNS at the
+/// gateway (UDP and TCP, port 53) and TCP to a Service (IPv6, bytes 6..10 all ff); the rest
+/// is dropped. An answer is the state of a connection seen both ways or made by one, or
+/// IPv6's neighbour discovery (not tracked).
+fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
+    let gateway = range.gateway().octets();
+    let dns = |protocol: u8| {
+        vec![
+            came_by(b"kp"),
+            nfproto(2),
+            l4proto(protocol),
+            at(1, 16, &gateway),
+            at(2, 2, &53u16.to_be_bytes()),
+            verdict(1),
+        ]
+    };
+    let mut rules = Vec::new();
+    for served in pods {
+        let link = if served.exit {
+            crate::exit::link(served.number)
+        } else {
+            link_of(served.number)
+        };
+        // (Whole, with its end: `kp1` is not `kp10`.)
+        let named = [link_name(6), is(&[link.as_bytes(), &[0]].concat())].concat();
+        let (v4, _) = addresses(range, None, served.number);
+        rules.push((
+            "check",
+            vec![named.clone(), nfproto(2), at(1, 12, &v4.octets()), verdict(1)],
+        ));
+        if let Some(v6) = served.v6 {
+            rules.push(("check", vec![named, nfproto(10), at(1, 8, &v6.octets()), verdict(1)]));
+        }
+    }
+    rules.push(("check", vec![came_by(b"kp"), verdict(0)]));
+    rules.extend([
+        ("in", vec![came_by(b"kp"), state(2 | 4 | 64), verdict(1)]),
+        ("in", vec![came_by(b"kpx"), verdict(0)]),
+        ("in", dns(17)),
+        ("in", dns(6)),
+        (
+            "in",
+            vec![
+                came_by(b"kp"),
+                nfproto(10),
+                l4proto(6),
+                at(1, 30, &[0xff; 4]),
+                verdict(1),
+            ],
+        ),
+        ("in", vec![came_by(b"kp"), verdict(0)]),
+    ]);
+    rules
+}
+
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
 /// node's (masquerade); with `guard`, `inet kith-pods` lets nothing be passed on but what
-/// comes in from or goes out to a pod's link.
-fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
+/// comes in from or goes out to a pod's link. Whole, for `pods` as they are now.
+fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<()> {
     let mut batch = Batch::new("kith-pods");
     batch.table(IP);
     // After routing (hook 4), where addresses are changed on the way out (priority 100).
@@ -521,16 +616,16 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str) -> Result<()> {
     batch.table(INET);
     // What is passed on (hook 2): with the guard, dropped (0) unless a rule lets it through.
     batch.chain(INET, "passed", "filter", 2, 0, Some(u32::from(!guard)));
-    // What comes to the node itself (hook 1).
+    // A pod link's guard, first: what comes by it from a source with no route back through it
+    // is dropped (prerouting, priority -100: ahead of conntrack's own).
+    batch.chain(INET, "check", "filter", 0, (-100i32) as u32, None);
+    // What comes to the node itself (hook 1): the pods' rules, see `pod_guard_rules`.
     batch.chain(INET, "in", "filter", 1, 0, Some(1));
+    for (chain, rule) in pod_guard_rules(range, pods) {
+        batch.rule(INET, chain, &rule);
+    }
     let to = |name: &[u8]| [link_name(7), is(name)].concat();
     let mesh = [mesh.as_bytes(), &[0]].concat();
-    // A pod of an exit asks nothing of its node: what comes from one to the node itself is
-    // an answer to what the node asked of it (a Service's relay or probe, at its mesh
-    // address), an ICMP error of such, or IPv6's neighbour discovery (not tracked). Any
-    // other port of the node's, its DNS and kithd's API among them, hears nothing of it.
-    batch.rule(INET, "in", &[came_by(b"kpx"), state(2 | 4 | 64), verdict(1)]);
-    batch.rule(INET, "in", &[came_by(b"kpx"), verdict(0)]);
     // (What comes in by a tunnel to be passed on is an answer, or the guard drops it; an
     // answer is passed whatever this table's policy.)
     batch.rule(INET, "passed", &[came_by(b"kx"), answering(), verdict(1)]);
@@ -674,7 +769,8 @@ pub(crate) fn netfilter(batch: &[u8], last: u32) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+    use std::time::Duration;
 
     fn range(text: &str) -> std::result::Result<Range, String> {
         text.parse()
@@ -816,10 +912,97 @@ mod tests {
         assert_ne!(v6, crate::node_address(crate::prefix(b"test"), "alpha").octets());
     }
 
+    fn contains(bytes: &[u8], part: &[u8]) -> bool {
+        bytes.windows(part.len()).any(|window| window == part)
+    }
+
+    /// What comes by a pod's link is passed at prerouting only from that pod's own addresses
+    /// (its link's name whole, and its IPv4 or IPv6 source), and the rest of `kp*` (an exit's
+    /// `kpx` among it) is dropped. A pod sends with its own addresses only, whatever the family.
+    #[test]
+    fn a_pod_link_has_a_reverse_path_check() {
+        let range = range("198.18.16.0/20").unwrap();
+        let net = crate::node_net(crate::prefix(b"test"), "alpha");
+        let pods = [
+            Served {
+                number: 2,
+                exit: false,
+                v6: addresses(range, Some(net), 2).1,
+            },
+            Served {
+                number: 3,
+                exit: true,
+                v6: None,
+            },
+        ];
+        let check: Vec<Vec<u8>> = pod_guard_rules(range, &pods)
+            .iter()
+            .filter(|(chain, _)| *chain == "check")
+            .map(|(_, rule)| rule.concat())
+            .collect();
+        let [pod2_v4, pod2_v6, exit3_v4, rest] = check.as_slice() else {
+            panic!("four rules in check, not {}", check.len())
+        };
+        let (v4, v6) = (
+            addresses(range, None, 2).0.octets(),
+            addresses(range, Some(net), 2).1.unwrap().octets(),
+        );
+        let kp2 = [link_name(6), is(b"kp2\0")].concat();
+        assert_eq!(pod2_v4, &[kp2.clone(), nfproto(2), at(1, 12, &v4), verdict(1)].concat());
+        assert_eq!(pod2_v6, &[kp2, nfproto(10), at(1, 8, &v6), verdict(1)].concat());
+        let kpx3 = [link_name(6), is(b"kpx3\0")].concat();
+        let v4_3 = addresses(range, None, 3).0.octets();
+        assert_eq!(exit3_v4, &[kpx3, nfproto(2), at(1, 12, &v4_3), verdict(1)].concat());
+        assert_eq!(
+            rest,
+            &[came_by(b"kp"), verdict(0)].concat(),
+            "the rest of kp* is dropped"
+        );
+    }
+
+    /// What answers the node is passed, an exit's pod gets nothing more, and any pod reaches
+    /// its node only for DNS at the gateway (UDP and TCP, port 53) and TCP to a Service (IPv6
+    /// with bytes 6..10 all ff: the services' /80). The rest of a pod's link is dropped.
+    #[test]
+    fn pods_reach_only_dns_and_the_services_of_their_node() {
+        let range = range("198.18.16.0/20").unwrap();
+        let input: Vec<Vec<u8>> = pod_guard_rules(range, &[])
+            .into_iter()
+            .filter(|(chain, _)| *chain == "in")
+            .map(|(_, rule)| rule.concat())
+            .collect();
+        let [answers, exit, dns_udp, dns_tcp, services, rest] = input.as_slice() else {
+            panic!("six rules in in, not {}", input.len())
+        };
+        assert_eq!(answers, &[came_by(b"kp"), state(2 | 4 | 64), verdict(1)].concat());
+        assert_eq!(
+            exit,
+            &[came_by(b"kpx"), verdict(0)].concat(),
+            "an exit's pod: nothing more"
+        );
+        for (dns, protocol) in [(dns_udp, 17u8), (dns_tcp, 6u8)] {
+            assert!(dns.starts_with(&came_by(b"kp")) && dns.ends_with(&verdict(1)));
+            assert!(contains(dns, &is(&range.gateway().octets())), "to the gateway");
+            assert!(contains(dns, &is(&53u16.to_be_bytes())), "port 53");
+            assert!(contains(dns, &is(&[protocol])), "UDP or TCP");
+        }
+        assert!(services.starts_with(&came_by(b"kp")) && services.ends_with(&verdict(1)));
+        assert!(
+            contains(services, &is(&[0xff; 4])),
+            "a Service's address: bytes 6..10 ff"
+        );
+        assert!(
+            contains(services, &is(&[10])) && contains(services, &is(&[6])),
+            "IPv6 and TCP"
+        );
+        assert_eq!(rest, &[came_by(b"kp"), verdict(0)].concat(), "and the rest is dropped");
+    }
+
     /// Two pods of one node, as root of a network namespace (`unshare -Urn cargo test -p
     /// kith-mesh pods`): both listen on port 80, each is reached in its own namespace,
     /// at its own address from the node and from the other pod, and what one sends to the
-    /// other's IPv4 address comes from the node.
+    /// other's IPv4 address comes from the node. A pod sends with its own address only, and
+    /// reaches its node only for DNS and Services.
     #[test]
     fn pods_have_a_network_each() {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
@@ -829,13 +1012,13 @@ mod tests {
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
         // (A kernel whose masquerade is a module nobody loaded has none in a namespace.)
-        let masquerade = match node(range, false, "kith0") {
+        let masquerade = match node(range, false, "kith0", &[]) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             guarded => guarded.unwrap(),
         };
         if !masquerade {
             eprintln!("this kernel has no masquerade here: without");
-            assert!(node_with(range, false, false, "kith0").unwrap());
+            assert!(node_with(range, false, false, "kith0", &[]).unwrap());
         }
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
         let pods: Vec<_> = [2, 3]
@@ -846,6 +1029,15 @@ mod tests {
                 (namespace, listener, v4, v6.unwrap())
             })
             .into();
+        // The pods' own addresses are the node's to pass by their links: made again with them.
+        let served: Vec<Served> = [2, 3]
+            .map(|number| Served {
+                number,
+                exit: false,
+                v6: addresses(range, Some(net), number).1,
+            })
+            .into();
+        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
         // Each says who it is to whoever connects, and who that was.
         let serve = |listener: &TcpListener, says: &str| {
             let (mut stream, from) = listener.accept().unwrap();
@@ -898,8 +1090,46 @@ mod tests {
                 "what leaves a pod by IPv4 leaves as the node"
             );
         });
+        // A root pod sends with another pod's address (pod 1's, added to pod 0's interface):
+        // the node hears nothing of it, and hears what pod 0 sends from its own address after
+        // it (datagrams of one path keep their order, so a spoof that got through came first).
+        let heard = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 53)).unwrap();
+        heard.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        within(&pods[0].0, || -> Result<()> {
+            address(index_of("eth0")?, pods[1].2.into(), 32)?;
+            let spoof = UdpSocket::bind((pods[1].2, 0))?;
+            spoof.send_to(b"spoofed", (range.gateway(), 53))?;
+            let own = UdpSocket::bind((pods[0].2, 0))?;
+            own.send_to(b"own", (range.gateway(), 53))?;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        let mut datagram = [0u8; 16];
+        let (size, from) = heard.recv_from(&mut datagram).unwrap();
+        assert_eq!(
+            (&datagram[..size], from.ip()),
+            (&b"own"[..], IpAddr::from(pods[0].2)),
+            "a source that is not the pod's own is dropped"
+        );
+        // A pod reaches its node only for DNS at the gateway and a Service: another port of the
+        // node's (open here, so it is the rule that refuses) does not connect; those do.
+        let _open = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 8080)).unwrap();
+        let _dns = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 53)).unwrap();
+        let service = crate::service_address(crate::prefix(b"test"), "default", "web");
+        address(1, service.into(), 128).unwrap();
+        let _services = TcpListener::bind((service, 80)).unwrap();
+        let connect = |pod: usize, to: SocketAddr| {
+            within(&pods[pod].0, || TcpStream::connect_timeout(&to, Duration::from_secs(5))).unwrap()
+        };
+        assert!(
+            connect(0, (range.gateway(), 8080).into()).is_err(),
+            "a node's other port: dropped"
+        );
+        assert!(connect(0, (range.gateway(), 53).into()).is_ok(), "DNS at the gateway");
+        assert!(connect(0, (service, 80).into()).is_ok(), "a Service's address");
         // A second time changes nothing (what the first left is taken away and made again).
-        assert!(node_with(range, true, masquerade, "kith0").unwrap());
+        assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());
         assert!(tables().unwrap());
     }
 }
