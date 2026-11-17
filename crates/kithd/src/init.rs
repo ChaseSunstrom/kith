@@ -312,8 +312,10 @@ fn partuuid(bytes: &[u8]) -> Result<String, String> {
         return Err("the firmware's boot partition is not UTF-16".into());
     }
     let units: Vec<u16> = text
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     let text = String::from_utf16(&units).map_err(|_| "the firmware's boot partition is not UTF-16")?;
     let text = text.trim_end_matches('\0').to_ascii_lowercase();
