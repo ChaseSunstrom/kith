@@ -14,4 +14,6 @@ if [ -z "${CC_x86_64_unknown_linux_musl:-}" ] && ! command -v musl-gcc >/dev/nul
 fi
 cd "$root"
 cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
-echo "${CARGO_TARGET_DIR:-$root/target}/$target/release"
+# cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py
+# matches it against /proc's maps).
+echo "$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/$target/release"
