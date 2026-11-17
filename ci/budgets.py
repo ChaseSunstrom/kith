@@ -91,22 +91,26 @@ class Daemon:
 
     def __init__(self, bins, dir, *args):
         os.makedirs(dir, exist_ok=True)
-        self.bins = bins
-        self.socket = os.path.join(dir, "kithd.sock")
+        # kithd runs in dir with its socket named relative to it: a Unix socket's path holds 107
+        # bytes, and the folder a check runs in (TMPDIR) may hold more.
+        dir = os.path.abspath(dir)
+        self.bins = os.path.abspath(bins)
+        self.dir = dir
+        self.socket = "kithd.sock"
         self.log = open(os.path.join(dir, "kithd.log"), "w")
-        argv = [os.path.join(bins, "kithd"), "--state", os.path.join(dir, "state"), "--socket", self.socket, *args]
-        self.proc = subprocess.Popen(argv, stdout=self.log, stderr=subprocess.STDOUT)
-        wait_until(lambda: os.path.exists(self.socket) or self.proc.poll() is not None, "kithd to serve")
+        argv = [os.path.join(self.bins, "kithd"), "--state", os.path.join(dir, "state"), "--socket", self.socket, *args]
+        self.proc = subprocess.Popen(argv, cwd=dir, stdout=self.log, stderr=subprocess.STDOUT)
+        wait_until(lambda: os.path.exists(os.path.join(dir, self.socket)) or self.proc.poll() is not None, "kithd to serve")
         if self.proc.poll() is not None:
             sys.exit(f"kithd did not start: see {self.log.name}")
 
     def kith(self, *args):
         argv = [os.path.join(self.bins, "kith"), "--socket", self.socket, *args]
-        return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(argv, check=True, capture_output=True, text=True, cwd=self.dir).stdout
 
     def apply(self, name, doc):
         """`kith apply` of doc, written to a file beside the node's state."""
-        path = os.path.join(os.path.dirname(self.socket), name + ".json")
+        path = os.path.join(self.dir, name + ".json")
         with open(path, "w") as f:
             json.dump(doc, f)
         return self.kith("apply", "-f", path)
@@ -289,8 +293,11 @@ def idle_rss(kithd, tmp):
         os.posix_fadvise(binary.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
         while binary.read(1 << 20):
             pass
+    # Run in tmp with a relative socket name: a Unix socket path holds 107 bytes (see Daemon).
+    tmp = os.path.abspath(tmp)
     socket = os.path.join(tmp, "kithd.sock")
-    daemon = subprocess.Popen([kithd, "--state", os.path.join(tmp, "state"), "--socket", socket], stderr=subprocess.DEVNULL)
+    daemon = subprocess.Popen([os.path.abspath(kithd), "--state", os.path.join(tmp, "state"), "--socket", "kithd.sock"],
+                              cwd=tmp, stderr=subprocess.DEVNULL)
     try:
         deadline = time.time() + 10
         while not os.path.exists(socket):
@@ -310,19 +317,21 @@ def relro_sealed(bin_dir, tmp, limit):
     """Per shipped binary, whether the bytes of its PT_GNU_RELRO that the running process can
     still write are at most `limit` (0: musl's static-pie start code leaves the part rw-p and
     the program must shut it itself; -1 for the self-test). Fails with the count."""
+    tmp = os.path.abspath(tmp)
+    # kithd's socket is named relative to tmp, which is the process's cwd (a Unix socket path holds 107 bytes).
     runs = {
-        "kithd": [os.path.join(tmp, "relro-state"), os.path.join(tmp, "relro.sock")],
+        "kithd": [os.path.join(tmp, "relro-state"), "relro.sock"],
         "kith": ["--store", os.path.join(tmp, "relro-store.json")],
     }
     results = []
     for name, rest in runs.items():
-        binary = os.path.join(bin_dir, name)
+        binary = os.path.abspath(os.path.join(bin_dir, name))
         # kithd serves its socket; kith waits for a document on a pipe that stays open.
         argv = [binary, "--state", rest[0], "--socket", rest[1]] if name == "kithd" else [binary, "apply", "-f", "-", *rest]
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(argv, cwd=tmp, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.time() + 10
-            while not (name == "kith" or os.path.exists(rest[1])) or os.path.realpath(f"/proc/{proc.pid}/exe") != os.path.realpath(binary):
+            while not (name == "kith" or os.path.exists(os.path.join(tmp, rest[1]))) or os.path.realpath(f"/proc/{proc.pid}/exe") != os.path.realpath(binary):
                 if proc.poll() is not None or time.time() > deadline:
                     sys.exit(f"{name} did not start for the RELRO check")
                 time.sleep(0.05)
