@@ -183,6 +183,8 @@ struct Controller {
     owners: Option<BTreeSet<String>>,
     /// The status report on its way to the store, if one is.
     report: Option<tokio::task::JoinHandle<()>>,
+    /// The removal of the data of made Volumes whose claim is gone, and then their deletion.
+    wiping: Option<tokio::task::JoinHandle<()>>,
     /// Bytes the state disk keeps free: under them the pod that wrote the most is replaced.
     /// `None` for the default (`storage::default_reserve`); 0 for none.
     reserve: Option<u64>,
@@ -316,6 +318,7 @@ pub async fn run(
         jobs: BTreeMap::new(),
         owners: None,
         report: None,
+        wiping: None,
         reserve,
         count: None,
         counted: None,
@@ -1247,6 +1250,8 @@ impl Controller {
         self.tend_storage(shared, &state);
         // Images no unit uses, once each unit there is has its slot and before any starts.
         self.tend_images(shared, &state);
+        // The data of a Volume made for a claim that is gone, where no unit mounts it.
+        self.tend_wipes(shared, &state, &mounted);
 
         // 3. Notice exits, then start whatever is due.
         // A Job's unit that ended is accounted for in step 1, and a unit that started may be
@@ -1829,6 +1834,48 @@ impl Controller {
         // Done, it wakes the loop to act on it; no thread for it, the next pass tries again.
     }
 
+    /// A Volume made for a claim that is gone has its data on this node removed, off the async
+    /// threads, and only then is the Volume deleted: a removal that fails (it says why) leaves
+    /// the Volume, and is tried again at the next pass. What a unit here mounts, or a workload
+    /// that is placed here would, waits for it to stop.
+    ///
+    /// ponytail: a unit that starts on the Volume while its data goes (a workload that names it
+    /// by name, after its claim went) finds its directory made anew, and loses what it wrote
+    /// before the Volume is deleted. Hold the Volume with a mark the scheduler reads if that shows.
+    fn tend_wipes(
+        &mut self,
+        shared: &std::sync::Arc<Shared>,
+        state: &Path,
+        mounted: &BTreeMap<String, BTreeMap<String, crate::volumes::Dir>>,
+    ) {
+        let Some(me) = shared.cluster.as_ref().map(|cluster| cluster.me.name.clone()) else {
+            return;
+        };
+        if self.wiping.as_ref().is_some_and(|task| !task.is_finished()) {
+            return;
+        }
+        let mut held = mounting(mounted);
+        for slot in self.slots.values() {
+            held.extend(slot.volumes.iter().map(|(dir, _, _)| volume_key(dir)));
+        }
+        let dirs = {
+            let file_store = shared.store.lock().expect("a handler panicked holding the store");
+            due(&file_store.store, &me, &held)
+        };
+        if dirs.is_empty() {
+            return;
+        }
+        let (shared, state) = (shared.clone(), state.to_path_buf());
+        self.wiping = Some(tokio::spawn(async move {
+            let removed = tokio::task::spawn_blocking(move || wipe_all(&state, dirs)).await;
+            for key in removed.unwrap_or_default() {
+                if let Err(e) = shared.submit(kith_store::Command::Delete { key: key.clone() }).await {
+                    eprintln!("kithd: deleting {key} after its data was removed: {e}");
+                }
+            }
+        }));
+    }
+
     /// Removes the images no unit here uses (`prune`), at most every `prune::EVERY` after the
     /// last removal ended, one at a time and off the async threads. In use is the image of
     /// every unit with a slot, whatever it is doing, and every image a container is made from.
@@ -1980,6 +2027,39 @@ impl<T> Job<T> {
             done => Some(done.ok()),
         }
     }
+}
+
+fn volume_key(dir: &crate::volumes::Dir) -> String {
+    format!("Volume/{}/{}", dir.namespace, dir.name)
+}
+
+/// The Volumes (their keys) the workloads placed on a node mount.
+fn mounting(mounted: &BTreeMap<String, BTreeMap<String, crate::volumes::Dir>>) -> BTreeSet<String> {
+    mounted
+        .values()
+        .flat_map(|dirs| dirs.values().map(volume_key))
+        .collect()
+}
+
+/// The Volumes made for a claim that is gone, with their data on `me`, that nothing mounts
+/// (`held`: their keys): the ones to remove now.
+fn due(store: &kith_api::store::Store, me: &str, held: &BTreeSet<String>) -> Vec<crate::volumes::Dir> {
+    let mut dirs = crate::volumes::wipes(store, me);
+    dirs.retain(|dir| !held.contains(&volume_key(dir)));
+    dirs
+}
+
+/// Remove each Volume's data under `state`; the keys of those that are gone now, to be deleted.
+/// One that is refused or cannot be removed is said and kept, with its Volume.
+fn wipe_all(state: &Path, dirs: Vec<crate::volumes::Dir>) -> Vec<String> {
+    let mut removed = Vec::new();
+    for dir in dirs {
+        match crate::volumes::wipe(state, &dir) {
+            Ok(()) => removed.push(volume_key(&dir)),
+            Err(e) => eprintln!("kithd: the data of {}: {e}", volume_key(&dir)),
+        }
+    }
+    removed
 }
 
 /// The images of the units with a slot here: kept, whatever their units are doing.
@@ -2910,5 +2990,58 @@ mod tests {
         let left = wait_for_storage(jobs, Duration::from_millis(50)).await;
         assert_eq!(left, ["the removal of pod b"]);
         assert!(wait_for_storage(Vec::new(), Duration::from_millis(50)).await.is_empty());
+    }
+
+    /// A Volume made for a claim that is gone has its directory removed by its own node once no
+    /// unit mounts it, and only then is the Volume deleted; one a unit mounts waits.
+    #[test]
+    fn a_made_volume_is_wiped_then_deleted_by_its_node() {
+        let source = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: db, annotations: { kith.dev/made-for-claim: \"true\" } }
+spec: { node: a, path: data, size: 1Gi }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: app }
+spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volume: db, path: /mnt }] }] } }
+";
+        let mut store = kith_api::store::Store::default();
+        for resource in Resource::from_source(source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let state = std::env::temp_dir().join(format!("kith-controller-wipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&state);
+        std::fs::create_dir_all(&state).unwrap();
+        let state = state.canonicalize().unwrap();
+        let dir = crate::volumes::dir(&store, "default", "db").unwrap();
+        let root = crate::volumes::host_dir(&state, &dir).unwrap();
+        std::fs::write(root.join("file"), "x").unwrap();
+        let data = state.join("volumes/default/db");
+        // Not on another node, and not while a unit mounts it.
+        let held = |store: &kith_api::store::Store| mounting(&crate::volumes::mounts(store, "a"));
+        assert!(due(&store, "b", &held(&store)).is_empty());
+        assert_eq!(held(&store), BTreeSet::from(["Volume/default/db".to_string()]));
+        assert!(due(&store, "a", &held(&store)).is_empty());
+        assert!(data.join("data/file").exists());
+        // The unit is gone: the data goes, then the Volume.
+        store.delete("Workload/default/app").unwrap();
+        let dirs = due(&store, "a", &held(&store));
+        assert_eq!(dirs.len(), 1);
+        let keys = wipe_all(&state, dirs);
+        assert!(!data.exists(), "the data is removed");
+        assert_eq!(keys, ["Volume/default/db"]);
+        assert!(state.join("volumes/default").exists());
+        for key in keys {
+            kith_store::run(&mut store, kith_store::Command::Delete { key }).unwrap();
+        }
+        assert!(store.get("Volume/default/db").is_none());
+        let _ = std::fs::remove_dir_all(&state);
     }
 }

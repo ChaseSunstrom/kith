@@ -452,7 +452,9 @@ pub async fn run(shared: Arc<Shared>, grace: Duration, mut stopping: watch::Rece
         let (fields, left, claimed, (made, gone)) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let (fields, left) = plan(&state.store, &seen, grace);
-            // The Volumes to make for claims that ask for one made, and those to remove.
+            // The Volumes to make for claims that ask for one made, and those to remove at once
+            // (data that stays, or a node that cannot remove it); the others' nodes remove the
+            // data and then the Volume (`controller::tend_wipes`).
             let volumes = crate::volumes::provision(&state.store, &|node| seen(node).1.is_none());
             let mut claimed = crate::claims::writes(&state.store);
             claimed.extend(crate::volumes::writes(&state.store));
