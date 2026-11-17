@@ -21,7 +21,7 @@ const DISCOVERED: &str = "kith.dev/discovered";
 
 /// Every label discovery writes. A worker's Device may carry these and no other
 /// (`crate::worker`): one added here is one a control node takes from a worker.
-pub(crate) const LABELS: [&str; 9] = [
+pub(crate) const LABELS: [&str; 10] = [
     DISCOVERED,
     "kith.dev/node",
     "class",
@@ -31,8 +31,19 @@ pub(crate) const LABELS: [&str; 9] = [
     "driver",
     "vram",
     "function",
+    "identity",
 ];
 const EVERY: Duration = Duration::from_secs(30);
+
+/// Who an input device is, behind the event index the kernel gives the next one at once: 16 hex
+/// of a hash of its name, where it is plugged (phys), its serial (uniq) and its ids.
+fn identity(device: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let parts =
+        ["name", "phys", "uniq", "id/vendor", "id/product"].map(|part| read(&device.join(part)).unwrap_or_default());
+    let hash = Sha256::digest(parts.join("\0"));
+    hash[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 /// The names in `dir`, sorted; none if it is not there.
 fn names(dir: &Path) -> Vec<String> {
@@ -148,8 +159,10 @@ fn scan_in(sys: &Path, proc: &Path, dev: &Path, node: &str) -> Vec<Resource> {
     }
     for name in names(&sys.join("class/input")) {
         if number(&name, "event").is_some() {
-            let model = read(&sys.join("class/input").join(&name).join("device/name"));
-            let labels = model.map(|model| ("model", label(&model))).into_iter().collect();
+            let device = sys.join("class/input").join(&name).join("device");
+            let model = read(&device.join("name"));
+            let mut labels: Vec<_> = model.map(|model| ("model", label(&model))).into_iter().collect();
+            labels.push(("identity", identity(&device)));
             found.push(("input", name.clone(), Some(format!("/dev/input/{name}")), labels));
         }
     }
@@ -373,7 +386,7 @@ type Held = (String, String);
 /// list because another node has the name: the name is that node's ([`whose`]), or that node's
 /// discovery made one under it.
 fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec<String>, Vec<Held>) {
-    let (mut apply, mut held) = (Vec::new(), Vec::new());
+    let (mut apply, mut held, mut changed) = (Vec::new(), Vec::new(), Vec::new());
     let nodes = nodes(store);
     for new in found {
         let theirs = whose_of(&nodes, &new.metadata.name);
@@ -383,6 +396,15 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
         }
         match store.get(&new.key()) {
             None => apply.push(new.clone()),
+            // Another device behind the same name (an input's event index, given to the next one
+            // at once): deleted this pass, its grant and holder with it, and listed as new at the next.
+            Some(live) if ours(live, node) && identity_changed(live, new) => {
+                eprintln!(
+                    "kithd: devices: {}: another device is behind this name now: it is taken from its holder and listed again at the next pass",
+                    new.key()
+                );
+                changed.push(new.key());
+            }
             Some(live) if ours(live, node) => {
                 // (The namespaces an admin gave it are theirs to set: a pass keeps the label there is.)
                 let mut wanted = new.clone();
@@ -423,10 +445,16 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
     let gone = live.filter(|live| {
         ours(live, node) && !labelled(live) && !found.iter().any(|new| new.key() == live.key()) || left(live)
     });
-    let gone: Vec<String> = gone.map(Resource::key).collect();
+    let gone: Vec<String> = gone.map(Resource::key).chain(changed).collect();
     // (What this pass takes away holds nothing: the name is listed at the next.)
     held.retain(|(key, _)| !gone.contains(key));
     (apply, gone, held)
+}
+
+/// Whether `live` and `new` both say who they are, and say someone else.
+fn identity_changed(live: &Resource, new: &Resource) -> bool {
+    let of = |device: &Resource| device.metadata.labels.get("identity").cloned();
+    matches!((of(live), of(new)), (Some(was), Some(now)) if was != now)
 }
 
 /// What to say of the names held: each once, and again only when what is held changes.
@@ -1077,6 +1105,63 @@ mod tests {
             written.metadata.labels.get("kith.dev/namespaces").map(String::as_str),
             Some("ops")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_input_device_carries_an_identity_label() {
+        let root = tree("identity");
+        laptop(&root);
+        put(&root, "class/input/event3/device/phys", "isa0060/serio0/input0\n");
+        put(&root, "class/input/event3/device/id/vendor", "0001\n");
+        put(&root, "class/input/event3/device/id/product", "0001\n");
+        let identity = |root: &Path| {
+            let found = scan(root, "n1");
+            get(&found, "n1-input-event3").metadata.labels.get("identity").cloned()
+        };
+        let first = identity(&root).expect("an identity label");
+        assert!(
+            first.len() == 16 && first.chars().all(|c| c.is_ascii_hexdigit()),
+            "{first}"
+        );
+        // Another device at the same index: another identity, by its phys, or by its uniq alone.
+        put(&root, "class/input/event3/device/phys", "usb-0000:00:14.0-2/input0\n");
+        let other = identity(&root).unwrap();
+        assert_ne!(first, other);
+        put(&root, "class/input/event3/device/uniq", "a4:5e:60:00:00:01\n");
+        assert_ne!(other, identity(&root).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The kernel gives an event index to the next device plugged in at once: a Device whose
+    /// identity changed behind its name is deleted, grant and holder with it, and listed again
+    /// at the next pass as new; one whose identity is the same keeps its namespaces.
+    #[test]
+    fn a_device_taken_by_another_behind_the_same_index_is_deleted_not_kept() {
+        let root = tree("taken");
+        laptop(&root);
+        put(&root, "class/input/event3/device/phys", "usb-0000:00:14.0-2/input0\n");
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        store.apply(node("n1", "worker")).unwrap();
+        for resource in &found {
+            store.apply(resource.clone()).unwrap();
+        }
+        let mut granted = get(&found, "n1-input-event3").clone();
+        granted
+            .metadata
+            .labels
+            .insert("kith.dev/namespaces".into(), "ops".into());
+        store.apply(granted.clone()).unwrap();
+        // The same device: nothing to do, and its grant stays.
+        let (apply, gone, _) = changes(&store, "n1", &scan(&root, "n1"));
+        assert!(gone.is_empty() && apply.is_empty(), "{gone:?} {apply:?}");
+        // A keyboard in the gamepad's place: deleted this pass, not written back with the grant.
+        put(&root, "class/input/event3/device/name", "Some Keyboard\n");
+        put(&root, "class/input/event3/device/phys", "usb-0000:00:14.0-3/input0\n");
+        let (apply, gone, _) = changes(&store, "n1", &scan(&root, "n1"));
+        assert_eq!(gone, [granted.key()]);
+        assert!(!apply.iter().any(|r| r.key() == granted.key()), "{apply:?}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

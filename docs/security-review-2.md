@@ -171,14 +171,14 @@ In detail:
 
 - M1 An input Device is named by its event index, which the kernel hands to the next
   device straight away. A claim on a gamepad gets a keyboard plugged in its place
-  (`kithd/src/devices.rs:149`, `controller.rs:509`). (Read.) task: T-0652
+  (`kithd/src/devices.rs:149`, `controller.rs:509`). (Read.) fixed: a_device_taken_by_another_behind_the_same_index_is_deleted_not_kept (T-0652)
 - M2 A USB Device is known only by its vendor and product, both of which the stick
   reports itself (`devices.rs:168`). (Read.) task: T-0653
 - L1 A selector with no node fails when a matching stick is plugged into another node
-  (`claims.rs:116`). (Read; queued.)
+  (`claims.rs:116`). (Read.) fixed: a_selector_with_no_node_claims_on_the_lowest_node_that_matches (T-0667)
 - L2 A Device's `path` is checked only for being a character device under `/dev`, so
   `/dev/mem` and `/dev/tpm*` pass. Who may write Devices bounds this (`kith-runtime`
-  `container.rs:1660`). (Read; queued.)
+  `container.rs:1660`). (Read.) fixed: device_nodes_refuse_mem_kmem_port_and_tpm (T-0667)
 - Examined and sound:
   - device cgroup rules give one device each, `rw` without `m`;
   - plug and unplug do not follow links;
