@@ -2172,10 +2172,103 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    thread_local! {
+        /// The index, and the files that check the cut entry before the repair that is
+        /// running now (see `meet`), in order.
+        static MEETING: std::cell::RefCell<(PathBuf, std::collections::VecDeque<PathBuf>)> =
+            const { std::cell::RefCell::new((PathBuf::new(), std::collections::VecDeque::new())) };
+    }
+
+    /// The `Link` of the tests that meet a cut entry at once. A repair's scratch link is the
+    /// point after its check of the entry and before its rename: there the next file of
+    /// MEETING shares first, nested, as another thread would at that point. So every file
+    /// checks the cut entry before any repair lands; the outermost repair lands last.
+    fn meet(from: &Path, to: &Path) -> std::io::Result<()> {
+        if to
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+        {
+            let next = MEETING.with(|m| {
+                let mut m = m.borrow_mut();
+                let index = m.0.clone();
+                m.1.pop_front().map(|other| (other, index))
+            });
+            if let Some((other, index)) = next {
+                share_one(&other, &index, meet, &mut vec![0; 64 << 10]);
+            }
+        }
+        fs::hard_link(from, to)
+    }
+
+    /// `count` files of one body, alike in all of `Same`, and the index entry they share cut
+    /// short to three bytes: what a stopped unpack leaves.
+    fn cut_entry_for(dir: &Path, count: usize) -> (PathBuf, PathBuf, Vec<PathBuf>) {
+        let index = dir.join("shared");
+        fs::create_dir_all(&index).unwrap();
+        let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let files: Vec<PathBuf> = (0..count)
+            .map(|n| {
+                let file = dir.join(format!("file-{n}"));
+                fs::write(&file, "file 1").unwrap();
+                File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+                file
+            })
+            .collect();
+        let (ours, hex) = fingerprint(&files[0], &mut vec![0; 64 << 10]).unwrap();
+        let cut = index.join(shared_name(&hex, same(&ours)));
+        fs::write(&cut, "fil").unwrap();
+        (index, cut, files)
+    }
+
+    /// Two files of one body meet their cut entry at once: each checks it before either
+    /// repairs it. Both repair it in turn, so the two stay two files, each whole, and the
+    /// entry is the first one's (it repaired last).
+    #[test]
+    fn a_cut_short_entry_met_by_two_files_before_either_repairs_it_leaves_two_files_each_whole() {
+        let (dir, _) = sandbox("cut-met-two");
+        let (index, cut, files) = cut_entry_for(&dir, 2);
+        let (p, q) = (&files[0], &files[1]);
+        MEETING.with(|m| *m.borrow_mut() = (index.clone(), [q.clone()].into()));
+        share_one(p, &index, meet, &mut vec![0; 64 << 10]);
+        for file in [p, q] {
+            assert_eq!(fs::read_to_string(file).unwrap(), "file 1");
+        }
+        assert_ne!(ino(p), ino(q), "two files that met the cut entry are one inode");
+        assert_eq!(ino(&cut), ino(p), "the entry is not the file that repaired it last");
+        assert_eq!(entries(&index).len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Four files meet their cut entry at once, as f1 and f151 of two unpacks may: each
+    /// checks it before any repairs it, so four inodes, each whole, the entry one of them.
+    #[test]
+    fn a_cut_short_entry_met_by_four_files_before_any_repairs_it_leaves_four_inodes_each_whole() {
+        let (dir, _) = sandbox("cut-met-four");
+        let (index, cut, files) = cut_entry_for(&dir, 4);
+        MEETING.with(|m| *m.borrow_mut() = (index.clone(), files[1..].iter().cloned().collect()));
+        share_one(&files[0], &index, meet, &mut vec![0; 64 << 10]);
+        for file in &files {
+            assert_eq!(fs::read_to_string(file).unwrap(), "file 1");
+        }
+        let mut inodes: Vec<u64> = files.iter().map(|file| ino(file)).collect();
+        inodes.sort_unstable();
+        inodes.dedup();
+        assert_eq!(inodes.len(), 4, "four files that met the cut entry");
+        assert_eq!(ino(&cut), ino(&files[0]));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Two unpacks at once into one index, which an earlier stop left an entry in that nothing
     /// links and one that is not whole: every file is whole, and equal files are one. (Except
-    /// the body of the entry cut short: two files of the first unpack may both find it unusable
-    /// at once and each replace it, as `share_all` says, so those four are one inode or two.)
+    /// the cut-short entry: f1 and f151 of both unpacks may each find it unusable before any
+    /// of them repairs it, and each replace it, as `share_all` says. Those four are up to four
+    /// inodes, the entry one of them, each whole; see the two tests above that meet it so.)
     #[test]
     fn shared_files_two_unpacks_at_once_and_stray_entries() {
         let (dir, _) = sandbox("shared-at-once");
@@ -2203,6 +2296,9 @@ mod tests {
         fs::remove_dir_all(&seed).unwrap();
         File::options().write(true).open(&cut).unwrap().set_len(3).unwrap();
         let short = ino(&cut);
+        // Kept, so the cut entry's inode is not freed, and its number reused by a file of the
+        // other unpack, once a repair has replaced it.
+        fs::hard_link(&cut, dir.join("cut")).unwrap();
 
         let bodies: Vec<String> = (0..300).map(|n| format!("file {}", n % 150)).collect();
         let files: Vec<(String, &str)> = bodies
@@ -2236,7 +2332,7 @@ mod tests {
         for root in [&x, &y] {
             assert_ne!(ino(&root.join("f1")), short, "linked to an entry cut short");
         }
-        // The first unpack's whole file took its place, and the rest share it.
+        // Whichever of the four repaired the entry last, it is whole.
         assert_eq!(fs::read_to_string(&cut).unwrap(), "file 1");
         for n in 1..150 {
             let four = [
@@ -2250,7 +2346,7 @@ mod tests {
                 let mut distinct = four.to_vec();
                 distinct.sort_unstable();
                 distinct.dedup();
-                assert!(distinct.len() <= 2, "f1: {four:?}");
+                assert!(distinct.len() <= 4, "f1: {four:?}");
                 assert!(distinct.contains(&ino(&cut)), "f1: the entry is none of the four");
             } else {
                 assert!(four.iter().all(|&i| i == four[0]), "f{n}");
