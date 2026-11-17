@@ -2271,7 +2271,10 @@ spec:
   N reaches it only if the label lists N, or N is `kith-system`, the cluster's own. With no
   label, a `gpu` is open to every namespace, and every other `Device` (`input`, `audio`,
   `camera`, `display`, `usb`, `other`) and every `Seat` is `kith-system`'s alone. A seat
-  claim, `access: client` included, is checked against the Seat's label, not its devices'.
+  claim, `access: client` included, is checked against the Seat's label, and against the
+  label of each of its Devices that has one of its own: a labelled Device not given to N
+  refuses it, and an unlabelled one follows the Seat's. A labelled `Device` or `Seat` whose
+  hardware is gone is kept with its label, so it is given the same way when found again.
   The label is an admin's: `kith get seat NAME -o yaml`, add it under `metadata.labels`,
   `kith apply -f`. Discovery keeps it, and a worker cannot add, change or drop it. Taking
   it away refuses a claim at the next pass, and its `status.message` says why (`Seat X is

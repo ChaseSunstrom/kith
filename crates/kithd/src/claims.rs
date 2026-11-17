@@ -116,8 +116,17 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
                 let have = &device.metadata.labels;
                 claim.selector.iter().all(|(k, v)| have.get(k) == Some(v))
             };
-            let all = store.list(Some("Device")).filter(fits);
-            ("the selector", all.map(|device| device.metadata.name.clone()).collect())
+            let matched: Vec<&Resource> = store.list(Some("Device")).filter(fits).collect();
+            // (Only the matches given to the namespace are its; the others are not named back.)
+            let names: Vec<String> = matched
+                .iter()
+                .filter(|device| given(device, namespace))
+                .map(|device| device.metadata.name.clone())
+                .collect();
+            if !matched.is_empty() && names.is_empty() {
+                return Err(format!("the selector gives no Device given to namespace {namespace}"));
+            }
+            ("the selector", names)
         }
         _ => return Err("name exactly one of seat, device or selector".into()),
     };
@@ -128,8 +137,9 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
     for name in &names {
         let device = store.get(&format!("Device/{name}"));
         let device = device.ok_or(format!("there is no Device {name}"))?;
-        // (A seat's claim is checked against the Seat's label alone, not its Devices'.)
-        if claim.seat.is_none() && !given(device, namespace) {
+        // (A seat's claim is checked against the Seat's label; a Device of it that has its own label
+        // must be given too, and one without follows the Seat's.)
+        if (claim.seat.is_none() || device.metadata.labels.contains_key(NAMESPACES)) && !given(device, namespace) {
             return Err(format!(
                 "Device {name} is not given to namespace {namespace} (its {NAMESPACES} label)"
             ));
@@ -724,15 +734,81 @@ spec: { node: b, devices: [b-keyboard] }
     }
 
     #[test]
-    fn a_selector_is_refused_if_any_device_it_matches_is_not_given() {
+    fn a_selector_keeps_the_devices_given_to_its_namespace_and_names_no_other() {
         assert!(claimed(OPEN, "default", "{ selector: { kith.dev/node: a, class: camera } }").is_ok());
+        // a-camera-video0 is given to default alone, and b-camera0 to nobody: neither is named for ops.
         let err = claimed(OPEN, "ops", "{ selector: { kith.dev/node: a, class: camera } }").unwrap_err();
         assert!(
-            err.contains("Device a-camera-video0 is not given to namespace ops"),
+            err.contains("the selector gives no Device given to namespace ops"),
             "{err}"
         );
-        let err = claimed(OPEN, "ops", "{ selector: { kith.dev/node: b } }").unwrap_err();
-        assert!(err.contains("is not given to namespace ops"), "{err}");
+        let err = claimed(OPEN, "ops", "{ selector: { class: camera } }").unwrap_err();
+        assert!(
+            err.contains("the selector gives no Device given to namespace ops"),
+            "{err}"
+        );
+        assert!(!err.contains("camera"), "{err}");
+        // Of a node's Devices, the one open GPU is kept; the keyboard, speaker and the rest are skipped.
+        assert_eq!(
+            claimed(OPEN, "ops", "{ selector: { kith.dev/node: b } }"),
+            Ok(("b".into(), vec!["b-gpu-card0".into()]))
+        );
+        assert_eq!(
+            claimed(OPEN, "ops", "{ selector: { kith.dev/node: a } }"),
+            Ok(("a".into(), vec!["a-gpu-card0".into()]))
+        );
+    }
+
+    /// A GPU labelled for `dev`, and an unlabelled USB port, on `b`. Seat `b-seat1` (for `ops` and
+    /// `dev`) lists both; seat `b-seat2` (for `ops`) lists the unlabelled one.
+    const LABELLED_SEATS: &str = "
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: b-gpu-card1, labels: { class: gpu, kith.dev/node: b, kith.dev/namespaces: dev } }
+spec: { node: b, class: gpu, path: /dev/dri/card1 }
+---
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: b-usb0, labels: { class: usb, kith.dev/node: b } }
+spec: { node: b, class: usb }
+---
+apiVersion: kith.dev/v1
+kind: Seat
+metadata: { name: b-seat1, labels: { kith.dev/namespaces: 'ops, dev' } }
+spec: { node: b, devices: [b-gpu-card1, b-usb0] }
+---
+apiVersion: kith.dev/v1
+kind: Seat
+metadata: { name: b-seat2, labels: { kith.dev/namespaces: ops } }
+spec: { node: b, devices: [b-usb0] }
+";
+
+    #[test]
+    fn a_seat_claim_is_refused_for_a_device_of_it_labelled_for_others() {
+        let err = claimed(LABELLED_SEATS, "ops", "{ seat: b-seat1 }").unwrap_err();
+        assert!(
+            err.contains("Device b-gpu-card1 is not given to namespace ops"),
+            "{err}"
+        );
+        let err = claimed(LABELLED_SEATS, "ops", "{ seat: b-seat1, access: client }").unwrap_err();
+        assert!(
+            err.contains("Device b-gpu-card1 is not given to namespace ops"),
+            "{err}"
+        );
+        assert!(
+            claimed(LABELLED_SEATS, "dev", "{ seat: b-seat1 }").is_ok(),
+            "the Device lists dev"
+        );
+    }
+
+    #[test]
+    fn an_unlabelled_device_of_a_seat_follows_the_seats_label() {
+        assert!(
+            claimed(LABELLED_SEATS, "ops", "{ seat: b-seat2 }").is_ok(),
+            "b-usb0 has no label of its own"
+        );
+        let err = claimed(LABELLED_SEATS, "dev", "{ seat: b-seat2 }").unwrap_err();
+        assert!(err.contains("Seat b-seat2 is not given to namespace dev"), "{err}");
     }
 
     #[test]
