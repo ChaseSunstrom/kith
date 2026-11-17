@@ -1215,6 +1215,12 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   handed its disk's key. Lock it when it goes missing. The config partition and the
   system itself are not encrypted, and an update stick (`kith.update=`) is not signed:
   whoever is at the machine with a stick is its admin.
+- **The config partition is measured by no firmware** unless the state is sealed to the
+  TPM, so whoever can write the disk can write kithd's words there. A `--release-key` it
+  names is taken only if the signed system holds it (`/etc/kith/release-keys`) or holds
+  none; another is dropped and said at boot, so the partition cannot hand the node's
+  updates, and root, to another key. `--claim` there is taken: it names the first admin
+  only while the cluster has no Identity, which anyone who reaches the node can also do.
 - **A node whose key is sealed to its TPM** (`kith node seal`, off unless asked for)
   opens its state with no node asked while PCRs 0, 4, 7, 9, 12 and 15 stand as they
   were sealed: other firmware, another boot file or command line, another Secure Boot

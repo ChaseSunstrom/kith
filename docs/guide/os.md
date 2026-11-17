@@ -159,6 +159,10 @@ first release:
 | at install | `releaseKey: KEY` in the installer's answers; it goes on kithd's line as `--release-key` |
 | to kithd | `--release-key KEY` (or `KITH_RELEASE_KEY`); on kith OS, ` -- --release-key KEY` at the end of the config partition's line |
 
+A key on the config partition (the installer's `releaseKey` too) is taken only if the image holds
+none or holds it: the partition is not signed, so it cannot name keys the image does not. Another
+key comes by a release's handover (below) or a new image.
+
 A key given to kithd counts first, then the keys a node keeps in its state (`os-release-keys`,
 written when it first updates, and by a handover), then the image's. A node with none takes the
 key of the first release it updates to and keeps it, and its Node's `status.os.releaseKeys` is

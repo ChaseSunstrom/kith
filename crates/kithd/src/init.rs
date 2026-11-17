@@ -140,6 +140,53 @@ pub fn configured(text: &str) -> (String, Vec<String>) {
     )
 }
 
+/// The config partition's words for kithd, with each `--release-key` that the signed system
+/// does not hold taken out, and what to say of each. `image`: the keys in
+/// /etc/kith/release-keys (none: the config may name any), or `None` when that file could
+/// not be read (then no config key is taken). The partition is measured by no firmware
+/// unless the state is sealed: anyone with the disk can write it, and a key it names would
+/// be whose releases, root and all, the node takes.
+fn vetted(args: Vec<String>, image: Option<&[String]>) -> (Vec<String>, Vec<String>) {
+    let (mut kept, mut said) = (Vec::new(), Vec::new());
+    let mut words = args.into_iter();
+    while let Some(word) = words.next() {
+        let keys = match word.strip_prefix("--release-key") {
+            Some("") => words.next().unwrap_or_default(),
+            Some(given) if given.starts_with('=') => given[1..].to_string(),
+            _ => {
+                kept.push(word);
+                continue;
+            }
+        };
+        let held: Vec<&str> = keys.split(',').map(str::trim).filter(|key| !key.is_empty()).collect();
+        let held: Vec<&str> = match image {
+            Some([]) => held,
+            Some(image) => held
+                .into_iter()
+                .filter(|key| {
+                    let ours = image.iter().any(|mine| mine == key);
+                    if !ours {
+                        said.push(format!(
+                            "kithd: init: the config partition's --release-key {key} is not one of this system's (/etc/kith/release-keys): it is not taken; a new key comes by a release's handover or a new image"
+                        ));
+                    }
+                    ours
+                })
+                .collect(),
+            None => {
+                said.push(
+                    "kithd: init: this system's release keys (/etc/kith/release-keys) could not be read: the config partition's --release-key is not taken".to_string(),
+                );
+                Vec::new()
+            }
+        };
+        if !held.is_empty() {
+            kept.extend(["--release-key".to_string(), held.join(",")]);
+        }
+    }
+    (kept, said)
+}
+
 /// The slaves of dm-0, the verity device the root is: the one this system runs from.
 const ROOT_SLAVES: &str = "/sys/block/dm-0/slaves";
 
@@ -725,6 +772,11 @@ pub fn early() -> Boot {
     });
     let config = told.as_ref().map(|text| configured(&String::from_utf8_lossy(text)));
     let (config, args) = config.unwrap_or_default();
+    let image = crate::update::keys_in(std::path::Path::new("/etc/kith/release-keys"));
+    let (args, said) = vetted(args, image.as_deref().ok());
+    for line in said {
+        eprintln!("{line}");
+    }
     // (An encrypted state waits for its key, and that for the network: see `main`.)
     let sealed = labelled("config").filter(|_| !installing);
     let sealed = sealed.and_then(|device| match crate::crypt::Record::read(&device) {
@@ -868,6 +920,46 @@ pub fn end(failed: bool) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn a_config_release_key_that_the_system_does_not_hold_is_dropped() {
+        let image = ["A".to_string()];
+        for (config, kept) in [
+            (
+                "--listen 0.0.0.0:7443 --release-key B --claim t",
+                "--listen 0.0.0.0:7443 --claim t",
+            ),
+            ("--release-key=B --claim t", "--claim t"),
+            ("--release-key A,B", "--release-key A"),
+            ("--release-key=B,A --listen x", "--release-key A --listen x"),
+        ] {
+            let (args, said) = vetted(words(config), Some(&image));
+            assert_eq!(args, words(kept), "{config}");
+            assert_eq!(said.len(), 1, "{config}: {said:?}");
+            assert!(
+                said[0].contains("--release-key B is not one of this system's"),
+                "{said:?}"
+            );
+        }
+        // A file of keys that could not be read: no key of the config is taken.
+        let (args, said) = vetted(words("--release-key A --claim t"), None);
+        assert_eq!(args, words("--claim t"));
+        assert!(said[0].contains("could not be read"), "{said:?}");
+    }
+
+    #[test]
+    fn a_config_release_key_stays_when_the_system_holds_none_or_the_same() {
+        let config = words("--claim t --release-key A,B --listen x");
+        assert_eq!(vetted(config.clone(), Some(&[])), (config.clone(), Vec::new()));
+        let both = ["B".to_string(), "A".to_string()];
+        assert_eq!(vetted(config.clone(), Some(&both)), (config, Vec::new()));
+        let none = words("--claim t --listen x");
+        assert_eq!(vetted(none.clone(), None), (none, Vec::new()));
+    }
 
     /// A slot on trial is good only once the node has its state: however long it waits
     /// for a key, the wait before it is marked good has not begun.

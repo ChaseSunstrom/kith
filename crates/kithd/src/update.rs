@@ -397,7 +397,7 @@ pub struct Keys {
 
 /// The keys in a file of them, one a line (`#` lines are notes). Only a file that is not
 /// there is no keys: one that cannot be read is an error, not a node that takes any key.
-fn keys_in(file: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn keys_in(file: &Path) -> Result<Vec<String>, String> {
     let text = match std::fs::read_to_string(file) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         text => text.map_err(|e| format!("reading this node's release keys ({}): {e}", file.display()))?,
