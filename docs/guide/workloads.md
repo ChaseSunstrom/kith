@@ -73,8 +73,9 @@ must be allowed to apply a Job.
 - A replica is stopped before its replacement starts, so `replicas: 1` is down for a moment during
   an update. `blueGreen` is treated as rolling.
 - Pulls are anonymous; layers must be gzip or plain tar.
-- [`dist/kithd.service`](../../dist/kithd.service) is a systemd user unit, not yet run under
-  systemd; a root service on a distro is untested.
+- [`dist/kithd.service`](../../dist/kithd.service) is a systemd user unit; `sh ci/systemd.sh` runs
+  it under your user's systemd and checks its cgroups and its stop. A root service on a distro is
+  untested.
 
 ### What a container is kept from
 
