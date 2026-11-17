@@ -599,12 +599,33 @@ fn verified(pin: &str, answers: &[u8]) -> Result<(), String> {
 }
 
 /// The answers at `url`. The network may take a moment to be there.
+/// Whether a redirect to an address of `scheme`, after `hops` of them, is followed: to https
+/// always, to plain http only for pinned answers (the pin covers what comes), and never past five.
+fn followed(scheme: &str, hops: usize, pinned: bool) -> Result<(), &'static str> {
+    match scheme {
+        _ if hops >= 5 => Err("too many redirects"),
+        "https" => Ok(()),
+        "http" if pinned => Ok(()),
+        _ => Err("an https address that sends its answers elsewhere than https: refused"),
+    }
+}
+
 async fn fetched(url: &str) -> Result<String, String> {
     // (Refused before any connection: an unpinned http answer is never fetched.)
     let (address, pin) = pinned(url)?;
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // (A redirect is followed only where the answers stay as safe as asked: unpinned https
+    // answers never come from plain http, and none come after more than a few hops.)
+    let pinned_answers = pin.is_some();
+    let redirect = reqwest::redirect::Policy::custom(move |attempt| {
+        match followed(attempt.url().scheme(), attempt.previous().len(), pinned_answers) {
+            Ok(()) => attempt.follow(),
+            Err(why) => attempt.error(why),
+        }
+    });
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(redirect)
         .build();
     let client = client.map_err(|e| e.to_string())?;
     let mut last = String::new();
@@ -938,6 +959,15 @@ mod tests {
                 .contains("no partition table")
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_redirect_never_takes_unpinned_answers_off_https() {
+        assert_eq!(followed("https", 0, false), Ok(()));
+        assert!(followed("http", 0, false).is_err());
+        assert!(followed("ftp", 0, true).is_err());
+        assert_eq!(followed("http", 1, true), Ok(()));
+        assert!(followed("https", 5, true).is_err());
     }
 
     #[test]

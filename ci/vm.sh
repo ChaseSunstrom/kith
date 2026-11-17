@@ -3294,6 +3294,8 @@ with open(sys.argv[1], "r+b") as disk:
         # for an address. The other disk is not touched.
         mkdir "$work/www"
         printf 'disk: vdc\nhostname: beta\n' >"$work/www/beta.yaml"
+        # (Over plain http the answers are taken only with their hash pinned in the URL.)
+        pin=$(sha256sum "$work/www/beta.yaml" | cut -d' ' -f1)
         (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
         web=$!
         stick beta
@@ -3301,7 +3303,7 @@ with open(sys.argv[1], "r+b") as disk:
         blank spare
         # shellcheck disable=SC2046
         vm install-beta $(drive beta.stick) $(drive spare.disk) $(drive beta.disk) -netdev user,id=out -device virtio-net-pci,netdev=out \
-            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.2:$((port + 9))/beta.yaml"
+            -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.2:$((port + 9))/beta.yaml#sha256=$pin"
         installed install-beta vdc
         cmp -s -n $((64 << 20)) "$work/spare.disk" /dev/zero || fail "the disk that was not chosen was written to"
         beta() { # LOG: the installed disk, started
