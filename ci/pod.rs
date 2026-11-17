@@ -34,11 +34,14 @@
 //!                              closed, reset by either end and kept for many small turns; say
 //!                              the address a connection there reached, each byte that did
 //!                              not come back in order, and how it went
-//!   pod fill FILE BYTES [unlinked]
+//!   pod fill FILE BYTES [unlinked] [fast]
 //!                              say whether FILE was there (its root is empty if not), then
 //!                              write BYTES to it, 64 KiB each half second, saying if a write
 //!                              fails (the disk is full), and wait; unlinked: removes FILE
-//!                              first and writes to it held open, with no name
+//!                              first and writes to it held open, with no name; fast: with
+//!                              no half second between
+//!   pod free PATH              say how many bytes the disk PATH is on has free for anyone
+//!                              (as kithd weighs its reserve: blocks available times their size)
 //!   pod probe                what `vm.sh --test tunnel` runs behind an exit: answers on
 //!                              port 8080 (TCP, as HTTP) and sends back what comes to UDP
 //!                              8080; and each second asks 198.51.100.1:80 and a new name
@@ -871,7 +874,7 @@ fn main() {
                 Err(_) => println!("fill: an empty root"),
             }
             let mut out = std::fs::File::create(file).expect("the file it fills");
-            if how == ["unlinked"] {
+            if how.contains(&"unlinked") {
                 std::fs::remove_file(file).expect("the file it fills, removed");
                 println!("fill: {file} removed, held open");
             }
@@ -883,12 +886,22 @@ fn main() {
                     break;
                 }
                 wrote += chunk.len() as u64;
-                std::thread::sleep(Duration::from_millis(500));
+                if !how.contains(&"fast") {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
             println!("fill: wrote {wrote} bytes");
             loop {
                 std::thread::sleep(Duration::from_secs(60));
             }
+        }
+        ["free", path] => {
+            // statfs(2): struct statfs is 15 words on x86-64; f_bavail the 5th, f_frsize the 10th.
+            let name = std::ffi::CString::new(*path).expect("a path");
+            let mut found = [0u64; 15];
+            let said = syscall(137, [name.as_ptr() as u64, found.as_mut_ptr() as u64, 0, 0, 0]);
+            assert!(said == 0, "statfs {path}: errno {}", -said);
+            println!("free: {path} {}", found[4] * found[9]);
         }
         ["probe"] => {
             std::thread::spawn(|| {

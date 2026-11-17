@@ -49,7 +49,7 @@
             others='' inside=8080 out=",restrict=on" gateway=,,10.9.0.9
             dumps="-object filter-dump,id=lan-dump,netdev=lan,file=$work/lan.pcap -object filter-dump,id=out-dump,netdev=out,file=$work/out.pcap"
         fi
-        # (pods: a state disk of 32 MB keeps 8 MiB free, so a pod filling it is seen in time.)
+        # (pods: a state disk keeps 8 MiB free, so a pod filling it is seen in time.)
         # (And an image no unit has used for two minutes goes: README, --image-grace.)
         [ "$test" != pods ] || more='--mesh --storage-reserve 8388608 --image-grace 120'
         # (worker: this machine asks what listens on port 80 of a node's own network.)
@@ -61,6 +61,14 @@
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
         seed() { # DISK
+            # (quota: its state partition as long as the disk from the start, made with its
+            # seed in it: kithd's unit tests, below, do not fit in the image's 32 MB.)
+            if [ "$test" = quota ]; then
+                truncate -s 2G "$1"
+                sfdisk -q --relocate gpt-bak-std "$1"
+                number=$(sfdisk -d "$1" | sed -n 's/^[^ ]*[^0-9]\([0-9][0-9]*\) :.*name="state".*/\1/p')
+                echo ',+' | sfdisk -q --no-reread -N "$number" "$1"
+            fi
             if ! [ -f "$work/state.img" ]; then
                 digest=$(printf kith | sha256sum | cut -d ' ' -f 1)
                 image=$work/seed/runtime/images/$digest
@@ -136,8 +144,12 @@
             read -r state_start state_sectors <"$work/state.at"
             dd if="$work/state.img" of="$1" bs=512 seek="$state_start" conv=notrunc status=none
             # (Room for an image that is pulled: the state grows to the disk's end at the first start.)
-            # (quota: room for what its pods write.)
-            case $test${KITH_E2E:-} in pods1 | kube1 | quota*) truncate -s 2G "$1" ;; esac
+            # (quota: room for what its pods write. pods: room above its reserve, which its
+            # full pod crosses on purpose.)
+            case $test${KITH_E2E:-} in
+                pods1 | kube1 | quota*) truncate -s 2G "$1" ;;
+                pods) truncate -s 512M "$1" ;;
+            esac
         }
       elif [ "$test" = rollout ]; then
         # The nodes run an image built with the release key: the first release they take

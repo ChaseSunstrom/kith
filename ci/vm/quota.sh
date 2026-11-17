@@ -317,25 +317,25 @@ EOF
             ok image
 
             # kithd's own tests of the project-quota path (crates/kithd/src/controller/storage.rs),
-            # which skip where the disk keeps no projects: here, as the node's root, on this
-            # state disk (TMPDIR in the pod's own root), every one run and none skipped.
-            cat >"$work/apply.json" <<EOF
-[{"apiVersion":"kith.dev/v1","kind":"NodeWorkload","metadata":{"name":"unit"},"spec":{"selector":{},"template":{"pod":true,"containers":[
-  {"name":"unit","image":"kith.test/kithd-tests:1","command":["/bin/kithd-tests","storage_projects_","--test-threads=1","--nocapture"],
-   "env":[{"name":"TMPDIR","value":"/t"}],"seccomp":{"unconfined":true}}]}}}]
-EOF
-            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NodeWorkload unit was not applied"
-            waited=0
-            until any GET "/v1/logs/NodeWorkload/default/unit?replica=0" >"$work/unit.out" 2>/dev/null && grep -q 'test result' "$work/unit.out"; do
-                waited=$((waited + 1))
-                [ "$waited" -lt 300 ] || fail "kithd's unit tests did not end; they say: $(units NodeWorkload unit): $(cat "$work/unit.out" 2>/dev/null)"
-                sleep 1
-            done
-            any GET "/v1/logs/NodeWorkload/default/unit?replica=0&stderr=true" >"$work/unit.err" 2>/dev/null || :
+            # which skip where the disk keeps no projects. They set a project's limit, which takes
+            # CAP_SYS_ADMIN, and no pod has it: so with n1 off, as the first process of a machine
+            # of their own, root with every capability. Kith OS's kernel and a memory disk of
+            # ci/pod.rs (its `tests`: it mounts n1's state partition as kithd does and runs them
+            # there) and the tests; every one run and none skipped.
+            echo quit | socat - "unix-connect:$work/keys1" >/dev/null 2>&1 || :
+            sleep 2
+            mkdir -p "$work/unitrd"
+            cp "$work/pod" "$work/unitrd/init"
+            cp "$(sh "$root/ci/musl.sh" --tests)" "$work/unitrd/kithd-tests"
+            (cd "$work/unitrd" && find . | cpio -o -H newc --quiet) >"$work/unit.cpio"
+            number=$(sfdisk -d "$work/n1.raw" | sed -n 's/^[^ ]*[^0-9]\([0-9][0-9]*\) :.*name="state".*/\1/p')
+            timeout 600 qemu-system-x86_64 -enable-kvm -cpu host -m 1024 -smp 2 -display none -no-reboot -machine q35 \
+                -kernel "$base/vmlinuz" -initrd "$work/unit.cpio" -append "console=ttyS0 panic=-1 -- tests /dev/vda$number" \
+                -drive "file=$work/n1.raw,format=raw,if=virtio" -serial "file:$work/unit.log" -monitor none </dev/null >/dev/null 2>&1 \
+                || fail "the machine of kithd's unit tests did not power off: $(tail -n 20 "$work/unit.log")"
             want=$(grep -c 'fn storage_projects_' "$root/crates/kithd/src/controller/storage.rs")
-            grep -q "test result: ok. $want passed" "$work/unit.out" || fail "kithd's storage_projects_ tests: $(grep -o 'test result: [a-zA-Z]*. [0-9]* passed; [0-9]* failed' "$work/unit.out"), not $want passed"
-            ! grep -q 'skipped' "$work/unit.err" || fail "a storage_projects_ test skipped on a disk that keeps projects: $(grep -o 'storage_projects_[a-z_]*: skipped' "$work/unit.err")"
-            gone NodeWorkload unit
+            grep -aq "test result: ok. $want passed" "$work/unit.log" || fail "kithd's storage_projects_ tests, not $want passed: $(grep -a -e 'test result' -e panicked -e 'tests:' "$work/unit.log")"
+            ! grep -aq 'skipped' "$work/unit.log" || fail "a storage_projects_ test skipped on a disk that keeps projects: $(grep -ao 'storage_projects_[a-z_]*: skipped' "$work/unit.log")"
             ok unit
 
             for case in said again write scratch unlinked files nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image unit; do

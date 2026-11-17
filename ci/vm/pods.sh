@@ -141,7 +141,7 @@ EOF
             reserve=8388608
             spare() {
                 job "$2" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"free\",\"/state\"],\"volumeMounts\":[{\"volume\":\"on-$1\",\"path\":\"/state\"}]" '^[0-9]+ succeeded'
-                left=$(tr -d '\r' <"$work/$2.out" | sed -n 's|^free: /state \([0-9][0-9]*\)$|\1|p')
+                left=$(grep -o 'free: /state [0-9]*' "$work/$2.out" | cut -d ' ' -f 3)
                 [ -n "$left" ] || fail "the Job $2 did not say what $1 has free: $(cat "$work/$2.out" "$work/$2.err")"
             }
             # Each node starts with more free than its reserve: the full pod below crosses it.
@@ -287,13 +287,14 @@ EOF
             fills over ',"resources":{"storage":"1Mi"}' 2097152 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
             # With no limit, writing until its node's disk is full: it is replaced once the disk
             # has less free than its reserve, and its write never fails. First a ballast brings
-            # n2's disk to 16 MiB above its reserve, fast: written to a Volume (not the pod's own,
-            # so not what is replaced) and held with no name (gone with the pod). Then full, on
-            # n2 too, crosses the reserve at its own pace: above it, it runs; under it, replaced.
+            # n2's disk to 16 MiB above its reserve, fast: a named file in a Volume (not the pod's
+            # own, so not counted and not what is replaced; one held with no name would be). Then
+            # full, on n2 too, crosses the reserve at its own pace: above it, it runs; under it,
+            # replaced. Then the ballast is emptied, so n2 has its room back.
             spare n2 free-ballast
             cat >"$work/apply.json" <<EOF
 [{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ballast"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
-  {"name":"fill","image":"kith.test/pod:1","command":["/bin/pod","fill","/state/ballast","$((left - reserve - 16777216))","unlinked","fast"],
+  {"name":"fill","image":"kith.test/pod:1","command":["/bin/pod","fill","/state/ballast","$((left - reserve - 16777216))","fast"],
    "volumeMounts":[{"volume":"on-n2","path":"/state"}]}]}}}]
 EOF
             any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload ballast was not applied"
@@ -311,6 +312,20 @@ EOF
             echo "vm.sh: the ballast left n2 $left bytes free, above its reserve" >&2
             fills full ',"volumeMounts":[{"volume":"on-n2","path":"/state"}]' 1073741824 'replaced: the node.s state disk has [0-9]* bytes free, under its reserve of 8388608'
             api 1 DELETE "/v1/resources/Workload/default/ballast" >/dev/null || fail "the Workload ballast was not deleted"
+            # Emptied by a pod of its own: fill opens it with truncation and writes nothing.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"unballast"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"fill","image":"kith.test/pod:1","command":["/bin/pod","fill","/state/ballast","0","fast"],
+   "volumeMounts":[{"volume":"on-n2","path":"/state"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload unballast was not applied"
+            waited=0
+            until any GET "/v1/logs/Workload/default/unballast?replica=0" >"$work/unballast.out" 2>/dev/null && grep -q 'fill: wrote 0 bytes' "$work/unballast.out"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 120 ] || fail "the ballast was not emptied: $(units Workload unballast): $(cat "$work/unballast.out" 2>/dev/null)"
+                sleep 1
+            done
+            api 1 DELETE "/v1/resources/Workload/default/unballast" >/dev/null || fail "the Workload unballast was not deleted"
             # Past its limit with a file it removed and holds open: no name to walk to, still counted.
             fills unlinked ',"resources":{"storage":"1Mi"}' '2097152","unlinked' 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
 
