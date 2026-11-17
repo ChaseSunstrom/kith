@@ -395,6 +395,11 @@ sockets made ahead (which also ends the thread per connection for the single pro
 Services; images; units; volumes; node. Then the serving part's confinement, the VM
 test of criterion 2, and the measurements.
 
+Built so far (`root_part.rs`): the `Request` enum and its wire (`decode`: at most 256 KiB,
+unknown fields and variants refused), `check` (each request's refusal), the `Root` trait
+with its in-process implementation `Direct`, and the first family, listeners (`Bind`,
+used by `share.rs`'s NFS listener). No socket and no second process yet.
+
 ## Measurements
 
 Taken in step 4 on the commit before Step A and again after the split, three runs each

@@ -44,6 +44,7 @@ mod raft;
 mod registry;
 mod releases;
 mod replicas;
+mod root_part;
 mod sched;
 mod seats;
 mod services;
