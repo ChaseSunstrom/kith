@@ -189,6 +189,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   there has the fourteen capabilities a container runtime gives by default, and no
   other; and its root file system is its own to write. It keeps `no_new_privs`, the
   seccomp filter and its namespaces, and has a network namespace of its own.
+- **A pod's link to its node** (`kp` and a number) is checked before anything else
+  looks at a packet: a packet from it is dropped unless the route back to its source
+  goes through that same link (`inet kith-pods`, chain `check`), so a pod sends with
+  only its own address, even as root, and a pod reaches its node only for DNS and
+  Services: UDP and TCP port 53 to the gateway, and TCP to a Service's address, with
+  nothing else of the node's (kithd's API among it) reached, ICMP included. An exit's
+  pod (`kpx`) gets neither of those.
 - **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
   tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
   the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
