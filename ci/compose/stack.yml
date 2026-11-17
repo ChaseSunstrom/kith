@@ -1,0 +1,36 @@
+# Four services of kith's own test pod (ci/pod.rs `serve`: answers every connection on port
+# 80 as HTTP): what `sh ci/vm.sh --test compose` imports on the host with `kith import
+# compose`, applies to a node and asks for by each service's name. Every key here is
+# carried, so the import says nothing is left out (it exits 0): no depends_on, no port
+# published and no network, which kith says it ignores.
+services:
+  api:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    expose:
+      - "80"
+  db:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    expose:
+      - 80
+  cache:
+    image: kith.test/pod:1
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    ports:
+      - "80"
+  web:
+    image: kith.test/pod:1
+    container_name: frontend
+    entrypoint: ["/bin/pod"]
+    command: ["serve"]
+    ports:
+      - target: 80
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 5s
+      timeout: 2s
+      retries: 3

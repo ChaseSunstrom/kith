@@ -381,6 +381,45 @@ fn compose_a_variable_that_reads_as_a_secret_is_said() {
     assert!(spec(&all, "Workload/app").to_string().contains("DB_PASSWORD"));
 }
 
+/// What `sh ci/vm.sh --test compose` imports on the host and runs in a node: kith's own test
+/// pod as four services, with nothing refused, so every one of them is a Workload and a
+/// Service (and `frontend`, web's alias, another) the node can be asked for by name.
+#[test]
+fn compose_vm_stack_imports_clean() {
+    let sb = Sandbox::new("compose-vm-stack");
+    let stack = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/compose/stack.yml");
+    let (code, out, err) = sb.kith(&["import", "compose", stack]);
+    assert_eq!((code, err.trim()), (0, "9 resources, 0 things not translated"));
+    let (all, _) = translate(
+        documents("stack.yml", &std::fs::read_to_string(stack).unwrap())
+            .unwrap()
+            .remove(0),
+        None,
+    );
+    let mut keys: Vec<String> = all.iter().map(|r| r.key().replacen("/default/", "/", 1)).collect();
+    keys.sort();
+    let expect = "Service/api Service/cache Service/db Service/frontend Service/web \
+        Workload/api Workload/cache Workload/db Workload/web";
+    assert_eq!(keys, expect.split_whitespace().collect::<Vec<_>>());
+    for name in ["api", "cache", "db", "web"] {
+        assert!(out.contains(&format!("name: {name}\n")), "{out}");
+        let c = &spec(&all, &format!("Workload/{name}"))["template"]["containers"][0];
+        assert_eq!(
+            (&c["image"], &c["command"], &c["args"]),
+            (&json!("kith.test/pod:1"), &json!(["/bin/pod"]), &json!(["serve"]))
+        );
+        assert_eq!(
+            spec(&all, &format!("Service/{name}"))["ports"],
+            json!([{"port": 80}]),
+            "{name}"
+        );
+    }
+    // web is ready by its healthcheck, an http probe of its own port.
+    let web = &spec(&all, "Workload/web")["template"]["containers"][0];
+    assert_eq!(web["readiness"]["http"], json!({"path": "/", "port": 80}));
+    assert_eq!(spec(&all, "Service/frontend")["selector"], json!({"app": "web"}));
+}
+
 #[test]
 fn compose_two_documents_are_not_one_stack() {
     let sb = Sandbox::new("compose-two");

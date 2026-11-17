@@ -24,6 +24,8 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
+#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
+#                               kith import compose, applied, ready, each asked for by its compose name
 #   sh ci/vm.sh --test quota    one node whose state disk keeps project quotas: a pod's storage limit
 #                               holds at the write, in its root and its scratch, however it tries past it
 #   sh ci/vm.sh --test kube     two nodes: the real kubectl and helm against them, with manifests written
@@ -150,6 +152,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    kithd passes its bytes; on the node's own network, the kernel
                    sends its connections straight to the pod. Needs rustc for
                    x86_64-unknown-linux-musl
+  --test compose   instead: one node as for services, and on this machine `kith import
+                   compose` of ci/compose/stack.yml (four services of the test pod,
+                   nothing in it left out) applied to it. Expected: each Workload ready,
+                   each Service given its backend, and a Job in a pod asking each service
+                   by its compose name (and the alias a container_name gives) is answered
+                   by that service's pod; the seconds from the apply to all four ready are
+                   printed (kith's side of T-0320's comparison with docker compose)
   --test quota     instead: one node as for services, its state disk made with project
                    quotas (as os/build.sh makes it). Expected: kithd says it holds
                    pods' storage limits at the write; a pod of 64Ki removed and the
@@ -247,7 +256,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | quota | kube | worker | chaos | access | policy | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, quota, kube, worker, chaos, access, policy, tunnel" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
@@ -291,7 +300,7 @@ if [ -n "$test" ] && [ "$test" != init ]; then
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
     sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
-    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ]; then
+    if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ]; then
         for tool in curl python3 xxd; do
             command -v "$tool" >/dev/null 2>&1 || skip "no $tool"
         done
@@ -321,9 +330,9 @@ if [ -n "$test" ] && [ "$test" != init ]; then
         # worker: two, on the mesh; services and quota: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -1060,6 +1069,83 @@ EOF
                 || fail "kithd did not say it counts what pods write on a state disk with no project quotas: $(grep -a 'storage limits' "$work/n1.log")"
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
             echo "vm.sh: ok: one node, a pod that sent back what it was sent and its Service; Jobs on the same node, one in a pod (passed by kithd) and one on the node's own network (passed by the kernel straight to the replica), sent through the Service on connections closed at once, half closed, reset by either end with bytes on their way, side by side and kept for small turns, and every byte came back in order ($checked)"
+            exit 0
+        fi
+        if [ "$test" = compose ]; then
+            # A compose file of the test pod's, as kith resources: made on this machine by the
+            # kith that is built here (exit 0 is all of it translated; 1 says what was left out).
+            kith=$(sh "$root/ci/musl.sh")/kith
+            "$kith" import compose "$root/ci/compose/stack.yml" >"$work/stack.yml" || fail "kith import compose left something of ci/compose/stack.yml out"
+            # The resources as JSON for the API: a store file of this machine's takes them (what
+            # `kith import` prints is YAML), and says each as JSON without its revision.
+            KITH_STORE="$work/stack-store.json" "$kith" apply --file "$work/stack.yml" >&2 || fail "the imported stack did not lint as resources"
+            KITH_STORE="$work/stack-store.json" "$kith" get --output json | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+for r in found:
+    r["metadata"].pop("revision", None)
+json.dump(found, sys.stdout)
+' >"$work/apply.json" || fail "the imported stack could not be read back as JSON"
+            names='api db cache web'
+            # The clock starts at the apply and stops when each Workload has said one container ready.
+            started=$(date +%s%N)
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the imported stack was not applied"
+            waited=0
+            while :; do
+                every=y
+                for name in $names; do
+                    line=$(units Workload "$name") && [ "${line%% *}" = 1 ] || { every=''; unready="$name: $line"; }
+                done
+                [ -z "$every" ] || break
+                waited=$((waited + 1))
+                [ "$waited" -lt 1500 ] || fail "waited for the four services to be ready; one says $unready"
+                sleep 0.2
+            done
+            elapsed=$((($(date +%s%N) - started) / 1000000))
+            seconds=$(printf '%d.%03d' $((elapsed / 1000)) $((elapsed % 1000)))
+            echo "vm.sh: compose: apply to all four ready: $seconds s" >&2
+            # Each name, then, as a Job in a pod of its own asks for it (40 times: pod ask,
+            # ci/pod.rs): its Service has an address and its pod answers with its own name.
+            for ask in api db cache web frontend; do
+                waited=0
+                until any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+try:
+    found = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+for r in found:
+    status = r.get("status") or {}
+    if r["kind"] == "Service" and r["metadata"]["name"] == sys.argv[1] and status.get("address") and status.get("backends"):
+        sys.exit(0)
+sys.exit(1)
+' "$ask"; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 120 ] || fail "the Service $ask was given no address with its pod"
+                    sleep 1
+                done
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"ask-$ask"},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"ask","image":"kith.test/pod:1","command":["/bin/pod","ask","$ask","80"]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job ask-$ask was not applied"
+                waited=0
+                until line=$(units Job "ask-$ask") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 300 ] || fail "waited for the Job ask-$ask; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/ask-$ask" >"$work/ask-$ask.out" 2>/dev/null || true
+                printf '%s\n' "$line" | grep -q succeeded || fail "the Job ask-$ask did not succeed: $line: $(cat "$work/ask-$ask.out")"
+                ! grep -q 'failed: ' "$work/ask-$ask.out" || fail "the Job asking for $ask was not always answered: $(cat "$work/ask-$ask.out")"
+                # (A pod is named for its Workload: web's alias, frontend, is answered by web-0.)
+                want=$ask
+                [ "$ask" != frontend ] || want=web
+                grep -q 'HTTP/1.0 200 OK' "$work/ask-$ask.out" && grep -q "$want-0" "$work/ask-$ask.out" || fail "the name $ask was not answered by $want-0: $(cat "$work/ask-$ask.out")"
+            done
+            ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
+            echo "vm.sh: ok: one node, kith import compose of ci/compose/stack.yml (four services of the test pod, nothing left out) applied: all four ready $seconds s after the apply, and each of api, db, cache, web and frontend (web's container_name) asked for by that name from a Job in a pod, and answered by its own pod"
             exit 0
         fi
         if [ "$test" = quota ]; then
