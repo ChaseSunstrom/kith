@@ -883,8 +883,30 @@ mod tests {
                 "{said}"
             );
         }
-        // And the machine this runs on can be asked (what it has is anyone's: only that it answers).
-        assert!(held_addresses().is_ok_and(|held| held.iter().any(|held| held.address.is_loopback())));
+        // And the machine this runs on can be asked (what it has is anyone's: only that it
+        // answers, and that a loopback address it has comes back on link 1; in a network
+        // namespace of its own, `unshare -Urn`, it has none).
+        let machine = held_addresses().unwrap();
+        assert!(
+            machine
+                .iter()
+                .filter(|held| held.address.is_loopback())
+                .all(|held| held.link == LOOPBACK),
+            "{machine:?}"
+        );
+    }
+
+    #[test]
+    fn a_node_with_no_address_at_all_refuses_no_range() {
+        let ours = range("10.77.0.0/16").unwrap();
+        ours.refuse_held(&[]).unwrap();
+        let lo = Held {
+            address: "127.0.0.1".parse().unwrap(),
+            bits: 8,
+            link: LOOPBACK,
+            name: "lo".into(),
+        };
+        ours.refuse_held(&[lo]).unwrap();
     }
 
     #[test]
