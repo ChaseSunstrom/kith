@@ -121,14 +121,14 @@ is still there when it starts again.
   <img src="docs/assets/diagrams/architecture-light.svg" alt="How kith works: the kith command and the web UI talk to kithd's resource API; what is applied goes into the store whole or not at all; from the store the scheduler places replicas, the controller starts and stops them on its node through kith's own runtime, and the mesh, Services and DNS follow; the store is replicated to the other nodes by Raft, and where the mesh is on (--mesh) each node has a WireGuard tunnel to every other" width="100%">
 </picture>
 
-You say what should exist, in files; `kith apply` sends them to a node, which
-takes all of them or none. Everything else is `kithd` making its node match:
-on the node that leads the store the scheduler says which node runs each
-replica, and every node's controller starts and stops what is its own, with no
-container daemon in between. With more than one node the store is copied to
-the others by Raft; started with `--mesh`, the nodes also set up WireGuard
-tunnels between themselves, over which what runs on one node reaches what
-runs on another.
+You say what should exist, in files. `kithd` makes each node match:
+
+- `kith apply` sends the files to a node, which takes all of them or none.
+- On the node that leads the store, the scheduler says which node runs each replica.
+- Every node's controller starts and stops what is its own, with no container daemon in between.
+- With more than one node, the store is copied to the others by Raft.
+- Started with `--mesh`, the nodes also set up WireGuard tunnels between themselves, so
+  what runs on one node reaches what runs on another.
 
 ## Status
 
@@ -139,11 +139,13 @@ tagged. Each section below says what works and, under "Not yet", what does not
 and what kith does not defend against, is in [SECURITY.md](SECURITY.md).
 
 `kithd` runs as a service on an existing Linux distro (agent mode), or as the
-first process of [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process); on
-one machine, or on several [joined into a cluster](docs/guide/cluster.md#more-than-one-node). It owns
-the store and keeps the containers, processes and machines on its node matching
-the resources you apply. The [first run](#first-run) is one node in agent mode;
-beyond it, everything goes through the same few commands:
+first process of [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process). It runs on
+one machine, or on several [joined into a cluster](docs/guide/cluster.md#more-than-one-node), owns
+the store, and keeps the containers, processes and machines on its node matching
+the resources you apply.
+
+The [first run](#first-run) is one node in agent mode; beyond it, everything goes
+through the same few commands:
 
 ```sh
 kith get workload/hello -o yaml  # status: each container's state, restarts and last exit code
@@ -168,11 +170,14 @@ web.yaml:7:13: invalid type: string "yes", expected u32
 ## Beside k3s
 
 `sh ci/compare.sh` starts the same three machines twice (QEMU with KVM, 2 CPUs and
-2048 MB each, on a network of their own): as three kith OS nodes, and as Alpine 3.24
-with k3s v1.37.2 as it comes (a server and two agents, with the DNS, ingress, load
-balancer, metrics and storage k3s starts by itself). It measures both from outside,
-the same way, runs the same workloads on both, and writes the tables down
-([ci/compare.txt](ci/compare.txt)):
+2048 MB each, on a network of their own):
+
+- as three kith OS nodes;
+- as Alpine 3.24 with k3s v1.37.2 as it comes: a server and two agents, with the DNS,
+  ingress, load balancer, metrics and storage k3s starts by itself.
+
+It measures both from outside, the same way, runs the same workloads on both, and
+writes the tables down ([ci/compare.txt](ci/compare.txt)):
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/beside-k3s-dark.svg">
@@ -211,8 +216,11 @@ A kith OS machine answers on its API 2.5 s (2.5 to 3.7, 3 runs) after it is swit
 
 Of k3s's time to a ready node, 24.7 s (23.6 to 28.2, 3 runs) is Alpine starting; the rest is k3s, started by hand the moment Alpine takes a login.
 
-One shape of machine, three nodes, a few runs, on a host doing other work at the time;
-where the two differ in what they do, the numbers are not of the same thing (a kith
-container shares its node's network, a kith Service is passed on by kithd and encrypted
-between nodes, and k3s is the whole Kubernetes API). How each row is measured, and what
-the tables do not say: [How the numbers beside k3s were taken](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken).
+One shape of machine, three nodes, a few runs, on a host doing other work at the time.
+Where the two differ in what they do, the numbers are not of the same thing:
+
+- a kith container shares its node's network;
+- a kith Service is passed on by kithd and encrypted between nodes;
+- k3s is the whole Kubernetes API.
+
+How each row is measured, and what the tables do not say: [How the numbers beside k3s were taken](docs/guide/numbers.md#how-the-numbers-beside-k3s-were-taken).
