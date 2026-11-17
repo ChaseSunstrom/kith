@@ -83,7 +83,13 @@ In detail:
   `kithd/src/init.rs:274`). A stick holding a copy of the public root and verity
   partitions, plus its own config and state, boots as the node. The node then joins the
   stick's cluster, unencrypted. Doing this takes hands on the machine and a restart. (Read.)
-  task: T-0647
+  fixed: T-0647. Before config or state is read, init checks that dm-0's disk holds the
+  partition the firmware's `LoaderDevicePartUUID` names (`check_boot_disk`, `gpt::guids`),
+  and refuses the root when it does not. Left open: firmware told to boot the stick's own
+  ESP boots the stick as another machine, which never reads the internal disk's state,
+  since the stick holds the ESP the firmware names. A stick whose GPT copies the node's ESP
+  GUID passes too, so the check is only as strong as that GUID's secrecy. With no variable
+  (a kernel started without systemd-boot) init goes on and says so.
 - M2 Install answers fetched over `http://` can be changed by anyone on the LAN: the
   disk, the join address and token, and `releaseKey` (`kithd/src/install.rs:557`). (Read.)
   task: T-0648

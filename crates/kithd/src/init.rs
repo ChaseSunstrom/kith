@@ -279,6 +279,101 @@ pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
     })
 }
 
+/// The firmware's variables, and the one systemd-boot sets to the partition GUID of the ESP it
+/// started kith from.
+const EFIVARS: &str = "/sys/firmware/efi/efivars";
+const LOADER: &str = "LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+/// The most a firmware variable is read as: this one is 78 bytes.
+const VARIABLE_MAX: u64 = 1024;
+
+/// The bytes of the firmware variable `name` in `dir`, or `None` when there is no such one.
+fn variable(dir: &std::path::Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(dir.join(name)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("reading {name}: {e}")),
+    };
+    let mut bytes = Vec::new();
+    file.take(VARIABLE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("reading {name}: {e}"))?;
+    if bytes.len() as u64 > VARIABLE_MAX {
+        return Err(format!("{name} is longer than a firmware variable is"));
+    }
+    Ok(Some(bytes))
+}
+
+/// The GUID a firmware variable's bytes hold: four attribute bytes, then its text as UTF-16LE
+/// with a NUL after it. Lower case, as a GPT writes one.
+fn partuuid(bytes: &[u8]) -> Result<String, String> {
+    let text = bytes.get(4..).ok_or("the firmware's boot partition is not written")?;
+    if text.len() % 2 != 0 {
+        return Err("the firmware's boot partition is not UTF-16".into());
+    }
+    let units: Vec<u16> = text
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let text = String::from_utf16(&units).map_err(|_| "the firmware's boot partition is not UTF-16")?;
+    let text = text.trim_end_matches('\0').to_ascii_lowercase();
+    let shaped = text.len() == 36
+        && text.char_indices().all(|(at, c)| match at {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        });
+    if !shaped {
+        return Err("the firmware's boot partition is not a partition's GUID".into());
+    }
+    Ok(text)
+}
+
+/// Whether the partition the firmware's variable names is one of `guids`, the unique GUIDs of
+/// a disk's partitions.
+fn holds_boot_partition(variable: &[u8], guids: &[String]) -> Result<bool, String> {
+    Ok(guids.contains(&partuuid(variable)?))
+}
+
+/// Refuses a root whose disk is not the one the firmware started kith from. Where the root is
+/// a verity device, a stick with a copy of the public root and verity partitions, and its own
+/// config and state, would boot as the node. systemd-boot sets the variable to its ESP's GUID,
+/// and the root's disk must hold a partition of that GUID. With no variable (a kernel started
+/// without systemd-boot) the disk goes on unchecked, and that is said. No verity root, nothing
+/// to check.
+fn check_boot_disk() -> Result<(), String> {
+    let Some(disk) = booted() else { return Ok(()) };
+    let dir = std::path::Path::new(EFIVARS);
+    let efi = std::path::Path::new("/sys/firmware/efi");
+    if efi.is_dir() && std::fs::read_dir(dir).map_or(true, |mut all| all.next().is_none()) {
+        let quiet = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        match mount(Some("efivarfs"), EFIVARS, Some("efivarfs"), quiet, None::<&str>) {
+            // (Already there: as in `early`.)
+            Ok(()) | Err(nix::errno::Errno::EBUSY) => {}
+            Err(e) => return Err(format!("mounting the firmware's variables: {e}")),
+        }
+    }
+    let Some(bytes) = variable(dir, LOADER)? else {
+        eprintln!("kithd: init: the firmware names no boot partition, so the disk {disk} is not checked against one");
+        return Ok(());
+    };
+    let sectors = std::fs::read_to_string(format!("/sys/block/{disk}/size"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .ok_or_else(|| format!("the size of {disk} is not known"))?;
+    let opened =
+        std::fs::File::open(std::path::Path::new("/dev").join(&disk)).map_err(|e| format!("opening {disk}: {e}"))?;
+    let guids = crate::gpt::guids(&opened, sectors).map_err(|e| format!("{disk}: {e}"))?;
+    if holds_boot_partition(&bytes, &guids)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "the firmware started kith from a partition that {disk} does not hold: its root is not this machine's"
+        ))
+    }
+}
+
 /// Where the disk this node runs from goes on past its state partition, make the partition
 /// end where the disk does (see `gpt`): the image's is 32 MB, whatever it was written to.
 /// Before the state is mounted or opened; `mount_state` grows the file system to it.
@@ -582,6 +677,11 @@ pub fn early() -> Boot {
         }
     }
     consoles();
+    // (Before anything is read from the root's disk: see `check_boot_disk`.)
+    if let Err(e) = check_boot_disk() {
+        eprintln!("kithd: init: {e}");
+        end(true);
+    }
     let line = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let installing = options(&line).0.install.is_some();
     // What the installer was told of this node, from the disk the node runs from. (The
@@ -896,5 +996,68 @@ mod tests {
         assert!(!events.power_pressed(&press[10..23]));
         assert!(events.power_pressed(&press[23..]));
         assert!(!events.power_pressed(&[]));
+    }
+
+    /// A firmware variable as the kernel's efivarfs holds one: four attribute bytes, then
+    /// `text` as UTF-16LE with its NUL, as systemd-boot writes it.
+    fn variable_bytes(text: &str) -> Vec<u8> {
+        let mut bytes = vec![7, 0, 0, 0];
+        for unit in text.encode_utf16().chain([0]) {
+            bytes.extend(unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    const FIRST: &str = "41414141-4141-4141-4141-414141414141";
+    const SECOND: &str = "42424242-4242-4242-4242-424242424242";
+
+    #[test]
+    fn firmware_variable_names_the_boot_partition_as_its_text() {
+        // Written in capitals, as the variable might be: read as the lower case a GPT writes.
+        let bytes = variable_bytes("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7");
+        assert_eq!(partuuid(&bytes), Ok("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7".into()));
+        let guids = [FIRST.to_string(), SECOND.to_string()];
+        assert_eq!(holds_boot_partition(&variable_bytes(SECOND), &guids), Ok(true));
+        let other = variable_bytes("43434343-4343-4343-4343-434343434343");
+        assert_eq!(holds_boot_partition(&other, &guids), Ok(false));
+        // A disk with no partitions holds none of them.
+        assert_eq!(holds_boot_partition(&variable_bytes(FIRST), &[]), Ok(false));
+    }
+
+    #[test]
+    fn firmware_variable_text_is_checked_as_it_is_read() {
+        let mut odd = variable_bytes(FIRST);
+        odd.push(0);
+        let mut surrogate = vec![7, 0, 0, 0];
+        surrogate.extend([0x00, 0xD8]);
+        surrogate.extend(variable_bytes(FIRST)[4..].iter().copied());
+        let mut one_more = variable_bytes(FIRST);
+        one_more.splice(one_more.len() - 2..one_more.len() - 2, [b'0', 0]);
+        let refused = [
+            ("nothing after the attributes", vec![7, 0, 0, 0]),
+            ("less than the attributes", vec![7, 0]),
+            ("an odd number of bytes", odd),
+            ("a lone surrogate", surrogate),
+            ("not a GUID", variable_bytes("hello")),
+            ("a GUID too long", one_more),
+            ("a NUL in the middle", variable_bytes(&format!("{FIRST}\0{FIRST}"))),
+        ];
+        for (what, bytes) in refused {
+            assert!(holds_boot_partition(&bytes, &[FIRST.to_string()]).is_err(), "{what}");
+        }
+        assert!(partuuid(&[]).is_err());
+    }
+
+    #[test]
+    fn an_absent_firmware_variable_is_none_and_a_huge_one_refused() {
+        let dir = std::env::temp_dir().join(format!("kith-efivars-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+        assert_eq!(variable(&dir, name), Ok(None));
+        std::fs::write(dir.join(name), variable_bytes(FIRST)).unwrap();
+        assert_eq!(variable(&dir, name), Ok(Some(variable_bytes(FIRST))));
+        std::fs::write(dir.join(name), vec![0; 1 << 20]).unwrap();
+        assert!(variable(&dir, name).unwrap_err().contains("longer"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
