@@ -41,6 +41,7 @@
 //!                              first and writes to it held open, with no name; fast: with
 //!                              no half second between
 //!   pod free PATH              say how many bytes the disk PATH is on has free for anyone
+//!   pod tests DEVICE           as a machine's first process: kithd's project-quota tests on DEVICE
 //!                              (as kithd weighs its reserve: blocks available times their size)
 //!   pod probe                what `vm.sh --test tunnel` runs behind an exit: answers on
 //!                              port 8080 (TCP, as HTTP) and sends back what comes to UDP
@@ -894,6 +895,39 @@ fn main() {
             loop {
                 std::thread::sleep(Duration::from_secs(60));
             }
+        }
+        ["tests", device] => {
+            // The first process of a machine of its own (ci/vm/quota.sh): kithd's tests of the
+            // project-quota path, which set a project's limit (CAP_SYS_ADMIN, which no pod has),
+            // run as root in `device`, a state partition made with projects, mounted as kithd
+            // mounts it. Then the machine is powered off.
+            let c = |text: &str| std::ffi::CString::new(text).expect("no NUL");
+            let mount = |source: &str, target: &str, kind: &str, data: &str| {
+                let _ = std::fs::create_dir_all(target);
+                let (source, target, kind, data) = (c(source), c(target), c(kind), c(data));
+                let at = [source.as_ptr(), target.as_ptr(), kind.as_ptr()].map(|p| p as u64);
+                syscall(165, [at[0], at[1], at[2], 0, data.as_ptr() as u64])
+            };
+            mount("dev", "/dev", "devtmpfs", "");
+            // (Its own stdout and stderr, and its tests': the kernel found no /dev/console to
+            // give it, which the memory disk has not.)
+            let console = std::fs::OpenOptions::new().write(true).open("/dev/console").expect("a console");
+            for fd in [1, 2] {
+                syscall(33, [std::os::fd::AsRawFd::as_raw_fd(&console) as u64, fd, 0, 0, 0]);
+            }
+            mount("proc", "/proc", "proc", "");
+            let said = mount(device, "/state", "ext4", "prjquota");
+            println!("tests: {device} mounted: {said}");
+            std::fs::create_dir_all("/state/unit-tests").expect("a directory for them");
+            let ran = std::process::Command::new("/kithd-tests")
+                .args(["storage_projects_", "--test-threads=1", "--nocapture"])
+                .env("TMPDIR", "/state/unit-tests")
+                .status();
+            println!("tests: {ran:?}");
+            let _ = std::fs::remove_dir_all("/state/unit-tests");
+            syscall(162, [0; 5]);
+            // reboot(2): LINUX_REBOOT_CMD_POWER_OFF.
+            syscall(169, [0xfee1dead, 672274793, 0x4321fedc, 0, 0]);
         }
         ["free", path] => {
             // statfs(2): struct statfs is 15 words on x86-64; f_bavail the 5th, f_frsize the 10th.
