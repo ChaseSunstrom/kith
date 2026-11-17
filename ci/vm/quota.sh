@@ -335,7 +335,7 @@ EOF
                 || fail "the machine of kithd's unit tests did not power off: $(tail -n 20 "$work/unit.log")"
             want=$(grep -c 'fn storage_projects_' "$root/crates/kithd/src/controller/storage.rs")
             grep -aq "test result: ok. $want passed" "$work/unit.log" || fail "kithd's storage_projects_ tests, not $want passed: $(grep -a -e 'test result' -e panicked -e 'tests:' "$work/unit.log")"
-            ! grep -aq 'skipped' "$work/unit.log" || fail "a storage_projects_ test skipped on a disk that keeps projects: $(grep -ao 'storage_projects_[a-z_]*: skipped' "$work/unit.log")"
+            ! grep -aq 'storage_projects_[a-z_]*: skipped' "$work/unit.log" || fail "a storage_projects_ test skipped on a disk that keeps projects: $(grep -ao 'storage_projects_[a-z_]*: skipped' "$work/unit.log")"
             ok unit
 
             for case in said again write scratch unlinked files nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image unit; do

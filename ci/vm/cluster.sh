@@ -61,14 +61,6 @@
         # here): kith itself, put where a node keeps an image it has pulled, in a state
         # partition made again with that in it.
         seed() { # DISK
-            # (quota: its state partition as long as the disk from the start, made with its
-            # seed in it: kithd's unit tests, below, do not fit in the image's 32 MB.)
-            if [ "$test" = quota ]; then
-                truncate -s 2G "$1"
-                sfdisk -q --relocate gpt-bak-std "$1"
-                number=$(sfdisk -d "$1" | sed -n 's/^[^ ]*[^0-9]\([0-9][0-9]*\) :.*name="state".*/\1/p')
-                echo ',+' | sfdisk -q --no-reread -N "$number" "$1"
-            fi
             if ! [ -f "$work/state.img" ]; then
                 digest=$(printf kith | sha256sum | cut -d ' ' -f 1)
                 image=$work/seed/runtime/images/$digest
@@ -100,14 +92,6 @@
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/small"
                     head -c 1048576 /dev/urandom >"$image/rootfs/data/other"
                     echo leaf >"$image/rootfs/tree/leaf"
-                    # (And kithd's unit tests, static: those of the project-quota path run
-                    # only where the state disk keeps projects, which this one does.)
-                    digest=$(printf kithd-tests | sha256sum | cut -d ' ' -f 1)
-                    tests=$work/seed/runtime/images/$digest
-                    mkdir -p "$tests/rootfs/bin"
-                    cp "$(sh "$root/ci/musl.sh" --tests)" "$tests/rootfs/bin/kithd-tests"
-                    echo '{}' >"$tests/config.json"
-                    printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fkithd-tests:1"
                 fi
                 if [ "$test" = pods ] || [ "$test" = policy ]; then
                     # And bubblewrap as this machine has it, with what it is linked to, beside
