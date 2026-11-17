@@ -2534,7 +2534,12 @@ mod tests {
     #[test]
     fn an_erased_record_says_so() {
         let path = std::env::temp_dir().join(format!("kith-crypt-erased-{}", std::process::id()));
-        let disk = File::options().read(true).write(true).create(true).truncate(true).open(&path);
+        let disk = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path);
         let disk = disk.unwrap();
         std::fs::remove_file(&path).unwrap();
         disk.set_len(AT + 2 * ROOM as u64).unwrap();
