@@ -459,6 +459,38 @@ async fn stop(why: &str) -> ! {
     std::future::pending().await
 }
 
+/// The disk opened for writing: refused while anything of it is mounted or held.
+fn exclusive(device: &Path) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::fcntl::OFlag::O_EXCL.bits())
+        .open(device)
+        .map_err(|e| format!("{}: {e}", device.display()))
+}
+
+/// Clears both partition tables of an open disk, so nothing on it is found to boot from.
+fn clear_table(disk: &mut File) -> Result<(), String> {
+    // (The size of a block device is its end, which a file's length is not.)
+    let sectors = disk.seek(SeekFrom::End(0)).map_err(|e| e.to_string())? / 512;
+    crate::gpt::clear(disk, sectors)
+}
+
+/// Seals the written disk. A seal that fails leaves a disk that boots unencrypted, so its tables are cleared.
+fn sealed(
+    image: &File,
+    device: &Path,
+    seal: impl FnOnce(&File, &Path) -> Result<String, String>,
+) -> Result<String, String> {
+    seal(image, device).map_err(
+        |e| match exclusive(device).and_then(|mut disk| clear_table(&mut disk)) {
+            Ok(()) => format!("{e}: its partition table was cleared, so it boots nothing"),
+            Err(c) => format!("{e}: clearing its partition table failed too ({c}), so it may boot unencrypted"),
+        },
+    )
+}
+
 /// Install mode, start to end. `source` is the URL of the answers, or empty.
 pub async fn run(source: String) -> ! {
     eprintln!("kithd: install: this is the kith OS installer: it erases a disk of this machine and puts kith OS on it");
@@ -546,26 +578,32 @@ pub async fn run(source: String) -> ! {
     let device = Path::new("/dev").join(&disk.name);
     let planned = disk.clone();
     let wrote = tokio::task::spawn_blocking(move || {
-        use std::os::unix::fs::OpenOptionsExt;
         // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
         size_unchanged(Path::new("/sys/block"), &planned)?;
-        // (O_EXCL on a disk: refused while anything of it is mounted or held.)
-        let mut options = std::fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .custom_flags(nix::fcntl::OFlag::O_EXCL.bits());
-        let mut disk = options
-            .open(&device)
-            .map_err(|e| format!("{}: {e}", device.display()))?;
-        write(&mut image, &mut disk, &config, |tenths| {
+        let mut disk = exclusive(&device)?;
+        if let Err(e) = write(&mut image, &mut disk, &config, |tenths| {
             eprintln!("kithd: install: {}%", tenths * 10)
-        })?;
+        }) {
+            // (Written from here on: the image may be partly on the disk, so its tables go too.)
+            eprintln!("kithd: install: {planned} may hold part of kith OS now and nothing of what it held before");
+            return Err(match clear_table(&mut disk) {
+                Ok(()) => format!("{e}: its partition table was cleared"),
+                Err(c) => format!("{e}; clearing its partition table failed too ({c})"),
+            });
+        }
         // (The disk let go of first: the kernel takes it for the mapping.)
         drop(disk);
-        encrypt.then(|| crate::crypt::seal(&image, &device)).transpose()
+        encrypt.then(|| sealed(&image, &device, crate::crypt::seal)).transpose()
     });
-    match wrote.await.map_err(|e| e.to_string()).and_then(|wrote| wrote) {
+    // (A panic may come after the write began, so it is said the same way.)
+    let wrote = match wrote.await {
+        Ok(wrote) => wrote,
+        Err(e) => {
+            eprintln!("kithd: install: {disk} may hold part of kith OS now and nothing of what it held before");
+            stop(&e.to_string()).await
+        }
+    };
+    match wrote {
         Ok(recovery) => {
             if let Some(recovery) = recovery {
                 eprintln!(
@@ -582,10 +620,7 @@ pub async fn run(source: String) -> ! {
             crate::init::POWER_OFF.store(!memory, std::sync::atomic::Ordering::Relaxed);
             crate::init::end(false)
         }
-        Err(e) => {
-            eprintln!("kithd: install: {disk} may hold part of kith OS now and nothing of what it held before");
-            stop(&e).await
-        }
+        Err(e) => stop(&e).await,
     }
 }
 
@@ -1107,5 +1142,63 @@ mod tests {
         let why = fetched("http://127.0.0.1:9/alpha.yaml").await.unwrap_err();
         assert!(why.contains("#sha256="), "{why}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// A seal that fails after the image is written leaves no bootable disk: its partition
+    /// tables are cleared, primary and spare, and the install says so.
+    #[test]
+    fn a_failed_seal_leaves_no_bootable_disk() {
+        let dir = std::env::temp_dir().join(format!("kith-install-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The image's backup table is in its last sector, as a partitioning tool writes one.
+        let mut source = image("config");
+        source[63 * 512..63 * 512 + 8].copy_from_slice(b"EFI PART");
+        std::fs::write(dir.join("image"), &source).unwrap();
+        std::fs::write(dir.join("disk"), vec![0xee; 64 * 512]).unwrap();
+        let open = |name: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+        };
+        let (mut from, mut disk) = (open("image"), open("disk"));
+        write(&mut from, &mut disk, "kith.hostname=alpha", |_| ()).unwrap();
+        drop(disk);
+        let device = dir.join("disk");
+        let before = std::fs::read(&device).unwrap();
+        assert!(before[512..520] == *b"EFI PART" && before[63 * 512..63 * 512 + 8] == *b"EFI PART");
+
+        let said = sealed(&from, &device, |_, _| Err("the seal failed".into()));
+        let now = std::fs::read(&device).unwrap();
+        let gone = crate::gpt::guids(&open("disk"), 64);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let why = said.unwrap_err();
+        assert!(why.contains("the seal failed") && why.contains("cleared"), "{why}");
+        assert!(
+            now[..34 * 512].iter().all(|byte| *byte == 0),
+            "the primary is not cleared"
+        );
+        assert!(
+            now[31 * 512..].iter().all(|byte| *byte == 0),
+            "the spare is not cleared"
+        );
+        assert!(gone.unwrap_err().contains("no partition table"));
+    }
+
+    /// A seal that fails and a clear that fails too: both are said, and the disk is not called clean.
+    #[test]
+    fn a_failed_clear_is_said_too() {
+        let dir = std::env::temp_dir().join(format!("kith-install-clear-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("image"), b"").unwrap();
+        let from = File::open(dir.join("image")).unwrap();
+        let why = sealed(&from, &dir.join("no-disk"), |_, _| Err("the seal failed".into())).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            why.contains("the seal failed") && why.contains("failed too") && why.contains("may boot unencrypted"),
+            "{why}"
+        );
     }
 }

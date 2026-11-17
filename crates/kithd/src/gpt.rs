@@ -225,6 +225,20 @@ fn protective(disk: &File, spare: u64) {
     }
 }
 
+/// Zero the disk's partition tables, both copies: the primary (the protective record, the
+/// header and the entries, its first 34 sectors) and the spare (the entries and the header,
+/// its last 33). A disk with neither boots nothing from its table, and nothing is left to
+/// show a partition. Synced before it is told of.
+pub fn clear(disk: &File, sectors: u64) -> Result<(), String> {
+    let zeros = [0u8; 34 * SECTOR as usize];
+    let wrote = |at: u64, length: u64| disk.write_all_at(&zeros[..(length * SECTOR) as usize], at * SECTOR);
+    let (primary, spare) = (sectors.min(34), sectors.min(33));
+    wrote(0, primary)
+        .and_then(|()| wrote(sectors - spare, spare))
+        .and_then(|()| disk.sync_all())
+        .map_err(|e| format!("clearing its partition table: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +365,35 @@ mod tests {
         torn[1024 + 128 + 41] ^= 1;
         torn[8191 * 512 - 128 * 128 + 128 + 40] ^= 1;
         assert!(guids_of(&torn, 8192, "torn").unwrap_err().contains("damaged"));
+    }
+
+    #[test]
+    fn a_cleared_disk_has_no_partition_table() {
+        // Both tables are there, and found; cleared, neither is left, and nothing else is touched.
+        let path = std::env::temp_dir().join(format!("kith-gpt-{}-cleared", std::process::id()));
+        let before = image(8192, &PARTS);
+        std::fs::write(&path, &before).unwrap();
+        let file = File::options().read(true).write(true).open(&path).unwrap();
+        assert_eq!(guids(&file, 8192), Ok(vec![FIRST.into(), SECOND.into()]));
+        let said = clear(&file, 8192);
+        let now = std::fs::read(&path).unwrap();
+        let gone = guids(&file, 8192);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(said, Ok(()));
+        // The primary: the protective record, the header and the entries. The spare: its entries and header.
+        assert!(
+            now[..34 * 512].iter().all(|byte| *byte == 0),
+            "the primary is not cleared"
+        );
+        assert!(
+            now[(8192 - 33) * 512..].iter().all(|byte| *byte == 0),
+            "the spare is not cleared"
+        );
+        assert!(
+            now[34 * 512..(8192 - 33) * 512] == before[34 * 512..(8192 - 33) * 512],
+            "what is no table was changed"
+        );
+        assert!(gone.unwrap_err().contains("no partition table"));
     }
 
     #[test]

@@ -1497,6 +1497,11 @@ kith-lsp. The findings and what became of each are in
   its fragment (`#sha256=`). Without one the installer refuses before it fetches, and
   answers that do not hash to the pin are refused naming both digests. https is as it
   was (T-0648).
+- Fixed: an install with `encrypt` whose seal failed after the image was written left a
+  disk that boots unencrypted, while the installer said nothing was installed (review 2
+  installer M3). Any error after the write now clears both partition tables, primary and
+  spare, and says whether that worked; a refusal before the disk is opened says nothing of
+  the disk (T-0658).
 
 - Dependencies: checked against the RustSec advisory database with `cargo audit` on
   2026-11-16 (383 crates). One advisory, RUSTSEC-2026-0385 (ctutils 0.4.3, timing), was
