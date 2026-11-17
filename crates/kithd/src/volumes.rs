@@ -60,6 +60,8 @@ struct Vol {
     shared: bool,
     /// Made for the claim of its name ([`provision`]): it fits no other.
     made: bool,
+    /// Its claim said `retain`: its data stays when the claim goes ([`RECLAIM`]).
+    retain: bool,
     refused: Option<String>,
 }
 
@@ -98,6 +100,8 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
             node: String::new(),
             encrypted: false,
         };
+        let made = volume.metadata.annotations.contains_key(MADE_FOR_CLAIM);
+        let retain = volume.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN);
         let vol = match serde_json::from_value::<VolumeSpec>(volume.spec.clone()) {
             Ok(spec) => {
                 dir.path = spec.path;
@@ -127,7 +131,8 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
                     dir,
                     size: spec.size.map(|size| size.value()),
                     shared,
-                    made: volume.metadata.annotations.contains_key(MADE_FOR_CLAIM),
+                    made,
+                    retain,
                 }
             }
             Err(e) => Vol {
@@ -135,7 +140,8 @@ fn volumes(store: &Store) -> BTreeMap<String, Vol> {
                 replicas: 1,
                 size: None,
                 shared: false,
-                made: false,
+                made,
+                retain,
                 refused: Some(e.to_string()),
             },
         };
@@ -266,6 +272,10 @@ pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>,
         if claim.spec["shared"] == true {
             spec["shared"] = true.into();
         }
+        let mut annotations = BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]);
+        if claim.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN) {
+            annotations.insert(RECLAIM.into(), RETAIN.into());
+        }
         make.push(Resource {
             api_version: kith_api::API_VERSION.into(),
             kind: "Volume".into(),
@@ -273,20 +283,100 @@ pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>,
                 name: name.into(),
                 namespace: Some(namespace.into()),
                 labels: BTreeMap::new(),
-                annotations: BTreeMap::from([(MADE_FOR_CLAIM.into(), "true".into())]),
+                annotations,
                 revision: Some(0),
             },
             spec,
             status: None,
         });
     }
-    let made = store
-        .list(Some("Volume"))
-        .filter(|volume| volume.metadata.annotations.contains_key(MADE_FOR_CLAIM));
-    let gone = made
-        .map(Resource::key)
-        .filter(|key| !there("VolumeClaim", parts(key).0, parts(key).1));
-    (make, gone.collect())
+    // What a claim says of keeping its data is said on its Volume, for the day the claim is gone
+    // (and again when it says it later, or no longer).
+    for volume in store.list(Some("Volume")) {
+        let key = volume.key();
+        let Some(claim) = store.get(&format!("VolumeClaim/{}", &key["Volume/".len()..])) else {
+            continue;
+        };
+        let keeps = |resource: &Resource| resource.metadata.annotations.get(RECLAIM).is_some_and(|v| v == RETAIN);
+        if !volume.metadata.annotations.contains_key(MADE_FOR_CLAIM) || keeps(claim) == keeps(volume) {
+            continue;
+        }
+        let mut marked = volume.clone();
+        match keeps(claim) {
+            true => marked.metadata.annotations.insert(RECLAIM.into(), RETAIN.into()),
+            false => marked.metadata.annotations.remove(RECLAIM),
+        };
+        make.push(marked);
+    }
+    // A made Volume whose claim is gone: if its data is to stay, or its node cannot remove it
+    // (it is not in the cluster, or the Volume is encrypted, replicated or refused), the Volume
+    // goes at once; if not, its node removes the data first ([`wipes`]) and then deletes it.
+    // ponytail: a node that never comes back keeps its made Volumes: delete them by hand.
+    let gone = volumes(store)
+        .into_iter()
+        .filter(|(key, vol)| vol.made && !there("VolumeClaim", parts(key).0, parts(key).1) && !wipeable(store, vol));
+    (make, gone.map(|(key, _)| key).collect())
+}
+
+/// On a VolumeClaim, and copied to the Volume made for it: `retain` keeps the Volume's data
+/// on its node when the claim is deleted. Without it a deleted claim loses its data.
+// README: say there that deleting a claim that provisioned its Volume deletes its data, and this.
+pub const RECLAIM: &str = "kith.dev/reclaim";
+const RETAIN: &str = "retain";
+
+/// Whether the node of `vol` is to remove its data when its claim goes: a node that is there,
+/// and a Volume that does not say retain and is a plain directory of that node's own.
+fn wipeable(store: &Store, vol: &Vol) -> bool {
+    let plain = vol.refused.is_none() && !vol.dir.encrypted && vol.replicas <= 1 && vol.dir.namespace != SYSTEM;
+    !vol.retain && plain && store.get(&format!("Node/{}", vol.dir.node)).is_some()
+}
+
+/// The Volumes made for a claim that is gone, with their data on `me`, that `me` is to remove:
+/// the data first, then the Volume ([`wipe`]). One applied by hand is never in it.
+pub fn wipes(store: &Store, me: &str) -> Vec<Dir> {
+    let mine = volumes(store).into_iter().filter(|(key, vol)| {
+        let claimed = store.get(&format!("VolumeClaim/{}", &key["Volume/".len()..])).is_some();
+        vol.made && !claimed && wipeable(store, vol) && vol.dir.node == me
+    });
+    mine.map(|(_, vol)| vol.dir).collect()
+}
+
+/// Remove the data of the Volume `dir`: `<state>/volumes/<namespace>/<name>` and what is in it,
+/// and nothing beside it. A part of that path that is a symbolic link is refused, and so is
+/// one that would leave the state directory; links inside it are removed, never followed. Not
+/// there is done.
+pub fn wipe(state: &Path, dir: &Dir) -> Result<(), String> {
+    let plain = |part: &str| !matches!(part, "" | "." | "..") && !part.contains(['/', '\0']);
+    if dir.namespace == SYSTEM || !plain(&dir.namespace) || !plain(&dir.name) {
+        return Err(format!(
+            "Volume {}/{} has no directory of its own to remove",
+            dir.namespace, dir.name
+        ));
+    }
+    let state = state
+        .canonicalize()
+        .map_err(|e| format!("cannot read {}: {e}", state.display()))?;
+    if crate::encrypted::made(&state, &dir.namespace, &dir.name) {
+        return Err("it was made encrypted and its file is on this node: not removed".into());
+    }
+    let mut path = state.clone();
+    for part in ["volumes", &dir.namespace, &dir.name] {
+        path.push(part);
+        match std::fs::symlink_metadata(&path) {
+            Ok(found) if found.is_symlink() => return Err(format!("{} is a symbolic link", path.display())),
+            Ok(found) if !found.is_dir() => return Err(format!("{} is not a directory", path.display())),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    let real = path
+        .canonicalize()
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if real != path || !real.starts_with(&state) {
+        return Err(format!("{} is outside {}", real.display(), state.display()));
+    }
+    std::fs::remove_dir_all(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
 }
 
 /// The names of the volumes a workload's containers mount.
@@ -819,10 +909,150 @@ spec: { node: a, path: tiny, size: 1Gi }
         assert!(status(&store, "VolumeClaim/default/plain")["message"].is_string());
         let (make, gone) = provision(&store, &|_| true);
         assert!(make.is_empty() && gone.is_empty());
-        // It goes when its claim does; a Volume somebody made stays when its claim goes.
+        // It goes when its claim does, its data first, by its node; a Volume somebody made stays.
         store.delete("VolumeClaim/default/huge").unwrap();
         store.delete("VolumeClaim/default/db").unwrap();
-        assert_eq!(provision(&store, &|_| true).1, ["Volume/default/huge"]);
+        assert!(provision(&store, &|_| true).1.is_empty());
+        assert_eq!(wipes(&store, "b").len(), 1);
+    }
+
+    /// A Volume of `default` the way `provision` makes one, on `node`; `retain` marks it kept.
+    fn made(name: &str, node: &str, retain: bool) -> String {
+        let keep = if retain { ", kith.dev/reclaim: retain" } else { "" };
+        format!(
+            "---\napiVersion: kith.dev/v1\nkind: Volume\nmetadata: {{ name: {name}, annotations: {{ kith.dev/made-for-claim: \"true\"{keep} }} }}\nspec: {{ node: {node}, path: data, size: 1Gi }}\n"
+        )
+    }
+
+    #[test]
+    fn wipes_lists_a_made_volume_whose_claim_is_gone_for_its_node() {
+        let source = [
+            made("m1", "a", false),
+            made("m2", "b", false),
+            made("kept", "a", true),
+            made("claimed", "a", false),
+            res("VolumeClaim", "default", "claimed", "{ size: 1Gi, provision: true }"),
+            // Gone, but on a node no longer in the cluster: nothing there to wait for.
+            made("orphan", "lost", false),
+        ]
+        .concat();
+        let store = store(&source);
+        let names = |dirs: Vec<Dir>| dirs.into_iter().map(|dir| dir.name).collect::<Vec<_>>();
+        assert_eq!(names(wipes(&store, "a")), ["m1"]);
+        assert_eq!(names(wipes(&store, "b")), ["m2"]);
+        // `fast`, `slow` and `tiny` were applied by hand: in neither list, however their claim stands.
+        // The retained one and the orphan go at once (their data, if any, stays); the others wait for their node.
+        let (_, gone) = provision(&store, &|_| true);
+        assert_eq!(gone, ["Volume/default/kept", "Volume/default/orphan"]);
+    }
+
+    #[test]
+    fn wiping_removes_the_volume_directory_and_no_other() {
+        let state = state("wipe");
+        let at = |ns: &str, name: &str| state.join("volumes").join(ns).join(name);
+        let kept = [at("shop", "data2"), at("shop", "other"), at("web", "data")];
+        for dir in kept.iter().chain([&at("shop", "data")]) {
+            std::fs::create_dir_all(dir.join("db")).unwrap();
+            std::fs::write(dir.join("db/file"), "x").unwrap();
+        }
+        let outside = state.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious"), "x").unwrap();
+        // A link inside the volume (a container made it) is removed, not followed.
+        std::os::unix::fs::symlink(&outside, at("shop", "data").join("link")).unwrap();
+        wipe(&state, &dir("shop", "data")).unwrap();
+        assert!(!at("shop", "data").exists());
+        assert!(kept.iter().all(|path| path.join("db/file").exists()));
+        assert!(outside.join("precious").exists());
+        // Again, nothing is left to remove.
+        wipe(&state, &dir("shop", "data")).unwrap();
+        // The volume's own directory a link, or the namespace's: refused, nothing outside touched.
+        std::os::unix::fs::symlink(&outside, at("shop", "link")).unwrap();
+        let mut linked = dir("shop", "data");
+        linked.name = "link".into();
+        assert!(wipe(&state, &linked).unwrap_err().contains("symbolic link"));
+        std::fs::create_dir_all(outside.join("db")).unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("volumes/ns")).unwrap();
+        let mut through = dir("ns", "data");
+        through.name = "db".into();
+        assert!(wipe(&state, &through).unwrap_err().contains("symbolic link"));
+        assert!(outside.join("db").exists());
+        // A name or namespace that leaves its place, and a path anywhere on the host, are refused.
+        for (ns, name) in [
+            ("shop", ".."),
+            ("..", "data"),
+            ("shop", ""),
+            ("", "data"),
+            ("shop", "a/b"),
+            ("shop", "."),
+        ] {
+            let mut bad = dir(ns, "data");
+            bad.name = name.into();
+            assert!(wipe(&state, &bad).is_err(), "{ns:?} {name:?}");
+        }
+        assert!(wipe(&state, &dir(SYSTEM, "/tmp")).is_err());
+        assert!(outside.join("precious").exists() && at("web", "data").join("db/file").exists());
+        assert!(state.join("volumes/shop/other/db/file").exists());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_retained_volume_goes_but_its_data_stays() {
+        let state = state("retain");
+        let source = [
+            res("VolumeClaim", "default", "db", "{ size: 10Ti, provision: true }"),
+            res("VolumeClaim", "default", "later", "{ size: 10Ti, provision: true }"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        // A claim that says retain has it said on its Volume as it is made.
+        let mut claim = store.get("VolumeClaim/default/db").unwrap().clone();
+        claim.metadata.annotations.insert(RECLAIM.into(), "retain".into());
+        claim.metadata.revision = None;
+        store.apply(claim).unwrap();
+        let (make, _) = provision(&store, &|_| true);
+        let [db, later] = <[Resource; 2]>::try_from(make).unwrap();
+        assert_eq!(db.metadata.annotations.get(RECLAIM).map(String::as_str), Some("retain"));
+        assert!(!later.metadata.annotations.contains_key(RECLAIM));
+        store.apply(db).unwrap();
+        store.apply(later).unwrap();
+        // A claim that says it after its Volume was made gives the Volume the mark, and takes it away again.
+        let mut claim = store.get("VolumeClaim/default/later").unwrap().clone();
+        claim.metadata.annotations.insert(RECLAIM.into(), "retain".into());
+        claim.metadata.revision = None;
+        store.apply(claim).unwrap();
+        let (make, _) = provision(&store, &|_| true);
+        assert_eq!(make.len(), 1);
+        assert_eq!(make[0].key(), "Volume/default/later");
+        assert_ne!(
+            make[0].metadata.revision,
+            Some(0),
+            "an edit of the live one, not a new one"
+        );
+        store.apply(make.into_iter().next().unwrap()).unwrap();
+        assert!(
+            provision(&store, &|_| true).0.is_empty(),
+            "a second look writes nothing"
+        );
+        // Its claim goes: the Volume is deleted at once and nothing is left to wipe.
+        store.delete("VolumeClaim/default/db").unwrap();
+        assert!(wipes(&store, "a").is_empty() && wipes(&store, "b").is_empty());
+        assert!(
+            provision(&store, &|_| true)
+                .1
+                .contains(&"Volume/default/db".to_string())
+        );
+        // Its data is where it was, and the next claim of the name finds it.
+        let held = Dir {
+            name: "db".into(),
+            ..dir("default", "data")
+        };
+        let there = host_dir(&state, &held).unwrap();
+        std::fs::write(there.join("kept"), "x").unwrap();
+        store.delete("Volume/default/db").unwrap();
+        let again = host_dir(&state, &held).unwrap();
+        assert_eq!(std::fs::read_to_string(again.join("kept")).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
