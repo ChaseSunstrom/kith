@@ -130,11 +130,19 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             let (name, ttl) = (format!("{}.node.kith", node.metadata.name), NODE_TTL);
             own.push(Record { name, ttl, data });
         }
-        let mesh = node
+        // A node's mesh name is its own mesh address, the one the cluster gives it (its peers reach
+        // it there, mesh.rs): a status that names another address publishes nothing. (With no
+        // prefix to derive it from, what the status says.)
+        let said = node
             .status
             .as_ref()
-            .and_then(|status| status["mesh"]["address"].as_str());
-        if let Some(address) = mesh.and_then(|address| address.parse().ok()) {
+            .and_then(|status| status["mesh"]["address"].as_str())
+            .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok());
+        let published = match mesh {
+            Some(prefix) => said.filter(|said| *said == kith_mesh::node_address(prefix, &node.metadata.name)),
+            None => said,
+        };
+        if let Some(address) = published {
             let (name, ttl) = (format!("{}.mesh.kith", node.metadata.name), NODE_TTL);
             let data = Rdata::Aaaa(address);
             own.push(Record { name, ttl, data });
@@ -649,17 +657,18 @@ spec: {}
     #[test]
     fn zones_come_from_the_store() {
         let mut store = store(HOME);
+        let mesh = kith_mesh::prefix(b"test");
+        let own = kith_mesh::node_address(mesh, "alpha");
         store
             .set_status(
                 "Node/alpha",
-                Some(json!({ "address": "10.1.2.3:7443", "mesh": { "address": "fd00:1::1" } })),
+                Some(json!({ "address": "10.1.2.3:7443", "mesh": { "address": own.to_string() } })),
             )
             .unwrap();
-        let mesh = kith_mesh::prefix(b"test");
         let (zones, status) = zones_of(&store, Some(mesh));
         let outside = "198.51.100.1";
         let on_mesh = zones.lookup(outside.parse().unwrap(), "alpha.mesh.kith", 28).unwrap();
-        assert_eq!(on_mesh.answers[0].data, Rdata::Aaaa("fd00:1::1".parse().unwrap()));
+        assert_eq!(on_mesh.answers[0].data, Rdata::Aaaa(own));
 
         assert_eq!(ask(&zones, outside, "alpha.node.kith"), Ok(vec!["10.1.2.3".into()]));
         // Ours to answer, so "no such name" (3), and never forwarded.
@@ -689,6 +698,29 @@ spec: {}
         assert!(alias.contains("is a CNAME and has other records too"), "{alias}");
         let lost = status["DNSRecord/lost"]["message"].as_str().unwrap();
         assert!(lost.contains("no DNSZone named `nowhere`"), "{lost}");
+    }
+
+    /// A node's mesh name is published at the address the cluster gives it (its node_address) and at
+    /// no other: what its status says of its mesh address counts only when it is that one.
+    #[test]
+    fn a_node_publishes_its_mesh_name_only_at_its_own_address() {
+        let mesh = kith_mesh::prefix(b"test");
+        let own = kith_mesh::node_address(mesh, "alpha");
+        let published = |said: Option<&str>| -> Vec<Rdata> {
+            let mut store = store(HOME);
+            if let Some(said) = said {
+                let status = json!({ "address": "10.1.2.3:7443", "mesh": { "address": said } });
+                store.set_status("Node/alpha", Some(status)).unwrap();
+            }
+            let (zones, _) = zones_of(&store, Some(mesh));
+            let found = zones.lookup(OUTSIDE.parse().unwrap(), "alpha.mesh.kith", 28);
+            found
+                .map(|found| found.answers.into_iter().map(|record| record.data).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(published(Some(own.to_string().as_str())), vec![Rdata::Aaaa(own)]);
+        assert_eq!(published(Some("fd00:1::1")), Vec::<Rdata>::new());
+        assert_eq!(published(None), Vec::<Rdata>::new());
     }
 
     const OUTSIDE: &str = "198.51.100.1";
