@@ -713,7 +713,10 @@ pub fn early() -> Boot {
         Ok(record) => Some((record?, device)),
         Err(e) => {
             eprintln!("kithd: init: {e}");
-            end(true)
+            // (An erased record stays erased: a restart would only find it again.)
+            let erased = e == crate::crypt::ERASED;
+            POWER_OFF.store(erased, Ordering::Relaxed);
+            end(!erased)
         }
     });
     // What the config says is obeyed below and measured by no firmware: it goes into the
