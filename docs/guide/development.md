@@ -24,7 +24,7 @@
 | `examples/` | Resources to apply as they are |
 | `ci/` | The budgets, the benchmark, the VM tests (`vm.sh`), and what measures and photographs the website (`site_numbers.py`, `site_shots.py`) |
 | `dist/` | A systemd user unit for agent mode |
-| `docs/` | The website (GitHub Pages serves this folder: `index.html`, `site.css`, `site.js`, its numbers and typeface), the pictures this file shows, and `adr-workers.md`, the design for worker nodes that is not built yet |
+| `docs/` | The website (GitHub Pages serves this folder), the pictures the README shows, and `adr-workers.md`, the design for worker nodes that is not built yet |
 
 ## Development
 
@@ -37,15 +37,10 @@ python3 ci/budgets.py            # binary-size and memory budgets, enforced in C
 python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
-Time budgets sit beside the size and memory ones. Three times are measured on one
-machine with no VM: `kith apply` until a container of a local image runs, a status
-change written on one of two kithds until the other has it, and one DNS answer from
-kithd. Each time is the median of five runs: `python3 ci/budgets.py --times` prints
-them, and the build's `python3 ci/budgets.py` holds each to its budget. Each budget is
-twice the slowest of three such medians on main on the CI runner, rounded up: a ceiling for a
-regression, not a claim of speed. Each is printed as `ok   one DNS answer from kithd:
-2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1. A machine where a path cannot be run (no
-cgroup of its own for a container, say) fails that path, since it has a budget.
+Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
+prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
+the CI runner, rounded up: a ceiling for a regression, not a claim of speed. A line reads `ok
+one DNS answer from kithd: 2.4 ms (budget 7.0 ms)`, or `FAIL` and exit 1.
 
 | Time | On the CI runner: the median of five, on three runs on main | Budget |
 |---|---|---|
@@ -54,58 +49,21 @@ cgroup of its own for a container, say) fails that path, since it has a budget.
 | one DNS answer from kithd | 2.9, 3.1, 3.5 ms | 7 ms |
 | boot to ready | 2.5 to 3.7 s to `kithd` answering, in a VM (`boot` in [ci/compare.txt](../../ci/compare.txt)) | not budgeted: no VM runs in CI |
 
-Release binaries are static musl builds. `kith-runtime` pulls in `ring`, which
-has C in it, so linking it for musl needs a musl C compiler: `musl-tools` on
-Debian/Ubuntu, or point `CC_x86_64_unknown_linux_musl` at a `zig cc -target
-x86_64-linux-musl` wrapper.
+Release binaries are static musl builds: `ring` (C) needs `musl-tools` (Debian/Ubuntu) or
+`CC_x86_64_unknown_linux_musl` set to a `zig cc -target x86_64-linux-musl` wrapper.
 
-kithd is linked by the Rust toolchain's own lld, with the functions it runs from its
-start until it has idled a while first in its code, in the order
-`crates/kithd/kithd.order` lists them. The kernel keeps in memory the pages around each
-one a process touches: with that code where the compiler put it, all over the binary,
-kithd with nothing to do held 10.50 MB without the order and 4.62 MB with it
-(`python3 ci/budgets.py`; the budget stays 9.00 MB). Those are of the binary read from
-disk, as a node has it: `ci/budgets.py` drops the file's cache and reads it back before it
-starts kithd, so the number is the same right after a build and an hour later. Right
-after a build, with the file in the page cache as the linker wrote it, the kernel maps
-fewer pages around each one touched, and kithd held 8.75 MB without the order and 3.75 MB
-with it (an earlier version of this paragraph told those: 8.91 and 3.81). On tmpfs the
-cache cannot be dropped and the number is that of the file as it is there. The binary is
-11.35 MB, as it was without the order. `python3 ci/order.py` writes the file again from a run of the kithd it
-builds: a breakpoint on every function, taken off the first time it is hit, so each one
-that runs is seen once and in order (x86_64 Linux). The file holds each name as a
-pattern, without what an ordinary change gives another value: the letters Rust writes
-before each crate's name (a `cargo update` or a new compiler changes them), the number
-of an `impl` in its module (one more for every `impl` written above it) and the number
-the compiler ends a copy of a function with. So the file outlives most changes; code
-written since is not in it, and each function kithd runs at start that is left where
-the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py
---check`, which CI runs, fails once under 95 in 100 of its names are still in kithd,
-or under four fifths of those are together where its code starts. The order is of
-one compiler, the one `rust-toolchain.toml` names (rustup installs it by itself):
-Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held
-5.96 MB (measured right after the build). After naming another there, run `python3
-ci/order.py` again. A toolchain with no lld links kithd in the compiler's order, with a
-warning, and it holds the 10.50 MB again (the check then fails, saying there is no lld).
+kithd is linked by the toolchain's own lld with the functions it runs from its start until it
+has idled a while first, in the order `crates/kithd/kithd.order` lists. The kernel keeps the
+pages around each one a process touches, so kithd idle held 10.50 MB without the order and 4.62
+MB with it (`python3 ci/budgets.py`; budget 9.00 MB).
 
-That number is of a kithd with nothing to do on the machine that built it. As the first
-process of kith OS it does more before it serves (its mounts, the state partition, DHCP,
-its node's TLS), and none of that code is in the order file, which is traced from a kithd
-that is not the first process. kithd as the first process says on its console what it
-holds when it is told to stop (`kithd: init: told to stop: 10248 kB resident, 8996 kB of
-it files`), and the VM tests print it: `sh ci/vm.sh --test image`, from the image's own
-root after one TLS request, 10.2 MB, 9.0 of them files, which is its own program (7.7 MB
-of its 9.8 MB of code); `sh ci/vm.sh --test init`, from a memory disk and told to stop as
-soon as it serves, 6.4 MB, 5.4 of them files. Tried in that VM, and not kept: telling the
-kernel the code is read at random (`MADV_RANDOM`) changed nothing (10.3 to 10.6 MB: the
-pages the kernel maps around a fault are not read-ahead); with the kernel mapping one
-page a fault where it maps 64 kB (a setting of the whole node, which kith OS leaves as it
-is) kithd held 7.7 MB, 5.4 of them code, so most of what it holds is code it ran, a page
-here and a page there, and not the pages around it. (Not tried: dropping the pages once
-it serves, which lowers the number until each is used again.) What would lower it is that code linked together
-too, which the order file does not do yet. These pages are the kernel's copy of a file:
-it takes them back when memory is short. No budget holds the VM's number (no VM runs in
-CI); the 9.00 MB budget is of the build machine's.
+| | |
+|---|---|
+| **Measured** | Of the binary read from disk, as a node has it: `ci/budgets.py` drops the file's cache and reads it back before starting kithd, so the number is the same right after a build and an hour later. Right after a build, with the file in the page cache as the linker wrote it, the kernel maps fewer pages around each one touched: 8.75 MB without the order, 3.75 with it. On tmpfs the cache cannot be dropped, so the number is that of the file as it is there. The binary is 11.35 MB, as without the order. |
+| **Writing it** | `python3 ci/order.py` (x86_64 Linux) writes the file from a run of the kithd it builds: a breakpoint on every function, taken off when first hit, so each one that runs is seen once, in order. Each name is a pattern without what an ordinary change alters: the letters Rust writes before each crate's name (`cargo update` or a new compiler changes them), an `impl`'s number in its module, and the number a copy of a function ends with. So the file outlives most changes, but code written since is not in it, and each start-up function left where the compiler put it keeps up to 64 kB around it in memory. `python3 ci/order.py --check`, which CI runs, fails once under 95 in 100 of its names are still in kithd, or under four fifths of those are together where its code starts. |
+| **Toolchain** | The order is of the one compiler `rust-toolchain.toml` names (rustup installs it): Rust 1.100.0 gave a tenth of these functions other names, and kithd built with it held 5.96 MB, measured right after the build. After naming another, run `python3 ci/order.py` again. With no lld, kithd is linked in the compiler's order with a warning and holds 10.50 MB again (the check then fails, saying there is no lld). |
+| **As init** | As the first process of kith OS, kithd does more before it serves (mounts, the state partition, DHCP, its node's TLS), none of it in the order file, which is traced from a kithd that is not first. It says on its console what it holds when told to stop (`kithd: init: told to stop: 10248 kB resident, 8996 kB of it files`), and the VM tests print it: `sh ci/vm.sh --test image`, from the image's own root after one TLS request, 10.2 MB, 9.0 of them files, which is its own program (7.7 MB of its 9.8 MB of code); `sh ci/vm.sh --test init`, from a memory disk and told to stop as soon as it serves, 6.4 MB, 5.4 of them files. No budget holds the VM's number (no VM runs in CI); the 9.00 MB budget is of the build machine's. |
+| **Tried, not kept** | Telling the kernel the code is read at random (`MADV_RANDOM`) changed nothing (10.3 to 10.6 MB): the pages it maps around a fault are not read-ahead. Mapping one page a fault where it maps 64 kB (a setting of the whole node, which kith OS leaves) gave 7.7 MB, 5.4 of them code, so most of what kithd holds is code it ran, a page here and there, not the pages around it. Not tried: dropping the pages once it serves, which lowers the number until each is used again. These pages are the kernel's copy of a file, taken back when memory is short; what would lower them is that code linked together too, which the order file does not do yet. |
 
 ### Testing on several nodes
 
@@ -125,22 +83,15 @@ KITH_E2E=1 cargo test -q -p kithd init_dhcp             # an address from a real
 sh ci/vm.sh --help                                      # any kernel, initramfs and disk image
 ```
 
-The `rig_` tests in `crates/kithd/tests/cluster.rs` run the test again inside
-`unshare -Urnm` (rootless; nothing outside it changes) and put each kithd in its own
-network namespace, a veth pair to the test's own namespace, which is the router.
-A node can sit behind a NAT (SNAT out, and only its API port forwarded in, TCP
-only, so UDP and every other inbound connection are dropped like a home router
-would), a node's link can be cut and healed, and `tc netem` latency is added when
-the kernel has `sch_netem`. Without `KITH_E2E=1`, user namespaces, `ip`,
-`iptables` or `nsenter`, a test prints `skipped: ...` and passes; without netem
-it prints `skipped: no netem` and goes on without the latency. The relay through an
-edge node is not covered here: kithd falls back to it only after 180 s of
-silence (`QUIET` in `crates/kithd/src/mesh.rs`), and `kith-mesh` has unit tests
-for the choice.
+The `rig_` tests in `crates/kithd/tests/cluster.rs` run again inside `unshare -Urnm` (rootless),
+each kithd in its own network namespace with a veth pair to the test's, the router. A node can
+sit behind a NAT (SNAT out, only its API port forwarded in, TCP only), its link can be cut and
+healed, and `tc netem` latency is added when the kernel has `sch_netem`. Without `KITH_E2E=1`,
+user namespaces, `ip`, `iptables` or `nsenter`, a test prints `skipped: ...` and passes. The
+edge relay (after 180 s of silence, `QUIET` in `crates/kithd/src/mesh.rs`) is not covered.
 
-`ci/vm.sh` is the launcher the image, installer, update and cluster tests reuse. It
-builds the static kithd, makes an initramfs whose `/init` is that kithd, boots the
-host's kernel with it under QEMU and KVM, and prints the console. `--kernel`,
-`--initrd` and `--disk` take any other; a disk image is attached with `-snapshot`
-(it is never written, and a `/dev` path is refused). Where there is no QEMU, KVM or
-readable kernel it prints `skipped: ...` and exits 0.
+`ci/vm.sh`, the launcher the image, installer, update and cluster tests reuse, builds the static
+kithd, makes an initramfs whose `/init` is it, boots the host's kernel with it under QEMU and
+KVM, and prints the console. `--kernel`, `--initrd` and `--disk` take any other (a disk is
+attached `-snapshot`, never written; a `/dev` path is refused). Without QEMU, KVM or a readable
+kernel it prints `skipped: ...`, exit 0.
