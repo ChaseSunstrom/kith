@@ -282,14 +282,27 @@ fn disk(partition: &std::path::Path) -> Option<std::ffi::OsString> {
 /// a partition of the disk the root is on will do: a stick with a partition named `state`
 /// must not become the node's store, nor one named `root-b` its next system.
 pub(crate) fn labelled(label: &str) -> Option<std::path::PathBuf> {
-    let ours = root_slave(std::path::Path::new(ROOT_SLAVES)).and_then(|under| disk(&under));
+    let slaves = std::path::Path::new(ROOT_SLAVES);
+    let verity = slaves.parent().is_some_and(std::path::Path::exists);
+    let ours = root_slave(slaves).and_then(|under| disk(&under));
     sorted(std::path::Path::new("/sys/class/block"))
         .into_iter()
         .find_map(|device| {
             let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
             let name = partition(&uevent, label)?;
-            (ours.is_none() || disk(&device) == ours).then(|| std::path::Path::new("/dev").join(name))
+            on_ours(verity, ours.as_deref(), disk(&device).as_deref()).then(|| std::path::Path::new("/dev").join(name))
         })
+}
+
+/// Whether a partition on `disk` may be taken: any, where there is no verity root (the
+/// installer from its stick, a development start); where there is one, only one on the disk
+/// it is read from, and none when that disk cannot be read (it fails closed).
+fn on_ours(verity: bool, ours: Option<&std::ffi::OsStr>, disk: Option<&std::ffi::OsStr>) -> bool {
+    match (verity, ours) {
+        (false, _) => true,
+        (true, None) => false,
+        (true, Some(ours)) => disk == Some(ours),
+    }
 }
 
 /// The firmware's variables, and the one systemd-boot sets to the partition GUID of the ESP it
@@ -648,14 +661,12 @@ fn consoles() {
     });
 }
 
-/// The first things, before anything else of kithd runs. Each is tried and said if it
-/// fails: with part of them kithd may still serve, and a console line says what is missing.
-pub fn early() -> Boot {
-    // Ctrl-Alt-Del comes to this process as SIGINT instead of restarting the machine at once.
-    let _ = set_cad_enabled(false);
+/// What the first process mounts: (kind, where, flags, options). Nothing runs a program
+/// from /dev/shm, /run or /tmp (a container's image and volumes under /run are mounts of
+/// their own, with their own flags), so none may.
+fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 8] {
     let quiet = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
-    let shared = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
-    let mounts = [
+    [
         ("proc", "/proc", quiet, ""),
         ("sysfs", "/sys", quiet, ""),
         ("devtmpfs", "/dev", MsFlags::MS_NOSUID, "mode=0755"),
@@ -665,12 +676,19 @@ pub fn early() -> Boot {
             MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
             "gid=5,mode=620,ptmxmode=666",
         ),
-        ("tmpfs", "/dev/shm", shared, "mode=1777"),
-        ("tmpfs", "/run", shared, "mode=0755"),
-        ("tmpfs", "/tmp", shared, "mode=1777"),
+        ("tmpfs", "/dev/shm", quiet, "mode=1777"),
+        ("tmpfs", "/run", quiet, "mode=0755"),
+        ("tmpfs", "/tmp", quiet, "mode=1777"),
         ("cgroup2", "/sys/fs/cgroup", quiet, ""),
-    ];
-    for (kind, at, flags, data) in mounts {
+    ]
+}
+
+/// The first things, before anything else of kithd runs. Each is tried and said if it
+/// fails: with part of them kithd may still serve, and a console line says what is missing.
+pub fn early() -> Boot {
+    // Ctrl-Alt-Del comes to this process as SIGINT instead of restarting the machine at once.
+    let _ = set_cad_enabled(false);
+    for (kind, at, flags, data) in mounts() {
         let made = std::fs::create_dir_all(at).map_err(|e| e.to_string());
         let mounted = made.and_then(|()| {
             match mount(
@@ -886,6 +904,26 @@ mod tests {
             (ext4_blocks(&superblock), ext4_blocks(&superblock[..100])),
             (None, None)
         );
+    }
+
+    /// With a verity root whose disk cannot be read, no partition is taken (a stick's `state`
+    /// would have been); with no verity root, any is, as the installer's stick needs.
+    #[test]
+    fn labelled_refuses_every_disk_when_dm0_exists_with_no_slave_but_not_when_it_is_absent() {
+        let (vda, sdb) = (Some(std::ffi::OsStr::new("vda")), Some(std::ffi::OsStr::new("sdb")));
+        assert!(!on_ours(true, None, vda) && !on_ours(true, None, sdb) && !on_ours(true, None, None));
+        assert!(on_ours(true, vda, vda) && !on_ours(true, vda, sdb) && !on_ours(true, vda, None));
+        assert!(on_ours(false, None, vda) && on_ours(false, None, sdb));
+    }
+
+    /// /dev/shm, /run and /tmp are mounted noexec, nosuid and nodev, as /proc and /sys are.
+    #[test]
+    fn run_tmp_and_shm_are_mounted_noexec() {
+        let all = MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        for at in ["/dev/shm", "/run", "/tmp"] {
+            let (_, _, flags, _) = mounts().into_iter().find(|(_, there, _, _)| *there == at).unwrap();
+            assert!(flags.contains(all), "{at}: {flags:?}");
+        }
     }
 
     /// `booted` and `labelled` read the same slave of dm-0: the first by name, whatever order the

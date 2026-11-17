@@ -210,9 +210,17 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
         words.push(word);
     }
     words.push(format!("-- --listen 0.0.0.0:{PORT}"));
-    let address = answers.ip.as_deref().and_then(|ip| ip.trim().split('/').next());
+    // (An empty ip is none, not `--advertise :7443`.)
+    let address = answers
+        .ip
+        .as_deref()
+        .and_then(|ip| ip.trim().split('/').next())
+        .filter(|a| !a.is_empty());
     if let Some(address) = address {
-        words.push(format!("--advertise {address}:{PORT}"));
+        let ip: std::net::Ipv4Addr = address
+            .parse()
+            .map_err(|_| format!("`{address}` in ip is not an IP address"))?;
+        words.push(format!("--advertise {ip}:{PORT}"));
     }
     if let Some(keys) = &answers.release_key {
         let keys: Vec<&str> = keys.split(',').map(str::trim).collect();
@@ -401,6 +409,7 @@ pub fn write(image: &mut File, disk: &mut File, config: &str, mut said: impl FnM
                 .into(),
         );
     }
+    zero_after(disk, length, &mut block).map_err(io("clearing the disk past kith OS"))?;
     // (To its end: a config from an install before this one would otherwise show through.)
     let mut text = config.as_bytes().to_vec();
     text.resize(room.min(64 << 10) as usize, 0);
@@ -412,6 +421,34 @@ pub fn write(image: &mut File, disk: &mut File, config: &str, mut said: impl FnM
     (back == text)
         .then_some(())
         .ok_or("the node's config did not stay on the disk as written".into())
+}
+
+/// What a reused disk held past `from` (an older install's state, someone's files) made to
+/// read as zeros, so the state partition grown over it later shows none of it. The disk
+/// clears the range itself where it can (unmapped, then zeroed in place); else it is written.
+fn zero_after(disk: &mut File, from: u64, block: &mut [u8]) -> std::io::Result<()> {
+    use nix::fcntl::{FallocateFlags as F, fallocate};
+    let end = disk.seek(SeekFrom::End(0))?;
+    let Some(len) = end.checked_sub(from).filter(|len| *len > 0) else {
+        return Ok(());
+    };
+    let (at, len) = (from as i64, len as i64);
+    let cleared = [
+        F::FALLOC_FL_PUNCH_HOLE | F::FALLOC_FL_KEEP_SIZE,
+        F::FALLOC_FL_ZERO_RANGE,
+    ]
+    .into_iter()
+    .any(|how| fallocate(std::os::fd::AsRawFd::as_raw_fd(&*disk), how, at, len).is_ok());
+    if !cleared {
+        block.fill(0);
+        let mut at = from;
+        while at < end {
+            let some = block.len().min((end - at) as usize);
+            disk.write_all_at(&block[..some], at)?;
+            at += some as u64;
+        }
+    }
+    disk.sync_all()
 }
 
 /// The answers file as YAML.
@@ -828,6 +865,23 @@ mod tests {
         std::fs::remove_dir_all(&sys).unwrap();
     }
 
+    /// An empty ip is no ip: no --advertise word (it was `--advertise :7443`); an ip whose
+    /// address is not one is refused by name.
+    #[test]
+    fn an_empty_ip_gives_no_advertise_word_and_a_bad_one_is_refused() {
+        let one = [disk("sda", 8)];
+        let config = |yaml: &str| {
+            let yaml = format!("disk: sda\n{yaml}");
+            plan(&answers(&yaml).unwrap(), &one, 300 << 20, 1 << 20).map(|(_, c)| c)
+        };
+        for yaml in ["ip: \"\"\n", "ip: \"  \"\n", "hostname: alpha\n"] {
+            let said = config(yaml).unwrap();
+            assert!(!said.contains("--advertise"), "{yaml}: {said}");
+        }
+        let bad = config("ip: alpha/24\n").unwrap_err();
+        assert!(bad.contains("ip"), "{bad}");
+    }
+
     #[test]
     fn install_needs_a_disk_named_or_the_only_one() {
         let two = [disk("sda", 8), disk("nvme0n1", 256)];
@@ -1029,6 +1083,30 @@ mod tests {
         image
     }
 
+    /// A reused disk: what it held past the image (an older install's state, someone's
+    /// files) reads as zeros once kith OS is written, so the state partition grown over
+    /// it later shows none of it; the disk keeps its size.
+    #[test]
+    fn write_zeroes_what_a_reused_disk_held_past_the_image() {
+        let dir = std::env::temp_dir().join(format!("kith-install-reused-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("image"), image("config")).unwrap();
+        // (Not a multiple of the copy's block, nor of a sector: the end is zeroed to the byte.)
+        std::fs::write(dir.join("disk"), vec![0x5a; (3 << 20) + 777]).unwrap();
+        let open = |name: &str| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+        };
+        write(&mut open("image"), &mut open("disk"), "kith.hostname=alpha", |_| ()).unwrap();
+        let wrote = std::fs::read(dir.join("disk")).unwrap();
+        assert_eq!(wrote.len(), (3 << 20) + 777);
+        assert!(wrote[64 * 512..].iter().all(|byte| *byte == 0));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn install_copies_the_image_and_writes_the_config_where_its_table_says() {
         let dir = std::env::temp_dir().join(format!("kith-install-{}", std::process::id()));
@@ -1056,8 +1134,8 @@ mod tests {
         assert_eq!(wrote[..40 * 512], source[..40 * 512]);
         assert_eq!(wrote[44 * 512..64 * 512], source[44 * 512..]);
         assert!(
-            wrote[64 * 512..].iter().all(|byte| *byte == 0xee),
-            "past the image the disk is left alone"
+            wrote[64 * 512..].iter().all(|byte| *byte == 0),
+            "past the image what the disk held is gone"
         );
         let config = &wrote[40 * 512..44 * 512];
         assert!(config.starts_with(b"kith.hostname=alpha -- --claim\0") && config[40..].iter().all(|byte| *byte == 0));

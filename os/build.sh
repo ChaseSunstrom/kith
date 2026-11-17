@@ -232,7 +232,7 @@ assemble() { # DIR
     truncate -s 64M "$w/esp.img" "$w/esp-install.img"
     mkfs.vfat --invariant -i 6B697468 -n KITH-ESP "$w/esp.img" >/dev/null
     mkfs.vfat --invariant -i 6B697469 -n KITH-INST "$w/esp-install.img" >/dev/null
-    printf 'timeout 0\n' >"$w/loader.conf"
+    printf 'timeout 0\neditor no\n' >"$w/loader.conf"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/loader.conf"
     cp -p "$efi/systemd-bootx64.efi" "$w/boot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/boot.efi"
