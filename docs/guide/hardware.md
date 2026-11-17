@@ -73,7 +73,10 @@ reaches it only if the label lists N, or N is `kith-system`, the cluster's own. 
 `display`, `usb`, `other`) and every `Seat` is `kith-system`'s alone. A seat claim also needs
 each of the Seat's labelled Devices to be given to N. The label is an admin's
 (`metadata.labels`, `kith apply -f`): discovery keeps it, and a worker cannot add, change or
-drop it. Removing it refuses a claim at the next pass; its `status.message` says why.
+drop it. Removing it refuses a claim at the next pass; its `status.message` says why. A
+labelled `Device` or `Seat` whose hardware is gone is kept, so the label is there when it comes
+back, and marked `kith.dev/absent: "true"` until then: a claim naming it is refused ("is
+absent") and a selector passes over it.
 
 **A share of a GPU's vram.** A `shared` claim may say `share: { vram: 512Mi }`: what it asks of
 each Device it holds, counted against the Device's `vram` label. A workload's shares add up; one

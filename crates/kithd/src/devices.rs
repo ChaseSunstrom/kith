@@ -18,11 +18,14 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 const DISCOVERED: &str = "kith.dev/discovered";
+/// On a Device or Seat kept while its hardware is gone (it was given namespaces): no claim gets it.
+pub(crate) const ABSENT: &str = "kith.dev/absent";
 
 /// Every label discovery writes. A worker's Device may carry these and no other
 /// (`crate::worker`): one added here is one a control node takes from a worker.
-pub(crate) const LABELS: [&str; 12] = [
+pub(crate) const LABELS: [&str; 13] = [
     DISCOVERED,
+    ABSENT,
     "kith.dev/node",
     "class",
     "vendor",
@@ -455,10 +458,19 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
     // (A Device or Seat an admin gave namespaces is kept while its hardware is gone, so the label
     // is there when it is found again: only a node that is gone or misnamed takes it away.)
     let labelled = |live: &Resource| live.metadata.labels.contains_key(crate::claims::NAMESPACES);
-    let gone = live.filter(|live| {
-        ours(live, node) && !labelled(live) && !found.iter().any(|new| new.key() == live.key()) || left(live)
-    });
-    let gone: Vec<String> = gone.map(Resource::key).chain(changed).collect();
+    let missing = |live: &Resource| ours(live, node) && !found.iter().any(|new| new.key() == live.key());
+    let mut gone = Vec::new();
+    for live in live {
+        if missing(live) && !labelled(live) || left(live) {
+            gone.push(live.key());
+        } else if missing(live) && !live.metadata.labels.contains_key(ABSENT) {
+            // (Kept, it is marked absent: a claim would give its holder a /dev path not there.)
+            let mut marked = live.clone();
+            marked.metadata.labels.insert(ABSENT.into(), "true".into());
+            apply.push(marked);
+        }
+    }
+    gone.extend(changed);
     // (What this pass takes away holds nothing: the name is listed at the next.)
     held.retain(|(key, _)| !gone.contains(key));
     (apply, gone, held)
@@ -1101,8 +1113,13 @@ mod tests {
             .filter(|r| r.metadata.name != "n1-gpu-card0")
             .cloned()
             .collect();
-        let (_, gone, _) = changes(&store, "n1", &without);
+        let (apply, gone, _) = changes(&store, "n1", &without);
         assert!(gone.is_empty(), "{gone:?}");
+        // Marked absent, so no claim resolves to its missing /dev path.
+        let marked = apply.iter().find(|r| r.key() == labelled.key()).expect("marked absent");
+        assert_eq!(marked.metadata.labels.get(ABSENT).map(String::as_str), Some("true"));
+        store.apply(marked.clone()).unwrap();
+        assert!(changes(&store, "n1", &without).0.is_empty(), "marked once");
         // Found again, with a driver it did not have: written back with the label it has.
         let mut back = found.clone();
         back.iter_mut()
@@ -1121,6 +1138,7 @@ mod tests {
             written.metadata.labels.get("kith.dev/namespaces").map(String::as_str),
             Some("ops")
         );
+        assert!(!written.metadata.labels.contains_key(ABSENT), "there again");
         let _ = std::fs::remove_dir_all(&root);
     }
 

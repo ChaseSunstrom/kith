@@ -116,7 +116,9 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
                 let have = &device.metadata.labels;
                 claim.selector.iter().all(|(k, v)| have.get(k) == Some(v))
             };
-            let matched: Vec<&Resource> = store.list(Some("Device")).filter(fits).collect();
+            // (One kept while its hardware is gone is passed over.)
+            let there = |device: &&Resource| !device.metadata.labels.contains_key(crate::devices::ABSENT);
+            let matched: Vec<&Resource> = store.list(Some("Device")).filter(fits).filter(there).collect();
             // (Only the matches given to the namespace are its; the others are not named back.)
             let names: Vec<String> = matched
                 .iter()
@@ -137,6 +139,9 @@ fn resolve_one(store: &Store, namespace: &str, claim: &DeviceClaimSpec) -> Resul
     for name in &names {
         let device = store.get(&format!("Device/{name}"));
         let device = device.ok_or(format!("there is no Device {name}"))?;
+        if device.metadata.labels.contains_key(crate::devices::ABSENT) {
+            return Err(format!("Device {name} is absent: its hardware is gone from its node"));
+        }
         // (A seat's claim is checked against the Seat's label; a Device of it that has its own label
         // must be given too, and one without follows the Seat's.)
         if (claim.seat.is_none() || device.metadata.labels.contains_key(NAMESPACES)) && !given(device, namespace) {
@@ -768,6 +773,31 @@ spec: { node: b, devices: [b-keyboard] }
         assert_eq!(
             claimed(OPEN, "ops", "{ selector: { class: gpu } }"),
             Ok(("a".into(), vec!["a-gpu-card0".into()]))
+        );
+    }
+
+    /// A camera kept on `a` after it was unplugged (discovery marks it absent), one like it on `b`.
+    const ABSENT: &str = "
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: a-camera-video1, labels: { model: c920, kith.dev/node: a, kith.dev/namespaces: default, kith.dev/absent: 'true' } }
+spec: { node: a, class: camera, path: /dev/video1 }
+---
+apiVersion: kith.dev/v1
+kind: Device
+metadata: { name: b-camera-video0, labels: { model: c920, kith.dev/node: b, kith.dev/namespaces: default } }
+spec: { node: b, class: camera, path: /dev/video0 }
+";
+
+    #[test]
+    fn an_absent_device_is_refused_and_a_selector_passes_over_it() {
+        // Named, it is refused: its holder would get a /dev path that is not there.
+        let err = claimed(ABSENT, "default", "{ device: a-camera-video1 }").unwrap_err();
+        assert!(err.contains("Device a-camera-video1 is absent"), "{err}");
+        // A selector takes the one that is there, though the absent one is on the lower node.
+        assert_eq!(
+            claimed(ABSENT, "default", "{ selector: { model: c920 } }"),
+            Ok(("b".into(), vec!["b-camera-video0".into()]))
         );
     }
 
