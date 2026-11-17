@@ -33,6 +33,7 @@ docs!(
     "docs/guide/ui.md",
     "docs/guide/os.md",
     "docs/guide/development.md",
+    "docs/guide/numbers.md",
 );
 
 #[test]
