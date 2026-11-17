@@ -42,7 +42,9 @@ jobs:
       # kithd's idle memory is low because the code it runs at start is linked together, in the
       # order of a file: one that names little of today's kithd orders little (and a toolchain
       # with no lld of its own orders nothing: this fails then too, saying so).
+      # (These two run when the budgets failed too: they say whether the order is why.)
       - name: kithd's order file still names its functions
+        if: ${{ !cancelled() }}
         run: python3 ci/order.py --self-test && python3 ci/order.py --check
       # ... and names what kithd runs today: code written since the last trace that runs at start
       # or idle is linked wherever the compiler put it (43 such functions once cost 2 MB).
@@ -50,6 +52,7 @@ jobs:
       # does not name ran here: its errors' texts, its C library's). It is held where the file
       # is traced: ci/budgets.py runs it off CI.
       - name: kithd's order file names what kithd runs (printed, not enforced)
+        if: ${{ !cancelled() }}
         run: python3 ci/order.py --stale || true
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
       - name: Times on the CI runner (printed, not enforced)
