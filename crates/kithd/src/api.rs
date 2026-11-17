@@ -41,7 +41,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use kith_api::Resource;
-use kith_api::kinds::Verb;
+use kith_api::kinds::{CronJobSpec, Verb};
 use kith_api::store::{Change, Error, Revision, Store};
 use kith_store::{Command, Done};
 use serde::Deserialize;
@@ -184,7 +184,29 @@ fn beyond(store: &Store, resources: &[Resource]) -> Vec<Right> {
         .iter()
         .map(|resource| (resource.kind.clone(), place(store, resource)))
         .collect();
-    made.chain(reached(&written)).collect()
+    // A container with its seccomp filter off (or with calls allowed through it) runs on the
+    // node with no filter: whoever writes one must be allowed Unconfined, which no namespace holds.
+    let loose = resources
+        .iter()
+        .filter(|resource| unconfined(resource))
+        .map(|_| (Verb::Apply, "Unconfined".to_string(), None));
+    made.chain(reached(&written)).chain(loose).collect()
+}
+
+/// Whether applying `resource` sets a container's seccomp unconfined, or names calls its filter
+/// allows: the same test the node's `unconfined` key is asked ([`crate::policy::needs`]). A
+/// CronJob's is the template of the Job it makes.
+fn unconfined(resource: &Resource) -> bool {
+    let template = match resource.kind.as_str() {
+        "CronJob" => serde_json::from_value::<CronJobSpec>(resource.spec.clone())
+            .ok()
+            .map(|spec| spec.job.template),
+        "Workload" | "Job" | "NodeWorkload" => crate::controller::template_of(resource)
+            .ok()
+            .map(|(template, _)| template),
+        _ => None,
+    };
+    template.is_some_and(|template| crate::policy::needs(&template, false).contains(&"unconfined"))
 }
 
 /// What resources known by kind and namespace alone reach into besides themselves.
@@ -1045,6 +1067,174 @@ spec: {size: 1Gi}
         assert!(said.contains("may not apply Volume in namespace default"), "{said}");
         assert_eq!(refused(&state.store, &carol, &command(plain)), None);
         drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A template that sets a container's seccomp unconfined, or names the calls its filter
+    /// allows, takes the right to apply Unconfined (in no namespace): a Workload, a Job, a
+    /// NodeWorkload, or the Job of a CronJob. One that keeps its filter takes nothing of it.
+    #[tokio::test]
+    async fn an_unconfined_workload_takes_the_unconfined_right() {
+        let dir = std::env::temp_dir().join(format!("kithd-unconfined-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let one = |text: &str| -> Vec<Resource> {
+            kith_api::Resource::from_source(text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let of = |kind: &str, seccomp: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{name: w}}\n\
+                 spec: {{template: {{containers: [{{name: a, image: x{seccomp}}}]}}}}\n"
+            )
+        };
+        let unconfined = (Verb::Apply, "Unconfined".to_string(), None);
+        let state = shared.store.lock().unwrap();
+        let takes_of = |text: &str| takes(&state.store, &one(text));
+        for kind in ["Workload", "Job", "NodeWorkload"] {
+            let loose = of(kind, ", seccomp: {unconfined: true}");
+            assert!(
+                takes_of(&loose).contains(&unconfined),
+                "{kind} unconfined takes Unconfined"
+            );
+            let allowing = of(kind, ", seccomp: {allow: [ptrace]}");
+            assert!(
+                takes_of(&allowing).contains(&unconfined),
+                "{kind} with an allow-list takes Unconfined"
+            );
+            assert!(
+                !takes_of(&of(kind, "")).contains(&unconfined),
+                "{kind} with no seccomp takes nothing"
+            );
+            assert!(
+                !takes_of(&of(kind, ", seccomp: {}")).contains(&unconfined),
+                "{kind} with {{}} takes nothing"
+            );
+        }
+        let cron = "apiVersion: kith.dev/v1\nkind: CronJob\nmetadata: {name: c}\n\
+                    spec: {schedule: '* * * * *', job: {template: {containers: [{name: a, image: x, seccomp: {unconfined: true}}]}}}\n";
+        assert!(
+            takes_of(cron).contains(&unconfined),
+            "a CronJob of an unconfined template takes Unconfined"
+        );
+        let plain_cron = cron.replace(", seccomp: {unconfined: true}", "");
+        assert!(
+            !takes_of(&plain_cron).contains(&unconfined),
+            "a CronJob of a plain template takes nothing"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Applying an unconfined template needs Unconfined (or *) in no namespace: a Role over
+    /// Workloads alone, or over * in one namespace, is refused; the local admin and a
+    /// cluster-wide * Role pass, and a plain Workload needs nothing more than Workloads.
+    #[tokio::test]
+    async fn an_identity_with_only_workload_rights_may_not_apply_unconfined() {
+        let dir = std::env::temp_dir().join(format!("kithd-unconfined-who-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, Duration::from_secs(300)).await.unwrap();
+        let roles = "
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: workloads}
+spec: {rules: [{kinds: [Workload], verbs: [apply]}]}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: unconfined}
+spec: {rules: [{kinds: [Workload, Unconfined], verbs: [apply]}]}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: star-here}
+spec: {rules: [{kinds: ['*'], verbs: [apply], namespaces: [default]}]}
+---
+apiVersion: kith.dev/v1
+kind: Role
+metadata: {name: star-all}
+spec: {rules: [{kinds: ['*'], verbs: [apply]}]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: bob-workloads}
+spec: {role: workloads, subjects: [bob]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: carol-unconfined}
+spec: {role: unconfined, subjects: [carol]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: dan-here}
+spec: {role: star-here, subjects: [dan]}
+---
+apiVersion: kith.dev/v1
+kind: RoleBinding
+metadata: {name: erin-all}
+spec: {role: star-all, subjects: [erin]}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: bob}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: carol}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: dan}
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Identity
+metadata: {name: erin}
+spec: {}
+";
+        {
+            let mut state = shared.store.lock().unwrap();
+            for resource in kith_api::Resource::from_source(roles).unwrap() {
+                state.store.apply(resource.unwrap()).unwrap();
+            }
+        }
+        let one = |text: &str| -> Vec<Resource> {
+            kith_api::Resource::from_source(text)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let loose = one(
+            "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {name: w}\nspec: {template: {containers: [{name: a, image: x, seccomp: {unconfined: true}}]}}\n",
+        );
+        let plain = one(
+            "apiVersion: kith.dev/v1\nkind: Workload\nmetadata: {name: p}\nspec: {template: {containers: [{name: a, image: x}]}}\n",
+        );
+        let check = |caller: &Caller, resources: &[Resource]| -> Result<(), String> {
+            match allowed(&shared, caller, |store| takes(store, resources)) {
+                Ok(()) => Ok(()),
+                Err(ApiError::Refused(why)) => Err(why),
+                Err(_) => Err("not a refusal".into()),
+            }
+        };
+        let bob = Caller::Identity("bob".into());
+        let why = check(&bob, &loose).unwrap_err();
+        assert!(why.contains("may not apply Unconfined"), "{why}");
+        assert!(check(&bob, &plain).is_ok(), "bob may apply a plain Workload");
+        assert!(
+            check(&Caller::Identity("dan".into()), &loose)
+                .unwrap_err()
+                .contains("may not apply Unconfined")
+        );
+        assert!(check(&Caller::Identity("carol".into()), &loose).is_ok());
+        assert!(check(&Caller::Identity("erin".into()), &loose).is_ok());
+        assert!(check(&Caller::Admin, &loose).is_ok());
+        drop(shared);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -463,7 +463,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   own the kernel makes it none); the device filter on the pod's cgroup is what keeps it
   from the node's disks. Containers that are not pods share the node's network, and an
   `exec` unit is a process of kithd's user. The Roles decide who may apply these, and
-  nothing more is in the way. Do not give them to someone you would not give a shell on
+  nothing more is in the way. Unconfined is one of those rights: applying a template that sets
+  `seccomp` unconfined, or names calls its filter allows, takes Apply on `Unconfined` in no
+  namespace, which a Role names by kind `Unconfined` or `*` with no namespaces (the local socket's
+  admin has it; a Role over Workloads alone does not, and is refused with `may not apply
+  Unconfined: no Role bound to it allows that`). A CronJob's Job template counts, and so does a
+  Release or Source that renders one. A Workload already stored keeps running; only its next apply
+  needs the right. Do not give them to someone you would not give a shell on
   the node.
 
   **A node's owner can refuse them for that node, whatever the cluster says.** The
