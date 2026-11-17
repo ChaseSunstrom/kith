@@ -71,6 +71,27 @@ web.kith:16:23: Workload.spec.replicas: invalid type: string "three", expected u
 | **Operators** | Loosest first: `??`, `\|\|`, `&&`, `== != < <= > >=`, `+ -`, `* / %`, then prefix `!` and `-`. `+` adds numbers and joins strings and lists; `/` of two whole numbers is a whole number; `==` compares whole values. |
 | **`import "./lib.kith"`** | Gives what that file gives (usually a record of functions). The path is from the importing file, ends in `.kith` and stays inside the directory of the file `kith` was given. An import cycle is refused. |
 
+The whole grammar:
+
+```
+file    = { "let" NAME "=" expr ";" | "fn" NAME "(" params ")" "=" expr ";" } expr
+params  = [ NAME [ "=" expr ] { "," NAME [ "=" expr ] } ]
+expr    = "if" expr "then" expr "else" expr
+        | "|" params "|" expr                      a function without a name
+        | expr OP expr                             ??  ||  &&  == != < <= > >=  + -  * / %
+        | ( "!" | "-" ) expr
+        | expr "." NAME | expr "[" expr "]" | expr "(" [ expr { "," expr } ] ")"
+        | "import" STRING                          what another file gives
+        | KIND "{" fields "}"                      a resource of that kind
+        | "{" fields "}" | "[" items "]" | "(" expr ")"
+        | "{" { let | fn } expr "}"                names for one value only
+        | STRING | NUMBER | "true" | "false" | "null" | NAME
+fields  = [ field { "," field } [ "," ] ]
+field   = NAME ":" expr | NAME | STRING ":" expr | "[" expr "]" ":" expr | ".." expr
+items   = [ item { "," item } [ "," ] ]
+item    = expr | ".." expr | "for" NAME "in" expr [ "if" expr ] ":" expr
+```
+
 The builtins:
 
 | | |

@@ -1,4 +1,4 @@
-## What kithd does today
+# What kithd does today
 
 kithd keeps the store and runs what the resources say: containers, host processes, Jobs and
 CronJobs. `kith` talks to it over a unix socket only you can open. A second kithd on one state
