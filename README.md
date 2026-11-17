@@ -3484,8 +3484,12 @@ The join token (`kith node token` there)?
 Everything on nvme0n1 (256.1 GB, Samsung SSD 970) will be erased. Type its name again to go on:
 ```
 
-The disk it was started from is never in the list. A name not typed the same
-twice writes nothing and the questions start over. It then copies kith OS to
+The disk it was started from is never in the list. A removable disk (a stick, a
+card reader) is listed and is installed on when named, but `only` never means
+one: a machine whose disks are all removable is asked for a name. The disk's size
+is read again just before it is written, and a disk of another size writes
+nothing. A name not typed the same twice writes nothing and the questions start
+over. It then copies kith OS to
 the disk, reads the disk back to see that it holds what was written, and
 powers the machine off: take the stick out and start it.
 
@@ -3501,7 +3505,7 @@ refuses plain `http` without that pin before it fetches anything, and refuses
 answers that do not hash to it, naming both digests. `https` needs no pin.
 
 ```yaml
-disk: nvme0n1        # or `only`: the one disk of a machine that has one
+disk: nvme0n1        # or `only`: the one disk of a machine that has one, not removable
 hostname: alpha
 ip: 10.0.0.5/24,10.0.0.1      # without it the network is asked (DHCP)
 dns: 10.0.0.1
