@@ -39,6 +39,7 @@ mod os;
 mod pki;
 mod pods;
 mod policy;
+mod predict;
 mod probe;
 mod raft;
 mod registry;
