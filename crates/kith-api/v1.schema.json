@@ -468,6 +468,78 @@
       "title": "Exit",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
+    "AccessLevel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "AccessLevel"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccessLevelSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "What the people in a level reach: networks, Services, a resolver, the internet",
+      "title": "AccessLevel",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
+    "RemotePeer": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "kith.dev/v1"
+        },
+        "kind": {
+          "const": "RemotePeer"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemotePeerSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "Written by controllers, never by `apply`."
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata"
+      ],
+      "description": "A person's device a node ends the tunnel of, at one AccessLevel, by its public key",
+      "title": "RemotePeer",
+      "$schema": "https://json-schema.org/draft/2020-12/schema"
+    },
     "Volume": {
       "type": "object",
       "additionalProperties": false,
@@ -1305,6 +1377,55 @@
         "shared",
         "client"
       ]
+    },
+    "AccessLevelSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "networks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Ranges passed on to, IPv4 or IPv6 (`192.168.0.0/16`, `fd00::/8`). Never `/0`: that is `internet`."
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Services, each `namespace/name` (its TCP ports), or `*` for every Service."
+        },
+        "api": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The cluster's API port on the node that ends the tunnel."
+        },
+        "dns": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The resolver its peers are given: one address, IPv4 or IPv6."
+        },
+        "internet": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "The internet by the home's own connection. Needs `dns`; not with `exit`."
+        },
+        "exit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The internet by this Exit only. Needs `dns`."
+        }
+      },
+      "description": "What the people a level is given reach (docs/adr-people.md): ranges passed on to, Services,\na resolver, and the internet by this home's own connection or by one Exit. Every field is\noptional: an empty level reaches nothing."
     },
     "AccessRule": {
       "type": "object",
@@ -3264,6 +3385,30 @@
       "required": [
         "package"
       ]
+    },
+    "RemotePeerSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "The node that ends its tunnel."
+        },
+        "level": {
+          "type": "string",
+          "description": "The AccessLevel that says what it reaches."
+        },
+        "publicKey": {
+          "type": "string",
+          "description": "Its WireGuard public key: 32 bytes in base64 (44 characters, the last one `=`)."
+        }
+      },
+      "required": [
+        "node",
+        "level",
+        "publicKey"
+      ],
+      "description": "A device of one person, which the node named ends the tunnel of, and what it reaches:\nthe level's. What is stored is its public key only: the private key is never given here."
     },
     "RepositorySpec": {
       "type": "object",

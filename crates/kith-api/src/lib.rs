@@ -161,6 +161,8 @@ kinds! {
     DNSRecord: DnsRecordSpec, cluster, "Names in a DNSZone: A, AAAA, CNAME, TXT, SRV, NS, PTR";
     NetworkPolicy: NetworkPolicySpec, namespaced, "Allow or deny traffic between workloads, namespaces and nodes";
     Exit: ExitSpec, cluster, "A WireGuard tunnel a node holds, the only way out for the pods that name it";
+    AccessLevel: AccessLevelSpec, cluster, "What the people in a level reach: networks, Services, a resolver, the internet";
+    RemotePeer: RemotePeerSpec, cluster, "A person's device a node ends the tunnel of, at one AccessLevel, by its public key";
     Volume: VolumeSpec, namespaced, "Storage on a node, optionally shared over the mesh";
     VolumeClaim: VolumeClaimSpec, namespaced, "A request for storage";
     Blob: BlobSpec, namespaced, "Bytes named by their BLAKE3 hash, kept on several nodes";

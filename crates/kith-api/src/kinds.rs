@@ -810,6 +810,41 @@ spec! {
         pub dns: Vec<String>,
     }
 
+    /// What the people a level is given reach (docs/adr-people.md): ranges passed on to, Services,
+    /// a resolver, and the internet by this home's own connection or by one Exit. Every field is
+    /// optional: an empty level reaches nothing.
+    pub struct AccessLevelSpec {
+        /// Ranges passed on to, IPv4 or IPv6 (`192.168.0.0/16`, `fd00::/8`). Never `/0`: that is `internet`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub networks: Vec<String>,
+        /// Services, each `namespace/name` (its TCP ports), or `*` for every Service.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub services: Vec<String>,
+        /// The cluster's API port on the node that ends the tunnel.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub api: Option<bool>,
+        /// The resolver its peers are given: one address, IPv4 or IPv6.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub dns: Option<String>,
+        /// The internet by the home's own connection. Needs `dns`; not with `exit`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub internet: Option<bool>,
+        /// The internet by this Exit only. Needs `dns`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub exit: Option<String>,
+    }
+
+    /// A device of one person, which the node named ends the tunnel of, and what it reaches:
+    /// the level's. What is stored is its public key only: the private key is never given here.
+    pub struct RemotePeerSpec {
+        /// The node that ends its tunnel.
+        pub node: String,
+        /// The AccessLevel that says what it reaches.
+        pub level: String,
+        /// Its WireGuard public key: 32 bytes in base64 (44 characters, the last one `=`).
+        pub public_key: String,
+    }
+
     pub struct DnsRecordSpec {
         /// Name of the `DNSZone` the record is in.
         pub zone: String,
@@ -2168,6 +2203,111 @@ impl Spec for ExitSpec {
             return Err(format!("dns: `{bad}` is not an IPv4 address"));
         }
         Ok(())
+    }
+}
+
+/// Is `net` a range passed on: an address and a prefix length (`192.0.2.0/24`, `fd00::/8`),
+/// not a prefix of 0 (the whole internet: that is `internet`), and no bit set past the prefix
+/// (`192.0.2.5/24` is no range). A bare address is no range.
+fn passed_range(net: &str) -> Result<(), String> {
+    let refused = format!("networks: `{net}` is not a range like `192.0.2.0/24` or `fd00::/8`");
+    let Some((address, length)) = net.split_once('/') else {
+        return Err(refused);
+    };
+    let address = match address.parse::<std::net::IpAddr>() {
+        Ok(address) => address,
+        Err(_) => return Err(refused),
+    };
+    let max = if address.is_ipv4() { 32 } else { 128 };
+    let digits = length.bytes().all(|b| b.is_ascii_digit());
+    match length.parse::<u8>() {
+        Ok(0) if digits => Err(format!("networks: `{net}` is the whole internet: say `internet: true`")),
+        Ok(bits) if digits && bits <= max && !host_bits_set(address, bits) => Ok(()),
+        _ => Err(refused),
+    }
+}
+
+/// Is a bit set in `address` past its first `bits` (the host part of a range)?
+fn host_bits_set(address: std::net::IpAddr, bits: u8) -> bool {
+    match address {
+        std::net::IpAddr::V4(a) => (u32::from(a) & u32::MAX.checked_shr(bits.into()).unwrap_or(0)) != 0,
+        std::net::IpAddr::V6(a) => (u128::from(a) & u128::MAX.checked_shr(bits.into()).unwrap_or(0)) != 0,
+    }
+}
+
+/// The value of a base64 character (RFC 4648's standard alphabet), if it is one.
+fn base64_value(b: u8) -> Option<u8> {
+    Some(match b {
+        b'A'..=b'Z' => b - b'A',
+        b'a'..=b'z' => b - b'a' + 26,
+        b'0'..=b'9' => b - b'0' + 52,
+        b'+' => 62,
+        b'/' => 63,
+        _ => return None,
+    })
+}
+
+/// Is `key` 32 bytes in base64: 44 characters, the last one `=`. Its 43 others hold 258 bits,
+/// of which the last two are padding and must be zero (so one key has one text).
+fn public_key_checked(key: &str) -> Result<(), String> {
+    let bytes = key.as_bytes();
+    if bytes.len() != 44 || bytes[43] != b'=' || bytes[42] == b'=' {
+        return Err("publicKey: not 32 bytes of base64: 44 characters, the last one `=`".into());
+    }
+    if !bytes[..43].iter().all(|&b| base64_value(b).is_some()) {
+        return Err("publicKey: a character that is not in base64".into());
+    }
+    if base64_value(bytes[42]).is_some_and(|last| last & 0b11 != 0) {
+        return Err("publicKey: its last character has a bit set past the 32nd byte".into());
+    }
+    Ok(())
+}
+
+impl Spec for AccessLevelSpec {
+    fn check(&self) -> Result<(), String> {
+        for net in &self.networks {
+            passed_range(net)?;
+        }
+        for service in &self.services {
+            // (A Service is named as a Workload's Service is: `namespace/name`, or every one.)
+            let named = service
+                .split_once('/')
+                .is_some_and(|(ns, name)| crate::check_name(ns).is_ok() && crate::check_name(name).is_ok());
+            if service != "*" && !named {
+                return Err(format!("services: `{service}` is not namespace/name or `*`"));
+            }
+        }
+        if let Some(dns) = &self.dns
+            && dns.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(format!("dns: `{dns}` is not an IP address"));
+        }
+        // (The internet is by the home's connection or by one Exit, and a peer that sends
+        // everything here needs a resolver.)
+        let internet = self.internet == Some(true);
+        if internet && self.exit.is_some() {
+            return Err("internet and exit: not both (the internet is by the home's connection or by one Exit)".into());
+        }
+        if let Some(exit) = &self.exit {
+            crate::check_name(exit).map_err(|e| format!("exit: {e}"))?;
+        }
+        if self.dns.is_none() {
+            if internet {
+                return Err("internet: needs `dns`: a peer that sends everything here needs a resolver".into());
+            }
+            if self.exit.is_some() {
+                return Err("exit: needs `dns`: a peer that sends everything here needs a resolver".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Spec for RemotePeerSpec {
+    fn check(&self) -> Result<(), String> {
+        crate::check_name(&self.node).map_err(|e| format!("node: {e}"))?;
+        crate::check_name(&self.level).map_err(|e| format!("level: {e}"))?;
+        public_key_checked(&self.public_key)
     }
 }
 

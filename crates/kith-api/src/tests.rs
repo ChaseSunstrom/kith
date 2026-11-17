@@ -146,8 +146,9 @@ fn errors_point_at_the_mistake() {
 
 #[test]
 fn every_kind_has_a_schema_and_a_minimal_resource() {
-    // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28.)
-    assert_eq!(KINDS.len(), 36);
+    // (PLAN.md's 28, NodeKey and Blob. `Backup` is one of the 28. Then AccessLevel and
+    // RemotePeer, docs/adr-people.md's.)
+    assert_eq!(KINDS.len(), 38);
     for info in KINDS {
         let schema = info.schema();
         assert_eq!(schema["properties"]["kind"]["const"], json!(info.kind));
@@ -1812,6 +1813,113 @@ fn an_exit_and_a_published_port_are_checked() {
     ] {
         let refused = read(kind, &bad).unwrap_err();
         assert!(refused.contains(why), "{kind} {bad}: {refused}");
+    }
+}
+
+/// An AccessLevel says what its peers reach: ranges, Services, a resolver, and the internet by
+/// this home's own connection or by one Exit, not both. Documentation addresses only.
+#[test]
+fn an_access_level_is_checked() {
+    let read = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: AccessLevel\nmetadata: {{ name: family }}\nspec: {spec}\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map_err(|e| e.msg)
+    };
+    assert!(!kind("AccessLevel").unwrap().namespaced);
+    for ok in [
+        "{ networks: [192.0.2.0/24, 198.51.100.0/24], services: ['*'], api: true, dns: 192.0.2.53, internet: true }",
+        "{ networks: [192.0.2.0/24, 'fd00::/8'], services: [media/films, home/photos], dns: 'fd00::53', exit: nl-1 }",
+        "{ services: [media/films], dns: 192.0.2.53, internet: true }",
+        "{ dns: 192.0.2.53, exit: nl-1, internet: false }",
+        "{}",
+    ] {
+        read(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    for (bad, why) in [
+        ("{ networks: [192.0.2.0] }", "networks: `192.0.2.0` is not a range"),
+        (
+            "{ networks: [192.0.2.0/33] }",
+            "networks: `192.0.2.0/33` is not a range",
+        ),
+        (
+            "{ networks: [example.org/24] }",
+            "networks: `example.org/24` is not a range",
+        ),
+        (
+            "{ networks: ['192.0.2.5/24'] }",
+            "networks: `192.0.2.5/24` is not a range",
+        ),
+        ("{ networks: ['fd00::1/8'] }", "networks: `fd00::1/8` is not a range"),
+        (
+            "{ networks: ['0.0.0.0/0'] }",
+            "networks: `0.0.0.0/0` is the whole internet",
+        ),
+        ("{ networks: ['::/0'] }", "networks: `::/0` is the whole internet"),
+        (
+            "{ services: [Media/films] }",
+            "services: `Media/films` is not namespace/name",
+        ),
+        ("{ services: [films] }", "services: `films` is not namespace/name"),
+        ("{ services: ['media/*'] }", "services: `media/*` is not namespace/name"),
+        ("{ dns: example.org }", "dns: `example.org` is not an IP address"),
+        ("{ dns: '192.0.2.0/24' }", "dns: `192.0.2.0/24` is not an IP address"),
+        (
+            "{ dns: 192.0.2.53, internet: true, exit: nl-1 }",
+            "internet and exit: not both",
+        ),
+        ("{ internet: true }", "internet: needs `dns`"),
+        ("{ exit: nl-1 }", "exit: needs `dns`"),
+        ("{ dns: 192.0.2.53, exit: Nl-1 }", "exit: invalid name"),
+        ("{ dns: 192.0.2.53, internet: true, extra: 1 }", "unknown field `extra`"),
+    ] {
+        let refused = read(bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+}
+
+/// A RemotePeer names its node, its level and its WireGuard public key: 32 bytes in base64,
+/// 44 characters with one `=` at the end whose last data character has no bits set past the
+/// 256th. Its private key is never given to kith.
+#[test]
+fn a_remote_peer_is_checked() {
+    let read = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: RemotePeer\nmetadata: {{ name: phone-1 }}\nspec: {spec}\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map_err(|e| e.msg)
+    };
+    assert!(!kind("RemotePeer").unwrap().namespaced);
+    let zeros = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let peer = |key: &str| format!("{{ node: n1, level: family, publicKey: '{key}' }}");
+    for key in [zeros, "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="] {
+        read(&peer(key)).unwrap_or_else(|e| panic!("{key}: {e}"));
+    }
+    let stars = format!("{}*=", "A".repeat(42));
+    let bits = format!("{}B=", "A".repeat(42));
+    for (bad, why) in [
+        (
+            "{ node: N1, level: family, publicKey: 'AAAA' }".to_string(),
+            "node: invalid name",
+        ),
+        (
+            "{ node: n1, level: Family, publicKey: 'AAAA' }".to_string(),
+            "level: invalid name",
+        ),
+        ("{ node: n1, level: family }".to_string(), "publicKey"),
+        (peer(&"A".repeat(43)), "not 32 bytes of base64"),
+        (peer(&format!("{}=", "A".repeat(44))), "not 32 bytes of base64"),
+        (peer(&"A".repeat(44)), "not 32 bytes of base64"),
+        (peer(&format!("{}==", "A".repeat(42))), "not 32 bytes of base64"),
+        (peer(&stars), "a character that is not in base64"),
+        (peer(&bits), "a bit set past the 32nd byte"),
+        (
+            "{ node: n1, level: family, publicKey: 'AAAA', key: x }".to_string(),
+            "unknown field `key`",
+        ),
+    ] {
+        let refused = read(&bad).unwrap_err();
+        assert!(refused.contains(why), "{bad}: {refused}");
     }
 }
 
