@@ -17,7 +17,7 @@
 //! kernel's memory disk; the machine then restarts into what was installed.
 //!
 //! Everything on the chosen disk is lost. Without a person there, a disk is only chosen
-//! by name, or as `only` when the machine has exactly one.
+//! by name, or as `only` when the machine has exactly one that is not removable.
 //
 // The image is copied as it is: its state partition is as small as the image's, and the
 // spare partition table sits where the image ended, until the node's first start from
@@ -36,6 +36,8 @@ pub struct Disk {
     pub name: String,
     pub bytes: u64,
     pub model: String,
+    /// A stick or a card reader (`removable` in sysfs): never the disk `only` means.
+    pub removable: bool,
 }
 
 impl std::fmt::Display for Disk {
@@ -72,6 +74,7 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
             let usable = bytes > 0 && said(&entry.path(), "ro") != "1";
             (usable && Some(&*name) != booted && !other.iter().any(|kind| name.starts_with(kind))).then(|| Disk {
                 model: said(&entry.path(), "device/model"),
+                removable: said(&entry.path(), "removable") == "1",
                 name,
                 bytes,
             })
@@ -81,11 +84,28 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
     found
 }
 
+/// Whether `disk` is still the size it was planned at, as `sys` (`/sys/block`) says now. A
+/// disk swapped, or a card pulled, since the plan is not the one that was chosen.
+pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
+    let now = std::fs::read_to_string(sys.join(&disk.name).join("size"))
+        .ok()
+        .and_then(|sectors| sectors.trim().parse::<u64>().ok())
+        .and_then(|sectors| sectors.checked_mul(512));
+    match now {
+        Some(bytes) if bytes == disk.bytes => Ok(()),
+        Some(bytes) => Err(format!(
+            "{disk} changed size since it was planned: it held {} bytes, and holds {bytes} now: nothing was written",
+            disk.bytes
+        )),
+        None => Err(format!("{disk}'s size can no longer be read: nothing was written")),
+    }
+}
+
 /// What the installer is told.
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Answers {
-    /// The disk's name (`sda`, `nvme0n1`), or `only`: the one disk the machine has.
+    /// The disk's name (`sda`, `nvme0n1`), or `only`: the one disk the machine has that is not removable.
     pub disk: String,
     #[serde(default)]
     pub hostname: Option<String>,
@@ -139,11 +159,22 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     let listed = || disks.iter().map(Disk::to_string).collect::<Vec<_>>().join(", ");
     let wanted = answers.disk.trim().trim_start_matches("/dev/");
     let disk = match wanted {
-        "only" => match disks {
-            [one] => one,
-            [] => return Err("this machine has no disk to install on".into()),
-            _ => return Err(format!("`disk: only` and this machine has several: {}", listed())),
-        },
+        // (A removable disk is never the one `only` means: a stick or a card reader that
+        // enumerates before the machine's own disk is not that disk. Named, it is used.)
+        "only" => {
+            let fixed: Vec<&Disk> = disks.iter().filter(|disk| !disk.removable).collect();
+            match fixed.as_slice() {
+                [one] => *one,
+                [] if disks.is_empty() => return Err("this machine has no disk to install on".into()),
+                [] => {
+                    return Err(format!(
+                        "`disk: only` and this machine has no disk but removable ones: {}. Name the disk to use it",
+                        listed()
+                    ));
+                }
+                _ => return Err(format!("`disk: only` and this machine has several: {}", listed())),
+            }
+        }
         name => disks.iter().find(|disk| disk.name == name).ok_or_else(|| match disks {
             [] => format!("no disk {name}: this machine has no disk to install on"),
             _ => format!("no disk {name} to install on; there is: {}", listed()),
@@ -513,8 +544,11 @@ pub async fn run(source: String) -> ! {
     let shown = config.split(" --token ").next().unwrap_or_default();
     eprintln!("kithd: install: writing kith OS to {disk}; its node will start with: {shown}");
     let device = Path::new("/dev").join(&disk.name);
+    let planned = disk.clone();
     let wrote = tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::OpenOptionsExt;
+        // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
+        size_unchanged(Path::new("/sys/block"), &planned)?;
         // (O_EXCL on a disk: refused while anything of it is mounted or held.)
         let mut options = std::fs::OpenOptions::new();
         options
@@ -667,6 +701,7 @@ mod tests {
             name: name.into(),
             bytes: gigabytes * 1_000_000_000,
             model: "Test".into(),
+            removable: false,
         }
     }
 
@@ -700,6 +735,61 @@ mod tests {
         assert_eq!(names(None), ["sda", "vda"]);
         assert_eq!(names(Some("sda")), ["vda"]);
         assert_eq!(disks(&sys, None)[0].to_string(), "sda (0.0 GB, Stick)");
+        std::fs::remove_dir_all(&sys).unwrap();
+    }
+
+    #[test]
+    fn only_never_picks_a_removable_disk() {
+        let sys = std::env::temp_dir().join(format!("kith-install-removable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        // A stick seen first (sda), then the machine's own disk (sdb), then a card reader (sdc).
+        for (name, size, removable) in [
+            ("sda", "2000000000", "1"),
+            ("sdb", "4000000000", "0"),
+            ("sdc", "128000000", "1"),
+        ] {
+            std::fs::create_dir_all(sys.join(name).join("device")).unwrap();
+            std::fs::write(sys.join(name).join("size"), size).unwrap();
+            std::fs::write(sys.join(name).join("ro"), "0").unwrap();
+            std::fs::write(sys.join(name).join("removable"), removable).unwrap();
+        }
+        let only = |found: &[Disk]| plan(&answers("disk: only\n").unwrap(), found, 300 << 20, 1 << 20);
+        // `only` is the one disk that is not removable, whichever of them enumerates first.
+        let found = disks(&sys, None);
+        assert_eq!(only(&found).unwrap().0.name, "sdb");
+        // Named, a removable disk is still installed on: the name is the answer.
+        let named = plan(&answers("disk: sda\n").unwrap(), &found, 300 << 20, 1 << 20).unwrap();
+        assert_eq!(named.0.name, "sda");
+        // A machine whose disks are all removable is refused, and the refusal names them.
+        let removable_only = disks(&sys, Some("sdb"));
+        let refused = only(&removable_only).unwrap_err();
+        assert!(
+            refused.contains("sda") && refused.contains("sdc") && refused.contains("removable"),
+            "{refused}"
+        );
+        std::fs::remove_dir_all(&sys).unwrap();
+    }
+
+    #[test]
+    fn a_disk_that_changed_size_is_not_written() {
+        let sys = std::env::temp_dir().join(format!("kith-install-resized-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        std::fs::create_dir_all(sys.join("sdb")).unwrap();
+        std::fs::write(sys.join("sdb/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sdb/ro"), "0").unwrap();
+        let planned = disks(&sys, None).remove(0);
+        assert!(size_unchanged(&sys, &planned).is_ok());
+        // Another disk under the same name (a card pulled, another put in): refused, both sizes said.
+        std::fs::write(sys.join("sdb/size"), "30000000").unwrap();
+        let why = size_unchanged(&sys, &planned).unwrap_err();
+        assert!(
+            why.contains(&planned.bytes.to_string()) && why.contains("15360000000"),
+            "{why}"
+        );
+        assert!(why.contains("nothing was written"), "{why}");
+        // A disk whose size can no longer be read is refused as well.
+        std::fs::remove_dir_all(sys.join("sdb")).unwrap();
+        assert!(size_unchanged(&sys, &planned).is_err());
         std::fs::remove_dir_all(&sys).unwrap();
     }
 
