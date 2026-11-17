@@ -89,7 +89,11 @@ mod tests {
     use super::*;
 
     fn ask(address: &str, port: u16, proto: Proto) -> Request {
-        Request::Bind { address: address.parse().unwrap(), port, proto }
+        Request::Bind {
+            address: address.parse().unwrap(),
+            port,
+            proto,
+        }
     }
 
     #[test]
@@ -144,7 +148,11 @@ mod tests {
         if let Ok(udp) = udp {
             assert!(UdpSocket::from(udp).local_addr().unwrap().is_ipv6());
         }
-        assert!(UdpSocket::from(Direct.request(ask("127.0.0.1", 0, Proto::Udp)).unwrap()).local_addr().is_ok());
+        assert!(
+            UdpSocket::from(Direct.request(ask("127.0.0.1", 0, Proto::Udp)).unwrap())
+                .local_addr()
+                .is_ok()
+        );
         // A port taken is the system's refusal, said with the address.
         let taken = tcp.local_addr().unwrap().port();
         let why = Direct.request(ask("127.0.0.1", taken, Proto::Tcp)).unwrap_err();

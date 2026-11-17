@@ -394,7 +394,11 @@ fn start(address: Ipv6Addr) -> Result<(), String> {
 
 /// Have the kernel's server listen on `address` too (a socket bound here and handed over).
 fn listen(address: IpAddr) -> Result<(), String> {
-    let listener = Direct.request(Request::Bind { address, port: PORT, proto: Proto::Tcp })?;
+    let listener = Direct.request(Request::Bind {
+        address,
+        port: PORT,
+        proto: Proto::Tcp,
+    })?;
     let told = std::fs::write("/proc/fs/nfsd/portlist", format!("{}\n", listener.as_raw_fd()));
     told.map_err(|e| format!("portlist: {e}"))
 }
