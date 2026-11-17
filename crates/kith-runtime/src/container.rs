@@ -882,11 +882,14 @@ impl Handle {
 
     /// Let the container read and write the character device numbered `device` that is
     /// `path` on the node, or, with none, no longer the one that was: in its cgroup's
-    /// filter, and in the spec it was made from (`made`), which is what the next change
-    /// starts from.
+    /// filter (where kithd is root, as `create` attaches it), and in the spec it was made
+    /// from (`made`), which is what the next change starts from.
     fn allow(&self, mut made: Spec, path: &Path, device: Option<u64>) -> Result<()> {
         let allowed = regrant(&mut made, path, device)?;
-        devfilter::attach(&self.cgroup, &allowed)?;
+        // (Where kithd is root, as in create; elsewhere the container has no filter to change.)
+        if nix::unistd::getuid().is_root() {
+            devfilter::attach(&self.cgroup, &allowed)?;
+        }
         made.save(self.bundle.join("config.json"))
             .ctx("keeping the container's device rules")
     }
@@ -2379,6 +2382,68 @@ mod tests {
         assert!(state.exists() && bundle.exists(), "the processes are still there");
         discard_leftovers(&state, fresh("").finish(err("removing the cgroup")));
         assert!(!state.exists() && !bundle.exists(), "only the cleanup failed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Where kithd is not root there is no device filter to put on the cgroup, so `allow` puts none
+    /// and does not fail for want of one; the spec the bundle keeps still takes the grant and its
+    /// taking back.
+    #[test]
+    fn allow_without_root_changes_the_spec_and_attaches_no_filter() {
+        if nix::unistd::getuid().is_root() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kith-allow-{}", std::process::id()));
+        let (bundle, cgroup) = (root.join("bundle"), root.join("cgroup"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::create_dir_all(&cgroup).unwrap();
+        let image = Image {
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let made = spec("a", &image, &Unit::default(), "/kith/a", Path::new("/b")).unwrap();
+        made.save(bundle.join("config.json")).unwrap();
+        let handle = Handle {
+            container: None,
+            go: None,
+            pid: Pid::from_raw(0),
+            reaped: true,
+            bundle: bundle.clone(),
+            cgroup: cgroup.clone(),
+            range: None,
+        };
+        let saved = || Spec::load(bundle.join("config.json")).unwrap();
+        let nodes = || saved().linux().as_ref().unwrap().devices().clone().unwrap_or_default();
+        let rules = || {
+            let limits = saved().linux().as_ref().unwrap().resources().clone().unwrap();
+            limits.devices().clone().unwrap_or_default()
+        };
+        // (/dev/null is the character device 1:3.)
+        let null =
+            |nodes: &[oci_spec::runtime::LinuxDevice]| nodes.iter().any(|node| node.path() == Path::new("/dev/null"));
+        handle
+            .allow(saved(), Path::new("/dev/null"), Some(nix::sys::stat::makedev(1, 3)))
+            .expect("without root no filter is attached, and the spec is saved");
+        assert!(null(&nodes()), "the grant is in the spec: {:?}", nodes());
+        assert!(
+            rules()
+                .iter()
+                .any(|rule| (rule.major(), rule.minor()) == (Some(1), Some(3))),
+            "and its rule: {:?}",
+            rules()
+        );
+        handle
+            .allow(saved(), Path::new("/dev/null"), None)
+            .expect("taking it back is saved too");
+        assert!(!null(&nodes()), "the grant is gone from the spec: {:?}", nodes());
+        assert!(
+            rules()
+                .iter()
+                .all(|rule| (rule.major(), rule.minor()) != (Some(1), Some(3))),
+            "and its rule: {:?}",
+            rules()
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
