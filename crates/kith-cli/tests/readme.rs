@@ -155,6 +155,50 @@ fn readme_and_security_say_who_has_a_host_two_services_name() {
     }
 }
 
+/// Who may claim a Device or Seat is said one way in both documents, and the sentence that
+/// said no Device or Seat was given to a namespace at all is gone.
+#[test]
+fn readme_and_security_say_who_may_claim_a_device_or_seat() {
+    let security = std::fs::read_to_string(root().join("SECURITY.md")).unwrap();
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (name, text, said) in [
+        (
+            "README.md",
+            flat(README),
+            "A `Device` or `Seat` is given to namespaces by its label `kith.dev/namespaces`",
+        ),
+        ("README.md", flat(README), "every `Seat` is `kith-system`'s alone"),
+        ("README.md", flat(README), "its `status.message` says why"),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "Devices and Seats are given to namespaces (T-0646)",
+        ),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "a seat claim, `access: client` included, is checked against the Seat's own label",
+        ),
+        (
+            "SECURITY.md",
+            flat(&security),
+            "discovery keeps it, and a worker can neither add, change nor drop it",
+        ),
+    ] {
+        assert!(text.contains(said), "{name} no longer says: {said}");
+    }
+    for (name, text) in [("README.md", flat(README)), ("SECURITY.md", flat(&security))] {
+        assert!(
+            !text.contains("are not given to namespaces"),
+            "{name} still says no Device or Seat is given to a namespace"
+        );
+        assert!(
+            !text.contains("a person who may apply DeviceClaims in some namespace can take"),
+            "{name} still says a claim in any namespace takes a node's input devices"
+        );
+    }
+}
+
 /// Who reads an Image on a node is said one way in both documents: the registry answers
 /// kithd's own pull only, and neither still says what was so before.
 #[test]

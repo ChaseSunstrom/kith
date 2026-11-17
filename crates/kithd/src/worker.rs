@@ -427,10 +427,18 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
                 .all(|(label, value)| match label.as_str() {
                     "kith.dev/node" => value == node,
                     "class" => Some(value.as_str()) == class,
+                    // (Checked below: the label is an admin's, not this node's to write.)
+                    crate::claims::NAMESPACES => true,
                     other => crate::devices::LABELS.contains(&other),
                 });
             if !(own(resource) && live.is_none_or(own) && plain) {
                 return Err(refused(&key, "it is not one this node's hardware made"));
+            }
+            // The namespaces a Device or Seat is given to are set by an admin, and kept as the store has
+            // them: a worker neither adds, changes nor takes that label away.
+            let namespaces = |resource: &Resource| resource.metadata.labels.get(crate::claims::NAMESPACES).cloned();
+            if namespaces(resource) != live.and_then(namespaces) {
+                return Err(refused(&key, "its kith.dev/namespaces label is an admin's to set"));
             }
             match crate::devices::whose(store, &resource.metadata.name) {
                 theirs if theirs.contains(&node) => Ok(()),
@@ -1031,6 +1039,54 @@ spec: { volume: there, every: 1d }
             let refused = try_as(&store, "w", report_of("w", "Workload/default/web", said(forged)));
             assert!(refused.is_err(), "{forged}");
         }
+    }
+
+    #[test]
+    fn a_namespaces_label_is_an_admins_and_a_worker_keeps_the_one_it_has() {
+        let mut store = store();
+        let device = |name: &str, namespaces: Option<&str>| -> Resource {
+            let mut labels = json!({ DISCOVERED: "true", "kith.dev/node": "w" });
+            if let Some(namespaces) = namespaces {
+                labels["kith.dev/namespaces"] = namespaces.into();
+            }
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Device",
+                "metadata": { "name": name, "labels": labels },
+                "spec": { "node": "w", "class": "gpu", "path": "/dev/dri/card0" },
+            }))
+            .unwrap()
+        };
+        let seat = |name: &str, namespaces: Option<&str>| -> Resource {
+            let mut labels = json!({ DISCOVERED: "true", "kith.dev/node": "w" });
+            if let Some(namespaces) = namespaces {
+                labels["kith.dev/namespaces"] = namespaces.into();
+            }
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Seat",
+                "metadata": { "name": name, "labels": labels },
+                "spec": { "node": "w", "devices": ["w-gpu-card0"] },
+            }))
+            .unwrap()
+        };
+        let apply = |resource: Resource| Command::Apply {
+            resources: vec![resource],
+            at: 0,
+        };
+        // An admin gave the GPU and the Seat the label: the store holds it.
+        store.apply(device("w-gpu-card0", Some("ops"))).unwrap();
+        store.apply(seat("w-seat0", Some("ops"))).unwrap();
+        // This node's discovery writes them back with the label they have: kept.
+        assert!(try_as(&store, "w", apply(device("w-gpu-card0", Some("ops")))).is_ok());
+        assert!(try_as(&store, "w", apply(seat("w-seat0", Some("ops")))).is_ok());
+        // Changed, or taken away, by the worker: refused.
+        assert!(try_as(&store, "w", apply(device("w-gpu-card0", Some("dev")))).is_err());
+        assert!(try_as(&store, "w", apply(device("w-gpu-card0", None))).is_err());
+        assert!(try_as(&store, "w", apply(seat("w-seat0", None))).is_err());
+        // Added by the worker, to a Device or Seat that has none: refused, too.
+        assert!(try_as(&store, "w", apply(device("w-gpu-card1", Some("ops")))).is_err());
+        assert!(try_as(&store, "w", apply(seat("w-seat1", Some("ops")))).is_err());
+        // Without the label, a worker's own Device is as it was.
+        assert!(try_as(&store, "w", apply(device("w-gpu-card1", None))).is_ok());
     }
 
     #[test]

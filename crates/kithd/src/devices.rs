@@ -384,8 +384,16 @@ fn changes(store: &Store, node: &str, found: &[Resource]) -> (Vec<Resource>, Vec
         match store.get(&new.key()) {
             None => apply.push(new.clone()),
             Some(live) if ours(live, node) => {
-                if live.metadata.labels != new.metadata.labels || live.spec != new.spec {
-                    apply.push(new.clone());
+                // (The namespaces an admin gave it are theirs to set: a pass keeps the label there is.)
+                let mut wanted = new.clone();
+                if let Some(namespaces) = live.metadata.labels.get(crate::claims::NAMESPACES) {
+                    wanted
+                        .metadata
+                        .labels
+                        .insert(crate::claims::NAMESPACES.into(), namespaces.clone());
+                }
+                if live.metadata.labels != wanted.metadata.labels || live.spec != wanted.spec {
+                    apply.push(wanted);
                 }
             }
             Some(live) if discovered(live) => {
@@ -993,6 +1001,30 @@ mod tests {
         let found = scan(&root, "w-b");
         let (apply, _, held) = changes(&after, "w-b", &found);
         assert!(apply.iter().any(|r| r.key() == early.key()) && held.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An admin's `kith.dev/namespaces` on this node's Device is not one discovery takes back: a
+    /// pass writes the Device without it only if it is written over, and it is not.
+    #[test]
+    fn an_admins_namespaces_label_is_kept_by_discovery() {
+        let root = tree("namespaces");
+        laptop(&root);
+        let found = scan(&root, "n1");
+        let mut store = Store::default();
+        store.apply(node("n1", "worker")).unwrap();
+        let mut labelled = found[0].clone();
+        labelled
+            .metadata
+            .labels
+            .insert("kith.dev/namespaces".into(), "ops".into());
+        store.apply(labelled.clone()).unwrap();
+        let (apply, gone, _) = changes(&store, "n1", &found);
+        let lost = apply.iter().any(|r| {
+            r.key() == labelled.key() && r.metadata.labels.get("kith.dev/namespaces").map(String::as_str) != Some("ops")
+        });
+        assert!(!lost, "a pass writes the Device back without the label");
+        assert!(gone.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -28,7 +28,7 @@ Two other checks were done alongside:
 ## Findings with their status
 
 - H1 Templates: a lazily repeated list is expanded by a serializing filter or output before fuel is charged, and a panic or stack overflow in a render ends kithd. fixed: a_template_that_grows_past_its_limits_is_refused (T-0645)
-- H2 Devices: no grant ties a Device or a Seat to a namespace, so any namespace's applier claims an unheld Seat or a keyboard. task: T-0646
+- H2 Devices: no grant ties a Device or a Seat to a namespace, so any namespace's applier claims an unheld Seat or a keyboard. fixed: a_label_names_who_may_claim_and_taking_it_away_refuses_at_the_next_resolve (T-0646)
 - H3 kith-lang: the walk from a file's value to its resources charged no steps (2^60 for a shared list sixty deep). fixed: limits_hold_a_file_that_gives_a_list_shared_many_times
 
 In detail:
@@ -48,6 +48,11 @@ In detail:
   - The per-namespace exclusion that SECURITY.md describes holds only while a holder is
     recorded.
   - While the session is gone, a `shared` claim also takes the seat's directory.
+  - Fixed (T-0646): `claims::resolve_one` refuses a Device or Seat that does not give the
+    claim's namespace, by its `kith.dev/namespaces` label (kith-system always passes; an
+    unlabelled GPU is open to all). Discovery keeps the admin's label, and `worker.rs` lets
+    a worker hold it only as the store has it. Unlabelled Seats and non-GPU Devices are
+    kith-system's after the upgrade, until labelled (SECURITY.md, Review 2).
 - **H3** (`crates/kith-lang/src/lib.rs`, line 181; test). A list that holds itself twice per
   level takes a few steps to make. Walking it, kithd pinned a core for a Source, and
   kith-lsp hung the editor.
