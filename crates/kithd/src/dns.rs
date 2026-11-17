@@ -161,19 +161,35 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
         let mut replicas = Vec::new();
         for workload in crate::services::behind(store, service, &spec) {
             for (replica, address) in crate::services::ready_addresses(workload) {
-                let named = format!("{}-{replica}.{name}.{namespace}.svc.cluster.local", workload.metadata.name);
-                own.push(Record { name: named, ttl: NODE_TTL, data: Rdata::Aaaa(address) });
+                let named = format!(
+                    "{}-{replica}.{name}.{namespace}.svc.cluster.local",
+                    workload.metadata.name
+                );
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
                 replicas.push(address);
             }
         }
         let addresses = if spec.headless == Some(true) {
             replicas
         } else {
-            mesh.map(|mesh| kith_mesh::service_address(mesh, &namespace, name)).into_iter().collect()
+            mesh.map(|mesh| kith_mesh::service_address(mesh, &namespace, name))
+                .into_iter()
+                .collect()
         };
         for address in addresses {
-            for named in [format!("{name}.{namespace}.kith"), format!("{name}.{namespace}.svc.cluster.local")] {
-                own.push(Record { name: named, ttl: NODE_TTL, data: Rdata::Aaaa(address) });
+            for named in [
+                format!("{name}.{namespace}.kith"),
+                format!("{name}.{namespace}.svc.cluster.local"),
+            ] {
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
             }
         }
     }
@@ -1191,13 +1207,11 @@ metadata: { name: api }
 spec: { selector: { app: web }, ports: [{ port: 80 }] }
 ",
         );
-        let unit = |replica: u32, ready: bool, address: &str| {
-            json!({ "name": "main", "replica": replica, "node": "a", "ready": ready, "address": address })
-        };
-        let status = |second: &str| {
-            json!({ "containers": [unit(0, true, "fd00:1::10"), unit(1, true, second), unit(2, false, "fd00:1::12")] })
-        };
-        store.set_status("Workload/default/web", Some(status("fd00:1::11"))).unwrap();
+        let unit = |replica: u32, ready: bool, address: &str| json!({ "name": "main", "replica": replica, "node": "a", "ready": ready, "address": address });
+        let status = |second: &str| json!({ "containers": [unit(0, true, "fd00:1::10"), unit(1, true, second), unit(2, false, "fd00:1::12")] });
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::11")))
+            .unwrap();
         let before = zones_made_of(&store);
 
         let ip = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
@@ -1206,23 +1220,37 @@ spec: { selector: { app: web }, ports: [{ port: 80 }] }
         let client = "10.0.0.1";
         // Each ready replica is named under each Service that selects its Workload, and it
         // answers its own address; one not ready answers nothing.
-        assert_eq!(answers6(&zones, client, "web-0.web.default.svc.cluster.local"), [ip("fd00:1::10")]);
-        assert_eq!(answers6(&zones, client, "web-1.api.default.svc.cluster.local"), [ip("fd00:1::11")]);
+        assert_eq!(
+            answers6(&zones, client, "web-0.web.default.svc.cluster.local"),
+            [ip("fd00:1::10")]
+        );
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::11")]
+        );
         assert!(answers6(&zones, client, "web-2.api.default.svc.cluster.local").is_empty());
         // A headless Service answers its ready replicas, and not an address of its own.
         assert_eq!(
             answers6(&zones, client, "web.default.svc.cluster.local"),
             [ip("fd00:1::10"), ip("fd00:1::11")]
         );
-        assert_eq!(answers6(&zones, client, "web.default.kith"), [ip("fd00:1::10"), ip("fd00:1::11")]);
+        assert_eq!(
+            answers6(&zones, client, "web.default.kith"),
+            [ip("fd00:1::10"), ip("fd00:1::11")]
+        );
         // The other Service answers its own address, as it did.
         let api = kith_mesh::service_address(prefix, "default", "api");
         assert_eq!(answers6(&zones, client, "api.default.svc.cluster.local"), [api]);
 
         // A replica that moves to another address is told apart, so the zones are built again.
-        store.set_status("Workload/default/web", Some(status("fd00:1::99"))).unwrap();
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::99")))
+            .unwrap();
         assert_ne!(zones_made_of(&store), before);
         let (zones, _) = zones_of(&store, Some(prefix));
-        assert_eq!(answers6(&zones, client, "web-1.api.default.svc.cluster.local"), [ip("fd00:1::99")]);
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::99")]
+        );
     }
 }

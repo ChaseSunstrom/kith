@@ -163,11 +163,16 @@ pub fn behind<'a>(store: &'a Store, service: &Resource, spec: &ServiceSpec) -> V
 /// address, or one that is not on the mesh, names nothing.)
 pub fn ready_addresses(workload: &Resource) -> BTreeMap<u32, Ipv6Addr> {
     let ready: BTreeSet<u32> = ready_on(workload).into_iter().map(|(_, replica)| replica).collect();
-    let units = workload.status.as_ref().and_then(|status| status["containers"].as_array());
+    let units = workload
+        .status
+        .as_ref()
+        .and_then(|status| status["containers"].as_array());
     let mut addresses = BTreeMap::new();
     for unit in units.into_iter().flatten() {
         let replica = unit["replica"].as_u64().and_then(|replica| u32::try_from(replica).ok());
-        let address = unit["address"].as_str().and_then(|address| address.parse::<Ipv6Addr>().ok());
+        let address = unit["address"]
+            .as_str()
+            .and_then(|address| address.parse::<Ipv6Addr>().ok());
         if let (Some(replica), Some(address)) = (replica, address) {
             if ready.contains(&replica) {
                 addresses.entry(replica).or_insert(address);

@@ -2357,7 +2357,10 @@ spec: { clusterIP: 10.96.0.9, selector: { app: db }, ports: [{ port: 80 }] }
             report.iter().any(|line| line.starts_with("Service/db: spec.clusterIP")),
             "{report:?}"
         );
-        assert!(!report.iter().any(|line| line.contains("web") || line.contains("api")), "{report:?}");
+        assert!(
+            !report.iter().any(|line| line.contains("web") || line.contains("api")),
+            "{report:?}"
+        );
     }
 
     #[test]

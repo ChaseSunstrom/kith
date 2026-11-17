@@ -2776,7 +2776,11 @@ mod tests {
                  metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
                  spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
             );
-            let mut resource = kith_api::Resource::from_source(&source).unwrap().pop().unwrap().unwrap();
+            let mut resource = kith_api::Resource::from_source(&source)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
             resource.status = Some(json!({"address": "fd00::7"}));
             served(&resource).unwrap().1
         };

@@ -212,7 +212,10 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
         let key = service.key();
         // (A headless Service has no address to send a host to: its name answers its replicas.)
         if crate::services::headless(service) {
-            refused.insert(key, "a headless Service has no address to expose: its name answers its replicas".to_string());
+            refused.insert(
+                key,
+                "a headless Service has no address to expose: its name answers its replicas".to_string(),
+            );
             continue;
         }
         let namespace = key.split('/').nth(1).unwrap_or_default();
