@@ -32,6 +32,8 @@ type Fallible<T> = Result<T, String>;
 /// The most files a source may hold under its path, and the most bytes in them.
 const FILES_LIMIT: usize = 2000;
 const BYTES_LIMIT: u64 = 4 << 20;
+/// The most resources one Source's files give.
+const RESOURCES_LIMIT: usize = 2000;
 /// How long git gets for one thing.
 const PATIENCE: Duration = Duration::from_secs(120);
 /// The most git may say in one go (the list of a big repository's files fits).
@@ -585,7 +587,11 @@ fn desired(key: &str, fetched: &Fetched) -> Fallible<Vec<Resource>> {
         .into_iter()
         .map(|resource| ("a Kubernetes manifest", true, resource));
     found.extend(theirs);
+    if found.len() > RESOURCES_LIMIT {
+        return Err(format!("more than {RESOURCES_LIMIT} resources in the source"));
+    }
     let mut resources: Vec<Resource> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for (path, placed, mut resource) in found {
         // (A kind some KindDefinition makes is placed when the store is at hand: `settled`.)
         let own = kith_api::kind(&resource.kind);
@@ -610,7 +616,7 @@ fn desired(key: &str, fetched: &Fetched) -> Fallible<Vec<Resource>> {
         if at == key {
             return Err(format!("{path}: {at}: a Source does not apply itself"));
         }
-        if resources.iter().any(|other| other.key() == at) {
+        if !seen.insert(at.clone()) {
             return Err(format!("{path}: {at} is in the source twice"));
         }
         (resource.metadata.revision, resource.status) = (None, None);
@@ -1152,6 +1158,25 @@ mod tests {
         format!(
             "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ colour: {colour} }} }}\n"
         )
+    }
+
+    /// A Source of 2000 resources is taken in one pass of its keys; one of 2001 is refused,
+    /// saying the limit.
+    #[test]
+    fn a_source_is_held_to_its_resources() {
+        let maps = |count: usize| {
+            (0..count)
+                .map(|n| map(&format!("m{n}"), "red"))
+                .collect::<Vec<_>>()
+                .join("---\n")
+        };
+        let desired_of = |count: usize| {
+            let fetches = at("one", &[("maps.yaml", maps(count))]);
+            desired("Source/shop/repo", fetches["Source/shop/repo"].as_ref().unwrap())
+        };
+        assert_eq!(desired_of(2000).unwrap().len(), 2000);
+        let past = desired_of(2001).unwrap_err();
+        assert!(past.contains("more than 2000 resources"), "{past}");
     }
 
     fn at(revision: &str, files: &[(&str, String)]) -> Fetches {

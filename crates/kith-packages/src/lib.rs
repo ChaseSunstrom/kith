@@ -36,6 +36,9 @@ type Fallible<T> = Result<T, String>;
 const FUEL: u64 = 500_000;
 /// No template renders to more text than this, and no package has more files or more in them.
 const TEXT_LIMIT: usize = 1 << 20;
+/// The most resources one render gives, and the most text all its templates render to.
+const RESOURCES_LIMIT: usize = 2000;
+const RENDERED_LIMIT: usize = 4 << 20;
 const FILES_LIMIT: usize = 200;
 const PACKAGE_LIMIT: usize = 4 << 20;
 /// No file of a package is bigger than this.
@@ -285,15 +288,24 @@ impl Package {
             "labels": labels,
         });
         let environment = self.environment()?;
+        let rendered = std::cell::Cell::new(0);
         let text = |path: &str| -> Fallible<String> {
             let template = environment.get_template(path).map_err(|e| template_error(&e))?;
             let text = template.render(minijinja::value::Serde(&context));
-            match text.map_err(|e| template_error(&e))? {
-                text if text.len() > TEXT_LIMIT => Err(format!("{path}: renders to more than {TEXT_LIMIT} bytes")),
-                text => Ok(text),
+            let text = text.map_err(|e| template_error(&e))?;
+            if text.len() > TEXT_LIMIT {
+                return Err(format!("{path}: renders to more than {TEXT_LIMIT} bytes"));
             }
+            rendered.set(rendered.get() + text.len());
+            if rendered.get() > RENDERED_LIMIT {
+                return Err(format!(
+                    "{path}: the templates render to more than {RENDERED_LIMIT} bytes in all"
+                ));
+            }
+            Ok(text)
         };
         let mut resources: Vec<Resource> = Vec::new();
+        let mut keys = std::collections::BTreeSet::new();
         // One resource a file gave: in the release's namespace unless it says another,
         // labelled as the release's, and no other file's too.
         let mut add = |path: &str, mut resource: Resource, placed: bool| -> Fallible<()> {
@@ -304,9 +316,16 @@ impl Package {
                 let value = value.as_str().unwrap_or_default().to_string();
                 resource.metadata.labels.insert(label.clone(), value);
             }
-            if let Some(twin) = resources.iter().find(|other| other.key() == resource.key()) {
-                return Err(format!("{path}: {} is rendered twice", twin.key()));
+            let key = resource.key();
+            if keys.contains(&key) {
+                return Err(format!("{path}: {key} is rendered twice"));
             }
+            if keys.len() == RESOURCES_LIMIT {
+                return Err(format!(
+                    "{path}: the package renders to more than {RESOURCES_LIMIT} resources"
+                ));
+            }
+            keys.insert(key);
             resources.push(resource);
             Ok(())
         };

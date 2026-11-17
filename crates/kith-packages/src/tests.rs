@@ -258,6 +258,30 @@ fn a_package_stays_in_bounds() {
     assert_eq!(found.len(), 2, "{found:?}");
 }
 
+/// A render gives at most 2000 resources and 4 MiB of text, each said by name past it;
+/// the duplicate check is one pass (2000 distinct resources render at once).
+#[test]
+fn a_render_is_held_to_its_resources_and_its_text() {
+    let map = "{% for n in range(COUNT) %}---\napiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: { name: m{{ n }} }\n{% endfor %}";
+    let mut many = example();
+    many.templates
+        .insert("templates/many.yaml".into(), map.replace("COUNT", "1990"));
+    let at_most = many.render(SHOP, &[]).unwrap();
+    assert!(at_most.resources.len() <= 2000, "{}", at_most.resources.len());
+    many.templates
+        .insert("templates/many.yaml".into(), map.replace("COUNT", "2001"));
+    let past = many.render(SHOP, &[]).unwrap_err();
+    assert!(past.contains("more than 2000 resources"), "{past}");
+    // Five templates of 900 KiB each: under the per-template limit, past the whole's.
+    let mut wide = example();
+    for n in 0..5 {
+        let text = format!("# {}\n", "a".repeat(900 << 10));
+        wide.templates.insert(format!("templates/wide{n}.yaml"), text);
+    }
+    let past = wide.render(SHOP, &[]).unwrap_err();
+    assert!(past.contains("more than 4194304 bytes"), "{past}");
+}
+
 #[test]
 fn deep_values_do_not_end_the_process() {
     let with = |source: String| {
