@@ -13,6 +13,14 @@ if [ -z "${CC_x86_64_unknown_linux_musl:-}" ] && ! command -v musl-gcc >/dev/nul
     export CC_x86_64_unknown_linux_musl="$root/ci/musl-cc.sh"
 fi
 cd "$root"
+if [ "${1:-}" = --tests ]; then
+    # (Or with --tests: kithd's unit tests, built the same way, and the path of that one file.
+    # In a target directory of their own: their link writes kithd.map too, and in kithd's
+    # it would leave ci/order.py the test binary's map for kithd.)
+    built=$(CARGO_TARGET_DIR="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/tests" cargo test --release --quiet --target "$target" -p kithd --bin kithd --no-run --message-format=json)
+    printf '%s\n' "$built" | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1
+    exit 0
+fi
 cargo build --release --quiet --target "$target" -p kithd -p kith-cli >&2
 # cargo reads a relative CARGO_TARGET_DIR from here; the line printed is absolute (order.py
 # matches it against /proc's maps).

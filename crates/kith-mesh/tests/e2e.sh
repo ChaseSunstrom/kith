@@ -62,3 +62,60 @@ in_ a ip link show tob > /dev/null
 in_ a ip link add kith0 type veth peer name other
 if in_ a $tool up $seed a $(private a) 2> /dev/null; then echo "took over a veth"; exit 1; fi
 in_ a ip link show kith0 | grep -q kith0
+
+# Two nodes behind NAT: x behind router ra, y behind rb, both at 192.168.1.2 at home; the edge
+# node e and the routers' outsides on one switch (the namespace wan), 203.0.113.0/24. A router
+# passes out whatever its home sends, and in only what answers it (as a home router does).
+for node in wan e ra rb x y; do ip netns add $node; ip -n $node link set lo up; done
+ip -n wan link add sw type bridge; ip -n wan link set sw up
+outside() { # outside NODE ADDRESS: NODE on the switch at ADDRESS
+    ip link add wan netns $1 type veth peer name $1 netns wan
+    ip -n wan link set $1 master sw up
+    ip -n $1 addr add $2/24 dev wan; ip -n $1 link set wan up
+}
+outside e 203.0.113.1
+outside ra 203.0.113.2
+outside rb 203.0.113.3
+home() { # home ROUTER NODE: NODE at 192.168.1.2 behind ROUTER
+    ip link add home netns $1 type veth peer name lan netns $2
+    ip -n $1 addr add 192.168.1.1/24 dev home; ip -n $1 link set home up
+    ip -n $2 addr add 192.168.1.2/24 dev lan; ip -n $2 link set lan up
+    ip -n $2 route add default via 192.168.1.1
+    in_ $1 sh -c 'echo 1 > /proc/sys/net/ipv4/ip_forward'
+    in_ $1 iptables -t nat -A POSTROUTING -o wan -j MASQUERADE
+    in_ $1 iptables -P FORWARD DROP
+    in_ $1 iptables -A FORWARD -i home -o wan -j ACCEPT
+    in_ $1 iptables -A FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # (And nothing unasked to itself: a packet let in here would be remembered as one to the
+    # router, and the home's answer to it given another port.)
+    in_ $1 iptables -A INPUT -i wan -m conntrack --ctstate NEW -j DROP
+}
+home ra x
+home rb y
+for node in e x y; do
+    eval "key_$node=\$(in_ $node $tool up $seed $node $(private $node))"
+    eval "addr_$node=\$($tool address $seed $node)"
+done
+# Each says it is where it is at home; nobody has seen anybody yet: x and y go through e.
+nat() { # nat X_SEEN Y_SEEN: the member list, x and y reaching each other where seen
+    reached=$([ -n "$1" ] && echo 1 || echo 0)
+    echo "e,$key_e,203.0.113.1:51820,1,1 x,$key_x,192.168.1.2:51820,0,$reached${1:+,$1} y,$key_y,192.168.1.2:51820,0,$reached${2:+,$2}"
+}
+for node in e x y; do in_ $node $tool peers $seed $node $(private $node) $(nat "" ""); done
+reaches x $addr_e
+reaches y $addr_e
+# Where e saw them: each router's outside, the port the router gave.
+seen() { in_ e $tool show $seed e $(private e) | grep "^$1 " | sed -n 's/.* Some(\([0-9.:]*\)) .*/\1/p'; }
+seen_x=$(seen $key_x)
+seen_y=$(seen $key_y)
+case "$seen_x $seen_y" in 203.0.113.2:*" "203.0.113.3:*) ;; *) echo "e saw x at $seen_x and y at $seen_y"; exit 1 ;; esac
+# Told so, x and y call each other there, both at once, and a hole opens in each router.
+for node in e x y; do in_ $node $tool peers $seed $node $(private $node) $(nat $seen_x $seen_y); done
+tries=0
+until reaches x $addr_y; do
+    tries=$((tries + 1))
+    [ $tries -lt 10 ] || { echo "x did not reach y through the two NATs"; in_ x $tool show $seed x $(private x); exit 1; }
+done
+# Directly: x's peer y is at rb's outside, and agreed on keys; e passes nothing on.
+in_ x $tool show $seed x $(private x) | grep "^$key_y " | grep -q "Some($seen_y) Some("
+in_ e sh -c 'cat /proc/sys/net/ipv6/conf/all/forwarding' | grep -qx 0

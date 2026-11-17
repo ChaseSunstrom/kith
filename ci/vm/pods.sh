@@ -136,6 +136,20 @@ EOF
                 any GET "/v1/logs/Job/default/$1?stderr=true" >"$work/$1.err" 2>/dev/null || true
                 printf '%s\n' "$line" | grep -Eq "$4" || fail "the Job $1 says: $line: $(cat "$work/$1.out" "$work/$1.err")"
             }
+            # What node SIDE's state disk has free, as a pod there sees it (a Volume of the
+            # node's is on that disk), asked by a Job NAME: the bytes are in $left.
+            reserve=8388608
+            spare() {
+                job "$2" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"free\",\"/state\"],\"volumeMounts\":[{\"volume\":\"on-$1\",\"path\":\"/state\"}]" '^[0-9]+ succeeded'
+                left=$(tr -d '\r' <"$work/$2.out" | sed -n 's|^free: /state \([0-9][0-9]*\)$|\1|p')
+                [ -n "$left" ] || fail "the Job $2 did not say what $1 has free: $(cat "$work/$2.out" "$work/$2.err")"
+            }
+            # Each node starts with more free than its reserve: the full pod below crosses it.
+            for side in n1 n2; do
+                spare $side "free-$side"
+                [ "$left" -gt $reserve ] || fail "$side's state disk has $left bytes free at the start, under its reserve of $reserve"
+            done
+            echo "vm.sh: each node's state disk above its reserve of $reserve at the start (n2: $left bytes free)" >&2
             # What holds a container to its devices: a pod that is root is root of a user
             # namespace of its own on kith OS, where the kernel makes no device node, not even
             # /dev/null again; its node's own disk it may neither make nor read. (NAME, block
@@ -272,16 +286,47 @@ EOF
             # Past its limit of 1 MiB at about 128 KiB a second.
             fills over ',"resources":{"storage":"1Mi"}' 2097152 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
             # With no limit, writing until its node's disk is full: it is replaced once the disk
-            # has less free than its reserve, and its write never fails.
-            fills full '' 1073741824 'replaced: the node.s state disk has [0-9]* bytes free, under its reserve of 8388608'
+            # has less free than its reserve, and its write never fails. First a ballast brings
+            # n2's disk to 16 MiB above its reserve, fast: written to a Volume (not the pod's own,
+            # so not what is replaced) and held with no name (gone with the pod). Then full, on
+            # n2 too, crosses the reserve at its own pace: above it, it runs; under it, replaced.
+            spare n2 free-ballast
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Workload","metadata":{"name":"ballast"},"spec":{"replicas":1,"template":{"pod":true,"containers":[
+  {"name":"fill","image":"kith.test/pod:1","command":["/bin/pod","fill","/state/ballast","$((left - reserve - 16777216))","unlinked","fast"],
+   "volumeMounts":[{"volume":"on-n2","path":"/state"}]}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Workload ballast was not applied"
+            waited=0
+            until any GET "/v1/logs/Workload/default/ballast?replica=0" >"$work/ballast.out" 2>/dev/null && grep -q 'fill: wrote' "$work/ballast.out"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "the ballast did not end its writes: $(units Workload ballast): $(cat "$work/ballast.out" 2>/dev/null)"
+                sleep 1
+            done
+            ! grep -q 'fill: a write failed' "$work/ballast.out" || fail "the ballast filled n2's disk: $(cat "$work/ballast.out")"
+            spare n2 free-full
+            if [ "$left" -le $reserve ] || [ "$left" -gt $((reserve + 16777216 + 4194304)) ]; then
+                fail "the ballast left n2 $left bytes free, not just above its reserve of $reserve"
+            fi
+            echo "vm.sh: the ballast left n2 $left bytes free, above its reserve" >&2
+            fills full ',"volumeMounts":[{"volume":"on-n2","path":"/state"}]' 1073741824 'replaced: the node.s state disk has [0-9]* bytes free, under its reserve of 8388608'
+            api 1 DELETE "/v1/resources/Workload/default/ballast" >/dev/null || fail "the Workload ballast was not deleted"
             # Past its limit with a file it removed and holds open: no name to walk to, still counted.
             fills unlinked ',"resources":{"storage":"1Mi"}' '2097152","unlinked' 'replaced: its pod wrote [0-9]* bytes outside its volumes, over its limit of 1048576'
 
             # The deleted Workload's image went, from the node it ran on, once unused for its
-            # grace (looked at once a minute; the state disks here are under their reserve,
-            # where an image goes once unused for two minutes, as long as the grace here). That
+            # grace (looked at once a minute; the state disks are above their reserve again,
+            # checked first, so it goes for its grace and not for want of room). That
             # of web, running on the first node all along (it is never drained), stayed there,
             # and web still answers.
+            for side in n1 n2; do
+                waited=0
+                until spare $side "free-again-$side-$waited" && [ "$left" -gt $reserve ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 10 ] || fail "$side's state disk has $left bytes free after the fills, under its reserve of $reserve"
+                    sleep 3
+                done
+            done
             gone=$(printf gone | sha256sum | cut -d ' ' -f 1)
             waited=0
             until grep -aq "kithd: removed image sha256:$gone, unused for [0-9]* s (past its grace)" "$work"/n?.log; do

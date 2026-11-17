@@ -89,8 +89,10 @@ The cluster then reaches it at its mesh address, through the tunnel it opens fro
 (`spec.roaming: true` on its Node). A roaming node never votes, and what it runs stays its own
 however long it is away: nothing moves after `--lost-after`, and nothing new is placed until it
 is back. For one gone for good, `kith delete node/NAME`. It must reach at least one node
-directly (a public address, or UDP 51820 forwarded at home); two nodes both behind NAT meet only
-through an edge node (no hole punching yet). To forbid that:
+directly (a public address, or UDP 51820 forwarded at home). Two nodes both behind NAT call
+each other where an edge node saw them, which opens a direct path through most home routers;
+behind a NAT that gives a new port for each address it sends to, they meet through an edge
+node instead. To forbid that:
 
 ```yaml
 spec:
@@ -273,7 +275,8 @@ KiB, 30 seconds. WebSocket is the only upgrade; no HTTP/2, and no `proxyProtocol
 ### Not yet
 
 - Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh
-  addresses (Services do); two nodes behind NAT meet only through an edge node.
+  addresses (Services do); two nodes behind NATs that give a port per address meet only
+  through an edge node.
 - A changed Workload's replicas on different nodes are replaced all at once (one at a time on
   one node; a NodeWorkload always all at once). Replicas on an unreachable node count as ready
   until `--lost-after`; a roaming node's, indefinitely.

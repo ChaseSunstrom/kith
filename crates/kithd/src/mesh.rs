@@ -105,6 +105,7 @@ fn told(path: &std::path::Path) -> Vec<Member> {
             reached: true,
             direct_only: false,
             reaches: Vec::new(),
+            seen: None,
         })
     };
     read.unwrap_or_default().into_iter().filter_map(member).collect()
@@ -127,6 +128,14 @@ fn reaching(members: &[Member], shook: &BTreeMap<Key, Option<Duration>>) -> Vec<
     names
 }
 
+/// Where this node saw each member it shook hands with lately, by name: what an edge node
+/// tells the others, so two nodes behind NAT can call each other there (kith_mesh::wanted).
+fn seeing(members: &[Member], shook: &BTreeMap<Key, Option<Duration>>, at: &BTreeMap<Key, SocketAddr>) -> Value {
+    let seen = members.iter().filter(|member| shook_lately(shook, &member.key));
+    let seen = seen.filter_map(|member| Some((member.name.clone(), json!(at.get(&member.key)?.to_string()))));
+    Value::Object(seen.collect())
+}
+
 /// The other nodes as the mesh sees them. `shook` has, for the interface's peers, how
 /// long ago each last agreed on keys; `known` remembers since when each has been a peer
 /// (one that is new has its three minutes to answer).
@@ -136,6 +145,25 @@ fn members(
     known: &mut BTreeMap<Key, Instant>,
     now: Instant,
 ) -> Vec<Member> {
+    let edge = |node: &kith_api::Resource| {
+        node.spec["roles"]
+            .as_array()
+            .is_some_and(|roles| roles.contains(&"edge".into()))
+    };
+    // Where each node was seen: by the first edge node, by name, that says so. (Only an edge
+    // node's word is taken: the cluster's admin made it one.)
+    let mut seen: BTreeMap<String, SocketAddr> = BTreeMap::new();
+    for node in store.list(Some("Node")).filter(|node| edge(node)) {
+        let said = node
+            .status
+            .as_ref()
+            .and_then(|status| status["mesh"]["seen"].as_object());
+        for (name, at) in said.into_iter().flatten() {
+            if let Some(at) = at.as_str().and_then(|at| at.parse().ok()) {
+                seen.entry(name.clone()).or_insert(at);
+            }
+        }
+    }
     let member = |node: &kith_api::Resource| {
         let status = node.status.as_ref()?;
         // (A key of zeros or a port that is none would be refused by the kernel.)
@@ -147,7 +175,6 @@ fn members(
         let since = *known.entry(key).or_insert(now);
         let fresh = shook_lately(shook, &key);
         let reaches = status["mesh"]["reaches"].as_array();
-        let roles = node.spec["roles"].as_array();
         Some(Member {
             name: node.metadata.name.clone(),
             key,
@@ -156,7 +183,7 @@ fn members(
             endpoint: at
                 .filter(|_| node.spec["roaming"] != true)
                 .map(|at| SocketAddr::new(at.ip(), port)),
-            edge: roles.is_some_and(|roles| roles.contains(&"edge".into())),
+            edge: edge(node),
             reached: fresh || now.saturating_duration_since(since) < QUIET,
             direct_only: node.spec["mesh"]["relay"] == "never",
             reaches: reaches
@@ -164,6 +191,7 @@ fn members(
                 .flatten()
                 .filter_map(|name| name.as_str().map(str::to_string))
                 .collect(),
+            seen: seen.get(&node.metadata.name).copied(),
         })
     };
     let mut members: Vec<Member> = store.list(Some("Node")).filter_map(member).collect();
@@ -214,13 +242,15 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let mut generation = shared.generation.subscribe();
     let mut warned = false;
     loop {
-        let shook: BTreeMap<Key, Option<Duration>> = match device.peers() {
-            Ok(peers) => peers.into_iter().map(|peer| (peer.key, peer.handshake)).collect(),
-            Err(e) => {
-                eprintln!("kithd: mesh: reading the peers of {}: {e}", options.interface);
-                BTreeMap::new()
-            }
-        };
+        let peers = device.peers().unwrap_or_else(|e| {
+            eprintln!("kithd: mesh: reading the peers of {}: {e}", options.interface);
+            Vec::new()
+        });
+        let shook: BTreeMap<Key, Option<Duration>> = peers.iter().map(|peer| (peer.key, peer.handshake)).collect();
+        let at: BTreeMap<Key, SocketAddr> = peers
+            .iter()
+            .filter_map(|peer| Some((peer.key, peer.endpoint?)))
+            .collect();
         let (members, mine, said, edge, services) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
@@ -232,10 +262,12 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             members.extend(more);
             let edge = members.iter().any(|member| member.name == me && member.edge);
             // What this node says of itself (written only when it changed). An edge node
-            // says who it reaches too: it is asked when a relay is picked, the others are not.
+            // says who it reaches too, and where it saw them: it is asked when a relay is
+            // picked and where to call a node behind NAT, the others are not.
             let mut mine = base.clone();
             if edge {
                 mine["reaches"] = json!(reaching(&members, &shook));
+                mine["seen"] = seeing(&members, &shook, &at);
             }
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
@@ -377,6 +409,24 @@ mod tests {
         assert_eq!((got[0].reached, got[1].reached), (true, false));
         let stale = BTreeMap::from([([1; 32], Some(QUIET))]);
         assert!(!members(&store, &stale, &mut known, later)[0].reached);
+        // Where a node was seen is what an edge node says, and only an edge node: b's word on a
+        // is taken; a's on b (a is no edge node) is not, nor an address that is none.
+        let saw = |byte, seen: Value| json!({ "address": "10.0.0.1:7443", "mesh": { "key": key(byte), "port": 51820, "seen": seen } });
+        let with = store_with_node(
+            &store,
+            "Node/b",
+            saw(2, json!({ "a": "203.0.113.2:40001", "x": "nowhere" })),
+        );
+        let with = store_with_node(&with, "Node/a", saw(1, json!({ "b": "203.0.113.9:1" })));
+        let got = members(&with, &none, &mut BTreeMap::new(), start);
+        assert_eq!(got[0].seen, Some("203.0.113.2:40001".parse().unwrap()));
+        assert_eq!(got[1].seen, None);
+        // What an edge node says it saw: each member it shook hands with lately, where from.
+        let at = BTreeMap::from([
+            ([1; 32], "203.0.113.2:40001".parse().unwrap()),
+            ([2; 32], "203.0.113.3:1".parse().unwrap()),
+        ]);
+        assert_eq!(seeing(&got, &heard, &at), json!({ "a": "203.0.113.2:40001" }));
         // A port that is none or a key of zeros: no member (a key two nodes say: the next test).
         let c = |mesh: Value| store_with(&store, json!({ "address": "10.0.0.3:7443", "mesh": mesh }));
         let named = |store: &Store| {

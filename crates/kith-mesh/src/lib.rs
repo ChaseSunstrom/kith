@@ -8,8 +8,9 @@
 //! of it knows, like its CA), every node an /80 of that (from its name) for itself (`::1`)
 //! and for what runs on it.
 //
-// ponytail: direct paths and one relay hop through an edge node. No hole punching: two
-// nodes that are both behind NAT talk through an edge node for good.
+// ponytail: direct paths, holes punched where an edge node saw each end, and one relay hop
+// through an edge node. Two nodes behind NATs that map a port per destination (symmetric) do
+// not get a hole: they talk through an edge node for good.
 
 pub mod exit;
 mod netlink;
@@ -93,6 +94,8 @@ pub struct Member {
     /// The names of the nodes it says it shook hands with lately (a node that does not say
     /// has none).
     pub reaches: Vec<String>,
+    /// Where an edge node last saw its packets come from: outside its NAT, if it is behind one.
+    pub seen: Option<SocketAddr>,
 }
 
 /// A peer as the interface should have it.
@@ -116,6 +119,18 @@ pub struct Peer {
 // read them at different times: they can pick different ones for a while.
 pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
     let others = || members.iter().filter(|member| member.name != me);
+    // Behind another NAT than this node (an edge node saw the two at different addresses), a
+    // member is called where the edge node saw it. Both ends call each other's NAT every
+    // KEEPALIVE, which opens a path through NATs that keep one port for a socket whoever it
+    // sends to. Behind the same NAT, or seen by none, it is called where it said it is.
+    let outside = members
+        .iter()
+        .find(|member| member.name == me)
+        .and_then(|member| member.seen);
+    let endpoint = |member: &Member| {
+        let apart = |seen: &SocketAddr| outside.is_none_or(|outside| outside.ip() != seen.ip());
+        member.seen.filter(apart).or(member.endpoint)
+    };
     // (Either end may say so: one that is not reached then has no path until it answers.)
     let mine = members.iter().any(|member| member.name == me && member.direct_only);
     let through = |member: &Member| {
@@ -139,7 +154,7 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
         allowed.extend(relayed.map(|other| node_net(prefix, &other.name)));
         Peer {
             key: member.key,
-            endpoint: member.endpoint,
+            endpoint: endpoint(member),
             allowed,
             keepalive: KEEPALIVE,
         }
@@ -150,6 +165,57 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member an edge node saw behind another NAT is called there; behind this node's own NAT,
+    /// or seen by none, where it said it is; reached or not, the same.
+    #[test]
+    fn a_member_seen_behind_another_nat_is_called_where_it_was_seen() {
+        let mesh = prefix(b"a cluster");
+        let member = |name: &str, endpoint: [u8; 4], seen: Option<([u8; 4], u16)>, reached| Member {
+            name: name.into(),
+            key: [name.as_bytes()[0]; 32],
+            endpoint: Some((endpoint, 51820).into()),
+            edge: name == "e",
+            reached,
+            direct_only: false,
+            reaches: Vec::new(),
+            seen: seen.map(Into::into),
+        };
+        let to = |me: &str, members: &[Member], other: u8| {
+            let peers = wanted(mesh, me, members);
+            peers
+                .into_iter()
+                .find(|peer| peer.key[0] == other)
+                .unwrap()
+                .endpoint
+                .unwrap()
+        };
+        for reached in [false, true] {
+            // a and b each behind its own NAT (both 192.168.1.2 at home), e public.
+            let apart = [
+                member("a", [192, 168, 1, 2], Some(([203, 0, 113, 2], 40001)), reached),
+                member("b", [192, 168, 1, 2], Some(([203, 0, 113, 3], 40002)), reached),
+                member("e", [203, 0, 113, 1], Some(([203, 0, 113, 1], 51820)), true),
+            ];
+            assert_eq!(to("a", &apart, b'b'), ([203, 0, 113, 3], 40002).into());
+            assert_eq!(to("b", &apart, b'a'), ([203, 0, 113, 2], 40001).into());
+            // The edge node calls each where it saw it, and is called where it is.
+            assert_eq!(to("e", &apart, b'a'), ([203, 0, 113, 2], 40001).into());
+            assert_eq!(to("a", &apart, b'e'), ([203, 0, 113, 1], 51820).into());
+            // Behind the same NAT: the address on their own network.
+            let together = [
+                member("a", [192, 168, 1, 2], Some(([203, 0, 113, 2], 40001)), reached),
+                member("b", [192, 168, 1, 3], Some(([203, 0, 113, 2], 40002)), reached),
+            ];
+            assert_eq!(to("a", &together, b'b'), ([192, 168, 1, 3], 51820).into());
+            // Seen by no edge node: where it said it is.
+            let unseen = [
+                member("a", [10, 0, 0, 1], None, reached),
+                member("b", [10, 0, 0, 2], None, reached),
+            ];
+            assert_eq!(to("a", &unseen, b'b'), ([10, 0, 0, 2], 51820).into());
+        }
+    }
 
     #[test]
     fn addresses_peers_and_relay() {
@@ -179,6 +245,7 @@ mod tests {
             reached,
             direct_only: false,
             reaches: Vec::new(),
+            seen: None,
         };
         let nets = |peers: &[Peer]| -> Vec<(u8, Vec<Ipv6Addr>)> {
             let of = |peer: &Peer| (peer.key[0], peer.allowed.clone());

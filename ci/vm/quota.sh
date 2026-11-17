@@ -316,9 +316,31 @@ EOF
             gone Workload image
             ok image
 
-            for case in said again write scratch unlinked files nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image; do
+            # kithd's own tests of the project-quota path (crates/kithd/src/controller/storage.rs),
+            # which skip where the disk keeps no projects: here, as the node's root, on this
+            # state disk (TMPDIR in the pod's own root), every one run and none skipped.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"NodeWorkload","metadata":{"name":"unit"},"spec":{"selector":{},"template":{"pod":true,"containers":[
+  {"name":"unit","image":"kith.test/kithd-tests:1","command":["/bin/kithd-tests","storage_projects_","--test-threads=1","--nocapture"],
+   "env":[{"name":"TMPDIR","value":"/t"}],"seccomp":{"unconfined":true}}]}}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NodeWorkload unit was not applied"
+            waited=0
+            until any GET "/v1/logs/NodeWorkload/default/unit?replica=0" >"$work/unit.out" 2>/dev/null && grep -q 'test result' "$work/unit.out"; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 300 ] || fail "kithd's unit tests did not end; they say: $(units NodeWorkload unit): $(cat "$work/unit.out" 2>/dev/null)"
+                sleep 1
+            done
+            any GET "/v1/logs/NodeWorkload/default/unit?replica=0&stderr=true" >"$work/unit.err" 2>/dev/null || :
+            want=$(grep -c 'fn storage_projects_' "$root/crates/kithd/src/controller/storage.rs")
+            grep -q "test result: ok. $want passed" "$work/unit.out" || fail "kithd's storage_projects_ tests: $(grep -o 'test result: [a-zA-Z]*. [0-9]* passed; [0-9]* failed' "$work/unit.out"), not $want passed"
+            ! grep -q 'skipped' "$work/unit.err" || fail "a storage_projects_ test skipped on a disk that keeps projects: $(grep -o 'storage_projects_[a-z_]*: skipped' "$work/unit.err")"
+            gone NodeWorkload unit
+            ok unit
+
+            for case in said again write scratch unlinked files nodewrite copyup nodecopyup userns noderoot unconfined elsewhere image unit; do
                 grep -qx "$case" "$work/oks" || fail "the case $case was not shown"
             done
             ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
-            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; a pod with the node's users was stopped in its root too, and in both kinds a file of the image copied up near the limit was refused whole and left unchanged; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it"
+            echo "vm.sh: ok: one node whose state disk keeps project quotas: kithd said it holds pods' storage limits at the write; a project id given again after kithd started again held its new pod to its own limit, not the last one's; a pod of 64 MiB writing 200 MiB was stopped by the kernel at its limit, in its root, in its scratch and in a file it removed and held open, and not replaced, while one beside it lost no write; a pod with the node's users was stopped in its root too, and in both kinds a file of the image copied up near the limit was refused whole and left unchanged; its files stayed in its project in a user namespace (the kernel) and as the node's root (its filter), and unconfined it moved one out and was counted and replaced; linked or renamed out of its root they were refused; what it changed of its image was charged to it; kithd's storage_projects_ unit tests passed on it, none skipped"
             exit 0

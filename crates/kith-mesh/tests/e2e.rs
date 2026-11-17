@@ -1,6 +1,7 @@
 //! Three network namespaces as three nodes, on a line: a and c each have a wire to b and
-//! none to each other. Run with `KITH_E2E=1`; needs unprivileged user namespaces and the
-//! `unshare`, `ip` and `ping` programs, and says so when it skips.
+//! none to each other; then two nodes each behind its own NAT router, and an edge node. Run
+//! with `KITH_E2E=1`; needs unprivileged user namespaces and the `unshare`, `ip`, `iptables`
+//! and `ping` programs, and says so when it skips.
 //!
 //! `e2e.sh` builds the namespaces and runs this same program in them as its tool: the
 //! arguments `up`, `peers`, `show`, `address` and `down` below.
@@ -32,7 +33,7 @@ fn tool(args: &[&str]) {
         ["up", seed, name, private] => {
             println!("{}", hex(&device(seed, name, private).public_key().unwrap()));
         }
-        // Each member: name,public key,endpoint or -,edge (0 or 1),reached (0 or 1).
+        // Each member: name,public key,endpoint or -,edge (0 or 1),reached (0 or 1)[,seen].
         ["peers", seed, name, private, members @ ..] => {
             let member = |text: &&str| {
                 let part: Vec<&str> = text.split(',').collect();
@@ -44,6 +45,7 @@ fn tool(args: &[&str]) {
                     reached: part[4] == "1",
                     direct_only: false,
                     reaches: Vec::new(),
+                    seen: part.get(5).and_then(|seen| seen.parse().ok()),
                 }
             };
             let members: Vec<Member> = members.iter().map(member).collect();
@@ -77,5 +79,5 @@ fn main() {
     let me = std::env::current_exe().unwrap();
     let status = unshare(&["sh", script, me.to_str().unwrap()]).unwrap();
     assert!(status.success(), "{script} failed");
-    println!("ok: three namespaces meshed, one pair through the edge node");
+    println!("ok: three namespaces meshed, one pair through the edge node; two nodes behind NAT meet directly");
 }
