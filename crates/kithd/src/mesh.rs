@@ -13,7 +13,7 @@ use crate::Shared;
 use kith_api::store::Store;
 use kith_mesh::{Device, Key, Member};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -167,9 +167,11 @@ fn members(
         })
     };
     let mut members: Vec<Member> = store.list(Some("Node")).filter_map(member).collect();
-    // One key is one node: nodes that say the same key are left out, whoever copied whom.
-    let keys: Vec<Key> = members.iter().map(|member| member.key).collect();
-    members.retain(|member| keys.iter().filter(|key| **key == member.key).count() == 1);
+    // One key is one node: of the nodes that say the same key, the first by name is the node and
+    // the later ones are left out, so a copied key cannot knock out the real node.
+    members.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut seen = BTreeSet::new();
+    members.retain(|member| seen.insert(member.key));
     known.retain(|key, _| members.iter().any(|member| member.key == *key));
     members
 }
@@ -373,7 +375,7 @@ mod tests {
         assert_eq!((got[0].reached, got[1].reached), (true, false));
         let stale = BTreeMap::from([([1; 32], Some(QUIET))]);
         assert!(!members(&store, &stale, &mut known, later)[0].reached);
-        // A port that is none, a key of zeros or one that two nodes say: no members.
+        // A port that is none or a key of zeros: no member (a key two nodes say: the next test).
         let c = |mesh: Value| store_with(&store, json!({ "address": "10.0.0.3:7443", "mesh": mesh }));
         let named = |store: &Store| {
             let got = members(store, &none, &mut BTreeMap::new(), later);
@@ -385,13 +387,33 @@ mod tests {
         assert_eq!(named(&c(mesh(0))), ["a", "b"]);
         // A node that left the mesh has its `mesh` cleared (null): no member.
         assert_eq!(named(&c(Value::Null)), ["a", "b"]);
-        assert_eq!(named(&c(mesh(1))), ["b"]);
+        // c says a's key: c is the later name, so c is left out and a stays.
+        assert_eq!(named(&c(mesh(1))), ["a", "b"]);
         // A key that is no key is no member, and a node that is gone is forgotten.
         assert_eq!(key_of("zz"), None);
         assert_eq!(key_of(&key(7)), Some([7; 32]));
         store.delete("Node/b").unwrap();
         members(&store, &none, &mut known, later);
         assert_eq!(known.len(), 1);
+    }
+
+    /// Two Nodes that say one key (one copied the other): the earlier-named one stays a member
+    /// and the later one is left out, whichever the store lists first.
+    #[test]
+    fn two_nodes_with_one_key_keep_only_the_earlier() {
+        let mut store = Store::default();
+        for name in ["zed", "amy", "bob"] {
+            let source = format!("apiVersion: kith.dev/v1\nkind: Node\nmetadata: {{ name: {name} }}\nspec: {{}}\n");
+            let resource = kith_api::Resource::from_source(&source).unwrap().remove(0);
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let mesh = |byte: u8| json!({ "address": "10.0.0.1:7443", "mesh": { "key": hex(&[byte; 32]), "port": 51820 } });
+        store.set_status("Node/zed", Some(mesh(1))).unwrap();
+        store.set_status("Node/amy", Some(mesh(1))).unwrap();
+        store.set_status("Node/bob", Some(mesh(2))).unwrap();
+        let got = members(&store, &BTreeMap::new(), &mut BTreeMap::new(), Instant::now());
+        let named: Vec<(&str, Key)> = got.iter().map(|member| (member.name.as_str(), member.key)).collect();
+        assert_eq!(named, [("amy", [1; 32]), ("bob", [2; 32])]);
     }
 
     #[test]
