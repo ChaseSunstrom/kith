@@ -459,26 +459,30 @@ pub fn answers(yaml: &str) -> Result<Answers, String> {
 /// One line from whoever types at any of the machine's consoles (a screen's keyboard, a
 /// serial line): the kernel hands its first process only the last console named.
 pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
-    use std::io::BufRead;
     let (lines, typed) = std::sync::mpsc::channel();
     let active = std::fs::read_to_string("/sys/class/tty/console/active").unwrap_or_default();
     for name in active.split_whitespace() {
         let (Ok(console), lines) = (File::open(format!("/dev/{name}")), lines.clone()) else {
             continue;
         };
-        std::thread::spawn(move || {
-            let (mut console, mut line) = (std::io::BufReader::new(console), Vec::new());
-            // (Bytes that are no text are typed too, on a serial line: they end nothing.)
-            while console.read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
-                if lines.send(String::from_utf8_lossy(&line).trim().to_string()).is_err() {
-                    return;
-                }
-                // (What was typed may be a PIN or a passphrase: no copy outlives its use.)
-                zeroize::Zeroize::zeroize(&mut line);
-            }
-        });
+        std::thread::spawn(move || lines_of(std::io::BufReader::new(console), &lines));
     }
     typed
+}
+
+/// Each line read from `console` to `lines`, until it ends or nobody listens. A line is read
+/// 4 KiB at most at a time: one longer (a serial line's noise, no newline) comes in pieces.
+fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<String>) {
+    use std::io::{BufRead, Read};
+    let mut line = Vec::new();
+    // (Bytes that are no text are typed too, on a serial line: they end nothing.)
+    while (&mut console).take(4096).read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+        if lines.send(String::from_utf8_lossy(&line).trim().to_string()).is_err() {
+            return;
+        }
+        // (What was typed may be a PIN or a passphrase: no copy outlives its use.)
+        zeroize::Zeroize::zeroize(&mut line);
+    }
 }
 
 /// Nothing more is done, and the machine stays as it is for someone to read why.
@@ -767,6 +771,21 @@ async fn fetched(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console that sends no newline (a serial line's noise) comes in pieces of at most
+    /// 4 KiB: what one line holds is bounded. A short line comes whole.
+    #[test]
+    fn install_keyboard_a_line_is_read_at_most_4_kib_at_a_time() {
+        let mut sent = vec![b'x'; 10_000];
+        sent.extend_from_slice(b"\n1234\n");
+        let (lines, typed_in) = std::sync::mpsc::channel();
+        lines_of(&sent[..], &lines);
+        drop(lines);
+        let got: Vec<String> = typed_in.iter().collect();
+        assert!(got.iter().all(|piece| piece.len() <= 4096), "{:?}", got.iter().map(String::len).collect::<Vec<_>>());
+        assert_eq!(got.iter().map(String::len).sum::<usize>(), 10_004);
+        assert_eq!(got.last().map(String::as_str), Some("1234"));
+    }
 
     fn disk(name: &str, gigabytes: u64) -> Disk {
         Disk {
