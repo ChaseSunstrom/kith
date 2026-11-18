@@ -17,6 +17,23 @@ fn one(src: &str) -> Resource {
     load(src).pop().unwrap()
 }
 
+#[test]
+fn passed_on_is_one_list_for_the_nodes_and_the_cli() {
+    // Reads a node passes on to the node that has the thing.
+    assert!(passed_on("GET", "/v1/logs/Workload/default/web?replica=0"));
+    assert!(passed_on("GET", "/v1/volumes/default/data/files"));
+    // Changes a control node that is not the leader passes on as they came.
+    assert!(passed_on("POST", "/v1/apply"));
+    assert!(passed_on("DELETE", "/v1/resources/ConfigMap/default/gone"));
+    assert!(passed_on("POST", "/v1/rollback/ConfigMap/default/gone?to=1"));
+    // Not these: a node's own reads, and the same routes by another method.
+    assert!(!passed_on("GET", "/v1/cluster"));
+    assert!(!passed_on("GET", "/v1/resources?namespace=default"));
+    assert!(!passed_on("GET", "/v1/apply"));
+    assert!(!passed_on("GET", "/v1/resources/ConfigMap/default/gone"));
+    assert!(!passed_on("DELETE", "/v1/rollback/ConfigMap/default/gone?to=1"));
+}
+
 /// The (line, column, message) of the first error in `src`.
 fn err(src: &str) -> (usize, usize, String) {
     let e = match Resource::from_source(src) {
