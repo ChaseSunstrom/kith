@@ -92,7 +92,10 @@ fn applied(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), S
         let empty = resource.spec.as_object().is_some_and(|spec| spec.is_empty());
         return match resource.metadata.name == who.name && none && empty {
             true => Ok(()),
-            false => Err(refused("a Node", "a control node makes its own Node only where it has none")),
+            false => Err(refused(
+                "a Node",
+                "a control node makes its own Node only where it has none",
+            )),
         };
     }
     worker::apply(store, who, resource)
@@ -143,10 +146,7 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
                 let said = worker::report(store, &who, &key, said)?;
                 taken.push((key, said));
             }
-            Ok(Command::Report {
-                node,
-                statuses: taken,
-            })
+            Ok(Command::Report { node, statuses: taken })
         }
         Command::Report { node, .. } => Err(refused(
             format!("a report in node {node}'s name"),
@@ -194,7 +194,11 @@ mod tests {
                 info.kind
             );
         }
-        assert_eq!(CLASSES.len(), kith_api::KINDS.len(), "a classified kind kith does not know");
+        assert_eq!(
+            CLASSES.len(),
+            kith_api::KINDS.len(),
+            "a classified kind kith does not know"
+        );
     }
 
     /// Through the write route: a control node's own write, naming no caller, is let through for
@@ -258,7 +262,15 @@ mod tests {
             },
         ];
         for command in &allowed {
-            let said = to_k.post(&url).json(command).send().await.unwrap().text().await.unwrap();
+            let said = to_k
+                .post(&url)
+                .json(command)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
             assert!(said.contains("Ok"), "{said}");
         }
 
@@ -277,7 +289,15 @@ mod tests {
             patch("Node/own-k", serde_json::json!({ "raftId": "1" })),
         ];
         for command in &refused {
-            let said = to_k.post(&url).json(command).send().await.unwrap().text().await.unwrap();
+            let said = to_k
+                .post(&url)
+                .json(command)
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
             assert!(said.contains("Err"), "{said}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -294,7 +314,15 @@ mod tests {
         let theirs = Command::Delete {
             key: "Cluster/cluster".into(),
         };
-        let said = to_w.post(&url).json(&theirs).send().await.unwrap().text().await.unwrap();
+        let said = to_w
+            .post(&url)
+            .json(&theirs)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
         assert!(said.contains("Err"), "{said}");
     }
 }

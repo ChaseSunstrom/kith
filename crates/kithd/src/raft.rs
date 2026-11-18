@@ -1302,7 +1302,10 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         // moved: the next tick says it, as the leader then.
         let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(Command::Patch { statuses })).await;
         match written {
-            Ok(Ok(written)) => written.data.map(drop).map_err(|e| format!("writing down which nodes are there: {e}"))?,
+            Ok(Ok(written)) => written
+                .data
+                .map(drop)
+                .map_err(|e| format!("writing down which nodes are there: {e}"))?,
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => {}
             Ok(Err(e)) => return Err(format!("writing down which nodes are there: {e}")),
             Err(_) => return Err("writing down which nodes are there: no majority in time".into()),

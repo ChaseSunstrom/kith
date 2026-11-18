@@ -369,7 +369,16 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
     // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
     const UNIT: [&str; 10] = [
-        "name", "replica", "state", "ready", "restarts", "revision", "exitCode", "message", "address", "hostUsers",
+        "name",
+        "replica",
+        "state",
+        "ready",
+        "restarts",
+        "revision",
+        "exitCode",
+        "message",
+        "address",
+        "hostUsers",
     ];
     for unit in &units {
         match unit.as_object() {
