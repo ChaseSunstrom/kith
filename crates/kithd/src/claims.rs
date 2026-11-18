@@ -508,9 +508,13 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
         .collect()
 }
 
-/// Whether `p` names something under /dev, with no `..` to climb out of it.
+/// Whether `p` names something under /dev: `/dev/` and then one or more plain names, none
+/// empty, `.` or `..` (`/dev`, `/dev/`, `/dev//x`, `/dev/./x` and `//dev/x` are all refused).
 fn in_dev(p: &str) -> bool {
-    p.starts_with("/dev/") && !p.split('/').any(|c| c == "..")
+    let Some(rest) = p.strip_prefix("/dev/") else {
+        return false;
+    };
+    rest.split('/').all(|c| !matches!(c, "" | "." | ".."))
 }
 
 /// What to give each workload that is placed on `me` with claims: its key, the paths of
@@ -1291,6 +1295,12 @@ spec: { node: b, devices: [b-usb0] }
             "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [/etc/shadow] }",
             "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [/dev/../etc/passwd] }",
             "{ node: a, class: gpu, nodes: [/proc/kcore] }",
+            "{ node: a, class: gpu, path: /dev }",
+            "{ node: a, class: gpu, path: /dev/ }",
+            "{ node: a, class: gpu, path: /dev/./x }",
+            "{ node: a, class: gpu, path: /dev//x }",
+            "{ node: a, class: gpu, path: //dev/x }",
+            "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [''] }",
         ] {
             let forged = format!(
                 "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-gpu-card1 }}\nspec: {spec}\n"
@@ -1305,6 +1315,50 @@ spec: { node: b, devices: [b-usb0] }
             assert!(on_a["Workload/default/train"].devices.is_empty(), "{spec}");
             assert!(on_a["Workload/default/train"].classes.is_empty(), "{spec}");
         }
+        // Real /dev names still pass.
+        let ok = "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: { name: a-gpu-card1 }\n\
+                  spec: { node: a, class: gpu, nodes: [/dev/bus/usb/001/002, /dev/input/event3, /dev/nvidia-uvm] }\n";
+        let source = [
+            ok.to_string(),
+            claim("cuda", "{ device: a-gpu-card1 }"),
+            workload("train", "[cuda]"),
+        ]
+        .concat();
+        assert_eq!(
+            granted(&self::store(&source), "a", &empty)["Workload/default/train"].devices,
+            ["/dev/bus/usb/001/002", "/dev/input/event3", "/dev/nvidia-uvm"].map(PathBuf::from)
+        );
+        // A client of a seat draws on the seat's GPUs (whole = false): a forged one, with a card
+        // name that finds a real render node in /sys, still grants nothing.
+        let root = sys("forged-client");
+        let client = [
+            claim("desk", "{ seat: a-seat0 }"),
+            claim("apps", "{ seat: a-seat0, access: client }"),
+            workload("session", "[desk]"),
+            workload("app", "[apps]"),
+        ]
+        .concat();
+        let hardware = |gpu: &str| {
+            let hardware = HARDWARE.replace("spec: { node: a, class: gpu, path: /dev/dri/card0 }", gpu);
+            let mut store = Store::default();
+            for resource in Resource::from_source(&format!("{hardware}---\n{client}")).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+            store
+        };
+        let real = granted(
+            &hardware("spec: { node: a, class: gpu, path: /dev/dri/card0 }"),
+            "a",
+            &root,
+        );
+        assert_eq!(
+            real["Workload/default/app"].devices,
+            [PathBuf::from("/dev/dri/renderD128")]
+        );
+        let forged = granted(&hardware("spec: { node: a, class: gpu, path: /etc/card0 }"), "a", &root);
+        assert!(forged["Workload/default/app"].devices.is_empty());
+        assert!(forged["Workload/default/app"].classes.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&empty);
     }
 
