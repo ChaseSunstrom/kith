@@ -1453,4 +1453,45 @@ mod tests {
             "{why}"
         );
     }
+
+    /// docs/install.html makes this file in the browser; its two examples (the form as it
+    /// starts, and the form filled in) are in the page as `<pre data-answers="...">`, and
+    /// ci/site_shots.py checks that the page's script writes them. Here the installer
+    /// reads them: its parser takes every field, and its plan accepts every value.
+    #[test]
+    fn the_install_page_examples_are_answers_the_installer_takes() {
+        const PAGE: &str = include_str!("../../../docs/install.html");
+        let example = |name: &str| {
+            let from = PAGE.find(&format!("<pre data-answers=\"{name}\"")).unwrap_or_else(|| panic!("no {name} example"));
+            let body = &PAGE[from..];
+            let body = &body[body.find('>').unwrap() + 1..body.find("</pre>").unwrap()];
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in body.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    c if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            text.replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        };
+        let mut seen = Vec::new();
+        for name in ["default", "example"] {
+            let yaml = example(name);
+            let told = answers(&yaml).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            let mut one = disk("nvme0n1", 256);
+            one.serial = "S4EWNX0R123456".into();
+            let (_, config) = plan(&told, &[one], 300 << 20, 1 << 20).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            seen.push((told, config));
+        }
+        // The default is the one disk and nothing else; the example fills in every field.
+        assert_eq!(seen[0].0, Answers { disk: "only".into(), ..Answers::default() });
+        let full = &seen[1].0;
+        assert!(full.disk.starts_with("serial:") && full.hostname.is_some() && full.ip.is_some() && full.dns.is_some());
+        assert!(full.join.is_some() && full.encrypt && full.release_key.is_some() && full.lan_releases);
+        assert!(full.node_policy.is_some());
+        assert!(seen[1].1.contains("--join ") && seen[1].1.contains("--release-key ") && seen[1].1.contains("--lan-releases"));
+    }
 }
