@@ -27,6 +27,7 @@ mod encrypted;
 mod exits;
 mod files;
 mod gpt;
+mod home;
 mod images;
 mod ingress;
 mod init;
@@ -1113,7 +1114,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let format = raft::tend_format(shared.clone(), stopping.clone());
             tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
         };
-        let (served, nodes, (), (), (), (), (), (), (), _) = tokio::join!(
+        let house = home::run(shared.clone(), stopping.clone());
+        let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
             apart(work),
@@ -1123,6 +1125,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             apart(proxy),
             apart(ingress),
             apart(saying),
+            apart(house),
             apart(storage)
         );
         let _ = shared.raft.shutdown().await;

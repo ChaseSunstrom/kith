@@ -219,6 +219,20 @@ spec! {
         /// only by a write the admin signed.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub signing: Option<Signing>,
+        /// The house's one address on its LAN: whichever control node leads holds it, and
+        /// answers DNS at it, so a router can name it once (DHCP option 6) and forward to it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub home: Option<HomeSpec>,
+    }
+
+    pub struct HomeSpec {
+        /// The address with its prefix length, as the LAN has it (`192.168.1.250/24`): an IPv4
+        /// address no other machine there has, in the network of a card of the node that holds it.
+        pub address: String,
+        /// How the outside reaches the house: a name, or an address, with a port
+        /// (`house.example.org:51820`). Kept and not acted on: the router forwards to `address`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub endpoint: Option<String>,
     }
 
     pub enum Signing { Open, Required }
@@ -1445,8 +1459,87 @@ fn not_keys(signers: &[Signer]) -> Option<String> {
     })
 }
 
+/// The house address `192.168.1.250/24` as (address, prefix length), or why it is not one a LAN
+/// can have: IPv4 with a prefix of 1 to 30, not the network's or broadcast address of that prefix,
+/// not loopback, multicast, link-local, in 0.0.0.0/8, 255.255.255.255, or in the default pod range
+/// (100.88.0.0/16) or the people range (100.89.0.0/16) that kith's own mesh uses.
+pub fn home_address(text: &str) -> Result<(std::net::Ipv4Addr, u8), String> {
+    let wrong = || format!("`{text}` is not an IPv4 address with its prefix length, like `192.168.1.250/24`");
+    let (address, bits) = text.split_once('/').ok_or_else(wrong)?;
+    let address: std::net::Ipv4Addr = address.parse().map_err(|_| wrong())?;
+    let bits: u8 = bits
+        .parse()
+        .ok()
+        .filter(|bits| (1..=30).contains(bits))
+        .ok_or_else(|| format!("`{text}`: the prefix length is 1 to 30 (a LAN of at least two machines)"))?;
+    let as_number = u32::from(address);
+    let mask = u32::MAX << (32 - u32::from(bits));
+    let in_range = |network: [u8; 4]| as_number & 0xffff_0000 == u32::from(std::net::Ipv4Addr::from(network));
+    let why = if address.is_loopback() {
+        "loopback"
+    } else if address.is_multicast() {
+        "a multicast address"
+    } else if address.is_link_local() {
+        "a link-local address (169.254.0.0/16)"
+    } else if address.octets()[0] == 0 {
+        "in 0.0.0.0/8"
+    } else if address.is_broadcast() {
+        "the broadcast address 255.255.255.255"
+    } else if in_range([100, 88, 0, 0]) {
+        "in the default pod range 100.88.0.0/16"
+    } else if in_range([100, 89, 0, 0]) {
+        "in the people range 100.89.0.0/16"
+    } else if as_number & !mask == 0 {
+        "the network address of its prefix"
+    } else if as_number | mask == u32::MAX {
+        "the broadcast address of its prefix"
+    } else {
+        return Ok((address, bits));
+    };
+    Err(format!(
+        "`{text}` is {why}: the house address is one machine's own address on the LAN"
+    ))
+}
+
+/// Why `text` is not how the outside reaches the house: a name or an IPv4 address (or an IPv6 one
+/// in brackets), a colon and a port.
+pub fn home_endpoint_refused(text: &str) -> Option<String> {
+    let wrong = || {
+        Some(format!(
+            "`{text}` is not a name or an address with a port, like `house.example.org:51820`"
+        ))
+    };
+    let Some((host, port)) = text.rsplit_once(':') else {
+        return wrong();
+    };
+    if port.parse::<u16>().ok().filter(|port| *port > 0).is_none() {
+        return wrong();
+    }
+    let name = |host: &str| {
+        host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
+    };
+    let host_ok = match host.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(v6) => v6.parse::<std::net::Ipv6Addr>().is_ok(),
+        None => name(host),
+    };
+    if host_ok { None } else { wrong() }
+}
+
 impl Spec for ClusterSpec {
     fn check(&self) -> Result<(), String> {
+        if let Some(home) = &self.home {
+            home_address(&home.address).map_err(|why| format!("spec.home.address: {why}"))?;
+            if let Some(why) = home.endpoint.as_deref().and_then(home_endpoint_refused) {
+                return Err(format!("spec.home.endpoint: {why}"));
+            }
+        }
         if self.images.len() > 32 {
             return Err("spec.images: at most 32 rules".into());
         }
