@@ -1,6 +1,5 @@
-# kith OS for a node that hands a PCI card (a GPU, a USB controller) to a virtual machine:
+# kith OS with its kernel prepared for PCI passthrough: the IOMMU on and vfio-pci built in:
 #   KITH_OS_VERSION=1.0.1+vfio sh os/build.sh --spec os/examples/vfio.yaml
-# The IOMMU is in every kith OS kernel; this adds vfio-pci. Bind the card with
-# vfio-pci.ids=VENDOR:DEVICE on the kernel's command line.
+# This only prepares the kernel. Binding a card to vfio-pci, and `vms` units on kith OS, come later.
 features: [vfio]
 firmware: []
