@@ -30,6 +30,7 @@ mod images;
 mod ingress;
 mod init;
 mod install;
+mod keeper;
 mod kube;
 mod kubeproto;
 mod members;
@@ -263,8 +264,25 @@ fn main() -> ExitCode {
     kith_runtime::exec_shim();
     // Started again to render a package's templates? Then this never returns either.
     releases::render_shim();
-    let first = init::is_init();
-    let mut boot = first.then(init::early);
+    // Process 1 keeps kithd (keeper.rs) and is nothing else; kithd it keeps is the node's first.
+    if std::process::id() == 1 {
+        keeper::keep();
+    }
+    let kept = keeper::kept();
+    let first = kept.is_some();
+    if let Some((start, end)) = kept {
+        init::FIRST.store(true, std::sync::atomic::Ordering::Relaxed);
+        // (What `pod kill` and a reader of ps find it by: it was started as /proc/self/exe.)
+        let _ = nix::sys::prctl::set_name(c"kithd");
+        if end {
+            eprintln!("kithd: init: kithd failed 10 times in a minute");
+            init::end(true);
+        }
+        if start > 1 {
+            eprintln!("kithd: init: started again ({start}): what runs is taken back");
+        }
+    }
+    let mut boot = kept.map(|(start, _)| init::early(start > 1));
     if let Some(source) = boot.as_mut().and_then(|boot| boot.install.take()) {
         installer(boot.expect("there is one"), source);
     }
@@ -746,6 +764,16 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
     let mut runtime = kith_runtime::Runtime::new(state.join("runtime"));
     if let Some(said) = runtime.as_ref().ok().and_then(|runtime| runtime.cgroup_problem()) {
         eprintln!("kithd: {said}");
+    }
+    // Started again by process 1: a container the kithd before made and did not start holds
+    // its sockets (this one's address among them) until it is gone.
+    if let (Ok(runtime), Some((2.., _))) = (&runtime, keeper::kept()) {
+        let stopped = runtime.stop_unstarted(std::path::Path::new(controller::UNITS));
+        if stopped > 0 {
+            eprintln!(
+                "kithd: {stopped} container(s) an earlier kithd made and never started: stopped, to be started again"
+            );
+        }
     }
     // The registry's door, and the one copy of what opens it: the runtime's, for its pulls.
     // (No door is no kithd: without one a pull of `localhost:PORT/…` would ask whatever

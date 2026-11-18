@@ -46,7 +46,7 @@ const JOB_RETRIES: u32 = 3;
 /// What a slot runs.
 // Most slots are containers, so boxing the big variant would save nothing.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Run {
     Container(Container),
     Exec(ExecUnit),
@@ -173,7 +173,37 @@ struct Progress {
     message: Option<String>,
 }
 
+/// Where each unit started is written down for the next kithd ([`kith_runtime::Runtime::record`]).
+pub const UNITS: &str = "/run/kith/units";
+
+/// What a unit was started as: what `differs` compares, hashed (its values hold secrets). A
+/// kithd started again takes back a running unit only if its slot's mark is the same.
+fn mark(slot: &Slot) -> String {
+    use sha2::Digest;
+    let what = format!(
+        "{:?}",
+        (
+            &slot.run,
+            &slot.pod,
+            &slot.exit,
+            &slot.notes,
+            &slot.policy,
+            &slot.devices,
+            &slot.seat,
+            &slot.volumes,
+            slot.env.as_ref().ok()
+        )
+    );
+    sha2::Sha256::digest(what.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 struct Controller {
+    /// Units a kithd before this one started that still run, with their marks: each is taken
+    /// by its slot when that slot would start, or stopped if it is not wanted or not the same.
+    adopted: BTreeMap<String, (Handle, String)>,
     runtime: Runtime,
     logs: PathBuf,
     log_cap: u64,
@@ -258,12 +288,31 @@ pub async fn run(
     image_grace: Duration,
     mut stopping: watch::Receiver<bool>,
 ) {
-    let runtime = match runtime.and_then(|rt| rt.cleanup().map(|old| (rt, old))) {
-        Ok((runtime, old)) => {
+    // Kept by process 1 (kith OS), what a kithd before this one started runs on: what of it is
+    // still wanted is taken back below, the rest stopped; elsewhere all of it is stopped here.
+    let runtime = runtime.map(|mut rt| {
+        rt.records = crate::init::is_init().then(|| UNITS.into());
+        rt
+    });
+    let swept = runtime.and_then(|rt| {
+        let adopted = rt.adopt();
+        let kept = adopted.keys().cloned().collect();
+        rt.cleanup_but(&kept).map(|old| (rt, old, adopted))
+    });
+    let (runtime, adopted) = match swept {
+        Ok((runtime, old, adopted)) => {
             if old > 0 {
                 eprintln!("kithd: removed {old} unit(s) left by an earlier run");
             }
-            runtime
+            if !adopted.is_empty() {
+                let ids: Vec<&str> = adopted.keys().map(String::as_str).collect();
+                eprintln!(
+                    "kithd: {} unit(s) of an earlier run still run, or ended while no kithd did: taken back where still wanted ({})",
+                    ids.len(),
+                    ids.join(", ")
+                );
+            }
+            (runtime, adopted)
         }
         Err(e) => {
             // The API still works, so resources can be inspected and edited.
@@ -334,6 +383,7 @@ pub async fn run(
         look_failed: None,
         projects,
         scanned: None,
+        adopted,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -1030,6 +1080,21 @@ impl Controller {
             // Dropped when nothing is wanted under its id: once gone it is not adopted as an exit.
             stop_unit(&mut self.slots, id, !wanted.contains_key(id)).await;
         }
+        // Taken back units nothing wants any more, or wants otherwise, are stopped.
+        let unwanted: Vec<String> = self
+            .adopted
+            .iter()
+            .filter(|(id, (_, was))| wanted.get(*id).is_none_or(|new| &mark(new) != was))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in unwanted {
+            if let Some((handle, _)) = self.adopted.remove(&id) {
+                eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
+                if let Err(e) = delete(handle).await {
+                    eprintln!("kithd: {id}: {}", e.error);
+                }
+            }
+        }
         let mut stale: Vec<String> = Vec::new();
         fn of(slot: &Slot) -> (&str, u32) {
             (slot.owner.as_str(), slot.replica)
@@ -1345,8 +1410,20 @@ impl Controller {
                     _ => None,
                 };
                 let mut stop_now = stopping.clone();
+                let taken = self.adopted.remove(id).filter(|(_, was)| *was == mark(slot));
                 let started = tokio::select! {
                     started = async {
+                        if let Some((handle, _)) = taken {
+                            eprintln!("kithd: {id}: taken back, as it ran");
+                            if let Some((pod, _)) = slot.pod.as_ref().filter(|_| nix::unistd::getuid().is_root()) {
+                                let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+                                let state = self.logs.parent().unwrap_or(&self.logs);
+                                if let Err(e) = pods.adopt(state, pod, handle.pid()) {
+                                    eprintln!("kithd: {id}: {e}");
+                                }
+                            }
+                            return Ok(handle);
+                        }
                         let project = given.transpose()?;
                         start(shared, &self.runtime, &self.logs, mesh, id, slot, project).await
                     } => started,
@@ -2433,6 +2510,11 @@ async fn start(
         }
     };
     let mut handle = created?;
+    // Written down before it runs: a unit may end kithd at once (as ci/vm/outlive.sh's does),
+    // and one that ran with no record would be run again by the next.
+    // ponytail: an exec unit whose kithd ends between this and `start` gets no go, ends, and is
+    // taken back as ended: a Job fails once in that window of microseconds.
+    runtime.record(id, &handle, &mark(slot));
     match handle.start() {
         Ok(()) => Ok(handle),
         Err(e) => {
@@ -2852,6 +2934,33 @@ mod tests {
             started: Instant::now(),
             start_at: None,
             replaced: false,
+        }
+    }
+
+    /// A unit is taken back by the slot that would start it only when its mark is the slot's:
+    /// the same for what a unit's life changes (its state, restarts, when it started), another
+    /// for what it was started as (what it runs, its devices, its environment).
+    #[test]
+    fn adopt_by_a_mark_of_what_a_unit_was_started_as() {
+        let slot = slot_of("w", &["/dev/a"], "c");
+        let mut lived = slot_of("w", &["/dev/a"], "c");
+        (lived.state, lived.restarts, lived.failures, lived.held) = ("running", 3, 2, true);
+        assert_eq!(mark(&slot), mark(&lived));
+        assert_eq!(mark(&slot).len(), 64);
+        let others = [
+            slot_of("w", &["/dev/a"], "d"),
+            slot_of("w", &["/dev/b"], "c"),
+            Slot {
+                env: Ok(vec![("A".into(), "1".into())]),
+                ..slot_of("w", &["/dev/a"], "c")
+            },
+            Slot {
+                policy: RestartPolicy::Never,
+                ..slot_of("w", &["/dev/a"], "c")
+            },
+        ];
+        for other in &others {
+            assert_ne!(mark(&slot), mark(other), "{:?}", other.run);
         }
     }
 

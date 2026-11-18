@@ -3,8 +3,8 @@
 use crate::{Context, Image, ImageStore, Result, devfilter, err};
 use caps::CapSet;
 use libcgroups::common::{CgroupManager, ControllerOpt};
-use libcontainer::container::Container;
 use libcontainer::container::builder::ContainerBuilder;
+use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::syscall::syscall::SyscallType;
 use libcontainer::workload::default::DefaultExecutor;
 use libcontainer::workload::{Executor, ExecutorError, ExecutorValidationError};
@@ -58,6 +58,9 @@ pub struct Runtime {
     pub images: ImageStore,
     /// The program [`Runtime::exec`] starts as its helper: this one, which must call [`exec_shim`].
     pub shim: PathBuf,
+    /// Where each unit started is written down, for a kithd started again to take it back
+    /// ([`Runtime::adopt`]): set under a keeper (kith OS), where units outlive kithd.
+    pub records: Option<PathBuf>,
 }
 
 /// What to run. Everything is already resolved: the controller turns a
@@ -405,6 +408,9 @@ pub struct Handle {
     pub cgroup: PathBuf,
     /// The first of the node's ids its user namespace maps from 0, where it has one of its own.
     range: Option<u32>,
+    /// Taken back from a kithd before this one ([`Runtime::adopt`]): its main is no child of
+    /// this process, and is known by its start time; how it ended, by what process 1 wrote.
+    adopted: Option<u64>,
 }
 
 impl Runtime {
@@ -424,6 +430,7 @@ impl Runtime {
             images,
             // Not `current_exe()`: after an upgrade replaces the file, that names a path that is gone.
             shim: "/proc/self/exe".into(),
+            records: None,
         })
     }
 
@@ -439,13 +446,133 @@ impl Runtime {
     /// Kill and remove every container a previous owner of `root` left behind,
     /// e.g. after a crash. Returns how many were removed.
     pub fn cleanup(&self) -> Result<usize> {
-        self.sweep_left(Path::new("/sys/fs/cgroup"))
+        self.sweep_left(Path::new("/sys/fs/cgroup"), &BTreeSet::new())
+    }
+
+    /// [`Runtime::cleanup`], but the units of `kept` (taken back by [`Runtime::adopt`]) stay.
+    pub fn cleanup_but(&self, kept: &BTreeSet<String>) -> Result<usize> {
+        self.sweep_left(Path::new("/sys/fs/cgroup"), kept)
+    }
+
+    /// Write down the unit `id` just started, with `mark` (what it was started as, for kithd to
+    /// tell whether it is still what is wanted): its main's pid and start time. Nothing is
+    /// written without [`Runtime::records`].
+    pub fn record(&self, id: &str, handle: &Handle, mark: &str) {
+        let (Some(dir), Some(start)) = (&self.records, started(handle.pid)) else {
+            return;
+        };
+        let written =
+            fs::create_dir_all(dir).and_then(|()| fs::write(dir.join(id), format!("{} {start} {mark}\n", handle.pid)));
+        if let Err(e) = written {
+            eprintln!("kith: writing down the unit {id}: {e}");
+        }
+    }
+
+    /// The units a kithd before this one started and wrote down that still run, by id, each
+    /// with its mark: one whose main has the pid and start time written, in the unit's own
+    /// cgroup. A record of none is removed; one taken back stays as it is, so a kithd that ends
+    /// before it is through takes nothing less back the next time (a unit started again writes
+    /// its own over it). A unit not taken back is swept by [`Runtime::cleanup_but`].
+    pub fn adopt(&self) -> BTreeMap<String, (Handle, String)> {
+        let mut taken = BTreeMap::new();
+        let Some(dir) = &self.records else { return taken };
+        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+            let (path, id) = (entry.path(), entry.file_name().to_string_lossy().into_owned());
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let gone = || {
+                let _ = fs::remove_file(&path);
+            };
+            let mut words = text.trim_end().splitn(3, ' ');
+            let (Some(pid), Some(start), mark) = (
+                words.next().and_then(|w| w.parse::<i32>().ok()),
+                words.next().and_then(|w| w.parse::<u64>().ok()),
+                words.next().unwrap_or_default(),
+            ) else {
+                gone();
+                continue;
+            };
+            let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
+            let in_its_cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|own| {
+                own.lines().any(|line| {
+                    line.strip_prefix("0::")
+                        .is_some_and(|at| at == cgroup || at.starts_with(&format!("{cgroup}/")))
+                })
+            });
+            let runs = started(Pid::from_raw(pid)) == Some(start) && in_its_cgroup;
+            // Or it ended while no kithd ran, and process 1 wrote down how (its pid and its start
+            // time both): taken back as ended, so a Job's unit is not run again.
+            let ended = || ended(Pid::from_raw(pid)).is_some_and(|(_, at)| at == start);
+            if pid <= 1 || !(runs || ended()) {
+                let why = match started(Pid::from_raw(pid)) {
+                    None => "it ended, and how was not written down".to_string(),
+                    Some(at) if at != start => "its pid is another process's".to_string(),
+                    Some(_) => {
+                        let own = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+                        format!("it is in {}, not {cgroup}", own.trim())
+                    }
+                };
+                eprintln!("kith: {id}: not taken back: {why}");
+                gone();
+                continue;
+            }
+            let (state, bundle) = (
+                self.root.join("state").join(&id),
+                self.root.join("containers").join(&id),
+            );
+            // An exec unit's state is an empty directory, its marker (see `exec`); a container
+            // whose state does not load is not taken.
+            let container = match state.join("state.json").exists() {
+                true => match Container::load(state) {
+                    Ok(container) => Some(container),
+                    Err(_) => {
+                        gone();
+                        continue;
+                    }
+                },
+                false => None,
+            };
+            let range = container.as_ref().and_then(|_| {
+                let spec = Spec::load(bundle.join("config.json")).ok()?;
+                let maps = spec.linux().as_ref()?.uid_mappings().clone()?;
+                maps.first().map(|map| map.host_id())
+            });
+            let handle = Handle {
+                container,
+                go: None,
+                pid: Pid::from_raw(pid),
+                reaped: false,
+                bundle,
+                cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
+                range,
+                adopted: Some(start),
+            };
+            taken.insert(id, (handle, mark.to_string()));
+        }
+        taken
+    }
+
+    /// Kill each container a kithd before this one made and never started, and remove its record
+    /// from `records`: its first process holds a copy of every file that kithd had open, its
+    /// listening sockets too, until it starts, which it never will. So it goes before this kithd
+    /// listens, and is not taken back (its slot starts it again). Says how many there were.
+    pub fn stop_unstarted(&self, records: &Path) -> usize {
+        let mut stopped = 0;
+        for entry in fs::read_dir(self.root.join("state")).into_iter().flatten().flatten() {
+            if let Ok(mut container) = Container::load(entry.path())
+                && container.status() == ContainerStatus::Created
+                && container.kill(nix::sys::signal::Signal::SIGKILL, true).is_ok()
+            {
+                let _ = fs::remove_file(records.join(entry.file_name()));
+                stopped += 1;
+            }
+        }
+        stopped
     }
 
     /// [`Runtime::cleanup`], with the cgroups asked about under `sys`. What is left is each id
     /// with state, and each bundle with none: a container being made when kithd stopped, whose
     /// config.json may be empty after a power cut (and so give no range: see `take_range`).
-    fn sweep_left(&self, sys: &Path) -> Result<usize> {
+    fn sweep_left(&self, sys: &Path, kept: &BTreeSet<String>) -> Result<usize> {
         let (states, bundles) = (self.root.join("state"), self.root.join("containers"));
         let mut left = BTreeSet::new();
         for dir in [&states, &bundles] {
@@ -454,7 +581,7 @@ impl Runtime {
             }
         }
         let mut removed = 0;
-        for name in left {
+        for name in left.into_iter().filter(|name| !kept.contains(&*name.to_string_lossy())) {
             let state = states.join(&name);
             let cgroup = format!("{}/kith-{}", self.cgroup_parent, name.to_string_lossy());
             let path = sys.join(cgroup.trim_start_matches('/'));
@@ -609,6 +736,7 @@ impl Runtime {
             bundle,
             cgroup: cgroup_dir,
             range: shift,
+            adopted: None,
         };
         // Before its program runs: the devices it may open, and no other. (Where kithd is
         // root; elsewhere the container is a user namespace, which makes no device node.)
@@ -682,6 +810,7 @@ impl Runtime {
             bundle: marker.clone(),
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
             range: None,
+            adopted: None,
         };
         let manager = manager(&cgroup);
         let options = ControllerOpt {
@@ -970,6 +1099,15 @@ impl Handle {
     /// Block until the container's process exits. Returns its exit code, or
     /// 128 + the signal number if a signal killed it (137 for the OOM killer).
     pub fn wait(&mut self) -> Result<i32> {
+        if self.adopted.is_some() {
+            // ponytail: looked at every 50 ms (it is no child of ours to wait for); a pidfd if it matters.
+            loop {
+                if let Some(code) = self.try_wait()? {
+                    return Ok(code);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
         loop {
             match waitpid(self.pid, None) {
                 Err(nix::errno::Errno::EINTR) => {}
@@ -982,6 +1120,19 @@ impl Handle {
 
     /// Like [`Handle::wait`], but returns `None` at once if it is still running.
     pub fn try_wait(&mut self) -> Result<Option<i32>> {
+        if let Some(start) = self.adopted {
+            if self.reaped {
+                return err("its exit was collected before");
+            }
+            // A zombie still has its start time: process 1 writes how it ended before it reaps.
+            if started(self.pid) == Some(start) {
+                return Ok(None);
+            }
+            let code = ended(self.pid).filter(|(_, at)| *at == start).map(|(code, _)| code);
+            let _ = fs::remove_file(Path::new(crate::EXITS).join(self.pid.to_string()));
+            // (None written: it ended while no keeper was there to see it.)
+            return self.reaped(code.unwrap_or(255)).map(Some);
+        }
         let flags = Some(nix::sys::wait::WaitPidFlag::WNOHANG);
         match waitpid(self.pid, flags).ctx("checking on the container")? {
             WaitStatus::StillAlive => Ok(None),
@@ -1037,7 +1188,7 @@ impl Handle {
             }),
             deleted => {
                 // It was killed just now: collect it, or it stays a zombie for as long as we live.
-                if deleted.is_ok() && !self.reaped {
+                if deleted.is_ok() && !self.reaped && self.adopted.is_none() {
                     let _ = waitpid(self.pid, None);
                 }
                 let removed = remove_bundle(&self.bundle).ctx("deleting the container");
@@ -1084,6 +1235,21 @@ fn clear_kept(state: &Path, bundle: &Path, cgroup: &Path, remove_cgroup: impl Fn
     let _ = fs::remove_dir_all(state);
     let _ = remove_bundle(bundle);
     Ok(())
+}
+
+/// When process `pid` started (field 22 of its stat, in clock ticks since the machine did): with
+/// its pid, what tells it from a later process given the same pid. `None` once it is reaped.
+pub fn started(pid: Pid) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(") ")?.1.split(' ').nth(19)?.parse().ok()
+}
+
+/// How the process `pid` ended, as process 1 wrote it down ([`crate::EXITS`]): its code and
+/// its start time, which tells it from another process given the same pid after it.
+fn ended(pid: Pid) -> Option<(i32, u64)> {
+    let text = fs::read_to_string(Path::new(crate::EXITS).join(pid.to_string())).ok()?;
+    let (code, start) = text.trim().split_once(' ')?;
+    Some((code.parse().ok()?, start.parse().ok()?))
 }
 
 /// What [`Runtime::cleanup`] does with a unit left behind (and a failed create with its own): `kill` it, then remove its `state` and
@@ -2384,6 +2550,7 @@ mod tests {
                 bundle: bundle.clone(),
                 cgroup: cgroup.clone(),
                 range: None,
+                adopted: None,
             }
         };
         // Processes still listed: the handle comes back and the bundle is kept.
@@ -2420,6 +2587,7 @@ mod tests {
                 bundle: bundle.clone(),
                 cgroup: cgroup.clone(),
                 range: None,
+                adopted: None,
             }
         };
         discard_leftovers(&state, fresh("4242\n").finish(err("removing the cgroup")));
@@ -2456,6 +2624,7 @@ mod tests {
             bundle: bundle.clone(),
             cgroup: cgroup.clone(),
             range: None,
+            adopted: None,
         };
         let saved = || Spec::load(bundle.join("config.json")).unwrap();
         let nodes = || saved().linux().as_ref().unwrap().devices().clone().unwrap_or_default();
@@ -2516,6 +2685,55 @@ mod tests {
         assert!(
             !state.exists() && !bundle.exists(),
             "its last run is gone: the id is free"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A record says a unit's pid, its start time and its mark; a kithd after takes back none
+    /// whose pid ended, started at another time, is process 1 or is outside the unit's cgroup
+    /// (this test's own process is in no kith- cgroup), and removes each record it did not take.
+    #[test]
+    fn adopt_takes_no_unit_but_its_own_and_removes_the_records_it_did_not_take() {
+        let root = std::env::temp_dir().join(format!("kith-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let records = root.join("units");
+        let runtime = Runtime {
+            root: root.clone(),
+            cgroup_parent: format!("/kith-test-adopt-{}", std::process::id()),
+            images: ImageStore::new(root.join("images")).unwrap(),
+            shim: "/proc/self/exe".into(),
+            records: Some(records.clone()),
+        };
+        let own = Pid::this();
+        let start = started(own).expect("this process's start time");
+        let handle = Handle {
+            container: None,
+            go: None,
+            pid: own,
+            reaped: true,
+            bundle: root.join("containers/own"),
+            cgroup: root.join("cgroup"),
+            range: None,
+            adopted: None,
+        };
+        runtime.record("own", &handle, "m1");
+        assert_eq!(
+            fs::read_to_string(records.join("own")).unwrap(),
+            format!("{own} {start} m1\n")
+        );
+        for (id, text) in [
+            ("late", format!("{own} {} m", start + 1)),
+            ("first", format!("1 {start} m")),
+            ("gone", "999999999 1 m".into()),
+            ("torn", "12".into()),
+        ] {
+            fs::write(records.join(id), text).unwrap();
+        }
+        assert!(runtime.adopt().is_empty());
+        assert_eq!(
+            fs::read_dir(&records).unwrap().count(),
+            0,
+            "a record not taken is removed"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -2834,6 +3052,7 @@ mod tests {
             bundle: bundles.join(name),
             cgroup: cgroup.clone(),
             range: None,
+            adopted: None,
         };
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
@@ -2842,6 +3061,7 @@ mod tests {
             cgroup_parent: format!("/kith-test-freed-{}", std::process::id()),
             images: ImageStore::new(root.join("images")).unwrap(),
             shim: "/proc/self/exe".into(),
+            records: None,
         };
         // (Each is made as the lowest free range, so the one a take gives after its removal is the same.)
         let freed = |name: &str, remove: &dyn Fn()| {
@@ -2859,7 +3079,7 @@ mod tests {
             clear_kept(&state.join("clear"), &bundles.join("clear"), &cgroup, || {}).unwrap();
         });
         freed("clean", &|| {
-            assert_eq!(runtime.sweep_left(&root.join("sys")).unwrap(), 1)
+            assert_eq!(runtime.sweep_left(&root.join("sys"), &BTreeSet::new()).unwrap(), 1)
         });
         // And a range whose bundle stays (a unit with processes left) is not.
         let kept = make("kept");
@@ -2948,6 +3168,7 @@ mod tests {
             cgroup_parent: parent.clone(),
             images: ImageStore::new(root.join("images")).unwrap(),
             shim: "/proc/self/exe".into(),
+            records: None,
         };
         fs::create_dir_all(root.join("state")).unwrap();
         for name in ["torn", "running"] {
@@ -2959,7 +3180,11 @@ mod tests {
         fs::create_dir_all(&running).unwrap();
         fs::write(running.join("cgroup.events"), "populated 1\n").unwrap();
         assert!(take_range(&root.join("containers"), "x").is_err());
-        assert_eq!(runtime.sweep_left(&sys).unwrap(), 1, "only what was removed is counted");
+        assert_eq!(
+            runtime.sweep_left(&sys, &BTreeSet::new()).unwrap(),
+            1,
+            "only what was removed is counted"
+        );
         assert!(!root.join("containers/torn").exists(), "nothing of it ran: gone");
         assert!(
             root.join("containers/running").exists(),

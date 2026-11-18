@@ -50,6 +50,10 @@ pub struct Pods {
     pub mesh: String,
 }
 
+/// Where each pod made is written down (its number, its exit's tunnel, its address) for a
+/// kithd started again ([`Pods::adopt`]); gone when the machine restarts, as the pods are.
+const RECORDS: &str = "/run/kith/pods";
+
 /// Where the node keeps that it guards what it passes on, until it restarts.
 const GUARDED: &str = "/run/kith-pods";
 
@@ -120,6 +124,9 @@ impl Pods {
                 address,
                 dir,
             };
+            // (For a kithd started again: what it needs to take the pod back, its network held by its processes.)
+            let record = format!("{number} {} {address}\n", tunnel.map_or("-".into(), |t| t.to_string()));
+            let _ = std::fs::create_dir_all(RECORDS).and_then(|()| std::fs::write(Path::new(RECORDS).join(id), record));
             self.made.insert(id.into(), pod);
             if let Err(e) = self.serve() {
                 if let Some(pod) = self.made.remove(id) {
@@ -145,6 +152,7 @@ impl Pods {
             let kept = wanted(id);
             if !kept {
                 let _ = std::fs::remove_dir_all(&pod.dir);
+                let _ = std::fs::remove_file(Path::new(RECORDS).join(id));
                 // (What of it lingers still goes nowhere: `release` leaves that rule.)
                 if pod.exit.is_some()
                     && let Err(e) = kith_mesh::exit::release(&kith_mesh::exit::link(pod.number))
@@ -161,6 +169,43 @@ impl Pods {
             }
             self.moved.notify_one();
         }
+    }
+
+    /// The pod `id` made by a kithd before this one, taken back with its network from
+    /// process `pid`, one of its containers' that still runs.
+    pub fn adopt(&mut self, state: &Path, id: &str, pid: i32) -> Result<(), String> {
+        if self.made.contains_key(id) {
+            return Ok(());
+        }
+        let failed = |e: &dyn std::fmt::Display| format!("taking back the pod {id}'s network: {e}");
+        let record = std::fs::read_to_string(Path::new(RECORDS).join(id)).map_err(|e| failed(&e))?;
+        let words: Vec<&str> = record.split_whitespace().collect();
+        let [number, exit, address] = words[..] else {
+            return Err(failed(&"its record is not whole"));
+        };
+        let number = number.parse().map_err(|e| failed(&e))?;
+        let exit = (exit != "-")
+            .then(|| exit.parse())
+            .transpose()
+            .map_err(|e| failed(&e))?;
+        let address = address.parse().map_err(|e| failed(&e))?;
+        let namespace = std::fs::File::open(format!("/proc/{pid}/ns/net")).map_err(|e| failed(&e))?;
+        let first = self.made.is_empty();
+        let dir = state.join("pods").join(id);
+        let pod = Pod {
+            number,
+            exit,
+            namespace: namespace.into(),
+            address,
+            dir,
+        };
+        self.made.insert(id.into(), pod);
+        self.serve().map_err(|e| failed(&e))?;
+        if first {
+            self.up.notify_one();
+        }
+        self.moved.notify_one();
+        Ok(())
     }
 
     pub fn address(&self, id: &str) -> Option<IpAddr> {

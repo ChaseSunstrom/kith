@@ -19,10 +19,16 @@ pub mod signed;
 
 pub use container::{
     Awaited, Handle, Mount, NODE_ROOT, ROOTS, Runtime, Undeleted, Unit, exec_shim, plugged, reap_orphans,
-    spawn_awaited, tune,
+    spawn_awaited, started, tune,
 };
 pub use image::{Image, ImageStore, Local, PullPolicy, registry, repository};
 pub use seccomp::REFUSED;
+
+/// Where a node's first process (kithd's keeper) writes how each process it reaped ended, one
+/// file per pid holding the code (128 + the signal for one killed) and the process's start
+/// time ([`started`]): a unit kithd took back after a restart is no child of the kithd that
+/// waits for it, and one may end while no kithd runs.
+pub const EXITS: &str = "/run/kith/exits";
 
 #[derive(Debug)]
 pub struct Error(String);

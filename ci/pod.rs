@@ -23,6 +23,13 @@
 //!                              it, and say how both went
 //!   pod put FILE TEXT          after three seconds, write TEXT to FILE
 //!   pod link TARGET PATH       make PATH a link to TARGET, and say how it went
+//!   pod tick [N]               say which process it is and when it started, then `tick N`
+//!                              each second, for as long as it runs (or N times, then end)
+//!   pod memory                 run on a node: process 1's and kithd's resident memory
+//!                              ("memory: PID COMM VmRSS RssAnon", kB)
+//!   pod kill N SECONDS         run on a node (an exec unit): N times, SECONDS apart, kill
+//!                              (SIGKILL) the process named kithd that is not process 1,
+//!                              saying each pid
 //!   pod tell [PATH ...]        say whose it is, the capabilities it has and what it was
 //!                              told (its environment); then of each PATH what is mounted
 //!                              there, whether it can be written, and every file under it;
@@ -729,6 +736,46 @@ fn main() {
         ["link", target, path] => {
             let made = std::os::unix::fs::symlink(target, path).map_err(|e| e.kind());
             println!("link: {path} -> {target}: {made:?}");
+        }
+        ["tick", times @ ..] => {
+            // Field 22 of its stat: when it started, in clock ticks since the machine did.
+            let stat = std::fs::read_to_string("/proc/self/stat").expect("its stat");
+            let start = stat.rsplit(") ").next().and_then(|rest| rest.split(' ').nth(19)).unwrap_or("?");
+            println!("tick: process {} started at {start}", std::process::id());
+            let last: u64 = times.first().map_or(u64::MAX, |n| n.parse().expect("N"));
+            for n in 1..=last {
+                println!("tick {n}");
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        ["memory"] => {
+            // Process 1 and kithd: "memory: PID COMM VmRSS RssAnon" (kB).
+            for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+                let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else { continue };
+                let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                if pid != 1 && comm.trim() != "kithd" {
+                    continue;
+                }
+                let status = std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+                let kb = |field: &str| status.lines().find_map(|l| l.strip_prefix(field)?.split_whitespace().next()).unwrap_or("?").to_string();
+                println!("memory: {pid} {} {} {}", comm.trim(), kb("VmRSS:"), kb("RssAnon:"));
+            }
+        }
+        ["kill", times, gap] => {
+            let (times, gap): (u32, u64) = (times.parse().expect("N"), gap.parse().expect("SECONDS"));
+            for _ in 0..times {
+                let kithd = std::fs::read_dir("/proc").expect("/proc").flatten().find_map(|entry| {
+                    let pid: i64 = entry.file_name().to_str()?.parse().ok()?;
+                    let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+                    (pid != 1 && comm.trim() == "kithd").then_some(pid)
+                });
+                match kithd {
+                    // (62: kill, 9: SIGKILL.)
+                    Some(pid) => println!("kill: kithd {pid}: {}", syscall(62, [pid as u64, 9, 0, 0, 0])),
+                    None => println!("kill: no kithd"),
+                }
+                std::thread::sleep(Duration::from_secs(gap));
+            }
         }
         ["put", file, text] => {
             std::thread::sleep(Duration::from_secs(3));

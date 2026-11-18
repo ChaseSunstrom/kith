@@ -95,8 +95,11 @@ pub const STATE: &str = "/var/lib/kith";
 const GOOD: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn is_init() -> bool {
-    std::process::id() == 1
+    FIRST.load(Ordering::Relaxed)
 }
+
+/// kithd is the machine's first: kept by process 1 (keeper.rs). Set once, at start.
+pub static FIRST: AtomicBool = AtomicBool::new(false);
 
 /// What the kernel command line says to kithd.
 #[derive(Debug, Default, PartialEq)]
@@ -708,6 +711,14 @@ fn consoles() {
     });
 }
 
+/// Whether something is mounted at `path`: it is on another device than its parent.
+fn mounted(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::Path::new(path);
+    let dev = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.dev());
+    matches!((dev(path), path.parent().map(dev)), (Ok(a), Some(Ok(b))) if a != b)
+}
+
 /// What the first process mounts: (kind, where, flags, options). Nothing runs a program
 /// from /dev/shm, /run or /tmp (a container's image and volumes under /run are mounts of
 /// their own, with their own flags), so none may.
@@ -732,8 +743,10 @@ fn mounts() -> [(&'static str, &'static str, MsFlags, &'static str); 8] {
 
 /// The first things, before anything else of kithd runs. Each is tried and said if it
 /// fails: with part of them kithd may still serve, and a console line says what is missing.
-pub fn early() -> Boot {
-    // Ctrl-Alt-Del comes to this process as SIGINT instead of restarting the machine at once.
+/// What process 1 does before it starts kithd (keeper.rs): the file systems every process
+/// needs, and the consoles made one.
+pub fn first_things() {
+    // Ctrl-Alt-Del comes to process 1 as SIGINT instead of restarting the machine at once.
     let _ = set_cad_enabled(false);
     for (kind, at, flags, data) in mounts() {
         let made = std::fs::create_dir_all(at).map_err(|e| e.to_string());
@@ -755,8 +768,15 @@ pub fn early() -> Boot {
         }
     }
     consoles();
+}
+
+/// kithd as the machine's first (under the keeper): what it learns of the machine, and, on
+/// the machine's first start of it (`again` false), what it does to it once. Started again
+/// (`again`), it reads the command line and the config as before and changes nothing: the
+/// state is mounted, the TPM measured, the disk grown already.
+pub fn early(again: bool) -> Boot {
     // (Before anything is read from the root's disk: see `check_boot_disk`.)
-    if let Err(e) = check_boot_disk() {
+    if !again && let Err(e) = check_boot_disk() {
         eprintln!("kithd: init: {e}");
         end(true);
     }
@@ -778,7 +798,8 @@ pub fn early() -> Boot {
         eprintln!("{line}");
     }
     // (An encrypted state waits for its key, and that for the network: see `main`.)
-    let sealed = labelled("config").filter(|_| !installing);
+    // (Started again: an encrypted state was opened by the kithd before, and is mounted.)
+    let sealed = labelled("config").filter(|_| !installing && !(again && mounted(STATE)));
     let sealed = sealed.and_then(|device| match crate::crypt::Record::read(&device) {
         Ok(record) => Some((record?, device)),
         Err(e) => {
@@ -791,13 +812,13 @@ pub fn early() -> Boot {
     });
     // What the config says is obeyed below and measured by no firmware: it goes into the
     // TPM before the TPM is asked for the state's key (tpm.rs).
-    if let (Some(told), Some(_)) = (&told, &sealed) {
+    if let (Some(told), Some(_), false) = (&told, &sealed, again) {
         crate::tpm::measure(told);
     }
-    if !installing && !options(&line).0.keep {
+    if !installing && !again && !options(&line).0.keep {
         widen();
     }
-    if !installing && sealed.is_none() {
+    if !installing && !again && sealed.is_none() {
         state();
     }
     // (The command line after the config: what is typed at a boot menu is the last word.)
@@ -812,12 +833,12 @@ pub fn early() -> Boot {
     if let Err(e) = nix::unistd::sethostname(&name) {
         eprintln!("kithd: init: naming the machine {name}: {e}");
     }
-    // A panic would end process 1, and with it the kernel: say it and restart instead.
+    // A panic ends kithd, wherever it is: the keeper starts it again, and what runs goes on.
     std::panic::set_hook(Box::new(|info| {
         eprintln!("kithd: {info}");
-        end(true);
+        std::process::abort();
     }));
-    if let (Some(slot), Some(device)) = (options.slot, &options.update) {
+    if let (Some(slot), Some(device), false) = (options.slot, &options.update, again) {
         match crate::os::update(device, slot, &line) {
             Ok(Some(version)) => {
                 eprintln!("kithd: init: kith OS {version} from {device} is in the other slot: starting it");

@@ -19,7 +19,17 @@ As process 1, kithd:
   -- --listen 0.0.0.0:7443 --advertise 10.0.0.5:7443`;
 - collects orphaned processes and says what it says on every console the kernel has;
 - stops what it runs, then restarts on Ctrl-Alt-Del or powers off on SIGTERM or the power
-  button. If kithd fails or panics it says why and restarts the machine ten seconds later.
+  button.
+
+Process 1 is the same binary keeping kithd as a child of its own (`crates/kithd/src/keeper.rs`,
+about 120 lines): it reaps what is left to it, writes down how each process ended, and starts
+kithd again the moment it ends. What kithd started does not stop with it: pods, containers,
+exec units and Jobs keep running, and the next kithd takes each back as it runs (or as it
+ended, so a Job's unit is not run again). It serves again within two seconds. What a
+restart drops: a container made and not yet started (made again), probes' counts, which
+devices are held (SECURITY.md) and what kithd had in memory. If kithd ends ten times in a
+minute, it says why and the machine restarts ten seconds later. `sh ci/vm.sh --test outlive`
+kills kithd under a pod, an exec unit and a Job and checks all of it.
 
 `sh ci/vm.sh --test init` boots exactly that in QEMU and prints the time to serve.
 

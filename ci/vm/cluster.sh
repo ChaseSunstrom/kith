@@ -32,9 +32,9 @@
         # worker: two, on the mesh; services and quota: one, on the mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
-      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ]; then
+      if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         others=2 more=--mesh project=''
-        [ "$test" != services ] && [ "$test" != compose ] || others=''
+        [ "$test" != services ] && [ "$test" != compose ] && [ "$test" != outlive ] || others=''
         # (quota: a state disk with project quotas, as os/build.sh makes it; the others' have none,
         # as a node's state from before had none: kithd counts what their pods write.)
         [ "$test" != quota ] || others='' project='-I 256 -O quota,project'
@@ -78,6 +78,8 @@
                 mkdir -p "$image/rootfs/bin"
                 cp "$work/pod" "$image/rootfs/bin/pod"
                 echo '{}' >"$image/config.json"
+                # (outlive: pod on the node's own disk as well, for its exec units.)
+                [ "$test" != outlive ] || { mkdir -p "$work/seed/tools" && cp "$work/pod" "$work/seed/tools/pod"; }
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":null}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:1"
                 printf '{"digest":"sha256:%s","entrypoint":[],"cmd":[],"env":[],"user":"1000"}' "$digest" >"$work/seed/runtime/refs/kith.test%2fpod:user"
                 for tag in serve again; do
@@ -323,6 +325,9 @@ EOF
         fi
         if [ "$test" = services ]; then
             . "$root/ci/vm/services.sh"
+        fi
+        if [ "$test" = outlive ]; then
+            . "$root/ci/vm/outlive.sh"
         fi
         if [ "$test" = compose ]; then
             . "$root/ci/vm/compose.sh"

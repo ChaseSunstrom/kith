@@ -139,7 +139,9 @@ tagged. Each section below says what works and, under "Not yet", what does not
 and what kith does not defend against, is in [SECURITY.md](SECURITY.md).
 
 `kithd` runs as a service on an existing Linux distro (agent mode), or as the
-first process of [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process). It runs on
+first process of [kith OS](docs/guide/os.md#kith-os-kithd-as-the-machines-first-process), where
+what it started keeps running while kithd itself is restarted (process 1 is the same file
+keeping kithd: [keeper.rs](crates/kithd/src/keeper.rs), 120 lines). It runs on
 one machine, or on several [joined into a cluster](docs/guide/cluster.md#more-than-one-node), owns
 the store, and keeps the containers, processes and machines on its node matching
 the resources you apply.

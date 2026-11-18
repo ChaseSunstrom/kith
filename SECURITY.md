@@ -1393,13 +1393,26 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   key shown and lost opens nothing either. It has run in VMs on disk files only.
 - **Confidential machines (SEV-SNP, TDX) and device passthrough** have never been run on
   real hardware.
+- **On kith OS what kithd started outlives it, and the next kithd takes it back.** Process 1
+  is the kithd binary keeping kithd (`crates/kithd/src/keeper.rs`). It acts on its own
+  arguments, its children's exits and the signals that stop a machine, and reads nothing
+  from the network, the disk or kithd: a kithd that is taken can make it do no more than
+  start kithd again, and ten ends in a minute restart the machine. It writes how each
+  process left to it ended, with that process's start time, under `/run/kith/exits` (a
+  tmpfs only root writes). kithd writes down each unit under `/run/kith/units` before
+  starting it, and the next kithd takes a unit back only where its pid has the start time
+  written and is in the unit's own cgroup, or ended as written: a record naming another
+  process is removed, not acted on, and a container made and never started is killed
+  before kithd binds its ports. Left open: a unit's process that moved out of its cgroup is
+  not taken back; an orphan that was no unit leaves its few bytes in `/run/kith/exits`
+  until the machine restarts.
 - **Most of kithd's and kith's memory is writable for as long as they run.** Both are
   static programs of musl's, whose start code sets the program's tables of functions
   (the vtables) and its own address table right once and leaves them writable. So the
   first thing each does, before any thread and before it reads an argument, is to make
   that part (the linker's `PT_GNU_RELRO`, about 480 kB in kithd and 77 kB in kith)
-  read-only after the start: a write that goes astray in kithd, root and PID 1 on kith
-  OS, can then no longer change the tables themselves. It does not protect the pointers
+  read-only after the start: a write that goes astray in kithd, root on kith OS (and
+  its process 1), can then no longer change the tables themselves. It does not protect the pointers
   to a table: those live in the heap, a stack or `.data`, and can still be pointed at a
   table someone made up. Nor does it stop someone who can already make the program call
   `mprotect`. What is not read-only after the start: the heap, the stacks of every
