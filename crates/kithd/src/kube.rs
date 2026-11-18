@@ -448,13 +448,17 @@ fn made_at(resource: &Resource) -> u64 {
     made.and_then(|made| made.parse().ok()).unwrap_or(0)
 }
 
-/// The time (as [`rfc3339`] writes it) of the oldest revision the store kept of `resource`:
-/// when a thing that no client made here (a namespace, a node) was first seen. That is not
-/// always when it was made: a worker that runs from a view has only the revisions the view
-/// carried, and a history that was trimmed starts later.
+/// The time (as [`rfc3339`] writes it) when the store first made `resource` (a namespace, a
+/// node: nothing a client made here says it): [`Store::born`] once the store is marked, which
+/// a trim of the history does not move. Before a mark (a worker's view, a store from before)
+/// it is the oldest revision kept, so it can be later than when the thing was made.
 fn oldest(store: &Store, resource: &Resource) -> String {
-    let first = store.history(&resource.key()).ok().and_then(|history| history.first());
-    rfc3339(first.map_or(0, |first| first.at))
+    let key = resource.key();
+    let at = store
+        .born(&key)
+        .map(|(_, at)| at)
+        .or_else(|| store.history(&key).ok()?.first().map(|first| first.at));
+    rfc3339(at.unwrap_or(0))
 }
 
 /// Sets what is at `path` (`/a/b`) of `at`, making the mappings on the way; nothing where
@@ -3250,6 +3254,47 @@ spec: {role: writer, subjects: [carol]}
             assert!(
                 cells[0].1.as_str().is_some_and(|age| age.ends_with('d')),
                 "{of}: {cells:?}"
+            );
+        }
+    }
+
+    /// Once the store is marked, a Node's and a Namespace's creationTimestamp is when the store
+    /// first made it, and it holds when a long edit history trims the revisions kept.
+    #[test]
+    fn the_made_time_holds_past_a_trimmed_history() {
+        let held = |kind: &str, name: &str, n: usize| -> Resource {
+            let mut held: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": kind,
+                "metadata": { "name": name }, "spec": {},
+            }))
+            .unwrap();
+            held.metadata.labels.insert("n".into(), n.to_string());
+            if kind == "Node" {
+                held.status = Some(json!({ "address": "10.0.0.2:7000", "state": "reachable" }));
+            }
+            held
+        };
+        let mut store = Store::default();
+        store.at(Some(1_700_000_000));
+        store.apply(held("Namespace", "shop", 0)).unwrap();
+        store.apply(held("Node", "n2", 0)).unwrap();
+        store.mark();
+        store.at(Some(1_700_000_500));
+        let limit = kith_api::store::HISTORY_LIMIT;
+        for n in 1..limit + 50 {
+            store.apply(held("Namespace", "shop", n)).unwrap();
+            store.apply(held("Node", "n2", n)).unwrap();
+        }
+        assert_eq!(store.history("Node/n2").unwrap().len(), limit);
+        let grants = Grants::of(&Caller::Admin, &store);
+        let kind = |of: &str| KINDS.iter().find(|kind| kind.kind == of).unwrap();
+        for (of, name) in [("Namespace", "shop"), ("Node", "n2")] {
+            let found = objects(&store, kind(of), None, Some(name), &grants, &Verb::Get);
+            assert_eq!(found.len(), 1, "{of}");
+            assert_eq!(
+                found[0]["metadata"]["creationTimestamp"],
+                rfc3339(1_700_000_000),
+                "{of}: {found:?}"
             );
         }
     }

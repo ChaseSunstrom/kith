@@ -2283,10 +2283,33 @@ fn public_key_checked(key: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The IPv4 ranges a network may not lie over: the people's, and the pods' default (`--pod-range`
+/// moves the pods', and kithd checks that at start). Their IPv6 ranges are the cluster's own, and
+/// kithd refuses those in the AccessLevel's status.
+const TAKEN: [(&str, std::net::Ipv4Addr, u8); 2] = [
+    ("people", std::net::Ipv4Addr::new(100, 89, 0, 0), 16),
+    ("pods", std::net::Ipv4Addr::new(100, 88, 0, 0), 16),
+];
+
+/// Does the IPv4 range `net` lie over one of [`TAKEN`]: the first `min` bits of the two agree?
+fn taken_range(net: &str) -> Option<String> {
+    let (address, length) = net.split_once('/')?;
+    let address: std::net::Ipv4Addr = address.parse().ok()?;
+    let length: u8 = length.parse().ok()?;
+    TAKEN.iter().find_map(|&(name, range, bits)| {
+        let mask = u32::MAX.checked_shl(32 - u32::from(length.min(bits))).unwrap_or(0);
+        let overlaps = (u32::from(address) & mask) == (u32::from(range) & mask);
+        overlaps.then(|| format!("networks: `{net}` overlaps the {name} range {range}/{bits}"))
+    })
+}
+
 impl Spec for AccessLevelSpec {
     fn check(&self) -> Result<(), String> {
         for net in &self.networks {
             passed_range(net)?;
+            if let Some(why) = taken_range(net) {
+                return Err(why);
+            }
         }
         for service in &self.services {
             // (A Service is named as a Workload's Service is: `namespace/name`, or every one.)
@@ -2738,5 +2761,67 @@ impl Spec for OsReleaseSpec {
 impl Spec for SourceSpec {
     fn check(&self) -> Result<(), String> {
         exactly_one("spec", &[("git", self.git.is_some()), ("oci", self.oci.is_some())])
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    use crate::Resource;
+
+    fn read(kind: &str, spec: &str) -> Result<(), String> {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: family }}\nspec: {spec}\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map(drop)
+            .map_err(|e| e.msg)
+    }
+
+    #[test]
+    fn access_level_refuses_a_range_over_the_people_or_pods_range() {
+        // (The people's `100.89.0.0/16` and the pods' default `100.88.0.0/16`, docs/adr-people.md.)
+        for (net, range) in [
+            ("100.89.0.0/16", "people range 100.89.0.0/16"),
+            ("100.89.4.0/24", "people range 100.89.0.0/16"),
+            ("100.89.255.255/32", "people range 100.89.0.0/16"),
+            ("100.0.0.0/8", "people range 100.89.0.0/16"),
+            ("100.64.0.0/10", "people range 100.89.0.0/16"),
+            ("100.88.0.0/16", "pods range 100.88.0.0/16"),
+            ("100.88.128.0/17", "pods range 100.88.0.0/16"),
+        ] {
+            let refused = read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_err();
+            assert!(
+                refused.contains(&format!("`{net}` overlaps the {range}")),
+                "{net}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_level_accepts_a_range_beside_the_people_range() {
+        for net in ["100.90.0.0/16", "100.64.0.0/16", "100.128.0.0/9", "100.87.255.255/32"] {
+            read("AccessLevel", &format!("{{ networks: [{net}] }}")).unwrap_or_else(|e| panic!("{net}: {e}"));
+        }
+    }
+
+    #[test]
+    fn access_remote_peer_needs_its_node_level_and_key() {
+        let key = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+        read(
+            "RemotePeer",
+            &format!("{{ node: n1, level: family, publicKey: '{key}' }}"),
+        )
+        .unwrap();
+        for (spec, why) in [
+            (format!("{{ level: family, publicKey: '{key}' }}"), "node"),
+            (format!("{{ node: n1, publicKey: '{key}' }}"), "level"),
+            ("{ node: n1, level: family }".to_string(), "publicKey"),
+            (
+                format!("{{ node: n1, level: family, publicKey: '{}' }}", &key[..43]),
+                "32 bytes",
+            ),
+        ] {
+            let refused = read("RemotePeer", &spec).unwrap_err();
+            assert!(refused.contains(why), "{spec}: {refused}");
+        }
     }
 }

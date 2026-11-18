@@ -210,7 +210,8 @@ fn exposed_in(store: &Store, prefix: Ipv6Addr, view: bool) -> (BTreeMap<String, 
             continue;
         };
         let key = service.key();
-        // (A headless Service has no address to send a host to: its name answers its replicas.)
+        // (A headless Service has no address to send a host to: its name answers its replicas.
+        // Refused at apply; one a store kept from before that check is refused here too.)
         if crate::services::headless(service) {
             refused.insert(
                 key,
@@ -1456,24 +1457,6 @@ mod tests {
         assert_eq!(
             refused,
             BTreeMap::from([("Service/default/b".to_string(), said.to_string())])
-        );
-    }
-
-    /// A headless Service has no address to send a host to, so it exposes nothing, and says so.
-    #[test]
-    fn a_headless_service_exposes_nothing_and_says_so() {
-        let mut store = Store::default();
-        let source = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: h }\nspec:\n  \
-                      selector: { app: h }\n  headless: true\n  ports: [{ port: 80 }]\n  \
-                      expose: { host: h.example.org, via: edge }\n";
-        for resource in Resource::from_source(source).unwrap() {
-            store.apply(resource.unwrap()).unwrap();
-        }
-        let (hosts, refused) = exposed(&store, kith_mesh::prefix(b"ca"));
-        assert!(hosts.is_empty(), "{hosts:?}");
-        assert_eq!(
-            refused.get("Service/default/h").map(String::as_str),
-            Some("a headless Service has no address to expose: its name answers its replicas")
         );
     }
 
