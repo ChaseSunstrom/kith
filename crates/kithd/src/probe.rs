@@ -248,10 +248,12 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_waits_for_a_first_success() {
-        // A port nothing listens on yet, then something does, then it is gone.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // A port nothing listens on yet, then something does, then it is gone. (Held bound
+        // but not listening until then: freed, another test could take it, answer once and
+        // go, and the probe would see a success and a failure while still starting.)
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
         let check = Check {
             port,
             path: None,
@@ -268,7 +270,7 @@ mod tests {
         let story = async {
             tokio::time::sleep(Duration::from_millis(2500)).await;
             assert!(health.borrow().live, "killed while still starting");
-            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let listener = socket.listen(16).unwrap();
             tokio::time::sleep(Duration::from_millis(1500)).await;
             drop(listener);
             let down = health.wait_for(|health| !health.live);
