@@ -401,6 +401,21 @@ Where the build differs from the text above:
 - A refused peer keeps its addresses reserved in its status. Slice B, which routes or writes
   WireGuard config, uses a peer's addresses only when its `refused` is empty.
 
+## Built: slice C
+
+`kithd --people [PORT]` (env `KITH_PEOPLE`, default 51821; needs `--mesh`; root only) and
+`--people-endpoint NAME:PORT` (env `KITH_PEOPLE_ENDPOINT`) bring the people's device up: the key
+`pki/people.key` (0600, made once, kept across starts); the WireGuard device `kwg0` with no peers,
+that key and the port, `100.89.0.1/16` and the people /64's `::1`, up; the `inet kith-people`
+table written first, with its base chains and a masquerade for the people's IPv4 range. The node's
+status says `people: {publicKey, port, endpoint}` (publicKey base64, as a peer's). Without the
+flag, a start takes away `kwg0`, the table and the `people` status an earlier start left.
+
+Not built (slice D): the level chains, the node's networks, routing rules 9010/9012, and any peer
+on the device. The table is empty of those. A kernel with no masquerade in a network namespace
+(this one, under `unshare -Urn`) refuses the table's masq rule, so the device test fails there;
+the table is strict in production, and the test-only fallback is kith-mesh's `build_here`.
+
 ## Open
 
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node

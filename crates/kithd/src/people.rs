@@ -17,6 +17,7 @@ use kith_store::Command;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -309,6 +310,82 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
 }
 
+/// The people's device made or found on `port`, up, with the people's table written first and no
+/// peers (docs/adr-people.md, "Built"). Its key is `pki/people.key`, made the first time and kept.
+/// Says the device's public key.
+pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::io::Result<kith_mesh::Key> {
+    let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+    kith_mesh::people::send(people64, &[], &[], interface, &[])?;
+    Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+}
+
+/// What this node says of its people's device in its status (`people`): the device's public key
+/// (base64, as a RemotePeer's is), its port and its endpoint. Null without a device.
+pub fn said(key: Option<&kith_mesh::Key>, port: u16, endpoint: Option<&str>) -> Value {
+    use base64::Engine as _;
+    match key {
+        Some(key) => json!({
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(key),
+            "port": port,
+            "endpoint": endpoint,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// The people's device (see `up`), until stopped, then taken away with its table; `people` said in
+/// this node's status while it is up. Without a port, what an earlier start left is taken away
+/// now, and what this node said of it is taken back.
+pub async fn device(
+    shared: Arc<Shared>,
+    state: PathBuf,
+    port: Option<u16>,
+    endpoint: Option<String>,
+    interface: String,
+    mut stopping: watch::Receiver<bool>,
+) {
+    let Some(port) = port else {
+        if let Err(e) = kith_mesh::people::remove() {
+            eprintln!("kithd: people: taking away what an earlier start left: {e}");
+        }
+        return crate::mesh::left(shared, "people", stopping).await;
+    };
+    let Some(cluster) = &shared.cluster else {
+        return eprintln!("kithd: --people is for a node of a cluster (--mesh): no people");
+    };
+    let node = format!("Node/{}", cluster.me.name);
+    let people64 = prefix(&cluster.me.ca);
+    let public = match up(&state, port, &interface, people64) {
+        Ok(public) => public,
+        Err(e) => return eprintln!("kithd: no people: {e} (it takes root)"),
+    };
+    eprintln!("kithd: people on {interface}: UDP port {port}");
+    let status = said(Some(&public), port, endpoint.as_deref());
+    let mut generation = shared.generation.subscribe();
+    loop {
+        // (Said again whenever the store does not have it: the Node may not be there yet.)
+        let there = {
+            let store = shared.store.lock().expect("nothing panics holding the store");
+            let own = store.store.get(&node);
+            own.is_some_and(|own| own.status.as_ref().is_some_and(|held| held["people"] == status))
+        };
+        if !there && let Err(e) = crate::mesh::say(&shared, &node, "people", status.clone()).await {
+            eprintln!("kithd: people: telling the cluster: {e}");
+        }
+        tokio::select! {
+            _ = generation.changed() => {}
+            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = stopping.changed() => break,
+        }
+    }
+    if let Err(e) = kith_mesh::people::remove() {
+        eprintln!("kithd: people: taking away {interface}'s people: {e}");
+    }
+    if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
+        eprintln!("kithd: people: taking back this node's people: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +659,60 @@ mod tests {
         );
         kith_store::run(&mut store, Command::Patch { statuses: first }).unwrap();
         assert!(statuses(&store, mesh, people(), true).is_empty());
+    }
+
+    /// The people device (docs/adr-people.md, "Built"), in a namespace of its own: with the flag,
+    /// kwg0 holds this node's key, the port, its two addresses and no peers, behind the table, and
+    /// its public key is said; a second start keeps the key. Without it, all of that is taken away.
+    #[test]
+    fn people_device() {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: set KITH_E2E=1 under unshare -Urn");
+        }
+        let alone = std::fs::read_to_string("/proc/net/dev")
+            .is_ok_and(|dev| dev.lines().skip(2).all(|line| line.trim_start().starts_with("lo:")));
+        if !alone {
+            return eprintln!("skipped: not in a network namespace of its own");
+        }
+        let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
+        std::fs::create_dir_all(state.join("pki")).unwrap();
+        let (port, people64) = (51821, people());
+
+        let key = super::up(&state, port, "kith0", people64).expect("the device comes up");
+        assert_eq!(
+            super::up(&state, port, "kith0", people64).unwrap(),
+            key,
+            "a start keeps the key"
+        );
+        let file = state.join("pki").join("people.key");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+
+        assert!(kith_mesh::people::table_present().unwrap(), "the table is in place");
+        let found = kith_mesh::people::device_found().unwrap().expect("kwg0 is up");
+        assert_eq!(found.public_key, key);
+        assert_eq!(found.port, port);
+        assert_eq!(found.peers, 0);
+        assert!(
+            found
+                .addresses
+                .contains(&(IpAddr::V4(Ipv4Addr::new(100, 89, 0, 1)), 16))
+        );
+        let six = Ipv6Addr::from(u128::from(people64) | 1);
+        assert!(found.addresses.contains(&(IpAddr::V6(six), 64)));
+
+        let said = super::said(Some(&key), port, None);
+        assert_eq!(said["port"].as_u64(), Some(u64::from(port)));
+        assert!(said["endpoint"].is_null());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        assert_eq!(said["publicKey"].as_str(), Some(encoded.as_str()));
+
+        // Without the flag, what an earlier start left is taken away, and nothing is said of it.
+        kith_mesh::people::remove().expect("taken away");
+        assert!(kith_mesh::people::device_found().unwrap().is_none(), "kwg0 is gone");
+        assert!(!kith_mesh::people::table_present().unwrap(), "the table is gone");
+        assert!(super::said(None, port, None).is_null());
+        let _ = std::fs::remove_dir_all(&state);
     }
 }
