@@ -325,12 +325,18 @@ to the leader for an Identity, and at the local socket; each sender passes the h
 was sent on unchanged. The CLI signer is the next slice. Where the code differs from the
 text above, the safe way was taken, and each is said here:
 
-- **Hops rewrite what they pass on.** The logs hop adds `here=true`, a restore its `at=`,
-  a node's lock routes send their own body, `kith run` is sent on as a spec, and a write
-  reaches the leader as a store command. A caller's signature over what they sent does
-  not hold over what arrives, so under `required` it is refused there, not taken. Until
-  hops pass the request on as it came (its own slice), sign at the node that has the
-  thing, and the admin's Cluster changes at the node that leads.
+- **A signed change is passed on as it came, or refused.** A signed apply (a Release,
+  Source, KindDefinition or Package rollback is an apply as it goes back too), a delete, a
+  rollback and a restore reach the leader, or the node that has the volume, with the same
+  method, path (query included), body and `x-kith-signed` header, so the signature holds
+  over what arrives. A signed change on a route the leader does not check the signature
+  of (a drain, for one) is refused at the follower, not sent on as the node's own write:
+  the leader would take it as none. A Mark is the node's own and is not refused. Unsigned,
+  a restore still names the backup it chose with `at=`, and a write reaches the leader as
+  a store command. Where a hop rewrites a signed request (the logs hop's `here=true`, a
+  `kith run` spec, a lock's body, a volume file put), the leader refuses the mismatch
+  under `required`, so it fails closed. Sign at the node that has the thing, and the
+  admin's Cluster changes at the node that leads, until those hops carry as well.
 - **"node:<name>" is not taken as a signer**: no node signs yet. Refused.
 - **`required` is not refused while older nodes report**: kithd does not yet say its
   version on its Node. Set it once every node is updated.

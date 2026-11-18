@@ -276,15 +276,23 @@ pub struct Relay {
     pub body: axum::body::Bytes,
     /// Who signed it, as the FOR header names them.
     pub who: Caller,
+    /// The room this request holds in [`HOLDING`], kept while the relay is held: its body is
+    /// held with it until the leader has answered.
+    #[allow(dead_code, reason = "held for its drop: the room is given back when the relay is")]
+    pub room: Arc<tokio::sync::SemaphorePermit<'static>>,
 }
 
 impl Relay {
     /// Is this request the route `command` is made by? Only then is it passed on as it came: a
-    /// write a handler makes on its own (a `Mark`, a restore's, a lock's) is not this request.
+    /// write a handler makes on its own (a `Mark`, a restore's, a lock's) is not this request. A
+    /// Release, Source, KindDefinition or Package rollback is applied as it goes back, so it is an
+    /// Apply made by a rollback route.
     pub fn carries(&self, command: &Command) -> bool {
         let route = self.path.split('?').next().unwrap_or("");
         match command {
-            Command::Apply { .. } => self.method == "POST" && route == "/v1/apply",
+            Command::Apply { .. } => {
+                self.method == "POST" && (route == "/v1/apply" || route.starts_with("/v1/rollback/"))
+            }
             Command::Delete { .. } => self.method == "DELETE" && route.starts_with("/v1/resources/"),
             Command::Rollback { .. } => self.method == "POST" && route.starts_with("/v1/rollback/"),
             _ => false,
@@ -294,12 +302,19 @@ impl Relay {
 
 impl Signed {
     /// This request as it came (`method`, `path`, `body`), to be passed on as it is.
-    fn relayed(mut self, method: &str, path: &str, body: &axum::body::Bytes) -> Signed {
+    fn relayed(
+        mut self,
+        method: &str,
+        path: &str,
+        body: &axum::body::Bytes,
+        room: tokio::sync::SemaphorePermit<'static>,
+    ) -> Signed {
         self.relay = Some(Relay {
             method: method.into(),
             path: path.into(),
             body: body.clone(),
             who: self.who.clone(),
+            room: Arc::new(room),
         });
         self
     }
@@ -432,7 +447,7 @@ pub async fn passed(
         };
         return (request, hop(shared, node, None, &asked, Some(named), log));
     };
-    let (request, bytes, _room) = match read(request).await {
+    let (request, bytes, room) = match read(request).await {
         Ok(read) => read,
         // (The body is gone: refused, whatever the setting.)
         Err(why) => return (Request::new(Body::empty()), Err(why)),
@@ -443,7 +458,7 @@ pub async fn passed(
         body: &bytes,
     };
     let signed = hop(shared, node, Some(&header), &asked, Some(named), log);
-    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes))))
+    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes, room))))
 }
 
 /// Is an unsigned call at the local socket taken under `required`, as the node, which reads?
@@ -502,12 +517,15 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
             signed.who
         )),
     });
+    // (A signed request keeps its room while it is relayed, so the body's bound covers the forward.)
     let signed = match checked {
-        Ok(signed) => Some(signed.relayed(&method, &path, &bytes)),
+        Ok(signed) => Some(signed.relayed(&method, &path, &bytes, room)),
         Err(why) if required => return refused(StatusCode::UNAUTHORIZED, format!("refused: {why}")),
-        Err(_) => None,
+        Err(_) => {
+            drop(room);
+            None
+        }
     };
-    drop(room);
     request.extensions_mut().insert(Caller::Admin);
     within(signed, next.run(request)).await
 }

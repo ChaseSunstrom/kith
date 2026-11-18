@@ -1550,6 +1550,251 @@ fn signed_delete_and_rollback_through_a_follower_are_taken_as_signed() {
     assert!(alpha.ok(&["get", "configmap/kept"]).contains("kept"));
 }
 
+/// A signed rollback of a Release made at a follower reaches the leader as the admin signed it,
+/// as a ConfigMap's does: the leader's audit names the signer via the follower, and the leader
+/// does not take it as the follower's own write. A rollback signed for another query is refused
+/// where the leader is, and changes nothing.
+#[test]
+fn signed_release_rollback_through_a_follower_is_taken_as_the_admins() {
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_release", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+
+    // A signed request at beta's local socket, as the admin signed it.
+    let at_beta = |method: &str, path: &str, nonce: u32, body: &str| {
+        let header = signed_by_admin(&id, "*", method, path, body.as_bytes(), nonce);
+        let mut curl = Command::new("curl");
+        curl.current_dir(&beta.dir).args(["--unix-socket", "kithd.sock"]);
+        let body = (!body.is_empty()).then_some(body);
+        ask(curl, method, &format!("http://kithd{path}"), &[(signed, &header)], body)
+    };
+    let required = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let (code, said) = at_beta("POST", "/v1/apply", 1, &required);
+    assert_eq!(code, "200", "{said}");
+    assert!(alpha.ok(&["get", "cluster/home", "-o", "json"]).contains("\"signing\": \"required\""));
+
+    // Two revisions of the Release `r`: the first names package `maps`, the second `other`.
+    let release = |package: &str| {
+        serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Release", "metadata": { "name": "r" },
+            "spec": { "package": { "name": package } } }])
+        .to_string()
+    };
+    let (code, said) = at_beta("POST", "/v1/apply", 2, &release("maps"));
+    assert_eq!(code, "200", "{said}");
+    let (code, said) = at_beta("POST", "/v1/apply", 3, &release("other"));
+    assert_eq!(code, "200", "{said}");
+    let before = alpha.ok(&["get", "release/r", "-o", "json"]);
+    assert!(before.contains("other") && !before.contains("maps"), "{before}");
+
+    // A rollback signed for `?to=1`, sent to `?to=2` by beta's certificate: refused where the
+    // leader is, and the Release is still `other`.
+    let betas = beta.dir.join("state/pki");
+    let signed_for_one = signed_by_admin(&id, "alpha", "POST", "/v1/rollback/Release/default/r?to=1", b"", 4);
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "POST",
+        "/v1/rollback/Release/default/r?to=2",
+        &[(by, "local socket"), (signed, &signed_for_one)],
+        None,
+    );
+    assert!(code == "403" && said.contains("not local socket's"), "{code} {said}");
+    assert!(alpha.ok(&["get", "release/r", "-o", "json"]).contains("other"));
+
+    // The admin's rollback to revision 1, made at beta: the leader takes it as the admin's. (A
+    // Release is applied as it goes back, so its audit line is an apply's: the lines the rollback
+    // adds at the leader are the ones checked.)
+    let before = alpha.ok(&["audit", "--tail", "1000"]).lines().count();
+    let (code, said) = at_beta("POST", "/v1/rollback/Release/default/r?to=1", 5, "");
+    assert_eq!(code, "200", "{said}");
+    let back = alpha.ok(&["get", "release/r", "-o", "json"]);
+    assert!(back.contains("maps") && !back.contains("other"), "{back}");
+    let audit = alpha.ok(&["audit", "--tail", "1000"]);
+    assert!(
+        audit
+            .lines()
+            .skip(before)
+            .any(|line| line.contains("Release/default/r") && line.contains("local socket via node beta")),
+        "the rollback is not in the leader's audit ({before} lines before): {audit}"
+    );
+}
+
+/// A signed restore asked of a node that does not have the volume is passed on as it came, so the
+/// node that has the volume checks the signature the admin made, over the path the admin signed,
+/// and takes it as the admin's under `signing: required`. A restore whose path is not the one
+/// signed is refused where the volume is, and restores nothing.
+#[test]
+fn signed_restore_through_another_node_is_taken_under_required_signing() {
+    if std::env::var_os("KITH_E2E").is_none() {
+        eprintln!("skipped: set KITH_E2E=1");
+        return;
+    }
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_restore", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("two nodes with addresses", || {
+        alpha.nodes().iter().filter(|(_, at)| !at.is_empty()).count() == 2
+    });
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+
+    // The volume and its backup are at alpha; beta does not have the volume.
+    let data = alpha.dir.join("state/volumes/default/data/d");
+    std::fs::create_dir_all(data.join("deep")).unwrap();
+    std::fs::write(data.join("deep/file"), b"what must not be lost").unwrap();
+    let yaml = "apiVersion: kith.dev/v1\nkind: Volume\nmetadata: { name: data }\nspec: { node: alpha, path: d }\n---\n\
+                apiVersion: kith.dev/v1\nkind: Backup\nmetadata: { name: often }\nspec: { volume: data, every: 1d, keep: 2 }\n";
+    std::fs::write(alpha.dir.join("backup.yaml"), yaml).unwrap();
+    alpha.ok(&["apply", "-f", "backup.yaml"]);
+    let status = |node: &Node, kind: &str, name: &str| {
+        let found: serde_json::Value = serde_json::from_str(&node.ok(&["get", kind, name, "-o", "json"])).unwrap();
+        found.as_array().map_or(found.clone(), |found| found[0].clone())["status"].clone()
+    };
+    wait_for("the backup to be made", || {
+        status(&alpha, "backup", "often")["backups"][0]["blob"].is_string()
+    });
+    let made = status(&alpha, "backup", "often")["backups"][0].clone();
+    std::fs::remove_dir_all(&data).unwrap();
+
+    // Required from here on: the signed Cluster is made at beta.
+    let at_beta = |method: &str, path: &str, nonce: u32, body: &str| {
+        let header = signed_by_admin(&id, "*", method, path, body.as_bytes(), nonce);
+        let mut curl = Command::new("curl");
+        curl.current_dir(&beta.dir).args(["--unix-socket", "kithd.sock"]);
+        let body = (!body.is_empty()).then_some(body);
+        ask(curl, method, &format!("http://kithd{path}"), &[(signed, &header)], body)
+    };
+    let required = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let (code, said) = at_beta("POST", "/v1/apply", 1, &required);
+    assert_eq!(code, "200", "{said}");
+    assert!(alpha.ok(&["get", "cluster/home", "-o", "json"]).contains("\"signing\": \"required\""));
+
+    // A restore signed for another path than the one it is sent on, passed on by beta's certificate:
+    // refused where the volume is, and nothing is restored.
+    // The admin signs the latest backup's restore (no `?at=`); beta would add `?at=` to it, so the
+    // path the admin signed is the one it must pass on.
+    let betas = beta.dir.join("state/pki");
+    let path = "/v1/backups/default/often/restore";
+    let signed_other = signed_by_admin(&id, "*", "POST", path, b"", 2);
+    let sent_other = format!("{path}?at={}", made["at"]);
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "POST",
+        &sent_other,
+        &[(by, "local socket"), (signed, &signed_other)],
+        None,
+    );
+    assert!(code == "403" && said.contains("not local socket's"), "{code} {said}");
+    assert!(!data.exists(), "a refused restore wrote the volume");
+
+    // The restore the admin signed, made at beta: beta passes it on as it came, and the volume is back.
+    let before = alpha.ok(&["audit", "--tail", "1000"]).lines().count();
+    let (code, said) = at_beta("POST", path, 3, "");
+    assert_eq!(code, "200", "{said}");
+    assert_eq!(std::fs::read(data.join("deep/file")).unwrap(), b"what must not be lost");
+    let audit = alpha.ok(&["audit", "--tail", "1000"]);
+    assert!(
+        audit
+            .lines()
+            .skip(before)
+            .any(|line| line.contains("restore") && line.contains("local socket via node beta")),
+        "the restore is not in the leader's audit ({before} lines before): {audit}"
+    );
+}
+
+/// A signed change a follower would make on a route the leader does not check the signature of (a
+/// drain, which applies a Node) is refused at the follower: it is not sent to the leader as the
+/// node's own write, and nothing changes.
+#[test]
+fn a_signed_change_a_follower_cannot_pass_on_as_it_came_is_refused() {
+    use ring::signature::KeyPair;
+    let (test, signed) = ("signed_refuse", "x-kith-signed");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+    let at_beta = |method: &str, path: &str, nonce: u32, body: &str| {
+        let header = signed_by_admin(&id, "*", method, path, body.as_bytes(), nonce);
+        let mut curl = Command::new("curl");
+        curl.current_dir(&beta.dir).args(["--unix-socket", "kithd.sock"]);
+        let body = (!body.is_empty()).then_some(body);
+        ask(curl, method, &format!("http://kithd{path}"), &[(signed, &header)], body)
+    };
+    let required = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let (code, said) = at_beta("POST", "/v1/apply", 1, &required);
+    assert_eq!(code, "200", "{said}");
+
+    // The drain of beta, signed and made at beta: refused there, and beta is not drained.
+    let (code, said) = at_beta("POST", "/v1/drain/beta?do=drain", 2, "");
+    assert!(code != "200" && said.contains("not passed on as it came"), "{code} {said}");
+    let node = alpha.ok(&["get", "node/beta", "-o", "json"]);
+    assert!(!node.contains("kith.dev/drain"), "{node}");
+}
+
 /// The status names the cluster (the id a signer salts its key with, the print of the CA the
 /// join token carries) and says `open` until the Cluster says `signing: required`.
 #[test]

@@ -838,9 +838,16 @@ impl Shared {
                 }
                 .header(access::FOR, relay.who.to_string())
                 .header("content-type", "application/json")
-                .body(relay.body);
-                return self.relayed(access_sign::pass_on(call), at, command).await;
+                .body(relay.body.clone());
+                return self.relayed(access_sign::pass_on(call), at, &relay).await;
             }
+        }
+        // A signed request's change that is not carried is not sent on as this node's own write: the
+        // leader would take it as none, with no signature checked there. (A Mark is this node's own.)
+        if access_sign::current().is_some() && !matches!(command, Command::Mark) {
+            let why = "refused: a signed request's change that is not passed on as it came (the route is \
+                       not one the leader checks the signature of); send it to the leader directly";
+            return Forward::Failed(Error::Invalid(why.into()));
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
         // Whose write it is, for the leader to decide again in the log's order (`write`).
@@ -880,20 +887,19 @@ impl Shared {
     }
 
     /// What the leader did with a signed write passed on as it came (`call`), as this node's
-    /// reply, read as the route `command` came from answers (`api.rs`: a delete a Resource, a
-    /// rollback a Change, an apply its Changes). The leader's write is in the log before it
-    /// answers: a `Mark` after it has the index this node waits for.
-    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str, command: &Command) -> Forward {
+    /// reply, read as the route `relay` came by answers (`api.rs`: a delete a Resource, a rollback
+    /// a Change, an apply its Changes). The leader's write is in the log before it answers: a
+    /// `Mark` after it has the index this node waits for.
+    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str, relay: &access_sign::Relay) -> Forward {
+        let route = relay.path.split('?').next().unwrap_or("");
         match call.timeout(PATIENCE).send().await {
             Ok(reply) if reply.status().is_success() => {
-                let done = match command {
-                    Command::Delete { .. } => {
-                        reply.json::<kith_api::Resource>().await.map(|r| Done::Deleted(Box::new(r)))
-                    }
-                    Command::Rollback { .. } => {
-                        reply.json::<kith_api::store::Change>().await.map(|c| Done::Changes(vec![c]))
-                    }
-                    _ => reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes),
+                let done = if relay.method == "DELETE" {
+                    reply.json::<kith_api::Resource>().await.map(|r| Done::Deleted(Box::new(r)))
+                } else if route.starts_with("/v1/rollback/") {
+                    reply.json::<kith_api::store::Change>().await.map(|c| Done::Changes(vec![c]))
+                } else {
+                    reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes)
                 };
                 let Ok(done) = done else {
                     let why = format!("the leader at {at} did not answer with the changes it made");
