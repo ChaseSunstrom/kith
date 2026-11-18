@@ -639,19 +639,28 @@ impl Runtime {
     // the host's network, unless the unit says otherwise (`writable`, `netns`). What a
     // writable root holds is on the state's disk with no limit of its own.
     pub fn create(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
+        let unrefused = AtomicBool::new(false);
         if !(unit.writable && !nix::unistd::getuid().is_root()) {
-            return self.create_once(id, image, unit, stdout, stderr);
+            return self.create_once(id, image, unit, stdout, stderr, &unrefused);
         }
         if self.overlay_refused.load(Ordering::Relaxed) {
             return self.create_read_only(id, image, unit, stdout, stderr);
         }
         let what = format!("creating container `{id}`");
         let (out, errs) = (stdout.try_clone().ctx(&what)?, stderr.try_clone().ctx(&what)?);
-        match self.create_once(id, image, unit, stdout, stderr) {
-            Err(e) if refuses_overlay(&e.to_string()) => {
-                self.overlay_refused.store(true, Ordering::Relaxed);
-                self.create_read_only(id, image, unit, out, errs)
-            }
+        let refused = AtomicBool::new(false);
+        match self.create_once(id, image, unit, stdout, stderr, &refused) {
+            // (Remembered only once the read-only retry has made the unit: a retry that fails too
+            // says both, and the next create tries the overlay again.)
+            Err(e) if refused.load(Ordering::Relaxed) => match self.create_read_only(id, image, unit, out, errs) {
+                Ok(handle) => {
+                    self.overlay_refused.store(true, Ordering::Relaxed);
+                    Ok(handle)
+                }
+                Err(retry) => err(format!(
+                    "{what}: the kernel refuses the overlay root ({e}), and the read-only root it fell back to failed too: {retry}"
+                )),
+            },
             done => done,
         }
     }
@@ -663,12 +672,22 @@ impl Runtime {
             writable: false,
             ..unit.clone()
         };
-        let mut handle = self.create_once(id, image, &read_only, stdout, stderr)?;
+        let mut handle = self.create_once(id, image, &read_only, stdout, stderr, &AtomicBool::new(false))?;
         handle.note = Some(ROOT_READ_ONLY);
         Ok(handle)
     }
 
-    fn create_once(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
+    /// One attempt at the create. `refused` is set when the attempt failed for the kernel refusing
+    /// the overlay root, as its init log says.
+    fn create_once(
+        &self,
+        id: &str,
+        image: &Image,
+        unit: &Unit,
+        stdout: File,
+        stderr: File,
+        refused: &AtomicBool,
+    ) -> Result<Handle> {
         let what = format!("creating container `{id}`");
         let bundle = self.root.join("containers").join(id);
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
@@ -773,7 +792,7 @@ impl Runtime {
                 .as_init(&bundle)
                 .with_systemd(false)
                 .with_detach(true);
-            let container = logged_build(&bundle.join("init.log"), || builder.build()).ctx(&what)?;
+            let container = logged_build(&bundle.join("init.log"), refused, || builder.build()).ctx(&what)?;
             match container.pid() {
                 Some(pid) => Ok((container, pid)),
                 None => err(format!("{what}: no process was created")),
@@ -1625,14 +1644,23 @@ fn refuses_overlay(said: &str) -> bool {
     said.contains("\"overlay\"") && said.contains("EPERM")
 }
 
-/// Most of what an init process logged that is said after a failed build.
+/// Most of what an init process logged that a failed create's error says.
 const LOG_BYTES: usize = 2048;
+
+/// Most of what an init process logged that is kept to be read: the whole of it is looked at for
+/// an overlay's refusal, which may come after a long first event.
+const LOG_KEPT: usize = 64 << 10;
 
 /// Runs `build` with the error-level events of the container's init process kept at `log`, and
 /// for a failure says what they were beside it. libcontainer's parent sees only the top error's
 /// text ("failed to prepare rootfs"); the cause is logged by the child, which inherits this
-/// subscriber through its fork.
-fn logged_build<T, E: std::fmt::Display>(log: &Path, build: impl FnOnce() -> std::result::Result<T, E>) -> Result<T> {
+/// subscriber through its fork. `refused` is set when the whole log says the kernel refused the
+/// overlay root ([`refuses_overlay`]).
+fn logged_build<T, E: std::fmt::Display>(
+    log: &Path,
+    refused: &AtomicBool,
+    build: impl FnOnce() -> std::result::Result<T, E>,
+) -> Result<T> {
     let file = File::create(log).ctx("its init log")?;
     let dispatch = tracing::Dispatch::new(InitLog(Mutex::new(file)));
     let built = tracing::dispatcher::with_default(&dispatch, build);
@@ -1643,6 +1671,7 @@ fn logged_build<T, E: std::fmt::Display>(log: &Path, build: impl FnOnce() -> std
         Ok(value) => Ok(value),
         Err(e) if logged.is_empty() => err(e.to_string()),
         Err(e) => {
+            refused.store(refuses_overlay(&String::from_utf8_lossy(&logged)), Ordering::Relaxed);
             let said = String::from_utf8_lossy(&logged[..logged.len().min(LOG_BYTES)]);
             err(format!(
                 "{e}; its init process logged: {}",
@@ -1652,7 +1681,7 @@ fn logged_build<T, E: std::fmt::Display>(log: &Path, build: impl FnOnce() -> std
     }
 }
 
-/// Writes the error-level events it is given, one line each, until the file holds [`LOG_BYTES`].
+/// Writes the error-level events it is given, one line each, until the file holds [`LOG_KEPT`].
 struct InitLog(Mutex<File>);
 
 impl tracing::Subscriber for InitLog {
@@ -1667,10 +1696,11 @@ impl tracing::Subscriber for InitLog {
     fn event(&self, event: &tracing::Event<'_>) {
         let mut line = Line(String::new());
         event.record(&mut line);
-        if let Ok(mut file) = self.0.lock()
-            && file.metadata().is_ok_and(|m| m.len() < LOG_BYTES as u64)
-        {
-            let _ = file.write_all(format!("{}\n", line.0).as_bytes());
+        if let Ok(mut file) = self.0.lock() {
+            // (Cut at the room left, so the file holds no more than `LOG_KEPT` however long an event is.)
+            let line = format!("{}\n", line.0);
+            let used = file.metadata().map_or(LOG_KEPT, |m| m.len() as usize);
+            let _ = file.write_all(&line.as_bytes()[..LOG_KEPT.saturating_sub(used).min(line.len())]);
         }
     }
     fn enter(&self, _: &tracing::span::Id) {}
@@ -3013,9 +3043,27 @@ mod tests {
         assert!(!refuses_overlay("failed to prepare rootfs"));
     }
 
+    /// The overlay's refusal is found in the whole log, not only the part of it an error says: a
+    /// first event longer than the error's cut, with the refusal after it, still makes the root
+    /// read-only on a retry.
+    #[test]
+    fn create_error_sees_an_overlay_refusal_past_a_long_first_event() {
+        let log = std::env::temp_dir().join(format!("kith-init-log-long-{}", std::process::id()));
+        let refused = AtomicBool::new(false);
+        let built = logged_build(&log, &refused, || {
+            tracing::error!("{}", "a long first event ".repeat(200));
+            tracing::error!("failed to mount {}: Nix(EPERM)", r#"Mount { typ: Some("overlay") }"#);
+            Err::<(), _>("failed to prepare rootfs")
+        });
+        assert!(built.is_err());
+        assert!(refused.load(Ordering::Relaxed), "the overlay's refusal is not seen");
+    }
+
     /// Where kithd is not root, a writable unit's root is an overlay first; where the kernel refuses
     /// that, the unit runs with a read-only root and says so, and this runtime does not try the
     /// overlay again. Where the kernel allows it, neither happens. Either way the unit is made.
+    /// (It exercises the fallback only on a kernel that refuses overlay in a user namespace, as
+    /// this host's hardened kernel does; on one that allows it, it checks the overlay is what is made.)
     #[test]
     fn a_rootless_writable_root_is_read_only_only_where_the_kernel_refuses_overlay() {
         if nix::unistd::getuid().is_root() {
