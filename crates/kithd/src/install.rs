@@ -36,6 +36,9 @@ pub struct Disk {
     pub name: String,
     pub bytes: u64,
     pub model: String,
+    /// What the disk itself says it is (empty when it says nothing): the same at every
+    /// start, where `name` is the order the kernel found the disks in.
+    pub serial: String,
     /// A stick or a card reader (`removable` in sysfs): never the disk `only` means.
     pub removable: bool,
 }
@@ -43,13 +46,14 @@ pub struct Disk {
 impl std::fmt::Display for Disk {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let size = self.bytes as f64 / 1e9;
-        write!(
-            f,
-            "{} ({size:.1} GB{}{})",
-            self.name,
-            if self.model.is_empty() { "" } else { ", " },
-            self.model
-        )
+        write!(f, "{} ({size:.1} GB", self.name)?;
+        if !self.model.is_empty() {
+            write!(f, ", {}", self.model)?;
+        }
+        if !self.serial.is_empty() {
+            write!(f, ", serial {}", self.serial)?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -74,6 +78,7 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
             let usable = bytes > 0 && said(&entry.path(), "ro") != "1";
             (usable && Some(&*name) != booted && !other.iter().any(|kind| name.starts_with(kind))).then(|| Disk {
                 model: said(&entry.path(), "device/model"),
+                serial: serial(&entry.path()),
                 removable: said(&entry.path(), "removable") == "1",
                 name,
                 bytes,
@@ -82,6 +87,26 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
         .collect();
     found.sort_by(|a, b| a.name.cmp(&b.name));
     found
+}
+
+/// The serial a disk under `/sys/block` says: an NVMe namespace's controller's, a VirtIO
+/// block disk's own, or a SCSI or SATA disk's page 0x80 (four bytes of header, then the
+/// serial). Only printable ASCII is kept: it is shown, and matched against what was typed.
+fn serial(disk: &Path) -> String {
+    let page = || {
+        let page = std::fs::read(disk.join("device/vpd_pg80")).ok()?;
+        let length = usize::from(*page.get(3)?);
+        Some(String::from_utf8_lossy(page.get(4..4 + length).unwrap_or(&page[4..])).into_owned())
+    };
+    let said = ["device/serial", "serial"]
+        .iter()
+        .find_map(|file| std::fs::read_to_string(disk.join(file)).ok())
+        .or_else(page)
+        .unwrap_or_default();
+    said.trim()
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect()
 }
 
 /// Whether `disk` is still the size it was planned at, as `sys` (`/sys/block`) says now. A
@@ -105,7 +130,8 @@ pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
 #[derive(Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Answers {
-    /// The disk's name (`sda`, `nvme0n1`), or `only`: the one disk the machine has that is not removable.
+    /// The disk's name (`sda`, `nvme0n1`); `serial:X`, the disk that says it is X, whatever
+    /// the kernel named it; or `only`: the one disk the machine has that is not removable.
     pub disk: String,
     #[serde(default)]
     pub hostname: Option<String>,
@@ -173,6 +199,32 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
                     ));
                 }
                 _ => return Err(format!("`disk: only` and this machine has several: {}", listed())),
+            }
+        }
+        serial if serial.starts_with("serial:") => {
+            let serial = serial["serial:".len()..].trim();
+            if serial.is_empty() {
+                return Err("`disk: serial:` names no serial".into());
+            }
+            let found: Vec<&Disk> = disks.iter().filter(|disk| disk.serial == serial).collect();
+            match found.as_slice() {
+                [one] => *one,
+                [] if disks.is_empty() => return Err("this machine has no disk to install on".into()),
+                [] => {
+                    return Err(format!(
+                        "no disk with serial {serial} to install on; there is: {}",
+                        listed()
+                    ));
+                }
+                // (Cheap USB bridges give every disk one serial: then it names none of them.)
+                several => {
+                    let names: Vec<&str> = several.iter().map(|disk| disk.name.as_str()).collect();
+                    return Err(format!(
+                        "{} disks give serial {serial}: {}. Name the disk",
+                        several.len(),
+                        names.join(", ")
+                    ));
+                }
             }
         }
         name => disks.iter().find(|disk| disk.name == name).ok_or_else(|| match disks {
@@ -800,6 +852,7 @@ mod tests {
             name: name.into(),
             bytes: gigabytes * 1_000_000_000,
             model: "Test".into(),
+            serial: String::new(),
             removable: false,
         }
     }
@@ -835,6 +888,61 @@ mod tests {
         assert_eq!(names(Some("sda")), ["vda"]);
         assert_eq!(disks(&sys, None)[0].to_string(), "sda (0.0 GB, Stick)");
         std::fs::remove_dir_all(&sys).unwrap();
+    }
+
+    #[test]
+    fn serial_names_a_disk_whatever_the_kernel_calls_it() {
+        let sys = std::env::temp_dir().join(format!("kith-install-serial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        for name in ["nvme0n1", "vda", "sda", "sdb"] {
+            std::fs::create_dir_all(sys.join(name).join("device")).unwrap();
+            std::fs::write(sys.join(name).join("size"), "2048").unwrap();
+        }
+        // Where each says it: NVMe its controller, VirtIO's block disk itself, a SCSI or
+        // SATA disk its page 0x80 (four bytes of header, then the serial, padded).
+        std::fs::write(sys.join("nvme0n1/device/serial"), "S4EW0001      \n").unwrap();
+        std::fs::write(sys.join("vda/serial"), "vd-two").unwrap();
+        std::fs::write(sys.join("sda/device/vpd_pg80"), b"\0\x80\0\x0cSCSI-ONE    ").unwrap();
+        let found = disks(&sys, None);
+        std::fs::remove_dir_all(&sys).unwrap();
+        let serials: Vec<_> = found.iter().map(|d| (d.name.as_str(), d.serial.as_str())).collect();
+        assert_eq!(
+            serials,
+            [
+                ("nvme0n1", "S4EW0001"),
+                ("sda", "SCSI-ONE"),
+                ("sdb", ""),
+                ("vda", "vd-two")
+            ]
+        );
+        assert_eq!(found[1].to_string(), "sda (0.0 GB, serial SCSI-ONE)");
+        assert_eq!(found[2].to_string(), "sdb (0.0 GB)");
+
+        let pick = |wanted: &str, found: &[Disk]| {
+            plan(
+                &answers(&format!("disk: \"serial:{wanted}\"\n")).unwrap(),
+                found,
+                0,
+                1 << 20,
+            )
+            .map(|(d, _)| d.name)
+        };
+        assert_eq!(pick("vd-two", &found).unwrap(), "vda");
+        assert_eq!(pick("SCSI-ONE", &found).unwrap(), "sda");
+        let none = pick("nope", &found).unwrap_err();
+        assert!(
+            none.contains("no disk with serial nope") && none.contains("vda (0.0 GB, serial vd-two)"),
+            "{none}"
+        );
+        // A serial two disks give (cheap USB bridges do) names neither.
+        let mut twice = found.clone();
+        twice[2].serial = "SCSI-ONE".into();
+        let both = pick("SCSI-ONE", &twice).unwrap_err();
+        assert!(
+            both.contains("2 disks give serial SCSI-ONE: sda") && both.contains("sdb"),
+            "{both}"
+        );
+        assert!(pick("", &found).unwrap_err().contains("serial:"));
     }
 
     #[test]
