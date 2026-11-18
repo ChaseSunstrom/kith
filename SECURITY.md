@@ -1431,11 +1431,13 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   until a waiting node's own is pushed out of the 64 that are kept: the node asks
   again every few seconds, and is not told while they keep at it. Only a control
   node forgets: a worker that is asked refuses, and the waiting node asks the next.
-  A node the cluster's code forgot (not the one it was typed at) keeps its own code
-  and loses the cluster's; unlocked again, it has neither until they are made anew.
-  One that was off when the cluster's code was used still knows that code: typed at
-  it later, it erases itself, and the cluster, which had forgotten its key already,
-  goes on saying forgotten and not wiped.
+  A node the cluster's code forgot (not the one it was typed at) keeps both codes, its
+  own and the cluster's. One that was off when the cluster's code was used still has
+  its record: either code typed at it later erases it, and the cluster says wiped.
+  `kith node duress --all --off` and a new `--all` reach a forgotten key too, so a
+  revoked cluster code wipes no node, and the forgotten key stays forgotten.
+  `kith node unlock` deletes a forgotten key: the node has neither code afterwards,
+  until they are made anew.
   **A new recovery key (`kith node recovery`) is written before it is shown**: an
   answer lost on its way leaves a key nobody saw, the old one opening no more and
   `recoverySeen` saying yes (the command says so when it fails: run it again). Where

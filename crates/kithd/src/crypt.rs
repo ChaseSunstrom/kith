@@ -1623,6 +1623,25 @@ fn never_shown(keys: &[kith_api::Resource]) -> Vec<&str> {
         .collect()
 }
 
+/// The NodeKeys the cluster's code is written to or taken from: every one not wiped. A
+/// forgotten one too, for it keeps the code (its node's record is still there to erase).
+fn under_all(store: &kith_api::store::Store) -> Vec<kith_api::Resource> {
+    let kept = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
+    kept.cloned().collect()
+}
+
+/// Set the cluster's code `public` on these keys, or (`None`) take it from them; a
+/// forgotten key stays forgotten.
+fn code_all(keys: &mut [kith_api::Resource], public: Option<&String>) {
+    for key in keys {
+        match (public, key.spec.as_object_mut()) {
+            (None, Some(spec)) => drop(spec.remove("duressAll")),
+            (Some(public), _) => key.spec["duressAll"] = public.clone().into(),
+            (None, None) => {}
+        }
+    }
+}
+
 /// `POST /v1/duress[?off]` (`kith node duress --all`): one duress code for the cluster,
 /// its public key written to every NodeKey there is (`off`: taken from each). Typed at
 /// any of those nodes' waiting consoles, it has the cluster forget all of their keys. For
@@ -1638,16 +1657,12 @@ pub async fn duress_all(
     }
     let (code, public) = duress_made();
     let off = asked.contains_key("off");
-    let mut keys: Vec<kith_api::Resource> = {
+    let mut keys = {
         let state = shared.store.lock().expect("a handler panicked holding the store");
-        state
-            .store
-            .list(Some("NodeKey"))
-            .filter(|key| !gone(key))
-            .cloned()
-            .collect()
+        under_all(&state.store)
     };
-    let unseen = never_shown(&keys);
+    let held: Vec<kith_api::Resource> = keys.iter().filter(|key| !gone(key)).cloned().collect();
+    let unseen = never_shown(&held);
     if !off && !unseen.is_empty() {
         let why = format!(
             "nobody was shown the recovery key of {}: `kith node recovery NAME` shows a new one, and with the cluster's key forgotten it alone opens a node",
@@ -1655,12 +1670,7 @@ pub async fn duress_all(
         );
         return refuse(StatusCode::CONFLICT, why).into_response();
     }
-    for key in &mut keys {
-        match (off, key.spec.as_object_mut()) {
-            (true, Some(spec)) => drop(spec.remove("duressAll")),
-            _ => key.spec["duressAll"] = public.clone().into(),
-        }
-    }
+    code_all(&mut keys, (!off).then_some(&public));
     let names: Vec<String> = keys.iter().map(|key| key.metadata.name.clone()).collect();
     let what = if off {
         "no duress code for all"
@@ -1668,7 +1678,7 @@ pub async fn duress_all(
         "duress code for all"
     };
     let done = async {
-        if keys.is_empty() {
+        if held.is_empty() {
             return Err("the cluster holds no node's key: no node's state is encrypted".to_string());
         }
         let applied = shared
@@ -1774,8 +1784,8 @@ fn forgetting(store: &kith_api::store::Store, id: &str, nonce: &[u8], signature:
         public.is_some_and(|public| public.verify(&text, signature).is_ok())
     };
     // (The disk the code was typed at erased its record: wiped. Another node under the
-    // cluster's code has its record still, and its recovery key: forgotten. Its own
-    // code stays with it: typed at it later, that still erases its record.)
+    // cluster's code has its record still, and its recovery key: forgotten. Both codes
+    // stay with it: typed at it later, either still erases its record.)
     let without = |key: &kith_api::Resource| {
         let mut spec = json!({ "id": key.spec["id"] });
         match key.spec["id"] == id {
@@ -2808,7 +2818,7 @@ mod tests {
         // b, forgotten, was off when the cluster's code was used: typed at b later, that
         // code (and b's own) erases its record too (wiped), and no other key with it.
         let gone = ("b".to_string(), json!({ "id": "bb", "wiped": true }));
-        assert_eq!(keys(&store, "bb", &pair), [gone.clone()]);
+        assert_eq!(keys(&store, "bb", &pair), std::slice::from_ref(&gone));
         assert_eq!(keys(&store, "bb", &bs), [gone]);
         assert!(keys(&store, "aa", &own).is_empty());
 
@@ -2821,6 +2831,43 @@ mod tests {
         let never = node_key("e", json!({ "id": "ee", "wrapped": "0102" }), Value::Null);
         assert_eq!(never_shown(&[held("a", "aa"), unseen, never]), ["d", "e"]);
         assert!(never_shown(&[held("a", "aa")]).is_empty());
+    }
+
+    #[test]
+    fn duress_all_off_and_anew_reach_a_forgotten_key() {
+        let (_, old, old_public) = code();
+        let (_, new, new_public) = code();
+        let seen = json!({ "recoverySeen": true });
+        let nonce = [5; 32];
+        let held = |name: &str, id: &str| {
+            let spec = json!({ "id": id, "wrapped": "0102", "duressAll": old_public });
+            node_key(name, spec, seen.clone())
+        };
+        let erases = |store: &kith_api::store::Store, pair: &ring::signature::Ed25519KeyPair| {
+            let signature = pair.sign(&forget_text("bb", &nonce));
+            let wiped = forgetting(store, "bb", &nonce, signature.as_ref());
+            wiped.iter().any(|key| key.spec["wiped"] == true)
+        };
+        // The code used at a: a is wiped, b forgotten (it keeps the code).
+        let mut store = stored(&[held("a", "aa"), held("b", "bb")]);
+        let signature = old.sign(&forget_text("aa", &nonce));
+        for key in forgetting(&store, "aa", &nonce, signature.as_ref()) {
+            store.apply(key).unwrap();
+        }
+        assert!(erases(&store, &old));
+        // Revoked (`--off`): it reaches the forgotten key, which stays forgotten and is not
+        // erased by the revoked code.
+        let (mut revoked, mut anew) = (under_all(&store), under_all(&store));
+        assert_eq!(revoked.len(), 1);
+        code_all(&mut revoked, None);
+        assert!(gone(&revoked[0]) && revoked[0].spec.get("duressAll").is_none());
+        let mut off = store.clone();
+        off.apply(revoked.remove(0)).unwrap();
+        assert!(!erases(&off, &old));
+        // A new code for all replaces the old one there: it erases the node, the old one no more.
+        code_all(&mut anew, Some(&new_public));
+        store.apply(anew.remove(0)).unwrap();
+        assert!(erases(&store, &new) && !erases(&store, &old));
     }
 
     #[test]
