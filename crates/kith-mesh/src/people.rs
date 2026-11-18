@@ -38,6 +38,7 @@ pub struct Person {
 /// A chain of the table, and its rules (each one's expressions, as bytes, in order). A base
 /// chain has its hook, priority and kind (`filter`, `nat`); a level's chain has none, and a
 /// rule jumps to it.
+#[derive(Debug)]
 pub struct Chain {
     pub name: String,
     pub hook: Option<(u32, u32, &'static str)>,
@@ -54,17 +55,49 @@ const DNS: [(u8, u16); 4] = [(17, 53), (17, 853), (6, 53), (6, 853)];
 const TABLE: &str = "kith-people";
 
 /// The table's chains, base ones first (pre, in, fwd, out, post), then each level's four
-/// (`-in`, `-out`, `-back`, `-replies`). `people64` is the people's /64, `links` the node's
-/// own links' networks (what `-out` never reaches).
-pub fn table(people64: Ipv6Addr, people: &[Person], levels: &[(String, Level)], links: &[(IpAddr, u8)]) -> Vec<Chain> {
+/// (`-in`, `-out`, `-back`, `-replies`). `people64` is the people's /64, `mesh` the mesh's link
+/// (kithd's `--mesh-interface`), `links` the node's own links' networks (what `-out` never
+/// reaches). A peer whose level is not in `levels` refuses the table: its jump would go nowhere.
+pub fn table(
+    people64: Ipv6Addr,
+    people: &[Person],
+    levels: &[(String, Level)],
+    mesh: &str,
+    links: &[(IpAddr, u8)],
+) -> Result<Vec<Chain>, String> {
     let drop_on = |which: u32, name: &str| [named(which, name), verdict(0)].concat();
     let (mut input, mut inward, mut outward, mut out) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for person in people {
         let mark = 0x6b79_0000 | u32::from(person.offset);
         let level = &person.level;
-        for address in [person.v4.map(IpAddr::V4), person.v6.map(IpAddr::V6)].into_iter().flatten() {
-            input.push([named(6, "kwg0"), host(address, false), jump(&format!("{level}-in"))].concat());
-            inward.push([named(6, "kwg0"), host(address, false), set_mark(mark), jump(&format!("{level}-out"))].concat());
+        if !levels.iter().any(|(name, _)| name == level) {
+            return Err(format!(
+                "{} is in level {level}, which the levels given do not have",
+                describe(person)
+            ));
+        }
+        for address in [person.v4.map(IpAddr::V4), person.v6.map(IpAddr::V6)]
+            .into_iter()
+            .flatten()
+        {
+            input.push(
+                [
+                    named(6, "kwg0"),
+                    host(address, false),
+                    set_mark(mark),
+                    jump(&format!("{level}-in")),
+                ]
+                .concat(),
+            );
+            inward.push(
+                [
+                    named(6, "kwg0"),
+                    host(address, false),
+                    set_mark(mark),
+                    jump(&format!("{level}-out")),
+                ]
+                .concat(),
+            );
             outward.push([named(7, "kwg0"), host(address, true), jump(&format!("{level}-back"))].concat());
             out.push([named(7, "kwg0"), host(address, true), jump(&format!("{level}-replies"))].concat());
         }
@@ -87,7 +120,12 @@ pub fn table(people64: Ipv6Addr, people: &[Person], levels: &[(String, Level)], 
             0,
             "filter",
             vec![
-                [not_named(6, "kwg0"), reach(IpAddr::V4(PEOPLE4.0), PEOPLE4.1, false), verdict(0)].concat(),
+                [
+                    not_named(6, "kwg0"),
+                    reach(IpAddr::V4(PEOPLE4.0), PEOPLE4.1, false),
+                    verdict(0),
+                ]
+                .concat(),
                 [not_named(6, "kwg0"), reach(IpAddr::V6(people64), 64, false), verdict(0)].concat(),
             ],
         ),
@@ -100,8 +138,18 @@ pub fn table(people64: Ipv6Addr, people: &[Person], levels: &[(String, Level)], 
             100,
             "nat",
             vec![
-                [not_named(7, "kwg0"), reach(IpAddr::V4(PEOPLE4.0), PEOPLE4.1, false), expression("masq", &[])].concat(),
-                [not_named(7, "kwg0"), reach(IpAddr::V6(people64), 64, false), expression("masq", &[])].concat(),
+                [
+                    not_named(7, "kwg0"),
+                    reach(IpAddr::V4(PEOPLE4.0), PEOPLE4.1, false),
+                    expression("masq", &[]),
+                ]
+                .concat(),
+                [
+                    not_named(7, "kwg0"),
+                    reach(IpAddr::V6(people64), 64, false),
+                    expression("masq", &[]),
+                ]
+                .concat(),
             ],
         ),
     ];
@@ -112,17 +160,32 @@ pub fn table(people64: Ipv6Addr, people: &[Person], levels: &[(String, Level)], 
             rules,
         };
         chains.push(plain("in", level_in(level)));
-        chains.push(plain("out", level_out(level, links)));
-        chains.push(plain("back", level_back(level)));
+        chains.push(plain("out", level_out(level, mesh, links)));
+        chains.push(plain("back", level_back(level, mesh)));
         chains.push(plain("replies", level_replies(level)));
     }
-    chains
+    Ok(chains)
+}
+
+/// A peer as an error names it: its offset and its addresses.
+fn describe(person: &Person) -> String {
+    let addresses: Vec<String> = [person.v4.map(|a| a.to_string()), person.v6.map(|a| a.to_string())]
+        .into_iter()
+        .flatten()
+        .collect();
+    format!("peer {:#06x} ({})", person.offset, addresses.join(", "))
 }
 
 /// Makes the table whole, in one batch: the kernel takes all of it or none, and a table made
 /// anew has no moment without its rules (as `pod.rs`'s `nat` does).
-pub fn send(people64: Ipv6Addr, people: &[Person], levels: &[(String, Level)], links: &[(IpAddr, u8)]) -> std::io::Result<()> {
-    build(&table(people64, people, levels, links))
+pub fn send(
+    people64: Ipv6Addr,
+    people: &[Person],
+    levels: &[(String, Level)],
+    mesh: &str,
+    links: &[(IpAddr, u8)],
+) -> std::io::Result<()> {
+    build(&table(people64, people, levels, mesh, links).map_err(std::io::Error::other)?)
 }
 
 /// Makes `chains` the table, in one batch (see `send`).
@@ -166,7 +229,7 @@ fn level_in(level: &Level) -> Vec<Vec<u8>> {
 /// The level's `-out`, in the ADR's order: the resolver's DNS, the other DNS dropped, the named
 /// networks, private addresses and the node's own networks dropped, then the internet (none,
 /// the home's, or an exit's own link). Ends in drop.
-fn level_out(level: &Level, own: &[(IpAddr, u8)]) -> Vec<Vec<u8>> {
+fn level_out(level: &Level, mesh: &str, own: &[(IpAddr, u8)]) -> Vec<Vec<u8>> {
     let mut rules = Vec::new();
     if let Some(resolver) = level.resolver {
         rules.extend(resolver_to(resolver));
@@ -177,7 +240,19 @@ fn level_out(level: &Level, own: &[(IpAddr, u8)]) -> Vec<Vec<u8>> {
         }
     }
     for &(network, bits) in &level.networks {
-        rules.push([reach(network, bits, true), verdict(1)].concat());
+        // Out by no Exit's link, no pod link and no people link, nor the mesh's: a named range is
+        // accepted only where it may go (the ADR's review, condition 3).
+        rules.push(
+            [
+                reach(network, bits, true),
+                not_begins(7, "kx"),
+                not_begins(7, "kp"),
+                not_named(7, mesh),
+                not_named(7, "kwg0"),
+                verdict(1),
+            ]
+            .concat(),
+        );
     }
     rules.extend(private(true));
     for &(network, bits) in own {
@@ -185,8 +260,8 @@ fn level_out(level: &Level, own: &[(IpAddr, u8)]) -> Vec<Vec<u8>> {
     }
     match level.internet {
         Internet::Home => {
-            // Out by any link but kith0, kp* and kx*: those are dropped, the rest passed.
-            rules.push(drop_on_link(7, "kith0"));
+            // Out by any link but the mesh's, kp* and kx*: those are dropped, the rest passed.
+            rules.push(drop_on_link(7, mesh));
             for prefix in ["kp", "kx"] {
                 rules.push([begins(7, prefix), verdict(0)].concat());
             }
@@ -202,7 +277,7 @@ fn level_out(level: &Level, own: &[(IpAddr, u8)]) -> Vec<Vec<u8>> {
 /// The level's `-back`: an answer (the connection seen both ways) from a named network, the
 /// resolver's DNS, or the internet (an exit's link, or home's public sources by no mesh, pod
 /// or exit link). Ends in drop.
-fn level_back(level: &Level) -> Vec<Vec<u8>> {
+fn level_back(level: &Level, mesh: &str) -> Vec<Vec<u8>> {
     let mut rules = Vec::new();
     for &(network, bits) in &level.networks {
         rules.push([answering(), reach(network, bits, false), verdict(1)].concat());
@@ -213,13 +288,15 @@ fn level_back(level: &Level) -> Vec<Vec<u8>> {
     match level.internet {
         Internet::Home => {
             rules.extend(private(false));
-            rules.push(drop_on_link(6, "kith0"));
+            rules.push(drop_on_link(6, mesh));
             for prefix in ["kp", "kx"] {
                 rules.push([begins(6, prefix), verdict(0)].concat());
             }
             rules.push([answering(), nfproto(2), verdict(1)].concat());
         }
-        Internet::Exit(n) => rules.push([answering(), nfproto(2), named(6, &crate::exit::device(n)), verdict(1)].concat()),
+        Internet::Exit(n) => {
+            rules.push([answering(), nfproto(2), named(6, &crate::exit::device(n)), verdict(1)].concat())
+        }
         Internet::None => {}
     }
     rules.push(verdict(0));
@@ -253,7 +330,15 @@ fn level_replies(level: &Level) -> Vec<Vec<u8>> {
 /// The resolver's DNS as the node's own, from anywhere: the packet is to it (`-in`, `-out`).
 fn resolver_to(resolver: IpAddr) -> Vec<Vec<u8>> {
     DNS.iter()
-        .map(|&(protocol, port)| [host(resolver, true), l4proto(protocol), at(2, 2, &port.to_be_bytes()), verdict(1)].concat())
+        .map(|&(protocol, port)| {
+            [
+                host(resolver, true),
+                l4proto(protocol),
+                at(2, 2, &port.to_be_bytes()),
+                verdict(1),
+            ]
+            .concat()
+        })
         .collect()
 }
 
@@ -262,7 +347,14 @@ fn resolver_to(resolver: IpAddr) -> Vec<Vec<u8>> {
 fn resolver_from(resolver: IpAddr) -> Vec<Vec<u8>> {
     DNS.iter()
         .map(|&(protocol, port)| {
-            [answering(), host(resolver, false), l4proto(protocol), at(2, 0, &port.to_be_bytes()), verdict(1)].concat()
+            [
+                answering(),
+                host(resolver, false),
+                l4proto(protocol),
+                at(2, 0, &port.to_be_bytes()),
+                verdict(1),
+            ]
+            .concat()
         })
         .collect()
 }
@@ -276,17 +368,24 @@ fn port_matches(ports: &[u16], offset: u32) -> Vec<Vec<u8>> {
     ports.iter().map(|port| at(2, offset, &port.to_be_bytes())).collect()
 }
 
-/// Private addresses, IPv4's and IPv6's unique local and link-local ones, dropped: from them
-/// (`outward` false) or to them (true).
+/// Private and reserved addresses, dropped: from them (`outward` false) or to them (true). IPv4's
+/// private ones and its reserved ones (`0/8`, multicast `224/4`, `240/4`, the benchmark `198.18/15`,
+/// `192.0.0/24`); IPv6's unique local, link-local and multicast ones.
 fn private(outward: bool) -> Vec<Vec<u8>> {
-    let networks: [(IpAddr, u8); 7] = [
+    let networks: [(IpAddr, u8); 13] = [
         (Ipv4Addr::new(10, 0, 0, 0).into(), 8),
         (Ipv4Addr::new(172, 16, 0, 0).into(), 12),
         (Ipv4Addr::new(192, 168, 0, 0).into(), 16),
         (Ipv4Addr::new(100, 64, 0, 0).into(), 10),
         (Ipv4Addr::new(169, 254, 0, 0).into(), 16),
+        (Ipv4Addr::new(0, 0, 0, 0).into(), 8),
+        (Ipv4Addr::new(224, 0, 0, 0).into(), 4),
+        (Ipv4Addr::new(240, 0, 0, 0).into(), 4),
+        (Ipv4Addr::new(198, 18, 0, 0).into(), 15),
+        (Ipv4Addr::new(192, 0, 0, 0).into(), 24),
         ("fc00::".parse().unwrap(), 7),
         ("fe80::".parse().unwrap(), 10),
+        ("ff00::".parse().unwrap(), 8),
     ];
     networks
         .iter()
@@ -335,7 +434,10 @@ fn within(base: u32, offset: u32, network: IpAddr, bits: u8) -> Vec<u8> {
         })
         .collect();
     let masked: Vec<u8> = bytes.iter().zip(&mask).map(|(byte, bits)| byte & bits).collect();
-    let load = expression("payload", &[number(1, 1), number(2, base), number(3, offset), number(4, len as u32)]);
+    let load = expression(
+        "payload",
+        &[number(1, 1), number(2, base), number(3, offset), number(4, len as u32)],
+    );
     let and = expression(
         "bitwise",
         &[
@@ -362,19 +464,41 @@ fn begins(which: u32, name: &str) -> Vec<u8> {
 /// The link it came by (6) or goes out by (7) is not `name` whole.
 fn not_named(which: u32, name: &str) -> Vec<u8> {
     let value = attribute(3 | NESTED, &attribute(1, &[name.as_bytes(), &[0]].concat()));
-    [link_name(which), expression("cmp", &[number(1, 1), number(2, 1), value])].concat()
+    [
+        link_name(which),
+        expression("cmp", &[number(1, 1), number(2, 1), value]),
+    ]
+    .concat()
+}
+
+/// The link it goes out by (7) does not begin with `name` (`kp` is not `kp1` nor `kpx2`): the
+/// first bytes of its name, not the whole of it.
+fn not_begins(which: u32, name: &str) -> Vec<u8> {
+    let value = attribute(3 | NESTED, &attribute(1, name.as_bytes()));
+    [
+        link_name(which),
+        expression("cmp", &[number(1, 1), number(2, 1), value]),
+    ]
+    .concat()
 }
 
 /// A rule that jumps to the chain `name` (the verdict -3, with the chain's name).
 fn jump(name: &str) -> Vec<u8> {
-    let verdict = attribute(2 | NESTED, &attribute(2 | NESTED, &[number(1, (-3i32) as u32), text(2, name)].concat()));
+    let verdict = attribute(
+        2 | NESTED,
+        &attribute(2 | NESTED, &[number(1, (-3i32) as u32), text(2, name)].concat()),
+    );
     expression("immediate", &[number(1, 0), verdict])
 }
 
 /// Marks the connection with `mark` (the ct mark, as `pod.rs`'s `marked` does).
 fn set_mark(mark: u32) -> Vec<u8> {
     let value = attribute(2 | NESTED, &attribute(1, &mark.to_ne_bytes()));
-    [expression("immediate", &[number(1, 1), value]), expression("ct", &[number(2, 3), number(4, 1)])].concat()
+    [
+        expression("immediate", &[number(1, 1), value]),
+        expression("ct", &[number(2, 3), number(4, 1)]),
+    ]
+    .concat()
 }
 
 #[cfg(test)]
@@ -413,13 +537,26 @@ mod tests {
         }
     }
 
+    /// The mesh's link in these tests.
+    const MESH: &str = "kith0";
+
     fn built(people: &[Person], levels: &[(&str, Level)]) -> Vec<Chain> {
         let levels: Vec<(String, Level)> = levels.iter().map(|(n, l)| (n.to_string(), l.clone())).collect();
-        table(PEOPLE64.parse().unwrap(), people, &levels, &[("10.0.0.0".parse().unwrap(), 24)])
+        table(
+            PEOPLE64.parse().unwrap(),
+            people,
+            &levels,
+            MESH,
+            &[("10.0.0.0".parse().unwrap(), 24)],
+        )
+        .unwrap()
     }
 
     fn chain<'a>(chains: &'a [Chain], name: &str) -> &'a Chain {
-        chains.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no chain {name}"))
+        chains
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no chain {name}"))
     }
 
     /// A rule is a drop (0) at its end.
@@ -433,7 +570,17 @@ mod tests {
         let names: Vec<&str> = chains.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(
             names,
-            ["pre", "in", "fwd", "out", "post", "work-in", "work-out", "work-back", "work-replies"]
+            [
+                "pre",
+                "in",
+                "fwd",
+                "out",
+                "post",
+                "work-in",
+                "work-out",
+                "work-back",
+                "work-replies"
+            ]
         );
         // (One rule per peer per hook and family: a peer with both addresses has two of each.)
         let counts: Vec<usize> = chains.iter().take(5).map(|c| c.rules.len()).collect();
@@ -455,6 +602,10 @@ mod tests {
         let input = &chain(&chains, "in").rules;
         assert!(input[0].ends_with(&jump("work-in")));
         assert!(input[0].contains_slice(&at(1, 12, &[100, 89, 1, 2])));
+        // The mark is set on delivery to the node as well, just before the jump: revocation
+        // flushes the connections to the node itself (the ADR's review, condition 6).
+        let before_jump = &input[0][..input[0].len() - jump("work-in").len()];
+        assert!(before_jump.ends_with(&set_mark(0x6b79_0102)));
         let forward = &chain(&chains, "fwd").rules;
         // The mark (0x6b79 in the high 16 bits, the peer's offset below), then out.
         assert!(forward[0].contains_slice(&set_mark(0x6b79_0102)));
@@ -493,10 +644,28 @@ mod tests {
         assert!(out.iter().position(|r| *r == other_dns).unwrap() > first_pass);
         // The named range is passed, then private space and the node's own link network
         // dropped, then the internet passed (Home's: out by any link but kith0, kp*, kx*).
-        let named_range = out.iter().position(|r| r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, true)) && r.ends_with(&verdict(1))).unwrap();
-        let private = out.iter().position(|r| r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8, true)) && r.ends_with(&verdict(0))).unwrap();
-        let own = out.iter().position(|r| r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24, true)) && r.ends_with(&verdict(0))).unwrap();
-        let home = out.iter().position(|r| *r == [nfproto(2), verdict(1)].concat()).unwrap();
+        let named_range = out
+            .iter()
+            .position(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, true)) && r.ends_with(&verdict(1))
+            })
+            .unwrap();
+        let private = out
+            .iter()
+            .position(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8, true)) && r.ends_with(&verdict(0))
+            })
+            .unwrap();
+        let own = out
+            .iter()
+            .position(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 24, true)) && r.ends_with(&verdict(0))
+            })
+            .unwrap();
+        let home = out
+            .iter()
+            .position(|r| *r == [nfproto(2), verdict(1)].concat())
+            .unwrap();
         assert!(named_range < private && private < home && own < home);
         assert!(out.iter().any(|r| *r == drop_on_link(7, "kith0")));
     }
@@ -509,7 +678,10 @@ mod tests {
         let out = &chain(&chains, "work-out").rules;
         let to = [link_name(7), is(b"kx3\0")].concat();
         assert!(out.iter().any(|r| r.contains_slice(&to)));
-        assert!(!out.iter().any(|r| r.contains_slice(&[link_name(7), is(b"kith0\0")].concat())));
+        assert!(
+            !out.iter()
+                .any(|r| r.contains_slice(&[link_name(7), is(b"kith0\0")].concat()))
+        );
     }
 
     #[test]
@@ -527,7 +699,11 @@ mod tests {
     fn a_service_is_reached_by_its_address_and_port_only() {
         let chains = built(&[peer()], &[("work", work())]);
         let input = &chain(&chains, "work-in").rules;
-        assert!(input.iter().any(|r| r.contains_slice(&at(1, 24, &"fd8a:2b3c:4d5e::1".parse::<Ipv6Addr>().unwrap().octets()))));
+        assert!(input.iter().any(|r| r.contains_slice(&at(
+            1,
+            24,
+            &"fd8a:2b3c:4d5e::1".parse::<Ipv6Addr>().unwrap().octets()
+        ))));
         assert!(input.iter().any(|r| r.contains_slice(&at(2, 2, &443u16.to_be_bytes()))));
         assert!(input.last().unwrap().ends_with(&verdict(0)));
         assert!(input.iter().all(|r| drops(r) || r.ends_with(&verdict(1))));
@@ -542,7 +718,11 @@ mod tests {
             resolver: None,
             internet: Internet::None,
         };
-        let chains = built(&[peer()], &[("nothing", empty)]);
+        let in_nothing = Person {
+            level: "nothing".into(),
+            ..peer()
+        };
+        let chains = built(&[in_nothing], &[("nothing", empty)]);
         for name in ["nothing-in", "nothing-out", "nothing-back", "nothing-replies"] {
             let rules = &chain(&chains, name).rules;
             assert!(rules.iter().all(|r| drops(r)), "{name} passes something");
@@ -553,7 +733,82 @@ mod tests {
     fn internet_over_ipv6_is_never_passed() {
         let chains = built(&[peer()], &[("work", work())]);
         let out = &chain(&chains, "work-out").rules;
-        assert!(out.iter().filter(|r| r.ends_with(&verdict(1))).all(|r| r.contains_slice(&nfproto(2))));
+        assert!(
+            out.iter()
+                .filter(|r| r.ends_with(&verdict(1)))
+                .all(|r| r.contains_slice(&nfproto(2)))
+        );
+    }
+
+    #[test]
+    fn a_named_range_is_accepted_only_out_by_no_exit_pod_mesh_or_people_link() {
+        let chains = built(&[peer()], &[("work", work())]);
+        let out = &chain(&chains, "work-out").rules;
+        let named_range = out
+            .iter()
+            .find(|r| {
+                r.contains_slice(&reach(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24, true)) && r.ends_with(&verdict(1))
+            })
+            .expect("the named range is accepted");
+        for guard in [
+            not_begins(7, "kx"),
+            not_begins(7, "kp"),
+            not_named(7, MESH),
+            not_named(7, "kwg0"),
+        ] {
+            assert!(
+                named_range.contains_slice(&guard),
+                "the named range is accepted out by a link it must not"
+            );
+        }
+    }
+
+    #[test]
+    fn private_drops_each_range_the_adr_names_in_both_directions() {
+        let ranges: [(IpAddr, u8); 6] = [
+            (Ipv4Addr::new(0, 0, 0, 0).into(), 8),
+            (Ipv4Addr::new(224, 0, 0, 0).into(), 4),
+            (Ipv4Addr::new(240, 0, 0, 0).into(), 4),
+            (Ipv4Addr::new(198, 18, 0, 0).into(), 15),
+            (Ipv4Addr::new(192, 0, 0, 0).into(), 24),
+            ("ff00::".parse().unwrap(), 8),
+        ];
+        for (network, bits) in ranges {
+            for outward in [false, true] {
+                let rule = [reach(network, bits, outward), verdict(0)].concat();
+                assert!(
+                    private(outward).contains(&rule),
+                    "{network}/{bits} is not dropped (outward {outward})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_mesh_link_is_the_name_given_not_kith0() {
+        let links = [("10.0.0.0".parse().unwrap(), 24)];
+        let levels = [("work".to_string(), work())];
+        let chains = table(PEOPLE64.parse().unwrap(), &[peer()], &levels, "wg7", &links).unwrap();
+        assert!(chain(&chains, "work-out").rules.contains(&drop_on_link(7, "wg7")));
+        assert!(chain(&chains, "work-back").rules.contains(&drop_on_link(6, "wg7")));
+        assert!(
+            chains
+                .iter()
+                .flat_map(|c| &c.rules)
+                .all(|r| !r.contains_slice(&named(7, "kith0")) && !r.contains_slice(&named(6, "kith0")))
+        );
+    }
+
+    #[test]
+    fn a_peer_in_a_level_not_given_is_refused_by_name() {
+        let mut stray = peer();
+        stray.level = "gone".into();
+        let levels = [("work".to_string(), work())];
+        let err = table(PEOPLE64.parse().unwrap(), &[stray], &levels, MESH, &[]).unwrap_err();
+        assert!(
+            err.contains("gone") && err.contains("100.89.1.2") && err.contains("0x0102"),
+            "{err}"
+        );
     }
 
     /// The attributes of one netfilter message, as (kind, payload), in order.
@@ -588,7 +843,9 @@ mod tests {
         loop {
             let (bytes, _) = socket.recv_from_full().map_err(crate::netlink::silent)?;
             if bytes.is_empty() {
-                return Err(std::io::Error::other("the kernel ended the dump before its last message"));
+                return Err(std::io::Error::other(
+                    "the kernel ended the dump before its last message",
+                ));
             }
             let mut rest = &bytes[..];
             while let Some(head) = rest.get(..16) {
@@ -661,6 +918,46 @@ mod tests {
         }
     }
 
+    /// Fails unless this is root in a network namespace of its own (`unshare -Urn`): the E2E
+    /// tests never touch the host's nftables. They all share one table name in that namespace,
+    /// so the guard returned is held for the whole test: one at a time, or a test's listing
+    /// reads another's table mid-replace.
+    fn own_namespace() -> std::sync::MutexGuard<'static, ()> {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            nix::unistd::getuid().is_root(),
+            "KITH_E2E=1 needs `unshare -Urn`: not root"
+        );
+        // (A fresh network namespace has only its loopback; the host's has more.)
+        let devices = std::fs::read_to_string("/proc/net/dev").unwrap();
+        let names: Vec<&str> = devices
+            .lines()
+            .skip(2)
+            .filter_map(|l| l.split(':').next())
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            names,
+            ["lo"],
+            "KITH_E2E=1 needs `unshare -Urn`: this is not a namespace of its own"
+        );
+        guard
+    }
+
+    /// Makes `chains` the table here. A kernel with no masquerade in a namespace refuses the post
+    /// chain's masq: then the table is made without those rules, and says so.
+    fn build_here(chains: &mut [Chain]) -> std::io::Result<()> {
+        match build(chains) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("this kernel has no masquerade here: without");
+                without_masquerade(chains);
+                build(chains)
+            }
+            done => done,
+        }
+    }
+
     /// Under `unshare -Urn` (KITH_E2E=1), the kernel takes the table whole or not at all, and a
     /// second build replaces the first in one batch: the dump lists the built chains in order,
     /// with their rules. Under KITH_E2E=1 but outside its own network namespace it fails, never
@@ -670,34 +967,23 @@ mod tests {
         if std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh people");
         }
-        assert!(nix::unistd::getuid().is_root(), "KITH_E2E=1 needs `unshare -Urn`: not root");
-        // (A fresh network namespace has only its loopback; the host's has more.)
-        let devices = std::fs::read_to_string("/proc/net/dev").unwrap();
-        let names: Vec<&str> = devices.lines().skip(2).filter_map(|l| l.split(':').next()).map(str::trim).collect();
-        assert_eq!(names, ["lo"], "KITH_E2E=1 needs `unshare -Urn`: this is not a namespace of its own");
+        let _one_at_a_time = own_namespace();
 
         let people64: Ipv6Addr = PEOPLE64.parse().unwrap();
         let people = [peer()];
         let links = [("10.0.0.0".parse::<IpAddr>().unwrap(), 24u8)];
         let first = [
             ("work".to_string(), work()),
-            ("home".to_string(), Level { internet: Internet::None, ..work() }),
+            (
+                "home".to_string(),
+                Level {
+                    internet: Internet::None,
+                    ..work()
+                },
+            ),
         ];
-        // (A kernel with no masquerade in a namespace refuses the post chain's masq: as
-        // `pod.rs`'s test does, the table is built without those rules, and says so.)
-        let mut first_chains = table(people64, &people, &first, &links);
-        let masquerade = match build(&first_chains) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            built => {
-                built.unwrap();
-                true
-            }
-        };
-        if !masquerade {
-            eprintln!("this kernel has no masquerade here: without");
-            without_masquerade(&mut first_chains);
-            build(&first_chains).unwrap();
-        }
+        let mut first_chains = table(people64, &people, &first, MESH, &links).unwrap();
+        build_here(&mut first_chains).unwrap();
         assert!(has_table(INET, TABLE).unwrap());
         let built = expected(&first_chains);
         for (name, rules) in &built {
@@ -716,15 +1002,36 @@ mod tests {
 
         // A second build, with `work` changed and `home` gone, replaces the first in one batch.
         let second = [("work".to_string(), Level { api: None, ..work() })];
-        let mut second_chains = table(people64, &people, &second, &links);
-        if !masquerade {
-            without_masquerade(&mut second_chains);
-        }
-        build(&second_chains).unwrap();
+        let mut second_chains = table(people64, &people, &second, MESH, &links).unwrap();
+        build_here(&mut second_chains).unwrap();
         let built = expected(&second_chains);
         for (name, rules) in &built {
             eprintln!("{TABLE} {name}: {rules} rules");
         }
         assert_eq!(listed().unwrap(), built);
+    }
+
+    /// Under KITH_E2E=1, 200 peers (each with both addresses) go in one batch and the kernel takes
+    /// it whole: a batch that size is too big for the socket's default send buffer, so the buffer
+    /// is raised first (`pod.rs`'s `netfilter`).
+    #[test]
+    fn a_table_of_200_peers_goes_in_one_batch() {
+        if std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh people");
+        }
+        let _one_at_a_time = own_namespace();
+        let people: Vec<Person> = (1..=200u16)
+            .map(|offset| Person {
+                level: "work".into(),
+                offset,
+                v4: Some(Ipv4Addr::new(100, 89, (offset >> 8) as u8, offset as u8)),
+                v6: Some(Ipv6Addr::new(0xfd8a, 0x2b3c, 0x4d5e, 5, 0, 0, 0, offset)),
+            })
+            .collect();
+        let levels = [("work".to_string(), work())];
+        let links = [("10.0.0.0".parse::<IpAddr>().unwrap(), 24u8)];
+        let mut chains = table(PEOPLE64.parse().unwrap(), &people, &levels, MESH, &links).unwrap();
+        build_here(&mut chains).unwrap();
+        assert_eq!(listed().unwrap(), expected(&chains));
     }
 }
