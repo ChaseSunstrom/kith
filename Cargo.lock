@@ -1428,6 +1428,7 @@ dependencies = [
  "serde_json",
  "tar",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

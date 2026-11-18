@@ -18,11 +18,12 @@ use oci_spec::runtime::{
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 /// First argument of the helper an exec unit starts as (see [`exec_shim`]).
 const SHIM: &str = "--kith-exec-unit";
@@ -713,7 +714,7 @@ impl Runtime {
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
             }
-            let container = ContainerBuilder::new(id.into(), SyscallType::Linux)
+            let builder = ContainerBuilder::new(id.into(), SyscallType::Linux)
                 .with_root_path(self.root.join("state"))
                 .ctx(&what)?
                 // Never the caller's stdin: a container must not read kithd's terminal.
@@ -723,9 +724,8 @@ impl Runtime {
                 .with_executor(Entry)
                 .as_init(&bundle)
                 .with_systemd(false)
-                .with_detach(true)
-                .build()
-                .ctx(&what)?;
+                .with_detach(true);
+            let container = logged_build(&bundle.join("init.log"), || builder.build()).ctx(&what)?;
             match container.pid() {
                 Some(pid) => Ok((container, pid)),
                 None => err(format!("{what}: no process was created")),
@@ -1568,6 +1568,71 @@ fn spec_of(
     spec_shifted(id, image, unit, cgroup, bundle, (uid, gid), None)
 }
 
+/// Most of what an init process logged that is said after a failed build.
+const LOG_BYTES: usize = 2048;
+
+/// Runs `build` with the error-level events of the container's init process kept at `log`, and
+/// for a failure says what they were beside it. libcontainer's parent sees only the top error's
+/// text ("failed to prepare rootfs"); the cause is logged by the child, which inherits this
+/// subscriber through its fork.
+fn logged_build<T, E: std::fmt::Display>(log: &Path, build: impl FnOnce() -> std::result::Result<T, E>) -> Result<T> {
+    let file = File::create(log).ctx("its init log")?;
+    let dispatch = tracing::Dispatch::new(InitLog(Mutex::new(file)));
+    let built = tracing::dispatcher::with_default(&dispatch, build);
+    drop(dispatch);
+    let logged = fs::read(log).unwrap_or_default();
+    let _ = fs::remove_file(log);
+    match built {
+        Ok(value) => Ok(value),
+        Err(e) if logged.is_empty() => err(e.to_string()),
+        Err(e) => {
+            let said = String::from_utf8_lossy(&logged[..logged.len().min(LOG_BYTES)]);
+            err(format!(
+                "{e}; its init process logged: {}",
+                said.trim_end().replace('\n', "; ")
+            ))
+        }
+    }
+}
+
+/// Writes the error-level events it is given, one line each, until the file holds [`LOG_BYTES`].
+struct InitLog(Mutex<File>);
+
+impl tracing::Subscriber for InitLog {
+    fn enabled(&self, meta: &tracing::Metadata<'_>) -> bool {
+        *meta.level() == tracing::Level::ERROR
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = Line(String::new());
+        event.record(&mut line);
+        if let Ok(mut file) = self.0.lock()
+            && file.metadata().is_ok_and(|m| m.len() < LOG_BYTES as u64)
+        {
+            let _ = file.write_all(format!("{}\n", line.0).as_bytes());
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// An event as one line: its message, then each field as `name=value`.
+struct Line(String);
+
+impl tracing::field::Visit for Line {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0.push_str(&format!("{value:?}"));
+        } else {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+}
+
 /// The container's spec, for a kithd that is the user `kithd`, where `shift` is the first id
 /// of the range its user namespace maps (where kithd is root, and `shifts` says so).
 fn spec_shifted(
@@ -1649,7 +1714,11 @@ fn spec_shifted(
     // (A range's image is its id-mapped mount, made by `stage`; so are its own layer and volumes.)
     let staged = |name: &str| Path::new(STAGE).join(name);
     let image_root = shift.map_or(image.rootfs.clone(), |_| staged("root"));
-    let rootfs = RootBuilder::default().path(&image_root).readonly(!unit.writable);
+    // (Where kithd is not root a writable root cannot be an overlay: the kernel refuses one in a
+    // user namespace, so the image is read-only and the pod's writes go to its tmpfs.)
+    let rootfs = RootBuilder::default()
+        .path(&image_root)
+        .readonly(!(unit.writable && uid.is_root()));
     spec.set_root(Some(rootfs.build()?));
     // Linux refuses hostnames over 64 bytes; ids are ASCII (validated by the caller).
     let hostname = unit.hostname.as_deref().unwrap_or(id);
@@ -1766,7 +1835,7 @@ fn spec_shifted(
             .build()?)
     };
     let mut mounts = spec.mounts().clone().unwrap_or_default();
-    if unit.writable {
+    if unit.writable && root {
         // The first mount, on the root itself: the image below, the container's own layer
         // over it, and everything after is mounted on the two together. (It is made in the
         // container's mount namespace, and goes with it.)
@@ -1777,8 +1846,8 @@ fn spec_shifted(
             format!("upperdir={}", layer("upper")),
             format!("workdir={}", layer("work")),
         ];
-        if !root || shift.is_some() {
-            // (What a user namespace may write its bookkeeping in.)
+        if shift.is_some() {
+            // (What a range's user namespace may write its bookkeeping in.)
             options.push("userxattr".into());
         }
         let over = MountBuilder::default().destination("/").typ("overlay");
@@ -2551,14 +2620,26 @@ mod tests {
         assert_eq!((process.user().uid(), process.user().gid()), (101, 0));
         let kept = Some(HashSet::from([Capability::NetBindService]));
         assert_eq!(process.capabilities().as_ref().unwrap().bounding(), &kept);
-        // Where kithd is not root, the overlay is a user namespace's own.
+        // Where kithd is not root, the overlay is refused inside its user namespace (the kernel
+        // says so on this host, with or without userxattr), so the image is the root, read-only,
+        // and the pod still runs: its tmpfs /tmp and /run are what it writes.
         let (uid, gid) = (nix::unistd::Uid::from_raw(1000), nix::unistd::Gid::from_raw(1000));
         let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
-        let first = &made.mounts().as_ref().unwrap()[0];
-        assert_eq!(
-            first.options().as_ref().unwrap().last().map(String::as_str),
-            Some("userxattr")
+        assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
+        assert!(
+            made.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|m| m.typ().as_deref() != Some("overlay"))
         );
+        let tmp = made
+            .mounts()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|m| m.destination() == Path::new("/tmp"));
+        assert!(tmp);
         // Without any of it: as before.
         let made = spec_of("a", &image, &Unit::default(), "/kith/a", Path::new("/b"), uid, gid).unwrap();
         assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
@@ -2799,6 +2880,40 @@ mod tests {
         assert!(
             !state.exists() && !bundle.exists(),
             "its last run is gone: the id is free"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A create that fails inside libcontainer says what failed beneath its top: libcontainer
+    /// reports only "failed to prepare rootfs" to kithd, and the error that named the path is
+    /// in the log its init process wrote, which the unit's failure must carry.
+    #[test]
+    fn create_error_names_what_failed_beneath() {
+        let root = std::env::temp_dir().join(format!("kith-create-error-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        // A rootfs that is a file: its path is there for the parent to canonicalize, and the
+        // init process fails to mount under it.
+        let rootfs = root.join("rootfs-is-a-file");
+        fs::write(&rootfs, "").unwrap();
+        let image = Image {
+            rootfs: rootfs.clone(),
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let (out, err) = (
+            File::create(root.join("out")).unwrap(),
+            File::create(root.join("err")).unwrap(),
+        );
+        let said = runtime
+            .create("broken", &image, &Unit::default(), out, err)
+            .err()
+            .expect("a rootfs that is a file makes no container")
+            .to_string();
+        assert!(said.contains("failed to prepare rootfs"), "{said}");
+        assert!(
+            said.contains("rootfs-is-a-file"),
+            "the path that failed is not in: {said}"
         );
         let _ = fs::remove_dir_all(&root);
     }
