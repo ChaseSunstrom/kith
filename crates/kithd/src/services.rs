@@ -1810,6 +1810,136 @@ spec:
         tokio::join!(carry(held, relay, Duration::from_secs(60)), asking)
     }
 
+    /// A client's connection to [`Proxy::take`] from [::1]: (the client's end, the one held).
+    async fn pair_from_ipv6() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("[::1]:0").await.unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        (ours, listener.accept().await.unwrap().0)
+    }
+
+    /// Applies the resources of `source` to `shared`'s store.
+    fn apply(shared: &Shared, source: &str) {
+        let mut state = shared.store.lock().unwrap();
+        for resource in Resource::from_source(source).unwrap() {
+            state.store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    const WEB: &str = "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  template:
+    containers: [{ name: main, image: example.org/web, ports: [{ name: http, port: 8080 }] }]
+";
+
+    /// A node `a` whose store has the Workload `web` in it, and nothing else.
+    async fn state_with_web(tag: &str) -> Arc<Shared> {
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared =
+            crate::cluster::pinned_peer::shared_with(tag, crate::cluster::pinned_peer::node(&ca, "a"), &[]).await;
+        apply(&shared, WEB);
+        shared
+    }
+
+    /// A Proxy as [`run`] makes one on `shared`, its table one backend: this node's Workload `of`
+    /// on `port`, and `replica` of it where it is a pod's.
+    fn proxy_of(shared: Arc<Shared>, port: u16, of: &str, replica: Option<u32>) -> Proxy {
+        let cluster = shared.cluster.as_ref().expect("a cluster");
+        let backend = (shared.members.me().to_string(), port, of.to_string(), replica);
+        Proxy {
+            prefix: crate::mesh::prefix(&cluster.me.ca),
+            table: Mutex::new(BTreeMap::from([((Ipv6Addr::LOCALHOST, 80), vec![backend])])),
+            turns: Turns::default(),
+            serving: Limits::new(SERVING, SERVING),
+            relaying: Limits::new(RELAYING, RELAYING_PER_NODE).per_node(),
+            spares: Limits::new(SPARE, SPARE_PER_NODE).per_node(),
+            kept: Mutex::default(),
+            shared,
+        }
+    }
+
+    /// Says `says` to `proxy`'s take over [::1]: what take passed on, and what the client heard.
+    async fn take_says(proxy: &Proxy, says: &str) -> (Option<()>, Vec<u8>) {
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client.write_all(says.as_bytes()).await.unwrap();
+            let mut heard = Vec::new();
+            client.read_to_end(&mut heard).await.unwrap();
+            heard
+        };
+        // A take that never closes must fail the test, not hang it.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends")
+    }
+
+    /// What the table asks for over [::1] (this node's `web` on `port`, no replica) reaches the
+    /// replica, which answers `a:`; the place it holds is held while the connection lasts and
+    /// given back when it ends.
+    #[tokio::test]
+    async fn take_passes_on_what_the_table_asks_for_to_the_replica() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let mut proxy = proxy_of(state_with_web("take-asked").await, port, "Workload/default/web", None);
+        // One place, so that a second one can be seen to be held.
+        proxy.relaying = Limits::new(1, 1).per_node();
+        let caller = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let (mut client, held) = pair_from_ipv6().await;
+        let asking = async {
+            client
+                .write_all(format!("{port} Workload/default/web\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(client.read_u8().await.unwrap(), b'+');
+            assert!(proxy.relaying.take(caller).is_none(), "held while the connection lasts");
+            client.write_all(b"q").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut heard = String::new();
+            client.read_to_string(&mut heard).await.unwrap();
+            heard
+        };
+        let (passed, heard) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(proxy.take(held), asking)
+        })
+        .await
+        .expect("take ends");
+        assert_eq!((passed, heard.as_str()), (Some(()), "a:q"));
+        assert!(proxy.relaying.take(caller).is_some(), "given back when it ends");
+        assert_eq!(replicas.load(Ordering::Relaxed), 1);
+    }
+
+    /// What the table does not ask for is closed with no byte, and no replica is connected: the
+    /// same Workload on the same port, but a replica the table has none of.
+    #[tokio::test]
+    async fn take_closes_what_the_table_does_not_ask_for_with_no_byte() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let proxy = proxy_of(state_with_web("take-unasked").await, port, "Workload/default/web", None);
+        let said = take_says(&proxy, &format!("{port} Workload/default/web 0\n")).await;
+        assert_eq!(said, (None, Vec::new()));
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+    }
+
+    /// A NetworkPolicy that does not let [::1] in closes what the table asks for the same way:
+    /// no byte, and no replica is connected.
+    #[tokio::test]
+    async fn take_closes_what_a_network_policy_refuses_with_no_byte() {
+        let (replica, replicas) = replica().await;
+        let port = replica.port();
+        let shared = state_with_web("take-refused").await;
+        let policy = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: web }\n\
+                      spec:\n  selector: { app: web }\n  ingress: [{ action: allow, peers: [{ cidr: 'fd00::/64' }] }]\n";
+        apply(&shared, policy);
+        let proxy = proxy_of(shared, port, "Workload/default/web", None);
+        let said = take_says(&proxy, &format!("{port} Workload/default/web\n")).await;
+        assert_eq!(said, (None, Vec::new()));
+        assert_eq!(replicas.load(Ordering::Relaxed), 0);
+    }
+
     /// One connection between two nodes passes on one client's connection after another,
     /// each to a replica that was asked for (and so admitted) by itself; what is not
     /// passed on is said, and costs no connection.
