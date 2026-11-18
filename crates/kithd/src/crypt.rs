@@ -1782,14 +1782,22 @@ fn forgetting(store: &kith_api::store::Store, id: &str, nonce: &[u8], signature:
             true => spec["wiped"] = true.into(),
             false => {
                 spec["forgotten"] = true.into();
-                if let Some(own) = key.spec.get("duress") {
-                    spec["duress"] = own.clone();
+                // (Both codes stay: a node that was off when the cluster's was used has
+                // its record still, and typed at it later, either one erases it.)
+                for code in ["duress", "duressAll"] {
+                    if let Some(kept) = key.spec.get(code) {
+                        spec[code] = kept.clone();
+                    }
                 }
             }
         }
         kith_api::Resource { spec, ..key.clone() }
     };
-    let live = || store.list(Some("NodeKey")).filter(|key| !gone(key));
+    // (The disk asked for is in it though forgotten: its record is what the code erases.)
+    let live = || {
+        let live = store.list(Some("NodeKey"));
+        live.filter(|key| !gone(key) || (key.spec["id"] == id && key.spec["wiped"] != true))
+    };
     // (Every NodeKey of that id is asked: one written beside it hides no code. A
     // forgotten one too, for its node's own code.)
     let kept = store.list(Some("NodeKey")).filter(|key| key.spec["wiped"] != true);
@@ -2783,7 +2791,7 @@ mod tests {
         // a's record is erased (wiped), b has its record and its recovery key (forgotten).
         let wiped = ("a".to_string(), json!({ "id": "aa", "wiped": true }));
         assert_eq!(keys(&store, "aa", &own), std::slice::from_ref(&wiped));
-        let forgotten = json!({ "id": "bb", "forgotten": true, "duress": bs_public });
+        let forgotten = json!({ "id": "bb", "forgotten": true, "duress": bs_public, "duressAll": public });
         assert_eq!(keys(&store, "aa", &pair), [wiped, ("b".to_string(), forgotten)]);
         // (Signed for another disk than the one asked for, or by a's code for b: nothing.)
         let other = forgetting(&store, "bb", &nonce, signed(&pair, "aa").as_ref());
@@ -2795,10 +2803,12 @@ mod tests {
         }
         assert_eq!((handed_out(&store, "aa"), handed_out(&store, "bb")), (None, None));
         assert_eq!(handed_out(&store, "cc"), Some(("c", "0102")));
-        // And a code that was used forgets nothing more.
-        assert!(keys(&store, "aa", &pair).is_empty() && keys(&store, "bb", &pair).is_empty());
-        // b, forgotten, has its own code still: typed at b, its record goes too (wiped).
+        // And a code that was used forgets nothing more at a (wiped, it asks nothing).
+        assert!(keys(&store, "aa", &pair).is_empty());
+        // b, forgotten, was off when the cluster's code was used: typed at b later, that
+        // code (and b's own) erases its record too (wiped), and no other key with it.
         let gone = ("b".to_string(), json!({ "id": "bb", "wiped": true }));
+        assert_eq!(keys(&store, "bb", &pair), [gone.clone()]);
         assert_eq!(keys(&store, "bb", &bs), [gone]);
         assert!(keys(&store, "aa", &own).is_empty());
 
