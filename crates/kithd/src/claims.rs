@@ -1292,8 +1292,15 @@ spec: { node: b, devices: [b-usb0] }
             "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [/dev/../etc/passwd] }",
             "{ node: a, class: gpu, nodes: [/proc/kcore] }",
         ] {
-            let forged = format!("---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-gpu-card1 }}\nspec: {spec}\n");
-            let source = [forged, claim("cuda", "{ device: a-gpu-card1 }"), workload("train", "[cuda]")].concat();
+            let forged = format!(
+                "---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-gpu-card1 }}\nspec: {spec}\n"
+            );
+            let source = [
+                forged,
+                claim("cuda", "{ device: a-gpu-card1 }"),
+                workload("train", "[cuda]"),
+            ]
+            .concat();
             let on_a = granted(&self::store(&source), "a", &empty);
             assert!(on_a["Workload/default/train"].devices.is_empty(), "{spec}");
             assert!(on_a["Workload/default/train"].classes.is_empty(), "{spec}");
