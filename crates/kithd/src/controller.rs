@@ -1432,7 +1432,7 @@ impl Controller {
                             if let Some((pod, _)) = slot.pod.as_ref().filter(|_| nix::unistd::getuid().is_root()) {
                                 let egress = {
                                     let held = shared.store.lock().expect("a handler panicked holding the store");
-                                    let prefix = mesh.map(|(prefix, _)| prefix);
+                                    let prefix = crate::services::mesh_prefix(shared);
                                     crate::services::egress_of(&held.store, &slot.owner, prefix)
                                 };
                                 let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
@@ -2456,7 +2456,7 @@ async fn start(
             // pod is made with it: held from its first moment).
             let egress = {
                 let state = shared.store.lock().expect("a handler panicked holding the store");
-                crate::services::egress_of(&state.store, &slot.owner, mesh.map(|(prefix, _)| prefix))
+                crate::services::egress_of(&state.store, &slot.owner, crate::services::mesh_prefix(shared))
             };
             let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
             let exit = exit.as_ref().map(|(tunnel, dns)| (*tunnel, dns.as_slice()));

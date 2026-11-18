@@ -323,6 +323,12 @@ pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Opt
     Some(rules.filter_map(|rule| egress_rule(rule, prefix)).collect())
 }
 
+/// The mesh's prefix where this node is in a cluster: the one `egress_of` is asked with, by
+/// every caller (so the rules a pod is made with are the ones it is kept in step with).
+pub fn mesh_prefix(shared: &Shared) -> Option<Ipv6Addr> {
+    shared.cluster.as_ref().map(|cluster| crate::mesh::prefix(&cluster.me.ca))
+}
+
 /// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read, or whose
 /// length is over its family's size (as `within_cidr` holds nothing for it).
 fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
@@ -369,8 +375,8 @@ fn policies<'a>(store: &'a Store, target: &'a Resource) -> impl Iterator<Item = 
 }
 
 /// What a NetworkPolicy's status is to be told, if it is not already.
-fn policy_unsaid(policy: &Resource) -> Option<serde_json::Map<String, Value>> {
-    let report = policy_report(policy);
+fn policy_unsaid(policy: &Resource, unsent: bool) -> Option<serde_json::Map<String, Value>> {
+    let report = policy_report(policy, unsent);
     if policy.status.as_ref() == Some(&report) {
         return None;
     }
@@ -380,12 +386,18 @@ fn policy_unsaid(policy: &Resource) -> Option<serde_json::Map<String, Value>> {
     Some(fields)
 }
 
-/// What a NetworkPolicy's status says: whether all of it is enforced.
-fn policy_report(policy: &Resource) -> Value {
+/// What a NetworkPolicy's status says: whether all of it is enforced. `unsent`: this node's
+/// pods' tables could not be made again for a change of rules (`Pods::unsent`): a policy with
+/// egress rules is then not enforced for them yet.
+fn policy_report(policy: &Resource, unsent: bool) -> Value {
+    // (`policies` skips one that cannot be read: the pods it was meant for are not held by it.)
     let Ok(spec) = serde_json::from_value::<NetworkPolicySpec>(policy.spec.clone()) else {
-        return json!({ "state": "error", "message": "cannot read this NetworkPolicy" });
+        return json!({ "state": "error", "message": "cannot read this NetworkPolicy: it holds no pod" });
     };
     let mut gaps = Vec::new();
+    if unsent && !spec.egress.is_empty() {
+        gaps.push("egress not enforced yet: this node could not write its pods' rules (tried again)");
+    }
     // (Egress is enforced for a Workload's pods, by `egress_of`'s rules: a pod it holds
     // reaches only what they allow, its DNS included.)
     if spec
@@ -1036,19 +1048,9 @@ pub async fn run(
     let mut unbound = BTreeSet::new();
     let relay = port.map(|port| (me, port));
     loop {
-        // What each pod here may reach, in step with its policies: the owners asked of the pods,
-        // the rules of the store, then the pods told (never both locks at once).
-        let owners = shared.pods.lock().expect("nothing panics holding the pods").owners();
-        if !owners.is_empty() {
-            let held: BTreeMap<String, Option<Vec<Egress>>> = {
-                let state = shared.store.lock().expect("nothing panics holding the store");
-                let of = |owner: &String| egress_of(&state.store, owner, Some(prefix));
-                // (One no longer in the store keeps its rules until its pods go: not let loose.)
-                let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
-                present.map(|owner| (owner.clone(), of(owner))).collect()
-            };
-            crate::pods::hold_again(&shared, &held);
-        }
+        // (Asked before the store's lock: never both at once. The rules themselves are kept in
+        // step by `pods::keep_held`, which needs no cluster.)
+        let unsent = shared.pods.lock().expect("nothing panics holding the pods").unsent();
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix);
@@ -1074,7 +1076,7 @@ pub async fn run(
             };
             let mut reports: Vec<_> = addresses(&state.store, prefix).into_iter().filter_map(stale).collect();
             for policy in state.store.list(Some("NetworkPolicy")) {
-                reports.extend(policy_unsaid(policy).map(|fields| (policy.key(), fields)));
+                reports.extend(policy_unsaid(policy, unsent).map(|fields| (policy.key(), fields)));
             }
             let plans = match kernel {
                 Kernel::Has(..) => kernel_plan(&state.store, &table, proxy.me()),
@@ -1642,7 +1644,7 @@ spec:
         let key = "NetworkPolicy/default/p";
         // What the leader does: write what is not said yet, merged into the status as a Patch does.
         let settle = |store: &mut Store| -> Option<Value> {
-            let fields = policy_unsaid(store.get(key).unwrap())?;
+            let fields = policy_unsaid(store.get(key).unwrap(), false)?;
             let mut status = match store.get(key).unwrap().status.clone() {
                 Some(Value::Object(status)) => status,
                 _ => serde_json::Map::new(),
@@ -1701,7 +1703,7 @@ spec:
         assert!(!admits(&store, web, Some("b"), "fd01::1".parse().unwrap(), 9000));
         // Not for other workloads.
         assert!(asks(&store, other, "c", 1));
-        let report = policy_report(store.get("NetworkPolicy/default/web").unwrap());
+        let report = policy_report(store.get("NetworkPolicy/default/web").unwrap(), false);
         assert_eq!(report, json!({ "state": "enforced", "message": null }));
 
         // Peers by label cannot be told apart yet: allowing them lets nobody in, denying
@@ -1713,7 +1715,7 @@ spec:
             &policy("web", "[{ action: allow, peers: [{ selector: { app: other } }] }]"),
         );
         assert!(!asks(&labels, web, "a", 8080));
-        let report = policy_report(labels.get("NetworkPolicy/default/web").unwrap());
+        let report = policy_report(labels.get("NetworkPolicy/default/web").unwrap(), false);
         assert_eq!(report["state"], "partial");
         let rules = "[{ action: deny, peers: [{ namespace: other }] }, { action: allow }]";
         let mut denied = Store::default();
@@ -1807,16 +1809,32 @@ spec:
         let all = egress_of(&denied, web, Some(prefix)).unwrap();
         assert_eq!(all[0].to, vec![net("0.0.0.0/0"), net("::/0")]);
         // The status says egress is enforced.
-        let report = policy_report(store.get("NetworkPolicy/default/p").unwrap());
+        let report = policy_report(store.get("NetworkPolicy/default/p").unwrap(), false);
         assert_eq!(report["state"], "partial", "(the selector peer)");
         assert!(!report["message"].as_str().unwrap().contains("egress rules are not enforced"));
-        let report = policy_report(denied.get("NetworkPolicy/default/d").unwrap());
+        let report = policy_report(denied.get("NetworkPolicy/default/d").unwrap(), false);
         assert!(report["message"].as_str().unwrap().contains("cannot be told apart"));
         let mut plain = Store::default();
         apply(&mut plain, HOME);
         apply(&mut plain, &policy("e", "{ app: web }", "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]"));
-        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap());
+        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap(), false);
         assert_eq!(report, json!({ "state": "enforced", "message": null }));
+        // While this node's pods' tables could not be made again for it, egress is not enforced:
+        // the status says so (a policy with no egress rule is not held back by it).
+        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap(), true);
+        assert_eq!(report["state"], "partial");
+        assert!(report["message"].as_str().unwrap().contains("egress not enforced yet"));
+        let report = policy_report(ingress.get("NetworkPolicy/default/i").unwrap(), true);
+        assert_eq!(report, json!({ "state": "enforced", "message": null }));
+        // A policy that cannot be read holds no pod (`policies` skips it): the status is not enforced.
+        // (The store refuses one, so this is one it holds from another version of the spec.)
+        let spec = json!({ "selector": { "app": "web" }, "egress": "nonsense" });
+        let written = json!({
+            "apiVersion": "kith.dev/v1", "kind": "NetworkPolicy", "metadata": { "name": "x" }, "spec": spec,
+        });
+        let report = policy_report(&serde_json::from_value(written).unwrap(), false);
+        assert_eq!(report["state"], "error");
+        assert!(report["message"].as_str().unwrap().contains("holds no pod"));
     }
 
     #[tokio::test]

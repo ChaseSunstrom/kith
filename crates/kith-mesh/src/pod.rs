@@ -1288,6 +1288,15 @@ mod tests {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh egress");
         }
+        // The namespace is left as found, a panic too: the other tests take forwarding off as a
+        // sign of a node not yet guarded.
+        struct Forwarding;
+        impl Drop for Forwarding {
+            fn drop(&mut self) {
+                let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "0");
+            }
+        }
+        let _forwarding = Forwarding;
         up(1).unwrap();
         let range = range("198.18.16.0/20").unwrap();
         let net = crate::node_net(crate::prefix(b"test"), "alpha");
@@ -1341,8 +1350,6 @@ mod tests {
         // A second time changes nothing.
         assert!(node_with(range, true, false, "kith0", &served).unwrap());
         assert!(connect(0, second, 80) && !connect(0, third, 81));
-        // The namespace is left as found: the other tests take forwarding off as a sign of a node not yet guarded.
-        std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "0").unwrap();
     }
 
     /// Two pods of one node, as root of a network namespace (`unshare -Urn cargo test -p

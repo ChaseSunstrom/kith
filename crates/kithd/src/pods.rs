@@ -178,8 +178,10 @@ impl Pods {
         });
         if self.made.len() < before {
             // (Rebuilt without the pods gone, so their links' rules go with them.)
-            if let Err(e) = self.serve() {
-                eprintln!("kithd: making the tables of this node's pods again: {e}");
+            // (Whole again, with every rule now wanted: nothing is left unsent when it went through.)
+            match self.serve() {
+                Ok(_) => self.unsent = false,
+                Err(e) => eprintln!("kithd: making the tables of this node's pods again: {e}"),
             }
             self.moved.notify_one();
         }
@@ -246,6 +248,11 @@ impl Pods {
         } else {
             vec![pod.address, v4]
         }
+    }
+
+    /// Whether the tables could not be made again for a change of egress rules (tried again).
+    pub fn unsent(&self) -> bool {
+        self.unsent
     }
 
     /// The keys of the resources the pods made are replicas of.
@@ -327,6 +334,35 @@ pub fn hold_again(shared: &Shared, wanted: &BTreeMap<String, Option<Vec<kith_mes
             true
         }
     };
+}
+
+/// Keeps every pod here in step with its policies until stopped, on a node in a cluster or
+/// alone (a node alone runs pods too): each time the store changes, and every few seconds
+/// (a change that could not be sent is tried again). A pod is made with its rules, so this
+/// is only for the rules that change after it.
+pub async fn keep_held(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+    let mut generation = shared.generation.subscribe();
+    loop {
+        // The owners asked of the pods, the rules of the store, then the pods told: never both locks at once.
+        let owners = shared.pods.lock().expect("nothing panics holding the pods").owners();
+        if !owners.is_empty() {
+            let prefix = crate::services::mesh_prefix(&shared);
+            let held: BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>> = {
+                let state = shared.store.lock().expect("nothing panics holding the store");
+                // (One no longer in the store keeps its rules until its pods go: not let loose.)
+                let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
+                present
+                    .map(|owner| (owner.clone(), crate::services::egress_of(&state.store, owner, prefix)))
+                    .collect()
+            };
+            hold_again(&shared, &held);
+        }
+        tokio::select! {
+            _ = generation.changed() => {}
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = stopping.changed() => return,
+        }
+    }
 }
 
 /// Make the node's tables for its pods again where they are gone while pods run (`nft flush
