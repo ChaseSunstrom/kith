@@ -2,11 +2,11 @@
 //! people's tunnels (`docs/adr-people.md`, "Where a level is enforced"). Not wired into
 //! kithd yet; this module only builds the table and its chains, and reads them back.
 
-use crate::Key;
 use crate::pod::{
     Batch, INET, NESTED, answering, at, attribute, expression, has_table, is, l4proto, link_name, nfproto, number,
     text, verdict,
 };
+use crate::{Key, Peer};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A level's reach: the networks it may reach, its Services' addresses and ports, its API's
@@ -190,6 +190,31 @@ pub fn send(
     build(&table(people64, people, levels, mesh, links).map_err(std::io::Error::other)?)
 }
 
+/// `send` with no masquerade rules. A kernel with no masquerade (a test namespace) has no way to
+/// take them; kith OS has them (CONFIG_NFT_MASQ=y), so only tests on such a host call this.
+#[doc(hidden)]
+pub fn send_without_masquerade(
+    people64: Ipv6Addr,
+    people: &[Person],
+    levels: &[(String, Level)],
+    mesh: &str,
+    links: &[(IpAddr, u8)],
+) -> std::io::Result<()> {
+    let mut chains = table(people64, people, levels, mesh, links).map_err(std::io::Error::other)?;
+    without_masquerade(&mut chains);
+    build(&chains)
+}
+
+/// `chains` with no masquerade rule (the kernel has none in a namespace).
+fn without_masquerade(chains: &mut [Chain]) {
+    let masq = expression("masq", &[]);
+    for chain in chains {
+        chain
+            .rules
+            .retain(|rule| rule.windows(masq.len()).all(|window| window != masq.as_slice()));
+    }
+}
+
 /// Makes `chains` the table, in one batch (see `send`).
 fn build(chains: &[Chain]) -> std::io::Result<()> {
     let mut batch = Batch::new(TABLE);
@@ -244,6 +269,19 @@ fn found(mut device: crate::netlink::Device) -> std::io::Result<Found> {
 /// Whether nftables has the people's table.
 pub fn table_present() -> std::io::Result<bool> {
     has_table(INET, TABLE)
+}
+
+/// Sets the people's device's peers, as the device has them now: kithd's tests seed one (a start
+/// never does). Fails if there is no device to seed.
+#[doc(hidden)]
+pub fn set_peers_for_tests(peers: &[Peer]) -> std::io::Result<()> {
+    match crate::netlink::Device::open(DEVICE)? {
+        Some(mut device) => device.set_peers(peers),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no people device to seed",
+        )),
+    }
 }
 
 /// Takes the people's device and table away, if they are there (the take-away with no flag).
@@ -964,14 +1002,6 @@ mod tests {
     /// The table `chains` make, as `listed` should give it back.
     fn expected(chains: &[Chain]) -> Vec<(String, usize)> {
         chains.iter().map(|c| (c.name.clone(), c.rules.len())).collect()
-    }
-
-    /// `chains` with no masquerade rule (the kernel has none in a namespace).
-    fn without_masquerade(chains: &mut [Chain]) {
-        let masq = expression("masq", &[]);
-        for chain in chains {
-            chain.rules.retain(|rule| !rule.contains_slice(&masq));
-        }
     }
 
     /// Fails unless this is root in a network namespace of its own (`unshare -Urn`): the E2E

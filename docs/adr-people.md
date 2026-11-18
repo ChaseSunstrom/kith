@@ -412,9 +412,11 @@ status says `people: {publicKey, port, endpoint}` (publicKey base64, as a peer's
 flag, a start takes away `kwg0`, the table and the `people` status an earlier start left.
 
 Not built (slice D): the level chains, the node's networks, routing rules 9010/9012, and any peer
-on the device. The table is empty of those. A kernel with no masquerade in a network namespace
-(this one, under `unshare -Urn`) refuses the table's masq rule, so the device test fails there;
-the table is strict in production, and the test-only fallback is kith-mesh's `build_here`.
+on the device. The table is empty of those. The table is strict in production: a kernel with no
+masquerade (kith OS has CONFIG_NFT_MASQ=y) says so by name, and `--people` does not start. A test
+namespace on a host kernel with no masquerade (`unshare -Urn` here) makes the table without its masq
+rules, as kith-mesh's `build_here` does, and says so; the masq rule is covered by kith-mesh's
+expression tests.
 
 ## Open
 

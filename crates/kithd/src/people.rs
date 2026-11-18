@@ -314,9 +314,34 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
 /// peers (docs/adr-people.md, "Built"). Its key is `pki/people.key`, made the first time and kept.
 /// Says the device's public key.
 pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::io::Result<kith_mesh::Key> {
+    up_with(state, port, people64, || {
+        kith_mesh::people::send(people64, &[], &[], interface, &[]).map_err(no_masquerade)
+    })
+}
+
+/// `up`, with the table made by `table` (the tests make theirs without masquerade: see `table_here`).
+fn up_with(
+    state: &Path,
+    port: u16,
+    people64: Ipv6Addr,
+    table: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<kith_mesh::Key> {
     let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
-    kith_mesh::people::send(people64, &[], &[], interface, &[])?;
+    table()?;
     Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+}
+
+/// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that
+/// is said plainly, where a bare ENOENT would not say what is missing. Other errors pass as they are.
+fn no_masquerade(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        std::io::Error::new(
+            e.kind(),
+            "this kernel has no nftables masquerade (CONFIG_NFT_MASQ): --people needs it",
+        )
+    } else {
+        e
+    }
 }
 
 /// What this node says of its people's device in its status (`people`): the device's public key
@@ -345,7 +370,10 @@ pub async fn device(
     mut stopping: watch::Receiver<bool>,
 ) {
     let Some(port) = port else {
-        if let Err(e) = kith_mesh::people::remove() {
+        // (Only root can take the device and table away: a start without root has nothing to say.)
+        if nix::unistd::getuid().is_root()
+            && let Err(e) = kith_mesh::people::remove()
+        {
             eprintln!("kithd: people: taking away what an earlier start left: {e}");
         }
         return crate::mesh::left(shared, "people", stopping).await;
@@ -661,11 +689,24 @@ mod tests {
         assert!(statuses(&store, mesh, people(), true).is_empty());
     }
 
+    /// The table `up` writes, on a kernel with no masquerade here (this namespace): without its
+    /// masquerade rules, and saying so (as kith-mesh's own tests do).
+    fn table_here(people64: Ipv6Addr) -> std::io::Result<()> {
+        match kith_mesh::people::send(people64, &[], &[], "kith0", &[]) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("this kernel has no masquerade here: without");
+                kith_mesh::people::send_without_masquerade(people64, &[], &[], "kith0", &[])
+            }
+            done => done,
+        }
+    }
+
     /// The people device (docs/adr-people.md, "Built"), in a namespace of its own: with the flag,
     /// kwg0 holds this node's key, the port, its two addresses and no peers, behind the table, and
-    /// its public key is said; a second start keeps the key. Without it, all of that is taken away.
-    #[test]
-    fn people_device() {
+    /// its public key is said; a second start keeps the key and empties the peers. Without the
+    /// flag, the start itself takes all of that away.
+    #[tokio::test]
+    async fn people_device() {
         use base64::Engine as _;
         use std::os::unix::fs::PermissionsExt;
         if std::env::var_os("KITH_E2E").is_none() {
@@ -679,10 +720,25 @@ mod tests {
         let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
         std::fs::create_dir_all(state.join("pki")).unwrap();
         let (port, people64) = (51821, people());
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "a");
+        let shared = crate::cluster::pinned_peer::shared_with("people-device", me, &[]).await;
 
-        let key = super::up(&state, port, "kith0", people64).expect("the device comes up");
+        let key = super::up_with(&state, port, people64, || table_here(people64)).expect("the device comes up");
+        let peer = kith_mesh::Peer {
+            key: [7; 32],
+            endpoint: None,
+            allowed: vec![(IpAddr::V4(Ipv4Addr::new(100, 89, 0, 2)), 32)],
+            keepalive: 0,
+        };
+        kith_mesh::people::set_peers_for_tests(std::slice::from_ref(&peer)).expect("a peer is seeded");
         assert_eq!(
-            super::up(&state, port, "kith0", people64).unwrap(),
+            kith_mesh::people::device_found().unwrap().unwrap().peers,
+            1,
+            "a peer is there"
+        );
+        assert_eq!(
+            super::up_with(&state, port, people64, || table_here(people64)).unwrap(),
             key,
             "a start keeps the key"
         );
@@ -708,11 +764,27 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(key);
         assert_eq!(said["publicKey"].as_str(), Some(encoded.as_str()));
 
-        // Without the flag, what an earlier start left is taken away, and nothing is said of it.
-        kith_mesh::people::remove().expect("taken away");
+        // Without the flag, the start itself takes what the last one left away (the peer too).
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        stop.send(true).unwrap();
+        super::device(shared, state.clone(), None, None, "kith0".into(), stopping).await;
         assert!(kith_mesh::people::device_found().unwrap().is_none(), "kwg0 is gone");
         assert!(!kith_mesh::people::table_present().unwrap(), "the table is gone");
         assert!(super::said(None, port, None).is_null());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// The masquerade message: a kernel with no nftables masquerade says so (CONFIG_NFT_MASQ), and
+    /// any other error is passed on as it is.
+    #[test]
+    fn no_masquerade_says_why() {
+        let missing = super::no_masquerade(std::io::ErrorKind::NotFound.into());
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            missing.to_string(),
+            "this kernel has no nftables masquerade (CONFIG_NFT_MASQ): --people needs it"
+        );
+        let other = super::no_masquerade(std::io::Error::other("elsewhere"));
+        assert_eq!(other.to_string(), "elsewhere");
     }
 }
