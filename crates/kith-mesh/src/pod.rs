@@ -477,7 +477,10 @@ pub(crate) fn verdict(code: u32) -> Vec<u8> {
 /// A jump to the chain `name` (NFT_JUMP, -3), which a rule of its own may return from.
 pub(crate) fn jump(name: &str) -> Vec<u8> {
     let told = [number(1, (-3i32) as u32), text(2, name)].concat();
-    expression("immediate", &[number(1, 0), attribute(2 | NESTED, &attribute(2 | NESTED, &told))])
+    expression(
+        "immediate",
+        &[number(1, 0), attribute(2 | NESTED, &attribute(2 | NESTED, &told))],
+    )
 }
 
 /// A return (NFT_RETURN, -5) to the chain that jumped.
@@ -694,7 +697,10 @@ fn egress_rules(pods: &[Served]) -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
             let networks: Vec<Vec<Vec<u8>>> = if rule.to.is_empty() {
                 vec![vec![]]
             } else {
-                rule.to.iter().map(|&(address, prefix)| towards(address, prefix)).collect()
+                rule.to
+                    .iter()
+                    .map(|&(address, prefix)| towards(address, prefix))
+                    .collect()
             };
             for network in networks {
                 let ports: Vec<Option<(u8, u16)>> = if rule.ports.is_empty() {
@@ -1254,8 +1260,16 @@ mod tests {
         let named = [link_name(6), is(b"kp2\0")].concat();
         for hook in ["passed", "in"] {
             let jumps = chain(hook);
-            assert!(jumps.iter().any(|rule| rule == &[named.clone(), jump("e-kp2")].concat()), "{hook}");
-            assert!(!jumps.iter().any(|rule| contains(rule, b"e-kp3")), "{hook}: a pod with none has no jump");
+            assert!(
+                jumps
+                    .iter()
+                    .any(|rule| rule == &[named.clone(), jump("e-kp2")].concat()),
+                "{hook}"
+            );
+            assert!(
+                !jumps.iter().any(|rule| contains(rule, b"e-kp3")),
+                "{hook}: a pod with none has no jump"
+            );
         }
         // In `in`, the jump is ahead of the generic DNS accept, so a pod's policy gates it.
         let input = chain("in");
@@ -1273,7 +1287,10 @@ mod tests {
         assert_eq!(rules.len(), 1 + 1 + 2 * 2 + 1);
         assert_eq!(rules[0], [answering(), ret()].concat());
         assert!(contains(&rules[1], &is(&[10, 1, 2, 3])) && rules[1].ends_with(&verdict(0)));
-        assert!(contains(&rules[2], &is(&[10])) && rules[2].ends_with(&ret()), "10.0.0.0/8: masked, then compared");
+        assert!(
+            contains(&rules[2], &is(&[10])) && rules[2].ends_with(&ret()),
+            "10.0.0.0/8: masked, then compared"
+        );
         assert!(contains(&rules[2], &is(&443u16.to_be_bytes())) && contains(&rules[2], &is(&[6])));
         assert!(contains(&rules[3], &is(&[17])), "the same port by UDP");
         assert!(contains(&rules[4], &is(&[10])), "IPv6's");
@@ -1334,9 +1351,11 @@ mod tests {
         assert!(node_with(range, true, false, "kith0", &served).unwrap());
         let connect = |from: usize, to: IpAddr, port: u16| {
             let to = SocketAddr::from((to, port));
-            within(&pods[from].0, || TcpStream::connect_timeout(&to, Duration::from_secs(2)))
-                .unwrap()
-                .is_ok()
+            within(&pods[from].0, || {
+                TcpStream::connect_timeout(&to, Duration::from_secs(2))
+            })
+            .unwrap()
+            .is_ok()
         };
         // The first rule that fits says: pod 4's port 81 is denied, its 80 and all of 3's allowed.
         let (second, third) = (host(pods[1].3), host(pods[2].3));

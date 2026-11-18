@@ -28,7 +28,9 @@ use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
 use kith_api::Resource;
-use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec};
+use kith_api::kinds::{
+    NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec,
+};
 use kith_api::store::Store;
 use kith_mesh::pod::Egress;
 use serde_json::{Value, json};
@@ -327,7 +329,10 @@ pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Opt
 /// The mesh's prefix where this node is in a cluster: the one `egress_of` is asked with, by
 /// every caller (so the rules a pod is made with are the ones it is kept in step with).
 pub fn mesh_prefix(shared: &Shared) -> Option<Ipv6Addr> {
-    shared.cluster.as_ref().map(|cluster| crate::mesh::prefix(&cluster.me.ca))
+    shared
+        .cluster
+        .as_ref()
+        .map(|cluster| crate::mesh::prefix(&cluster.me.ca))
 }
 
 /// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read, or whose
@@ -1839,7 +1844,11 @@ spec:
         // With no mesh a node has no address: its peer holds nothing.
         let alone = egress_of(&store, web, None).unwrap();
         assert_eq!(alone[1].to, vec![net("10.0.0.0/8")]);
-        assert_eq!(alone.len(), 3, "a rule whose peers hold nothing is no rule: it would be any");
+        assert_eq!(
+            alone.len(),
+            3,
+            "a rule whose peers hold nothing is no rule: it would be any"
+        );
         // Others are not held, nor is a Workload whose policies have ingress rules only.
         assert_eq!(egress_of(&store, other, Some(prefix)), None);
         let mut ingress = Store::default();
@@ -1851,18 +1860,33 @@ spec:
         // A deny of peers that cannot be told apart keeps everybody out, in both families.
         let mut denied = Store::default();
         apply(&mut denied, HOME);
-        apply(&mut denied, &policy("d", "{ app: web }", "[{ action: deny, peers: [{ namespace: x }] }]"));
+        apply(
+            &mut denied,
+            &policy("d", "{ app: web }", "[{ action: deny, peers: [{ namespace: x }] }]"),
+        );
         let all = egress_of(&denied, web, Some(prefix)).unwrap();
         assert_eq!(all[0].to, vec![net("0.0.0.0/0"), net("::/0")]);
         // The status says egress is enforced.
         let report = policy_report(store.get("NetworkPolicy/default/p").unwrap(), false);
         assert_eq!(report["state"], "partial", "(the selector peer)");
-        assert!(!report["message"].as_str().unwrap().contains("egress rules are not enforced"));
+        assert!(
+            !report["message"]
+                .as_str()
+                .unwrap()
+                .contains("egress rules are not enforced")
+        );
         let report = policy_report(denied.get("NetworkPolicy/default/d").unwrap(), false);
         assert!(report["message"].as_str().unwrap().contains("cannot be told apart"));
         let mut plain = Store::default();
         apply(&mut plain, HOME);
-        apply(&mut plain, &policy("e", "{ app: web }", "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]"));
+        apply(
+            &mut plain,
+            &policy(
+                "e",
+                "{ app: web }",
+                "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]",
+            ),
+        );
         let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap(), false);
         assert_eq!(report, json!({ "state": "enforced", "message": null }));
         // While this node's pods' tables could not be made again for it, egress is not enforced:

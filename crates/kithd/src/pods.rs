@@ -948,7 +948,8 @@ mod tests {
         let mut pods = Pods::default();
         pods.made.insert("a".into(), pod("Workload/default/web", 2, None));
         pods.made.insert("b".into(), pod("Workload/default/web", 3, None));
-        pods.made.insert("c".into(), pod("Workload/default/other", 4, Some(vec![rule(1)])));
+        pods.made
+            .insert("c".into(), pod("Workload/default/other", 4, Some(vec![rule(1)])));
         assert_eq!(
             pods.owners(),
             BTreeSet::from(["Workload/default/web".to_string(), "Workload/default/other".to_string()])
