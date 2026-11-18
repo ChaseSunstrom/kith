@@ -63,17 +63,15 @@ fn main() {
 
 /// os/features' `# pci:` lines as `OS_FEATURES` (devices.rs matches the PCI bus against it): each
 /// feature that has some, by name, with its vendor and device ids as sysfs writes them. A line
-/// that is not `vendor:device` in hex stops the build, so a typo is not a card never matched.
+/// that is not `vendor:device` in hex, or a `#pci:`/`# PCI:` line not written `# pci:`, stops the
+/// build, so a typo is not a card never matched. kithd is only built in this repository, so a
+/// missing os/features stops it too (a kithd that matches nothing would say so to nobody).
 fn features_table() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("os_features.rs");
     let dir = Path::new("../../os/features");
     // (A directory: cargo looks at every file in it.)
     println!("cargo::rerun-if-changed=../../os/features");
-    let Ok(listed) = std::fs::read_dir(dir) else {
-        println!("cargo::warning=os/features is not there: no feature is matched to the PCI bus");
-        std::fs::write(&out, "pub const OS_FEATURES: &[(&str, &[(&str, &str)])] = &[];\n").unwrap();
-        return;
-    };
+    let listed = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let mut files: Vec<PathBuf> = listed
         .flatten()
         .map(|entry| entry.path())
@@ -86,7 +84,15 @@ fn features_table() {
         let name = file.file_stem().unwrap().to_str().unwrap();
         let ids: Vec<(String, String)> = text
             .lines()
-            .filter_map(|line| line.strip_prefix("# pci:"))
+            .filter(|line| {
+                let loose: String = line.split_whitespace().collect();
+                // (`#pci:`, `# PCI :`, …; not `# PCIe …`, a comment's word.)
+                loose.to_ascii_lowercase().starts_with("#pci:")
+            })
+            .map(|line| {
+                line.strip_prefix("# pci:")
+                    .unwrap_or_else(|| panic!("{}: '{line}' is not written `# pci: vendor:device …`", file.display()))
+            })
             .flat_map(str::split_whitespace)
             .map(|pair| {
                 let hex = |id: &str| id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit());

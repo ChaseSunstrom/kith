@@ -868,6 +868,8 @@ pub async fn node(
     let (mut raised, mut unraised) = (false, String::new());
     // How its pods' storage limits hold, for whoever looks at the node.
     let storage = crate::controller::storage::how(crate::controller::storage::held_at_write(&state));
+    // The os/features its PCI cards want, read once: a card put in later is seen at the next start.
+    let wants = crate::devices::wants(Path::new("/sys"));
     loop {
         // (Its slot is marked good a little after the start, and no update is taken before.)
         if !raised && crate::os::GOOD.load(std::sync::atomic::Ordering::Relaxed) {
@@ -890,7 +892,7 @@ pub async fn node(
         }
         let mut said = report(&state, &version, slot, keys.whose());
         said["storage"] = json!(storage);
-        said["wants"] = json!(crate::devices::wants(Path::new("/sys")));
+        said["wants"] = json!(wants);
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
