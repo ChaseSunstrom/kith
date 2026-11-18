@@ -368,6 +368,16 @@ fn is_self(upstream: SocketAddr, listen: SocketAddr) -> bool {
     upstream.port() == listen.port() && same_host
 }
 
+/// The resolvers of `all` that are not this server, listening on `listen`, nor the house address
+/// `house` (whichever node holds it, it is asked of this one: a resolver named so loops).
+fn others(all: &[SocketAddr], listen: SocketAddr, house: Option<Ipv4Addr>) -> Arc<[SocketAddr]> {
+    let at_house = house.map(|address| SocketAddr::new(address.into(), listen.port()));
+    all.iter()
+        .copied()
+        .filter(|upstream| !is_self(*upstream, listen) && !at_house.is_some_and(|house| is_self(*upstream, house)))
+        .collect()
+}
+
 /// A UDP socket on `address`, non-blocking. It may share its port with another of ours bound to
 /// a different address (the one on every address and the one on the house address), and an
 /// address not yet on any card can be bound: the house address comes and goes with the leader.
@@ -462,28 +472,42 @@ pub async fn run(
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
-    let ours = move |all: &[SocketAddr]| -> Arc<[SocketAddr]> {
-        all.iter()
-            .copied()
-            .filter(|upstream| !is_self(*upstream, listen))
-            .collect()
+    // The house address the Clusters name (held by this node or not): a resolver list that names
+    // it (a router's DHCP) must not be asked by the node that holds it, nor dropped for good by
+    // the one that held it when the list was read.
+    let (house_wants, house_wanted) = watch::channel(None::<Ipv4Addr>);
+    let configured = || {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        crate::home::configured(&state.store).map(|home| home.address)
     };
+    house_wants.send_replace(configured());
+    let ours = move |all: &[SocketAddr], house: Option<Ipv4Addr>| others(all, listen, house);
     let said = move |now: &[SocketAddr]| {
         eprintln!("kithd: serving DNS on {listen}; other names go to {now:?}");
         if now.is_empty() {
             eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
         }
     };
-    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update()));
+    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update(), *house_wanted.borrow()));
     said(&asked.borrow());
+    let mut house_seen = house_wanted.clone();
+    house_seen.mark_unchanged();
     let told = async {
-        while upstreams.changed().await.is_ok() {
-            let now = ours(&upstreams.borrow_and_update());
+        // (Resolvers named on the command line: the list never changes, the house address may.)
+        let mut listed = true;
+        loop {
+            tokio::select! {
+                got = upstreams.changed(), if listed => listed = got.is_ok(),
+                got = house_seen.changed() => {
+                    if got.is_err() {
+                        return std::future::pending::<()>().await;
+                    }
+                }
+            }
+            let now = ours(&upstreams.borrow_and_update(), *house_seen.borrow_and_update());
             said(&now);
             ask.send_replace(now);
         }
-        // (Resolvers named on the command line: nothing more is told.)
-        std::future::pending::<()>().await;
     };
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
     // The lists of names to answer as not there, and the answers kept from the upstreams.
@@ -499,7 +523,6 @@ pub async fn run(
             zones.send_modify(|zones| Arc::make_mut(zones).blocks = blocks);
         }
     };
-    let (house_wants, house_wanted) = watch::channel(None::<Ipv4Addr>);
     let feed = async {
         let mut generation = shared.generation.subscribe();
         // What the zones were last built from: most changes to the store are not about DNS.
@@ -1251,5 +1274,16 @@ spec: {}
         assert!(!is_self(at("1.1.1.1:53"), at("0.0.0.0:53")));
         // Any address of this machine, when listening on all of them.
         assert!(is_self(at("127.0.0.2:53"), at("0.0.0.0:53")));
+    }
+
+    /// A router that names the house address as a resolver: it is dropped from the upstreams
+    /// when a Cluster names it, held by this node or not (and kept when none does).
+    #[test]
+    fn the_house_address_named_as_an_upstream_is_not_asked() {
+        let at = |address: &str| address.parse::<SocketAddr>().unwrap();
+        let (listen, house) = (at("0.0.0.0:5353"), Some(Ipv4Addr::new(10, 9, 0, 100)));
+        let all = [at("10.9.0.100:5353"), at("1.1.1.1:5353"), at("10.9.0.100:53")];
+        assert_eq!(*others(&all, listen, house), [at("1.1.1.1:5353"), at("10.9.0.100:53")]);
+        assert_eq!(*others(&all, listen, None), all);
     }
 }

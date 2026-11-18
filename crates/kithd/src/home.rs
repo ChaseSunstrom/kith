@@ -297,12 +297,24 @@ async fn confirmed(shared: &crate::Shared) -> Result<Instant, String> {
     }
 }
 
-fn let_go(held: &mut Option<Put>) {
-    if let Some(Put { home, card }) = held.take()
-        && let Err(e) = kith_mesh::drop_address4(card.index, home.address, home.bits)
+/// Take the address off. One that could not be taken off is kept in `stuck`, with when: it is
+/// this node's own doing, and the kernel takes it off within its lifetime.
+fn let_go(held: &mut Option<Put>, stuck: &mut Option<(Put, Instant)>) {
+    if let Some(put) = held.take()
+        && let Err(e) = kith_mesh::drop_address4(put.card.index, put.home.address, put.home.bits)
     {
-        eprintln!("kithd: taking the house address {} off {}: {e}", home.address, card.name);
+        eprintln!("kithd: taking the house address {} off {}: {e}", put.home.address, put.card.name);
+        *stuck = Some((put, Instant::now()));
     }
+}
+
+/// What this node has put on a card and the card has: held, or one that could not be taken off
+/// until its lifetime is over.
+fn ours<'a>(held: &'a Option<Put>, stuck: &'a Option<(Put, Instant)>) -> Option<&'a Put> {
+    held.as_ref().or_else(|| {
+        let (put, at) = stuck.as_ref()?;
+        (at.elapsed() < LIFETIME + CONFIRM_EVERY).then_some(put)
+    })
 }
 
 /// Say why the address is held or not, when that has changed.
@@ -323,6 +335,8 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
     let (mut reason, mut blocked) = (NO_CLUSTER.to_string(), None::<String>);
     // What Raft last said when it did not confirm this node as leader.
     let mut denied = String::new();
+    // What could not be taken off the card, and when (see `let_go`).
+    let mut stuck = None::<(Put, Instant)>;
     // A socket that hears the card while the address is held (to hear another answer for it), and
     // when it was last defended, last said so, and when a block was last said.
     // ponytail: the socket hears every frame of the card, read twice a second and the ARP ones
@@ -335,11 +349,11 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
             _ = tick.tick() => {}
             _ = stopping.changed() => break,
         }
-        let want = wanted(&shared, held.as_ref());
+        let want = wanted(&shared, ours(&held, &stuck));
         // The address or its card changed (the Cluster was edited, a card came or went): what
         // was held is let go, and the new one is waited for as any.
         if want.as_ref().ok() != before.as_ref() {
-            let_go(&mut held);
+            let_go(&mut held, &mut stuck);
             ear = None;
             (state, blocked, before) = (State::Idle, None, want.as_ref().ok().cloned());
         }
@@ -378,10 +392,15 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                     blocked = why;
                     if blocked.is_none() {
                         // (A moment the probe took: the confirmation is old, and a new one gives the lifetime.)
-                        began = confirmed(&shared).await.ok();
-                        if began.is_none() {
-                            state = State::Idle;
-                        }
+                        began = match confirmed(&shared).await {
+                            Ok(started) => Some(started),
+                            Err(why) => {
+                                // (Said as the reason it is not held: this node is not confirmed.)
+                                denied = why;
+                                state = State::Idle;
+                                None
+                            }
+                        };
                     } else {
                         state = State::Waiting(Instant::now() + WAIT);
                     }
@@ -402,14 +421,14 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                 // The time left of the confirmation, now, at the moment before the kernel is told.
                 let seconds = began.map_or(0, |started| left(started, Instant::now()));
                 if seconds == 0 {
-                    let_go(&mut held);
+                    let_go(&mut held, &mut stuck);
                     state = State::Idle;
                     continue;
                 }
                 if let Err(e) = kith_mesh::address4_for(card.index, home.address, home.bits, seconds) {
                     eprintln!("kithd: holding the house address {} on {}: {e}", home.address, card.name);
                     // (Not held: nothing is said, and the wait is begun again.)
-                    let_go(&mut held);
+                    let_go(&mut held, &mut stuck);
                     state = State::Idle;
                     continue;
                 }
@@ -422,7 +441,7 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                     }
                 }
             }
-            Action::Delete => let_go(&mut held),
+            Action::Delete => let_go(&mut held, &mut stuck),
             Action::Nothing => {}
         }
         if held.is_none() {
@@ -466,7 +485,7 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
         }
         say(&mut reason, why);
     }
-    let_go(&mut held);
+    let_go(&mut held, &mut stuck);
 }
 
 fn not_leader(home: &Home, why: &str) -> String {
@@ -718,6 +737,20 @@ mod tests {
         assert_eq!(heard(&ear, MAC, HOME), Some(OTHER));
         // Read: not heard twice.
         assert_eq!(heard(&ear, MAC, HOME), None);
+    }
+
+    #[test]
+    fn an_address_that_could_not_be_taken_off_is_ours_until_its_lifetime_is_over() {
+        let card = kith_mesh::Card { name: "eth0".into(), index: 2, mac: MAC };
+        let put = Put { home: Home { address: HOME, bits: 24 }, card };
+        assert_eq!(ours(&None, &None), None);
+        assert_eq!(ours(&Some(put.clone()), &None), Some(&put));
+        let now = Instant::now();
+        assert_eq!(ours(&None, &Some((put.clone(), now))), Some(&put));
+        let old = now.checked_sub(LIFETIME + CONFIRM_EVERY + Duration::from_millis(1));
+        if let Some(old) = old {
+            assert_eq!(ours(&None, &Some((put, old))), None);
+        }
     }
 
     #[test]
