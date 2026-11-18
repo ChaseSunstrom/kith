@@ -221,9 +221,12 @@ fn held(dir: &Path) -> (BTreeSet<String>, Vec<(PathBuf, Duration)>) {
     (blobs, others)
 }
 
+/// What a copy comes to, once it has ended, as its callers see it.
+type Answer = watch::Receiver<Option<Result<(), String>>>;
+
 /// The copies being made, by the file each makes. A caller that asks for a blob while it is
 /// copied waits for that copy; its entry goes when the copy ends, however it ends.
-static COPYING: Mutex<BTreeMap<PathBuf, watch::Receiver<Option<Result<(), String>>>>> = Mutex::new(BTreeMap::new());
+static COPYING: Mutex<BTreeMap<PathBuf, Answer>> = Mutex::new(BTreeMap::new());
 
 /// Takes a copy off COPYING when the copy ends (a panic too).
 struct Copying(PathBuf);
@@ -247,12 +250,15 @@ async fn copied(client: &reqwest::Client, dir: &Path, name: &str, from: Vec<(Str
             None => {
                 let (tell, answers) = watch::channel(None);
                 copying.insert(path.clone(), answers.clone());
+                // (Made here, not in the task: a task that is never polled still takes its entry off.)
+                let entry = Copying(path.clone());
                 tokio::spawn(copying_task(
                     client.clone(),
                     dir.to_path_buf(),
                     name.to_string(),
                     from,
                     tell,
+                    entry,
                 ));
                 answers
             }
@@ -273,11 +279,11 @@ async fn copying_task(
     name: String,
     from: Vec<(String, String)>,
     tell: watch::Sender<Option<Result<(), String>>>,
+    copying: Copying,
 ) {
     // ponytail: QUIET bounds each chunk, not the copy: a node that trickles bytes holds it as
     // long as it trickles, with nobody waiting; a whole-copy deadline is the fix if that happens.
     // (A caller that finds the copy under way waits on it, and its own `from` is not asked.)
-    let copying = Copying(dir.join(&name));
     let mut answer = Err(format!("no node says it holds blob {name}"));
     for (node, address) in from {
         answer = fetch(&client, &address, &name, &dir)
@@ -289,6 +295,10 @@ async fn copying_task(
     }
     // (Off the map before anyone is told: a caller after this finds the file, or copies again.)
     drop(copying);
+    // (A failure nobody waits for, because its caller went, is said here, or it leaves no trace.)
+    if let (Err(e), 0) = (&answer, tell.receiver_count()) {
+        eprintln!("kithd: {e}");
+    }
     tell.send_replace(Some(answer));
 }
 
@@ -469,7 +479,8 @@ pub async fn here(shared: &Shared, key: &str) -> Result<PathBuf, String> {
     if path.exists() {
         return Ok(path);
     }
-    let Some(cluster) = &shared.cluster else {
+    // (Nobody to ask: no copy is made, so no caller joins one that cannot succeed.)
+    let Some(cluster) = shared.cluster.as_ref().filter(|_| !from.is_empty()) else {
         return Err(format!("no node says it holds blob {name}"));
     };
     copied(&cluster.client, &dir, name, from).await.map(|()| path)
@@ -784,8 +795,9 @@ mod tests {
 
     const BYTES: &[u8] = b"the first half of a blob, and then the rest of it";
 
-    /// A node that holds BYTES and serves them in two pieces: the first at once, the rest once
-    /// `gate` is open. Each request is counted in `served`, and `started` is told of it.
+    /// A node that serves `bytes` (BYTES, or bytes that are not the blob's) in two pieces: the
+    /// first at once, the rest once `gate` is open. Each request is counted in `served`, and
+    /// `started` is told of it.
     struct Holder {
         address: String,
         served: Arc<std::sync::atomic::AtomicUsize>,
@@ -793,7 +805,7 @@ mod tests {
         gate: watch::Sender<bool>,
     }
 
-    async fn serving(ca: &crate::pki::Ca) -> Holder {
+    async fn serving(ca: &crate::pki::Ca, bytes: &'static [u8]) -> Holder {
         use crate::cluster::{listen, pinned_peer::node};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -808,11 +820,11 @@ mod tests {
             tell.notify_one();
             let mut open = open.clone();
             async move {
-                let half = BYTES.len() / 2;
-                let head = futures_util::stream::once(async move { Ok::<_, std::io::Error>(BYTES[..half].to_vec()) });
+                let half = bytes.len() / 2;
+                let head = futures_util::stream::once(async move { Ok::<_, std::io::Error>(bytes[..half].to_vec()) });
                 let rest = futures_util::stream::once(async move {
                     let _ = open.wait_for(|open| *open).await;
-                    Ok::<_, std::io::Error>(BYTES[half..].to_vec())
+                    Ok::<_, std::io::Error>(bytes[half..].to_vec())
                 });
                 axum::body::Body::from_stream(futures_util::StreamExt::chain(head, rest))
             }
@@ -828,9 +840,14 @@ mod tests {
 
     /// Node `a` with the Blob of BYTES, which says node `b` holds it; `b` is `serving`.
     async fn copier(tag: &str) -> (Arc<Shared>, String, Holder) {
+        copier_serving(tag, BYTES).await
+    }
+
+    /// As `copier`, but `b` serves `served` for the blob that is BYTES' name.
+    async fn copier_serving(tag: &str, served: &'static [u8]) -> (Arc<Shared>, String, Holder) {
         use crate::cluster::pinned_peer::{at, node, shared_with};
         let ca = crate::pki::Ca::create().unwrap();
-        let holder = serving(&ca).await;
+        let holder = serving(&ca, served).await;
         let shared = shared_with(tag, node(&ca, "a"), &[at("b", &holder.address, None)]).await;
         let name = blake3::hash(BYTES).to_hex()[..62].to_string();
         let source = format!(
@@ -912,6 +929,56 @@ mod tests {
             "one copy was not made for both callers"
         );
         assert_eq!(std::fs::read(&path).unwrap(), BYTES);
+        let _ = std::fs::remove_dir_all(dir(&shared));
+    }
+
+    /// A holder that serves bytes that are not the blob's: both callers get an error, the copy
+    /// leaves no entry in COPYING and no temporary file, and a later caller asks again.
+    #[tokio::test]
+    async fn blob_copy_of_wrong_bytes_fails_for_every_caller_and_leaves_nothing() {
+        use std::sync::atomic::Ordering;
+        let (shared, name, holder) = copier_serving("copy-wrong", b"these are not the bytes of the blob").await;
+        let key = format!("Blob/default/{name}");
+        let path = dir(&shared).join(&name);
+        let ask = |shared: &Arc<Shared>, key: &String| {
+            let (shared, key) = (shared.clone(), key.clone());
+            tokio::spawn(async move { here(&shared, &key).await })
+        };
+        let first = ask(&shared, &key);
+        tokio::time::timeout(Duration::from_secs(10), holder.started.notified())
+            .await
+            .expect("nothing asked the node for the blob");
+        let second = ask(&shared, &key);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        holder.gate.send_replace(true);
+        let both = async { (first.await.unwrap(), second.await.unwrap()) };
+        let (one, two) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("the callers did not get an answer");
+        assert!(one.is_err() && two.is_err(), "wrong bytes were taken: {one:?} {two:?}");
+        assert_eq!(
+            holder.served.load(Ordering::SeqCst),
+            1,
+            "one copy was not made for both callers"
+        );
+        assert!(
+            !COPYING.lock().unwrap().contains_key(&path),
+            "the failed copy is still listed"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(dir(&shared))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|file| file.to_string_lossy().starts_with("in-"))
+            .collect();
+        assert!(leftover.is_empty(), "temporary files were left: {leftover:?}");
+        assert!(!path.exists());
+        // The next caller asks again, and gets the same refusal.
+        assert!(here(&shared, &key).await.is_err());
+        assert_eq!(
+            holder.served.load(Ordering::SeqCst),
+            2,
+            "the later caller did not ask again"
+        );
         let _ = std::fs::remove_dir_all(dir(&shared));
     }
 }
