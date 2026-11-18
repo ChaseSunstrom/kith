@@ -154,6 +154,24 @@ fn readme_says_nothing_that_was_true_once() {
     }
 }
 
+/// What deleting a claim that provisioned its Volume takes with it, and how to keep it.
+#[test]
+fn readme_says_what_a_deleted_claim_takes_with_it_and_how_to_retain() {
+    let storage = DOCS.iter().find(|(path, _)| path.ends_with("storage.md")).unwrap().1;
+    let flat = storage.split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in [
+        "Deleting a claim that provisioned its Volume deletes the Volume and its data",
+        "`kith.dev/reclaim: retain`",
+        "A Volume you applied yourself is never deleted with a claim, nor is its data",
+    ] {
+        assert!(flat.contains(said), "storage.md no longer says {said:?}");
+    }
+    assert!(
+        !flat.contains("its directory stays. Whoever"),
+        "storage.md says the data of a deleted claim stays"
+    );
+}
+
 /// Who has a host two Services name is said in both documents: the one made first, a
 /// delete gives it up, a Namespace's hosts keep it for good, and what the update is.
 #[test]
