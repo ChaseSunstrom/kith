@@ -410,7 +410,7 @@ pub struct Egress {
 fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
     crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
-    let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
+    let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
     nat(range, guard, masquerade, mesh, pods)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
@@ -423,6 +423,12 @@ fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[
     std::fs::write(passes, "1")?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     Ok(guard)
+}
+
+/// Whether the guard is wanted: when the node was `guarded` before, or when it did not pass
+/// packets on until now (`forwarding` is what its IPv6 forwarding said, `None` if unread).
+pub(crate) fn guard_wanted(guarded: bool, forwarding: Option<&str>) -> bool {
+    guarded || !forwarding.is_some_and(|said| said.trim() == "1")
 }
 
 /// Whether the tables [`node`] makes are there (gone with `nft flush ruleset`, say).
@@ -953,6 +959,19 @@ mod tests {
 
     fn range(text: &str) -> std::result::Result<Range, String> {
         text.parse()
+    }
+
+    /// The guard is wanted when the node was guarded before, or when it did not pass packets
+    /// on until now (forwarding read as not 1, or not read at all): a machine that already
+    /// passed them on keeps doing so, and gets no guard.
+    #[test]
+    fn guard_wanted_is_true_when_guarded_before_or_forwarding_was_off() {
+        assert!(guard_wanted(true, Some("1")));
+        assert!(guard_wanted(false, Some("0")));
+        assert!(guard_wanted(false, Some("0\n")));
+        assert!(guard_wanted(false, None));
+        assert!(!guard_wanted(false, Some("1")));
+        assert!(!guard_wanted(false, Some("1\n")));
     }
 
     #[test]

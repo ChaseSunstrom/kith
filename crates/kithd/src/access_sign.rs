@@ -165,31 +165,22 @@ fn keys(store: &Store, who: &str) -> Result<(Caller, Vec<Key>), String> {
 }
 
 /// Who signed `header` for this request, to one of `targets`, on the cluster `cluster` (its
-/// id: the SHA-256 print of its CA certificate), by `store`'s keys and at `now`; or why the
-/// signature does not hold. The nonce is taken only once all else holds.
-pub fn verify(
-    header: &str,
+/// id: the SHA-256 print of its CA certificate), by `store`'s keys, and the header read; or why
+/// the signature does not hold. The signature alone: no clock and no nonce, so every node that
+/// asks it of a signed entry in the log decides alike ([`admit`]).
+pub fn signature<'a>(
+    header: &'a str,
     cluster: &str,
     targets: &[&str],
     asked: &Asked,
     store: &Store,
-    now: u64,
-    nonces: &Nonces,
-) -> Result<Caller, String> {
+) -> Result<(Caller, kith_store::Header<'a>), String> {
     let (signed, sig) = parse(header)?;
     if !targets.contains(&signed.target) {
         return Err(format!(
             "signed for {}, not for {}",
             signed.target,
             targets.join(" or ")
-        ));
-    }
-    if signed.expires < now {
-        return Err(format!("the signature expired {} s ago", now - signed.expires));
-    }
-    if signed.expires > now + AHEAD {
-        return Err(format!(
-            "the signature lasts past this node's clock by more than {AHEAD} s"
         ));
     }
     let (caller, keys) = keys(store, signed.who)?;
@@ -202,10 +193,215 @@ pub fn verify(
     if !keys.iter().any(holds) {
         return Err(format!("the signature is not {}'s over this request", signed.who));
     }
+    Ok((caller, signed))
+}
+
+/// [`signature`], and at the edge `now` and this node's `nonces` too: a signature that has
+/// expired, lasts too far ahead or was used already does not hold. The nonce is taken only
+/// once all else holds.
+pub fn verify(
+    header: &str,
+    cluster: &str,
+    targets: &[&str],
+    asked: &Asked,
+    store: &Store,
+    now: u64,
+    nonces: &Nonces,
+) -> Result<Caller, String> {
+    let (caller, signed) = signature(header, cluster, targets, asked, store)?;
+    if signed.expires < now {
+        return Err(format!("the signature expired {} s ago", now - signed.expires));
+    }
+    if signed.expires > now + AHEAD {
+        return Err(format!(
+            "the signature lasts past this node's clock by more than {AHEAD} s"
+        ));
+    }
     if !nonces.take(signed.nonce, signed.expires, now) {
         return Err("the signature was used already".into());
     }
     Ok(caller)
+}
+
+/// `text` with each `%XX` read as the byte it stands for, as the router reads a path's key; a
+/// `%` that is not of two hex digits, or bytes that are not UTF-8, refuse it.
+fn unescaped(text: &str) -> Result<String, String> {
+    let (bytes, mut read) = (text.as_bytes(), Vec::with_capacity(text.len()));
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'%' {
+            read.push(bytes[at]);
+            at += 1;
+            continue;
+        }
+        let byte = bytes
+            .get(at + 1..at + 3)
+            .and_then(|hex| unhex(std::str::from_utf8(hex).ok()?));
+        let byte = byte.ok_or_else(|| format!("{text}: a % that is not two hex digits"))?;
+        read.extend(byte);
+        at += 3;
+    }
+    String::from_utf8(read).map_err(|e| format!("{text}: {e}"))
+}
+
+/// What a route's query may say.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Options {
+    #[serde(default)]
+    dry_run: bool,
+    to: Option<u64>,
+}
+
+/// The change `method` on `path` with `body` makes of `store` for `signer`, as `api.rs`'s apply,
+/// delete and rollback routes make it (before a kind's admission, and with `at` 0): what a
+/// signed entry's command must be. Any other route makes none.
+fn derived(store: &Store, signer: &Caller, method: &str, path: &str, body: &[u8]) -> Result<Command, String> {
+    let uri: axum::http::Uri = path.parse().map_err(|e| format!("{path}: {e}"))?;
+    let query = axum::extract::Query::<Options>::try_from_uri(&uri);
+    let options = query.map_err(|e| format!("{path}: {}", e.body_text()))?.0;
+    let route = uri.path();
+    let applied = |resources: Vec<Resource>| -> Result<Command, String> {
+        resources.iter().try_for_each(Resource::submitted)?;
+        let resources = crate::api::stamped(store, signer, resources);
+        Ok(Command::Apply { resources, at: 0 })
+    };
+    match method {
+        "POST" if route == "/v1/apply" => {
+            if options.dry_run {
+                return Err("a dry run writes nothing".into());
+            }
+            let read = serde_json::from_slice(body).map_err(|e| format!("the body is not resources: {e}"));
+            applied(read?)
+        }
+        "DELETE" if let Some(key) = route.strip_prefix("/v1/resources/") => {
+            Ok(Command::Delete { key: unescaped(key)? })
+        }
+        "POST" if let Some(key) = route.strip_prefix("/v1/rollback/") => {
+            let (key, to) = (unescaped(key)?, options.to.ok_or("a rollback names no revision (to)")?);
+            if key.starts_with("NodeKey/") {
+                return Err("a NodeKey is not rolled back".into());
+            }
+            if !["Release/", "Source/", "KindDefinition/", "Package/"]
+                .iter()
+                .any(|kind| key.starts_with(kind))
+            {
+                return Ok(Command::Rollback { key, to, at: 0 });
+            }
+            let history = store.history(&key).map_err(|e| e.to_string())?;
+            let was = history.iter().find(|was| was.resource.metadata.revision == Some(to));
+            let mut was = was
+                .ok_or_else(|| format!("{key} has no revision {to}"))?
+                .resource
+                .clone();
+            was.metadata.revision = None;
+            applied(vec![was])
+        }
+        _ => Err(format!("{method} {route} is not a change a signed entry carries")),
+    }
+}
+
+/// Is `carried` the change `derived` is? An apply's `at` is the leader's, and what a kind's
+/// admission module may rewrite (a custom resource's spec, labels and annotations) is taken as
+/// carried; all else is as derived.
+fn same(store: &Store, derived: Command, carried: &Command) -> Result<(), String> {
+    let differs = || "the command it carries is not what its method, path and body make".to_string();
+    match (derived, carried) {
+        (
+            Command::Apply {
+                resources: mut ours, ..
+            },
+            Command::Apply { resources: theirs, .. },
+        ) => {
+            if ours.len() != theirs.len() {
+                return Err(differs());
+            }
+            for at in crate::controllers::admits(store, &mut ours)? {
+                let (ours, theirs) = (&mut ours[at], &theirs[at]);
+                ours.spec = theirs.spec.clone();
+                ours.metadata.labels = theirs.metadata.labels.clone();
+                ours.metadata.annotations = theirs.metadata.annotations.clone();
+                // (A module that answers the resource changed drops its status.)
+                if theirs.status.is_none() {
+                    ours.status = None;
+                }
+            }
+            (ours == *theirs).then_some(()).ok_or_else(differs)
+        }
+        (Command::Delete { key }, Command::Delete { key: theirs }) if key == *theirs => Ok(()),
+        (
+            Command::Rollback { key, to, .. },
+            Command::Rollback {
+                key: theirs, to: back, ..
+            },
+        ) if key == *theirs && to == *back => Ok(()),
+        _ => Err(differs()),
+    }
+}
+
+/// May a node apply `command`, an entry of the log the node `leader` wrote, to `store`? Anything
+/// but a signed entry may. A signed one only where all of these hold, in this order: `store` is
+/// in format 4 ([`Store::checking`]); its
+/// signature holds by `store`'s keys, for `*` or for `leader`; its method, path and body make
+/// its command ([`derived`], [`same`]); its signer may make it ([`crate::api::refused`], and
+/// the admin's key and `spec.signing` change only by the admin's: [`guard`]); and the signer's
+/// book takes its nonce ([`Store::takes_nonce`]). Deterministic: the entry and `store` alone,
+/// no clock (its time is its `expires`, as the book reads it).
+pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store::NodeId) -> Result<(), String> {
+    let Command::Signed {
+        header,
+        method,
+        path,
+        body,
+        command,
+    } = command
+    else {
+        return Ok(());
+    };
+    // Before format 4 a member may be on a kithd that refuses every signed entry (T-0779's):
+    // refused here too, so the stores stay alike.
+    if !store.checking() {
+        return Err("the store is not in format 4, where every member checks signed entries".into());
+    }
+    let target = kith_store::header(header)?.target;
+    if target != "*" && kith_store::node_id(target) != leader {
+        return Err(format!("signed for {target}, not for the node that wrote it"));
+    }
+    let body = base64::engine::general_purpose::STANDARD.decode(body);
+    let body = body.map_err(|e| format!("its body is not base64: {e}"))?;
+    let asked = Asked {
+        method,
+        path,
+        body: &body,
+    };
+    let (signer, read) = signature(header, cluster, &[target], &asked, store)?;
+    same(store, derived(store, &signer, method, path, &body)?, command)?;
+    if let Some(why) = crate::api::refused(store, &signer, command) {
+        return Err(why);
+    }
+    guard(store, command, signer == Caller::Admin)?;
+    let taken = store.takes_nonce(read.who, read.expires, read.nonce);
+    taken.map_err(|e| e.to_string())
+}
+
+/// What each entry of the log is asked once the store is in format 3 ([`admit`]), on the
+/// cluster `cluster` (its id; none: nothing signed is applied). A refusal applies nothing, and
+/// is written in `audit` as `signed`.
+pub fn hook(cluster: Option<String>, audit: Arc<crate::audit::Audit>) -> kith_store::Check {
+    Arc::new(move |store, command, leader| {
+        let Command::Signed { header, path, .. } = command else {
+            return Ok(());
+        };
+        let decided = match &cluster {
+            Some(cluster) => admit(store, cluster, command, leader),
+            None => Err("this kithd is not part of a cluster: nothing is signed for it".into()),
+        };
+        decided.map_err(|why| {
+            let who = kith_store::header(header).map_or("unknown", |read| read.who);
+            audit.record(&who, "signed", vec![path.clone()], Err(why.clone()));
+            kith_api::store::Error::Invalid(format!("refused: a signed entry: {why}"))
+        })
+    })
 }
 
 fn now() -> u64 {
@@ -545,7 +741,8 @@ fn clusters_after(store: &Store, command: &Command) -> Result<Option<BTreeMap<St
         | Command::Patch { .. }
         | Command::Report { .. }
         | Command::Mark
-        | Command::MarkSigned => return Ok(None),
+        | Command::MarkSigned
+        | Command::MarkChecked => return Ok(None),
     }
     Ok(Some(after))
 }
@@ -978,5 +1175,341 @@ mod tests {
         assert!(grants.may(&kith_api::kinds::Verb::Get, "Secret", Some("default")));
         assert!(!grants.may(&kith_api::kinds::Verb::Apply, "Workload", Some("default")));
         assert!(!grants.anywhere(&kith_api::kinds::Verb::Exec, None));
+    }
+
+    /// [`signature`] asks neither the clock nor the nonces (a node applying the log has neither
+    /// to go by); [`verify`], the edge's, asks both still.
+    #[test]
+    fn signed_signature_holds_without_clock_or_nonce() {
+        let store = store_with(admin().public_key().as_ref(), "");
+        let good = by_admin(&good());
+        for _ in 0..2 {
+            let (who, read) = signature(&good, CLUSTER, &["n2"], &asked(), &store).unwrap();
+            assert_eq!((who, read.nonce), (Caller::Admin, NONCE));
+        }
+        let nonces = Nonces::default();
+        assert_eq!(
+            verify(&good, CLUSTER, &["n2"], &asked(), &store, NOW, &nonces),
+            Ok(Caller::Admin)
+        );
+        let again = verify(&good, CLUSTER, &["n2"], &asked(), &store, NOW, &nonces);
+        assert_eq!(again, Err("the signature was used already".into()));
+        let message = bytes(CLUSTER, "n2", &asked(), "local socket", NOW - 1000, NONCE);
+        let sign = |m: &[u8]| admin().sign(m).as_ref().to_vec();
+        let old = header(sign, "local socket", "n2", NOW - 1000, &message);
+        assert!(signature(&old, CLUSTER, &["n2"], &asked(), &store).is_ok());
+        refused(&old, "expired 1000 s ago");
+        // What is not the signer's, or not for this node, does not hold here either.
+        let forged = good.replace("sig=", "sig=AA");
+        assert!(signature(&forged, CLUSTER, &["n2"], &asked(), &store).is_err());
+        let said = signature(&good, CLUSTER, &["n3"], &asked(), &store).err().unwrap();
+        assert!(said.contains("not for n3"), "{said}");
+    }
+
+    /// The leader every entry of these tests is written by.
+    const LEADER: &str = "n2";
+
+    /// A store in format 4 whose Cluster has the admin's key.
+    fn signing_store() -> Store {
+        let mut store = store_with(admin().public_key().as_ref(), "");
+        kith_store::run(&mut store, Command::MarkChecked).unwrap();
+        store
+    }
+
+    fn resource(text: &str) -> Resource {
+        Resource::from_source(text).unwrap().remove(0).unwrap()
+    }
+
+    fn map(name: &str) -> Resource {
+        resource(&format!(
+            "apiVersion: kith.dev/v1\nkind: ConfigMap\nmetadata: {{ name: {name} }}\nspec: {{ data: {{ a: b }} }}\n"
+        ))
+    }
+
+    /// The body of `POST /v1/apply` with a ConfigMap of each name.
+    fn maps(names: &[&str]) -> Vec<u8> {
+        serde_json::to_vec(&names.iter().map(|name| map(name)).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn applies(resources: Vec<Resource>) -> Command {
+        Command::Apply { resources, at: 7 }
+    }
+
+    fn nonce(n: u32) -> String {
+        format!("{n:032x}")
+    }
+
+    /// A signed entry of `POST /v1/apply`: `who`'s signature (by `sign`) over `signed`, for
+    /// `target`, carrying the body `carried` and `command`.
+    #[allow(clippy::too_many_arguments)]
+    fn entry(
+        sign: impl Fn(&[u8]) -> Vec<u8>,
+        who: &str,
+        target: &str,
+        expires: u64,
+        nonce: &str,
+        signed: &[u8],
+        carried: &[u8],
+        command: Command,
+    ) -> Command {
+        let asked = Asked {
+            method: "POST",
+            path: "/v1/apply",
+            body: signed,
+        };
+        let message = bytes(CLUSTER, target, &asked, who, expires, nonce);
+        let sig = base64::engine::general_purpose::STANDARD.encode(sign(message.as_bytes()));
+        Command::Signed {
+            header: format!("v1; who={who}; target={target}; expires={expires}; nonce={nonce}; sig={sig}"),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: base64::engine::general_purpose::STANDARD.encode(carried),
+            command: Box::new(command),
+        }
+    }
+
+    /// [`entry`] by the admin.
+    fn by_admin_entry(
+        target: &str,
+        expires: u64,
+        nonce: &str,
+        signed: &[u8],
+        carried: &[u8],
+        command: Command,
+    ) -> Command {
+        let sign = |m: &[u8]| admin().sign(m).as_ref().to_vec();
+        entry(sign, "local socket", target, expires, nonce, signed, carried, command)
+    }
+
+    /// What a node does with each entry of `log`: [`admit`], then runs it. Taken or not.
+    fn feed(store: &mut Store, log: &[Command]) -> Vec<bool> {
+        let leader = kith_store::node_id(LEADER);
+        let taken = |store: &mut Store, command: &Command| {
+            admit(store, CLUSTER, command, leader).is_ok() && kith_store::run(store, command.clone()).is_ok()
+        };
+        log.iter().map(|command| taken(store, command)).collect()
+    }
+
+    /// Two nodes fed one log, a forgery of each sort in it, take the same entries and end the
+    /// same, without the forgeries; and no clock is asked: the same an hour either way.
+    #[test]
+    fn signed_apply_two_stores_end_equal_without_forgeries() {
+        let other = Ed25519KeyPair::from_seed_unchecked(&[8; 32]).unwrap();
+        let (a, x) = (maps(&["a"]), maps(&["x"]));
+        let now = kith_api::store::now();
+        for expires in [NOW, now - 3600, now + 3600] {
+            let good = by_admin_entry(LEADER, expires, &nonce(1), &a, &a, applies(vec![map("a")]));
+            let log = [
+                good.clone(),
+                // Another body than was signed.
+                by_admin_entry(LEADER, expires, &nonce(2), &a, &x, applies(vec![map("x")])),
+                // Another command than the body says.
+                by_admin_entry(LEADER, expires, &nonce(3), &a, &a, applies(vec![map("x")])),
+                // The good one again.
+                good,
+                // Signed for another node than led the term.
+                by_admin_entry("n3", expires, &nonce(5), &a, &a, applies(vec![map("a")])),
+                // A key not the signer's.
+                entry(
+                    |m: &[u8]| other.sign(m).as_ref().to_vec(),
+                    "local socket",
+                    LEADER,
+                    expires,
+                    &nonce(6),
+                    &a,
+                    &a,
+                    applies(vec![map("a")]),
+                ),
+                // For any node.
+                by_admin_entry(
+                    "*",
+                    expires,
+                    &nonce(7),
+                    &maps(&["b"]),
+                    &maps(&["b"]),
+                    applies(vec![map("b")]),
+                ),
+            ];
+            let (mut one, mut two) = (signing_store(), signing_store());
+            let taken = [true, false, false, false, false, false, true];
+            assert_eq!(feed(&mut one, &log), taken, "expires {expires}");
+            assert_eq!(feed(&mut two, &log), taken, "expires {expires}");
+            assert_eq!(one, two);
+            let names: Vec<_> = one.list(Some("ConfigMap")).map(|m| m.metadata.name.clone()).collect();
+            assert_eq!(names, ["a", "b"]);
+            // In format 3 none is taken: a T-0779 kithd, a member then, refuses them all.
+            let mut three = store_with(admin().public_key().as_ref(), "");
+            kith_store::run(&mut three, Command::MarkSigned).unwrap();
+            assert_eq!(feed(&mut three, &log), [false; 7], "expires {expires}");
+        }
+    }
+
+    /// What a kind's admission module may change (the spec, labels and annotations of a custom
+    /// kind's resource) the carried command may differ in; nothing else.
+    #[test]
+    fn signed_apply_takes_what_admission_may_rewrite() {
+        let mut store = signing_store();
+        store
+            .apply(resource(
+                "apiVersion: kith.dev/v1\nkind: KindDefinition\nmetadata: { name: gameserver }\n\
+                 spec: { group: games.example.com, version: v1, kind: GameServer, schema: { type: object }, \
+                 admission: { wasm: AGFzbQEAAAA= } }\n",
+            ))
+            .unwrap();
+        let server = |name: &str| {
+            resource(&format!(
+                "apiVersion: games.example.com/v1\nkind: GameServer\nmetadata: {{ name: {name} }}\nspec: {{ map: dust }}\n"
+            ))
+        };
+        let body = serde_json::to_vec(&[server("one")]).unwrap();
+        let leader = kith_store::node_id(LEADER);
+        let asked = |n: u32, command: Command| {
+            let entry = by_admin_entry(LEADER, NOW, &nonce(n), &body, &body, command);
+            admit(&store, CLUSTER, &entry, leader)
+        };
+        // As admission makes it: in the default namespace, its spec and labels its own.
+        let mut rewritten = server("one");
+        rewritten.metadata.namespace = Some("default".into());
+        rewritten.spec = serde_json::json!({ "map": "rewritten" });
+        rewritten.metadata.labels.insert("by".into(), "admission".into());
+        assert_eq!(asked(1, applies(vec![rewritten.clone()])), Ok(()));
+        // Not another resource.
+        let mut renamed = rewritten.clone();
+        renamed.metadata.name = "two".into();
+        assert!(asked(2, applies(vec![renamed])).is_err());
+        assert!(asked(3, applies(vec![rewritten.clone(), rewritten])).is_err());
+        // A built-in kind has no admission: its spec is as signed.
+        let a = maps(&["a"]);
+        let mut changed = map("a");
+        changed.spec = serde_json::json!({ "data": { "a": "c" } });
+        let entry = by_admin_entry(LEADER, NOW, &nonce(4), &a, &a, applies(vec![changed]));
+        assert!(admit(&store, CLUSTER, &entry, leader).is_err());
+    }
+
+    /// A signer is held to its Roles where the entry is applied, as the store then stands.
+    #[test]
+    fn signed_apply_asks_the_signers_rights() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let (_, key, public) = ca.issue_user("alice").unwrap();
+        let mut store = signing_store();
+        let mut identity = resource("apiVersion: kith.dev/v1\nkind: Identity\nmetadata: { name: alice }\nspec: {}\n");
+        identity.spec = serde_json::json!({ "publicKey": public });
+        store.apply(identity).unwrap();
+        for text in [
+            "apiVersion: kith.dev/v1\nkind: Role\nmetadata: {name: maps}\nspec: {rules: [{kinds: [ConfigMap], verbs: [apply]}]}\n",
+            "apiVersion: kith.dev/v1\nkind: RoleBinding\nmetadata: {name: alice-writes}\nspec: {role: maps, subjects: [alice]}\n",
+        ] {
+            store.apply(resource(text)).unwrap();
+        }
+        let der = rustls::pki_types::PrivatePkcs8KeyDer::from_pem_slice(key.as_bytes()).unwrap();
+        let rng = ring::rand::SystemRandom::new();
+        let pair = signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            der.secret_pkcs8_der(),
+            &rng,
+        )
+        .unwrap();
+        let by_alice = |n: u32, resources: Vec<Resource>| {
+            let body = serde_json::to_vec(&resources).unwrap();
+            let sign = |m: &[u8]| pair.sign(&rng, m).unwrap().as_ref().to_vec();
+            entry(sign, "alice", LEADER, NOW, &nonce(n), &body, &body, applies(resources))
+        };
+        let leader = kith_store::node_id(LEADER);
+        assert_eq!(admit(&store, CLUSTER, &by_alice(1, vec![map("a")]), leader), Ok(()));
+        let secret = resource("apiVersion: kith.dev/v1\nkind: Secret\nmetadata: { name: s }\nspec: { data: {} }\n");
+        let said = admit(&store, CLUSTER, &by_alice(2, vec![secret]), leader).unwrap_err();
+        assert!(said.contains("may not"), "{said}");
+    }
+
+    /// A signer's book of nonces holds at most [`SIGNED_NONCES`] at once: past that its entries
+    /// are refused, nothing taken, until a later `expires` lets the old ones go.
+    #[test]
+    fn raft_write_refuses_past_a_signers_nonce_cap() {
+        use kith_api::store::{SIGNED_NONCES, SIGNED_SKEW};
+        let mut store = signing_store();
+        for n in 0..SIGNED_NONCES as u32 {
+            store.nonce("local socket", NOW, &nonce(n)).unwrap();
+        }
+        let full = nonce(SIGNED_NONCES as u32);
+        let said = store.takes_nonce("local socket", NOW, &full).unwrap_err().to_string();
+        assert!(said.contains("full"), "{said}");
+        let before = store.clone();
+        assert!(store.nonce("local socket", NOW, &full).is_err());
+        assert_eq!(store, before, "nothing taken");
+        // Another signer's book is its own; and later, the old ones go.
+        assert_eq!(store.nonce("alice", NOW, &full), Ok(()));
+        assert_eq!(store.nonce("local socket", NOW + SIGNED_SKEW, &full), Ok(()));
+    }
+
+    /// The leader writes a signed request it applies as a signed entry once the store is in
+    /// format 4, and bare before (in 3 a member may refuse every signed entry); one whose
+    /// command is not what its body says is nothing.
+    #[tokio::test]
+    async fn signed_wrap_at_format_4_and_bare_below() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("signed-wrap", node(&ca, "wrap-c"), &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        let one = BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
+        leads.current_leader(id, "leads").await.unwrap();
+        let key = crate::pki::hex(admin().public_key().as_ref());
+        let cluster = resource(&format!(
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+        ));
+        shared.write(applies(vec![cluster])).await.unwrap();
+        let id = crate::pki::fingerprint(&shared.cluster.as_ref().unwrap().me.ca).unwrap();
+        let expires = now() + 300;
+        let signed = |n: u32, body: &[u8]| {
+            let asked = Asked {
+                method: "POST",
+                path: "/v1/apply",
+                body,
+            };
+            let message = bytes(&id, "*", &asked, "local socket", expires, &nonce(n));
+            let sig = base64::engine::general_purpose::STANDARD.encode(admin().sign(message.as_bytes()));
+            let n = nonce(n);
+            Signed {
+                header: format!("v1; who=local socket; target=*; expires={expires}; nonce={n}; sig={sig}"),
+                who: Caller::Admin,
+                relay: Some(Relay {
+                    method: "POST".into(),
+                    path: "/v1/apply".into(),
+                    body: axum::body::Bytes::copy_from_slice(body),
+                    who: Caller::Admin,
+                    room: Arc::new(HOLDING.try_acquire_many(1).unwrap()),
+                }),
+            }
+        };
+        let apply = |n: u32, body: &[&str], written: &str| {
+            let command = applies(vec![map(written)]);
+            within(
+                Some(signed(n, &maps(body))),
+                shared.submit_as(command, Some(&Caller::Admin)),
+            )
+        };
+        let book = |n: u32| {
+            let state = shared.store.lock().unwrap();
+            state.store.takes_nonce("local socket", expires, &nonce(n)).is_ok()
+        };
+        // Format 1: written bare (a signed entry would be refused there).
+        apply(1, &["a"], "a").await.unwrap();
+        // Format 3: bare too, a member may be a T-0779 kithd that refuses every signed entry.
+        shared.write(Command::MarkSigned).await.unwrap();
+        assert!(book(1), "below format 3 no nonce is taken");
+        apply(4, &["d"], "d").await.unwrap();
+        assert!(book(4), "at format 3 the entry is bare, and no nonce taken");
+        shared.write(Command::MarkChecked).await.unwrap();
+        apply(2, &["b"], "b").await.unwrap();
+        assert!(!book(2), "at format 4 the entry is signed, and its nonce taken");
+        // Its command is not what its body says: refused on every node, and written down.
+        assert!(apply(3, &["c"], "x").await.is_err());
+        let state = shared.store.lock().unwrap();
+        assert!(state.store.get("ConfigMap/default/x").is_none() && state.store.get("ConfigMap/x").is_none());
+        drop(state);
+        let tail = shared.audit.tail(20).unwrap();
+        let refused = tail.iter().any(|line| line["verb"] == "signed" && line["ok"] == false);
+        assert!(refused, "{tail:?}");
     }
 }

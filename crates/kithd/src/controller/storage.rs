@@ -471,7 +471,7 @@ const BATCH: usize = 1024;
 /// which ignores it (a directory that leaves not empty ends the removal at its own `rmdir`).
 /// Any other error that leaves an entry in place ends the removal with it, as `remove_dir_all`
 /// does: no path goes round again. A `root` that is a link or a file is unlinked.
-fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
+pub fn remove_tree(root: &Path, halted: &dyn Fn() -> bool) -> std::io::Result<bool> {
     remove_tree_with(root, halted, |path| {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().mode(0o700).create(path)

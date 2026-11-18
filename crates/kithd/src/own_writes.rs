@@ -235,15 +235,22 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
         }
         Command::Rollback { key, .. } => Err(refused(key, "a rollback is not a control node's own write")),
         Command::Import { .. } => Err(refused("a whole store", "only an admin brings one in")),
-        // (A follower's relayed write ends with a Mark, the barrier it waits for: a no-op where the
-        // store is marked already. Unmarked, it is the leader's to make.)
-        Command::Mark if store.marked() => Ok(Command::Mark),
-        Command::Mark => Err(refused("the store's format", "only the leader changes it")),
-        // (The same for format 3: a no-op where the store keeps nonces already.)
-        Command::MarkSigned if store.signing() => Ok(Command::MarkSigned),
-        Command::MarkSigned => Err(refused("the store's format", "only the leader changes it")),
-        // A person signs a change and the leader writes it as it came: never a node's own write.
-        Command::Signed { .. } => Err(refused("a signed change", "a control node signs none of its own")),
+        // The store's format is the leader's to change: a mark it has made already is the barrier
+        // an older follower's relayed write ends with, a no-op, and taken (this build's is an
+        // empty Patch). A signed entry is the leader's to write from the request it checked:
+        // never another node's own write.
+        Command::Mark | Command::MarkSigned | Command::MarkChecked => {
+            let made = match command {
+                Command::Mark => 2,
+                Command::MarkSigned => 3,
+                _ => 4,
+            };
+            match kith_store::format_of(store) >= made {
+                true => Ok(command),
+                false => Err(refused("the store's format", "only the leader changes it")),
+            }
+        }
+        Command::Signed { .. } => Err(refused("a signed change", "only the leader writes them")),
     }
 }
 
@@ -404,35 +411,38 @@ mod tests {
         assert!(said.contains("Err"), "{said}");
     }
 
-    /// A follower's relayed write ends with a Mark (`raft.rs` `relayed`): the barrier it waits
-    /// for. On a store marked already it is a no-op and let through; an unmarked store is marked
-    /// by the leader alone.
+    /// The store's format is the leader's to change, and a signed entry the leader's to write: a
+    /// Signed is never a control node's own write, and a mark only once the store has made it
+    /// (the barrier an older follower's relayed write ends with; this build's is an empty Patch).
     #[tokio::test]
-    async fn own_writes_let_a_mark_through_only_where_the_store_is_marked() {
-        let ca = pki::Ca::create().unwrap();
-        let shared: Arc<Shared> = shared_with("own-mark", node(&ca, "mark-c"), &[]).await;
-        assert!(checked(&shared, "mark-c", Command::Mark).is_err());
-        shared.store.lock().unwrap().store.mark();
-        assert!(checked(&shared, "mark-c", Command::Mark).is_ok());
-    }
-
-    /// Format 3 is the leader's to make as format 2 is, and a signed entry is never a control
-    /// node's own write, whatever it wraps.
-    #[tokio::test]
-    async fn own_writes_refuse_a_signed_entry_and_an_unmade_format_3() {
+    async fn raft_write_refuses_a_format_or_signed_entry_as_a_control_nodes_own_write() {
         let ca = pki::Ca::create().unwrap();
         let shared: Arc<Shared> = shared_with("own-signed", node(&ca, "sign-c"), &[]).await;
-        assert!(checked(&shared, "sign-c", Command::MarkSigned).is_err());
-        shared.store.lock().unwrap().store.sign();
-        assert!(checked(&shared, "sign-c", Command::MarkSigned).is_ok());
-        let signed = Command::Signed {
+        let signed = || Command::Signed {
             header: String::new(),
             method: "POST".into(),
             path: "/v1/apply".into(),
             body: String::new(),
-            command: Box::new(Command::Mark),
+            command: Box::new(Command::Patch { statuses: vec![] }),
         };
-        assert!(checked(&shared, "sign-c", signed).is_err());
+        for format in 1..=4 {
+            match format {
+                2 => shared.store.lock().unwrap().store.mark(),
+                3 => shared.store.lock().unwrap().store.sign(),
+                4 => shared.store.lock().unwrap().store.check(),
+                _ => {}
+            }
+            // A mark the store has made already is an older follower's barrier: taken, a no-op.
+            for (made, command) in [(2, Command::Mark), (3, Command::MarkSigned), (4, Command::MarkChecked)] {
+                match checked(&shared, "sign-c", command) {
+                    Ok(_) => assert!(format >= made, "format {format}: format {made}'s mark taken"),
+                    Err(said) => assert!(format < made && said.contains("only the leader changes it"), "{said}"),
+                }
+            }
+            let said = checked(&shared, "sign-c", signed()).unwrap_err();
+            assert!(said.contains("only the leader writes"), "{said}");
+            assert!(checked(&shared, "sign-c", Command::Patch { statuses: vec![] }).is_ok());
+        }
     }
 
     /// Another node's mesh key, said in a control node's own Node, is refused as a worker's is:
