@@ -456,13 +456,97 @@ fn is_self(upstream: SocketAddr, listen: SocketAddr) -> bool {
     upstream.port() == listen.port() && same_host
 }
 
+/// The resolvers of `all` that are not this server, listening on `listen`, nor the house address
+/// `house` (whichever node holds it, it is asked of this one: a resolver named so loops).
+fn others(all: &[SocketAddr], listen: SocketAddr, house: Option<Ipv4Addr>) -> Arc<[SocketAddr]> {
+    let at_house = house.map(|address| SocketAddr::new(address.into(), listen.port()));
+    all.iter()
+        .copied()
+        .filter(|upstream| !is_self(*upstream, listen) && !at_house.is_some_and(|house| is_self(*upstream, house)))
+        .collect()
+}
+
+/// A UDP socket on `address`, non-blocking. It may share its port with another of ours bound to
+/// a different address (the one on every address and the one on the house address), and an
+/// address not yet on any card can be bound: the house address comes and goes with the leader.
+/// SO_REUSEPORT, not SO_REUSEADDR: the kernel lets only a socket of the same user share the port,
+/// so another program on the node cannot bind beside ours and take its queries.
+fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrStorage, bind, setsockopt, socket, sockopt};
+    let family = if address.is_ipv4() {
+        AddressFamily::Inet
+    } else {
+        AddressFamily::Inet6
+    };
+    let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
+    let fd = socket(family, SockType::Datagram, flags, None)?;
+    setsockopt(&fd, sockopt::ReusePort, &true)?;
+    if address.is_ipv4() {
+        setsockopt(&fd, sockopt::IpFreebind, &true)?;
+    }
+    bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &SockaddrStorage::from(address))?;
+    Ok(fd.into())
+}
+
+/// How long the house address's socket waits to be bound again after it could not be.
+const HOUSE_RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Answers on the house address, on `port`, while the store names one (`serve_udp_on`).
+async fn house(
+    port: u16,
+    mut wanted: watch::Receiver<Option<Ipv4Addr>>,
+    zones: watch::Receiver<Arc<Zones>>,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<kith_dns::Cache>,
+) {
+    // The last error said, so that one that stays is said once.
+    let mut said = String::new();
+    loop {
+        let now = *wanted.borrow_and_update();
+        let serving = async {
+            let Some(address) = now else {
+                return std::future::pending::<()>().await;
+            };
+            let at = SocketAddr::from((address, port));
+            match udp_socket(at).and_then(UdpSocket::from_std) {
+                Ok(udp) => {
+                    eprintln!("kithd: serving DNS on the house address {at}");
+                    said.clear();
+                    kith_dns::serve_udp_on(udp, zones.clone(), upstreams.clone(), forwarders.clone(), cache.clone())
+                        .await;
+                }
+                Err(e) => {
+                    if said != e.to_string() {
+                        eprintln!(
+                            "kithd: serving DNS on the house address {at}: {e} (tried again every {} s)",
+                            HOUSE_RETRY.as_secs()
+                        );
+                        said = e.to_string();
+                    }
+                }
+            }
+            // (Not bound, or no longer served: the next try is after this, or when the store changes.)
+            tokio::time::sleep(HOUSE_RETRY).await;
+        };
+        tokio::select! {
+            () = serving => {}
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    return std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+}
+
 /// UDP and TCP on the same address; with port 0, on the same free port.
 pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String> {
     let failed = |e: std::io::Error| format!("serving DNS on {listen}: {e}");
     for _ in 0..20 {
         let tcp = TcpListener::bind(listen).await.map_err(failed)?;
         let address = tcp.local_addr().map_err(failed)?;
-        match UdpSocket::bind(address).await {
+        match udp_socket(address).and_then(UdpSocket::from_std) {
             Ok(udp) => return Ok((udp, tcp)),
             // Someone else has that port on UDP: with port 0, take another.
             Err(_) if listen.port() == 0 => {}
@@ -470,6 +554,14 @@ pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String
         }
     }
     Err(format!("serving DNS on {listen}: no port is free on both UDP and TCP"))
+}
+
+/// Whether this node leads the log: the one control node that says the DNS statuses (and the
+/// block lists') for all of them.
+pub fn leads(shared: &Shared) -> bool {
+    let metrics = shared.raft.metrics();
+    let metrics = metrics.borrow();
+    metrics.current_leader == Some(metrics.id)
 }
 
 /// Serve DNS until kithd stops.
@@ -486,28 +578,42 @@ pub async fn run(
     let forwarders = kith_dns::LOCAL_NETWORKS.into_iter().chain([pods.as_str()]);
     let forwarders: Vec<Cidr> = forwarders.filter_map(|net| net.parse().ok()).collect();
     let listen = tcp.local_addr().expect("a bound socket has an address");
-    let ours = move |all: &[SocketAddr]| -> Arc<[SocketAddr]> {
-        all.iter()
-            .copied()
-            .filter(|upstream| !is_self(*upstream, listen))
-            .collect()
+    // The house address the Clusters name (held by this node or not): a resolver list that names
+    // it (a router's DHCP) must not be asked by the node that holds it, nor dropped for good by
+    // the one that held it when the list was read.
+    let (house_wants, house_wanted) = watch::channel(None::<Ipv4Addr>);
+    let configured = || {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        crate::home::configured(&state.store).map(|home| home.address)
     };
+    house_wants.send_replace(configured());
+    let ours = move |all: &[SocketAddr], house: Option<Ipv4Addr>| others(all, listen, house);
     let said = move |now: &[SocketAddr]| {
         eprintln!("kithd: serving DNS on {listen}; other names go to {now:?}");
         if now.is_empty() {
             eprintln!("kithd: no other resolver to ask (--dns-upstream): only names in the store resolve");
         }
     };
-    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update()));
+    let (ask, asked) = watch::channel(ours(&upstreams.borrow_and_update(), *house_wanted.borrow()));
     said(&asked.borrow());
+    let mut house_seen = house_wanted.clone();
+    house_seen.mark_unchanged();
     let told = async {
-        while upstreams.changed().await.is_ok() {
-            let now = ours(&upstreams.borrow_and_update());
+        // (Resolvers named on the command line: the list never changes, the house address may.)
+        let mut listed = true;
+        loop {
+            tokio::select! {
+                got = upstreams.changed(), if listed => listed = got.is_ok(),
+                got = house_seen.changed() => {
+                    if got.is_err() {
+                        return std::future::pending::<()>().await;
+                    }
+                }
+            }
+            let now = ours(&upstreams.borrow_and_update(), *house_seen.borrow_and_update());
             said(&now);
             ask.send_replace(now);
         }
-        // (Resolvers named on the command line: nothing more is told.)
-        std::future::pending::<()>().await;
     };
     let (zones, served) = watch::channel(Arc::new(Zones::default()));
     // The lists of names to answer as not there, and the answers kept from the upstreams.
@@ -530,6 +636,8 @@ pub async fn run(
         loop {
             let reports = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
+                let home = crate::home::configured(&state.store).map(|home| home.address);
+                house_wants.send_if_modified(|was| std::mem::replace(was, home) != home);
                 built.changed(&state.store).then(|| {
                     let mesh = shared
                         .cluster
@@ -552,12 +660,17 @@ pub async fn run(
             // (Every node that answers says the same of the records: a worker leaves the
             // saying to the control nodes, whose it is to write.)
             let worker = crate::access::worker(&shared, shared.members.me());
-            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker)
-                && let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await
-            {
-                eprintln!("kithd: reporting on DNS records: {e}");
-                // Tried again at the next change to the store.
-                built = Built::default();
+            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker) {
+                // (Every control node builds the same statuses: the leader alone says them. A
+                // follower's would be passed on as its own write, and refused.)
+                if !leads(&shared) {
+                    // Said again at the next change to the store, which may find this node leading.
+                    built = Built::default();
+                } else if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
+                    eprintln!("kithd: reporting on DNS records: {e}");
+                    // Tried again at the next change to the store.
+                    built = Built::default();
+                }
             }
             if generation.changed().await.is_err() {
                 return;
@@ -571,6 +684,14 @@ pub async fn run(
         tokio::runtime::Handle::current()
     });
     let sockets = udp.into_std().and_then(|udp| Ok((udp, tcp.into_std()?)));
+    let at_home = thread.spawn(house(
+        listen.port(),
+        house_wanted,
+        served.clone(),
+        asked.clone(),
+        forwarders.clone(),
+        cache.clone(),
+    ));
     let answering = thread.spawn(async move {
         let (udp, tcp) = sockets?;
         let (udp, tcp) = (UdpSocket::from_std(udp)?, TcpListener::from_std(tcp)?);
@@ -591,11 +712,22 @@ pub async fn run(
         _ = stopping.changed() => {}
     }
     stop.abort();
+    at_home.abort();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The socket on every address and the one on the house address share a port, and the
+    /// second binds an address no card has yet.
+    #[test]
+    fn house_socket_shares_the_port() {
+        let all = udp_socket("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = all.local_addr().unwrap().port();
+        let house = udp_socket(SocketAddr::from(([10, 9, 0, 100], port))).unwrap();
+        assert_eq!(house.local_addr().unwrap().port(), port);
+    }
 
     /// A node's resolvers can be written after kithd started (its lease comes while it serves).
     #[tokio::test]
@@ -1288,6 +1420,33 @@ spec: {}
         assert!(!is_self(at("1.1.1.1:53"), at("0.0.0.0:53")));
         // Any address of this machine, when listening on all of them.
         assert!(is_self(at("127.0.0.2:53"), at("0.0.0.0:53")));
+    }
+
+    /// Every control node builds the same DNS statuses, and only the leader says them: a
+    /// follower's would be passed on as its own write, and refused for the kinds it does not hold.
+    #[tokio::test]
+    async fn dns_statuses_are_said_by_the_leader_alone() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "dns-c");
+        let shared = crate::cluster::pinned_peer::shared_with("dns-leader", me, &[]).await;
+        assert!(!leads(&shared));
+        let id = shared.raft.metrics().borrow().id;
+        let one = std::collections::BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads_now = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
+        leads_now.current_leader(id, "leads").await.unwrap();
+        assert!(leads(&shared));
+    }
+
+    /// A router that names the house address as a resolver: it is dropped from the upstreams
+    /// when a Cluster names it, held by this node or not (and kept when none does).
+    #[test]
+    fn the_house_address_named_as_an_upstream_is_not_asked() {
+        let at = |address: &str| address.parse::<SocketAddr>().unwrap();
+        let (listen, house) = (at("0.0.0.0:5353"), Some(Ipv4Addr::new(10, 9, 0, 100)));
+        let all = [at("10.9.0.100:5353"), at("1.1.1.1:5353"), at("10.9.0.100:53")];
+        assert_eq!(*others(&all, listen, house), [at("1.1.1.1:5353"), at("10.9.0.100:53")]);
+        assert_eq!(*others(&all, listen, None), all);
     }
 
     /// The addresses `client` is told `name` is (type AAAA), sorted.

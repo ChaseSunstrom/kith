@@ -143,15 +143,36 @@ pub async fn serve(
     forwarders: Vec<Cidr>,
     cache: Arc<Cache>,
 ) {
-    let shared = Shared {
+    let shared = shared(zones, upstreams, forwarders, cache);
+    tokio::join!(serve_udp(udp, shared.clone()), serve_tcp(tcp, shared));
+}
+
+/// Serves DNS on one more UDP socket (the house address's: see kithd's home), the same zones
+/// and upstreams as `serve`, until the task is dropped.
+pub async fn serve_udp_on(
+    udp: UdpSocket,
+    zones: ZonesRx,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<Cache>,
+) {
+    serve_udp(udp, shared(zones, upstreams, forwarders, cache)).await;
+}
+
+fn shared(
+    zones: ZonesRx,
+    upstreams: watch::Receiver<Arc<[SocketAddr]>>,
+    forwarders: Vec<Cidr>,
+    cache: Arc<Cache>,
+) -> Shared {
+    Shared {
         zones,
         upstreams,
         forwarders: forwarders.into(),
         forwards: PerIp::default(),
         slot_log: Arc::default(),
         cache,
-    };
-    tokio::join!(serve_udp(udp, shared.clone()), serve_tcp(tcp, shared));
+    }
 }
 
 async fn serve_udp(sock: UdpSocket, sh: Shared) {
