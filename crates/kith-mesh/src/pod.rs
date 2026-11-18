@@ -408,7 +408,7 @@ pub struct Egress {
 }
 
 fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
-    crate::address4(1, range.gateway(), 32, None)?;
+    crate::gateway4(1, range.gateway())?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
     let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
     nat(range, guard, masquerade, mesh, pods)?;

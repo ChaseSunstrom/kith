@@ -548,6 +548,50 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
     ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
 }
 
+/// The label kith puts on the gateway it holds on the loopback (a label of the loopback's
+/// must begin with its name).
+const GATEWAY_LABEL: &str = "lo:kith";
+
+/// The IPv4 addresses of the link `index`, each with its label if it has one.
+fn lo_addresses4(index: u32) -> Result<Vec<(Ipv4Addr, Option<String>)>> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+    let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| match found {
+            RouteNetlinkMessage::NewAddress(found) if found.header.index == index => {
+                let (mut address, mut label) = (None, None);
+                for attribute in found.attributes {
+                    match attribute {
+                        AddressAttribute::Local(IpAddr::V4(local)) => address = Some(local),
+                        AddressAttribute::Address(IpAddr::V4(a)) => address = address.or(Some(a)),
+                        AddressAttribute::Label(name) => label = Some(name),
+                        _ => {}
+                    }
+                }
+                address.map(|address| (address, label))
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Give the link `index` (the loopback) the `gateway` as a /32 marked as kith's, and take
+/// off every other address it marked so before: a gateway of an earlier range is no longer
+/// this node's to answer for. (An address without the mark is not touched.)
+pub fn gateway4(index: u32, gateway: Ipv4Addr) -> Result<()> {
+    let mut message = address_message(index, gateway, 32);
+    message.attributes.push(AddressAttribute::Label(GATEWAY_LABEL.into()));
+    ask_route(RouteNetlinkMessage::NewAddress(message), NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE)?;
+    for (stale, label) in lo_addresses4(index)? {
+        if stale != gateway && label.as_deref() == Some(GATEWAY_LABEL) {
+            drop_address4(index, stale, 32)?;
+        }
+    }
+    Ok(())
+}
+
 /// The kernel's message for `address`/`bits` on link `index`.
 fn address_message(index: u32, address: std::net::Ipv4Addr, bits: u8) -> AddressMessage {
     let mut message = AddressMessage::default();
@@ -589,6 +633,24 @@ pub fn drop_address4(index: u32, address: std::net::Ipv4Addr, bits: u8) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run as root of a network namespace: `unshare -Urn cargo test -p kith-mesh --lib lo_only`.
+    /// (Anywhere else it is skipped: it must not touch a real loopback.)
+    #[test]
+    fn lo_only_the_new_gateway() {
+        let (a, b) = (Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(198, 51, 100, 2));
+        if up(1).is_err() || lo_addresses4(1).map(|all| all.len()).ok() != Some(1) {
+            return eprintln!("skipped: not a fresh network namespace");
+        }
+        // An address of another's (no label) and one of ours that is not a gateway's stay/go.
+        address4(1, Ipv4Addr::new(198, 51, 100, 9), 32, None).unwrap();
+        gateway4(1, a).unwrap();
+        gateway4(1, a).unwrap(); // again does no harm
+        gateway4(1, b).unwrap();
+        let mut now: Vec<_> = lo_addresses4(1).unwrap().into_iter().map(|(address, _)| address).collect();
+        now.sort();
+        assert_eq!(now, [Ipv4Addr::LOCALHOST, b, Ipv4Addr::new(198, 51, 100, 9)]);
+    }
 
     #[test]
     fn a_silent_kernel_is_a_timeout() {
