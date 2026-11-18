@@ -96,13 +96,15 @@ and the network cards the plain kernel lacks. `firmware: [all]` is all of linux-
 of paths there (`amdgpu/*`) is those files, and in both cases the files each module names
 (`modinfo -F firmware`) are there too.
 
-- **Signed, per build.** The kernel makes a key of its own at the start of each build, signs
+- **Signed, per kernel build.** The kernel makes a key of its own at the start of each kernel build (a tree cut short and gone on from has its old key removed first), signs
   every module with it as `modules_install` writes them, and builds the public half in;
   `CONFIG_MODULE_SIG_FORCE` refuses any other module. `build.sh` then deletes the key: the build
   fails if a `signing_key` or a `.pem` is left in the kernel's tree or in the root, and a
   failed build deletes it too. It checks one module's signature against the kernel's own key.
   So the modules of one build load only into that build's kernel, and the kernel of an `all`
-  image is not the same bytes from one build to the next (the plain one is).
+  image is not the same bytes from one kernel build to the next (the plain one is). The
+  kernel and its modules are cached by the hash of their config, so the key is made when
+  they are built, not at each image build.
 - **In the root, not the ESP.** `/lib/modules/VER` (with `modules.dep`, `modules.alias`,
   `modules.builtin` and `modules.builtin.modinfo`, so a loader knows what is built in) and
   `/lib/firmware` (with the links linux-firmware lists in `WHENCE`: a driver asks for
@@ -116,7 +118,7 @@ of paths there (`amdgpu/*`) is those files, and in both cases the files each mod
 - **Not yet.** kithd does not load modules (`finit_module`): this installs them, so a node of
   this image has its drivers on disk and loads none yet. The NVIDIA open modules are a later
   slice: built out of tree against this kernel and signed with the same throwaway key in the
-  same build. Not for use with `gpu-amd-phoenix` (the same driver, built in there).
+  same build. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in there).
 
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label

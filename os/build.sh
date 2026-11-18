@@ -166,7 +166,8 @@ spec_list() { # KEY
 }
 kconfig=$cache/kernel.config.$$
 # (The key a kernel with modules signs them with is made in its build tree: gone from it on
-# any way out of this script, a killed one included. Rebuilt, if the build is run again.)
+# any way out of this script the trap sees (not SIGKILL: a tree that is gone on from has its
+# key removed before make). Made anew, if the build is run again.)
 tree=''
 trap 'rm -f "$kconfig"; [ -z "$tree" ] || rm -f "$tree/certs/signing_key.pem"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -189,6 +190,10 @@ if [ -n "$spec" ]; then
         globs="$globs
 $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     done
+    # (all.config has modules, gpu-amd-phoenix builds the same driver in: merged, the one
+    # would be =y and =m by the order of the lines.)
+    ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-amd-phoenix ||
+        die "--spec: 'all' and 'gpu-amd-phoenix' do not go together (the same driver, as modules and built in)"
     # shellcheck disable=SC2086
     globs=$(printf '%s\n' $globs | LC_ALL=C sort -u)
     for g in $globs; do
@@ -264,6 +269,10 @@ if ! [ -r "$kernel" ]; then
             done
             : >.kith-config
         fi
+        # A tree that was cut short may still hold the key of that run (a SIGKILL or a power
+        # cut gives the trap no turn): gone, the kernel makes a fresh one and builds its
+        # public half in, and the modules are signed with that.
+        [ ! -d certs ] || find certs -name 'signing_key*' -delete
         nice -n 10 make -s -j"${KITH_OS_JOBS:-$(nproc)}" bzImage ${modules:+modules}
         cp arch/x86/boot/bzImage ../vmlinuz.part
         cp .config ../config

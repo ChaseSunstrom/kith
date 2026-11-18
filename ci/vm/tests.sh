@@ -69,10 +69,10 @@
     # the file holds what is written. Past 32 GB an ext4 as small as the image's has used
     # up the room it kept for growing and the kernel has to lay its groups out anew.)
     truncate -s 40G "$work/disk.raw"
-    # (The state partition ends at the disk's end: 40960 MB less where it starts, which
-    # is the size of the rest of the image; $want is its size in hundreds of MB, 407 for
-    # the plain image.)
-    want=$(sfdisk -l -o Start,Name "$work/disk.raw" 2>/dev/null | awk '$2 == "state" { print int((40960 - $1 / 2048) / 100) }')
+    # (The state partition ends at the disk's end, less the last MiB the GPT's backup and
+    # the alignment take: 40959 MB less where it starts, which is the size of the rest of
+    # the image; $want is its size in hundreds of MB, 407 for the plain image.)
+    want=$(sfdisk -l -o Start,Name "$work/disk.raw" 2>/dev/null | awk '$2 == "state" { print int((40959 - $1 / 2048) / 100) }')
     [ -n "$want" ] || fail "no state partition in the image's table"
     began=$(date +%s%N)
     boot
