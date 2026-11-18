@@ -2,6 +2,7 @@
 {"u":"guide/index.html","t":"The guide","h":""},
 {"u":"guide/os.html","t":"kith OS: kithd as the machine's first process","h":""},
 {"u":"guide/os.html#the-image","t":"kith OS: kithd as the machine's first process","h":"The image"},
+{"u":"guide/os.html#a-node-that-needs-more-a-spec","t":"kith OS: kithd as the machine's first process","h":"A node that needs more: a spec"},
 {"u":"guide/os.html#updating-a-node-two-slots","t":"kith OS: kithd as the machine's first process","h":"Updating a node: two slots"},
 {"u":"guide/os.html#what-an-update-keeps-the-format-of-the-store","t":"kith OS: kithd as the machine's first process","h":"What an update keeps: the format of the store"},
 {"u":"guide/os.html#rolling-a-release-through-the-cluster","t":"kith OS: kithd as the machine's first process","h":"Rolling a release through the cluster"},
