@@ -106,7 +106,11 @@ class Daemon:
         self.proc = subprocess.Popen(argv, cwd=dir, stdout=self.log, stderr=subprocess.STDOUT)
         wait_until(lambda: os.path.exists(os.path.join(dir, self.socket)) or self.proc.poll() is not None, "kithd to serve")
         if self.proc.poll() is not None:
-            sys.exit(f"kithd did not start: see {self.log.name}")
+            # The log is deleted with the run's folder: say why here, in the exit message.
+            self.log.flush()
+            with open(self.log.name) as log:
+                tail = log.read()[-2000:]
+            sys.exit(f"kithd did not start: see {self.log.name}\n{tail}")
 
     def kith(self, *args):
         argv = [os.path.join(self.bins, "kith"), "--socket", self.socket, *args]
@@ -176,7 +180,8 @@ def crossing(bins, dir):
     first = Daemon(bins, os.path.join(dir, "a"), "--name", "a", "--listen", address)
     try:
         token = first.kith("node", "token").strip()
-        second = Daemon(bins, os.path.join(dir, "b"), "--name", "b", "--join", address, "--token", token)
+        # Its own loopback port: kithd's --join alone listens on 0.0.0.0:7443, which two runs at once share.
+        second = Daemon(bins, os.path.join(dir, "b"), "--name", "b", "--listen", f"127.0.0.1:{free_port()}", "--join", address, "--token", token)
         try:
             def config(value):
                 return {"apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": {"name": "crossing"}, "spec": {"data": {"k": value}}}
