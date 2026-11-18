@@ -38,8 +38,53 @@ function spy() {
     if (at.top < box.top + 40 || at.bottom > box.bottom - 40) side.scrollTop += at.top - box.top - box.height / 2;
   }
 }
-addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(spy); } }, { passive: true });
+// The reading line: the page's line fills with blue as far as you have read (to 55% down the window), and each h2 passed is blue.
+const page = $(".page"), h2s = $$(".page h2");
+function readLine() {
+  if (!page) return;
+  const box = page.getBoundingClientRect();
+  page.style.setProperty("--run", Math.max(0, Math.min(1, (innerHeight * 0.55 - box.top) / box.height)).toFixed(4));
+  for (const h of h2s) h.classList.toggle("read", h.getBoundingClientRect().top < innerHeight * 0.55);
+}
+const frame = () => { queued = false; spy(); readLine(); };
+addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(frame); } }, { passive: true });
+addEventListener("resize", readLine);
+readLine();
 spy();
+
+// Copy: a button above each block of code writes its text to the clipboard and says Copied for 1.5 s. The trailing
+// newline is left off, so a command pasted into a terminal waits for you.
+async function copyText(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+  const area = document.createElement("textarea"); // a page opened from a file, or over plain http, has no clipboard API
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.append(area);
+  area.select();
+  const ok = document.execCommand("copy");
+  area.remove();
+  if (!ok) throw new Error("copy refused");
+}
+for (const pre of $$(".page pre")) {
+  const wrap = document.createElement("div"), button = document.createElement("button");
+  wrap.className = "code";
+  button.type = "button";
+  button.className = "copy";
+  button.textContent = "Copy";
+  button.setAttribute("aria-label", "Copy this code");
+  let timer = 0;
+  button.addEventListener("click", async () => {
+    let said = "Copied";
+    try { await copyText(pre.textContent.replace(/\n+$/, "")); } catch { said = "Not copied"; }
+    button.textContent = said;
+    button.dataset.state = said === "Copied" ? "done" : "failed";
+    clearTimeout(timer);
+    timer = setTimeout(() => { button.textContent = "Copy"; delete button.dataset.state; }, 1500);
+  });
+  pre.replaceWith(wrap);
+  wrap.append(button, pre);
+}
 
 // Search: every word typed must be in the heading or the page's title.
 const form = $(".find"), box = $("#q"), found = $(".found"), side = $(".side");

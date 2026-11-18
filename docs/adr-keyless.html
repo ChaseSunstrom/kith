@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="guide/index.html">Guide</a>
-    <a href="guide/index.html#decisions">Decisions</a>
-    <a href="index.html#numbers">Numbers</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -72,7 +73,7 @@
 <ul><li><strong>Referrers.</strong> Only descriptors of the bundle's kind and of a bundle's size are taken, and the cap of 32 applies after that filter. A registry that answers with something else, or that has no referrers API, counts as having none, and the tag is looked at next. The whole search for signatures stops at 60 s.</li><li><strong>A rule of identities alone</strong> goes to the node in the same list as keys, so it is never an empty list that runs unsigned. A test pulls an unsigned image under such a rule and sees it refused.</li><li><strong>Envelopes.</strong> A <code>payloadType</code> other than <code>application/vnd.in-toto+json</code> is refused. A statement of any kind other than <code>https://sigstore.dev/cosign/sign/v1</code>, such as an attestation, is refused as "no signature".</li><li><strong>Repeated extensions.</strong> A certificate that holds the same extension twice is not read.</li><li><strong>Registry text in refusals.</strong> Any text a registry gave that a refusal repeats is cut to 80 characters, with control characters removed.</li><li><strong>Left for its own task:</strong> manifests and the referrers index are read whole by oci-client, and an outside registry has no timeout of its own. Both were true for every pull before this change.</li></ul>
 <p>Checked against a real bundle: <code>keyless_real_bundle_from_cosign_verifies_against_its_own_roots</code> reads an attestation that cosign wrote with the public instance. It checks it against that instance's trusted root. The log's promise (the JCS bytes), the <code>dsse</code> entry's binding, the certificate's chain to Fulcio at the log's time, and the issuer and subject all hold. Only its statement, which is an attestation, is refused.</p>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="guide/numbers.html"><span>Before</span>How the numbers beside k3s were taken</a><a class="after" href="adr-people.html"><span>After</span>People's devices into the home network: peers, levels and where a level holds</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-keyless.md">docs/adr-keyless.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Next page"><a class="prev" rel="prev" href="guide/numbers.html"><span>Previous</span>How the numbers beside k3s were taken</a><a class="next" rel="next" href="adr-people.html"><span>Next</span>People's devices into the home network: peers, levels and where a level holds</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-keyless.md">docs/adr-keyless.md</a>.</p></footer>
 </div>
 </div>
 </body>

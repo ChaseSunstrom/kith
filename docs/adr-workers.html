@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="guide/index.html">Guide</a>
-    <a href="guide/index.html#decisions">Decisions</a>
-    <a href="index.html#numbers">Numbers</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -95,7 +96,7 @@
 <p>The first draft sent other Workloads "status only", left Blob, Share, Image, Cluster and Backup out of the table with no default for a kind not listed, forgot the controller's barrier write and the DNS loops' status writes, took a worker's word for which Devices are its own and which replicas it runs, and let a worker's word about a Blob or a Volume's <code>synced</code> cost another node its copy. Each is decided above. It also asked for the tests named under "Writes", "What changes" and "Step 5". A second pass found the rewrite sound with changes, which are in: Devices are held to <code>spec.node</code> and not to their name, the changed keys are noted where the first rewrite hashed every resource, the barrier is limited, and the rule for Blobs is said in the code's terms.</p>
 <p>A third pass read what was added after it (the other node routes, the API on a worker, a Node's status) and found: a Blob gate by namespace would hand a worker every backup of a namespace it runs one unit of; the route a node's writes arrive by checks nothing of what the sending node checks; a blob's file outlives its Blob by ten minutes; every node keeps every encrypted Volume's key; a ping's word about other nodes is believed; a mesh key said twice cuts both nodes off; and a redirect from a worker's API is followed by no <code>kith</code> and would send a client where a taken worker says. Each is decided above. It did not finish reading who believes a Device's, a Seat's and a Volume's status: step 5 reads those before it lets a worker write them.</p>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="adr-unlock.html"><span>Before</span>The ways into a node's encrypted state, and what each leaves open</a><a class="after" href="security-review-2.html"><span>After</span>Security review 2</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-workers.md">docs/adr-workers.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Next page"><a class="prev" rel="prev" href="adr-unlock.html"><span>Previous</span>The ways into a node's encrypted state, and what each leaves open</a><a class="next" rel="next" href="security-review-2.html"><span>Next</span>Security review 2</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-workers.md">docs/adr-workers.md</a>.</p></footer>
 </div>
 </div>
 </body>

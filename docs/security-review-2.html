@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="guide/index.html">Guide</a>
-    <a href="guide/index.html#decisions">Decisions</a>
-    <a href="index.html#numbers">Numbers</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -62,7 +63,7 @@
 <h2 id="kith-lang-and-kith-lsp">kith-lang and kith-lsp <a class="anchor" href="#kith-lang-and-kith-lsp" aria-label="Link to this section">#</a></h2>
 <ul><li>M1 <code>node_at</code> charged nothing for the nulls it leaves out of a list: the same class of bug as H3, on the way into a resource (<code>kith-lang/src/eval.rs:993</code>). (Test.) fixed: limits_hold_a_file_that_gives_a_list_shared_many_times</li><li>M2 An error's column is counted from the line's start, on every error, and kith-lsp does this on every keystroke (<code>eval.rs:963</code>). (Read; queued.)</li><li>L1 Chains of closures are dropped by recursion (<code>eval.rs:99</code>). (Read; queued.)</li><li>L2 An import is read whole before its size is checked, with no total across imports. This affects kith and kith-lsp only, not kithd (<code>kith-lang/src/lib.rs:284</code>). (Read; queued.)</li><li>Examined and sound:<ul><li>the parser's nesting is capped, and the evaluator runs on a 64 MB stack with a depth limit;</li><li>arithmetic is checked;</li><li>builtins charge before they allocate;</li><li>UTF-8 is stepped by characters;</li><li>imports are confined to the directory;</li><li>kith-lsp caps Content-Length, converts UTF-16 positions safely, and never runs or fetches anything.</li></ul></li></ul>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="adr-workers.html"><span>Before</span>A worker keeps no Secret that nothing placed on it names</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/security-review-2.md">docs/security-review-2.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Next page"><a class="prev" rel="prev" href="adr-workers.html"><span>Previous</span>A worker keeps no Secret that nothing placed on it names</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/security-review-2.md">docs/security-review-2.md</a>.</p></footer>
 </div>
 </div>
 </body>
