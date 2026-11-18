@@ -1101,7 +1101,9 @@ fn access_is_kiths_own_and_the_kubernetes_api_is_no_way_past_it() {
         "-o",
         "name",
     ]);
-    assert_eq!(watched, "deployment.apps/web\n");
+    // (A status change in its 2 s says the same Deployment again: what counts is which ones.)
+    let watched: std::collections::BTreeSet<&str> = watched.lines().collect();
+    assert_eq!(watched, std::collections::BTreeSet::from(["deployment.apps/web"]));
 
     // What kith gives no Workload it gives none through here: there is no field to ask it by.
     for (field, named) in [

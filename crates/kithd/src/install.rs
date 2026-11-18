@@ -23,6 +23,9 @@
 // spare partition table sits where the image ended, until the node's first start from
 // the disk, which makes both right (`gpt`).
 
+mod fb;
+
+use fb::Panel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -335,17 +338,21 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     Ok((disk.clone(), config))
 }
 
-/// Ask whoever is at the console. `ask` prints a question and reads a line.
-pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<Answers, String> {
+/// Ask whoever is at the console. `ask` takes the question's stop on the rail (an index into
+/// `fb::STOPS`), prints the question and reads a line.
+pub fn interview(disks: &[Disk], mut ask: impl FnMut(usize, &str) -> String) -> Result<Answers, String> {
     if disks.is_empty() {
         return Err("this machine has no disk to install on".into());
     }
     let listed: Vec<String> = disks.iter().map(|disk| format!("  {disk}\n")).collect();
     let some = |answer: String| Some(answer).filter(|answer| !answer.is_empty());
-    let disk = ask(&format!(
-        "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
-        listed.concat()
-    ));
+    let disk = ask(
+        0,
+        &format!(
+            "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
+            listed.concat()
+        ),
+    );
     let chosen = match disk.strip_prefix("serial:") {
         Some(serial) => by_serial(serial, disks)?,
         None => disks
@@ -354,20 +361,26 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
             .ok_or(format!("there is no disk `{disk}` here"))?,
     };
     let hostname = some(ask(
+        1,
         "The node's name (empty: one made from its network card's address)?",
     ));
-    let ip = some(ask("Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?"));
+    let ip = some(ask(2, "Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?"));
     let address = some(ask(
+        3,
         "Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)",
     ));
     let join = address.map(|address| Join {
         address,
-        token: ask("The join token (`kith node token` there)?"),
+        token: ask(3, "The join token (`kith node token` there)?"),
     });
-    let encrypt = ask("Keep its state encrypted, the key held by its cluster (yes, or empty: no)?") == "yes";
-    let again = ask(&format!(
-        "Everything on {chosen} will be erased. Type its name again to go on:"
-    ));
+    let encrypt = ask(
+        4,
+        "Keep its state encrypted, the key held by its cluster (yes, or empty: no)?",
+    ) == "yes";
+    let again = ask(
+        5,
+        &format!("Everything on {chosen} will be erased. Type its name again to go on:"),
+    );
     if again != disk && again != chosen.name {
         return Err(format!("`{again}` is not `{disk}`: nothing was written"));
     }
@@ -540,6 +553,21 @@ pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
     typed
 }
 
+/// How long a recovery key's screen waits for a line with nobody at the console: then it is
+/// cleared and the install goes on.
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A line typed (any), or `wait` with none: `Ok` either way; `Err` when no console can be
+/// typed at, so no key can be released.
+fn wait_for_key_line(typed: &std::sync::mpsc::Receiver<String>, wait: std::time::Duration) -> std::io::Result<()> {
+    match typed.recv_timeout(wait) {
+        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("no console can be typed at"))
+        }
+    }
+}
+
 /// Each line read from `console` to `lines`, until it ends or nobody listens. A line is read
 /// 4 KiB at most at a time: one longer (a serial line's noise, no newline) comes in pieces.
 fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<String>) {
@@ -680,8 +708,18 @@ pub async fn run(source: String) -> ! {
                 let asked = tokio::task::spawn_blocking(move || {
                     let typed = typed.lock().expect("nothing panics holding the keyboard");
                     let mut gone = false;
-                    let told = interview(&disks, |question| {
+                    // The picture is held while the questions are asked: dropped when this block
+                    // ends, the console is text again (none where there is no 32 bpp framebuffer).
+                    let mut screen = fb::open();
+                    let told = interview(&disks, |stop, question| {
                         eprintln!("\n{question}");
+                        if let Some(device) = screen.as_mut() {
+                            let mut frame = device.frame();
+                            fb::draw_question(&mut frame, &fb::STOPS, stop, question, fb::ANSWER);
+                            if let Err(e) = device.show(&frame) {
+                                eprintln!("kithd: install: the question is not on the screen: {e}");
+                            }
+                        }
                         typed.recv().unwrap_or_else(|_| {
                             gone = true;
                             String::new()
@@ -736,9 +774,39 @@ pub async fn run(source: String) -> ! {
     match wrote {
         Ok(recovery) => {
             if let Some(recovery) = recovery {
+                // Answers given (a file, a URL) are for an install nobody watches: no screen waits
+                // for the key then. Asked, the Enters typed before now are dropped first, so that
+                // none of them clears the key's screen at once.
+                let asked = given.is_none();
+                if asked {
+                    typed
+                        .lock()
+                        .expect("nothing panics holding the keyboard")
+                        .try_iter()
+                        .for_each(drop);
+                }
                 eprintln!(
                     "kithd: install: the node's state is encrypted. Its recovery key opens it where no cluster answers, and is shown this once: {recovery}"
                 );
+                if asked {
+                    // On the screen too, where there is one: held until a key is pressed (or KEY_WAIT
+                    // goes by), then cleared.
+                    let held = tokio::task::spawn_blocking(move || {
+                        let Some(mut device) = fb::open() else {
+                            return Ok(());
+                        };
+                        let mut frame = device.frame();
+                        let key = format!("Recovery key:\n{recovery}");
+                        fb::draw_question(&mut frame, &fb::STOPS, fb::STOPS.len() - 1, &key, fb::KEY);
+                        let typed = typed.lock().expect("nothing panics holding the keyboard");
+                        fb::hold_until_key(&mut device, &frame, || wait_for_key_line(&typed, KEY_WAIT))
+                    });
+                    match held.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                        Err(e) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                    }
+                }
             }
             // (Nothing to take out of a machine installed from its own memory: it starts at once.)
             let then = if memory {
@@ -860,6 +928,27 @@ async fn fetched(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery key's screen waits for a line typed, or for its wait with none (then the
+    /// install goes on); it is refused only when no console can be typed at at all.
+    #[test]
+    fn install_key_screen_waits_for_a_line_or_gives_up_after_its_wait() {
+        let (lines, typed) = std::sync::mpsc::channel::<String>();
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_ok(),
+            "nobody typed: it gives up"
+        );
+        lines.send(String::new()).expect("a listener");
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_secs(60)).is_ok(),
+            "a line released it"
+        );
+        drop(lines);
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_err(),
+            "no console at all is said"
+        );
+    }
 
     /// A console that sends no newline (a serial line's noise) comes in pieces of at most
     /// 4 KiB: what one line holds is bounded. A short line comes whole.
@@ -1225,7 +1314,7 @@ mod tests {
         let ask = |lines: &[&str]| {
             let mut lines = lines.iter();
             let mut asked = Vec::new();
-            let told = interview(&two, |question| {
+            let told = interview(&two, |_, question| {
                 asked.push(question.to_string());
                 (*lines.next().unwrap_or(&"")).to_string()
             });
@@ -1265,20 +1354,34 @@ mod tests {
         );
         assert!(ask(&["sda", "", "", "", "", ""]).0.is_err());
         assert!(ask(&["sdz"]).0.unwrap_err().contains("no disk `sdz`"));
-        assert!(interview(&[], |_| String::new()).is_err());
+        assert!(interview(&[], |_, _| String::new()).is_err());
         // At the console a disk may be named by its serial, as in the answers file; the
         // second time, by its serial again or its name.
         let mut two = two;
         two[1].serial = "S4EW0001".into();
         for again in ["serial:S4EW0001", "sdb"] {
             let mut lines = ["serial:S4EW0001", "", "", "", "", again].into_iter();
-            let told = interview(&two, |_| lines.next().unwrap().to_string()).unwrap();
+            let told = interview(&two, |_, _| lines.next().unwrap().to_string()).unwrap();
             assert_eq!(told.disk, "serial:S4EW0001");
         }
         let mut lines = ["serial:S4EW0001", "", "", "", "", "sda"].into_iter();
-        assert!(interview(&two, |_| lines.next().unwrap().to_string()).is_err());
-        let refused = interview(&two, |_| "serial:NONE".into()).unwrap_err();
+        assert!(interview(&two, |_, _| lines.next().unwrap().to_string()).is_err());
+        let refused = interview(&two, |_, _| "serial:NONE".into()).unwrap_err();
         assert!(refused.contains("no disk with serial NONE"), "{refused}");
+    }
+
+    #[test]
+    fn install_asks_each_question_at_its_stop_on_the_rail() {
+        let two = [disk("sda", 8), disk("sdb", 16)];
+        let mut stops = Vec::new();
+        let mut lines = ["sda", "", "10.0.0.5/24", "10.0.0.7:7443", "kith1.ab.cd", "yes", "sda"].into_iter();
+        let told = interview(&two, |stop, _| {
+            stops.push(stop);
+            lines.next().unwrap_or("").to_string()
+        });
+        assert!(told.is_ok(), "{told:?}");
+        // Disk, Name, Address, Join (its address and its token), Encryption, Erase: fb::STOPS.
+        assert_eq!(stops, [0, 1, 2, 3, 3, 4, 5]);
     }
 
     /// A disk image of 64 sectors with a GPT whose third partition is `config`, 4 sectors at sector 40.
