@@ -646,9 +646,12 @@ async fn replica(
     let _ = reach.set(Arc::downgrade(&shared));
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
-    if let Some((store, at, _)) = view {
+    if let Some((mut store, at, _)) = view {
         let _ = shared.raft.shutdown().await;
-        shared.store.lock().expect("nothing panics holding the store").store = store;
+        let mut state = shared.store.lock().expect("nothing panics holding the store");
+        store.continue_changes(&state.store);
+        state.store = store;
+        drop(state);
         shared.view.send_replace(Some(at));
         return Ok(shared);
     }
@@ -1090,7 +1093,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
         // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
-        let proxy = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        let services = services::run(shared.clone(), args.mesh, taken, stopping.clone());
+        // (What each pod may reach, kept in step with its policies: on a node alone too.)
+        let held = pods::keep_held(shared.clone(), stopping.clone());
+        let proxy = async {
+            tokio::join!(services, held);
+        };
         let ingress = async {
             // (A control node with --acme alone orders for the workers that serve ingress.)
             if args.ingress || args.acme.is_some() {

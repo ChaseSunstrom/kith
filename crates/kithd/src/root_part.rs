@@ -66,6 +66,10 @@ pub enum Request {
         hostname: String,
         net: Option<std::net::Ipv6Addr>,
         exit: Option<(u16, Vec<Ipv4Addr>)>,
+        /// The key of the resource it is a replica of, and what its policies let it reach
+        /// (`None`: all), as for `Pods::given`.
+        owner: String,
+        egress: Option<Vec<kith_mesh::pod::Egress>>,
     },
     /// `count` stream sockets made inside the pod `pod`'s namespace, for connections to its
     /// loopback: one thread and one `setns` for all of them.
@@ -376,6 +380,7 @@ pub fn claim(devices: impl IntoIterator<Item = PathBuf>) {
 pub trait Hands {
     /// What a created container is, until it is started.
     type Made;
+    #[allow(clippy::too_many_arguments)]
     fn pod(
         &self,
         state: &Path,
@@ -384,6 +389,8 @@ pub trait Hands {
         hostname: &str,
         net: Option<std::net::Ipv6Addr>,
         exit: Option<(u16, &[Ipv4Addr])>,
+        owner: &str,
+        egress: Option<Vec<kith_mesh::pod::Egress>>,
     ) -> Result<Given, String>;
     fn sockets(&self, pod: &str, v6: bool, count: usize) -> Result<Vec<OwnedFd>, String>;
     /// Whether `path` is the network namespace of a pod this root part made.
@@ -425,6 +432,8 @@ impl Hands for Nobody {
         _: &str,
         _: Option<std::net::Ipv6Addr>,
         _: Option<(u16, &[Ipv4Addr])>,
+        _: &str,
+        _: Option<Vec<kith_mesh::pod::Egress>>,
     ) -> Result<Given, String> {
         Err("this root part makes no pods".into())
     }
@@ -459,9 +468,11 @@ impl Hands for Today<'_> {
         hostname: &str,
         net: Option<std::net::Ipv6Addr>,
         exit: Option<(u16, &[Ipv4Addr])>,
+        owner: &str,
+        egress: Option<Vec<kith_mesh::pod::Egress>>,
     ) -> Result<Given, String> {
         let mut pods = self.pods.lock().expect("nothing panics holding the pods");
-        pods.given(state, id, namespace, hostname, net, exit)
+        pods.given(state, id, namespace, hostname, net, exit, owner, egress)
     }
 
     fn sockets(&self, pod: &str, v6: bool, count: usize) -> Result<Vec<OwnedFd>, String> {
@@ -579,12 +590,14 @@ impl<H: Hands> Root for Direct<'_, H> {
                 hostname,
                 net,
                 exit,
+                owner,
+                egress,
             } => {
                 // (The directory is the root part's own, never the asker's.)
                 let state = self.book.state().ok_or("this root part has no state directory")?;
                 let exit = exit.as_ref().map(|(tunnel, dns)| (*tunnel, dns.as_slice()));
                 self.hands
-                    .pod(&state, &id, &namespace, &hostname, net, exit)
+                    .pod(&state, &id, &namespace, &hostname, net, exit, &owner, egress)
                     .map(Reply::Pod)
             }
             Request::Sockets { pod, v6, count } => self.hands.sockets(&pod, v6, usize::from(count)).map(Reply::Sockets),
@@ -767,6 +780,8 @@ mod tests {
             hostname: &str,
             _: Option<std::net::Ipv6Addr>,
             _: Option<(u16, &[Ipv4Addr])>,
+            _: &str,
+            _: Option<Vec<kith_mesh::pod::Egress>>,
         ) -> Result<Given, String> {
             self.said("pod");
             let dir = state.join("pods").join(id);
@@ -807,6 +822,8 @@ mod tests {
             hostname: hostname.into(),
             net: None,
             exit: tunnel.map(|tunnel| (tunnel, vec!["10.9.0.1".parse().unwrap()])),
+            owner: "Workload/a/b".into(),
+            egress: None,
         }
     }
 
@@ -895,6 +912,8 @@ mod tests {
             hostname: "b-0".into(),
             net: None,
             exit: Some((7, vec![Ipv4Addr::LOCALHOST; 9])),
+            owner: "Workload/a/b".into(),
+            egress: None,
         };
         assert!(root.request(many).unwrap_err().contains("name servers"));
         assert_eq!(
