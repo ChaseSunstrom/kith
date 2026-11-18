@@ -1324,6 +1324,7 @@ mod tests {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh egress");
         }
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
         // The namespace is left as found, a panic too: the other tests take forwarding off as a
         // sign of a node not yet guarded.
         struct Forwarding;
@@ -1400,6 +1401,7 @@ mod tests {
         if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
             return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh pods");
         }
+        let _lo = crate::netlink::LO.lock().unwrap_or_else(|e| e.into_inner());
         up(1).unwrap();
         // (A range that is not the default, and not whole bytes: the masquerade matches its bits.)
         let range = range("198.18.16.0/20").unwrap();
