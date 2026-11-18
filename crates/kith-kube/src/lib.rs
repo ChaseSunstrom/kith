@@ -2398,7 +2398,9 @@ spec:
         assert!(containers[0]["readiness"].get("startSeconds").is_none(), "{spec:?}");
         assert!(containers[1]["liveness"].get("startSeconds").is_none(), "{spec:?}");
         assert!(
-            report.iter().any(|line| line.contains("readinessProbe.initialDelaySeconds")),
+            report
+                .iter()
+                .any(|line| line.contains("readinessProbe.initialDelaySeconds")),
             "{report:?}"
         );
     }
