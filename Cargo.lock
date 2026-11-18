@@ -1332,6 +1332,8 @@ dependencies = [
  "kith-packages",
  "kith-yaml",
  "nix 0.29.0",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
 ]
