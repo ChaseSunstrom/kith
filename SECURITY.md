@@ -801,7 +801,15 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
     `open`, the default, takes everything as before. What it does not close: a taken
     control node still writes into the log as itself (its own writes are held to a list
     in layer 2), and one that leads still appends what it likes until every node checks
-    what the leader appends (layer 3, T-0742). Today's hops rewrite what they pass on (a
+    what the leader appends (layer 3, T-0742). Nonces are kept in memory: a node that starts
+    again, or a new leader, takes once more a request it took in the ten minutes before, if a
+    node that saw it pass sends it again (layer 3 keeps them in the store). One Cluster that
+    says `required` makes every node require a signature, and every Cluster's `adminKey`
+    signs as the admin. A key whose private half no one has (mistyped), set by a signed write
+    under `required`, leaves no one able to sign as the admin; the CLI that signs (T-0744) is
+    to set only a key it holds. Signed bodies wait for each
+    other while they are checked (128 MiB held at once, 96 MiB the most for one), so a node
+    that sends large ones with bad signatures holds no more than that. Today's hops rewrite what they pass on (a
     write is passed to the leader as a store command, a restore with its time, `kith run`
     as a spec), so under `required` those signed by the caller are refused on the next
     node, not taken: sign the admin's changes to the Cluster at the node that leads, until

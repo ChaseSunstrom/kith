@@ -35,6 +35,21 @@ const AHEAD: u64 = 600;
 // signed uploads become common.
 const LIMIT: usize = 96 << 20;
 
+/// The MiB of signed bodies held at once before their signatures are checked: callers whose
+/// signatures do not hold (a taken node sending many large ones) wait for each other here,
+/// instead of each holding [`LIMIT`].
+static HOLDING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(128);
+
+/// The MiB a body takes from [`HOLDING`] while it is read: what its `Content-Length` says, or
+/// [`LIMIT`] where it says none; and the most of it read.
+fn held(length: Option<&str>) -> (u32, usize) {
+    let bytes = length
+        .and_then(|length| length.parse().ok())
+        .unwrap_or(LIMIT)
+        .min(LIMIT);
+    (bytes.div_ceil(1 << 20).max(1) as u32, bytes)
+}
+
 /// Why an unsigned hop is refused under `required`, naming the node that passed it.
 pub fn unsigned(node: &str) -> String {
     format!(
@@ -294,12 +309,16 @@ pub fn pass_on(call: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
-/// The request back, its body read whole, and what it holds.
-async fn read(request: Request) -> Result<(Request, axum::body::Bytes), String> {
+/// The request back, its body read whole, and what it holds; and its room in [`HOLDING`],
+/// held until the signature has been checked.
+async fn read(request: Request) -> Result<(Request, axum::body::Bytes, tokio::sync::SemaphorePermit<'static>), String> {
     let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, LIMIT).await;
+    let length = parts.headers.get(axum::http::header::CONTENT_LENGTH);
+    let (room, most) = held(length.and_then(|length| length.to_str().ok()));
+    let room = HOLDING.acquire_many(room).await.expect("HOLDING is never closed");
+    let bytes = axum::body::to_bytes(body, most).await;
     let bytes = bytes.map_err(|e| format!("a signed request's body is at most {} MiB: {e}", LIMIT >> 20))?;
-    Ok((Request::from_parts(parts, Body::from(bytes.clone())), bytes))
+    Ok((Request::from_parts(parts, Body::from(bytes.clone())), bytes, room))
 }
 
 fn path(request: &Request) -> String {
@@ -369,7 +388,7 @@ pub async fn passed(
         };
         return (request, hop(shared, node, None, &asked, Some(named), false));
     };
-    let (request, bytes) = match read(request).await {
+    let (request, bytes, _room) = match read(request).await {
         Ok(read) => read,
         // (The body is gone: refused, whatever the setting.)
         Err(why) => return (Request::new(Body::empty()), Err(why)),
@@ -421,7 +440,7 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
         request.extensions_mut().insert(caller);
         return next.run(request).await;
     };
-    let (mut request, bytes) = match read(request).await {
+    let (mut request, bytes, room) = match read(request).await {
         Ok(read) => read,
         Err(why) => return refused(StatusCode::PAYLOAD_TOO_LARGE, why),
     };
@@ -443,6 +462,7 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
         Err(why) if required => return refused(StatusCode::UNAUTHORIZED, format!("refused: {why}")),
         Err(_) => None,
     };
+    drop(room);
     request.extensions_mut().insert(Caller::Admin);
     within(signed, next.run(request)).await
 }
@@ -586,6 +606,16 @@ mod tests {
 
     /// The bytes are the ADR's, field by field, and the fixed seed's signature over them is
     /// this one (Ed25519 is deterministic): a signer elsewhere can be held to it.
+    #[test]
+    fn signed_bodies_hold_what_they_say_up_to_the_limit() {
+        assert_eq!(held(Some("0")), (1, 0));
+        assert_eq!(held(Some("1048577")), (2, 1048577));
+        // No length, one that is not a number, or one past the limit: the limit.
+        for length in [None, Some("lots"), Some("1000000000")] {
+            assert_eq!(held(length), (96, LIMIT), "{length:?}");
+        }
+    }
+
     #[test]
     fn signed_bytes_are_the_adrs() {
         assert_eq!(

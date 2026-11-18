@@ -1315,6 +1315,10 @@ fn signed_hops_alone_stand_once_signing_is_required() {
         code == "403" && said.contains("an unsigned caller passed on by node beta"),
         "{code} {said}"
     );
+    // A node asking for itself, naming no one, signs nothing yet (layers 2 and 3 hold what it
+    // may write): pinned, so a later layer changes it on purpose.
+    let (code, said) = hop(&[]);
+    assert!(!said.contains("unsigned caller"), "{code} {said}");
     // With the admin's signature for alpha it stands, once.
     let header = signed_by_admin(&id, "alpha", "GET", logs, b"", 2);
     let (code, said) = hop(&[(by, "local socket"), (signed, &header)]);

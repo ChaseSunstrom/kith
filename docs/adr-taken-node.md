@@ -196,8 +196,9 @@ kith-signed-v1
 Replay across nodes: a hop names its target, so a header taken at n2 does not pass at n3. A
 write signed for `*` could be sent to two nodes, and both pass it to the leader; the leader
 keeps one nonce cache, so the second is refused there. A leader that changes loses its
-cache: until layer 3 keeps nonces in the store, a write can be replayed once across a
-change of leader, inside its five minutes. Said so; layer 3 ends it.
+cache, and so does a node that starts again: until layer 3 keeps nonces in the store, a
+request can be replayed once across a change of leader or a restart, inside its window, by a
+node that saw it pass. Said so; layer 3 ends it.
 
 ## Layer 2: what a control node may write for itself
 
