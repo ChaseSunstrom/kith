@@ -391,7 +391,10 @@ async fn within(
 /// Call inside the runtime.
 fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
     use tokio::signal::unix::{SignalKind, signal};
-    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
+    let heard = (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?);
+    // (A kept kithd inherits the keeper's blocked mask: unblocked once these handlers are set.)
+    keeper::unblock_heard();
+    Ok(heard)
 }
 
 fn default_state() -> Option<PathBuf> {
