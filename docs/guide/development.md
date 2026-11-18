@@ -37,6 +37,13 @@ python3 ci/budgets.py            # binary-size and memory budgets, enforced in C
 python3 ci/bench.py              # the plan's numbers for one node: cached start < 150 ms, 20+ containers under 30 MB of kithd
 ```
 
+The tests of a pushed commit can run on another kith node instead, as a Job there:
+`KITH_REMOTE=ADDR KITH_REMOTE_CREDS=DIR sh ci/remote.sh [COMMIT [CARGO TEST ARGS]]`, with DIR
+holding the cluster's `ca.crt` and a client's `root.crt` and `root.key`. It prints what failed
+and exits as `cargo test` did. On a kith OS mini PC (16 CPUs) the whole workspace took 218 s from
+a fresh clone, with one test that differs there: `node_policy_refuses_what_the_node_turned_off`
+(kithd's e2e) timed out in the pod.
+
 Time budgets are medians of five runs on one machine, no VM. `python3 ci/budgets.py --times`
 prints them; `python3 ci/budgets.py` holds each to twice the slowest of three medians on main on
 the CI runner, rounded up: a ceiling for a regression, not a claim of speed. A line reads `ok
