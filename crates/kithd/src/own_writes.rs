@@ -71,15 +71,14 @@ fn kind_of(key: &str) -> &str {
     key.split('/').next().unwrap_or(key)
 }
 
-/// A control node's own Node: any status field, its raft id only as its name gives it. The boot
+/// A control node's own Node: any status field, its raft id only as its name gives it (the boot
 /// writes that id again, and a follower forwards the write to the leader, which would otherwise
-/// hold it as the node's own write.
-fn own_node(name: &str, fields: &Fields) -> Result<(), String> {
+/// hold it as the node's own write), and no mesh key another node holds (as a worker's may not).
+fn own_node(store: &Store, name: &str, key: &str, fields: &Fields) -> Result<(), String> {
     let id = kith_store::node_id(name).to_string();
     match fields.get("raftId") {
-        None => Ok(()),
-        Some(said) if said.as_str() == Some(id.as_str()) => Ok(()),
-        Some(_) => Err(refused(format!("Node/{name}"), "the raft id is the one its name gives")),
+        Some(said) if said.as_str() != Some(id.as_str()) => Err(refused(key, "the raft id is the one its name gives")),
+        _ => worker::mesh_key_elsewhere(store, name, key, fields),
     }
 }
 
@@ -124,7 +123,7 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
         Command::Patch { statuses } => {
             for (key, fields) in &statuses {
                 if *key == mine {
-                    own_node(name, fields)?;
+                    own_node(store, name, key, fields)?;
                 } else {
                     class(kind_of(key))?;
                     worker::patch(store, &who, key, fields)?;
@@ -165,6 +164,9 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
         }
         Command::Rollback { key, .. } => Err(refused(key, "a rollback is not a control node's own write")),
         Command::Import { .. } => Err(refused("a whole store", "only an admin brings one in")),
+        // (A follower's relayed write ends with a Mark, the barrier it waits for: a no-op where the
+        // store is marked already. Unmarked, it is the leader's to make.)
+        Command::Mark if store.marked() => Ok(Command::Mark),
         Command::Mark => Err(refused("the store's format", "only the leader changes it")),
     }
 }
@@ -324,5 +326,44 @@ mod tests {
             .await
             .unwrap();
         assert!(said.contains("Err"), "{said}");
+    }
+
+    /// A follower's relayed write ends with a Mark (`raft.rs` `relayed`): the barrier it waits
+    /// for. On a store marked already it is a no-op and let through; an unmarked store is marked
+    /// by the leader alone.
+    #[tokio::test]
+    async fn own_writes_let_a_mark_through_only_where_the_store_is_marked() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-mark", node(&ca, "mark-c"), &[]).await;
+        assert!(checked(&shared, "mark-c", Command::Mark).is_err());
+        shared.store.lock().unwrap().store.mark();
+        assert!(checked(&shared, "mark-c", Command::Mark).is_ok());
+    }
+
+    /// Another node's mesh key, said in a control node's own Node, is refused as a worker's is:
+    /// two nodes that say one key are both left out of the mesh.
+    #[tokio::test]
+    async fn own_writes_refuse_a_mesh_key_another_node_holds() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-mesh", node(&ca, "mesh-c"), &[]).await;
+        {
+            let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: mesh-o}\nspec: {}\n";
+            let other = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(other).unwrap();
+            let mesh = serde_json::json!({ "mesh": { "key": "QUFB", "port": 51820 } });
+            store.set_status("Node/mesh-o", Some(mesh)).unwrap();
+        }
+        let own = |key: &str| Command::Patch {
+            statuses: vec![(
+                "Node/mesh-c".to_string(),
+                serde_json::json!({ "mesh": { "key": key, "port": 51820 } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )],
+        };
+        assert!(checked(&shared, "mesh-c", own("QUFB")).is_err());
+        assert!(checked(&shared, "mesh-c", own("TkVX")).is_ok());
     }
 }

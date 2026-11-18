@@ -393,17 +393,21 @@ pub async fn run(shared: Arc<Shared>, cache: Arc<Cache>, out: watch::Sender<Arc<
         if let Some(blocks) = round.blocks {
             out.send_replace(Arc::new(blocks));
         }
-        // (A worker answers by its lists and leaves saying how they are to the control nodes.)
-        if !round.statuses.is_empty()
-            && !crate::access::worker(&shared, shared.members.me())
-            && let Err(e) = shared
+        // (A worker answers by its lists and leaves saying how they are to the control nodes. The
+        // leader alone says them, as the DNS statuses: a follower's would be refused as its own.)
+        if !round.statuses.is_empty() && !crate::access::worker(&shared, shared.members.me()) {
+            if !crate::dns::leads(&shared) {
+                // Said again at the next pass, which may find this node leading.
+                lists.unwritten();
+            } else if let Err(e) = shared
                 .submit(kith_store::Command::Status {
                     statuses: round.statuses,
                 })
                 .await
-        {
-            eprintln!("kithd: reporting on block lists: {e}");
-            lists.unwritten();
+            {
+                eprintln!("kithd: reporting on block lists: {e}");
+                lists.unwritten();
+            }
         }
         let due = lists.due();
         tokio::select! {

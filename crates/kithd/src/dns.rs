@@ -384,6 +384,14 @@ pub async fn bind(listen: SocketAddr) -> Result<(UdpSocket, TcpListener), String
     Err(format!("serving DNS on {listen}: no port is free on both UDP and TCP"))
 }
 
+/// Whether this node leads the log: the one control node that says the DNS statuses (and the
+/// block lists') for all of them.
+pub fn leads(shared: &Shared) -> bool {
+    let metrics = shared.raft.metrics();
+    let metrics = metrics.borrow();
+    metrics.current_leader == Some(metrics.id)
+}
+
 /// Serve DNS until kithd stops.
 pub async fn run(
     shared: Arc<Shared>,
@@ -467,12 +475,17 @@ pub async fn run(
             // (Every node that answers says the same of the records: a worker leaves the
             // saying to the control nodes, whose it is to write.)
             let worker = crate::access::worker(&shared, shared.members.me());
-            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker)
-                && let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await
-            {
-                eprintln!("kithd: reporting on DNS records: {e}");
-                // Tried again at the next change to the store.
-                built_from = None;
+            if let Some(statuses) = reports.filter(|statuses| !statuses.is_empty() && !worker) {
+                // (Every control node builds the same statuses: the leader alone says them. A
+                // follower's would be passed on as its own write, and refused.)
+                if !leads(&shared) {
+                    // Said again at the next change to the store, which may find this node leading.
+                    built_from = None;
+                } else if let Err(e) = shared.submit(kith_store::Command::Status { statuses }).await {
+                    eprintln!("kithd: reporting on DNS records: {e}");
+                    // Tried again at the next change to the store.
+                    built_from = None;
+                }
             }
             if generation.changed().await.is_err() {
                 return;
@@ -1165,5 +1178,21 @@ spec: {}
         assert!(!is_self(at("1.1.1.1:53"), at("0.0.0.0:53")));
         // Any address of this machine, when listening on all of them.
         assert!(is_self(at("127.0.0.2:53"), at("0.0.0.0:53")));
+    }
+
+    /// Every control node builds the same DNS statuses, and only the leader says them: a
+    /// follower's would be passed on as its own write, and refused for the kinds it does not hold.
+    #[tokio::test]
+    async fn dns_statuses_are_said_by_the_leader_alone() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "dns-c");
+        let shared = crate::cluster::pinned_peer::shared_with("dns-leader", me, &[]).await;
+        assert!(!leads(&shared));
+        let id = shared.raft.metrics().borrow().id;
+        let one = std::collections::BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        let leads_now = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
+        leads_now.current_leader(id, "leads").await.unwrap();
+        assert!(leads(&shared));
     }
 }

@@ -157,6 +157,21 @@ fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Refused where the mesh key `fields` say is another node's: two nodes that say one key are both
+/// left out of the mesh, so saying another's cuts it off. (A Node's own patch, by a worker or a
+/// control node alike: `own_writes` calls it too.)
+pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &Fields) -> Result<(), String> {
+    let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
+    let theirs = |other: &Resource| {
+        let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
+        other.metadata.name != node && has.is_some() && has == said
+    };
+    match store.list(Some("Node")).find(|other| theirs(other)) {
+        Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
+        None => Ok(()),
+    }
+}
+
 pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
@@ -214,16 +229,7 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
                     ));
                 }
             }
-            // Two nodes that say one key are both left out of the mesh: saying another's cuts it off.
-            let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
-            let theirs = |other: &Resource| {
-                let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
-                other.metadata.name != node && has.is_some() && has == said
-            };
-            match store.list(Some("Node")).find(|other| theirs(other)) {
-                Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
-                None => Ok(()),
-            }
+            mesh_key_elsewhere(store, node, key, fields)
         }
         "Blob" => {
             only(key, fields, &["nodes"])?;
