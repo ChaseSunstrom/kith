@@ -16,6 +16,8 @@
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #   sh ci/vm.sh --test tpm      the same machine with a TPM: its key sealed to the system it runs
 #   sh ci/vm.sh --test duress   the same machine given a new recovery key and a duress code, which is typed
+#   sh ci/vm.sh --test blackout three encrypted nodes (two with a TPM, a worker) losing power at once in the
+#                               middle of writes and started together: nothing typed, a leader, no write lost
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -113,6 +115,14 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    runs on until unlocked; its own duress code, typed at its waiting
                    console, is answered as a wrong key is, its lock record is erased,
                    the cluster forgets its key, and nothing opens it after
+  --test blackout  instead: three nodes the installer made, each with its state
+                   encrypted: two control nodes sealed by their TPMs (swtpm) and a
+                   worker with none, with writes going in and a Workload on the worker
+                   and on a control node; all three lose power at the same moment and
+                   start together, with nothing typed at any console: the control
+                   nodes open from their TPMs, one hands the worker its key, a leader
+                   is elected, every acknowledged write is there and both Workloads
+                   run again; needs swtpm
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -266,11 +276,12 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
 [ "$test" != duress ] || test=crypt duress=1
+[ "$test" != blackout ] || sealing=1
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in

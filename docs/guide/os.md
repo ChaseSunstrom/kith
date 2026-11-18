@@ -459,6 +459,7 @@ kith node duress beta                  # a duress code for beta, shown once: typ
 kith node duress --all                 # one code for the whole cluster (--off takes either away)
 sh ci/vm.sh --test crypt               # all of it, in QEMU, on a disk that is a file
 sh ci/vm.sh --test tpm                 # the seal, with a software TPM (swtpm)
+sh ci/vm.sh --test blackout            # every node killed at once and started together: nothing typed
 sh ci/vm.sh --test duress              # the new recovery key and the duress code, the same way
 ```
 
@@ -471,7 +472,9 @@ stays).
 **The recovery key.** The installer shows it once, at the console, when it is done (32 digits in
 groups of four): write it down. Typed at a waiting machine's console, it opens the state where
 no cluster answers: a laptop away from home, or a cluster whose nodes were all off at once. It
-opens a locked node too; only `wipe` of a running node, or a duress code, ends that.
+opens a locked node too; only `wipe` of a running node, or a duress code, ends that. A cluster
+that must come back from a power cut with nobody there seals its control nodes instead: [When
+every node was off](cluster.md#when-every-node-was-off).
 
 An install nobody watched (from a URL, or the network) has a recovery key nobody saw. `kith node
 recovery beta` has beta, while it runs, make a new one and show it this once (kept nowhere); the

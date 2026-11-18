@@ -338,6 +338,44 @@ The GPU is a `DeviceClaim` ([Hardware](hardware.md#hardware)); the checkpoint fo
 program's. `sh ci/vm.sh --test pods` runs this around a drain: the Job waits while its node is
 drained, then resumes from the step it left.
 
+## When every node was off
+
+A power cut takes every node at once, and a cluster of [encrypted
+nodes](os.md#encrypted-state) must then come back with nobody at a console. It does, when it was
+set up for it:
+
+```sh
+kith node seal n1                      # each control node (a voter) keeps its own key in its TPM
+kith node seal n2
+kith get NodeKey                       # says which nodes are sealed
+sh ci/vm.sh --test blackout            # two sealed control nodes and a worker, killed at once, started together
+```
+
+- **The machines must start by themselves.** Set the BIOS (or the board's firmware) to
+  "Restore on AC power loss: Power On" (or "Last State"), or start them over the network by
+  Wake-on-LAN from another machine that stays up. A machine that waits for a button is a node that
+  is off.
+- **Seal every voter.** A sealed control node opens its state from its own TPM with no node asked,
+  so the voters start without each other, elect a leader and a quorum forms. If one voter is not
+  sealed it waits for a sealed one to answer, and while it waits it is not a voter. Seal at least
+  as many as make a quorum; sealing all of them is the plain rule.
+- **Unsealed nodes and workers wait for a sealed node.** A node with no seal (a worker, say) asks
+  the control nodes it knows for its key every few seconds, and is handed it as soon as one of
+  them is up; nothing is typed. Its workloads start again after that.
+- **A node that was changed is refused by its TPM.** One that was updated, or whose firmware
+  changed, since it was sealed is not given the key: it asks the cluster for it instead, and seals
+  again once open. When every node was off and one of them was changed, that one waits for the
+  others, which open from their TPMs; the cluster does not need it to start.
+- **The last way is a recovery key.** If no sealed node will open (every TPM was replaced, or the
+  machines were moved), type one control node's [recovery
+  key](os.md#encrypted-state) at its console. That node opens its state and, with the cluster's
+  records in it, hands each of the others its key as they ask: only the one recovery key is
+  typed.
+
+Writes the cluster acknowledged before the cut are there after it: the test checks every one.
+Plan for the quorum, not for one machine: with three control nodes, two sealed and started are
+enough.
+
 ## DNS
 
 ```sh
