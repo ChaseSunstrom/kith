@@ -1,7 +1,7 @@
 //! The kernel's side: a WireGuard link made and addressed over route netlink, its key and
 //! peers set and read over generic netlink.
 
-use crate::{Key, MESH_BITS, NODE_BITS, Peer};
+use crate::{Key, MESH_BITS, Peer};
 use netlink_packet_core::{
     NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkDeserializable,
     NetlinkMessage, NetlinkPayload, NetlinkSerializable,
@@ -18,7 +18,7 @@ use netlink_packet_wireguard::{
 use netlink_sys::{Socket, SocketAddr, protocols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A peer as the kernel has it.
@@ -279,11 +279,16 @@ impl Device {
             changes.push(WireguardPeer(gone));
         }
         for peer in wanted.values().filter(|peer| had.get(&peer.key) != Some(*peer)) {
-            let allowed = |net: &Ipv6Addr| {
+            // Each allowed address is written in its own family (an IPv4 one is a /32, say).
+            let allowed = |&(net, bits): &(IpAddr, u8)| {
+                let family = match net {
+                    IpAddr::V4(_) => WireguardAddressFamily::Ipv4,
+                    IpAddr::V6(_) => WireguardAddressFamily::Ipv6,
+                };
                 WireguardAllowedIp(vec![
-                    WireguardAllowedIpAttr::Family(WireguardAddressFamily::Ipv6),
-                    WireguardAllowedIpAttr::IpAddr((*net).into()),
-                    WireguardAllowedIpAttr::Cidr(NODE_BITS),
+                    WireguardAllowedIpAttr::Family(family),
+                    WireguardAllowedIpAttr::IpAddr(net),
+                    WireguardAllowedIpAttr::Cidr(bits),
                 ])
             };
             let mut new = vec![

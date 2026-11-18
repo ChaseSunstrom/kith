@@ -418,9 +418,9 @@ pub fn tables() -> Result<bool> {
 
 // ---- nftables, as the kernel takes it (nfnetlink): a few attributes by hand ----
 
-const NESTED: u16 = 0x8000;
+pub(crate) const NESTED: u16 = 0x8000;
 
-fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+pub(crate) fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(value.len() + 8);
     bytes.extend((value.len() as u16 + 4).to_ne_bytes());
     bytes.extend(kind.to_ne_bytes());
@@ -429,7 +429,7 @@ fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn text(kind: u16, text: &str) -> Vec<u8> {
+pub(crate) fn text(kind: u16, text: &str) -> Vec<u8> {
     attribute(kind, &[text.as_bytes(), &[0]].concat())
 }
 
@@ -438,19 +438,19 @@ pub(crate) fn number(kind: u16, number: u32) -> Vec<u8> {
 }
 
 /// An expression of a rule: its name and what it is told.
-fn expression(name: &str, told: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn expression(name: &str, told: &[Vec<u8>]) -> Vec<u8> {
     let told = attribute(2 | NESTED, &told.concat());
     attribute(1 | NESTED, &[text(1, name), told].concat())
 }
 
 /// Register 1 is what `bytes` are (the comparison every rule here ends its looking with).
-fn is(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn is(bytes: &[u8]) -> Vec<u8> {
     let value = attribute(3 | NESTED, &attribute(1, bytes));
     expression("cmp", &[number(1, 1), number(2, 0), value])
 }
 
 /// The name of the link a packet came in by (6) or goes out by (7), in register 1.
-fn link_name(which: u32) -> Vec<u8> {
+pub(crate) fn link_name(which: u32) -> Vec<u8> {
     expression("meta", &[number(2, which), number(1, 1)])
 }
 
@@ -505,7 +505,7 @@ fn marked() -> Vec<u8> {
 
 /// The bytes `bytes` are at `offset` into the packet's header `base` (1: network, 2:
 /// transport), compared in register 1.
-fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
     let load = expression(
         "payload",
         &[
@@ -519,12 +519,12 @@ fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// The packet's family is `family` (meta nfproto: 2 IPv4, 10 IPv6).
-fn nfproto(family: u8) -> Vec<u8> {
+pub(crate) fn nfproto(family: u8) -> Vec<u8> {
     [expression("meta", &[number(2, 15), number(1, 1)]), is(&[family])].concat()
 }
 
 /// The packet's transport protocol is `protocol` (meta l4proto: 6 TCP, 17 UDP).
-fn l4proto(protocol: u8) -> Vec<u8> {
+pub(crate) fn l4proto(protocol: u8) -> Vec<u8> {
     [expression("meta", &[number(2, 16), number(1, 1)]), is(&[protocol])].concat()
 }
 
@@ -703,6 +703,11 @@ impl Batch {
         let mut chain = vec![text(1, self.table), text(3, name), hook, text(7, kind)];
         chain.extend(policy.map(|policy| number(5, policy)));
         self.say(0xa03, family, 0, &chain);
+    }
+
+    /// A chain of the table no hook reaches: a rule jumps to it.
+    pub(crate) fn plain(&mut self, family: u8, name: &str) {
+        self.say(0xa03, family, 0, &[text(1, self.table), text(3, name)]);
     }
 
     /// A rule at the end of `chain`, of `expressions`.
