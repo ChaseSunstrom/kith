@@ -19,6 +19,9 @@
 #   sh ci/vm.sh --test blackout four encrypted nodes (three control, two of them with a TPM, and a worker)
 #                               losing power at once in the middle of writes and started again: nothing
 #                               typed, a leader from the two sealed ones, no write lost
+#   sh ci/vm.sh --test alone    two nodes, the worker set to run alone: the control node off and the worker
+#                               started again, it runs its replica and holds its Job after 30 s, with the risks
+#                               said; the control node back, the replica placed there is stopped on the worker
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -125,6 +128,13 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    third still off, which then, and the worker, are handed their keys;
                    every acknowledged write is on all three control nodes and both
                    Workloads are started again; needs swtpm
+  --test alone    instead: two nodes the installer made, each with its state not
+                   encrypted: a control node and a worker set to `alone: run`, with a
+                   one-replica Workload and a Job on the worker; the control node is
+                   stopped and the worker started again: after about 30 s it says so,
+                   with the risks, runs the replica and holds the Job; the control node
+                   back, the worker says since when it ran alone and until when, and
+                   the replica placed on the control node is stopped on the worker
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -278,7 +288,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive | alone) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, alone, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1

@@ -555,6 +555,15 @@ fn control_nodes(shared: &Shared, me: &str) -> Vec<Upstream> {
 
 const OLDER: &str = "this control node is older than workers: update it";
 
+/// The line said when a view that failed (and was said so, `said`) is taken again: once, and
+/// `said` is cleared, so a failure that comes back is said again.
+fn back(said: &mut String, node: &str, address: &str) -> Option<String> {
+    (!said.is_empty()).then(|| {
+        said.clear();
+        format!("kithd: node {node} ({address}) sends its view again")
+    })
+}
+
 /// Follow the view `upstream` sends until it ends. `Ok`: something of it was taken.
 async fn stream(
     follower: &mut Follower<'_>,
@@ -648,7 +657,12 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
             let upstream = &nodes[turn % nodes.len()];
             match stream(&mut follower, upstream, &mut stopping).await {
                 // (It was there: called again first, at once.)
-                Ok(_) => pause = Duration::from_secs(1),
+                Ok(_) => {
+                    if let Some(line) = back(&mut said, &upstream.name, &upstream.address) {
+                        eprintln!("{line}");
+                    }
+                    pause = Duration::from_secs(1);
+                }
                 Err(why) => {
                     turn += 1;
                     let why = format!("node {} ({}) sends no view: {why}", upstream.name, upstream.address);
@@ -1213,5 +1227,20 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
         std::fs::write(path(&dir), r#"{"format":2,"at":1,"resources":[]}"#).unwrap();
         assert!(load(&dir).unwrap_err().contains("newer kithd"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A control node whose view failed (and was said so) is said to send its view again once a
+    /// pass takes it; said once, and not again while it still sends it.
+    #[test]
+    fn alone_a_view_that_comes_back_is_said_once() {
+        let mut said = String::new();
+        assert!(back(&mut said, "n1", "10.9.0.1:7443").is_none());
+        said = "node n1 (10.9.0.1:7443) sends no view: Host is unreachable".into();
+        assert_eq!(
+            back(&mut said, "n1", "10.9.0.1:7443").as_deref(),
+            Some("kithd: node n1 (10.9.0.1:7443) sends its view again")
+        );
+        assert!(said.is_empty());
+        assert!(back(&mut said, "n1", "10.9.0.1:7443").is_none());
     }
 }

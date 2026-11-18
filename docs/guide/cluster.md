@@ -417,10 +417,13 @@ The risks, said on the console and in that status:
 - a Job is not started alone.
 
 When a leader answers, the node catches up as it does on any store change: what was moved off is
-stopped, and what changed is replaced. A state the node cannot open alone does not open: an
-encrypted state whose key the cluster holds is opened only once a control node is up (see
-[when every node was off](#when-every-node-was-off)), so such a node runs nothing alone. Seal it,
-or keep its state unencrypted, for `alone: run` to help.
+stopped, and what changed is replaced.
+
+Running alone needs state the node can open by itself: unencrypted, or sealed to its TPM. A node
+whose state key the cluster holds cannot run alone: its state opens only once a control node is up
+(see [when every node was off](#when-every-node-was-off)), and the `alone` setting is in that
+state, so kithd cannot read it before then. Such a node runs nothing alone whatever `alone: run`
+says, and waits for a leader as it does without the setting. The setting is not refused for it.
 
 ## DNS
 
