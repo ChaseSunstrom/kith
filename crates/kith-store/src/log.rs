@@ -96,6 +96,7 @@ impl Log {
                 let format = match &entry.payload {
                     openraft::EntryPayload::Normal(crate::Command::Mark) => 2,
                     openraft::EntryPayload::Normal(crate::Command::MarkSigned) => 3,
+                    openraft::EntryPayload::Normal(crate::Command::MarkChecked) => 4,
                     _ => 0,
                 };
                 if format > 1 {

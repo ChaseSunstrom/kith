@@ -592,16 +592,19 @@ async fn write(
             return Json(None::<(Reply, u64)>).into_response();
         }
         // The store's format is the leader's own to change (`tend_format`, where it leads): a
-        // Mark or MarkSigned sent here is taken only as a no-op, the barrier a follower's relayed
-        // write waits for, whoever the headers say it is for. Nor is a signed entry taken before
-        // format 3: a member that reads format 2 could not read it (T-0779).
+        // Mark, MarkSigned or MarkChecked sent here is taken only as a no-op, the barrier an
+        // older follower's relayed write waits for (T-0779). A signed entry is the leader's own
+        // to write, from a signed request it checked (`Shared::write_as`): never taken from
+        // another node, whoever the headers say it is for (T-0783).
         let why = {
             let state = shared.store.lock().expect("a handler panicked holding the store");
+            let format = kith_store::format_of(&state.store);
             match command {
-                Command::Mark if !state.store.marked() => Some("the store's format: only the leader changes it"),
-                Command::MarkSigned if !state.store.signing() => Some("the store's format: only the leader changes it"),
-                Command::Signed { .. } if !state.store.signing() => {
-                    Some("a signed entry before the store is in format 3")
+                Command::Mark if format < 2 => Some("the store's format: only the leader changes it"),
+                Command::MarkSigned if format < 3 => Some("the store's format: only the leader changes it"),
+                Command::MarkChecked if format < 4 => Some("the store's format: only the leader changes it"),
+                Command::Signed { .. } => {
+                    Some("a signed entry: only the leader writes them, from the request it checked")
                 }
                 _ => None,
             }
@@ -843,11 +846,35 @@ impl Shared {
         if viewing {
             return crate::view::write(self, &command).await;
         }
+        // A signed request's change goes in the log as signed once every member checks that
+        // (format 4; a format 3 kithd refuses every signed entry, and its store would part from
+        // the others'): its header, method, path and body with it, which every node checks
+        // before it applies the change (`access_sign::admit`). (Sent on to a leader, it is sent
+        // bare.)
+        let entry = {
+            let checking = self
+                .store
+                .lock()
+                .expect("a handler panicked holding the store")
+                .store
+                .checking();
+            let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
+            match relay {
+                Some((header, relay)) if checking && relay.carries(&command) => Command::Signed {
+                    header,
+                    method: relay.method,
+                    path: relay.path,
+                    body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &relay.body),
+                    command: Box::new(command.clone()),
+                },
+                _ => command.clone(),
+            }
+        };
         let deadline = Instant::now() + PATIENCE;
         let mut refused = None;
         loop {
             let turn = self.turn(&command, who).await?;
-            let written = tokio::time::timeout(PATIENCE, self.raft.client_write(command.clone())).await;
+            let written = tokio::time::timeout(PATIENCE, self.raft.client_write(entry.clone())).await;
             // (Let go before the leader is asked: it holds its own.)
             drop(turn);
             let leader = match written {
@@ -916,8 +943,10 @@ impl Shared {
             return self.relayed(access_sign::pass_on(call), at, &relay).await;
         }
         // A signed request's change that is not carried is not sent on as this node's own write: the
-        // leader would take it as none, with no signature checked there. (A Mark is this node's own.)
-        if access_sign::current().is_some() && !matches!(command, Command::Mark) {
+        // leader would take it as none, with no signature checked there. (The barrier, an empty
+        // Patch, is this node's own: `relayed`.)
+        let barrier = matches!(command, Command::Patch { statuses } if statuses.is_empty());
+        if access_sign::current().is_some() && !barrier {
             let why = "refused: a signed request's change that is not passed on as it came (the route is \
                        not one the leader checks the signature of); send it to the leader directly";
             return Forward::Failed(Error::Invalid(why.into()));
@@ -991,7 +1020,9 @@ impl Shared {
                     let why = format!("the leader at {at} did not answer with the changes it made");
                     return Forward::Failed(unavailable(why));
                 };
-                let index = match Box::pin(self.write_as(Command::Mark, None)).await {
+                // (An empty Patch: a write that changes nothing, which any node may send on.)
+                let barrier = Command::Patch { statuses: vec![] };
+                let index = match Box::pin(self.write_as(barrier, None)).await {
                     Ok((_, index)) => index,
                     Err(e) => return Forward::Failed(e),
                 };
@@ -1036,7 +1067,8 @@ fn changes_access(command: &Command) -> bool {
         | Command::Patch { .. }
         | Command::Report { .. }
         | Command::Mark
-        | Command::MarkSigned => false,
+        | Command::MarkSigned
+        | Command::MarkChecked => false,
     }
 }
 
@@ -1125,7 +1157,8 @@ const FRESH: Duration = Duration::from_secs(30);
 
 /// Which of `members` (but `me`) are not known to read format `wanted`: not heard lately,
 /// or heard saying less. While there is one the leader does not move the store to it
-/// ([`Command::Mark`], [`Command::MarkSigned`]), which such a kithd could not read.
+/// ([`Command::Mark`], [`Command::MarkSigned`], [`Command::MarkChecked`]), which such a kithd
+/// could not read.
 fn not_reading(
     heard: &BTreeMap<NodeId, (u32, Instant)>,
     members: &BTreeSet<NodeId>,
@@ -1184,7 +1217,11 @@ async fn mark(shared: &Shared, said: &mut Vec<String>) -> Result<(), String> {
     if waiting.is_empty() {
         let (command, what) = match wanted {
             2 => (Command::Mark, "when each resource was first made"),
-            _ => (Command::MarkSigned, "the nonces of signed entries"),
+            3 => (Command::MarkSigned, "the nonces of signed entries"),
+            _ => (
+                Command::MarkChecked,
+                "signed requests as signed entries, every node checking them",
+            ),
         };
         let marked = shared.submit(command).await;
         marked.map_err(|e| format!("moving the store to format {wanted}: {e}"))?;
@@ -2118,7 +2155,7 @@ mod tests {
     /// member to say it reads 3: one that reads 2 holds back 3, not 2.
     #[test]
     fn store_format_3_waits_for_every_member_to_say_it_reads_it() {
-        assert_eq!(kith_store::FORMAT, 3);
+        assert_eq!(kith_store::FORMAT, 4);
         let now = Instant::now() + Duration::from_secs(3600);
         let ago = |seconds: u64| now - Duration::from_secs(seconds);
         let set = |ids: &[u64]| ids.iter().copied().collect::<BTreeSet<_>>();
@@ -2135,7 +2172,38 @@ mod tests {
         kith_store::run(&mut store, Command::Mark).unwrap();
         assert_eq!(kith_store::format_of(&store) + 1, 3);
         kith_store::run(&mut store, Command::MarkSigned).unwrap();
+        assert_eq!(kith_store::format_of(&store) + 1, 4);
+        kith_store::run(&mut store, Command::MarkChecked).unwrap();
         assert_eq!(kith_store::format_of(&store), kith_store::FORMAT);
+    }
+
+    /// A store in format 3 whose members do not all say they read 4 is not moved to 4 (and in 3
+    /// the leader writes a signed request's change bare: `signed_wrap_at_format_4_and_bare_below`):
+    /// a T-0779 kithd, which reads 3, refuses every signed entry at apply, and its store would part
+    /// from the others' (T-0783).
+    #[tokio::test]
+    async fn store_format_3_with_a_member_reading_3_gets_no_signed_entry() {
+        let (shared, _ca) = leading("format-3-held", &[]).await;
+        shared.write(Command::MarkSigned).await.unwrap();
+        // A Node about to be a member, whose kithd says it reads 3, lately.
+        let id = 7_233_003;
+        let text = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: {name: format-3-old}\nspec: {}\n";
+        let node = kith_api::Resource::from_source(text).unwrap().remove(0).unwrap();
+        let status = serde_json::json!({ "address": "10.0.0.3:7443", "raftId": id.to_string() });
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(node).unwrap();
+            store.set_status("Node/format-3-old", Some(status)).unwrap();
+        }
+        HEARD.lock().unwrap().insert(id, (3, Instant::now()));
+        let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
+        let mut said = Vec::new();
+        mark(&shared, &mut said).await.unwrap();
+        assert_eq!((format(&shared), said.len()), (3, 1), "{said:?}");
+        // Once it says 4, the store moves.
+        HEARD.lock().unwrap().insert(id, (4, Instant::now()));
+        mark(&shared, &mut said).await.unwrap();
+        assert_eq!(format(&shared), 4);
     }
 
     #[test]
@@ -2563,11 +2631,12 @@ mod tests {
         assert!(!holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
     }
 
-    /// The store's format is changed only by the leader's own `tend_format`: a Mark or MarkSigned
-    /// another node sends is refused whoever it says it is for, until the store is in that format
-    /// already (then it is a follower's barrier, a no-op, and taken).
+    /// The store's format is changed only by the leader's own `tend_format`, and a signed entry is
+    /// written only by the leader that checked the request: a mark another node sends is taken
+    /// only once the store is in its format (a no-op then), and a Signed entry is refused
+    /// whoever it says it is for, in every format (T-0783).
     #[tokio::test]
-    async fn the_format_is_never_changed_from_outside() {
+    async fn raft_write_refuses_the_format_and_signed_entries_from_outside() {
         use crate::cluster::pinned_peer::{at, node};
         use crate::cluster::{Cluster, listen, node_router};
         let (shared, ca) = leading("format-out", &["format-out-f"]).await;
@@ -2589,10 +2658,7 @@ mod tests {
                 serde_json::from_str::<Option<(Reply, u64)>>(&said).unwrap_or_else(|e| panic!("{e}: {said}"))
             }
         };
-        let marks = |shared: &Shared| {
-            let state = shared.store.lock().unwrap();
-            (state.store.marked(), state.store.signing())
-        };
+        let format = |shared: &Shared| kith_store::format_of(&shared.store.lock().unwrap().store);
         let headers: [&[(&str, &str)]; 5] = [
             &[],
             &[(access::FOR, "local socket")],
@@ -2600,49 +2666,44 @@ mod tests {
             &[(WORKER, "format-out-f")],
             &[(access::FOR, "local socket"), (WORKER, "format-out-f")],
         ];
-        let refused = |said: &Option<(Reply, u64)>| matches!(said, Some((Err(Error::Invalid(why)), 0)) if why.contains("only the leader changes it"));
-        assert_eq!(marks(&shared), (false, false));
-        let index = |shared: &Shared| shared.raft.metrics().borrow().last_log_index;
-        let before = index(&shared);
-        for headers in headers {
-            for command in [Command::Mark, Command::MarkSigned] {
-                let said = send(command, headers).await;
-                assert!(refused(&said), "{headers:?}: {said:?}");
+        let refused = |said: &Option<(Reply, u64)>, why: &str| matches!(said, Some((Err(Error::Invalid(said)), 0)) if said.contains(why));
+        let signed = || Command::Signed {
+            header: String::new(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(Command::Patch { statuses: vec![] }),
+        };
+        // In each format: a mark of it or below is an older follower's barrier, a no-op, and
+        // taken (said to be alice's or a worker's, it is held to what they may write, and
+        // refused); a mark above is refused; a signed entry always is.
+        for (now, mark) in [
+            (1, None),
+            (2, Some(Command::Mark)),
+            (3, Some(Command::MarkSigned)),
+            (4, Some(Command::MarkChecked)),
+        ] {
+            if let Some(mark) = mark {
+                shared.write(mark).await.unwrap();
             }
-            // A signed entry before format 3 is refused before the log, not only at apply: a
-            // member that reads format 2 could not read it there.
-            let signed = Command::Signed {
-                header: String::new(),
-                method: "POST".into(),
-                path: "/v1/apply".into(),
-                body: String::new(),
-                command: Box::new(Command::Mark),
-            };
-            let said = send(signed, headers).await;
-            assert!(
-                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("before the store is in format 3")),
-                "{headers:?}: {said:?}"
-            );
-        }
-        assert_eq!(marks(&shared), (false, false));
-        assert_eq!(index(&shared), before, "nothing was written to the log");
-        // Marked by the leader itself: a Mark sent is the barrier a follower's relayed write
-        // waits for, and taken (said to be alice's or a worker's, it is held to what they may
-        // write, and refused); MarkSigned still is not.
-        shared.write(Command::Mark).await.unwrap();
-        for (n, headers) in headers.into_iter().enumerate() {
-            let said = send(Command::Mark, headers).await;
-            match n {
-                2 | 3 => assert!(matches!(said, Some((Err(_), 0))), "{headers:?}: {said:?}"),
-                _ => assert!(
-                    matches!(said, Some((Ok(_), index)) if index > 0),
-                    "{headers:?}: {said:?}"
-                ),
+            assert_eq!(format(&shared), now);
+            for (n, headers) in headers.into_iter().enumerate() {
+                for (made, mark) in [(2, Command::Mark), (3, Command::MarkSigned), (4, Command::MarkChecked)] {
+                    let said = send(mark, headers).await;
+                    match (made <= now, n) {
+                        (true, 2 | 3) => assert!(matches!(said, Some((Err(_), 0))), "{headers:?}: {said:?}"),
+                        (true, _) => assert!(
+                            matches!(said, Some((Ok(_), index)) if index > 0),
+                            "{headers:?}: {said:?}"
+                        ),
+                        (false, _) => assert!(refused(&said, "only the leader changes it"), "{headers:?}: {said:?}"),
+                    }
+                }
+                let said = send(signed(), headers).await;
+                assert!(refused(&said, "only the leader writes"), "{headers:?}: {said:?}");
             }
-            let said = send(Command::MarkSigned, headers).await;
-            assert!(refused(&said), "{headers:?}: {said:?}");
+            assert_eq!(format(&shared), now, "the format moved only by the leader");
         }
-        assert_eq!(marks(&shared), (true, false));
     }
 
     /// A write passed on to a node that does not lead (any more) is not decided there, on a
