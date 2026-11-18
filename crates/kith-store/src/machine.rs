@@ -252,9 +252,16 @@ impl RaftStateMachine<TypeConfig> for Machine {
                         };
                         let reply = match checked {
                             Ok(()) => {
+                                let signed = matches!(command, crate::Command::Signed { .. });
                                 state.store.entry(entry.log_id.index);
                                 let reply = run(&mut state.store, command);
                                 state.store.entry(0);
+                                // (A signed entry refused, whatever it wraps, changed no key:
+                                // refused before it ran, or by what it ran, which changes
+                                // nothing when it fails. Its readers read nothing again.)
+                                if signed && reply.is_err() {
+                                    keys = Some(Vec::new());
+                                }
                                 reply
                             }
                             // Refused: nothing on every node, and nothing changed.

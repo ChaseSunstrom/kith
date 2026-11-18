@@ -237,8 +237,8 @@ Every node, applying an entry, decides the same way from the entry and its own s
 2. Checks the signer may do the command, with the rights in that store
    (`Grants::of`, crates/kithd/src/access.rs:102-131).
 3. Checks the nonce. Nonces are kept in the store, per signer, with their `expires`. A nonce
-   seen is refused. An entry whose `expires` is more than five minutes before the newest
-   `expires` of the same signer is refused, and nonces older than that are dropped.
+   seen is refused. An entry whose `expires` is five minutes or more before the newest
+   `expires` of the same signer is refused, and nonces that old are dropped.
 4. Takes time from the envelope's `expires`. Never the clock: two nodes must decide alike.
 
 Kept per signer, a forged far-future `expires` spoils only the forger's own key. A refused

@@ -406,10 +406,10 @@ fn format_3_state_is_read_whole_by_this_build() {
     assert_eq!(read.born("ConfigMap/default/d"), Some((16, 500)));
     assert_eq!(read.born("ConfigMap/default/e"), Some((17, 600)));
     assert_eq!(read.born("ConfigMap/default/c"), Some((13, 400)));
-    // The signer's book: both nonces, its newest expires.
+    // The signer's book, `[newest, {nonce: expires}]`: its newest expires, both nonces.
     let book = serde_json::to_value(&read).unwrap()["signers"]["local socket"].clone();
-    assert_eq!(book["newest"], 1100);
-    let nonces = book["nonces"].as_object().unwrap();
+    assert_eq!(book[0], 1100);
+    let nonces = book[1].as_object().unwrap();
     assert_eq!(
         nonces.keys().map(|nonce| &nonce[30..]).collect::<Vec<_>>(),
         ["01", "02"]
@@ -694,6 +694,68 @@ fn signed_entry_refused_is_nothing_on_both_stores() {
     );
 }
 
+/// A signed entry refused changes no key, whatever it wraps: a signed import refused (before
+/// format 3, its nonce seen, inside another, or by the check at apply) leaves what a reader
+/// reads again as it was, rather than sending every reader to read the whole store.
+#[test]
+fn signed_refused_changes_no_keys() {
+    use openraft::storage::RaftStateMachine;
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    let made = |name: &str| Command::Apply {
+        resources: vec![config(name, "1")],
+        at: 100,
+    };
+    let import = || Command::Import {
+        store: Store::default(),
+    };
+    let commands = vec![
+        made("a"),
+        signed("ann", 1000, 1, import()),
+        Command::MarkSigned,
+        signed("ann", 1000, 1, made("b")),
+        signed("ann", 1000, 1, import()),
+        signed("ann", 1000, 2, signed("ann", 1000, 3, import())),
+        Command::Signed {
+            header: "v1; who=ann".into(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(import()),
+        },
+    ];
+    let entry = |(index, command)| Entry {
+        log_id: LogId::new(CommittedLeaderId::new(4, 9), index as u64 + 1),
+        payload: EntryPayload::Normal(command),
+    };
+    let entries: Vec<Entry<TypeConfig>> = commands.into_iter().enumerate().map(entry).collect();
+    let both = ["ConfigMap/default/a", "ConfigMap/default/b"];
+    let dir = Scratch::new();
+    let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
+    let replies = block(async { machine.apply(entries.clone()).await.unwrap() });
+    let refused: Vec<_> = replies.iter().map(Result::is_err).collect();
+    assert_eq!(refused, [false, true, false, false, true, true, true], "{replies:?}");
+    let touched = |machine: &Machine| {
+        let state = machine.state.lock().unwrap();
+        state
+            .touched(0)
+            .map(|keys| keys.into_iter().map(String::from).collect::<Vec<_>>())
+    };
+    assert_eq!(touched(&machine), Some(both.map(String::from).to_vec()));
+    // Refused by the check at apply: the same.
+    let refusing: crate::Check = Arc::new(|_, command, _| match command {
+        Command::Signed { command, .. } if matches!(**command, Command::Import { .. }) => {
+            Err(Error::Invalid("refused".into()))
+        }
+        _ => Ok(()),
+    });
+    let dir = Scratch::new();
+    let mut machine = Machine::open(&dir.0, Arc::new(|| {}), refusing).unwrap();
+    let entries = [&entries[..4], &[entry((4, signed("ann", 1000, 9, import())))]].concat();
+    let replies = block(async { machine.apply(entries).await.unwrap() });
+    assert!(replies[4].is_err());
+    assert_eq!(touched(&machine), Some(both.map(String::from).to_vec()));
+}
+
 /// The signers' book: a nonce seen is refused and changes nothing, one whose `expires` is
 /// five minutes or more before the signer's newest is refused, and nonces that old are dropped.
 #[test]
@@ -705,7 +767,7 @@ fn signed_nonce_seen_is_a_no_op() {
     let mut store = Store::default();
     run(&mut store, Command::MarkSigned).unwrap();
     let nonces = |store: &Store, who: &str| {
-        let book = serde_json::to_value(store).unwrap()["signers"][who]["nonces"].clone();
+        let book = serde_json::to_value(store).unwrap()["signers"][who][1].clone();
         let nonces = book.as_object().cloned().unwrap_or_default();
         nonces.keys().map(|nonce| nonce[30..].to_string()).collect::<Vec<_>>()
     };

@@ -94,12 +94,10 @@ type Undo = BTreeMap<String, Option<Vec<Revision>>>;
 const SIGNED_SKEW: u64 = 300;
 
 /// One signer's book: the newest `expires` its signed entries said, and the nonces taken
-/// (each with its `expires`) not yet [`SIGNED_SKEW`] older than that.
+/// (each with its `expires`) not yet [`SIGNED_SKEW`] older than that. (Written as a pair,
+/// `[newest, {nonce: expires}]`: named fields cost kith 4 KB more of serde, T-0779.)
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Signer {
-    newest: u64,
-    nonces: BTreeMap<String, u64>,
-}
+pub struct Signer(u64, BTreeMap<String, u64>);
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Store {
@@ -205,21 +203,20 @@ impl Store {
             return Err(Error::Invalid("a signed entry before the store is in format 3".into()));
         };
         let book = signers.get(who);
-        let newest = book.map_or(0, |book| book.newest);
+        let newest = book.map_or(0, |book| book.0);
         if expires.saturating_add(SIGNED_SKEW) <= newest {
             return Err(Error::Invalid(format!(
                 "a signed entry of {who} expiring at {expires}, five minutes or more before one already taken"
             )));
         }
-        if book.is_some_and(|book| book.nonces.contains_key(nonce)) {
+        if book.is_some_and(|book| book.1.contains_key(nonce)) {
             return Err(Error::Invalid(format!("the nonce {nonce} of {who} was seen already")));
         }
         let book = signers.entry(who.to_string()).or_default();
-        book.newest = book.newest.max(expires);
-        book.nonces.insert(nonce.to_string(), expires);
-        let newest = book.newest;
-        book.nonces
-            .retain(|_, expires| expires.saturating_add(SIGNED_SKEW) > newest);
+        book.0 = book.0.max(expires);
+        book.1.insert(nonce.to_string(), expires);
+        let newest = book.0;
+        book.1.retain(|_, expires| expires.saturating_add(SIGNED_SKEW) > newest);
         Ok(())
     }
 
