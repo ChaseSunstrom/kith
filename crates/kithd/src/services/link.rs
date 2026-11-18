@@ -30,7 +30,6 @@ use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::AbortHandle;
 
@@ -385,13 +384,22 @@ impl Link {
             ));
         }
         let id = state.next;
-        state.next = id
-            .checked_add(2)
-            .ok_or_else(|| io::Error::other("the link has no stream numbers left"))?;
+        let Some(next) = id.checked_add(2) else {
+            // (A link with no numbers left is down: the next client is on a new one.)
+            drop(state);
+            self.0.down();
+            return Err(io::Error::other("the link has no stream numbers left"));
+        };
+        state.next = next;
         let stream = self.0.stream(&mut state, id);
         drop(state);
         self.0.send(id, Kind::Open, Vec::new());
         Ok(stream)
+    }
+
+    /// Whether the link is down (closed here, or its connection ended).
+    pub fn is_down(&self) -> bool {
+        self.0.state().closed
     }
 
     /// Takes the link down: every stream is reset.
@@ -400,6 +408,7 @@ impl Link {
     }
 
     /// Frames and writes so far: how many frames share a write.
+    #[cfg(test)]
     pub fn counts(&self) -> (u64, u64) {
         (
             self.0.counts.0.load(Ordering::Relaxed),
@@ -504,10 +513,9 @@ impl Rx {
 
 impl Stream {
     /// Passes `local`'s bytes to the other end and the other end's to it, until both ways
-    /// have ended or the stream is reset.
-    pub async fn join(self, local: TcpStream) {
-        let _ = local.set_nodelay(true);
-        let (mut read, mut write) = local.into_split();
+    /// have ended or the stream is reset; a reset (or the link going down) ends `local` too.
+    pub async fn join<T: AsyncRead + AsyncWrite + Send + Unpin>(self, local: T) {
+        let (mut read, mut write) = tokio::io::split(local);
         let Stream { mut tx, mut rx } = self;
         let up = async {
             let mut chunk = vec![0; MAX_DATA];
@@ -528,15 +536,25 @@ impl Stream {
                 match rx.read().await {
                     Ok(Some(bytes)) => {
                         if write.write_all(&bytes).await.is_err() {
-                            return rx.reset();
+                            rx.reset();
+                            return false;
                         }
                     }
-                    Ok(None) => return drop(write.shutdown().await),
-                    Err(_) => return,
+                    Ok(None) => {
+                        let _ = write.shutdown().await;
+                        return true;
+                    }
+                    Err(_) => return false,
                 }
             }
         };
-        tokio::join!(up, down);
+        // A reset or a dead link ends the client's connection at once, not when it next speaks;
+        // the other end's clean end leaves the way up open.
+        tokio::pin!(up, down);
+        tokio::select! {
+            _ = &mut up => { down.await; }
+            clean = &mut down => { if clean { up.await; } }
+        }
     }
 }
 
@@ -569,6 +587,17 @@ mod tests {
             bytes.extend_from_slice(&more);
         }
         Ok(bytes)
+    }
+
+    /// A link that has used its last stream number is down, so a client that finds it so dials a new one.
+    #[tokio::test]
+    async fn a_link_with_no_stream_numbers_left_goes_down() {
+        let ((near, _), _far) = pair();
+        near.0.state().next = u32::MAX - 2;
+        assert!(near.open().is_ok());
+        assert!(!near.is_down());
+        assert!(near.open().is_err());
+        assert!(near.is_down());
     }
 
     #[tokio::test]
