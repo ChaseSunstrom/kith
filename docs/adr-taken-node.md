@@ -2,7 +2,7 @@
 
 Status: decided, not built (T-0737). This is a design record. No code changes with it.
 Layers 1 and 2 are the build that follows it. Layer 3 is its own task (captured as
-T-0???). Where this record names today's code, the line was read from the code when it was
+T-0742). Where this record names today's code, the line was read from the code when it was
 written.
 
 ## The problem
@@ -84,7 +84,7 @@ Layers 1 and 2 stop a taken node that does not lead. **They do not stop a taken 
 leads.** The leader writes the log itself: what it appends is applied on every node, signed
 or not, checked or not (crates/kith-store/src/machine.rs:223-266). And a taken control node
 can make itself leader through the vote route (door 5). Only layer 3 closes that, and it is
-its own task (captured as T-0???), not part of this build.
+its own task (captured as T-0742), not part of this build.
 
 ## Where the admin's key lives
 
@@ -222,7 +222,7 @@ is layer 3's.
 
 ## Layer 3
 
-Out of this task's build; its own task (captured as T-0???). Written down here so layers 1
+Out of this task's build; its own task (captured as T-0742). Written down here so layers 1
 and 2 are built to fit it.
 
 A new command, `Signed { envelope, signature, command }`, next to the ones in
@@ -306,7 +306,7 @@ The VM test for slices 1 to 3 extends `ci/vm.sh --test access` (three nodes, n1 
 - n2 replays a signed header it was sent, to n3 and again to n1: refused;
 - n2 posts a RoleBinding to n1's `/v1/raft/write` with its node certificate: refused.
 
-4. **Layer 3: the check at apply** (captured as T-0???). `Signed`, FORMAT 3, the nonce
+4. **Layer 3: the check at apply** (captured as T-0742). `Signed`, FORMAT 3, the nonce
    store, the table above. Test: machine.rs unit tests that two stores fed one log, one
    entry forged, end equal and without it; a replayed nonce is a no-op; the decision is the
    same with the clock moved. VM: a kithd built with a test-only feature (off in a release,
@@ -328,7 +328,7 @@ They were weighed and are not part of this:
 
 ## What stays open
 
-- **A taken node that leads,** until layer 3 is built (captured as T-0???).
+- **A taken node that leads,** until layer 3 is built (captured as T-0742).
 - **The CA node mints.** Whoever takes the node with the CA key
   (crates/kithd/src/pki.rs:261-266, crates/kithd/src/pki.rs:275) can issue any certificate
   (crates/kithd/src/pki.rs:125-160). With layer 3 a new node certificate still needs a Node
