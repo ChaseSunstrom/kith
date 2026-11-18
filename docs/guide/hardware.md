@@ -237,3 +237,23 @@ spec:
 - Not yet: the scheduler knows nothing of which nodes have such a processor (use `placement`);
   no attestation; containers inside such a machine; cloud-hypervisor. **Not tested: a guest on
   SEV-SNP or TDX hardware**, only QEMU's options and the refusal elsewhere.
+
+### Tried on a real PC
+
+kith OS 1.0.0 on an AMD mini PC (a Ryzen with a Radeon 780M), booted over HTTP from the
+firmware, claimed with `--claim`, and a desktop Linux PC beside it on the same LAN:
+
+- **Ran:** images pulled from Docker Hub; two replicas of a web server, ready by an HTTP probe,
+  one port with `publish: true` reached from the other PC; pod to pod over IPv4 and IPv6.
+- **A desktop on the real screen:** a Workload in `kith-system` claiming the seat (`NODE-seat0`:
+  the card and two inputs) runs Alpine's weston (DRM backend, pixman renderer) at 2560x1440 with
+  a terminal. seatd in a container cannot make the seat active (there is no VT), so the session
+  runs with `LIBSEAT_BACKEND=noop`, as root in its container.
+- **The other PC as a worker:** its kithd (not root, a user's process) joined with a worker
+  token; Jobs placed on it with `placement: { require: { kith.dev/trust: worker } }` ran an
+  `exec` unit and a plain container, their logs read through the first node; `kith delete
+  node/NAME` then took it out. **A `pod: true` template does not start on a kithd that is not
+  root** ("failed to prepare rootfs").
+- **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu`: the image
+  builds no driver that needs firmware blobs); a Service has no status and its name reaches
+  nothing on a node started without `--mesh`, which kith OS's default is.
