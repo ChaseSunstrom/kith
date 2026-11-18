@@ -22,6 +22,15 @@ serde_json.workspace = true
 clap.workspace = true
 # A passphrase is typed unseen (`kith node passphrase`).
 nix = { version = "0.29", features = ["term"] }
+# The TLS client behind `--server` (cargo feature `remote`, off by default: the default kith links no TLS).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+
+[features]
+remote = ["dep:rustls"]
+
+[dev-dependencies]
+# The remote tests' own cluster CA and node certificates, as kithd's pki.rs makes them.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [lints]
 workspace = true

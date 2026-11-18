@@ -72,6 +72,9 @@ WireGuard interface of that name is taken over (any other kind is refused) and r
 kithd stops. The mesh adds 0.08–0.15 ms to a veth round trip of 0.03 ms (`sh ci/mesh_rtt.sh`;
 the plan allowed 0.3 ms).
 
+- Without `--mesh` (kith OS's default) a Service still answers the pods of the node it is on:
+  kithd puts the Service's address on the loopback, and its status says the address and
+  backends as ever. Other nodes' replicas are out of reach, as no mesh carries them.
 - Each node gets a stable IPv6 address derived from the CA and its name; `kith get node/NAME -o
   yaml` shows it and the public key (`mesh`), `kith node status` the peers and their last
   handshakes. The private key stays in `<state>/pki`.
@@ -306,9 +309,12 @@ kith node undrain n1           # takes the drain off; replicas that moved are no
 - A drain is an apply of `Node/NAME`: audited, and allowed to whoever may apply Nodes. The plan
   (`GET /v1/drain/NAME`) shows readers of Nodes the lines they may read. A worker plans no
   drain.
-- Undrain removes only what the drain added. A cordon from before (an OS update's included: take
-  `unschedulable` off the Node) stays; one added during the drain goes with it; an update
-  finishing mid-drain lifts its cordon while the taint holds.
+- Undrain removes only what the drain added. A cordon from before (take `unschedulable` off the
+  Node) stays; one added during the drain goes with it. An OS update's cordon is recorded as the
+  `kith.dev/update` taint: its end lifts only that cordon, and a drain on the node keeps it
+  cordoned until undrain. A rolling upgrade from an older kithd meets a cordon with no record: a
+  drain that joins it records itself as the owner, so once the update ends, undrain leaves the node
+  cordoned, and `kith node uncordon` lifts it.
 
 ### Checkpointing a long GPU Job
 

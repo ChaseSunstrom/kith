@@ -97,6 +97,28 @@ fn id(path: &Path) -> Option<String> {
     Some(text.strip_prefix("0x").unwrap_or(&text).to_string())
 }
 
+// The `# pci:` ids of os/features (build.rs writes the table from those lines).
+include!(concat!(env!("OUT_DIR"), "/os_features.rs"));
+
+/// The kith OS features whose `# pci:` ids a PCI device under `sys` (a `/sys`) has, by name and
+/// sorted: what this node's hardware wants of them, for its status (`os.wants`). A feature with
+/// no such line is never wanted by hardware: it is chosen by hand.
+pub fn wants(sys: &Path) -> Vec<&'static str> {
+    let pci = sys.join("bus/pci/devices");
+    let cards: BTreeSet<(String, String)> = names(&pci)
+        .iter()
+        .filter_map(|name| Some((id(&pci.join(name).join("vendor"))?, id(&pci.join(name).join("device"))?)))
+        .collect();
+    OS_FEATURES
+        .iter()
+        .filter(|(_, ids)| {
+            ids.iter()
+                .any(|(vendor, device)| cards.contains(&(vendor.to_string(), device.to_string())))
+        })
+        .map(|(name, _)| *name)
+        .collect()
+}
+
 /// `text` as a label value: letters, digits, `.`, `_` and `-`; anything else is `_`; 63 at most.
 fn label(text: &str) -> String {
     let safe = |c: char| {
@@ -591,6 +613,48 @@ mod tests {
         let path = root.join(file);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    /// The `# pci:` ids of os/features as build.rs wrote them: gpu-amd-phoenix's four, and
+    /// nothing for a feature with no such line.
+    #[test]
+    fn os_wants_table_has_every_feature_pci_ids() {
+        let gpu = OS_FEATURES
+            .iter()
+            .find(|(name, _)| *name == "gpu-amd-phoenix")
+            .expect("gpu-amd-phoenix is in the table");
+        assert_eq!(
+            gpu.1.to_vec(),
+            vec![("1002", "15bf"), ("1002", "15c8"), ("1002", "1900"), ("1002", "1901")]
+        );
+        assert!(OS_FEATURES.iter().all(|(_, ids)| !ids.is_empty()));
+    }
+
+    /// A made-up PCI bus under `root`, with a card for each (vendor, device) as sysfs shows it.
+    fn cards(root: &Path, cards: &[(&str, &str)]) {
+        for (n, (vendor, device)) in cards.iter().enumerate() {
+            let dir = format!("bus/pci/devices/0000:0{n}:00.0");
+            put(root, &format!("{dir}/vendor"), &format!("{vendor}\n"));
+            put(root, &format!("{dir}/device"), &format!("{device}\n"));
+        }
+    }
+
+    #[test]
+    fn os_wants_names_the_feature_of_each_card_it_matches_once() {
+        let root = tree("os-wants-match");
+        cards(
+            &root,
+            &[("0x1002", "0x15bf"), ("0x1002", "0x1900"), ("0x8086", "0x1234")],
+        );
+        assert_eq!(wants(&root), ["gpu-amd-phoenix"]);
+    }
+
+    #[test]
+    fn os_wants_is_empty_with_no_card_it_matches_or_no_bus() {
+        let root = tree("os-wants-none");
+        assert!(wants(&root).is_empty());
+        cards(&root, &[("0x8086", "0x1234"), ("0x1002", "0x73bf")]);
+        assert!(wants(&root).is_empty());
     }
 
     fn laptop(root: &Path) {
