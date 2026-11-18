@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="guide/index.html">Guide</a>
-    <a href="guide/index.html#decisions">Decisions</a>
-    <a href="index.html#numbers">Numbers</a>
+    <a href="install.html">Install</a>
+    <a class="more" href="guide/index.html#decisions">Decisions</a>
+    <a class="more" href="index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -168,7 +169,7 @@
 <h2 id="what-the-plan-review-and-the-rival-plan-raised">What the plan review and the rival plan raised <a class="anchor" href="#what-the-plan-review-and-the-rival-plan-raised" aria-label="Link to this section">#</a></h2>
 <ul><li><em>The choice of update seal made before the record</em> (HIGH): made here, after weighing A, B and both ("A seal across a signed update").</li><li><em>Sealing again before the restart has no rollback in the field</em> (HIGH): the running system's seal is kept; a slot is good only once the state is open; the five-minute wait sends a new system that cannot open back to the old one with nobody there.</li><li><em>What the session test asserts, and the salt key unauthenticated</em> (MEDIUM): the key's bytes are absent from the recorded traffic, and the name is kept and checked. The endorsement key is not checked: "Open".</li><li><em>swtpm's lockout is not hardware's; short PINs are weak</em> (MEDIUM): kithd reads the TPM's own settings and holds the PIN to them, takes the lockout authorization so the count cannot be reset from another system, and the hardware checklist counts tries. Hardware counting remains untried.</li><li><em>Sealing again blesses an unknown system</em> (MEDIUM): a node seals again only on a system the release key signed, whose prediction the TPM's PCRs bear out, on the same TPM, while the cluster hands out its key.</li><li><em>FIDO2's size unchecked</em> (LOW): estimated, not measured ("Open").</li><li><em>Update lockout from raw PCR values</em> (rival): the next system is sealed for before the restart, and the old seal kept.</li><li><em>Lockout by removing the last way</em> (rival): the recovery key is never removed by this task, and every new way is opened once before an old one goes. Turning the recovery key off is not built.</li><li><em>Sealing again without checking the boot state; the cluster's key cached on the disk</em> (rival): the first is the four checks of step 5. The second does not happen: the key is on the disk only until another node holds it, as today, and the node says so at each start.</li><li><em>Overclaiming against a software TPM</em> (rival): said at the top, under each way, and in the docs at step 5.</li></ul>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="adr-taken-node.html"><span>Before</span>A taken control node is not the cluster taken</a><a class="after" href="adr-workers.html"><span>After</span>A worker keeps no Secret that nothing placed on it names</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-unlock.md">docs/adr-unlock.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="adr-taken-node.html"><span>Previous</span>A taken control node is not the cluster taken</a><a class="next" rel="next" href="adr-workers.html"><span>Next</span>A worker keeps no Secret that nothing placed on it names</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/adr-unlock.md">docs/adr-unlock.md</a>.</p></footer>
 </div>
 </div>
 </body>
