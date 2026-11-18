@@ -46,6 +46,21 @@
                 *) fail "DNS from $house (n$had) did not answer n1.node.kith: $reply" ;;
             esac
             echo "vm.sh: n$had holds $house ($holder), announced it, and answers DNS from it" >&2
+            # The holder says so in the Cluster (status.home.holder), and the next one replaces it.
+            says_holder() { # N: waits for the Cluster to say node nN holds the house address
+                waited=0
+                until [ "$(any GET /v1/resources 2>/dev/null | python3 -c '
+import json, sys
+found = json.load(sys.stdin)
+found = found if isinstance(found, list) else found.get("resources", found.get("items", []))
+print(next((((r.get("status") or {}).get("home") or {}).get("holder", "") for r in found if r["kind"] == "Cluster"), ""))
+')" = "n$1" ]; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 30 ] || fail "$2: the Cluster does not say n$1 holds $house: $(any GET /v1/resources 2>&1 | head -c 600)"
+                    sleep 1
+                done
+            }
+            says_holder "$had" "the first holder"
             # (The nodes have no ip to show the address's valid_lft with: kithd says the time it
             # gives it, and a node that stopped renewing is shown below to lose it.)
             grep -aq "kithd: the house address $house is held on [a-z0-9]*, for up to 3 s at a time" "$work/n$had.log" || fail "n$had holds $house and did not say it holds it for up to 3 s at a time: $(grep -a 'house address' "$work/n$had.log" | tail -n 3)"
@@ -82,6 +97,7 @@
             node_of "$holder"
             now_holder=$n
             asked "$holder" >/dev/null || fail "nothing answered DNS from $house after n$had was reset (n$now_holder holds it)"
+            says_holder "$now_holder" "after n$had was reset"
 
             # The node that was reset is back, one of the three again (a write goes through it).
             printf '[{"apiVersion":"kith.dev/v1","kind":"ConfigMap","metadata":{"name":"back"},"spec":{"data":{"n":"back"}}}]' >"$work/back.json"

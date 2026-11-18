@@ -293,7 +293,7 @@ metadata: {name: home}
 spec:
   home:
     address: 192.168.1.250/24
-    endpoint: house.example.org:51820   # kept, and not acted on yet
+    endpoint: house.example.org:51820   # where a roaming node calls home from outside
 ```
 
 The leader puts the address on that card, tells the LAN with ARP announcements, and the node's
@@ -316,8 +316,18 @@ Three voters are needed for it to move: with two, the one that is left cannot co
 leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
 LAN from claiming the address: the holder announces it again when it hears another card answer
 for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
-still take traffic. Only DNS answers on it so far; UDP 51820 and TCP 443 are for the nodes' own
+still take traffic. Only DNS answers on it so far; TCP 443 is for the nodes' own
 addresses still.
+
+**Calling home from outside.** The holder says so in the `Cluster` (`kith get cluster` shows the
+house address, the endpoint, the holder and since when; the next holder replaces it). To let a
+roaming laptop in, forward UDP 51820 (the mesh port) on the router to the house address, and
+point `endpoint` at the router's public name or address with that port. A laptop (`--roaming`)
+that has not shaken hands with the holder for 30 seconds calls the holder at `endpoint`; it does
+not give it to any other node, and a node that calls it from somewhere keeps that address, so
+inside the house the laptop is reached where it is. When the leader moves, the forward still
+lands on the new holder, as the address moved with it. A name in `endpoint` is looked up each
+time it is used (kithd logs when it does not resolve).
 
 ### Not yet
 

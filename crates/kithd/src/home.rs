@@ -277,10 +277,34 @@ pub fn choose<'a>(
 /// The house address the Clusters say (the lowest of them, so that every node takes the same
 /// when two disagree), or nothing.
 pub fn configured(store: &kith_api::store::Store) -> Option<Home> {
-    let said = store
-        .list(Some("Cluster"))
-        .filter_map(|cluster| cluster.spec["home"]["address"].as_str().and_then(Home::parse));
-    said.min_by_key(|home| (home.address, home.bits))
+    configured_in(store).map(|(_, home)| home)
+}
+
+/// [`configured`], and the key of the Cluster that says it.
+fn configured_in(store: &kith_api::store::Store) -> Option<(String, Home)> {
+    let said = store.list(Some("Cluster")).filter_map(|cluster| {
+        let home = cluster.spec["home"]["address"].as_str().and_then(Home::parse)?;
+        Some((cluster.key(), home))
+    });
+    said.min_by_key(|(_, home)| (home.address, home.bits))
+}
+
+/// Say in the Cluster that `me` holds the house address, since now, unless it says so already:
+/// the next holder writes it over, and a holder that is told it is not (a write that lost its
+/// turn to another's) says it again. A kithd that is not the leader sends the write on.
+async fn keep_told(shared: &crate::Shared, me: &str) -> Result<(), String> {
+    let key = {
+        let state = shared.store.lock().expect("nothing panics holding the store");
+        let (key, _) = configured_in(&state.store).ok_or(NO_CLUSTER)?;
+        let status = state.store.get(&key).and_then(|cluster| cluster.status.as_ref());
+        if status.is_some_and(|status| status["home"]["holder"] == me) {
+            return Ok(());
+        }
+        key
+    };
+    let since = kith_api::store::rfc3339(kith_api::store::now());
+    let said = serde_json::json!({ "holder": me, "since": since });
+    crate::mesh::say(shared, &key, "home", said).await
 }
 
 /// Every IPv4 address of this machine's cards: the card's name, the address, its prefix length.
@@ -390,6 +414,8 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
     let mut denied = String::new();
     // What could not be taken off the card, and when (see `let_go`).
     let mut stuck = None::<(Put, Instant)>;
+    // Why the Cluster could not be told that this node holds it (empty: it could).
+    let mut told_said = String::new();
     // A socket that hears the card while the address is held (to hear another answer for it), and
     // when it was last defended, last said so, and when a block was last said.
     // ponytail: the socket hears every frame of the card, read twice a second and the ARP ones
@@ -503,6 +529,15 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                             "kithd: announcing the house address {} on {}: {e}",
                             home.address, card.name
                         );
+                    }
+                }
+                // The Cluster says who holds it. (Kept short: the next renewal waits for it.)
+                if let Some(me) = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str()) {
+                    let told = tokio::time::timeout(CONFIRM_EVERY, keep_told(&shared, me)).await;
+                    let told = told.unwrap_or_else(|_| Err(format!("no answer in {} ms", CONFIRM_EVERY.as_millis())));
+                    match told {
+                        Ok(()) => told_said.clear(),
+                        Err(e) => say(&mut told_said, format!("saying in the Cluster that this node holds the house address: {e}")),
                     }
                 }
             }
@@ -908,6 +943,47 @@ mod tests {
         if let Some(old) = old {
             assert_eq!(ours(&None, &Some((put, old))), None);
         }
+    }
+
+    /// The holder says it in the Cluster, once while it holds, and the next holder writes it over.
+    #[tokio::test]
+    async fn home_status_says_the_holder_and_the_next_holder_replaces_it() {
+        use crate::cluster::pinned_peer::{node, shared_with};
+        use kith_store::openraft::BasicNode;
+        let ca = crate::pki::Ca::create().unwrap();
+        let shared = shared_with("home-status", node(&ca, "hs-a"), &[]).await;
+        let id = shared.raft.metrics().borrow().id;
+        shared
+            .raft
+            .initialize(std::collections::BTreeMap::from([(id, BasicNode::new(""))]))
+            .await
+            .unwrap();
+        shared
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .current_leader(id, "leads")
+            .await
+            .unwrap();
+        let cluster = "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {name: house}\nspec: {home: {address: 10.9.0.100/24}}\n";
+        let cluster = kith_api::Resource::from_source(cluster).unwrap().remove(0).unwrap();
+        shared.store.lock().unwrap().store.apply(cluster).unwrap();
+        let says = || {
+            let state = shared.store.lock().unwrap();
+            state.store.get("Cluster/house").unwrap().status.clone()
+        };
+        assert_eq!(says(), None);
+
+        keep_told(&shared, "hs-a").await.unwrap();
+        let first = says().unwrap()["home"].clone();
+        assert_eq!(first["holder"], "hs-a");
+        assert!(first["since"].as_str().is_some_and(|since| since.ends_with('Z')), "{first}");
+        // Told already: not written again (the same since).
+        keep_told(&shared, "hs-a").await.unwrap();
+        assert_eq!(says().unwrap()["home"], first);
+        // The next holder writes over it.
+        keep_told(&shared, "hs-b").await.unwrap();
+        assert_eq!(says().unwrap()["home"]["holder"], "hs-b");
+        assert_eq!(says().unwrap()["home"].as_object().unwrap().len(), 2);
     }
 
     #[test]

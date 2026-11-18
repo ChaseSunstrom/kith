@@ -206,6 +206,31 @@ fn members(
     members
 }
 
+/// A roaming node that the house's holder has not shaken hands with for this long calls it at the
+/// house's endpoint (the router's forward to the house address).
+const HOME_AFTER: Duration = Duration::from_secs(30);
+
+/// Who `me` is to call at the Cluster's house endpoint (`spec.home.endpoint`, as written: a name
+/// or an address with a port): the holder (`status.home.holder`), and only when `me` roams, is not
+/// the holder, and has not shaken hands with it for `HOME_AFTER`. Every other peer, and the
+/// holder once it answers, stays where it was last called from.
+fn home_endpoint(
+    store: &Store,
+    me: &str,
+    members: &[Member],
+    shook: &BTreeMap<Key, Option<Duration>>,
+) -> Option<(String, String)> {
+    let roaming = store.get(&format!("Node/{me}")).is_some_and(|node| node.spec["roaming"] == true);
+    let heard = |key: &Key| shook.get(key).copied().flatten().is_some_and(|ago| ago < HOME_AFTER);
+    let says = |cluster: &kith_api::Resource| {
+        let holder = cluster.status.as_ref()?["home"]["holder"].as_str()?.to_string();
+        Some((holder, cluster.spec["home"]["endpoint"].as_str()?.to_string()))
+    };
+    let (holder, endpoint) = store.list(Some("Cluster")).find_map(says)?;
+    let holder = members.iter().find(|member| member.name == holder)?;
+    (roaming && holder.name != me && !heard(&holder.key)).then(|| (holder.name.clone(), endpoint))
+}
+
 /// Set `field` in the status of Node `node`: what this node says of itself under it, or null to take it back.
 pub(crate) async fn say(shared: &Shared, node: &str, field: &str, value: Value) -> Result<(), String> {
     let fields = serde_json::Map::from_iter([(field.to_string(), value)]);
@@ -251,7 +276,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             .iter()
             .filter_map(|peer| Some((peer.key, peer.endpoint?)))
             .collect();
-        let (members, mine, said, edge, services) = {
+        let (mut members, mine, said, edge, services, home) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node);
             let mut members = members(&state.store, &shook, &mut known, Instant::now());
@@ -271,8 +296,18 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             }
             let said = own.is_none_or(|own| own.status.as_ref().is_some_and(|status| status["mesh"] == mine));
             let services = crate::services::addresses(&state.store, prefix);
-            (members, mine, said, edge, services.into_values().collect())
+            let home = home_endpoint(&state.store, me, &members, &shook);
+            (members, mine, said, edge, services.into_values().collect(), home)
         };
+        // (Resolved here, not under the store's lock: the endpoint may be a name.)
+        if let Some((holder, endpoint)) = home {
+            let found = tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(&endpoint)).await;
+            let at = found.ok().and_then(Result::ok).and_then(|mut found| found.next());
+            match (at, members.iter_mut().find(|member| member.name == holder)) {
+                (Some(at), Some(member)) => member.endpoint = Some(at),
+                _ => eprintln!("kithd: mesh: the house endpoint {endpoint} did not resolve"),
+            }
+        }
         // Every node has every Service's address (crate::services listens on them).
         if let Err(e) = device.set_addresses(&services) {
             eprintln!("kithd: mesh: the services' addresses on {}: {e}", options.interface);
@@ -447,6 +482,59 @@ mod tests {
         store.delete("Node/b").unwrap();
         members(&store, &none, &mut known, later);
         assert_eq!(known.len(), 1);
+    }
+
+    /// A roaming node unheard by the house's holder for 30 s calls it at the house endpoint, and
+    /// no one else: not a node that stays put, not a holder heard lately, not another peer.
+    #[test]
+    fn home_endpoint_goes_to_the_holder_of_a_roaming_node_unheard_for_30_s() {
+        let mut store = Store::default();
+        let source = |kind: &str, name: &str, spec: &str| {
+            format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: {name} }}\nspec: {spec}\n")
+        };
+        let sources = [
+            source("Node", "a", "{ roaming: true }"),
+            source("Node", "b", "{}"),
+            source("Node", "c", "{}"),
+            source("Cluster", "house", "{ home: { address: 10.9.0.100/24, endpoint: \"203.0.113.7:51820\" } }"),
+        ];
+        for text in sources {
+            store.apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()).unwrap();
+        }
+        for (byte, name) in [(1, "a"), (2, "b"), (3, "c")] {
+            let mesh = json!({ "key": hex(&[byte; 32]), "port": 51820 });
+            store.set_status(&format!("Node/{name}"), Some(json!({ "address": "10.0.0.1:7443", "mesh": mesh }))).unwrap();
+        }
+        let holds = |store: &Store, holder: &str| {
+            let mut store = store.clone();
+            store.set_status("Cluster/house", Some(json!({ "home": { "holder": holder, "since": "2026-01-01T00:00:00Z" } }))).unwrap();
+            store
+        };
+        let start = Instant::now();
+        let got = |store: &Store, me: &str, shook: &BTreeMap<Key, Option<Duration>>| {
+            let members = members(store, shook, &mut BTreeMap::new(), start);
+            home_endpoint(store, me, &members, shook)
+        };
+        let none = BTreeMap::new();
+        let at = Some(("b".to_string(), "203.0.113.7:51820".to_string()));
+        // No one holds it yet: nothing to call.
+        assert_eq!(got(&store, "a", &none), None);
+        let store = holds(&store, "b");
+        // Never heard, or heard 30 s ago: call the holder at the house endpoint.
+        assert_eq!(got(&store, "a", &none), at);
+        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], None)])), at);
+        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(HOME_AFTER))])), at);
+        // Heard lately: it keeps the address it called from. Another peer's silence is not the holder's.
+        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(Duration::from_secs(29)))])), None);
+        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(HOME_AFTER)), ([3; 32], Some(Duration::ZERO))])), at);
+        // Only a node that roams (b and c stay put) and never the holder itself.
+        assert_eq!(got(&store, "c", &none), None);
+        assert_eq!(got(&holds(&store, "a"), "a", &none), None);
+        // A Cluster that gives no endpoint gives none.
+        let mut bare = store.clone();
+        let text = source("Cluster", "house", "{ home: { address: 10.9.0.100/24 } }");
+        bare.apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()).unwrap();
+        assert_eq!(got(&bare, "a", &none), None);
     }
 
     /// Two Nodes that say one key (one copied the other): the earlier-named one stays a member

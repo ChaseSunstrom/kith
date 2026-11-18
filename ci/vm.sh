@@ -231,7 +231,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
   --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
                    in the Cluster, and a machine on their network (ci/lan_probe.py)
                    that asks who has it four times a second. Expected: one card
-                   answers and announces it, DNS asked of it answers from it, with
+                   answers and announces it, the Cluster's status.home says whose
+                   it is (and the next holder's after a reset), DNS asked of it answers from it, with
                    the holder reset by the hypervisor and then (after it is back)
                    the next one stopped, another announces it within 10 s (the
                    seconds are printed), and two cards are never heard answering at

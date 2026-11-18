@@ -2163,11 +2163,22 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
 
 /// The STATUS column: what a controller reported, in a few words.
 fn status_summary(resource: &Resource) -> String {
+    // First line only, and nothing that could drive the terminal: messages quote image names and output.
+    let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
+    // A Cluster's house address (T-0730): its endpoint, and which node holds it since when.
+    if let (Some(address), "Cluster") = (resource.spec["home"]["address"].as_str(), resource.kind.as_str()) {
+        let said = |value: &serde_json::Value| value.as_str().map(clean);
+        let endpoint = said(&resource.spec["home"]["endpoint"]).map(|at| format!(", endpoint {at}"));
+        let held = resource.status.as_ref().map(|status| &status["home"]);
+        let held = match held.and_then(|home| Some((said(&home["holder"])?, said(&home["since"])?))) {
+            Some((holder, since)) => format!(", held by {holder} since {since}"),
+            None => ", held by no one yet".to_string(),
+        };
+        return format!("house {}{}{held}", clean(address), endpoint.unwrap_or_default());
+    }
     let Some(status) = &resource.status else {
         return String::new();
     };
-    // First line only, and nothing that could drive the terminal: messages quote image names and output.
-    let clean = |m: &str| m.lines().next().unwrap_or_default().replace(char::is_control, "");
     match (status["ready"].as_u64(), status["replicas"].as_u64()) {
         (Some(ready), Some(replicas)) => {
             // Why it is not ready, if a container said so.
@@ -2526,6 +2537,31 @@ mod drain_tests {
             json!({ "address": "198.51.100.9:7443", "state": "ready", "serves": {} }),
         );
         assert_eq!(table_row(&plain)[4], "ready at 198.51.100.9:7443");
+    }
+
+    #[test]
+    fn get_cluster_home_says_the_house_address_endpoint_holder_and_since() {
+        use crate::table_row;
+        use kith_api::Resource;
+        let cluster = |spec: serde_json::Value, status: Option<serde_json::Value>| {
+            let mut cluster = json!({ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "house" }, "spec": spec });
+            cluster["status"] = status.unwrap_or(serde_json::Value::Null);
+            serde_json::from_value::<Resource>(cluster).unwrap()
+        };
+        let home = json!({ "home": { "address": "192.168.1.250/24", "endpoint": "house.example.org:51820" } });
+        let held = json!({ "home": { "holder": "n1", "since": "2026-11-18T09:00:00Z" } });
+        assert_eq!(
+            table_row(&cluster(home.clone(), Some(held)))[4],
+            "house 192.168.1.250/24, endpoint house.example.org:51820, held by n1 since 2026-11-18T09:00:00Z"
+        );
+        // Not held yet, and no endpoint: it says so, and no more.
+        let bare = json!({ "home": { "address": "192.168.1.250/24" } });
+        assert_eq!(table_row(&cluster(bare, None))[4], "house 192.168.1.250/24, held by no one yet");
+        // A Cluster with no house says nothing here.
+        assert_eq!(table_row(&cluster(json!({}), None))[4], "");
+        // What a node writes there cannot drive the terminal.
+        let held = json!({ "home": { "holder": "n\u{1b}[2J", "since": "now" } });
+        assert!(!table_row(&cluster(home, Some(held)))[4].contains('\u{1b}'));
     }
 
     #[test]
