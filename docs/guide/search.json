@@ -81,6 +81,7 @@
 {"u":"guide/development.html#development","t":"Working on kith","h":"Development"},
 {"u":"guide/development.html#testing-on-several-nodes","t":"Working on kith","h":"Testing on several nodes"},
 {"u":"guide/numbers.html","t":"How the numbers beside k3s were taken","h":""},
+{"u":"guide/numbers.html#the-numbers-drawn","t":"How the numbers beside k3s were taken","h":"The numbers, drawn"},
 {"u":"guide/numbers.html#what-each-row-is","t":"How the numbers beside k3s were taken","h":"What each row is"},
 {"u":"guide/numbers.html#what-it-does-not-say","t":"How the numbers beside k3s were taken","h":"What it does not say"},
 {"u":"adr-keyless.html","t":"Decision: image signatures made without a kept key (T-0463)","h":""},

@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-FILE, PAGE = ROOT / "docs/numbers.json", ROOT / "docs/index.html"
+FILE, PAGE, GUIDE = ROOT / "docs/numbers.json", ROOT / "docs/index.html", ROOT / "docs/guide/numbers.html"
 MB = 1024 * 1024
 
 
@@ -157,6 +157,12 @@ def filled(page, n):
     return block.sub(lambda f: f.group(1) + json.dumps(n) + f.group(2), page), missing
 
 
+def embedded(page):
+    """The text of a page's #measured block ('' when it has none)."""
+    found = re.search(r'<script id="measured" type="application/json">(.*?)</script>', page, re.S)
+    return found.group(1) if found else ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Measure the numbers the site shows and write docs/numbers.json, the page and the charts.")
     parser.add_argument("--check", action="store_true", help="measure nothing: fail if the page or charts differ from docs/numbers.json")
@@ -174,6 +180,9 @@ def main():
         for file, drawn in charts(n).items():
             if not file.exists() or file.read_text() != drawn:
                 sys.exit(f"{file.relative_to(ROOT)} draws other numbers than docs/numbers.json: python3 ci/site_numbers.py draws it again")
+        # The guide's numbers page draws its bars in the browser from the block it embeds: that block is this file, whole.
+        if embedded(GUIDE.read_text(encoding="utf-8")) != json.dumps(n):
+            sys.exit("docs/guide/numbers.html embeds other numbers than docs/numbers.json: python3 ci/site_docs.py writes it again")
         print(f"ok: {len(re.findall('data-n=', page))} numbers in the page, all from docs/numbers.json")
         return
     FILE.write_text(json.dumps(n, indent=1) + "\n")

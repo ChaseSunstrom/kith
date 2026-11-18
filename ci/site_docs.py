@@ -351,6 +351,10 @@ def rail(pages, decisions, here):
             '<p class="rail-group">Decisions and reviews</p><ol class="stops">' + "".join(stop(p) for p in decisions) + "</ol>")
 
 
+NUMBERS = "docs/guide/numbers.md"
+DRAWN = '<div class="versus" id="versus" hidden>\n<p class="fine" id="versus-said"></p>\n<div class="panel" id="versus-chart"></div>\n</div>'
+
+
 def shell(title, description, up, rail_html, body, foot, source=None):
     return f"""<!doctype html>
 <html lang="en" data-root="{up}">
@@ -363,7 +367,7 @@ def shell(title, description, up, rail_html, body, foot, source=None):
 <link rel="icon" href="{ICON}">
 <link rel="stylesheet" href="{up}site.css">
 <link rel="stylesheet" href="{up}docs.css">
-<script src="{up}docs.js" defer></script>
+{f'<script src="{up}chart.js" defer></script>' + chr(10) if source == NUMBERS else ''}<script src="{up}docs.js" defer></script>
 </head>
 <body>
 <!-- Made by ci/site_docs.py{f' from {source}' if source else ''}: change the markdown, then run it again. -->
@@ -420,7 +424,12 @@ def build():
         near = [("Before", allp[n - 1]) if n else None, ("After", allp[n + 1]) if n + 1 < len(allp) else None]
         links = "".join(f'<a class="{w.lower()}" href="{posixpath.relpath(q.out, posixpath.dirname(p.out))}"><span>{w}</span>{esc(q.label)}</a>' for w, q in filter(None, near))
         foot = f'<footer class="tail"><nav aria-label="Next page">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
-        body = f'<article>\n{p.doc.body}\n</article>'
+        text = p.doc.body
+        if p.src == NUMBERS:  # the bars are drawn in the browser (docs/chart.js) from the numbers this page embeds
+            text = text.replace('<h2 id="what-each-row-is">', DRAWN + '\n<h2 id="what-each-row-is">', 1)
+            assert DRAWN in text, f"{NUMBERS} has lost the heading the drawn numbers go before"
+            text += '\n<script id="measured" type="application/json">' + json.dumps(json.loads((ROOT / "docs/numbers.json").read_text(encoding="utf-8"))) + "</script>"
+        body = f'<article>\n{text}\n</article>'
         out[p.out] = shell(p.title, p.doc.summary(), up, rail(pages, notes, p), body, foot, p.src)
     out["docs/guide/index.html"] = shell("The guide", "kith's guide and the decisions behind it, one page for each part.", "../", rail(pages, notes, None), index_body(pages, notes), "")
     search = [{"u": "guide/index.html", "t": "The guide", "h": ""}]
