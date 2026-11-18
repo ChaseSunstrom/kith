@@ -12,8 +12,7 @@ motion.hidden = calm;
 motion.onclick = () => {
   paused = !paused;
   document.documentElement.classList.toggle("paused", paused);
-  motion.textContent = paused ? "Play" : "Pause";
-  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
+  motion.setAttribute("aria-pressed", paused); // the label stays "Pause": pressed means the motion is paused  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
 };
 const wait = ms => new Promise(done => setTimeout(done, ms));
 const sleep = async ms => {
@@ -97,10 +96,14 @@ let at = 200;
 for (const line of $$("#term .line")) line.style.setProperty("--at", `${(at += line.classList.contains("out") ? 110 : 750)}ms`);
 
 // The rail fills with the blue line as far as the page has been read.
-const rail = $("main");
+const rail = $("main"), parts = $$(".part[id]");
 function run() {
   document.documentElement.classList.toggle("scrolled", scrollY > 8);
   rail.style.setProperty("--run", Math.max(0, Math.min(1, (scrollY + innerHeight * 0.55 - rail.offsetTop) / rail.offsetHeight)));
+  // The part you are in: its stop breathes, and the nav says so.
+  const here = parts.filter(part => part.getBoundingClientRect().top <= innerHeight * 0.4).pop();
+  for (const part of parts) part.classList.toggle("here", part === here);
+  for (const a of $$(".bar nav a")) here && a.hash === `#${here.id}` ? a.setAttribute("aria-current", "true") : a.removeAttribute("aria-current");
 }
 addEventListener("scroll", run, { passive: true });
 addEventListener("resize", run);
@@ -191,4 +194,41 @@ async function disk() {
   }
 }
 
-if (!calm) pulse(), disk();
+// The map at the top: a change to hello rolls through its replicas. A dot runs the line from the hub to
+// a machine, and that machine's replicas each wait while a new one starts, so the count dips by one at a time.
+async function live() {
+  const map = $("#live .map"), said = $("#live-said"), wave = $(".wave", map), ready = () => $$(".rep.on", map).length, total = ready();
+  const fly = (line, ms) => new Promise(done => {
+    const len = line.getTotalLength();
+    let t = 0, last = performance.now();
+    wave.style.opacity = 1;
+    (function step(now) {
+      if (!paused) t += (now - last) / ms;
+      last = now;
+      const at = line.getPointAtLength(len * Math.min(1, t));
+      wave.setAttribute("cx", at.x);
+      wave.setAttribute("cy", at.y);
+      if (t < 1) return void requestAnimationFrame(step);
+      wave.style.opacity = 0;
+      done();
+    })(last);
+  });
+  await sleep(2600); // the map draws itself first
+  map.classList.add("go");
+  await sleep(3000);
+  for (let revision = 2; ; revision++) {
+    for (const node of $$(".reps", map)) {
+      await fly($(`#m-${node.dataset.node}`), 600);
+      for (const rep of $$(".rep.on", node)) {
+        rep.classList.replace("on", "wait");
+        said.textContent = `hello: ${ready()} of ${total} replicas ready, rolling to revision ${revision}`;
+        await sleep(700);
+        rep.classList.replace("wait", "on");
+      }
+    }
+    said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on 4 machines`;
+    await sleep(5000);
+  }
+}
+
+if (!calm) pulse(), disk(), live();

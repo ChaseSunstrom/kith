@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Resources and the language: kith</title>
+<meta name="description" content="From kith 1.0, a kith.dev/v1 file that 1.0 takes is taken by every later build.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/api.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li class=here><a href="api.html" aria-current="page">Resources and the language</a><ol class="inner"><li class="h2"><a href="#kithdevv1-is-stable">kith.dev/v1 is stable</a></li><li class="h2"><a href="#kiths-own-language">kith's own language</a></li><li class="h3"><a href="#syntax">Syntax</a></li><li class="h2"><a href="#kinds-of-your-own">Kinds of your own</a></li><li class="h3"><a href="#controllers-and-admission-in-webassembly">Controllers and admission, in WebAssembly</a></li></ol></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="resources-and-the-language">Resources and the language</h1>
+<h2 id="kithdevv1-is-stable">kith.dev/v1 is stable <a class="anchor" href="#kithdevv1-is-stable" aria-label="Link to this section">#</a></h2>
+<p>From kith 1.0, a <code>kith.dev/v1</code> file that 1.0 takes is taken by every later build.</p>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>Held by test</strong></td><td><code>crates/kith-api/v1.schema.json</code> is the JSON Schema of every built-in kind (what <code>kith schema KIND</code> prints). <code>cargo test -p kith-api stable</code> compares the code with it: a gone field or kind, a changed type, a newly required field and a new limit on a value fail the build.</td></tr><tr><td><strong>Growth</strong></td><td>A new optional field, a new kind and one more allowed value pass once the file is written again (<code>KITH_BLESS=1 cargo test -p kith-api stable</code>), so every change to what v1 takes is in a diff somebody reads. A change that would refuse a v1 file waits for <code>kith.dev/v2</code>.</td></tr><tr><td><strong>Held by review</strong></td><td>What a schema cannot say: what an omitted field means, checks across fields, and the few values kith reads by hand (a quantity such as <code>512Mi</code>, a placement preference).</td></tr><tr><td><strong>Not promised</strong></td><td>The fields of <code>status</code> (controllers write them), kinds you define (their schema is yours), and what commands print for people (<code>-o yaml</code> and <code>-o json</code> print resources, which are promised).</td></tr><tr><td><strong>YAML, strictly</strong></td><td>kith reads a strict subset of YAML (and JSON). Duplicate keys, anchors, aliases, tags and unknown fields are errors. Only <code>true</code>/<code>false</code>, <code>null</code>/<code>~</code> and decimal numbers are special: <code>no</code>, <code>on</code>, <code>Yes</code>, <code>0x10</code> and <code>012</code> are strings. A string field is taken as written (<code>version: 1.0</code> is <code>"1.0"</code>).</td></tr></tbody></table></div>
+<h2 id="kiths-own-language">kith's own language <a class="anchor" href="#kiths-own-language" aria-label="Link to this section">#</a></h2>
+<p>When YAML says one thing five times with a word changed, a <code>*.kith</code> file can work it out: named values, functions, <code>if</code>, lists, records, imports. It gives the resources a YAML file would, checked by the same code: <code>kith apply</code>, <code>lint</code> and <code>diff</code> take it wherever they take YAML, and <code>kith eval FILE</code> prints what it gives. Every YAML file stays valid.</p>
+<pre><code class="language-kith">// web.kith: a workload and the service in front of it.
+let app = "web";
+let ports = { http: 80, metrics: 9090 };
+
+fn container(image, env = {}) = {
+    name: app,
+    image,
+    ports: [for p in entries(ports): { name: p.key, port: p.value }],
+    env: [for e in entries(env): { name: e.key, value: e.value }],
+};
+
+[
+    Workload {
+        metadata: { name: app, labels: { app } },
+        spec: {
+            replicas: 3,
+            template: { containers: [container("docker.io/library/nginx:1.27-alpine", { MODE: "production" })] },
+        },
+    },
+    Service {
+        metadata: { name: app },
+        spec: { selector: { app }, ports: [{ port: 80, targetPort: "http" }] },
+    },
+]
+</code></pre>
+<p>A kind's name before a record makes it a resource of that kind; a kind of your own is a record with its own <code>apiVersion</code>. A file gives one resource, a list of them (nested lists flattened) or <code>null</code>. A <code>null</code> field or item is left out, which makes a part optional (<code>expose: if host != "" then { host, via: "edge" } else null</code>). A mistake is refused where it was said, with the path into the resource:</p>
+<pre><code>web.kith:16:23: Workload.spec.replicas: invalid type: string "three", expected u32
+  |             replicas: "three",
+  |                       ^
+</code></pre>
+<h3 id="syntax">Syntax <a class="anchor" href="#syntax" aria-label="Link to this section">#</a></h3>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>A file</strong></td><td><code>let NAME = expr;</code> and <code>fn NAME(params) = expr;</code> lines, then one expression.</td></tr><tr><td><strong>Expressions</strong></td><td><code>if c then a else b</code>; <code>|x, y = 1| expr</code> (a function without a name); <code>f(a, b)</code>, <code>r.name</code>, <code>l[i]</code>; <code>Kind { … }</code> (a resource); <code>{ let …; fn …; expr }</code> (names for one value only); a list item <code>for x in xs if c: expr</code> or <code>..other</code>. A parameter may have a default (<code>fn f(a, b = 1)</code>).</td></tr><tr><td><strong>Values</strong></td><td><code>null</code>, <code>true</code>, <code>false</code>, whole numbers, numbers with a fraction, strings, lists, records, functions. Nothing changes once it has a name. Comments run from <code>//</code> to the end of the line.</td></tr><tr><td><strong>Strings</strong></td><td>In double quotes; <code>${…}</code> puts a value in (<code>"${app}-${n}"</code>); escapes are <code>\n \t \r \" \\ \$</code>. Three quotes open a multi-line string, which loses the indentation its closing quotes stand at.</td></tr><tr><td><strong>Records</strong></td><td><code>{ app }</code> is <code>{ app: app }</code>; <code>..base</code> puts another record's fields in, and a later field replaces one it brought; <code>[key]: value</code> works the name out. A name said twice in one record is a mistake.</td></tr><tr><td><strong><code>??</code></strong></td><td>Gives its right side when the left is <code>null</code> or names a field or item that is not there: <code>values.replicas ?? 1</code>.</td></tr><tr><td><strong>Operators</strong></td><td>Loosest first: <code>??</code>, <code>||</code>, <code>&amp;&amp;</code>, <code>== != &lt; &lt;= &gt; &gt;=</code>, <code>+ -</code>, <code>* / %</code>, then prefix <code>!</code> and <code>-</code>. <code>+</code> adds numbers and joins strings and lists; <code>/</code> of two whole numbers is a whole number; <code>==</code> compares whole values.</td></tr><tr><td><strong><code>import "./lib.kith"</code></strong></td><td>Gives what that file gives (usually a record of functions). The path is from the importing file, ends in <code>.kith</code> and stays inside the directory of the file <code>kith</code> was given. An import cycle is refused.</td></tr></tbody></table></div>
+<p>The whole grammar:</p>
+<pre><code>file    = { "let" NAME "=" expr ";" | "fn" NAME "(" params ")" "=" expr ";" } expr
+params  = [ NAME [ "=" expr ] { "," NAME [ "=" expr ] } ]
+expr    = "if" expr "then" expr "else" expr
+        | "|" params "|" expr                      a function without a name
+        | expr OP expr                             ??  ||  &amp;&amp;  == != &lt; &lt;= &gt; &gt;=  + -  * / %
+        | ( "!" | "-" ) expr
+        | expr "." NAME | expr "[" expr "]" | expr "(" [ expr { "," expr } ] ")"
+        | "import" STRING                          what another file gives
+        | KIND "{" fields "}"                      a resource of that kind
+        | "{" fields "}" | "[" items "]" | "(" expr ")"
+        | "{" { let | fn } expr "}"                names for one value only
+        | STRING | NUMBER | "true" | "false" | "null" | NAME
+fields  = [ field { "," field } [ "," ] ]
+field   = NAME ":" expr | NAME | STRING ":" expr | "[" expr "]" ":" expr | ".." expr
+items   = [ item { "," item } [ "," ] ]
+item    = expr | ".." expr | "for" NAME "in" expr [ "if" expr ] ":" expr
+</code></pre>
+<p>The builtins:</p>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><code>len(x)</code></td><td>how many items a list, fields a record or characters a string has</td></tr><tr><td><code>map(list, f)</code></td><td>a list of f(item) for each item</td></tr><tr><td><code>filter(list, f)</code></td><td>the items f(item) is true of</td></tr><tr><td><code>range(n) or range(from, to)</code></td><td>the whole numbers from 0 (or <code>from</code>) up to, not including, the last</td></tr><tr><td><code>sort(list)</code></td><td>a list of strings or a list of numbers, the smallest first</td></tr><tr><td><code>keys(record)</code></td><td>its fields' names, in order</td></tr><tr><td><code>values(record)</code></td><td>its fields' values, in order</td></tr><tr><td><code>entries(record)</code></td><td>a list of { key, value }, one for each field</td></tr><tr><td><code>record(list)</code></td><td>a record from a list of { key, value }</td></tr><tr><td><code>has(x, y)</code></td><td>whether a record has the field y, a list the item y or a string the text y</td></tr><tr><td><code>merge(a, b)</code></td><td>record a with b's fields over it, records inside merged the same way</td></tr><tr><td><code>join(list, between)</code></td><td>its items as one string</td></tr><tr><td><code>split(string, at)</code></td><td>the pieces of a string between each <code>at</code></td></tr><tr><td><code>replace(string, from, to)</code></td><td>the string with every <code>from</code> made <code>to</code></td></tr><tr><td><code>string(x)</code></td><td>a number, true or false as text</td></tr><tr><td><code>int(x)</code></td><td>a whole number from a string or from a number with a fraction (which is cut off)</td></tr><tr><td><code>json(x)</code></td><td>a value written out as JSON</td></tr><tr><td><code>yaml(x)</code></td><td>a value written out as YAML</td></tr><tr><td><code>b64(string)</code></td><td>its bytes in base64</td></tr><tr><td><code>error(message)</code></td><td>stops here with that message</td></tr></tbody></table></div>
+<p>A file cannot read the machine, the time or the network, so it gives the same resources everywhere. It is refused at 500,000 steps, 3,000 levels of nesting (a function calling itself gets a thousand calls or so) or 1 MB of output, so kithd can run a registry package's files.</p>
+<p>A package's <code>templates/</code> may hold <code>.kith</code> files instead of or beside YAML templates, with a YAML template's names (<code>values</code>, <code>release</code>, <code>package</code>, <code>name</code>, <code>labels</code>); a file named <code>_*</code> is only for importing. <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/web-kith"><code>packages/web-kith</code></a> is <a href="https://github.com/ChaseSunstrom/kith/tree/main/packages/web"><code>packages/web</code></a> written this way. Its <code>templates/service.kith</code>:</p>
+<pre><code class="language-kith">// The Service in front of the server and, if there is a page, the page.
+[
+    Service {
+        metadata: { name },
+        spec: {
+            selector: { app: name },
+            ports: [{ port: 80, targetPort: "http" }],
+            expose: if (values.expose.host ?? "") != ""
+                then { host: values.expose.host, via: "edge" }
+                else null,
+        },
+    },
+    if (values.page ?? "") != "" then ConfigMap {
+        metadata: { name: "${name}-page" },
+        spec: { data: { "index.html": values.page } },
+    } else null,
+]
+</code></pre>
+<p>For editors, <code>kith-lsp</code> (<code>cargo build --release -p kith-lsp</code>; nothing else needs it) is a language server for <code>.kith</code> files. It reports errors as you type with <code>kith lint</code>'s messages, offers kinds, the fields of the kind the cursor is in (from <code>kith schema</code>), builtins and the file's names, and says what each is when pointed at. In a package's <code>templates/</code> it knows a template's names, with <code>values</code> from <code>values.yaml</code>. Any LSP editor starts it with no arguments. In Neovim:</p>
+<pre><code class="language-lua">vim.filetype.add({ extension = { kith = "kith" } })
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "kith",
+  callback = function() vim.lsp.start({ name = "kith-lsp", cmd = { "kith-lsp" } }) end,
+})
+</code></pre>
+<h2 id="kinds-of-your-own">Kinds of your own <a class="anchor" href="#kinds-of-your-own" aria-label="Link to this section">#</a></h2>
+<p>A <code>KindDefinition</code> makes a new kind, whose resources are applied, listed, watched, kept with history and deleted like any other. What a kind <em>does</em> is up to a controller that watches it.</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: KindDefinition
+metadata: { name: gameserver }
+spec:
+  group: games.example.com   # a domain of yours; with version, the apiVersion
+  version: v1
+  kind: GameServer
+  namespaced: true           # [true]
+  schema:                    # of the spec; the same subset as a package's values
+    type: object
+    required: [map]
+    additionalProperties: false
+    properties:
+      map: { type: string }
+      players: { type: integer, minimum: 1, maximum: 64 }
+  columns:                   # what `kith get gameserver` shows
+    - { name: Map, path: spec.map }
+---
+apiVersion: games.example.com/v1
+kind: GameServer
+metadata: { name: one }
+spec: { map: dust, players: 8 }
+</code></pre>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>Checks</strong></td><td>The store checks every write of such a resource against the schema and names what is wrong by path (<code>spec.players: it must be at most 64</code>). In one <code>kith apply</code>, put the definition first. A changed schema is checked at the next write of each resource; what is stored stays.</td></tr><tr><td><strong>Commands</strong></td><td><code>kith get</code>, <code>delete</code>, <code>history</code>, <code>rollback</code> and <code>schema</code> take the kind's name in any case; <code>kith schema</code> lists the cluster's kinds after kith's. One definition per kind. While resources of a kind exist, its definition cannot be deleted, renamed to another kind or moved between namespaced and cluster-wide.</td></tr><tr><td><strong>Who applies</strong></td><td>A Source or package may apply resources of a defined kind; a Source in <code>kith-system</code> may bring the definition along. Not yet: several versions of a kind side by side, a schema for <code>status</code>.</td></tr></tbody></table></div>
+<h3 id="controllers-and-admission-in-webassembly">Controllers and admission, in WebAssembly <a class="anchor" href="#controllers-and-admission-in-webassembly" aria-label="Link to this section">#</a></h3>
+<p>A kind can carry a <strong>controller</strong> (says what should exist because of each resource) and an <strong>admission</strong> hook (asked before a write). Both are WebAssembly modules kithd runs itself, with no container, image or credentials: a function from JSON to JSON that reaches nothing else.</p>
+<pre><code class="language-rust">// sdk/kith-controller/examples/gameserver has all of it
+use kith_controller::{Admit, Reconcile, Reconciled, Value, json};
+
+fn reconcile(input: Reconcile) -&gt; Result&lt;Reconciled, String&gt; {
+    let name = input.resource["metadata"]["name"].as_str().ok_or("no name")?;
+    Ok(Reconciled {
+        status: json!({ "state": "ready" }),
+        resources: vec![json!({
+            "apiVersion": "kith.dev/v1", "kind": "ConfigMap",
+            "metadata": { "name": format!("{name}-config") },
+            "spec": { "data": { "map": input.resource["spec"]["map"] } },
+        })],
+    })
+}
+
+fn admit(input: Admit) -&gt; Result&lt;Option&lt;Value&gt;, String&gt; {
+    if input.resource["spec"]["map"] == "lava" {
+        return Err("the map lava is closed".into());   // refused, with this reason
+    }
+    Ok(None)                                           // as it is; Some(resource) changes it
+}
+
+kith_controller::controller!(reconcile);
+kith_controller::admission!(admit);
+</code></pre>
+<pre><code class="language-sh">rustup target add wasm32-unknown-unknown
+cargo build --release --target wasm32-unknown-unknown    # a cdylib depending on sdk/kith-controller
+kith controller set GameServer --controller game.wasm --admission game.wasm
+</code></pre>
+<p><code>kith controller set</code> puts the module in the KindDefinition (<code>spec.controller.wasm</code>, <code>spec.admission.wasm</code>, base64), so it is replicated, versioned and rolled back with the cluster.</p>
+<div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><strong>Controller</strong></td><td>Runs on the node that leads the store, whenever the resource, the module or something the resource owns changes. Given <code>{resource, owned}</code>, answers <code>{status, resources}</code>. The resources are made in the resource's namespace as its own (annotated <code>kith.dev/owned-by</code>), put back if changed or removed, removed when no longer answered, and removed with their owner. It may make anything namespaced except a Release or a Source, including resources of other defined kinds, whose controllers then run in turn.</td></tr><tr><td><strong>Status</strong></td><td>Its <code>status</code> fields are recorded on the resource, with <code>resources</code> (what it owns) and <code>controller</code>: <code>{state: ok, observedRevision}</code> or <code>{state: error, message}</code>. A failed run changes nothing and is tried again when something changes.</td></tr><tr><td><strong>Admission</strong></td><td>Asked about every apply of a resource of the kind through kithd, whoever makes it (<code>kith apply</code>, a Source, a Release, a controller), with <code>{resource, old}</code>. It may refuse (<code>refused by GameServer's admission: the map lava is closed</code>, also on <code>--dry-run</code>) or change the spec, labels and annotations; the result is checked against the schema like any write. A hook that fails refuses the write. A rollback is asked too (what it refuses does not come back; what it would change comes back as it was); a delete is not.</td></tr><tr><td><strong>Limits</strong></td><td>Each ends that one call with the reason: a module of at most 1 MiB, 50 million instructions' worth of fuel, 16 MiB of memory, 1 MiB of input and of answer. A module that imports anything does not start. Each call starts from a fresh instance: nothing is remembered. At most four modules run at once; a controller answers at most 64 resources.</td></tr><tr><td><strong>Rights</strong></td><td>A controller acts as whoever applied its KindDefinition (kith writes that one's name and key on it), not whoever applied a resource of the kind: what it answers is made, and what it no longer answers removed, only where that one may apply and delete it in the resource's namespace, and the resource's status says whose right fell short. So the right to apply a custom kind's resources is the right to what its controller makes of them. A KindDefinition applied before this makes nothing new until applied again.</td></tr><tr><td><strong>Grant</strong></td><td>Whoever may write KindDefinitions may run code in every namespace through them: grant that as you would admin.</td></tr><tr><td><strong>Good to know</strong></td><td>Applying a KindDefinition's YAML without its <code>controller</code>/<code>admission</code> removes them: keep the YAML and module together, or run <code>kith controller set</code> after. <code>kith --store FILE</code>, which works on a file without kithd, runs neither. A module sees one resource and what it owns; a controller that has to look further is a Workload using the API.</td></tr><tr><td><strong>Other languages</strong></td><td>Export <code>memory</code>, <code>kith_alloc(len: u32) -&gt; ptr</code>, and <code>kith_reconcile</code> / <code>kith_admit</code> as <code>(ptr: u32, len: u32) -&gt; u64</code>: JSON in at <code>ptr</code>, the answer's <code>ptr &lt;&lt; 32 | len</code> out, <code>{"ok": …}</code> or <code>{"error": "why"}</code>.</td></tr></tbody></table></div>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="access.html"><span>Before</span>Access</a><a class="after" href="kubernetes.html"><span>After</span>Coming from Kubernetes, Helm, Proxmox or compose</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/api.md">docs/guide/api.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

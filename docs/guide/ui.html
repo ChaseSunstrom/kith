@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Web UI: kith</title>
+<meta name="description" content="Every node serves a page that shows the cluster and changes it: what is running where, a form for every kind (drawn from its schema, your own kinds included), the YAML beside it, status, history with...">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/ui.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li class=here><a href="ui.html" aria-current="page">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="web-ui">Web UI</h1>
+<p>Every node serves a page that shows the cluster and changes it: what is running where, a form for every kind (drawn from its schema, your own kinds included), the YAML beside it, status, history with rollback, and output. An apply or a rollback shows its diff first; a delete asks.</p>
+<p class="picture"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screens/ui-review-dark.png"><img src="../assets/screens/ui-review-light.png" alt="The web UI asking before it applies: &#x27;Apply 1 change?&#x27; over the diff of Workload/default/web, replicas 3 struck out in red and replicas 5 added in blue, with Cancel and Apply" width="70%"></picture></p>
+<p class="picture"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screens/ui-phone-dark.png"><img src="../assets/screens/ui-phone-light.png" alt="The web UI at a phone&#x27;s width: three nodes as stops on lines, mail with 0 of 2 replicas ready and web with 3 of 3, the list of Workloads under them, and the form of the one that is open" width="24%"></picture></p>
+<p>On a node, as its admin:</p>
+<pre><code class="language-sh">kith ui                 # prints http://127.0.0.1:PORT/SECRET/ui/ ; open it
+kith ui --port 7000     # a port of your choosing
+</code></pre>
+<p>From your own machine, through SSH (<code>kith ui --port 7000</code> on the node, then):</p>
+<pre><code class="language-sh">ssh -L 7000:127.0.0.1:7000 node    # and open the printed address here
+</code></pre>
+<p>The address is the key: <code>kith ui</code> passes on only requests under that secret path, asked for under this machine's own name, by its own page, and stops when you stop it. Keep it to yourself.</p>
+<p>As an Identity, a browser can also open <code>https://kith:7443/ui/</code> on a node's TLS port and act as that Identity, with what its Roles allow and no more. It needs the Identity's certificate (<code>openssl pkcs12 -export -in alice.crt -inkey alice.key -out alice.p12</code>, imported into the browser), <code>ca.crt</code> trusted, and the name <code>kith</code> pointing at a node (a line in <code>/etc/hosts</code>).</p>
+<ul><li>The page is a few files inside kithd, open to all: everything it asks is not. No framework, nothing fetched from elsewhere (its content policy forbids it): it works with no internet.</li><li>It asks kithd as you: the same API, rules and audit log as <code>kith</code> and <code>curl</code>; <code>POST /v1/diff</code> is the dry run it shows. A field the form cannot draw (a free-form object, <code>oneOf</code>) is a JSON box; the YAML tab edits anything.</li><li>Not yet: logging in without a certificate (OIDC), secrets hidden until asked for, metrics.</li></ul>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="kubernetes.html"><span>Before</span>Coming from Kubernetes, Helm, Proxmox or compose</a><a class="after" href="development.html"><span>After</span>Working on kith</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/ui.md">docs/guide/ui.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

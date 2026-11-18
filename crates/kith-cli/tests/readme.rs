@@ -41,6 +41,8 @@ fn every_guide_is_read() {
     let mut there: Vec<String> = std::fs::read_dir(root().join("docs/guide"))
         .unwrap()
         .map(|entry| format!("docs/guide/{}", entry.unwrap().file_name().to_string_lossy()))
+        // (The .html beside each is ci/site_docs.py's page of it, checked by that.)
+        .filter(|path| path.ends_with(".md"))
         .collect();
     there.sort();
     let mut read: Vec<&str> = DOCS
@@ -88,8 +90,8 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
 }
 
 /// Blocks that are not a whole resource, and so are not checked: two `spec:` parts shown
-/// inside a list, and the installer's file.
-const PARTS: usize = 4;
+/// inside a list, the installer's file, and an OS spec (`os/build.sh --spec`).
+const PARTS: usize = 5;
 
 #[test]
 fn readme_examples_are_taken_by_this_build() {

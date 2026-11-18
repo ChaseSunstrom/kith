@@ -88,7 +88,9 @@ shares there as `dmem.max` in its cgroup, and the kernel refuses it more of the 
 (`status.share.DEVICE.enforced: true`). That is where the driver gives the region (amdgpu, xe,
 NVIDIA's) and kithd may hand the controller down to its containers (root, or a delegation with
 `dmem`; a kithd that cannot gives its Devices no `dmem` label). Elsewhere a share is
-cooperative. Untried: MPS, MIG partitions.
+cooperative. Read back on a PC with a Radeon iGPU and kithd as root, a `256Mi` share gave the
+container's cgroup `drm/0000:74:00.0/vram 268435456` in `dmem.max`, and the claim `enforced:
+true`. Untried: MPS, MIG partitions.
 
 ### An app as a workload of its own, in a session's window
 
@@ -261,6 +263,6 @@ firmware, claimed with `--claim`, and a desktop Linux PC beside it on the same L
   `exec` unit and a plain container, their logs read through the first node; `kith delete
   node/NAME` then took it out. **A `pod: true` template does not start on a kithd that is not
   root** ("failed to prepare rootfs").
-- **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu`: the image
-  builds no driver that needs firmware blobs); a Service has no status and its name reaches
+- **Not working yet:** the GPU has only the firmware's framebuffer (no `amdgpu` in the plain image;
+  the `gpu-amd-phoenix` [spec](os.md#a-node-that-needs-more-a-spec) builds it in, not yet run here); a Service has no status and its name reaches
   nothing on a node started without `--mesh`, which kith OS's default is.
