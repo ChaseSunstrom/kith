@@ -45,3 +45,16 @@ spec:
     app: db
   ports:
     - port: 80
+---
+# Headless: its name answers the address of each ready replica, and each replica's own name
+# (db-0.db-replicas) answers its address too.
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-replicas
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - port: 80

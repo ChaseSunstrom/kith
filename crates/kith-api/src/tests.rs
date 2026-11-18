@@ -664,6 +664,82 @@ fn expose_host_is_a_domain_name() {
     assert!(service(&long).unwrap_err().contains("expose.host"));
 }
 
+/// A Service's and a Namespace's name, and a namespace, are one DNS label: no `.` (Kubernetes allows
+/// none, and a dotted one would name another replica: `db-0.db-replicas` is replica 0 of `db` under
+/// `db-replicas`). Refused when submitted, not parsed: see `replay_takes_a_dotted_service...`.
+/// Other kinds keep their dots.
+#[test]
+fn a_new_service_or_namespace_name_is_one_dns_label() {
+    let read = |kind: &str, meta: &str, spec: &str| -> Result<Resource, String> {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ {meta} }}\n{spec}");
+        let docs = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        docs.map(|mut docs| docs.remove(0)).map_err(|e| e.msg)
+    };
+    let service = "spec: { selector: { app: web }, ports: [{ port: 80 }] }\n";
+    // What is submitted: refused where a dot would make another name's (`submitted`).
+    read("Service", "name: web", service).unwrap().submitted().unwrap();
+    read("Namespace", "name: media", "").unwrap().submitted().unwrap();
+    read("Secret", "name: a.b", "spec: { data: { k: v } }\n")
+        .unwrap()
+        .submitted()
+        .unwrap();
+    for bad in ["db-0.db-replicas", "a.b"] {
+        let said = read("Service", &format!("name: '{bad}'"), service)
+            .unwrap()
+            .submitted()
+            .unwrap_err();
+        assert!(said.contains("one DNS label") && said.contains(bad), "{bad}: {said}");
+        let said = read("Namespace", &format!("name: '{bad}'"), "")
+            .unwrap()
+            .submitted()
+            .unwrap_err();
+        assert!(said.contains("one DNS label") && said.contains(bad), "{bad}: {said}");
+    }
+    let said = read("Service", "name: web, namespace: db.prod", service)
+        .unwrap()
+        .submitted()
+        .unwrap_err();
+    assert!(said.contains("namespace") && said.contains("db.prod"), "{said}");
+    let said = read("Secret", "name: x, namespace: a.b", "spec: { data: { k: v } }\n")
+        .unwrap()
+        .submitted()
+        .unwrap_err();
+    assert!(said.contains("namespace") && said.contains("a.b"), "{said}");
+}
+
+/// Replay takes what an older binary logged: a dotted Service and namespace are applied, as
+/// they were, because the one-label rule is only at submission (`submitted`), not in `validated`.
+#[test]
+fn replay_takes_a_dotted_service_an_older_binary_logged() {
+    let mut store = Store::default();
+    let old = one(
+        "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: 'db-0.db-replicas' }\nspec: { selector: { app: web }, ports: [{ port: 80 }] }\n",
+    );
+    let dotted_ns = one(
+        "apiVersion: kith.dev/v1\nkind: Service\nmetadata: { name: db-0, namespace: 'db.prod' }\nspec: { selector: { app: web }, ports: [{ port: 80 }] }\n",
+    );
+    store.apply_all(vec![old, dotted_ns]).unwrap();
+    assert!(store.get("Service/default/db-0.db-replicas").is_some());
+    assert!(store.get("Service/db.prod/db-0").is_some());
+}
+
+/// A headless Service has no address to send a host to: it is refused with `expose` at apply,
+/// and not served without its host (its name answers its replicas, and nothing else).
+#[test]
+fn a_headless_service_has_no_expose() {
+    let read = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\n{spec}");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    read("spec: { selector: { app: web }, ports: [{ port: 80 }], headless: true }\n").unwrap();
+    let said = read(
+        "spec: { selector: { app: web }, ports: [{ port: 80 }], headless: true, expose: { host: shop.example.org, via: edge } }\n",
+    )
+    .unwrap_err();
+    assert!(said.contains("headless") && said.contains("expose"), "{said}");
+}
+
 #[test]
 fn expose_host_is_one_a_certificate_authority_issues_for() {
     for bad in [

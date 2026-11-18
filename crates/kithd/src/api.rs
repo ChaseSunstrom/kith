@@ -428,6 +428,7 @@ pub(crate) async fn plan(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
+    submitted(&resources)?;
     let resources = stamped_by(shared, caller, resources);
     allowed(shared, caller, |store| takes(store, &resources))?;
     // (Never closed.) Waiters queue: the page's checks, one per edit, are each worth an answer.
@@ -469,6 +470,13 @@ fn veiled(shared: &Shared, caller: &Caller, mut changes: Vec<Change>) -> Vec<Cha
     changes
 }
 
+/// What a new resource may not be (`Resource::submitted`): asked where it is submitted, not when
+/// a log entry is replayed.
+fn submitted(resources: &[Resource]) -> Result<(), ApiError> {
+    let refused = resources.iter().try_for_each(Resource::submitted);
+    refused.map_err(|why| ApiError::Store(Error::Invalid(why)))
+}
+
 async fn apply(
     State(shared): State<Arc<Shared>>,
     Extension(caller): Extension<Caller>,
@@ -488,6 +496,7 @@ pub(crate) async fn applied(
     caller: &Caller,
     resources: Vec<Resource>,
 ) -> Result<Vec<Change>, ApiError> {
+    submitted(&resources)?;
     let resources = stamped_by(shared, caller, resources);
     // Each resource of the body is asked about: one that is not allowed refuses them all.
     allowed(shared, caller, |store| takes(store, &resources))?;
@@ -1497,6 +1506,45 @@ spec: {}
             assert!(why.contains("apply it without"), "{why}");
         }
         assert!(shared.store.lock().unwrap().store.get("Package/maps-1.0.0").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_dotted_service_is_refused_at_apply_and_at_plan() {
+        let dir = std::env::temp_dir().join(format!("kithd-dotted-service-{}", std::process::id()));
+        let shared = crate::replica(None, &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let sent = "apiVersion: kith.dev/v1\nkind: Service\nmetadata: {name: db-0.db-replicas}\n\
+                    spec: {selector: {app: db}, ports: [{port: 80}]}\n";
+        let sent = || -> Vec<Resource> {
+            Resource::from_source(sent)
+                .unwrap()
+                .into_iter()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let within = std::time::Duration::from_secs(30);
+        let refused = tokio::time::timeout(within, applied(&shared, &Caller::Admin, sent()))
+            .await
+            .unwrap();
+        let planned = tokio::time::timeout(within, plan(&shared, &Caller::Admin, sent()))
+            .await
+            .unwrap();
+        for answer in [refused.map(drop), planned.map(drop)] {
+            let Err(ApiError::Store(Error::Invalid(why))) = answer else {
+                panic!("a new Service with a dot in its name was taken");
+            };
+            assert!(why.contains("one DNS label"), "{why}");
+        }
+        assert!(
+            shared
+                .store
+                .lock()
+                .unwrap()
+                .store
+                .get("Service/default/db-0.db-replicas")
+                .is_none()
+        );
     }
 
     /// A watch ends (401) once its Identity is deleted or given another key while it waits,

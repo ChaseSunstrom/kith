@@ -16,7 +16,7 @@
 
 use crate::{Shared, ingress};
 use kith_api::Resource;
-use kith_api::kinds::{DnsRecordSpec, DnsRecordType, DnsZoneSpec};
+use kith_api::kinds::{DnsRecordSpec, DnsRecordType, DnsZoneSpec, ServiceSpec};
 use kith_api::store::Store;
 use kith_dns::{Cidr, Rdata, Record, Records, View, Zones};
 use serde_json::{Value, json};
@@ -93,15 +93,22 @@ fn records_of(record: &DnsRecordSpec, domain: &str, ttl: u32) -> Result<Vec<Reco
 
 /// What the zones are made of, as `run` compares it with the last build: each resource's key and
 /// spec, and a Node's address, what it serves and its state (the ingress addresses come from
-/// those). Not the revision: deleted and made again, it starts over.
+/// those); a Workload's labels (which Services pick it) and each replica's node, readiness and
+/// address (the names come from those). Not the revision: deleted and made again, it starts over.
 fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
-    let kinds = ["Node", "Service", "DNSZone", "DNSRecord", "Namespace"].into_iter();
+    let kinds = ["Node", "Service", "Workload", "DNSZone", "DNSRecord", "Namespace"].into_iter();
     kinds
         .flat_map(|kind| store.list(Some(kind)))
         .map(|r| {
             let status = r.status.as_ref().map(|s| {
                 if r.kind == "Node" {
                     json!([s["address"], s["serves"], s["state"]])
+                } else if r.kind == "Workload" {
+                    let units = s["containers"].as_array().into_iter().flatten();
+                    let units: Vec<Value> = units
+                        .map(|unit| json!([unit["replica"], unit["node"], unit["ready"], unit["address"]]))
+                        .collect();
+                    json!([r.metadata.labels, units])
                 } else {
                     s["address"].clone()
                 }
@@ -112,6 +119,12 @@ fn zones_made_of(store: &Store) -> Vec<(String, Value, Option<Value>)> {
 }
 
 /// What the server answers from, and what to report on each DNSZone and DNSRecord.
+/// Whether a Service's or Workload's name and namespace are each one DNS label. A dotted one (a
+/// store written before the rule at submission holds one) would name another's: not served.
+fn one_label(resource: &Resource) -> bool {
+    !resource.metadata.name.contains('.') && !crate::services::namespace(resource).contains('.')
+}
+
 pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTreeMap<String, Value>) {
     let mut status = BTreeMap::new();
     let served = || json!({ "state": "served" });
@@ -148,23 +161,56 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             own.push(Record { name, ttl, data });
         }
     }
-    // `<service>.<namespace>.kith`: the Service's address on the mesh.
-    for (key, address) in mesh
-        .into_iter()
-        .flat_map(|mesh| crate::services::addresses(store, mesh))
-    {
-        let mut parts = key.split('/').skip(1);
-        if let (Some(namespace), Some(service)) = (parts.next(), parts.next()) {
-            let (name, ttl) = (format!("{service}.{namespace}.kith"), NODE_TTL);
-            let data = Rdata::Aaaa(address);
-            own.push(Record {
-                name,
-                ttl,
-                data: data.clone(),
-            });
-            // (As what is written for Kubernetes names it: a pod is told to look there.)
-            let name = format!("{service}.{namespace}.svc.cluster.local");
-            own.push(Record { name, ttl, data });
+    // Each Service, by its name (`<service>.<namespace>.kith`, and as Kubernetes writes it,
+    // under `svc.cluster.local`, where a pod is told to look): the Service's address on the
+    // mesh, or for a headless one, the addresses of its ready replicas. Each ready replica is
+    // also named under every Service that selects its Workload: `<workload>-<replica>.<service>.
+    // <namespace>.svc.cluster.local` (a StatefulSet's pod names).
+    for service in store.list(Some("Service")) {
+        let Ok(spec) = serde_json::from_value::<ServiceSpec>(service.spec.clone()) else {
+            continue;
+        };
+        if !one_label(service) {
+            continue;
+        }
+        let namespace = crate::services::namespace(service);
+        let name = &service.metadata.name;
+        let mut replicas = Vec::new();
+        for workload in crate::services::behind(store, service, &spec) {
+            if !one_label(workload) {
+                continue;
+            }
+            for (replica, address) in crate::services::ready_addresses(workload) {
+                let named = format!(
+                    "{}-{replica}.{name}.{namespace}.svc.cluster.local",
+                    workload.metadata.name
+                );
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
+                replicas.push(address);
+            }
+        }
+        let addresses = if spec.headless == Some(true) {
+            replicas
+        } else {
+            mesh.map(|mesh| kith_mesh::service_address(mesh, &namespace, name))
+                .into_iter()
+                .collect()
+        };
+        for address in addresses {
+            for named in [
+                format!("{name}.{namespace}.kith"),
+                format!("{name}.{namespace}.svc.cluster.local"),
+            ] {
+                own.push(Record {
+                    name: named,
+                    ttl: NODE_TTL,
+                    data: Rdata::Aaaa(address),
+                });
+            }
         }
     }
 
@@ -255,6 +301,7 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
         let mut records = Records::default();
         let domains: BTreeSet<&str> = shown.iter().map(|zone| zone.domain.as_str()).collect();
         let apexes = domains.into_iter().map(soa);
+        let mut refused = None;
         for record in own
             .iter()
             .cloned()
@@ -262,8 +309,14 @@ pub fn zones_of(store: &Store, mesh: Option<std::net::Ipv6Addr>) -> (Zones, BTre
             .chain(shown.iter().flat_map(|zone| zone.records.clone()))
         {
             // Each record was added once already, beside the rest of its domain's, so this
-            // only fails where one zone's domain lies inside another's and they collide.
-            let _ = records.add(record);
+            // only fails where one zone's domain lies inside another's and they collide, or
+            // past the RRset limit. Said once: the first, with a line on stderr.
+            if let Err(error) = records.add(record) {
+                refused.get_or_insert(error);
+            }
+        }
+        if let Some(error) = refused {
+            eprintln!("kithd: dns: records refused, not answered: {error}");
         }
         // An exposed host is answered where its zone is shown, at each ingress address, for the
         // zone's TTL. A DNSRecord of that name answers instead when it is an A or a CNAME; a TXT
@@ -1194,5 +1247,128 @@ spec: {}
         let leads_now = shared.raft.wait(Some(std::time::Duration::from_secs(30)));
         leads_now.current_leader(id, "leads").await.unwrap();
         assert!(leads(&shared));
+    }
+
+    /// The addresses `client` is told `name` is (type AAAA), sorted.
+    fn answers6(zones: &Zones, client: &str, name: &str) -> Vec<std::net::Ipv6Addr> {
+        let found = zones.lookup(client.parse().unwrap(), name, 28).unwrap();
+        let mut ips: Vec<std::net::Ipv6Addr> = found
+            .answers
+            .iter()
+            .filter_map(|record| match &record.data {
+                Rdata::Aaaa(ip) => Some(*ip),
+                _ => None,
+            })
+            .collect();
+        ips.sort();
+        ips
+    }
+
+    #[test]
+    fn a_statefulsets_replicas_are_named_under_each_service_and_a_headless_service_answers_them() {
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  replicas: 3
+  template:
+    containers: [{ name: main, image: example.org/web }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: web }
+spec: { headless: true, selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: api }
+spec: { selector: { app: web }, ports: [{ port: 80 }] }
+",
+        );
+        let unit = |replica: u32, ready: bool, address: &str| json!({ "name": "main", "replica": replica, "node": "a", "ready": ready, "address": address });
+        let status = |second: &str| json!({ "containers": [unit(0, true, "fd00:1::10"), unit(1, true, second), unit(2, false, "fd00:1::12")] });
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::11")))
+            .unwrap();
+        let before = zones_made_of(&store);
+
+        let ip = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
+        let prefix = kith_mesh::prefix(b"test");
+        let (zones, _) = zones_of(&store, Some(prefix));
+        let client = "10.0.0.1";
+        // Each ready replica is named under each Service that selects its Workload, and it
+        // answers its own address; one not ready answers nothing.
+        assert_eq!(
+            answers6(&zones, client, "web-0.web.default.svc.cluster.local"),
+            [ip("fd00:1::10")]
+        );
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::11")]
+        );
+        assert!(answers6(&zones, client, "web-2.api.default.svc.cluster.local").is_empty());
+        // A headless Service answers its ready replicas, and not an address of its own.
+        assert_eq!(
+            answers6(&zones, client, "web.default.svc.cluster.local"),
+            [ip("fd00:1::10"), ip("fd00:1::11")]
+        );
+        assert_eq!(
+            answers6(&zones, client, "web.default.kith"),
+            [ip("fd00:1::10"), ip("fd00:1::11")]
+        );
+        // The other Service answers its own address, as it did.
+        let api = kith_mesh::service_address(prefix, "default", "api");
+        assert_eq!(answers6(&zones, client, "api.default.svc.cluster.local"), [api]);
+
+        // A replica that moves to another address is told apart, so the zones are built again.
+        store
+            .set_status("Workload/default/web", Some(status("fd00:1::99")))
+            .unwrap();
+        assert_ne!(zones_made_of(&store), before);
+        let (zones, _) = zones_of(&store, Some(prefix));
+        assert_eq!(
+            answers6(&zones, client, "web-1.api.default.svc.cluster.local"),
+            [ip("fd00:1::99")]
+        );
+    }
+
+    #[test]
+    fn a_service_or_namespace_with_a_dot_in_its_name_is_not_served() {
+        // A Service `db-0` in namespace `db.prod` would name `db-0.db.prod.svc.cluster.local`, which
+        // is replica 0 of Workload `db` under Service `db` in `prod`: a dotted one is not served.
+        let mut store = store(
+            "
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db, namespace: prod, labels: { app: db } }
+spec:
+  replicas: 1
+  template:
+    containers: [{ name: main, image: example.org/db }]
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: db, namespace: prod }
+spec: { headless: true, selector: { app: db }, ports: [{ port: 80 }] }
+---
+apiVersion: kith.dev/v1
+kind: Service
+metadata: { name: db-0, namespace: 'db.prod' }
+spec: { selector: { app: other }, ports: [{ port: 80 }] }
+",
+        );
+        let status = json!({ "containers": [{ "name": "main", "replica": 0, "node": "a", "ready": true, "address": "fd00:1::10" }] });
+        store.set_status("Workload/prod/db", Some(status)).unwrap();
+        let prefix = kith_mesh::prefix(b"test");
+        let (zones, _) = zones_of(&store, Some(prefix));
+        let client = "10.0.0.1";
+        let ip = |text: &str| text.parse::<std::net::Ipv6Addr>().unwrap();
+        assert_eq!(
+            answers6(&zones, client, "db-0.db.prod.svc.cluster.local"),
+            [ip("fd00:1::10")]
+        );
+        assert!(answers6(&zones, client, "db-0.db.prod.kith").is_empty());
     }
 }

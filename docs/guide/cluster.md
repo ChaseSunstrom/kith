@@ -201,6 +201,11 @@ ready replica in turn, wherever it runs: kithd relays it, over the mesh if neede
 replica's port on `127.0.0.1` (or `::1`). TCP only; a named `targetPort` is a container port of
 that name. A kithd restart drops the connections through it.
 
+A Service with `headless: true` (`clusterIP: None` in Kubernetes) has no address of its own: its
+name answers the addresses of its ready replicas, and it cannot be `expose`d. Each ready replica
+is also named `NAME-N.SERVICE.NAMESPACE.svc.cluster.local` (a StatefulSet's pod names) under every
+Service that selects its Workload.
+
 - Relaying runs on up to four threads of its own and DNS on one more, so a busy Service holds up
   neither the API nor lookups.
 - A node relays 4096 connections at a time (1024 per peer node) and closes one silent for an
