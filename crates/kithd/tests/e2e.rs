@@ -1265,6 +1265,105 @@ fn probes_gate_ready_and_restart() {
     );
 }
 
+/// A busybox pod whose main process is `httpd` in the foreground, as the default user, stays up:
+/// no restart, and still running after the hold.
+#[test]
+fn httpd_in_the_foreground_stays_up() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("httpd-fg");
+    let unit = |name: &str| daemon.status(&format!("Workload/{name}"))["containers"][0].clone();
+    let port = free_port();
+    daemon.apply(&boxed(
+        "web",
+        1,
+        "rolling",
+        &format!("httpd -f -p {port} -h /tmp"),
+        "    pod: true\n",
+    ));
+    wait_for("web to run", || unit("web")["state"] == "running");
+    std::thread::sleep(Duration::from_secs(5));
+    let (state, restarts) = (unit("web")["state"].clone(), unit("web")["restarts"].clone());
+    if state != "running" || restarts != 0 {
+        let target = "Workload/web".to_string();
+        panic!(
+            "httpd -f stopped: state {state}, restarts {restarts}, exitCode {}\nstdout: {:?}\nstderr: {:?}",
+            unit("web")["exitCode"],
+            daemon.kith(&["logs", &target]).1,
+            daemon.kith(&["logs", &target, "--stderr"]).1,
+        );
+    }
+}
+
+/// Each variant changes one thing from `httpd -f -p PORT -h /tmp` as a pod: foreground or not,
+/// the root at /tmp/www, the port 8080, and the user 0. Each runs in its own pod, which all
+/// share the node's network where kithd is not root, so each takes its own port. The failure
+/// names every variant that did not stay up, with its exit code and what it wrote.
+#[test]
+fn httpd_variants_name_the_one_that_stops() {
+    if !e2e() {
+        return;
+    }
+    let daemon = Daemon::start("httpd-variants");
+    let unit = |name: &str| daemon.status(&format!("Workload/{name}"))["containers"][0].clone();
+    let variants = [
+        (
+            "base",
+            format!("httpd -f -p {} -h /tmp", free_port()),
+            "    pod: true\n".to_string(),
+        ),
+        (
+            "not-foreground",
+            format!("httpd -p {} -h /tmp; sleep 300", free_port()),
+            "    pod: true\n".to_string(),
+        ),
+        (
+            "www",
+            format!("mkdir -p /tmp/www; httpd -f -p {} -h /tmp/www", free_port()),
+            "    pod: true\n".to_string(),
+        ),
+        (
+            "port-8080",
+            "httpd -f -p 8080 -h /tmp".to_string(),
+            "    pod: true\n".to_string(),
+        ),
+        (
+            "user-0",
+            format!("httpd -f -p {} -h /tmp", free_port()),
+            "        runAsUser: 0\n    pod: true\n".to_string(),
+        ),
+    ];
+    let names: Vec<&str> = variants.iter().map(|(name, _, _)| *name).collect();
+    for (name, script, extra) in &variants {
+        daemon.apply(&boxed(name, 1, "rolling", script, extra));
+    }
+    // Each one is up, or has been restarted at least once: then it has shown what it does.
+    wait_for("every variant to run or fail", || {
+        names.iter().all(|name| {
+            let unit = unit(name);
+            unit["state"] == "running" || unit["restarts"].as_u64().unwrap_or(0) >= 1
+        })
+    });
+    std::thread::sleep(Duration::from_secs(5));
+    let mut report = String::new();
+    for name in &names {
+        let unit = unit(name);
+        let target = format!("Workload/{name}");
+        if unit["state"] != "running" || unit["restarts"].as_u64().unwrap_or(0) != 0 {
+            report += &format!(
+                "{name}: state {}, restarts {}, exitCode {}\n  stdout: {:?}\n  stderr: {:?}\n",
+                unit["state"],
+                unit["restarts"],
+                unit["exitCode"],
+                daemon.kith(&["logs", &target]).1,
+                daemon.kith(&["logs", &target, "--stderr"]).1,
+            );
+        }
+    }
+    assert!(report.is_empty(), "variants that did not stay up:\n{report}");
+}
+
 #[test]
 fn rolling_updates_keep_replicas_ready() {
     if !e2e() {
