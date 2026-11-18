@@ -88,7 +88,9 @@ shares there as `dmem.max` in its cgroup, and the kernel refuses it more of the 
 (`status.share.DEVICE.enforced: true`). That is where the driver gives the region (amdgpu, xe,
 NVIDIA's) and kithd may hand the controller down to its containers (root, or a delegation with
 `dmem`; a kithd that cannot gives its Devices no `dmem` label). Elsewhere a share is
-cooperative. Untried: MPS, MIG partitions.
+cooperative. Read back on a PC with a Radeon iGPU and kithd as root, a `256Mi` share gave the
+container's cgroup `drm/0000:74:00.0/vram 268435456` in `dmem.max`, and the claim `enforced:
+true`. Untried: MPS, MIG partitions.
 
 ### An app as a workload of its own, in a session's window
 
