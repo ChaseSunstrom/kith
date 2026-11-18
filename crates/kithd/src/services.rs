@@ -867,7 +867,7 @@ async fn within<T>(doing: impl Future<Output = std::io::Result<T>>) -> std::io::
 /// are not listened on here: the ingress has those ports, and sends what is ours on.
 pub async fn run(
     shared: Arc<Shared>,
-    port: u16,
+    port: Option<u16>,
     mut strays: Option<mpsc::UnboundedReceiver<TcpStream>>,
     mut stopping: watch::Receiver<bool>,
 ) {
@@ -934,6 +934,9 @@ pub async fn run(
         .moved
         .clone();
     let mut probed = BTreeMap::new();
+    // (With no mesh: the Services' addresses this kithd put on the loopback, and whether it said it could not.)
+    let (mut on_loopback, mut told) = (BTreeSet::new(), false);
+    let relay = port.map(|port| (me, port));
     loop {
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
@@ -992,6 +995,7 @@ pub async fn run(
         // The relay, and one listener for each Service port; one whose address is not on
         // the interface yet (the mesh puts it there) is tried again shortly.
         let mut keys: BTreeSet<(Ipv6Addr, u16)> = wanted.keys().copied().collect();
+        let wanted_at: BTreeSet<Ipv6Addr> = keys.iter().map(|(at, _)| *at).collect();
         let elsewhere = elsewhere.load(Ordering::Relaxed);
         keys.retain(|(_, port)| !(elsewhere && [443, 80].contains(port)));
         // (No thread, and no listener, before there is a Service: a node that has none
@@ -999,8 +1003,18 @@ pub async fn run(
         if threads.is_empty() && !wanted.is_empty() {
             threads = start();
         }
-        if !threads.is_empty() {
-            keys.insert((me, port));
+        if let (false, Some(relay)) = (threads.is_empty(), relay) {
+            keys.insert(relay);
+        }
+        // With no mesh to carry them, the Services' addresses are on the loopback: a pod's
+        // connection to one arrives there, and kithd listens on it (T-0723).
+        if port.is_none() {
+            let held = hold_on_loopback(&mut on_loopback, &wanted_at);
+            if let Err(e) = held
+                && !std::mem::replace(&mut told, true)
+            {
+                eprintln!("kithd: services: their addresses on the loopback: {e}");
+            }
         }
         proxy.turns.keep(&wanted);
         proxy.forget();
@@ -1029,7 +1043,7 @@ pub async fn run(
                     let Ok(listener) = TcpListener::from_std(listener) else {
                         return;
                     };
-                    if key == (me, port) {
+                    if Some(key) == relay {
                         let take = |proxy: Arc<Proxy>, stream| async move {
                             let _ = proxy.take(stream).await;
                         };
@@ -1055,11 +1069,23 @@ pub async fn run(
     if let Kernel::Has(netns, _) | Kernel::Stuck(netns) = kernel {
         let _ = connect::attach(&[], netns);
     }
+    if port.is_none() {
+        let _ = hold_on_loopback(&mut on_loopback, &BTreeSet::new());
+    }
     listening
         .values()
         .flatten()
         .chain(&stray)
         .for_each(tokio::task::JoinHandle::abort);
+}
+
+/// With no mesh, the Services' addresses on the loopback (what the mesh's interface holds
+/// where there is one): the node's own, as a pod's connection to one is sent here, and kithd
+/// listens on it. `held` is what this kithd put there before.
+fn hold_on_loopback(held: &mut BTreeSet<Ipv6Addr>, wanted: &BTreeSet<Ipv6Addr>) -> Result<(), String> {
+    let (_, lo) = kith_mesh::cards().map_err(|e| e.to_string())?;
+    let lo = lo.ok_or("no loopback")?;
+    kith_mesh::hold(lo, held, wanted).map_err(|e| e.to_string())
 }
 
 /// The kernel's program on the containers' cgroup, for the network namespace (`u64`, its
