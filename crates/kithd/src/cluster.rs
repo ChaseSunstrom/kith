@@ -849,11 +849,19 @@ async fn issue(
     });
     identity.spec["publicKey"] = public.into();
     let resources = std::iter::once(identity).chain(more).collect();
+    // (As the admin's, not this node's own: a control node that is not the leader passes it on,
+    // and the leader holds a node's own writes to what it holds. `claim` cannot be the Identity's
+    // own write, as the Role it grants is not there until this one is in; its console token is
+    // this node's admin's, as `certificate` is. The caller is still the audit's.)
+    let admin = crate::access::Caller::Admin;
     let done = shared
-        .submit(Command::Apply {
-            resources,
-            at: kith_api::store::now(),
-        })
+        .submit_as(
+            Command::Apply {
+                resources,
+                at: kith_api::store::now(),
+            },
+            Some(&admin),
+        )
         .await;
     let said = done.as_ref().map(drop).map_err(ToString::to_string);
     shared.audit.record(&caller, what, vec![key_of], said);

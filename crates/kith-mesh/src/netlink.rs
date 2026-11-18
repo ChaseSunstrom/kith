@@ -548,17 +548,7 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
     use netlink_packet_route::route::{
         RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType,
     };
-    let mut message = AddressMessage::default();
-    message.header.family = AddressFamily::Inet;
-    message.header.prefix_len = bits;
-    message.header.index = index;
-    let mask = u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
-    let broadcast = std::net::Ipv4Addr::from(u32::from(address) | !mask);
-    message.attributes.extend([
-        AddressAttribute::Local(address.into()),
-        AddressAttribute::Address(address.into()),
-        AddressAttribute::Broadcast(broadcast),
-    ]);
+    let message = address_message(index, address, bits);
     let flags = NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
     ask_route(RouteNetlinkMessage::NewAddress(message), flags)?;
     let Some(gateway) = gateway else { return Ok(()) };
@@ -573,6 +563,44 @@ pub fn address4(index: u32, address: std::net::Ipv4Addr, bits: u8, gateway: Opti
         RouteAttribute::Oif(index),
     ]);
     ask_route(RouteNetlinkMessage::NewRoute(route), flags).map(drop)
+}
+
+/// The kernel's message for `address`/`bits` on link `index`.
+fn address_message(index: u32, address: std::net::Ipv4Addr, bits: u8) -> AddressMessage {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet;
+    message.header.prefix_len = bits;
+    message.header.index = index;
+    let mask = u32::MAX.checked_shl(32 - u32::from(bits.min(32))).unwrap_or(0);
+    let broadcast = std::net::Ipv4Addr::from(u32::from(address) | !mask);
+    message.attributes.extend([
+        AddressAttribute::Local(address.into()),
+        AddressAttribute::Address(address.into()),
+        AddressAttribute::Broadcast(broadcast),
+    ]);
+    message
+}
+
+/// Give a link an IPv4 address that the kernel takes off by itself `seconds` from now (again
+/// does no harm, and starts the time again): an address held for as long as someone says so.
+/// It is no route, and no gateway: a card in that network has them already.
+pub fn address4_for(index: u32, address: std::net::Ipv4Addr, bits: u8, seconds: u32) -> Result<()> {
+    let mut message = address_message(index, address, bits);
+    let mut times = CacheInfo::default();
+    (times.ifa_preferred, times.ifa_valid) = (seconds, seconds);
+    message.attributes.push(AddressAttribute::CacheInfo(times));
+    let flags = NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+    ask_route(RouteNetlinkMessage::NewAddress(message), flags).map(drop)
+}
+
+/// Take an IPv4 address off a link; one that is not there (its time ran out) is no error.
+pub fn drop_address4(index: u32, address: std::net::Ipv4Addr, bits: u8) -> Result<()> {
+    let message = address_message(index, address, bits);
+    match ask_route(RouteNetlinkMessage::DelAddress(message), NLM_F_ACK) {
+        // (EADDRNOTAVAIL: the kernel's word for an address it does not have.)
+        Err(e) if e.raw_os_error() == Some(99) || e.kind() == ErrorKind::NotFound => Ok(()),
+        other => other.map(drop),
+    }
 }
 
 #[cfg(test)]
