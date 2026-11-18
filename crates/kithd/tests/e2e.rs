@@ -1282,7 +1282,18 @@ fn httpd_in_the_foreground_stays_up() {
         &format!("httpd -f -p {port} -h /tmp"),
         "    pod: true\n",
     ));
-    wait_for("web to run", || unit("web")["state"] == "running");
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while unit("web")["state"] != "running" {
+        // (What it is at, and what it said: a pull that fails and an httpd that stops differ.)
+        let target = "Workload/web".to_string();
+        assert!(
+            Instant::now() < deadline,
+            "web never ran: {}\nstderr: {:?}",
+            daemon.status(&target),
+            daemon.kith(&["logs", &target, "--stderr"]).1,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     std::thread::sleep(Duration::from_secs(5));
     let (state, restarts) = (unit("web")["state"].clone(), unit("web")["restarts"].clone());
     if state != "running" || restarts != 0 {
