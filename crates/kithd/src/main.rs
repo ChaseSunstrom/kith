@@ -611,7 +611,16 @@ async fn replica(
             _ => {}
         }
     }
-    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke).await?;
+    // What each entry is asked once the store is in format 3: a signed one is refused (no
+    // kithd checks its signature in the log yet), so none is ever run. (Under the store's
+    // lock, and deterministic: it reads the command alone.)
+    let check: kith_store::Check = Arc::new(|_, command, _| match command {
+        kith_store::Command::Signed { .. } => Err(kith_api::store::Error::Invalid(
+            "refused: a signed entry, which this kithd does not check yet".into(),
+        )),
+        _ => Ok(()),
+    });
+    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
         raft: replica.raft,

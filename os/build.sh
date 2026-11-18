@@ -5,7 +5,8 @@
 #
 # What is in it:
 #   - a kernel built from kernel.org's source at a pinned version and checksum with
-#     os/kernel.config: no modules, no initramfs;
+#     os/kernel.config: no modules, no initramfs (but for a spec with the `all` feature:
+#     signed modules and their firmware in the root, see --spec);
 #   - a root file system (squashfs, read-only) holding kithd as /sbin/init, kith, a CA
 #     bundle and empty directories, with a dm-verity hash tree beside it;
 #   - a unified kernel image (systemd's stub, the kernel, and the command line that
@@ -53,8 +54,12 @@ releases from (/etc/kith/release-keys); without, a node takes the first release'
   --spec FILE what goes into the kernel beyond os/kernel.config: a YAML file with
               `features:` (each os/features/NAME.config) and `firmware:` (paths or
               globs in linux-firmware, built in), for a node that needs a driver
-              others do not (os/examples/gpu-amd.yaml)
-  --check     fail unless the raw image is under 300 MB
+              others do not (os/examples/gpu-amd.yaml). A feature that turns on
+              CONFIG_MODULES (all: os/examples/all.yaml) makes the kernel sign its
+              modules with a key made for this build and deleted after, and puts the
+              modules and the firmware they name (`firmware: [all]`: all of
+              linux-firmware) in the root's /lib/modules and /lib/firmware
+  --check     fail unless the raw image is under 300 MB (4 GB with modules)
   --twice     build the root and the image a second time and fail unless both are
               byte for byte the same (the kernel comes from the cache both times)
   --help      this text
@@ -160,10 +165,15 @@ spec_list() { # KEY
     ' "$spec"
 }
 kconfig=$cache/kernel.config.$$
-trap 'rm -f "$kconfig"' EXIT
+# (The key a kernel with modules signs them with is made in its build tree: gone from it on
+# any way out of this script the trap sees (not SIGKILL: a tree that is gone on from has its
+# key removed before make). Made anew, if the build is run again.)
+tree=''
+trap 'rm -f "$kconfig"; [ -z "$tree" ] || rm -f "$tree/certs/signing_key.pem"' EXIT
+trap 'exit 1' HUP INT TERM
 cp "$root/os/kernel.config" "$kconfig"
 fwdir=$cache/firmware-$firmware_date
-firmware=''
+firmware='' modules='' fwextra=''
 if [ -n "$spec" ]; then
     bad=$(spec_list features | grep '^?' | head -n 1) || true
     [ -z "$bad" ] || die "--spec: not a feature, a firmware or a list item: '${bad#?}'"
@@ -180,12 +190,28 @@ if [ -n "$spec" ]; then
         globs="$globs
 $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     done
+    # (all.config has modules, gpu-amd-phoenix builds the same driver in: merged, the one
+    # would be =y and =m by the order of the lines.)
+    ! spec_list features | grep -qx all || ! spec_list features | grep -qx gpu-amd-phoenix ||
+        die "--spec: 'all' and 'gpu-amd-phoenix' do not go together (the same driver, as modules and built in)"
     # shellcheck disable=SC2086
     globs=$(printf '%s\n' $globs | LC_ALL=C sort -u)
-    if [ -n "$globs" ]; then
-        for g in $globs; do
-            case $g in /* | *..* | *[!A-Za-z0-9_./*+-]*) die "--spec: '$g' is not a path in linux-firmware" ;; esac
+    for g in $globs; do
+        case $g in /* | *..* | *[!A-Za-z0-9_./*+-]*) die "--spec: '$g' is not a path in linux-firmware" ;; esac
+    done
+    # With modules (the last word on CONFIG_MODULES in the config is =y), the firmware is
+    # not built in: the drivers load it from the root when they start, so the root has
+    # the files the modules name (modinfo -F firmware), and the whole of linux-firmware
+    # for `all`.
+    [ "$(grep -E '^(CONFIG_MODULES=y|# CONFIG_MODULES is not set)$' "$kconfig" | tail -n 1)" != CONFIG_MODULES=y ] || modules=1
+    if [ -n "$modules" ]; then
+        for tool in modinfo depmod openssl; do
+            command -v "$tool" >/dev/null 2>&1 || lacks "$tool (kmod, openssl: modules are signed and indexed)"
         done
+        fwextra=$globs
+        limit=$((4096 * 1024 * 1024))
+    elif [ -n "$globs" ]; then
+        case " $(echo $globs) " in *" all "*) die "--spec: firmware: [all] is for a kernel with modules (os/examples/all.yaml)" ;; esac
         # (The tarball is 640 MB, read once per new list of files: what it gave is kept.)
         if [ "$(cat "$fwdir/.globs" 2>/dev/null)" != "$globs" ]; then
             echo "build.sh: firmware from linux-firmware $firmware_date: $(echo $globs)" >&2
@@ -213,30 +239,140 @@ fi
 compiler=$(gcc --version | head -n 1)
 key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; cat "$kconfig"; } | sha256sum | cut -c 1-16)
 kernel=$cache/kernel-$key/vmlinuz
+mods=$cache/kernel-$key/mods
 if ! [ -r "$kernel" ]; then
     echo "build.sh: building the kernel ($kernel_version): this takes a while, once" >&2
     fetch "$kernel_url" "$kernel_sha256" "$cache/linux-$kernel_version.tar.xz"
     tree=$cache/kernel-$key/src
-    mkdir -p "$tree"
-    tar -xJf "$cache/linux-$kernel_version.tar.xz" -C "$tree" --strip-components=1
+    # (A build that was cut short goes on from its tree, which has the mark of a config
+    # made; a tree without it is begun again. The modules of an earlier key are not kept.)
+    fresh=''
+    if ! [ -e "$tree/.kith-config" ]; then
+        [ ! -d "$tree" ] || find "$tree" -delete
+        mkdir -p "$tree"
+        tar -xJf "$cache/linux-$kernel_version.tar.xz" -C "$tree" --strip-components=1
+        fresh=1
+    fi
+    [ ! -d "$mods" ] || find "$mods" -delete
+    [ ! -d "$mods.part" ] || find "$mods.part" -delete
     (
         cd "$tree"
         export KBUILD_BUILD_TIMESTAMP='Thu Jan  1 00:00:00 UTC 1970' KBUILD_BUILD_USER=kith KBUILD_BUILD_HOST=kith
-        make -s x86_64_defconfig
-        [ -z "$firmware" ] || cp -r "$fwdir" kith-firmware
-        scripts/kconfig/merge_config.sh -m .config "$kconfig" >/dev/null
-        make -s olddefconfig
-        # What the config asks for and the kernel does not have would be dropped in silence.
-        grep '^CONFIG_' "$kconfig" | while read -r wanted; do
-            grep -qxF "$wanted" .config || { echo "build.sh: the kernel did not take $wanted" >&2; exit 1; }
-        done
-        nice -n 10 make -s -j"${KITH_OS_JOBS:-$(nproc)}" bzImage
+        if [ -n "$fresh" ]; then
+            make -s x86_64_defconfig
+            [ -z "$firmware" ] || cp -r "$fwdir" kith-firmware
+            scripts/kconfig/merge_config.sh -m .config "$kconfig" >/dev/null
+            make -s olddefconfig
+            # What the config asks for and the kernel does not have would be dropped in silence.
+            grep '^CONFIG_' "$kconfig" | while read -r wanted; do
+                grep -qxF "$wanted" .config || { echo "build.sh: the kernel did not take $wanted" >&2; exit 1; }
+            done
+            : >.kith-config
+        fi
+        # A tree that was cut short may still hold the key of that run (a SIGKILL or a power
+        # cut gives the trap no turn): gone, the kernel makes a fresh one and builds its
+        # public half in, and the modules are signed with that.
+        [ ! -d certs ] || find certs -name 'signing_key*' -delete
+        nice -n 10 make -s -j"${KITH_OS_JOBS:-$(nproc)}" bzImage ${modules:+modules}
         cp arch/x86/boot/bzImage ../vmlinuz.part
         cp .config ../config
+        if [ -n "$modules" ]; then
+            # Signed as they are installed, with the key this build made (certs/signing_key.pem),
+            # whose public half is in the kernel (certs/signing_key.x509). Stripped, so that
+            # what goes into the root is the code; /lib/modules/VER/{build,source} would
+            # name this tree, which goes.
+            make -s modules_install INSTALL_MOD_PATH="$mods.part" INSTALL_MOD_STRIP=1
+            rel=$(make -s kernelrelease)
+            m=$mods.part/lib/modules/$rel
+            rm -f "$m/build" "$m/source"
+            for f in modules.dep modules.alias modules.symbols modules.builtin modules.builtin.modinfo modules.order; do
+                [ -s "$m/$f" ] || { echo "build.sh: modules_install left no $f in lib/modules/$rel" >&2; exit 1; }
+            done
+            # Every module carries a signature, and the signer is the key built into the kernel.
+            find "$m" -name '*.ko' | while read -r f; do
+                tail -c 28 "$f" | grep -aq '^~Module signature appended~$' || { echo "build.sh: $f is not signed" >&2; exit 1; }
+            done
+            n=$(find "$m" -name '*.ko' | wc -l)
+            [ "$n" -gt 100 ] || { echo "build.sh: only $n modules built: the config did not give the drivers" >&2; exit 1; }
+            sample=$(find "$m" -name 'amdgpu.ko' | head -n 1)
+            [ -n "$sample" ] || { echo "build.sh: no amdgpu.ko among the modules" >&2; exit 1; }
+            # (kmod shows the signer's serial or its key id, by version: either names the cert.)
+            hexid() { tr -d ': \n' | tr 'a-f' 'A-F' | sed 's/^0*//'; }
+            have=$(modinfo -F sig_key "$sample" | hexid)
+            serial=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -serial | sed 's/^serial=//' | hexid)
+            ski=$(openssl x509 -inform DER -in certs/signing_key.x509 -noout -ext subjectKeyIdentifier | sed -n 2p | hexid)
+            [ -n "$have" ] && [ -n "$(modinfo -F signer "$sample")" ] || { echo "build.sh: amdgpu.ko has no signer: $(modinfo "$sample" | tail -n 5)" >&2; exit 1; }
+            [ "$have" = "$serial" ] || [ "$have" = "$ski" ] ||
+                { echo "build.sh: amdgpu.ko is signed by $have, which is not the kernel's key (serial $serial, id $ski)" >&2; exit 1; }
+            echo "build.sh: $n modules, signed by $(modinfo -F signer "$sample") ($have)"
+            # The key is not kept: not in the tree, not in what is installed.
+            rm -f certs/signing_key.pem
+            [ -z "$(find . -name 'signing_key*' ! -name 'signing_key.x509' ! -name 'signing_key.x509.d')$(find certs "$mods.part" -name '*.pem')" ] ||
+                { echo "build.sh: a private key is left in the build" >&2; exit 1; }
+            ! grep -rlaE -e '-----BEGIN [A-Z ]*PRIVATE KEY' "$mods.part" || { echo "build.sh: a private key is in the modules" >&2; exit 1; }
+        fi
     ) >&2
+    [ -z "$modules" ] || mv "$mods.part" "$mods"
     # (The tree is 2.6 GB; the kernel is what is kept.)
     find "$tree" -delete
     mv "$cache/kernel-$key/vmlinuz.part" "$kernel"
+fi
+if [ -n "$modules" ]; then
+    # What the modules ask for, from linux-firmware: the whole of it for `all`, and the files
+    # named in the spec. The list is kept; the tarball (640 MB) is read once, into a tree.
+    fwall=$cache/firmware-$firmware_date-all
+    if ! [ -e "$fwall/.kith-done" ]; then
+        echo "build.sh: linux-firmware $firmware_date, all of it" >&2
+        fetch "$firmware_url" "$firmware_sha256" "$cache/linux-firmware-$firmware_date.tar.xz"
+        [ ! -d "$fwall" ] || find "$fwall" -delete
+        mkdir -p "$fwall"
+        tar -xJf "$cache/linux-firmware-$firmware_date.tar.xz" -C "$fwall" --strip-components=1
+        : >"$fwall/.kith-done"
+    fi
+    # The links linux-firmware's WHENCE lists (a driver asks for iwlwifi-cc-a0-77.ucode, the
+    # file is intel/iwlwifi/iwlwifi-cc-a0-77.ucode): made as its own copy-firmware.sh does.
+    if ! [ -e "$fwall/.kith-links" ]; then
+        sed -n 's/^Link: \([^ ]*\) *-> \([^ ]*\)$/\1 \2/p' "$fwall/WHENCE" | while read -r name target; do
+            # (The tarball is checked against its hash; still, no link out of the tree.)
+            case $name in /* | *..*) continue ;; esac
+            case $target in /*) continue ;; esac
+            [ -e "$fwall/$name" ] || [ -h "$fwall/$name" ] || { mkdir -p "$fwall/$(dirname "$name")" && ln -s "$target" "$fwall/$name"; }
+        done
+        : >"$fwall/.kith-links"
+    fi
+    # (The tag is the layout of the list: a list made before the links was another.)
+    fwlist=$cache/kernel-$key/firmware-$(printf 'links2\n%s\n%s\n' "$firmware_sha256" "$fwextra" | sha256sum | cut -c 1-16).list
+    if ! [ -s "$fwlist" ]; then
+        set -f
+        case " $(echo $fwextra) " in
+        # (Every file and every link, a link to a directory too: not what is under one.)
+        *" all "*) (cd "$fwall" && find . \( -type f -o -type l \) ! -name '.kith-*' | sed 's|^\./||' | LC_ALL=C sort) >"$fwlist.part" ;;
+        *)
+            # (A module names the files it may load; the ones linux-firmware has are kept.)
+            { find "$mods/lib/modules" -name '*.ko' -exec modinfo -F firmware {} + ; echo "$fwextra"; } |
+                tr ' ' '\n' | LC_ALL=C sort -u >"$fwlist.named"
+            (
+                cd "$fwall"
+                set +f
+                while read -r name; do
+                    case $name in '' | /* | *..*) continue ;; esac
+                    # shellcheck disable=SC2086
+                    # (A link is kept with the file it points to.)
+                    for f in $name; do
+                        [ -f "$f" ] || continue
+                        echo "$f"
+                        ! [ -h "$f" ] || realpath --relative-to=. "$f"
+                    done
+                done <"$fwlist.named" | LC_ALL=C sort -u
+            ) >"$fwlist.part"
+            echo "build.sh: the $(wc -l <"$fwlist.named") names the modules ask for are $(wc -l <"$fwlist.part") files and links in linux-firmware" >&2
+            find "$fwlist.named" -delete
+            ;;
+        esac
+        set +f
+        [ -s "$fwlist.part" ] || die "no firmware for the modules"
+        mv "$fwlist.part" "$fwlist"
+    fi
 fi
 fetch "$ca_url" "$ca_sha256" "$cache/cacert-$ca_date.pem"
 exec 9>&-
@@ -273,6 +409,35 @@ assemble() { # DIR
     truncate -s 8M "$r/usr/share/kith/volume.ext4"
     E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -b 4096 -N 4096 -L kith-volume -U "$seed" \
         -E "hash_seed=$seed,root_owner=0:0,lazy_itable_init=0,lazy_journal_init=0" "$r/usr/share/kith/volume.ext4" >&2
+    msize=0 fsize=0
+    if [ -n "$modules" ]; then
+        # The modules (signed, with depmod's index and the list of what is built in, so the
+        # loader skips those) and the firmware they name, in the root: it is checked block
+        # by block, and the 64 MB ESP stays as it is.
+        [ -r "$mods/lib/modules/$(ls "$mods/lib/modules")/modules.alias" ] || die "$mods has no modules: the kernel in the cache is not this build's"
+        mkdir -p "$r/lib/firmware"
+        cp -a "$mods/lib/modules" "$r/lib/modules"
+        # (Links stay links, as in linux-firmware: a file once, under both its names.)
+        (cd "$fwall" && cpio -pd --quiet "$r/lib/firmware") <"$fwlist"
+        # (A link whose file the list lacks is not kept.)
+        find "$r/lib/firmware" -xtype l -delete
+        find "$r/lib" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+        # Not a key anywhere in the root (its CA bundle is a .crt).
+        [ -z "$(find "$r" \( -name '*.pem' -o -name 'signing_key*' \))" ] || die "a key is in the root"
+        ! grep -rlaE -e '-----BEGIN [A-Z ]*PRIVATE KEY' "$r/lib/modules" || die "a private key is in the modules"
+        # The firmware a module names (modinfo -F firmware) is in the root, by that name: shown
+        # for the two drivers everyone asks about, and there must be some.
+        for m in amdgpu iwlwifi; do
+            ko=$(find "$r/lib/modules" -name "$m.ko")
+            [ -n "$ko" ] || continue
+            named=$(modinfo -F firmware "$ko" | wc -l)
+            have=$(modinfo -F firmware "$ko" | while read -r f; do [ ! -e "$r/lib/firmware/$f" ] || echo "$f"; done | wc -l)
+            echo "build.sh: $m.ko names $named firmware files, $have of them in /lib/firmware" >&2
+            [ "$have" -gt 0 ] || die "$m.ko: none of the firmware it names is in the root's /lib/firmware"
+        done
+        msize=$(du -sb "$r/lib/modules" | cut -f 1)
+        fsize=$(du -sb "$r/lib/firmware" | cut -f 1)
+    fi
     chmod -R u=rwX,go=rX "$r"
     mksquashfs "$r" "$w/root.squashfs" -comp zstd -Xcompression-level 19 -all-root -noappend -no-xattrs -quiet -no-progress
     veritysetup format "$w/root.squashfs" "$w/root.verity" --salt="$salt" --uuid="$seed" >"$w/verity.txt"
@@ -343,11 +508,19 @@ assemble() { # DIR
         shift 4
         for line; do echo "$line" >>"$f"; done
     }
+    # (88 MB and 4 MB; with modules, the root's size and a quarter more and 64 MB, and its
+    # tree's size and 4 MB, for the next version to be bigger.)
+    rootsz=88M veritysz=4M
+    if [ -n "$modules" ]; then
+        s=$(stat -c %s "$w/root.squashfs")
+        rootsz=$((s / 1048576 * 5 / 4 + 64))M
+        veritysz=$(($(stat -c %s "$w/root.verity") / 1048576 * 5 / 4 + 4))M
+    fi
     part 10-esp esp esp 64M "CopyBlocks=$w/esp.img"
-    part 20-root-a root-x86-64 root-a 88M "CopyBlocks=$w/root.squashfs"
-    part 21-root-b root-x86-64 root-b 88M
-    part 30-verity-a root-x86-64-verity verity-a 4M "CopyBlocks=$w/root.verity"
-    part 31-verity-b root-x86-64-verity verity-b 4M
+    part 20-root-a root-x86-64 root-a "$rootsz" "CopyBlocks=$w/root.squashfs"
+    part 21-root-b root-x86-64 root-b "$rootsz"
+    part 30-verity-a root-x86-64-verity verity-a "$veritysz" "CopyBlocks=$w/root.verity"
+    part 31-verity-b root-x86-64-verity verity-b "$veritysz"
     # (config: what the installer was told of this node, read at each start as more of
     # the kernel command line. Empty here.)
     part 35-config linux-generic config 1M
@@ -368,8 +541,8 @@ assemble() { # DIR
     d=$w/repart-install.d
     mkdir "$d"
     part 10-esp esp esp 64M "CopyBlocks=$w/esp-install.img"
-    part 20-root-a root-x86-64 root-a 88M "CopyBlocks=$w/root.squashfs"
-    part 30-verity-a root-x86-64-verity verity-a 4M "CopyBlocks=$w/root.verity"
+    part 20-root-a root-x86-64 root-a "$rootsz" "CopyBlocks=$w/root.squashfs"
+    part 30-verity-a root-x86-64-verity verity-a "$veritysz" "CopyBlocks=$w/root.verity"
     part 50-payload linux-generic payload "$(($(stat -c %s "$w/kith-os.raw") / 1048576 + 1))M" "CopyBlocks=$w/kith-os.raw"
     systemd-repart --empty=create --size=auto --dry-run=no --seed="$seed" --definitions="$d" "$w/kith-os-installer.raw" >"$w/repart-install.log" 2>&1 \
         || { cat "$w/repart-install.log" >&2; die "systemd-repart failed (the installer)"; }
@@ -380,7 +553,12 @@ assemble() { # DIR
     # file. The kernel unpacks it and starts /init: no disk is needed to get there.
     i=$w/initramfs
     mkdir "$i"
-    cp -a "$r/." "$i/"
+    if [ -n "$modules" ]; then
+        # (Not the modules and the firmware: it installs the image it carries, it runs nothing.)
+        for e in "$r"/*; do [ "$e" = "$r/lib" ] || cp -a "$e" "$i/"; done
+    else
+        cp -a "$r/." "$i/"
+    fi
     ln -s sbin/init "$i/init"
     cp "$w/kith-os.raw" "$i/payload"
     find "$i" -exec touch -h -d @0 {} +
@@ -412,13 +590,17 @@ assemble() { # DIR
         --add-section .initrd="$w/netboot.initrd" --change-section-vma .initrd="$initrd_at" \
         "$efi/linuxx64.efi.stub" "$w/kith-netboot.efi"
     touch -d "@$SOURCE_DATE_EPOCH" "$w/kith-netboot.efi"
+    # (With the firmware the root dir is a GB the image has: kept only where it is small.)
+    [ -z "$modules" ] || find "$r" -delete
 }
 
 assemble "$out"
 size=$(stat -c %s "$out/kith-os.raw")
-echo "build.sh: $out/kith-os.raw: $((size / 1024 / 1024)) MB ($(($(stat -c %s "$out/kith-os.qcow2") / 1024 / 1024)) MB as qcow2); kernel $kernel_version, $(($(stat -c %s "$kernel") / 1024 / 1024)) MB; root $(($(stat -c %s "$out/root.squashfs") / 1024 / 1024)) MB"
+sizes="kernel $kernel_version, $(($(stat -c %s "$kernel") / 1024 / 1024)) MB; root $(($(stat -c %s "$out/root.squashfs") / 1024 / 1024)) MB"
+[ -z "$modules" ] || sizes="$sizes (modules $((msize / 1024 / 1024)) MB and firmware $((fsize / 1024 / 1024)) MB, before compression)"
+echo "build.sh: $out/kith-os.raw: $((size / 1024 / 1024)) MB ($(($(stat -c %s "$out/kith-os.qcow2") / 1024 / 1024)) MB as qcow2); $sizes"
 if [ -n "$check" ]; then
-    [ "$size" -lt "$limit" ] || die "the image is $size bytes: over 300 MB"
+    [ "$size" -lt "$limit" ] || die "the image is $size bytes: over $((limit / 1024 / 1024)) MB"
     qemu-img compare -q -f raw -F qcow2 "$out/kith-os.raw" "$out/kith-os.qcow2" || die "the qcow2 image is not the raw one"
 fi
 if [ -n "$twice" ]; then

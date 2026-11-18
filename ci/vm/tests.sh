@@ -10,7 +10,10 @@
     done
     [ -n "$firmware" ] || skip "no UEFI firmware (OVMF)"
     command -v sfdisk >/dev/null 2>&1 || skip "no sfdisk to find the root partition with"
-    sh "$root/os/build.sh" --check >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
+    # (KITH_OS_SPEC=os/examples/all.yaml tries the image of a spec instead of the plain one.)
+    osdir=$root/target/os
+    [ -z "${KITH_OS_SPEC:-}" ] || osdir=$root/target/os-spec
+    sh "$root/os/build.sh" --check ${KITH_OS_SPEC:+--spec "$root/$KITH_OS_SPEC" --out "$osdir"} >&2 || { [ $? -ne 3 ] || skip "this machine cannot build the image"; exit 1; }
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         . "$root/ci/vm/cluster.sh"
     fi
@@ -18,7 +21,7 @@
         . "$root/ci/vm/machines.sh"
     fi
     # A copy: the node writes its state to the disk, and this test damages its root.
-    cp "$root/target/os/kith-os.raw" "$work/disk.raw"
+    cp "$osdir/kith-os.raw" "$work/disk.raw"
     port=$((20000 + $$ % 20000))
     # (The stub adds $more to the command line of the image: here, kithd's own arguments.)
     serve='-- --listen 0.0.0.0:7443 --advertise 10.0.2.15:7443'
@@ -66,6 +69,11 @@
     # the file holds what is written. Past 32 GB an ext4 as small as the image's has used
     # up the room it kept for growing and the kernel has to lay its groups out anew.)
     truncate -s 40G "$work/disk.raw"
+    # (The state partition ends at the disk's end, less the last MiB the GPT's backup and
+    # the alignment take: 40959 MB less where it starts, which is the size of the rest of
+    # the image; $want is its size in hundreds of MB, 407 for the plain image.)
+    want=$(sfdisk -l -o Start,Name "$work/disk.raw" 2>/dev/null | awk '$2 == "state" { print int((40959 - $1 / 2048) / 100) }')
+    [ -n "$want" ] || fail "no state partition in the image's table"
     began=$(date +%s%N)
     boot
     up
@@ -74,8 +82,8 @@
     said 'kithd: init: state on /dev/vda7' || fail "the state partition was not mounted"
     # The state partition is the image's 32 MB no longer: it ends where the disk does, the
     # file system fills it, and a tool that reads partition tables finds nothing to say.
-    said 'kithd: init: the state partition now ends where its disk does: 407[0-9][0-9] MB' || fail "the state partition was not made to end where its disk does"
-    said "kithd: init: the state's file system grown to 407[0-9][0-9] MB" || fail "the state's file system was not grown to its partition"
+    said 'kithd: init: the state partition now ends where its disk does: '"$want"'[0-9][0-9] MB' || fail "the state partition was not made to end where its disk does"
+    said "kithd: init: the state's file system grown to ${want}[0-9][0-9] MB" || fail "the state's file system was not grown to its partition"
     who
     first=$who
     said 'by DHCP' || fail "the network card got no address by DHCP"
@@ -83,7 +91,7 @@
     cp "$work/log" "$work/log.first"
     table=$(sfdisk -l "$work/disk.raw" 2>&1)
     case $table in *mismatch* | *corrupt* | *'not on the end'* | *rror*) fail "the partition table kith OS wrote is not right: $table" ;; esac
-    [ "$(sfdisk -l -o Name,Sectors "$work/disk.raw" | awk '$1 == "state" { print int($2 / 2048 / 100) }')" = 407 ] || fail "the table does not say the state partition is longer: $table"
+    [ "$(sfdisk -l -o Name,Sectors "$work/disk.raw" | awk '$1 == "state" { print int($2 / 2048 / 100) }')" = "$want" ] || fail "the table does not say the state partition is longer: $table"
 
     boot
     up

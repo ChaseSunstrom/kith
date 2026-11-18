@@ -95,6 +95,44 @@ A node with no card a feature matches prints `features: []`; a node that runs no
 `wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
 card the catalogue does not list yet) is chosen by hand, as above.
 
+#### The `all` feature: drivers as signed modules
+
+```sh
+KITH_OS_VERSION=1.0.1+all sh os/build.sh --spec os/examples/all.yaml --out target/os-all
+KITH_OS_SPEC=os/examples/all.yaml sh ci/vm.sh --test image   # boot it in QEMU
+```
+
+For a node whose hardware is not known when the image is built, `features: [all]` turns on
+kernel modules (`os/features/all.config`): GPUs (amdgpu, i915, xe, nouveau), sound (HDA and its
+codecs, USB audio, Sound Open Firmware), Wi-Fi (iwlwifi, ath9k to ath12k, mt76, rtw88, rtw89)
+and the network cards the plain kernel lacks. `firmware: [all]` is all of linux-firmware; a list
+of paths there (`amdgpu/*`) is those files, and in both cases the files each module names
+(`modinfo -F firmware`) are there too.
+
+- **Signed, per kernel build.** The kernel makes a key of its own at the start of each kernel build (a tree cut short and gone on from has its old key removed first), signs
+  every module with it as `modules_install` writes them, and builds the public half in;
+  `CONFIG_MODULE_SIG_FORCE` refuses any other module. `build.sh` then deletes the key: the build
+  fails if a `signing_key` or a `.pem` is left in the kernel's tree or in the root, and a
+  failed build deletes it too. It checks one module's signature against the kernel's own key.
+  So the modules of one build load only into that build's kernel, and the kernel of an `all`
+  image is not the same bytes from one kernel build to the next (the plain one is). The
+  kernel and its modules are cached by the hash of their config, so the key is made when
+  they are built, not at each image build.
+- **In the root, not the ESP.** `/lib/modules/VER` (with `modules.dep`, `modules.alias`,
+  `modules.builtin` and `modules.builtin.modinfo`, so a loader knows what is built in) and
+  `/lib/firmware` (with the links linux-firmware lists in `WHENCE`: a driver asks for
+  `iwlwifi-cc-a0-77.ucode`, the file is `intel/iwlwifi/`) are in the squashfs under dm-verity,
+  block by block like the rest. The ESP stays 64 MB; the root slots grow with the root, so a
+  node installed from a plain image has slots too small to be updated to this one.
+- **Sizes** (the plain image is 295,715,328 bytes, as before, and its kernel the same bytes):
+  kernel 13 MB; modules 77 MB (170 of them) and firmware 1,992 MB, both before compression; the
+  root 931 MB squashfs; the raw disk image 2,576 MB (953 MB as qcow2), the update file 965 MB. The check for it is 4 GB,
+  not the plain 300 MB. The installer's memory disk carries the payload and not the modules.
+- **Not yet.** kithd does not load modules (`finit_module`): this installs them, so a node of
+  this image has its drivers on disk and loads none yet. The NVIDIA open modules are a later
+  slice: built out of tree against this kernel and signed with the same throwaway key in the
+  same build. A spec naming both `all` and `gpu-amd-phoenix` is refused (the same driver, built in there).
+
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
 those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
@@ -150,7 +188,7 @@ cargo test -p kith-store format        # this build reads a state written in for
 ```
 
 A node's copy of the cluster's resources is two files in its state, `raft/log.redb` and
-`raft/snapshot.json`, each saying its format, 1 or 2 (a file from before the number is 1).
+`raft/snapshot.json`, each saying its format, 1, 2 or 3 (a file from before the number is 1).
 Format 2 keeps when each resource was first made, apart from its history (which is trimmed): it
 says which of two Services naming one host was there first. A state stays in format 1 until the
 cluster's leader marks the store with one entry in the log, once every other node that keeps the
@@ -166,13 +204,17 @@ files. So:
    when each resource was first made`, and there is no going back short of that backup. A
    cluster of one node has nobody to wait for: it marks its store as soon as the new kithd
    starts.
+4. Format 3 comes the same way, once every node's kithd says it reads format 3: the leader
+   says `the store keeps from now on the nonces of signed entries`. It is format 2 with a book
+   of the nonces of signed writes in the log, kept so that each is run once; a kithd that
+   reads format 3 refuses every such write for now, and none is written yet.
 
 What there was at the mark counts as made at the time of its oldest revision still kept: a
 Service edited more than a hundred times before may count as newer than one that names its host.
 Where that matters, keep the host with its Namespace's `hosts` before updating.
 
-- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1` and `format-2`
-  are a state as each format writes it. A build that changes what is written takes the next
+- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1`, `format-2` and
+  `format-3` are a state as each format writes it. A build that changes what is written takes the next
   number, adds a fixture and keeps the old ones.
 - A kithd refuses a newer format and leaves the files as they were. Going back to an older
   release is sure only while the state is in a format that release reads.
