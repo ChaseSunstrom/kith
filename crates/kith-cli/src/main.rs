@@ -394,6 +394,12 @@ enum NodeCommand {
     },
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
+    /// Print the `--spec` file of the features NAME's hardware wants, from its PCI cards:
+    /// `kith node features NAME > NAME.yaml`, then `sh os/build.sh --spec NAME.yaml --out DIR`
+    Features {
+        /// The node, as `kith get Node` names it
+        name: String,
+    },
     /// Move what runs on NAME to other nodes, and keep new replicas off it: each replica that
     /// cannot move is said first. A running Job and a replica pinned to NAME stay where they are
     Drain {
@@ -1599,6 +1605,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             print_table(["WHEN", "WHO", "DID", "WHAT", "OUTCOME"], rows.collect());
         }
         Command::Node {
+            command: NodeCommand::Features { name },
+        } => {
+            let node = backend()?.get(&format!("Node/{name}"))?;
+            print!("{}", features_spec(&node)?);
+        }
+        Command::Node {
             command: NodeCommand::Status,
         } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -2166,6 +2178,40 @@ fn print_rows(header: &[&str], rows: &[Vec<String>]) {
     }
 }
 
+/// The `--spec` file of the features NAME's hardware wants (`status.os.wants`, from its PCI cards
+/// matched by os/features' `# pci:` ids), for os/build.sh. A name that is not a feature name is
+/// refused: os/build.sh reads the list as names, so a comma in one would add a feature.
+fn features_spec(node: &Resource) -> Result<String, String> {
+    let name = &node.metadata.name;
+    let wants = node
+        .status
+        .as_ref()
+        .and_then(|status| status["os"]["wants"].as_array())
+        .ok_or_else(|| {
+            format!("{name} has not said what its hardware wants: it runs no kith OS, or its kithd is older")
+        })?;
+    let names = wants
+        .iter()
+        .map(|want| {
+            want.as_str()
+                .filter(|want| {
+                    !want.is_empty()
+                        && want
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+                .ok_or_else(|| format!("{name}'s wants are not feature names"))
+        })
+        .collect::<Result<Vec<&str>, String>>()?;
+    let mut text = if names.is_empty() {
+        format!("# {name}: no feature matches its PCI cards, so none is wanted\n")
+    } else {
+        format!("# {name}: the features its hardware wants, from its PCI cards (os/features' # pci: ids)\n")
+    };
+    text.push_str(&format!("features: [{}]\n", names.join(", ")));
+    Ok(text)
+}
+
 #[cfg(test)]
 mod drain_tests {
     use super::drain_text;
@@ -2226,5 +2272,30 @@ mod drain_tests {
             json!({ "address": "198.51.100.9:7443", "state": "ready", "serves": {} }),
         );
         assert_eq!(table_row(&plain)[4], "ready at 198.51.100.9:7443");
+    }
+
+    #[test]
+    fn node_features_prints_the_spec_the_node_wants() {
+        use super::features_spec;
+        use kith_api::Resource;
+        let node = |status: serde_json::Value| {
+            let node = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "n1" },
+                "spec": {}, "status": status,
+            });
+            serde_json::from_value::<Resource>(node).unwrap()
+        };
+        let spec = features_spec(&node(json!({ "os": { "wants": ["gpu-amd-phoenix", "nic-x"] } }))).unwrap();
+        assert_eq!(
+            spec,
+            "# n1: the features its hardware wants, from its PCI cards (os/features' # pci: ids)\nfeatures: [gpu-amd-phoenix, nic-x]\n"
+        );
+        let none = features_spec(&node(json!({ "os": { "wants": [] } }))).unwrap();
+        assert!(none.contains("# n1: no feature matches its PCI cards"), "{none}");
+        assert!(none.ends_with("features: []\n"), "{none}");
+        // Not a kith OS node (no status.os.wants at all): said, not an empty spec.
+        assert!(features_spec(&node(json!({ "state": "ready" }))).is_err());
+        // A name that is not a feature name is refused, so none can add a feature to the spec.
+        assert!(features_spec(&node(json!({ "os": { "wants": ["a, gpu"] } }))).is_err());
     }
 }

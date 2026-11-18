@@ -890,6 +890,7 @@ pub async fn node(
         }
         let mut said = report(&state, &version, slot, keys.whose());
         said["storage"] = json!(storage);
+        said["wants"] = json!(crate::devices::wants(Path::new("/sys")));
         // What the store has of this node, and a plan that says it is this node's turn.
         let (known, turn, named, back) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
