@@ -44,10 +44,18 @@ pub struct Order {
 
 /// Red in the low byte, as on most x86 boards (the tests' two orders; the device gives its own).
 #[cfg(test)]
-pub const RGB: Order = Order { red: 0, green: 8, blue: 16 };
+pub const RGB: Order = Order {
+    red: 0,
+    green: 8,
+    blue: 16,
+};
 /// Blue in the low byte.
 #[cfg(test)]
-pub const BGR: Order = Order { red: 16, green: 8, blue: 0 };
+pub const BGR: Order = Order {
+    red: 16,
+    green: 8,
+    blue: 0,
+};
 
 /// A picture in memory: what is drawn here is written to the framebuffer whole.
 #[derive(Clone, Debug)]
@@ -104,8 +112,17 @@ impl Frame {
     #[cfg(test)]
     pub fn pixel(&self, x: usize, y: usize) -> [u8; 3] {
         let at = self.at(x, y);
-        let word = u32::from_ne_bytes([self.bytes[at], self.bytes[at + 1], self.bytes[at + 2], self.bytes[at + 3]]);
-        [(word >> self.order.red) as u8, (word >> self.order.green) as u8, (word >> self.order.blue) as u8]
+        let word = u32::from_ne_bytes([
+            self.bytes[at],
+            self.bytes[at + 1],
+            self.bytes[at + 2],
+            self.bytes[at + 3],
+        ]);
+        [
+            (word >> self.order.red) as u8,
+            (word >> self.order.green) as u8,
+            (word >> self.order.blue) as u8,
+        ]
     }
 
     /// Set the pixel at (`x`, `y`) (what is outside the picture is left out).
@@ -113,9 +130,8 @@ impl Frame {
         if x >= self.width || y >= self.height {
             return;
         }
-        let word = (u32::from(r) << self.order.red)
-            | (u32::from(g) << self.order.green)
-            | (u32::from(b) << self.order.blue);
+        let word =
+            (u32::from(r) << self.order.red) | (u32::from(g) << self.order.green) | (u32::from(b) << self.order.blue);
         let at = self.at(x, y);
         self.bytes[at..at + 4].copy_from_slice(&word.to_ne_bytes());
     }
@@ -133,7 +149,11 @@ impl Frame {
     fn text(&mut self, x: usize, y: usize, scale: usize, text: &str, colour: [u8; 3]) -> usize {
         let mut left = x;
         for c in text.chars() {
-            let code = if (' '..='~').contains(&c) { c as usize } else { '?' as usize };
+            let code = if (' '..='~').contains(&c) {
+                c as usize
+            } else {
+                '?' as usize
+            };
             for (row, bits) in GLYPHS[code - 0x20].iter().enumerate() {
                 for column in 0..5 {
                     if (bits >> (4 - column)) & 1 == 1 {
@@ -184,8 +204,16 @@ fn layout(question: &str, width: usize) -> Vec<(String, usize)> {
     let room = width.saturating_sub(2 * MARGIN);
     let mut lines = Vec::new();
     for source in question.split('\n') {
-        let longest = source.split_whitespace().map(|word| word.chars().count()).max().unwrap_or(0);
-        let scale = if longest <= room / (6 * QUESTION_SCALE) { QUESTION_SCALE } else { LABEL_SCALE };
+        let longest = source
+            .split_whitespace()
+            .map(|word| word.chars().count())
+            .max()
+            .unwrap_or(0);
+        let scale = if longest <= room / (6 * QUESTION_SCALE) {
+            QUESTION_SCALE
+        } else {
+            LABEL_SCALE
+        };
         let pieces = wrap(source, room / (6 * scale));
         if pieces.is_empty() {
             lines.push((String::new(), scale));
@@ -206,7 +234,13 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
         y += 10 * scale;
     }
     let last = FIRST_STOP_Y + STOP_GAP * stops.len().saturating_sub(1);
-    frame.rect(RAIL_X + (STOP - STROKE) / 2, FIRST_STOP_Y, STROKE, last - FIRST_STOP_Y, SITE_HAIR);
+    frame.rect(
+        RAIL_X + (STOP - STROKE) / 2,
+        FIRST_STOP_Y,
+        STROKE,
+        last - FIRST_STOP_Y,
+        SITE_HAIR,
+    );
     for (i, label) in stops.iter().enumerate() {
         let centre = FIRST_STOP_Y + STOP_GAP * i;
         let top = centre - STOP / 2;
@@ -222,9 +256,21 @@ pub fn draw_question(frame: &mut Frame, stops: &[&str], current: usize, question
             frame.rect(RAIL_X, top, STROKE, STOP, SITE_HAIR);
             frame.rect(RAIL_X + STOP - STROKE, top, STROKE, STOP, SITE_HAIR);
         }
-        frame.text(RAIL_X + 2 * STOP, centre - 7 * LABEL_SCALE / 2, LABEL_SCALE, label, text);
+        frame.text(
+            RAIL_X + 2 * STOP,
+            centre - 7 * LABEL_SCALE / 2,
+            LABEL_SCALE,
+            label,
+            text,
+        );
     }
-    frame.text(MARGIN, frame.height.saturating_sub(MARGIN), LABEL_SCALE, footer, SITE_DIM);
+    frame.text(
+        MARGIN,
+        frame.height.saturating_sub(MARGIN),
+        LABEL_SCALE,
+        footer,
+        SITE_DIM,
+    );
 }
 
 /// Show the picture `shown`, wait for a key (`wait_for_key`), then show it cleared, whatever
@@ -264,7 +310,7 @@ pub fn open() -> Option<Device> {
     let geometry = geometry(Path::new("/sys/class/graphics/fb0"))?;
     let file = OpenOptions::new().write(true).open("/dev/fb0").ok()?;
     let [red, green, blue] = kith_dm_sys::fb_channels(&file).ok()?;
-    let fits = |bit: u32| bit <= 24 && bit % 8 == 0;
+    let fits = |bit: u32| bit <= 24 && bit.is_multiple_of(8);
     if ![red, green, blue].into_iter().all(fits) || red == green || green == blue || red == blue {
         return None;
     }
@@ -273,7 +319,12 @@ pub fn open() -> Option<Device> {
         .open("/dev/tty0")
         .ok()
         .filter(|tty| kith_dm_sys::set_graphics(tty, true).is_ok());
-    Some(Device { file, tty, geometry, order: Order { red, green, blue } })
+    Some(Device {
+        file,
+        tty,
+        geometry,
+        order: Order { red, green, blue },
+    })
 }
 
 impl Device {
@@ -313,7 +364,14 @@ mod tests {
     const QUESTION: &str = "Install kith OS on which disk?";
 
     fn screen(stride: usize, order: Order) -> Frame {
-        Frame::new(Geometry { width: 800, height: 600, stride }, order)
+        Frame::new(
+            Geometry {
+                width: 800,
+                height: 600,
+                stride,
+            },
+            order,
+        )
     }
 
     /// The first `:root` block of docs/site.css, the one the build reads.
@@ -330,22 +388,34 @@ mod tests {
     /// The colour the site gives `--name`.
     fn site(name: &str) -> [u8; 3] {
         let prefix = format!("--{name}:");
-        let line = root_block().lines().find(|line| line.trim().starts_with(&prefix)).expect(name);
+        let line = root_block()
+            .lines()
+            .find(|line| line.trim().starts_with(&prefix))
+            .expect(name);
         hex(line.split('#').nth(1).expect("a hex colour"))
     }
 
     /// Every colour of the first `:root` block.
     fn site_colours() -> Vec<[u8; 3]> {
-        root_block().lines().filter_map(|line| line.split('#').nth(1)).map(hex).collect()
+        root_block()
+            .lines()
+            .filter_map(|line| line.split('#').nth(1))
+            .map(hex)
+            .collect()
     }
 
     fn pixels(frame: &Frame) -> Vec<[u8; 3]> {
-        (0..frame.height).flat_map(|y| (0..frame.width).map(move |x| (x, y))).map(|(x, y)| frame.pixel(x, y)).collect()
+        (0..frame.height)
+            .flat_map(|y| (0..frame.width).map(move |x| (x, y)))
+            .map(|(x, y)| frame.pixel(x, y))
+            .collect()
     }
 
     fn accent_rows(frame: &Frame) -> Vec<usize> {
         let accent = site("accent");
-        (0..frame.height).filter(|&y| (0..frame.width).any(|x| frame.pixel(x, y) == accent)).collect()
+        (0..frame.height)
+            .filter(|&y| (0..frame.width).any(|x| frame.pixel(x, y) == accent))
+            .collect()
     }
 
     #[test]
@@ -354,8 +424,15 @@ mod tests {
         draw_question(&mut frame, &STOPS, 1, QUESTION, ANSWER);
         let all = pixels(&frame);
         let on_paper = all.iter().filter(|&&p| p == site("bg")).count();
-        assert!(on_paper * 10 >= all.len() * 6, "only {on_paper} of {} pixels are paper", all.len());
-        assert!(!accent_rows(&frame).is_empty(), "the current stop is not drawn in the accent");
+        assert!(
+            on_paper * 10 >= all.len() * 6,
+            "only {on_paper} of {} pixels are paper",
+            all.len()
+        );
+        assert!(
+            !accent_rows(&frame).is_empty(),
+            "the current stop is not drawn in the accent"
+        );
     }
 
     #[test]
@@ -366,7 +443,10 @@ mod tests {
         draw_question(&mut last, &STOPS, 4, QUESTION, ANSWER);
         let (a, b) = (accent_rows(&first), accent_rows(&last));
         assert!(!a.is_empty() && !b.is_empty());
-        assert!(a.iter().sum::<usize>() / a.len() < b.iter().sum::<usize>() / b.len(), "stop 4 is not below stop 1");
+        assert!(
+            a.iter().sum::<usize>() / a.len() < b.iter().sum::<usize>() / b.len(),
+            "stop 4 is not below stop 1"
+        );
     }
 
     #[test]
@@ -391,15 +471,29 @@ mod tests {
             }
         }
         for y in 0..600 {
-            assert!(bgr.bytes[y * 3328 + 3200..y * 3328 + 3328].iter().all(|&b| b == 0), "row {y} padding was drawn on");
+            assert!(
+                bgr.bytes[y * 3328 + 3200..y * 3328 + 3328].iter().all(|&b| b == 0),
+                "row {y} padding was drawn on"
+            );
         }
     }
 
     #[test]
     fn fb_16_bpp_or_no_device_is_text() {
         assert_eq!(Geometry::parse("800,600", "16", "1600"), None);
-        assert_eq!(Geometry::parse("800,600", "32", "3200"), Some(Geometry { width: 800, height: 600, stride: 3200 }));
-        assert_eq!(Geometry::parse("800,600", "32", "1000"), None, "a stride too short for its row is refused");
+        assert_eq!(
+            Geometry::parse("800,600", "32", "3200"),
+            Some(Geometry {
+                width: 800,
+                height: 600,
+                stride: 3200
+            })
+        );
+        assert_eq!(
+            Geometry::parse("800,600", "32", "1000"),
+            None,
+            "a stride too short for its row is refused"
+        );
         assert_eq!(geometry(Path::new("/nonexistent/fb0")), None);
     }
 
@@ -460,7 +554,11 @@ mod tests {
             Ok(())
         });
         assert!(held.is_err(), "the failed show is reported");
-        assert_eq!(*log.borrow(), ["show", "clear"], "a picture half-written is cleared, and no key is waited for");
+        assert_eq!(
+            *log.borrow(),
+            ["show", "clear"],
+            "a picture half-written is cleared, and no key is waited for"
+        );
     }
 
     #[test]
@@ -469,7 +567,10 @@ mod tests {
         assert_eq!(key.len(), 39);
         assert_eq!(
             layout(&format!("Recovery key:\n{key}"), 800),
-            [("Recovery key:".to_string(), QUESTION_SCALE), (key.to_string(), LABEL_SCALE)],
+            [
+                ("Recovery key:".to_string(), QUESTION_SCALE),
+                (key.to_string(), LABEL_SCALE)
+            ],
             "the key is drawn whole, at the smaller size that fits it"
         );
     }
@@ -484,7 +585,9 @@ mod tests {
     #[test]
     fn fb_key_screen_writes_no_log_or_kernel_ring() {
         let production = include_str!("fb.rs").split("#[cfg(test)]").next().expect("the module");
-        for sink in ["eprint", "println", "print!", "kmsg", "log::", "info!", "warn!", "debug!", "trace!", "syslog"] {
+        for sink in [
+            "eprint", "println", "print!", "kmsg", "log::", "info!", "warn!", "debug!", "trace!", "syslog",
+        ] {
             assert!(!production.contains(sink), "fb.rs writes with `{sink}`");
         }
     }

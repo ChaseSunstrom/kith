@@ -373,7 +373,10 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(usize, &str) -> String) -> 
         address,
         token: ask(3, "The join token (`kith node token` there)?"),
     });
-    let encrypt = ask(4, "Keep its state encrypted, the key held by its cluster (yes, or empty: no)?") == "yes";
+    let encrypt = ask(
+        4,
+        "Keep its state encrypted, the key held by its cluster (yes, or empty: no)?",
+    ) == "yes";
     let again = ask(
         5,
         &format!("Everything on {chosen} will be erased. Type its name again to go on:"),
@@ -776,7 +779,11 @@ pub async fn run(source: String) -> ! {
                 // none of them clears the key's screen at once.
                 let asked = given.is_none();
                 if asked {
-                    typed.lock().expect("nothing panics holding the keyboard").try_iter().for_each(drop);
+                    typed
+                        .lock()
+                        .expect("nothing panics holding the keyboard")
+                        .try_iter()
+                        .for_each(drop);
                 }
                 eprintln!(
                     "kithd: install: the node's state is encrypted. Its recovery key opens it where no cluster answers, and is shown this once: {recovery}"
@@ -927,11 +934,20 @@ mod tests {
     #[test]
     fn install_key_screen_waits_for_a_line_or_gives_up_after_its_wait() {
         let (lines, typed) = std::sync::mpsc::channel::<String>();
-        assert!(wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_ok(), "nobody typed: it gives up");
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_ok(),
+            "nobody typed: it gives up"
+        );
         lines.send(String::new()).expect("a listener");
-        assert!(wait_for_key_line(&typed, std::time::Duration::from_secs(60)).is_ok(), "a line released it");
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_secs(60)).is_ok(),
+            "a line released it"
+        );
         drop(lines);
-        assert!(wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_err(), "no console at all is said");
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_err(),
+            "no console at all is said"
+        );
     }
 
     /// A console that sends no newline (a serial line's noise) comes in pieces of at most

@@ -793,7 +793,11 @@ mod tests {
     #[test]
     fn fb_var_screeninfo_is_160_bytes_with_the_channels_offsets_at_32_44_56() {
         assert_eq!(FB_VAR_SCREENINFO, 160, "struct fb_var_screeninfo");
-        assert_eq!(FB_CHANNEL_OFFSETS, [32, 44, 56], "red, green and blue fb_bitfield.offset");
+        assert_eq!(
+            FB_CHANNEL_OFFSETS,
+            [32, 44, 56],
+            "red, green and blue fb_bitfield.offset"
+        );
         // A pixel of BGR: blue in the low byte, red at 16.
         let mut screen = vec![0u8; FB_VAR_SCREENINFO];
         for (at, offset) in FB_CHANNEL_OFFSETS.into_iter().zip([16u32, 8, 0]) {

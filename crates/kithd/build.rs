@@ -95,7 +95,10 @@ fn write_site(dir: &Path, out: &Path) {
         .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
         .map(|line| {
             let rows: Vec<&str> = line.split_whitespace().collect();
-            assert!(rows.len() == 7 && rows.iter().all(|row| row.len() == 5), "a glyph is seven rows of five: {line}");
+            assert!(
+                rows.len() == 7 && rows.iter().all(|row| row.len() == 5),
+                "a glyph is seven rows of five: {line}"
+            );
             let mut glyph = [0u8; 7];
             for (bits, row) in glyph.iter_mut().zip(rows) {
                 *bits = u8::from_str_radix(row, 2).expect("a row of 0s and 1s");
@@ -103,7 +106,11 @@ fn write_site(dir: &Path, out: &Path) {
             glyph
         })
         .collect();
-    assert_eq!(glyphs.len(), 95, "the font has a glyph for each printable ASCII character");
+    assert_eq!(
+        glyphs.len(),
+        95,
+        "the font has a glyph for each printable ASCII character"
+    );
     code += "#[allow(dead_code)]\npub const GLYPHS: [[u8; 7]; 95] = [\n";
     for glyph in &glyphs {
         code += &format!("    {glyph:?},\n");
