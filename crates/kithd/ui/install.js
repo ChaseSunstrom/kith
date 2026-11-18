@@ -5,6 +5,10 @@
 // page's storage, not its address, not a variable that outlives the dialog.
 //
 // What is drawn is kithd's text and the operator's own: text nodes only, as the board does.
+//
+// It also holds the Add a peer dialog (`kith peer add`, from the RemotePeer list): the one place
+// the page shows a private key, as a QR code (./qr.js) and as text, once.
+import { draw as drawCode, qr } from './qr.js';
 
 /**
  * Is this a `host:port` a machine can be sent to: an IPv4 or a bracketed IPv6 address, or a
@@ -88,8 +92,9 @@ export function installPart({ $, h, api, ask, toast, say, state, may }) {
     }
   }
 
-  const secret = (warning, label, text, big = false) => h('div', { class: 'secret' },
+  const secret = (warning, label, text, big = false, picture = null) => h('div', { class: 'secret' },
     h('p', { class: 'warning', role: 'alert' }, warning),
+    picture,
     h('p', { class: 'what', id: 'secret-what' }, label),
     h('pre', { class: big ? 'key' : '', tabindex: 0, 'aria-labelledby': 'secret-what' }, text),
     h('div', { class: 'tools' },
@@ -220,9 +225,62 @@ export function installPart({ $, h, api, ask, toast, say, state, may }) {
     });
   }
 
+  // ── 04: a peer, a phone, gets in ──────────────────────────────────────────────────
+
+  /**
+   * `kith peer add`, from the RemotePeer list: kithd makes the peer's key and answers its
+   * WireGuard configuration once. It is shown as a code on a canvas and as text, in a dialog
+   * that keeps nothing: the closed dialog is emptied, and the page has no storage of it.
+   */
+  async function addPeer() {
+    const nodesWithPeople = nodes().filter((node) => typeof node.status?.people?.endpoint === 'string');
+    const levels = names('AccessLevel');
+    const name = h('input', { id: 'peer-name', type: 'text', autocomplete: 'off', spellcheck: 'false', maxlength: '63', placeholder: 'phone' });
+    const node = h('select', { id: 'peer-node' }, nodesWithPeople.map((one) => h('option', { value: one.metadata.name }, `${one.metadata.name}  (${one.status.people.endpoint})`)));
+    const level = h('select', { id: 'peer-level' }, levels.map((one) => h('option', { value: one }, one)));
+    const field = (id, label, control, hint) => h('div', { class: 'field' }, h('label', { for: id }, label), control, h('span', { class: 'hint' }, hint));
+    const made = await ask({
+      title: 'Add a peer',
+      body: h('div', { class: 'peer' },
+        h('p', {}, 'Makes a key for the new peer here, lets it in at the level you choose, and shows its WireGuard configuration once, as a picture for the phone\'s WireGuard app to scan. Its private key is kept nowhere: not by kithd, not by this page.'),
+        h('div', { class: 'fields' },
+          field('peer-name', 'name', name, 'What the peer is called: a name of a RemotePeer, in lower case.'),
+          field('peer-node', 'connects to', node, 'The node it reaches the mesh through: one started with --people and --people-endpoint.'),
+          field('peer-level', 'level', level, 'The AccessLevel: what it may reach.')),
+        !nodesWithPeople.length && h('p', { class: 'warning' }, 'No node has told of a people device with an endpoint: start one with --people and --people-endpoint.'),
+        !levels.length && h('p', { class: 'warning' }, 'There is no AccessLevel yet: apply one, which says what a peer may reach.')),
+      yes: 'Make the peer',
+      act: () => {
+        if (!name.value.trim()) throw new Error('Name the peer.');
+        if (!node.value || !level.value) throw new Error('Choose the node it connects to and a level.');
+        return api('POST', 'peers', { name: name.value.trim(), node: node.value, level: level.value });
+      },
+    });
+    if (!made) return;
+    let picture;
+    try {
+      picture = h('canvas', { class: 'qr', role: 'img', 'aria-label': `The WireGuard configuration of ${made.name}, as a QR code: scan it in the WireGuard app` });
+      drawCode(picture, qr(made.config));
+    } catch (error) {
+      picture = h('p', { class: 'dim' }, `No picture: ${error.message}. Copy the text into the app.`);
+    }
+    await ask({
+      title: `${made.name}: its WireGuard configuration`,
+      body: secret(
+        'Shown this once, and kept nowhere: close this and it is gone. Show it to the phone and to no one else: whoever has this picture is this peer, at the level you gave it.',
+        `WireGuard configuration of ${made.name}, for ${made.node}: scan the picture in the WireGuard app, or copy the text`,
+        made.config,
+        false,
+        picture,
+      ),
+    });
+    toast(`${made.name} is a peer of ${made.node}.`);
+  }
+
   // ── The part, in and out of view ──────────────────────────────────────────────────
 
   const failing = (what) => (error) => say($(what), error.message, 'bad');
+  $('peer-add').addEventListener('click', () => addPeer().catch((error) => toast(error.message, true)));
   $('token-make').addEventListener('click', () => token().catch(failing('token-check')));
   $('netboot-on').addEventListener('click', () => netbootOn().catch(failing('netboot-check')));
   $('netboot-off').addEventListener('click', () => netbootOff().catch(failing('netboot-check')));

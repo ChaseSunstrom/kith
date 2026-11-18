@@ -391,10 +391,17 @@ dialog::backdrop { background: color-mix(in srgb, var(--bg) 84%, transparent); }
 .secret pre { background: var(--sunken); padding: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--accent); white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 .secret .key { font-size: var(--large); letter-spacing: 0.04em; }
 .secret .what { margin: 0; color: var(--dim); font-size: var(--small); }
+/* A QR code is black on white, quiet zone and all, in either theme: a phone reads it so. */
+.secret .qr { align-self: center; width: min(100%, 360px); height: auto; aspect-ratio: 1; image-rendering: pixelated; border: var(--stroke) solid var(--text); }
+.peer { display: flex; flex-direction: column; gap: calc(var(--unit) * 3); }
+.peer p { margin: 0; }
+.peer .warning { padding-left: calc(var(--unit) * 3); border-left: var(--stroke) solid var(--warn); font-weight: 700; }
 @media (max-width: 900px) {
   .install { padding-left: calc(var(--unit) * 3); padding-right: calc(var(--unit) * 3); overflow: visible; }
   .install .field { grid-template-columns: minmax(0, 1fr); }
   .install .hint { grid-column: 1; }
+  .peer .field { grid-template-columns: minmax(0, 1fr); }
+  .peer .hint { grid-column: 1; }
 }
 
 /* A finger gets 44 px of everything it can press. */

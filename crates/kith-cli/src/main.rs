@@ -159,6 +159,11 @@ enum Command {
         #[command(subcommand)]
         command: NodeCommand,
     },
+    /// Remote peers: a phone or a laptop that joins the mesh over WireGuard
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
     /// Identities: who may call the API over the network, as their Roles allow
     Identity {
         #[command(subcommand)]
@@ -399,6 +404,34 @@ fn set_value(assignment: &str) -> Result<serde_json::Value, String> {
     let value = kith_yaml::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.into()));
     let nest = |inside, key: &str| serde_json::json!({ key: inside });
     Ok(path.rsplit('.').fold(value, nest))
+}
+
+#[derive(Subcommand)]
+enum PeerCommand {
+    /// Make a key for a new peer, let it in at a level, and print its WireGuard configuration, once
+    Add {
+        /// The peer's name
+        name: String,
+        /// The node (started with --people and --people-endpoint) it connects to
+        #[arg(long)]
+        node: String,
+        /// The AccessLevel it gets: what it may reach
+        #[arg(long)]
+        level: String,
+    },
+}
+
+/// What `kith peer add` prints from kithd's answer: the configuration, which holds the peer's
+/// private key, with the word that it is shown this once.
+fn peer_text(answer: &serde_json::Value) -> Result<String, String> {
+    let Some(config) = answer["config"].as_str().filter(|config| !config.is_empty()) else {
+        return fail("kithd's answer holds no configuration: update kithd");
+    };
+    let name = answer["name"].as_str().unwrap_or("the peer");
+    let node = answer["node"].as_str().unwrap_or("its node");
+    Ok(format!(
+        "{name}'s WireGuard configuration for {node}, shown this once and kept nowhere: put it in the WireGuard app (scan the QR code of the web UI's Add a peer instead, or paste this) before you lose it. It holds {name}'s private key: whoever has it is this peer. Take the peer away with `kith delete RemotePeer {name}`.\n\n{config}"
+    ))
 }
 
 #[derive(Subcommand)]
@@ -1576,6 +1609,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 }
             );
         }
+        Command::Peer {
+            command: PeerCommand::Add { name, node, level },
+        } => {
+            let Backend::Daemon(kithd) = backend()? else {
+                return fail("keys are made by kithd: leave out --store");
+            };
+            let body = serde_json::json!({"name": name, "node": node, "level": level});
+            let made = request::<serde_json::Value>(&kithd, "POST", "/v1/peers", body.to_string().as_bytes())?;
+            print!("{}", peer_text(&made)?);
+        }
         Command::Node {
             command: NodeCommand::Recovery { name },
         } => {
@@ -2463,6 +2506,39 @@ mod passphrase_tests {
             "{why}"
         );
         assert!(streamed_refusal(&serde_json::json!({"signing": "open"})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::{Cli, peer_text};
+    use clap::Parser;
+    use serde_json::json;
+
+    #[test]
+    fn peer_add_asks_for_a_name_a_node_and_a_level() {
+        let cli = Cli::try_parse_from(["kith", "peer", "add", "phone", "--node", "n1", "--level", "family"]);
+        assert!(cli.is_ok());
+        assert!(Cli::try_parse_from(["kith", "peer", "add", "phone", "--node", "n1"]).is_err());
+        assert!(Cli::try_parse_from(["kith", "peer", "add", "--node", "n1", "--level", "family"]).is_err());
+    }
+
+    #[test]
+    fn peer_add_prints_the_configuration_and_says_it_is_shown_once() {
+        let answer = json!({
+            "name": "phone", "node": "n1", "level": "family",
+            "publicKey": "cHVibGlj",
+            "addresses": {"ipv4": "100.89.0.2", "ipv6": "fd00::2"},
+            "config": "[Interface]\nPrivateKey = c2VjcmV0\nAddress = 100.89.0.2/32\n\n[Peer]\nPublicKey = bm9kZQ==\n",
+        });
+        let text = peer_text(&answer).unwrap();
+        assert!(text.contains("shown this once"), "{text}");
+        assert!(text.contains("kept nowhere"), "{text}");
+        assert!(text.contains("whoever has it is this peer"), "{text}");
+        assert!(text.contains("[Interface]\nPrivateKey = c2VjcmV0\n"), "{text}");
+        assert!(text.contains("phone"), "{text}");
+        // An answer with no configuration is no answer: nothing is printed as one.
+        assert!(peer_text(&json!({"name": "phone"})).is_err());
     }
 }
 

@@ -17,7 +17,7 @@ mod netlink;
 pub mod people;
 pub mod pod;
 
-pub use netlink::{Card, Device, Seen, address4, addresses6, cards, hold, up};
+pub use netlink::{Card, Device, Seen, address4, addresses6, cards, hold, public_of, up};
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
