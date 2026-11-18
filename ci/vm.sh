@@ -42,6 +42,9 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
+#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it
+#                               and DNS answers from it; the holder reset, and the next stopped: another
+#                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
@@ -225,6 +228,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
+  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+                   in the Cluster, and a machine on their network (ci/lan_probe.py)
+                   that asks who has it four times a second. Expected: one card
+                   answers and announces it, DNS asked of it answers from it, with
+                   the holder reset by the hypervisor and then (after it is back)
+                   the next one stopped, another announces it within 10 s (the
+                   seconds are printed), and two cards are never heard answering at
+                   once, not when the stopped one goes on again; needs socat and
+                   python3 as --test chaos does
   --test access    instead: three nodes as for rollout, and the cluster's admin
                    writing through n2 and n3 by a RoleBinding that is deleted through
                    n1, once while n2 is cut off from the others. Expected: no write
@@ -278,7 +290,7 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
