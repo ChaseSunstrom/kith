@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::OwnedFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -171,33 +171,80 @@ pub struct Ground {
     pub root: bool,
 }
 
-/// A directory as it is, links followed where it is there (what a mount follows).
-fn real(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// How many ids a container's user namespace has where kithd is root
+/// (`kith_runtime`'s `RANGE`): a user past them is one the runtime refuses.
+const RANGE: u32 = 65536;
+
+/// Whether a unit `container` of the pod `pod` is made a mount of `host` (a path as it is,
+/// links followed), by what the controller mounts: `Some(true)` of what it gives the unit's
+/// user (it made it for the unit, or a volume the unit's workload asks for), `Some(false)` of
+/// what the unit only reads, `None` of all else. The state and memory directories hold more
+/// than that (the node's keys, other pods' files): none of it is the unit's to mount, and
+/// neither is a directory that holds only what is.
+fn source(host: &Path, ground: &Ground, pod: &str, container: &str) -> Option<bool> {
+    let parts = |base: &Option<PathBuf>| -> Option<Vec<String>> {
+        let rest = host.strip_prefix(base.as_ref()?.canonicalize().ok()?).ok()?;
+        Some(
+            rest.components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect(),
+        )
+    };
+    // (The pod's own, in either directory: a file of a map and a scratch; and in memory its
+    // identity's files. The pod's directory itself, in memory, holds its key.)
+    let own = |rest: &[&str], identity: bool| match rest {
+        ["replicas", p, "files", c, _, ..] => (p, c) == (&pod, &container),
+        ["replicas", p, "identity", c, ..] => identity && (p, c) == (&pod, &container),
+        ["replicas", p, "scratch", _, ..] => *p == pod,
+        _ => false,
+    };
+    if let Some(rest) = parts(&ground.state) {
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        return match rest[..] {
+            ["volumes", _, _, ..] | ["remote", _, _, _, ..] | ["seats", _, ..] => Some(true),
+            ["pods", p, "resolv.conf" | "hosts"] if p == pod => Some(false),
+            _ => own(&rest, false).then_some(true),
+        };
+    }
+    let rest = parts(&ground.memory)?;
+    let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+    own(&rest, true).then_some(true)
 }
 
-fn check_mount(mount: &Mount, ground: &Ground) -> Result<(), String> {
+fn check_mount(mount: &Mount, ground: &Ground, id: &str) -> Result<(), String> {
     let (host, at) = (&mount.host, &mount.container);
     if !at.starts_with('/') || at.contains('\0') || at.split('/').any(|part| part == "..") {
         return Err(format!("mount at `{}`: not a path in the container", at.escape_debug()));
     }
-    // A node whose policy says so mounts what the store names, wherever it is.
-    if ground.policy.allows("hostPaths") {
-        return Ok(());
-    }
-    let plain = host.is_absolute() && !host.components().any(|part| matches!(part, Component::ParentDir));
-    let inside = |root: &PathBuf| real(host).starts_with(real(root));
-    let under = ground.state.iter().chain(&ground.memory).any(inside);
-    match plain && under {
-        true => Ok(()),
-        false => Err(format!(
-            "mount of {}: not under the state directory ({}; hostPaths is off)",
+    let hostpaths = ground.policy.allows("hostPaths");
+    let refused = |why: &str| {
+        Err(format!(
+            "mount of {}: {why} (the state directory is {}; hostPaths is {})",
             host.display(),
             ground
                 .state
                 .as_ref()
-                .map_or("none set".into(), |dir| dir.display().to_string())
-        )),
+                .map_or("none set".into(), |dir| dir.display().to_string()),
+            if hostpaths { "on" } else { "off" }
+        ))
+    };
+    if !host.is_absolute() {
+        return refused("not a directory a unit's mounts are made from: it is no absolute path");
+    }
+    // (Not judged by its text: a path that is not there is made of nothing the root part saw.)
+    let Ok(real) = host.canonicalize() else {
+        return refused("a path that does not resolve");
+    };
+    let (pod, container) = id.rsplit_once('_').unwrap_or((id, ""));
+    let given = "not a directory the node gives to a container's user: it may not be given";
+    match (source(&real, ground, pod, container), mount.give) {
+        (Some(true), _) | (Some(false), false) => Ok(()),
+        // (Where the node's policy lets the store name a path, it does: a directory of the host's
+        // that an admin named is theirs, and given to no one.)
+        (None, false) if hostpaths => Ok(()),
+        (Some(false), true) => refused(given),
+        (None, true) if hostpaths => refused(given),
+        (None, _) => refused("not a directory a unit's mounts are made from"),
     }
 }
 
@@ -207,7 +254,17 @@ pub fn check_create(create: &Create, ground: &Ground, owns: &dyn Fn(&Path) -> bo
     let (unit, policy) = (create.unit, &ground.policy);
     label("unit id", create.id)?;
     for mount in &unit.mounts {
-        check_mount(mount, ground)?;
+        check_mount(mount, ground, create.id)?;
+    }
+    // What is given a user is chowned to it, tree and all, before the runtime looks at the
+    // user: where there are ranges (kithd is root), a user past the range is refused here.
+    if ground.root
+        && let Some(user) = unit.user.filter(|user| *user >= RANGE)
+        && unit.mounts.iter().any(|mount| mount.give)
+    {
+        return Err(format!(
+            "user {user} is past the {RANGE} ids a container's range has: nothing is given it"
+        ));
     }
     for device in &unit.devices {
         if !ground.devices.contains(device) {
@@ -889,7 +946,7 @@ mod tests {
     fn a_mount_outside_the_state_directory_is_refused_whatever_the_caller_says() {
         let (_, state) = book("mounts");
         let off = ground(&state, "no-host-paths");
-        let inside = state.join("volumes").join("data");
+        let inside = state.join("volumes").join("ns").join("data");
         std::fs::create_dir_all(&inside).unwrap();
         let with = |host: &Path, at: &str| Unit {
             mounts: vec![mount(host, at)],
@@ -914,7 +971,7 @@ mod tests {
         ] {
             let why = refused(&with(host, "/data"), &off).unwrap_or_else(|| panic!("{} was mounted", host.display()));
             assert!(
-                why.contains("not under the state directory"),
+                why.contains("not a directory a unit's mounts") || why.contains("does not resolve"),
                 "{}: {why}",
                 host.display()
             );
@@ -932,6 +989,122 @@ mod tests {
             ..ground(&state, "no-host-paths")
         };
         assert!(refused(&with(&inside, "/data"), &none).is_some());
+    }
+
+    /// Make `path` a directory (or, with a file name that has a dot, a file) and say it.
+    fn on_disk(path: PathBuf) -> PathBuf {
+        match path.extension().is_some() {
+            true => {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "x").unwrap();
+            }
+            false => std::fs::create_dir_all(&path).unwrap(),
+        }
+        path
+    }
+
+    #[test]
+    fn a_unit_mounts_only_what_its_mounts_are_made_from_and_is_given_only_what_it_owns() {
+        let (_, state) = book("mount-kinds");
+        let (_, memory) = book("mount-kinds-memory");
+        let g = Ground {
+            memory: Some(memory.clone()),
+            ..ground(&state, "no-host-paths")
+        };
+        let (s, m) = (
+            |rest: &str| on_disk(state.join(rest)),
+            |rest: &str| on_disk(memory.join(rest)),
+        );
+        let with = |host: &Path, give: bool| Unit {
+            mounts: vec![Mount {
+                give,
+                ..mount(host, "/data")
+            }],
+            ..plain()
+        };
+        // What the controller mounts a unit of the pod `w_a_b_0` from: each made, and each given.
+        let mine = [
+            s("volumes/ns/vol"),
+            s("volumes/ns/vol/deeper"),
+            s("remote/node/ns/vol"),
+            s("replicas/w_a_b_0/files/c/0"),
+            s("replicas/w_a_b_0/scratch/tmp"),
+            s("seats/one"),
+            m("replicas/w_a_b_0/files/c/0"),
+            m("replicas/w_a_b_0/scratch/tmp"),
+            m("replicas/w_a_b_0/identity/c"),
+        ];
+        for host in &mine {
+            assert_eq!(refused(&with(host, true), &g), None, "{}", host.display());
+        }
+        // The pod's own two files: read, never given.
+        let resolv = s("pods/w_a_b_0/resolv.conf");
+        assert_eq!(refused(&with(&resolv, false), &g), None);
+        assert!(refused(&with(&resolv, true), &g).unwrap().contains("given"));
+        // What the node keeps for itself is in the state and memory directories too, and no
+        // mount of it is made whoever asks: the directories themselves, and their keys.
+        let keys = s("pki/ca.key");
+        std::fs::write(&keys, "x").unwrap();
+        let theirs = [
+            state.clone(),
+            memory.clone(),
+            s("pki"),
+            keys,
+            s("volumes"),
+            s("volumes/ns"),
+            s("remote/node/ns"),
+            s("replicas"),
+            s("replicas/w_a_b_0"),
+            s("seats"),
+            s("pods"),
+            s("pods/w_a_b_0"),
+            s("pods/w_a_b_1/resolv.conf"),
+            // Another pod's, though of the kind a unit may mount.
+            s("replicas/w_a_b_1/files/c/0"),
+            m("replicas/w_a_b_1/scratch/tmp"),
+            m("replicas/w_a_b_1/identity/c"),
+            // The pod's directory in memory holds its key.
+            m("replicas/w_a_b_0"),
+            m("replicas/w_a_b_0/identity.key"),
+            m("replicas"),
+            // A kind of the state directory's own that the memory directory has none of.
+            m("volumes/ns/vol"),
+        ];
+        for host in &theirs {
+            for give in [false, true] {
+                let why = refused(&with(host, give), &g).unwrap_or_else(|| panic!("{} was mounted", host.display()));
+                assert!(
+                    why.contains("not a directory a unit's mounts"),
+                    "{}: {why}",
+                    host.display()
+                );
+            }
+        }
+        // A path that does not resolve is judged by nothing but its text, so it is refused.
+        let gone = state.join("volumes/ns/gone");
+        let open = ground(&state, "");
+        for ground in [&g, &open] {
+            let why = refused(&with(&gone, false), ground).unwrap();
+            assert!(why.contains("does not resolve"), "{why}");
+        }
+        // Where hostPaths is on, a path anywhere is mounted, and given to no one.
+        assert_eq!(refused(&with(Path::new("/etc"), false), &open), None);
+        assert!(
+            refused(&with(Path::new("/etc"), true), &open)
+                .unwrap()
+                .contains("given")
+        );
+        assert!(refused(&with(&state, true), &open).unwrap().contains("given"));
+        // A user the unit's range does not have is given nothing: the runtime would refuse the
+        // user, but not the chown of what is to be given it.
+        let user = |user: u32, give: bool| Unit {
+            user: Some(user),
+            ..with(&mine[0], give)
+        };
+        assert_eq!(refused(&user(65535, true), &g), None);
+        assert!(refused(&user(65536, true), &g).unwrap().contains("range"));
+        assert!(refused(&user(u32::MAX - 1, true), &g).unwrap().contains("range"));
+        assert_eq!(refused(&user(65536, false), &g), None);
     }
 
     #[test]
@@ -1106,7 +1279,7 @@ mod tests {
         assert!(root.hands.reached().is_empty(), "{:?}", root.hands.reached());
         let granted = Unit {
             devices: vec!["/dev/dri/renderD128".into()],
-            mounts: vec![mount(&state, "/data")],
+            mounts: vec![mount(&on_disk(state.join("volumes/ns/data")), "/data")],
             ..good
         };
         assert_eq!(made(&granted, "w_a_b_0_c").unwrap(), "w_a_b_0_c");
@@ -1136,7 +1309,10 @@ mod tests {
             no_node_root: false,
             netns: Some(given.netns),
             hostname: Some(given.hostname),
-            mounts: vec![mount(&given.files[0], "/etc/resolv.conf"), mount(state, "/data")],
+            mounts: vec![
+                mount(&on_disk(given.files[0].clone()), "/etc/resolv.conf"),
+                mount(&on_disk(state.join("volumes/ns/data")), "/data"),
+            ],
             ..Unit::default()
         };
         let image = Image::default();

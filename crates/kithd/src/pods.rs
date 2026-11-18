@@ -27,6 +27,8 @@ struct Pod {
     namespace: OwnedFd,
     address: IpAddr,
     dir: PathBuf,
+    /// Which making of the pod this is (`Pods::births`): a pod made again under its id is another.
+    born: u64,
 }
 
 /// What a container of a pod is given.
@@ -81,6 +83,8 @@ pub struct Pods {
     made: BTreeMap<String, Pod>,
     told: BTreeMap<String, Told>,
     spares: BTreeMap<String, Spare>,
+    /// How many pods this has made, each given its number as its `born`.
+    births: u64,
     /// Told once the node is ready for pods: its DNS for them starts then.
     up: Arc<Notify>,
     /// Told when a pod is made or let go (its address may be given to the next): the
@@ -157,12 +161,14 @@ impl Pods {
             written.map_err(|e| format!("{}: {e}", dir.display()))?;
             let tunnel = exit.map(|(tunnel, _)| tunnel);
             let namespace = kith_mesh::pod::make(range, number, v6, tunnel).map_err(failed)?;
+            let born = self.birth();
             let pod = Pod {
                 number,
                 exit: tunnel,
                 namespace,
                 address,
                 dir,
+                born,
             };
             // (For a kithd started again: what it needs to take the pod back, its network held by its processes.)
             let record = format!("{number} {} {address}\n", tunnel.map_or("-".into(), |t| t.to_string()));
@@ -194,6 +200,11 @@ impl Pods {
         (alive && told.exit == exit && told.hostname == hostname).then(|| told.given.clone())
     }
 
+    fn birth(&mut self) -> u64 {
+        self.births += 1;
+        self.births
+    }
+
     pub fn remember(&mut self, id: &str, exit: Option<u16>, given: &Given) {
         let hostname = given.hostname.clone();
         let given = given.clone();
@@ -205,12 +216,14 @@ impl Pods {
     pub fn pretend(&mut self, id: &str, state: &Path) {
         let namespace = std::fs::File::open("/dev/null").expect("/dev/null opens").into();
         let (address, dir) = (Ipv4Addr::LOCALHOST.into(), state.join("pods").join(id));
+        let born = self.birth();
         let pod = Pod {
             number: 1,
             exit: None,
             namespace,
             address,
             dir,
+            born,
         };
         self.made.insert(id.into(), pod);
     }
@@ -284,12 +297,14 @@ impl Pods {
         let namespace = std::fs::File::open(format!("/proc/{pid}/ns/net")).map_err(|e| failed(&e))?;
         let first = self.made.is_empty();
         let dir = state.join("pods").join(id);
+        let born = self.birth();
         let pod = Pod {
             number,
             exit,
             namespace: namespace.into(),
             address,
             dir,
+            born,
         };
         self.made.insert(id.into(), pod);
         self.serve().map_err(|e| failed(&e))?;
@@ -409,14 +424,16 @@ fn take<R: crate::root_part::Root>(
     v6: bool,
 ) -> Result<OwnedFd, String> {
     let held = || pods.lock().expect("nothing panics holding the pods");
-    {
+    let born = {
         let mut pods = held();
+        let born = pods.made.get(id).map(|pod| pod.born);
         let spare = pods.spares.entry(id.into()).or_default();
         spare.used = Some(std::time::Instant::now());
         if spare.pool(v6).len() > LOW {
             return Ok(spare.pool(v6).pop().expect("more than LOW are spare"));
         }
-    }
+        born
+    };
     let count = u8::try_from(BATCH).expect("a batch is under 256");
     let asked = root.request(crate::root_part::Request::Sockets {
         pod: id.into(),
@@ -424,6 +441,11 @@ fn take<R: crate::root_part::Root>(
         count,
     });
     let mut pods = held();
+    // (The lock was let go meanwhile: a pod let go and made again under its id has another
+    // namespace, and what was made in the old one is closed here, not kept for the new.)
+    if pods.made.get(id).map(|pod| pod.born) != born {
+        return Err("the pod was made again while sockets were made for it".into());
+    }
     let pool = pods.spares.entry(id.into()).or_default().pool(v6);
     match asked {
         Ok(crate::root_part::Reply::Sockets(more)) => pool.extend(more),
@@ -1351,6 +1373,54 @@ mod tests {
         echoed(other).await;
         full_relay.abort();
         other_relay.abort();
+    }
+
+    /// A root part that, while it makes sockets in the pod's namespace, has the pod let go
+    /// and made again under the same id (a new namespace): what a request in flight meets.
+    struct Remakes<'a>(&'a std::sync::Mutex<Pods>, &'a Path);
+
+    impl crate::root_part::Root for Remakes<'_> {
+        type Made = ();
+
+        fn request(&self, request: crate::root_part::Request) -> Result<crate::root_part::Reply, String> {
+            let crate::root_part::Request::Sockets { pod, v6, count } = request else {
+                return Err("not asked".into());
+            };
+            let old: Vec<OwnedFd> = (0..count)
+                .map(|_| crate::root_part::stream_socket(v6).map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?;
+            let mut pods = self.0.lock().unwrap();
+            pods.keep(|_| false);
+            pods.pretend(&pod, self.1);
+            Ok(crate::root_part::Reply::Sockets(old))
+        }
+
+        fn create(&self, _: crate::root_part::Create) -> Result<(), String> {
+            Err("not asked".into())
+        }
+
+        fn start(&self, made: (), _: &str, _: &str) -> Result<(), ((), String)> {
+            Err((made, "not asked".into()))
+        }
+    }
+
+    /// Sockets made in a pod's namespace go to that pod only: where the pod was let go and
+    /// made again while they were asked for, they are closed, not given to the new pod.
+    #[test]
+    fn sockets_made_for_a_pod_let_go_meanwhile_are_not_the_new_pods() {
+        let state = std::env::temp_dir().join("kith-pods-remade");
+        let pods = std::sync::Mutex::new(Pods::default());
+        pods.lock().unwrap().pretend("w_a_b_0", &state);
+        let root = Remakes(&pods, &state);
+        let taken = take(&root, &pods, "w_a_b_0", false);
+        assert!(taken.is_err(), "a socket of the old namespace was handed out");
+        let pods = pods.lock().unwrap();
+        assert!(pods.made.contains_key("w_a_b_0"), "the new pod is there");
+        let spare = pods
+            .spares
+            .get("w_a_b_0")
+            .map_or(0, |spare| spare.v4.len() + spare.v6.len());
+        assert_eq!(spare, 0, "the new pod's pool holds the old one's sockets");
     }
 
     /// A published UDP port stopped (its pod gone) is free at once for the pod made again,
