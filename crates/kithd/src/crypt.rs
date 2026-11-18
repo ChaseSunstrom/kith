@@ -339,7 +339,13 @@ impl Record {
         (lines.next()? == FIRST).then_some(())?;
         let mut record = Record::default();
         for line in lines {
-            let (name, value) = line.split_once(": ")?;
+            // (A seal line cut to its bare name is an unreadable one, not a damaged record.)
+            let bare = |name: &'static str| line.strip_suffix(':').filter(|n| *n == name).map(|n| (n, ""));
+            let (name, value) = line.split_once(": ").or_else(|| {
+                ["tpm-parent", "tpm-pin", "tpm-next", "tpm-pin-next", "passphrase"]
+                    .into_iter()
+                    .find_map(bare)
+            })?;
             match name {
                 "secret" => record.secret = unhex(value)?,
                 "recovery" => record.recovery = unhex(value)?,
@@ -1020,6 +1026,15 @@ fn ways_left(record: &Record, seal: bool, shut: bool) -> Record {
     }
 }
 
+/// `left` (written) is now the record in memory, its peers (which are kept apart) aside: a
+/// field not copied would stay, and a later write would put it back on the disk.
+fn adopt(record: &mut Record, left: Record) {
+    *record = Record {
+        peers: std::mem::take(&mut record.peers),
+        ..left
+    };
+}
+
 /// What a `tpm-parent:` line that cannot be read is: present, so the seal beside it is not
 /// opened without the check it stands for.
 const UNREAD: &str = "the lock record's tpm-parent: line cannot be read, so its TPM seal is not opened (kith node seal NAME --off, then kith node seal NAME, makes a new one)";
@@ -1242,7 +1257,7 @@ pub async fn keep(
         // the cluster's duress codes are not made its own. A wipe is then as the cluster
         // forgetting its key: it runs on, and opens next with its recovery key alone.)
         let wipes = crate::policy::get().allows("wipe");
-        match (&mine, &record.key) {
+        match (&mine, record.key.clone()) {
             (Some(spec), _) if spec["wiped"] == true && wipes => {
                 eprintln!(
                     "kithd: the cluster has wiped this node: its lock record is erased and its state can no longer be opened"
@@ -1297,15 +1312,14 @@ pub async fn keep(
                             "kithd: the cluster no longer hands this node's key out: its PIN no longer opens its state"
                         );
                     }
-                    (record.tpm, record.parent, record.pass) = (left.tpm, left.parent, left.pass);
-                    record.pin = left.pin;
-                    (record.duress, record.duress_all) = (left.duress, left.duress_all);
+                    adopt(&mut record, left);
                 }
                 // (A seal that could not be dropped is tried again: restarted beside it,
                 // the node would open by its TPM, locked or not. And so a passphrase.)
                 if locked
                     && was_locked == Some(false)
                     && record.tpm.is_none()
+                    && record.next.is_none()
                     && record.pass.is_none()
                     && record.pin.is_none()
                 {
@@ -1325,7 +1339,7 @@ pub async fn keep(
                 }
                 if let Some(key) = key {
                     for peer in &peers {
-                        if asked(&client, peer, &record).await.as_ref() == Ok(key) {
+                        if asked(&client, peer, &record).await.as_ref() == Ok(&key) {
                             let held = Record {
                                 key: None,
                                 peers: peers.clone(),
@@ -2705,6 +2719,34 @@ mod tests {
         );
         assert_eq!((read.next, read.pin_next), (Some(vec![3, 4]), Some(vec![5, 6])));
         assert_eq!(said, Vec::<String>::new());
+        // A bare name (its space cut off) is as unread as a bad value, not a damaged record.
+        let (read, said) = parsed("tpm-next:\ntpm-pin-next:\ntpm-pin:\ntpm-parent:\npassphrase:\nseen: yes\n");
+        assert_eq!(
+            (read.next, read.pin_next, read.parent),
+            (Some(vec![]), Some(vec![]), Some(vec![]))
+        );
+        assert!(read.seen && read.pin.is_some() && read.pass.is_none());
+        assert_eq!(said.len(), 5, "{said:?}");
+    }
+
+    /// The cluster's word, once written, is the record in memory too: a seal dropped from the
+    /// disk is not written back by a later write of what is in memory.
+    #[test]
+    fn crypt_records_in_memory_are_what_the_cluster_left() {
+        let record = Record {
+            secret: vec![7; 32],
+            tpm: Some(vec![1; 20]),
+            next: Some(vec![2; 20]),
+            parent: Some(vec![0; 34]),
+            peers: vec!["10.0.0.2".into()],
+            ..Record::default()
+        };
+        let left = ways_left(&record, false, false);
+        assert!(left.next.is_none() && left.tpm.is_none());
+        let mut held = record.clone();
+        adopt(&mut held, left.clone());
+        assert_eq!(held, left);
+        assert!(held.next.is_none());
     }
 
     /// Against a software TPM: `open` tries `tpm:` and then `tpm-next:`, so a system the
