@@ -778,6 +778,7 @@ impl Runtime {
             spec.save(&new).ctx(&what)?;
             File::open(&new).and_then(|file| file.sync_all()).ctx(&what)?;
             fs::rename(&new, bundle.join("config.json")).ctx(&what)?;
+            File::open(&bundle).and_then(|dir| dir.sync_all()).ctx(&what)?;
             if let Some(base) = shift {
                 stage(image, unit, &bundle, base).ctx(format!("{what}: mounting its image and volumes id-mapped"))?;
             }
