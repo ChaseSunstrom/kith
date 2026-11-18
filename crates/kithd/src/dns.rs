@@ -434,6 +434,8 @@ fn others(all: &[SocketAddr], listen: SocketAddr, house: Option<Ipv4Addr>) -> Ar
 /// A UDP socket on `address`, non-blocking. It may share its port with another of ours bound to
 /// a different address (the one on every address and the one on the house address), and an
 /// address not yet on any card can be bound: the house address comes and goes with the leader.
+/// SO_REUSEPORT, not SO_REUSEADDR: the kernel lets only a socket of the same user share the port,
+/// so another program on the node cannot bind beside ours and take its queries.
 fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrStorage, bind, setsockopt, socket, sockopt};
     let family = if address.is_ipv4() {
@@ -443,7 +445,7 @@ fn udp_socket(address: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     };
     let flags = SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC;
     let fd = socket(family, SockType::Datagram, flags, None)?;
-    setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+    setsockopt(&fd, sockopt::ReusePort, &true)?;
     if address.is_ipv4() {
         setsockopt(&fd, sockopt::IpFreebind, &true)?;
     }
