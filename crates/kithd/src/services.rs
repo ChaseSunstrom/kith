@@ -391,8 +391,11 @@ struct Proxy {
     /// What a link from another node may hold ([`receive`]).
     links: receive::Bounds,
     /// The one link this node keeps to each other node that takes links, dialled by the first
-    /// client that needs it ([`Proxy::link_to`]); one that is down is dialled again.
-    linked: Mutex<BTreeMap<String, link::Link>>,
+    /// client that needs it ([`Proxy::link_to`]); one that is down is dialled again. With
+    /// when a stream was last open on it, as far as [`Proxy::forget`] has looked.
+    // ponytail: one link, so one task (a core) frames and writes everything to a node; a second
+    // link per node when a profile of a busy one shows that core full.
+    linked: Mutex<BTreeMap<String, (link::Link, Instant)>>,
     /// Where every other node is dialled, in the tests (a node's mesh address is not on the machine).
     #[cfg(test)]
     dial_to: Option<SocketAddr>,
@@ -444,9 +447,12 @@ impl Proxy {
         let there = SocketAddr::new(kith_mesh::node_address(self.prefix, node).into(), relay);
         let replica = replica.map(|replica| format!(" {replica}")).unwrap_or_default();
         if links {
-            return self
-                .linked(node, there, &format!("{port} {workload}{replica}\n"), early)
-                .await;
+            let line = format!("{port} {workload}{replica}\n");
+            // (None: the node would not take the link, or this one holds as many streams as the
+            // node takes; the connection kept to it is used instead, as it says it keeps them.)
+            if let Some(reached) = self.linked(node, there, &line, early).await? {
+                return Ok(reached);
+            }
         }
         if !keeps {
             // A node of before: a connection for this client alone, as it knows them. It
@@ -498,16 +504,31 @@ impl Proxy {
     /// `+` when it has it, and resets the stream when it has not. A link that is down is
     /// dialled again, once: with the client's bytes on the link that went down they may be
     /// with a replica ([`Reached::Lost`]), and with none said the same asking is made on the new one.
-    async fn linked(&self, node: &str, there: SocketAddr, line: &str, early: &[u8]) -> std::io::Result<Reached> {
+    /// A node that gives no answer in time has the link taken down (it is as good as gone), so
+    /// that the next client dials a new one rather than waiting as long. None, with nothing
+    /// sent: the node took no link, or this one holds the streams the node takes at most.
+    async fn linked(
+        &self,
+        node: &str,
+        there: SocketAddr,
+        line: &str,
+        early: &[u8],
+    ) -> std::io::Result<Option<Reached>> {
         let asking = [line.as_bytes(), early].concat();
         for attempt in 0..2 {
-            let link = self.link_to(node, there).await?;
+            let Some(link) = self.link_to(node, there).await? else {
+                return Ok(None);
+            };
+            // (The node resets what is past its cap, which reads as its no: the kept way is for those.)
+            if link.streams() >= receive::STREAMS {
+                return Ok(None);
+            }
             let Ok(mut stream) = link.open() else { continue };
             if stream.tx.write(&asking).await.is_err() {
                 continue;
             }
             let e = match within(stream.rx.read()).await {
-                Ok(Some(said)) if said == b"+" => return Ok(Reached::Linked(stream)),
+                Ok(Some(said)) if said == b"+" => return Ok(Some(Reached::Linked(stream))),
                 Ok(_) => return Err(std::io::Error::other("that node does not pass it on")),
                 Err(e) => e,
             };
@@ -515,8 +536,11 @@ impl Proxy {
             if !link.is_down() && e.kind() == std::io::ErrorKind::ConnectionReset {
                 return Err(e);
             }
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                link.close();
+            }
             match unanswered(e, link.is_down() && attempt == 0, !early.is_empty()) {
-                Unanswered::Lost => return Ok(Reached::Lost),
+                Unanswered::Lost => return Ok(Some(Reached::Lost)),
                 Unanswered::Next(e) => return Err(e),
                 Unanswered::Again => {}
             }
@@ -525,24 +549,36 @@ impl Proxy {
     }
 
     /// The link to `node`: the one there is, or a new one (`link` said first, as a node
-    /// that takes links wants it) that takes its place.
-    async fn link_to(&self, node: &str, there: SocketAddr) -> std::io::Result<link::Link> {
-        let live = |links: &BTreeMap<String, link::Link>| links.get(node).filter(|link| !link.is_down()).cloned();
+    /// that takes links wants it, and answers `+` to) that takes its place. None when the
+    /// node says no (`-`) or hangs up instead, before anything of a client's was sent.
+    async fn link_to(&self, node: &str, there: SocketAddr) -> std::io::Result<Option<link::Link>> {
+        let live = |links: &BTreeMap<String, (link::Link, Instant)>| {
+            links
+                .get(node)
+                .filter(|(link, _)| !link.is_down())
+                .map(|(link, _)| link.clone())
+        };
         let hit = live(&self.linked.lock().expect("nothing panics holding the links"));
         if let Some(link) = hit {
-            return Ok(link);
+            return Ok(Some(link));
         }
         let mut relay = Relay::new(within(self.dial(there)).await?);
         within(relay.to.write_all(b"link\n")).await?;
+        match within(relay.from.read_u8()).await {
+            Ok(b'+') => {}
+            // (Silent: a node that is slow or gone, and the kept way would wait as long.)
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(e),
+            _ => return Ok(None),
+        }
         let (link, _) = link::link(relay, true);
         let mut links = self.linked.lock().expect("nothing panics holding the links");
         // (Another client dialled meanwhile: one link to a node, so ours goes.)
         if let Some(other) = live(&links) {
             link.close();
-            return Ok(other);
+            return Ok(Some(other));
         }
-        links.insert(node.to_string(), link.clone());
-        Ok(link)
+        links.insert(node.to_string(), (link.clone(), Instant::now()));
+        Ok(Some(link))
     }
 
     /// A connection to `node`'s kithd from before, if one is kept and not for too long.
@@ -587,9 +623,17 @@ impl Proxy {
             kept.retain(|(_, since)| since.elapsed() < KEPT);
             !kept.is_empty()
         });
-        // (A link that is down is dialled again by the next client that needs it.)
+        // (A link that is down is dialled again by the next client that needs it. One with no
+        // stream open for as long as a connection is kept is closed, as the node closes it.)
         let mut links = self.linked.lock().expect("nothing panics holding the links");
-        links.retain(|_, link| !link.is_down());
+        links.retain(|_, (link, since)| {
+            if link.streams() > 0 {
+                *since = Instant::now();
+            } else if since.elapsed() > KEPT {
+                link.close();
+            }
+            !link.is_down()
+        });
     }
 
     /// Someone connected to a Service: pass the connection to its next backend that
@@ -795,11 +839,14 @@ where
             .ok()?;
         let line = std::str::from_utf8(&line).ok()?.strip_suffix('\n')?;
         if line == "link" && wait == CONNECT {
-            // (A node with no place to relay for gets no link: it is hung up on, as at the limit.)
-            return match hold.room() {
-                true => link(relay, hold.relaying.clone(), hold.caller).await,
-                false => None,
-            };
+            // (A node with no place to relay for gets no link: it is told `-` and hung up on. A
+            // link is begun with `+`, which the node that asks for it waits for before it sends.)
+            if !hold.room() {
+                let _ = relay.to.write_all(b"-").await;
+                return None;
+            }
+            relay.to.write_all(b"+").await.ok()?;
+            return link(relay, hold.relaying.clone(), hold.caller).await;
         }
         let mut words = line.split(' ').peekable();
         let kept = words.next_if_eq(&"kept").is_some();
@@ -2888,7 +2935,7 @@ spec:
     /// Another node's kithd that takes links as well as connections ([`other_node`] takes only
     /// connections): every replica but the Workload `shut` is the one at `replica`. Where it
     /// listens, and how many connections it has had.
-    async fn linking_node(replica: SocketAddr) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn linking_node(replica: SocketAddr, places: usize) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (at, had) = (
             listener.local_addr().unwrap(),
@@ -2899,7 +2946,7 @@ spec:
             while let Ok((stream, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let (relaying, spares) = (Limits::new(8, 8), Limits::new(1, 1));
+                    let (relaying, spares) = (Limits::new(places, places), Limits::new(1, 1));
                     let local = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
                     let find = move |_: u16, workload: String, _: Option<u32>| async move {
                         match workload.as_str() {
@@ -2915,9 +2962,10 @@ spec:
         (at, had)
     }
 
-    /// A node that reads `reads` bytes of each connection and then hangs up. Where it listens,
-    /// and how many connections it has had.
-    async fn hanging_node(reads: usize) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    /// A node that takes each link (`link\n`, answered `+`), reads `reads` bytes more of it and
+    /// hangs up; or, with none, reads what it is sent and says nothing, as a peer that is half-open
+    /// does. Where it listens, and how many connections it has had.
+    async fn hanging_node(reads: Option<usize>) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::AsyncReadExt;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (at, had) = (
@@ -2929,7 +2977,12 @@ spec:
             while let Ok((mut stream, _)) = listener.accept().await {
                 count.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let _ = stream.read_exact(&mut vec![0; reads]).await;
+                    let _ = stream.read_exact(&mut [0; 5]).await;
+                    let _ = stream.write_all(b"+").await;
+                    match reads {
+                        Some(reads) => drop(stream.read_exact(&mut vec![0; reads]).await),
+                        None => while stream.read(&mut [0; 4096]).await.is_ok_and(|read| read > 0) {},
+                    }
                 });
             }
         });
@@ -2953,6 +3006,11 @@ spec:
         let mut proxy = proxy_of(shared, 8080, AT_B, None);
         proxy.dial_to = Some(at);
         proxy
+    }
+
+    /// The link `proxy` has to Node b.
+    fn link_of(proxy: &Proxy) -> link::Link {
+        proxy.linked.lock().unwrap().get("b").unwrap().0.clone()
     }
 
     fn on_b(workload: &str) -> Backend {
@@ -2984,7 +3042,7 @@ spec:
     #[tokio::test]
     async fn reach_uses_a_stream_of_the_link_where_the_node_takes_links_and_the_old_paths_where_not() {
         let (replica, replicas) = replica().await;
-        let (node, connections) = linking_node(replica).await;
+        let (node, connections) = linking_node(replica, 8).await;
         let proxy = proxy_to_b("reach-link", json!({ "port": 1, "kept": true, "link": true }), node).await;
         for turn in 0..3 {
             let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
@@ -3019,20 +3077,19 @@ spec:
     /// client is asked for: the client does not notice.
     #[tokio::test]
     async fn a_link_that_went_down_idle_is_redialled_for_the_next_client() {
-        let (node, connections) = linking_node(replica().await.0).await;
+        let (node, connections) = linking_node(replica().await.0, 8).await;
         let proxy = proxy_to_b("link-redial", json!({ "port": 1, "kept": true, "link": true }), node).await;
         let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
             panic!("not a stream of a link");
         };
         assert_eq!(say_on(stream, "one").await, "a:one");
-        let old = proxy.linked.lock().unwrap().get("b").cloned().unwrap();
-        old.close();
+        link_of(&proxy).close();
         let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"spoken").await else {
             panic!("not a stream of a link");
         };
         assert_eq!(say_on(stream, " and two").await, "a:spoken and two");
         assert_eq!(connections.load(Ordering::Relaxed), 2);
-        assert!(!proxy.linked.lock().unwrap().get("b").unwrap().is_down());
+        assert!(!link_of(&proxy).is_down());
     }
 
     /// A link that goes down with a client's bytes on it ends that client's connection as a
@@ -3041,8 +3098,8 @@ spec:
     #[tokio::test]
     async fn a_link_that_dies_ends_its_streams_as_lost_and_is_dialled_once_more_for_a_client_that_said_nothing() {
         let line = format!("8080 {AT_B}\n");
-        // (The node's `link\n`, the opening, and the data frame with the asking.)
-        let (node, connections) = hanging_node(5 + 7 + 7 + line.len() + 6).await;
+        // (After the node's `+`: the opening, and the data frame with the asking.)
+        let (node, connections) = hanging_node(Some(7 + 7 + line.len() + 6)).await;
         let proxy = proxy_to_b("link-lost", json!({ "port": 1, "kept": true, "link": true }), node).await;
         assert!(matches!(proxy.reach(&on_b(AT_B), b"spoken").await, Ok(Reached::Lost)));
         assert_eq!(
@@ -3051,7 +3108,7 @@ spec:
             "what was said is asked for nowhere else"
         );
 
-        let (node, connections) = hanging_node(5 + 7 + 7 + line.len()).await;
+        let (node, connections) = hanging_node(Some(7 + 7 + line.len())).await;
         let proxy = proxy_to_b("link-twice", json!({ "port": 1, "kept": true, "link": true }), node).await;
         assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
         assert_eq!(connections.load(Ordering::Relaxed), 2, "dialled once more, not again");
@@ -3061,15 +3118,14 @@ spec:
     #[tokio::test]
     async fn a_stream_open_on_a_link_that_goes_down_closes_its_client() {
         use tokio::io::AsyncReadExt;
-        let (node, _) = linking_node(replica().await.0).await;
+        let (node, _) = linking_node(replica().await.0, 8).await;
         let proxy = proxy_to_b("link-open", json!({ "port": 1, "kept": true, "link": true }), node).await;
         let Ok(Reached::Linked(stream)) = proxy.reach(&on_b(AT_B), b"").await else {
             panic!("not a stream of a link");
         };
         let (mut client, held) = pair().await;
         let joined = tokio::spawn(stream.join(held));
-        let link = proxy.linked.lock().unwrap().get("b").cloned().unwrap();
-        link.close();
+        link_of(&proxy).close();
         tokio::time::timeout(Duration::from_secs(10), joined)
             .await
             .expect("the stream ends")
@@ -3080,6 +3136,116 @@ spec:
             matches!(read, Ok(Ok(0)) | Ok(Err(_))),
             "the client's connection is closed"
         );
+    }
+
+    /// The node holds as many streams of a link as [`receive::STREAMS`] and resets the rest: the
+    /// clients past that many reach it on a kept connection, and all of them reach the replica.
+    #[tokio::test]
+    async fn clients_past_the_streams_a_link_holds_take_the_kept_path() {
+        let (replica, replicas) = replica().await;
+        let (node, connections) = linking_node(replica, receive::STREAMS + 8).await;
+        let proxy = proxy_to_b("link-cap", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let (mut held, mut kept) = (Vec::new(), Vec::new());
+        for _ in 0..receive::STREAMS + 4 {
+            match proxy.reach(&on_b(AT_B), b"").await {
+                Ok(Reached::Linked(stream)) => held.push(stream),
+                Ok(Reached::Kept(_, relay)) => kept.push(relay),
+                _ => panic!("a client did not reach the replica"),
+            }
+        }
+        assert_eq!((held.len(), kept.len()), (receive::STREAMS, 4));
+        assert_eq!(say_on(held.pop().unwrap(), "linked").await, "a:linked");
+        for relay in &mut kept {
+            let (carried, heard) = through(relay, "kept").await;
+            assert!(carried.is_ok());
+            assert_eq!(heard, "a:kept");
+        }
+        assert_eq!(replicas.load(Ordering::Relaxed), receive::STREAMS + 4);
+        assert_eq!(
+            connections.load(Ordering::Relaxed),
+            1 + 4,
+            "the link, and a connection to each"
+        );
+    }
+
+    /// A node that takes the link and answers nothing on a stream is not waited for by each
+    /// client: the first one's wait ends the link, and the next client dials a new one.
+    #[tokio::test]
+    async fn a_node_that_answers_nothing_on_a_stream_loses_its_link() {
+        let (node, connections) = hanging_node(None).await;
+        let proxy = proxy_to_b("link-silent", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert!(link_of(&proxy).is_down());
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert_eq!(connections.load(Ordering::Relaxed), 2, "the next client dialled again");
+    }
+
+    /// The node answers `link\n` with `+` or `-`: a no (or a hang-up, as a node of before does)
+    /// before any stream is opened sends the client the kept way, with nothing lost.
+    #[tokio::test]
+    async fn a_node_that_does_not_take_the_link_is_reached_on_a_kept_connection() {
+        let (replica, _) = replica().await;
+        // No place to relay in: the link is said no to, and so is the kept connection.
+        let (node, connections) = linking_node(replica, 0).await;
+        let proxy = proxy_to_b("link-no", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        assert!(proxy.reach(&on_b(AT_B), b"spoken").await.is_err());
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 2, "the link's, and the kept one's");
+
+        // A hang-up before any answer: the kept way is tried (and is hung up on as well here).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (node, connections) = (
+            listener.local_addr().unwrap(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        let count = connections.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        });
+        let proxy = proxy_to_b("link-hung-up", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        // (Not Lost: nothing was sent on the link.)
+        assert!(proxy.reach(&on_b(AT_B), b"").await.is_err());
+        assert!(proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 2);
+    }
+
+    /// A link with no open stream for longer than a kept connection lasts is closed by
+    /// [`Proxy::forget`] (the node closes one that is empty), and one with a stream open is not.
+    #[tokio::test]
+    async fn a_link_no_stream_has_used_for_long_is_closed() {
+        let (node, connections) = linking_node(replica().await.0, 8).await;
+        let proxy = proxy_to_b("link-idle", json!({ "port": 1, "kept": true, "link": true }), node).await;
+        let Ok(Reached::Linked(open)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        let long_ago = |proxy: &Proxy| {
+            let ago = Instant::now().checked_sub(KEPT + Duration::from_secs(1)).unwrap();
+            proxy.linked.lock().unwrap().get_mut("b").unwrap().1 = ago;
+        };
+        long_ago(&proxy);
+        proxy.forget();
+        assert!(!link_of(&proxy).is_down(), "a stream is open on it");
+        let Ok(Reached::Linked(over)) = proxy.reach(&on_b(AT_B), b"").await else {
+            panic!("not a stream of a link");
+        };
+        assert_eq!(say_on(over, "two").await, "a:two");
+        drop(open);
+        for _ in 0..100 {
+            if link_of(&proxy).streams() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(link_of(&proxy).streams(), 0);
+        long_ago(&proxy);
+        let link = link_of(&proxy);
+        proxy.forget();
+        assert!(link.is_down() && proxy.linked.lock().unwrap().is_empty());
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
     }
 }
 

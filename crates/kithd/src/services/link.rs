@@ -384,9 +384,13 @@ impl Link {
             ));
         }
         let id = state.next;
-        state.next = id
-            .checked_add(2)
-            .ok_or_else(|| io::Error::other("the link has no stream numbers left"))?;
+        let Some(next) = id.checked_add(2) else {
+            // (A link with no numbers left is down: the next client is on a new one.)
+            drop(state);
+            self.0.down();
+            return Err(io::Error::other("the link has no stream numbers left"));
+        };
+        state.next = next;
         let stream = self.0.stream(&mut state, id);
         drop(state);
         self.0.send(id, Kind::Open, Vec::new());
@@ -413,7 +417,6 @@ impl Link {
     }
 
     /// Streams not yet over both ways.
-    #[cfg(test)]
     pub fn streams(&self) -> usize {
         self.0.state().streams.len()
     }
@@ -584,6 +587,17 @@ mod tests {
             bytes.extend_from_slice(&more);
         }
         Ok(bytes)
+    }
+
+    /// A link that has used its last stream number is down, so a client that finds it so dials a new one.
+    #[tokio::test]
+    async fn a_link_with_no_stream_numbers_left_goes_down() {
+        let ((near, _), _far) = pair();
+        near.0.state().next = u32::MAX - 2;
+        assert!(near.open().is_ok());
+        assert!(!near.is_down());
+        assert!(near.open().is_err());
+        assert!(near.is_down());
     }
 
     #[tokio::test]
