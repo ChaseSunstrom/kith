@@ -955,7 +955,8 @@ pub async fn restore(
         let client = cluster.to(&there).map_err(io)?;
         // (As long as a volume takes to unpack, and no longer than an hour.)
         let asked = client.post(url).timeout(Duration::from_secs(3600));
-        let asked = asked.header(crate::access::FOR, caller.to_string()).send().await;
+        let asked = crate::access_sign::pass_on(asked.header(crate::access::FOR, caller.to_string()));
+        let asked = asked.send().await;
         let failed = |e: reqwest::Error| {
             io(format!(
                 "asking node {} to restore: {}",

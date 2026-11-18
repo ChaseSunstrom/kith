@@ -315,6 +315,29 @@ The VM test for slices 1 to 3 extends `ci/vm.sh --test access` (three nodes, n1 
 
 All four: about +215 KB, to about 11.6 MB.
 
+### Layer 1a as built (T-0743), and where the code said otherwise
+
+kithd checks the header (crates/kithd/src/access_sign.rs: `verify` is the pure check) on
+every request a node passes on with `x-kith-for`, on `kith run`'s hop, on a write passed
+to the leader for an Identity, and at the local socket; each sender passes the header it
+was sent on unchanged. The CLI signer is the next slice. Where the code differs from the
+text above, the safe way was taken, and each is said here:
+
+- **Hops rewrite what they pass on.** The logs hop adds `here=true`, a restore its `at=`,
+  a node's lock routes send their own body, `kith run` is sent on as a spec, and a write
+  reaches the leader as a store command. A caller's signature over what they sent does
+  not hold over what arrives, so under `required` it is refused there, not taken. Until
+  hops pass the request on as it came (its own slice), sign at the node that has the
+  thing, and the admin's Cluster changes at the node that leads.
+- **"node:<name>" is not taken as a signer**: no node signs yet. Refused.
+- **`required` is not refused while older nodes report**: kithd does not yet say its
+  version on its Node. Set it once every node is updated.
+- **An unsigned POST that only reads** (`/v1/diff`) is refused at the local socket under
+  `required`, like a write: no handler is trusted to read alone.
+- **A signed request's body is read whole**, up to 96 MiB, to be hashed.
+- The first `adminKey` is written unsigned, while the cluster is `open`; after that the
+  key and `spec.signing` change only by a write the admin signed.
+
 ## Why not short-lived node certificates
 
 They were weighed and are not part of this:

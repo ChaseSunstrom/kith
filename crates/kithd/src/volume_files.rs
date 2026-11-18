@@ -388,7 +388,7 @@ async fn elsewhere(
     };
     let failed = |e: reqwest::Error| format!("asking node {}: {}", dir.node, crate::cluster::why(&e));
     // (For whoever asked this node: the node that has the Volume asks what they may.)
-    let asked = asked.header(crate::access::FOR, caller.to_string());
+    let asked = crate::access_sign::pass_on(asked.header(crate::access::FOR, caller.to_string()));
     let answer = asked.send().await.map_err(failed)?;
     let status = answer.status();
     if status.is_success() {

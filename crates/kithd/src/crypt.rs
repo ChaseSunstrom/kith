@@ -1546,7 +1546,7 @@ async fn at_node(shared: &Shared, caller: &Caller, name: &str, what: &str, body:
     let ask = ask.post(format!("https://{}/v1/lock/{name}/{what}", there.address));
     let ask = ask.timeout(Duration::from_secs(60)).json(&body);
     // (For whoever asked this node: the node the record is of asks what they may.)
-    let ask = ask.header(crate::access::FOR, caller.to_string());
+    let ask = crate::access_sign::pass_on(ask.header(crate::access::FOR, caller.to_string()));
     let unreached = |e: reqwest::Error| {
         let e = crate::cluster::why(&e);
         format!("{name} cannot be reached, and its lock record is its own to write ({e})")
