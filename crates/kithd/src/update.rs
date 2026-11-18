@@ -246,6 +246,21 @@ pub fn step(plan: &Resource, release: Option<(&str, &str)>, nodes: &[Node], now:
     done("Progressing", why.into(), states, since, cordoned, cordon)
 }
 
+/// Puts (`on`) or takes off the OS update's cordon of a Node's spec, as its `kith.dev/update`
+/// record says it put one on. A node an older kithd cordoned for an update has no record:
+/// its cordon is lifted as before, unless a drain holds the node.
+fn apply_cordon(spec: &mut Value, on: bool) {
+    if on {
+        crate::sched::cordon_on(spec, crate::sched::UPDATE_CORDON, "noSchedule");
+    } else if crate::sched::has_record(spec, crate::sched::UPDATE_CORDON) {
+        crate::sched::cordon_off(spec, crate::sched::UPDATE_CORDON);
+    } else if !crate::sched::has_record(spec, kith_sched::DRAIN)
+        && let Some(spec) = spec.as_object_mut()
+    {
+        spec.remove("unschedulable");
+    }
+}
+
 /// The leader's part: every plan's next step, written down.
 pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     let mut generation = shared.generation.subscribe();
@@ -308,10 +323,7 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
                     let Some(mut node) = store.get(&format!("Node/{name}")).cloned() else {
                         continue;
                     };
-                    node.spec["unschedulable"] = if cordoned { json!(true) } else { Value::Null };
-                    if !cordoned && let Some(spec) = node.spec.as_object_mut() {
-                        spec.remove("unschedulable");
-                    }
+                    apply_cordon(&mut node.spec, cordoned);
                     commands.push(Command::Apply {
                         resources: vec![node],
                         at,
@@ -1683,6 +1695,35 @@ mod tests {
         );
         let none = step(&plan(json!({}), None), None, &nodes, 0);
         assert_eq!(none.status["reason"], "there is no OSRelease next");
+    }
+
+    /// An update ends only the cordon it put on: one its owner set first stays, a drained node
+    /// stays cordoned when the update ends, and a drain ending leaves the cordon the update holds.
+    #[test]
+    fn update_ending_uncordons_only_what_it_cordoned() {
+        let cordoned = |spec: &Value| spec["unschedulable"] == true;
+        let mut owned = json!({ "unschedulable": true });
+        apply_cordon(&mut owned, true);
+        apply_cordon(&mut owned, false);
+        assert!(cordoned(&owned), "an owner's cordon: {owned}");
+        let mut drained = json!({});
+        apply_cordon(&mut drained, true);
+        crate::sched::drain_on(&mut drained);
+        apply_cordon(&mut drained, false);
+        assert!(cordoned(&drained), "a drained node: {drained}");
+        crate::sched::drain_off(&mut drained);
+        assert!(!cordoned(&drained), "{drained}");
+        let mut held = json!({});
+        crate::sched::drain_on(&mut held);
+        apply_cordon(&mut held, true);
+        crate::sched::drain_off(&mut held);
+        assert!(cordoned(&held), "a drain ending on an update's node: {held}");
+        apply_cordon(&mut held, false);
+        assert!(!cordoned(&held), "{held}");
+        // A cordon an older kithd set with no record: the update's end lifts it, as it did.
+        let mut legacy = json!({ "unschedulable": true });
+        apply_cordon(&mut legacy, false);
+        assert!(!cordoned(&legacy), "{legacy}");
     }
 
     #[test]
