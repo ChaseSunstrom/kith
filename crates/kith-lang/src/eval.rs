@@ -121,8 +121,8 @@ fn release(value: &mut V, more: &mut Vec<Held>) {
             }
         }
         V::Fn(closure) => {
-            if let Some(closure) = Rc::get_mut(closure) {
-                more.push(Held::Env(closure.env.take()));
+            if let Some(env) = Rc::get_mut(closure).and_then(|closure| closure.env.take()) {
+                more.push(Held::Env(Some(env)));
             }
         }
         _ => {}
@@ -149,6 +149,12 @@ fn let_go(mut more: Vec<Held>) {
 
 impl Drop for Scope {
     fn drop(&mut self) {
+        // (Most scopes have nothing above them and hold no list, record or closure: nothing to
+        // let go of in turn, so no list to make.)
+        let holds = matches!(&self.bound, Bound::Value(V::List(_) | V::Rec(_) | V::Fn(_)));
+        if self.up.is_none() && !holds {
+            return;
+        }
         let mut more = vec![Held::Env(self.up.take())];
         if let Bound::Value(value) = &mut self.bound {
             more.push(Held::Value(std::mem::replace(value, V::Null)));
@@ -1146,6 +1152,7 @@ mod tests {
         for text in [
             "[\n  \"ab\", \"cd\",\n  \"ef\" ]",
             "[\n  \"aé\", \"bö€\",\n  \"c😀d\" ]",
+            "[\r\n  \"é\",\r\n 1 ]",
             long.as_str(),
         ] {
             let load = |_: &str| -> std::result::Result<String, String> { Ok(text.to_string()) };
@@ -1190,5 +1197,32 @@ mod tests {
             drop(value);
         });
         thread.expect("a thread").join().expect("it ends");
+    }
+
+    /// A closure cloned, the original dropped, and the clone called: the drop finds the
+    /// closure shared, so it takes nothing out of it, and the clone still has its scope.
+    #[test]
+    fn a_shared_closure_keeps_its_scope_when_one_copy_is_dropped() {
+        let Ok(tree) = parse::file("fn f() = y; 0") else {
+            panic!("it parses")
+        };
+        let Is::Block(binds, _) = tree.is else {
+            panic!("a block")
+        };
+        let Bind::Fn(lambda) = &binds[0].1 else { panic!("a fn") };
+        let env = bind(&None, &Rc::from("y"), V::Int(7));
+        let original = V::Fn(Rc::new(Closure {
+            lambda: lambda.clone(),
+            env,
+            file: 0,
+        }));
+        let clone = original.clone();
+        drop(original);
+        let load = |_: &str| -> std::result::Result<String, String> { Err("no files".to_string()) };
+        let mut machine = Machine::new(&load, &[]);
+        let value = machine
+            .call(&clone, Vec::new(), At::NOWHERE)
+            .unwrap_or_else(|e| panic!("{}", e.msg));
+        assert!(matches!(value, V::Int(7)), "the clone still sees its `y`");
     }
 }

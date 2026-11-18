@@ -723,3 +723,25 @@ fn import_totals_are_capped() {
     assert!(!imports(8).contains("in all"), "eight are in the cap");
     assert!(imports(9).contains("bytes in all"), "a ninth is refused");
 }
+
+/// A file whose limit cuts a letter in two: the read keeps what it has, lossily, and the
+/// import is refused by its size all the same (review-2 lang L2). (With one byte fewer
+/// before the letter, the cut would come after it, and the read would be whole.)
+#[test]
+fn import_cut_inside_a_letter_at_the_limit_is_refused_by_its_size() {
+    let dir = std::env::temp_dir().join(format!("kith-lang-lossy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let big = format!("{}é{}", "a".repeat(1 << 20), "b".repeat(10));
+    std::fs::write(dir.join("big.kith"), big).expect("write");
+    std::fs::write(dir.join("app.kith"), "[import \"./big.kith\"]").expect("write");
+    let read = kith_lang::dir(&dir)("big.kith");
+    let refused = kith_lang::eval("app.kith", &kith_lang::dir(&dir), &[])
+        .err()
+        .map(|e| e.msg);
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert!(read.is_ok(), "the cut letter is read lossily: {read:?}");
+    assert!(
+        refused.unwrap_or_default().contains("big.kith: more than"),
+        "refused by its size"
+    );
+}
