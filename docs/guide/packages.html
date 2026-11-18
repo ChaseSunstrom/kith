@@ -20,8 +20,9 @@
   </a>
   <nav aria-label="Sections">
     <a href="../guide/index.html">Guide</a>
-    <a href="../guide/index.html#decisions">Decisions</a>
-    <a href="../index.html#numbers">Numbers</a>
+    <a href="../install.html">Install</a>
+    <a class="more" href="../guide/index.html#decisions">Decisions</a>
+    <a class="more" href="../index.html#numbers">Numbers</a>
   </nav>
   <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
 </header>
@@ -120,7 +121,7 @@ kith source push conf --to oci://registry.example/sources/conf:v1   # for `spec.
 <div class="table"><table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Fetching</td><td>The node that leads the store fetches the source every <code>intervalSeconds</code> (5 at least) and applies its resources, marked <code>kith.dev/owned-by</code> like a Release's. Sources are fetched several at once; one that keeps failing is fetched less often (its interval doubles each time, to an hour).</td></tr><tr><td>Conflicts</td><td>It does not take over what is there and not its own. Of two Sources that name one resource the one that has it keeps it (the first by name, if they come together); the other says <code>error</code>.</td></tr><tr><td><code>status.state</code></td><td><code>synced</code> (at <code>revision</code>), <code>pending</code> (<code>pending.revision</code> waits for <code>kith source approve</code>, with what it would change) or <code>error</code> (with <code>message</code>; what was applied stays). When the source moves on, a manual Source waits again.</td></tr><tr><td>Approval</td><td>It is for a revision: a Source whose <code>path</code> or <code>prune</code> you change applies the revision already approved the new way.</td></tr><tr><td>Drift</td><td>What a Source applied and someone changed since is put back and listed in <code>status.drift</code>: the source is what is true. Deleting a Source deletes what it applied.</td></tr><tr><td>git</td><td>The node's <code>git</code> program, over <code>https://</code> or <code>ssh://</code> only, with no credentials but what ssh has. Nothing is checked out, so links in a repository are skipped (<code>status.skipped</code>); a source is 2000 files and 4 MB at most. git runs under <code>ulimit -f</code> and writes no file over 256 MB.</td></tr><tr><td>Addresses</td><td>Only a Source in <code>kith-system</code> is fetched over <code>ssh://</code> (the node's own keys open the door) or from this node and its own networks (loopback, private, link-local and shared addresses, by whatever name; any address of this machine's cards or a Node's advertised). Any other Source is fetched from the very address that was checked: a name that answers differently a moment later, or a redirect, leads nowhere else (git follows none and needs 2.37 or newer; a registry's redirects and token host are checked the same way).</td></tr></tbody></table></div>
 <p>Not yet: signed-commit verification, credentials for private repositories.</p>
 </article>
-<footer class="tail"><nav aria-label="Next page"><a class="before" href="hardware.html"><span>Before</span>Hardware</a><a class="after" href="access.html"><span>After</span>Access</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/packages.md">docs/guide/packages.md</a>.</p></footer>
+<footer class="tail"><nav aria-label="Previous and next pages"><a class="prev" rel="prev" href="hardware.html"><span>Previous</span>Hardware</a><a class="next" rel="next" href="access.html"><span>Next</span>Access</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/packages.md">docs/guide/packages.md</a>.</p></footer>
 </div>
 </div>
 </body>
