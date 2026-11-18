@@ -755,18 +755,100 @@ fn drained(ready_since: Option<Instant>) -> bool {
 /// before the status says what it lacks.
 const SLOW: Duration = Duration::from_secs(30);
 
+/// The generation (true: the second) of the replica that the unit `id` is of, if it is of it.
+fn gen_of(owner: &str, replica: u32, id: &str) -> Option<bool> {
+    let rest = id.strip_prefix(&pod_of(owner, replica))?;
+    match (rest.starts_with('_'), rest.starts_with("b_")) {
+        (true, _) => Some(false),
+        (_, true) => Some(true),
+        _ => None,
+    }
+}
+
+/// The pod a unit's id names (`{pod}_{unit}`: a unit's name has no `_`).
+fn pod_of_unit(id: &str) -> &str {
+    id.rsplit_once('_').map_or(id, |(pod, _)| pod)
+}
+
+/// The time `/proc/PID/stat` says its process started, in clock ticks after boot (field 22, after
+/// a name that may hold spaces and parentheses).
+fn starttime_of(stat: &str) -> Option<u64> {
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
 /// Which generation a replica is wanted as when a kithd started again finds both of its generations
 /// running (the old and the one its update began) and does not know which is which: the one that is
-/// wanted as it runs is the new, and the other the old; the second where neither is.
+/// wanted as it runs is the new, and the other the old; where both or neither is, the one whose
+/// processes started later (`starts`, by unit id); the second where that is not known either.
 /// ponytail: a third update begun in the same stretch is not told apart; the old is held either way.
-fn adopted_gen(marks: &BTreeMap<String, String>, wanted: &BTreeMap<String, Slot>, owner: &str, replica: u32) -> bool {
+fn adopted_gen(
+    marks: &BTreeMap<String, String>,
+    starts: &BTreeMap<String, u64>,
+    wanted: &BTreeMap<String, Slot>,
+    owner: &str,
+    replica: u32,
+) -> bool {
     let runs = |second: bool| {
         wanted
             .iter()
             .filter(|(_, s)| s.owner == owner && s.replica == replica && is_second(s) == second)
             .any(|(id, s)| marks.get(id).is_some_and(|was| *was == mark(s)))
     };
-    !(runs(false) && !runs(true))
+    if runs(false) != runs(true) {
+        return runs(true);
+    }
+    let began = |second: bool| {
+        let of = starts
+            .iter()
+            .filter(|(id, _)| gen_of(owner, replica, id) == Some(second));
+        of.map(|(_, at)| *at).min()
+    };
+    match (began(false), began(true)) {
+        (Some(first), Some(second)) => second >= first,
+        _ => true,
+    }
+}
+
+/// What a kithd started again makes of a replica it finds running: `(second, surge)`, the generation
+/// wanted and whether the other is held beside it till that answers. Both generations found: the one
+/// that [`adopted_gen`] says is new, the other held. One found that is not as wanted: the other
+/// generation, where the replica could run twice (as the update itself would, see `no_surge`), so that
+/// it is not down for the new one's pull and init; else the one found, replaced as ever.
+/// ponytail: no `no_room` check here (what runs is not in `slots`), and no stopped-first note.
+fn after_restart(
+    marks: &BTreeMap<String, String>,
+    starts: &BTreeMap<String, u64>,
+    wanted: &BTreeMap<String, Slot>,
+    owner: &str,
+    replica: u32,
+    root: bool,
+) -> (bool, bool) {
+    let ran = |second: bool| marks.keys().any(|id| gen_of(owner, replica, id) == Some(second));
+    if ran(false) && ran(true) {
+        return (adopted_gen(marks, starts, wanted, owner, replica), true);
+    }
+    let found = ran(true);
+    let as_wanted = marks
+        .iter()
+        .filter(|(id, _)| gen_of(owner, replica, id) == Some(found))
+        .all(|(id, was)| wanted.get(id).is_some_and(|s| mark(s) == *was));
+    let other: Vec<&Slot> = wanted
+        .values()
+        .filter(|s| s.owner == owner && s.replica == replica && is_second(s) != found)
+        .collect();
+    let surge = !as_wanted && !other.is_empty() && other.iter().all(|s| s.rolling) && no_surge(&other, root).is_none();
+    (found != surge, surge)
+}
+
+/// The pods of the adopted units `ids` that are [`held`]: they answer without a slot, so they are
+/// taken back and kept like the pods of the slots.
+fn held_pods<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    surging: &Surging,
+    wanted: &BTreeMap<String, Slot>,
+) -> BTreeSet<String> {
+    let held = ids.into_iter().filter(|id| held(surging, wanted, id));
+    held.map(|id| pod_of_unit(id).to_string()).collect()
 }
 
 /// An adopted unit nothing wants that is the old generation of a replica whose new one has not
@@ -1207,9 +1289,14 @@ impl Controller {
                 let seen = |ran: String| self.adopted.keys().any(|id| id.starts_with(&ran));
                 let second = match self.gens.get(&(key.clone(), replica)) {
                     Some(second) => Some(*second),
-                    // Found running as both (an update was begun): both are wanted below, and
-                    // `adopted_gen` says which, once the marks are known.
-                    None if surges && seen(format!("{prefix}{replica}b_")) && seen(format!("{prefix}{replica}_")) => {
+                    // Found running as both (an update was begun), or as one a rolling update could
+                    // replace beside it: both are wanted below, and `after_restart` says which, once
+                    // the marks are known.
+                    None if surges
+                        && (seen(format!("{prefix}{replica}b_")) && seen(format!("{prefix}{replica}_"))
+                            || rolling
+                                && (seen(format!("{prefix}{replica}b_")) || seen(format!("{prefix}{replica}_")))) =>
+                    {
                         undecided.push((key.clone(), replica));
                         None
                     }
@@ -1340,11 +1427,26 @@ impl Controller {
             .iter()
             .map(|(id, (_, was))| (id.clone(), was.clone()))
             .collect();
+        // (When each started, for the two that are neither as wanted.)
+        let starts: BTreeMap<String, u64> = match undecided.is_empty() {
+            true => BTreeMap::new(),
+            false => self
+                .adopted
+                .iter()
+                .filter_map(|(id, (handle, _))| {
+                    let stat = std::fs::read_to_string(format!("/proc/{}/stat", handle.pid())).ok()?;
+                    Some((id.clone(), starttime_of(&stat)?))
+                })
+                .collect(),
+        };
+        let root = nix::unistd::getuid().is_root();
         for (owner, replica) in undecided {
-            let second = adopted_gen(&marks, &wanted, &owner, replica);
+            let (second, surge) = after_restart(&marks, &starts, &wanted, &owner, replica, root);
             wanted.retain(|_, s| !(s.owner == owner && s.replica == replica && is_second(s) != second));
             self.gens.insert((owner.clone(), replica), second);
-            self.surging.entry((owner, replica)).or_insert((Instant::now(), None));
+            if surge {
+                self.surging.entry((owner, replica)).or_insert((Instant::now(), None));
+            }
         }
         let mut stale: Vec<String> = Vec::new();
         let mut again_now = false;
@@ -1365,22 +1467,43 @@ impl Controller {
         }
         // Taken back units nothing wants any more, or wants otherwise, are stopped: but the old
         // generation of a replica whose update is not over (see `held`) stays till the new one answers.
-        let unwanted: Vec<String> = self
-            .adopted
-            .iter()
-            .filter(|(id, (_, was))| {
-                wanted.get(*id).is_none_or(|new| &mark(new) != was) && !held(&self.surging, &wanted, id)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        // A held unit has no slot, so it has no restart, storage limit or probe, and no place in the
+        // status: it only answers till its replacement does. Its pod is taken back here, as a slot's
+        // is where it starts (no rule of its pod's link, no Service could reach it), and kept below.
+        let mut unwanted: Vec<String> = Vec::new();
+        for (id, (handle, was)) in &self.adopted {
+            if !wanted.get(id).is_none_or(|new| &mark(new) != was) {
+                continue;
+            }
+            let adopt = |pod: &str| {
+                let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+                pods.adopt(self.logs.parent().unwrap_or(&self.logs), pod, handle.pid())
+            };
+            // (One whose pod cannot be taken back answers nobody: stopped, as if not held.)
+            let kept = held(&self.surging, &wanted, id)
+                && match nix::unistd::getuid().is_root() {
+                    true => adopt(pod_of_unit(id))
+                        .inspect_err(|e| eprintln!("kithd: {id}: {e}"))
+                        .is_ok(),
+                    false => true,
+                };
+            if !kept {
+                unwanted.push(id.clone());
+            }
+        }
         for id in unwanted {
-            if let Some((handle, _)) = self.adopted.remove(&id) {
+            if let Some((handle, was)) = self.adopted.remove(&id) {
                 eprintln!("kithd: {id}: run by an earlier kithd and not wanted as it is: stopped");
+                // One that is not gone is asked again next pass, not forgotten running.
                 if let Err(e) = delete(handle).await {
                     eprintln!("kithd: {id}: {}", e.error);
+                    if let Some(handle) = e.handle {
+                        self.adopted.insert(id, (*handle, was));
+                    }
                 }
             }
         }
+        let held_pods = held_pods(self.adopted.keys().map(String::as_str), &self.surging, &wanted);
         // Per owner, the replicas with something to replace.
         let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
         let differs = |new: &Slot, slot: &Slot| {
@@ -1628,10 +1751,12 @@ impl Controller {
             .collect();
         crate::files::sweep(&bases, &replicas.collect());
         // A pod none of whose units is wanted any more is let go, its network with it.
+        // (Also the pod of a held old generation, till it is stopped: its record goes with the pod then.)
         let pods: BTreeSet<&str> = self
             .slots
             .values()
             .filter_map(|slot| Some(slot.pod.as_ref()?.0.as_str()))
+            .chain(held_pods.iter().map(String::as_str))
             .collect();
         let made = shared.pods.lock();
         made.expect("nothing panics holding the pods")
@@ -3483,13 +3608,14 @@ mod tests {
         wanted.insert(id_b.clone(), b);
         let adopted = |a: &str, b: &str| BTreeMap::from([(id_a.clone(), a.to_string()), (id_b.clone(), b.to_string())]);
         // The first update: the original is the old one, the second generation what is wanted.
-        assert!(adopted_gen(&adopted("v1", &mark_b), &wanted, owner, 0));
+        let no = BTreeMap::new();
+        assert!(adopted_gen(&adopted("v1", &mark_b), &no, &wanted, owner, 0));
         // The second: the second generation is the old one, the first what is wanted.
-        assert!(!adopted_gen(&adopted(&mark_a, "v2"), &wanted, owner, 0));
-        // Neither is what is wanted: the second.
-        assert!(adopted_gen(&adopted("v3", "v2"), &wanted, owner, 0));
+        assert!(!adopted_gen(&adopted(&mark_a, "v2"), &no, &wanted, owner, 0));
+        // Neither is what is wanted, and no start is known: the second.
+        assert!(adopted_gen(&adopted("v3", "v2"), &no, &wanted, owner, 0));
         // (Another replica is none of these: neither is wanted.)
-        assert!(adopted_gen(&adopted(&mark_a, "v2"), &wanted, owner, 1));
+        assert!(adopted_gen(&adopted(&mark_a, "v2"), &no, &wanted, owner, 1));
         // What is held: the units nothing wants, of a replica whose update is not over.
         let began = Instant::now();
         let surging = BTreeMap::from([((owner.to_string(), 0), (began, None))]);
@@ -3505,6 +3631,103 @@ mod tests {
         );
         let ready_now = BTreeMap::from([((owner.to_string(), 0), (began, Some(Instant::now())))]);
         assert!(held(&ready_now, &wanted, &id_a), "and while the drain goes on");
+    }
+
+    /// A held old generation is still a pod that answers: its pod is taken back (its network and
+    /// rules) and kept while it is held, though no slot of it is made. (Its units are named
+    /// `{pod}_{unit}`, and a unit name has no `_`.)
+    #[test]
+    fn surge_after_a_restart_adopts_and_keeps_the_pod_it_holds() {
+        let owner = "Workload/x/a";
+        let (id_a, _) = surge_unit(false, "pending");
+        let (id_b, b) = surge_unit(true, "pending");
+        assert_eq!(pod_of_unit(&id_a), pod_of(owner, 0));
+        assert_eq!(pod_of_unit(&id_b), pod_id(owner, 0, true));
+        let wanted = BTreeMap::from([(id_b.clone(), b)]);
+        let ids = [id_a.as_str(), id_b.as_str(), "w_x_a_1_app"];
+        let began = Instant::now();
+        let surging = BTreeMap::from([((owner.to_string(), 0), (began, None))]);
+        assert_eq!(held_pods(ids, &surging, &wanted), BTreeSet::from([pod_of(owner, 0)]));
+        let drained_since = BTreeMap::from([((owner.to_string(), 0), (began, Some(Instant::now() - DRAIN)))]);
+        assert!(
+            held_pods(ids, &drained_since, &wanted).is_empty(),
+            "let go once drained"
+        );
+        assert!(
+            held_pods(ids, &BTreeMap::new(), &wanted).is_empty(),
+            "none held with no update"
+        );
+    }
+
+    /// A kithd started again that finds one generation of a replica running as it is no longer
+    /// wanted starts the other beside it (the old keeps answering) where a rolling update could; and
+    /// finds one that is as wanted left alone.
+    #[test]
+    fn surge_after_a_restart_with_one_generation_changed_starts_the_other_beside_it() {
+        let owner = "Workload/x/a";
+        let rolled = |b: bool| {
+            let (id, mut slot) = surge_unit(b, "pending");
+            slot.rolling = true;
+            (id, slot)
+        };
+        let (id_a, a) = rolled(false);
+        let (id_b, b) = rolled(true);
+        let (mark_a, mark_b) = (mark(&a), mark(&b));
+        let mut wanted = BTreeMap::from([(id_a.clone(), a), (id_b.clone(), b)]);
+        let no = BTreeMap::new();
+        let after = |wanted: &BTreeMap<String, Slot>, ran: &str, was: &str, root: bool| {
+            after_restart(
+                &BTreeMap::from([(ran.to_string(), was.to_string())]),
+                &no,
+                wanted,
+                owner,
+                0,
+                root,
+            )
+        };
+        // As wanted: left alone, whichever generation it is.
+        assert_eq!(after(&wanted, &id_a, &mark_a, true), (false, false));
+        assert_eq!(after(&wanted, &id_b, &mark_b, true), (true, false));
+        // Not as wanted: the other generation is wanted, the one running held.
+        assert_eq!(after(&wanted, &id_a, "v1", true), (true, true));
+        assert_eq!(after(&wanted, &id_b, "v1", true), (false, true));
+        // Where it could not run twice (not root: no pod of its own), it is stopped first as ever.
+        assert_eq!(after(&wanted, &id_a, "v1", false), (false, false));
+        // A Recreate Workload is not surged.
+        for slot in wanted.values_mut() {
+            slot.rolling = false;
+        }
+        assert_eq!(after(&wanted, &id_a, "v1", true), (false, false));
+    }
+
+    /// With neither generation as wanted, the older process is the old generation: the second is not
+    /// always the new one (on every even update the first is).
+    #[test]
+    fn surge_after_a_restart_tells_the_old_generation_by_when_it_started() {
+        let owner = "Workload/x/a";
+        let (id_a, a) = surge_unit(false, "pending");
+        let (id_b, b) = surge_unit(true, "pending");
+        let wanted = BTreeMap::from([(id_a.clone(), a), (id_b.clone(), b)]);
+        let marks = BTreeMap::from([(id_a.clone(), "v2".to_string()), (id_b.clone(), "v3".to_string())]);
+        let starts = |a: u64, b: u64| BTreeMap::from([(id_a.clone(), a), (id_b.clone(), b)]);
+        assert!(
+            adopted_gen(&marks, &starts(100, 200), &wanted, owner, 0),
+            "the second is newer"
+        );
+        assert!(
+            !adopted_gen(&marks, &starts(300, 200), &wanted, owner, 0),
+            "the first is newer"
+        );
+        assert!(
+            adopted_gen(&marks, &starts(100, 100), &wanted, owner, 0),
+            "no telling: the second"
+        );
+        // The time is the 22nd field of /proc/PID/stat, after a name that may hold spaces and parentheses.
+        let stat = "42 (a b) c) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 100 18446744073709551615";
+        assert_eq!(starttime_of(stat), Some(987654));
+        assert_eq!(starttime_of("garbage"), None);
+        let own = std::fs::read_to_string("/proc/self/stat").unwrap();
+        assert!(starttime_of(&own).is_some_and(|t| t > 0));
     }
 
     /// What the status says of a replica mid-update: why it was stopped first, and, once its

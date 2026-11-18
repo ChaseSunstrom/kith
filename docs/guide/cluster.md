@@ -247,9 +247,11 @@ is never without a ready replica.
   nginx:2: no route to host); the old one still answers`. Change the Workload again to replace
   the replacement; the old replica is let go only once one answers.
 - **A kithd restarted in the middle.** Both copies are taken back. The one that runs as the
-  Workload says now is the new one (the second, where neither does); the other is kept until it
-  answers, so a restart never leaves a replica with nothing running. A third change within that
-  stretch does not tell the copies apart: the older one is kept either way.
+  Workload says now is the new one (where neither does, the one that started later); the other
+  is kept, its network and Service rules with it, until the new one answers, so a restart never
+  leaves a replica with nothing running. A replica found running as an older definition, with
+  nothing else of it running, is replaced the same way: the new copy starts beside it. A third
+  change within that stretch does not tell the copies apart: the older one is kept either way.
 - **Where it is said.** With one node, in the Workload's `notes`; with several, in the `message`
   of the replica's units, as each node says only its own.
 
