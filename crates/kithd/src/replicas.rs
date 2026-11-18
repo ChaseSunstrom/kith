@@ -324,6 +324,13 @@ async fn sync(
     placed.await.map_err(|e| e.to_string())?
 }
 
+/// Removes what a stop in the middle of a sync left: a volume's files, which a container wrote.
+fn clear_unfinished(state: &Path) {
+    for left in [".sending", ".receiving"] {
+        let _ = crate::controller::storage::remove_tree(&state.join("replicas").join(left), &|| false);
+    }
+}
+
 /// Keeps this node's copies of other nodes' volumes up to date.
 pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Receiver<bool>) {
     let me = shared.members.me().to_string();
@@ -332,9 +339,7 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
     // (And what went wrong with each, said once and not every round.)
     let mut said: BTreeMap<String, String> = BTreeMap::new();
     // (What a stop in the middle of a sync left behind.)
-    for left in [".sending", ".receiving"] {
-        let _ = std::fs::remove_dir_all(state.join("replicas").join(left));
-    }
+    clear_unfinished(&state);
     loop {
         tokio::select! {
             _ = tokio::time::sleep(ROUND) => {}
@@ -419,6 +424,32 @@ pub async fn run(shared: Arc<Shared>, state: PathBuf, mut stopping: watch::Recei
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A volume's files left by a stop in a sync, a chain 2,000 directories deep (more than
+    /// `remove_dir_all` holds descriptors for), are freed, and no level is left beside them.
+    #[test]
+    fn a_deep_chain_left_by_a_stopped_sync_is_freed() {
+        crate::controller::storage::tests::few_files(
+            concat!(module_path!(), "::a_deep_chain_left_by_a_stopped_sync_is_freed"),
+            || {
+                let state = std::env::temp_dir().join(format!("kith-replica-deep-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&state);
+                let replicas = state.join("replicas");
+                for left in [".sending", ".receiving"] {
+                    std::fs::create_dir_all(replicas.join(left)).unwrap();
+                    crate::controller::storage::tests::chain(&replicas.join(left), 2000);
+                }
+                clear_unfinished(&state);
+                let left: Vec<_> = std::fs::read_dir(&replicas)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                let _ = std::fs::remove_dir_all(&state);
+                assert!(left.is_empty(), "{left:?}");
+            },
+        );
+    }
 
     fn store(status: Value) -> Store {
         let mut store = Store::default();

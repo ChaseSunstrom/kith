@@ -142,22 +142,30 @@ pub fn one(dir: &Path, path: &str) -> io::Result<PathBuf> {
 /// the limit of its project (on a disk that keeps them), once nothing is left in it.
 pub fn sweep(bases: &[&Path], keep: &BTreeSet<String>) {
     for base in bases {
-        for entry in std::fs::read_dir(base.join(REPLICAS)).into_iter().flatten().flatten() {
+        // (Listed first: a removal makes its levels beside the directory, and the listing is not
+        // to meet them.)
+        let all: Vec<_> = std::fs::read_dir(base.join(REPLICAS))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        for entry in all {
             if keep.contains(&*entry.file_name().to_string_lossy()) {
                 continue;
             }
             let id = kith_dm_sys::project(&entry.path()).map_or(0, |(id, _)| id);
-            match std::fs::remove_dir_all(entry.path()) {
+            // (A tree a container wrote is not walked down and up: it may be deeper than there are descriptors.)
+            match crate::controller::storage::remove_tree(&entry.path(), &|| false) {
                 Err(e) => eprintln!("kithd: removing {}: {e}", entry.path().display()),
                 // (A container's root may be left in it a while: then the limit stays, and the
                 // next pod given the id sets its own first.)
-                Ok(())
+                Ok(_)
                     if id != 0
                         && kith_dm_sys::project_usage(base, id).is_ok_and(|(bytes, files)| bytes + files == 0) =>
                 {
                     let _ = kith_dm_sys::set_project_limit(base, id, 0, 0);
                 }
-                Ok(()) => {}
+                Ok(_) => {}
             }
         }
     }
@@ -166,6 +174,34 @@ pub fn sweep(bases: &[&Path], keep: &BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gone replica's directory with a chain 2,000 directories deep a container made in its
+    /// scratch is freed, with no level left beside it, and a kept replica's is not touched.
+    #[test]
+    fn a_deep_chain_in_a_gone_replicas_files_is_freed() {
+        crate::controller::storage::tests::few_files(
+            concat!(module_path!(), "::a_deep_chain_in_a_gone_replicas_files_is_freed"),
+            || {
+                let base = std::env::temp_dir().join(format!("kith-files-deep-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&base);
+                for replica in ["w_default_web_0", "w_default_web_1"] {
+                    let made = scratch(&base, replica, "cache").unwrap();
+                    crate::controller::storage::tests::chain(&made, 2000);
+                }
+                sweep(&[&base], &BTreeSet::from(["w_default_web_1".to_string()]));
+                let left: Vec<_> = std::fs::read_dir(base.join(REPLICAS))
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                let kept =
+                    crate::controller::storage::tests::deep(&base.join(REPLICAS).join("w_default_web_1/scratch/cache"));
+                let _ = std::fs::remove_dir_all(&base);
+                assert_eq!(left, ["w_default_web_1"], "{left:?}");
+                assert_eq!(kept, 2000);
+            },
+        );
+    }
 
     fn map(files: &[(&str, &str)]) -> BTreeMap<String, String> {
         files

@@ -86,6 +86,12 @@ pub fn range() -> kith_mesh::pod::Range {
     RANGE.get().copied().unwrap_or_default()
 }
 
+/// Removes a gone pod's directory. Not `remove_dir_all`, which holds a descriptor per level
+/// and fails on a tree thousands deep (a container may have made one).
+fn forget(dir: &Path) {
+    let _ = crate::controller::storage::remove_tree(dir, &|| false);
+}
+
 impl Pods {
     /// The pod `id` (of `namespace`, called `hostname`), made if it is not there yet.
     /// `net`: this node's /80 of the mesh, where there is a cluster. `exit`: the tunnel it
@@ -159,7 +165,7 @@ impl Pods {
             self.made.insert(id.into(), pod);
             if let Err(e) = self.serve() {
                 if let Some(pod) = self.made.remove(id) {
-                    let _ = std::fs::remove_dir_all(&pod.dir);
+                    forget(&pod.dir);
                 }
                 return Err(failed(e));
             }
@@ -180,7 +186,7 @@ impl Pods {
         self.made.retain(|id, pod| {
             let kept = wanted(id);
             if !kept {
-                let _ = std::fs::remove_dir_all(&pod.dir);
+                forget(&pod.dir);
                 let _ = std::fs::remove_file(Path::new(RECORDS).join(id));
                 // (What of it lingers still goes nowhere: `release` leaves that rule.)
                 if pod.exit.is_some()
@@ -936,6 +942,29 @@ pub async fn names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gone pod's directory with a chain 2,000 directories deep in it is freed whole.
+    #[test]
+    fn a_deep_chain_in_a_gone_pods_directory_is_freed() {
+        crate::controller::storage::tests::few_files(
+            concat!(module_path!(), "::a_deep_chain_in_a_gone_pods_directory_is_freed"),
+            || {
+                let state = std::env::temp_dir().join(format!("kith-pod-deep-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&state);
+                let (pods, dir) = (state.join("pods"), state.join("pods/w_default_web_0"));
+                std::fs::create_dir_all(&dir).unwrap();
+                crate::controller::storage::tests::chain(&dir, 2000);
+                forget(&dir);
+                let left: Vec<_> = std::fs::read_dir(&pods)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                let _ = std::fs::remove_dir_all(&state);
+                assert!(left.is_empty(), "{left:?}");
+            },
+        );
+    }
 
     #[test]
     fn an_unguarded_machine_is_told_so_once() {

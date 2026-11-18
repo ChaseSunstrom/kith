@@ -780,7 +780,7 @@ pub fn choose(pods: &[Pod], free: u64, reserve: u64) -> Vec<(usize, String)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
@@ -1397,9 +1397,33 @@ mod tests {
         std::fs::remove_dir_all(top).unwrap();
     }
 
+    /// Runs `body` as the test `name` (its `module_path!()` and function) in a child of this test
+    /// binary that may hold 256 files, as kithd, which raises nothing, may hold 1024: a chain
+    /// 2,000 deep ends what a removal that holds a descriptor per level does, where the
+    /// 500,000 or so a test run is let have do not.
+    pub(crate) fn few_files(name: &str, body: impl FnOnce()) {
+        if std::env::var_os("KITHD_FEW_FILES").is_some() {
+            return body();
+        }
+        let name = name.split_once("::").map_or(name, |(_, path)| path);
+        let run = std::process::Command::new("sh")
+            .args(["-c", "ulimit -n 256 && exec \"$0\" \"$@\""])
+            .arg(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--test-threads=1"])
+            .env("KITHD_FEW_FILES", "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
     /// `depth` directories `d` inside one another below `top`, a file at the bottom: made through
     /// the handle of each (a path that long is no path).
-    fn chain(top: &Path, depth: usize) {
+    pub(crate) fn chain(top: &Path, depth: usize) {
         use crate::backups::{open_dir, within};
         let mut at = open_dir(top).unwrap();
         for _ in 0..depth {
@@ -1410,7 +1434,7 @@ mod tests {
     }
 
     /// How many directories `d` deep `top` goes.
-    fn deep(top: &Path) -> usize {
+    pub(crate) fn deep(top: &Path) -> usize {
         use crate::backups::{open_dir, within};
         let mut at = open_dir(top).unwrap();
         let mut down = 0;
