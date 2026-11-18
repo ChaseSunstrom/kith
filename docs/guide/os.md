@@ -188,7 +188,7 @@ cargo test -p kith-store format        # this build reads a state written in for
 ```
 
 A node's copy of the cluster's resources is two files in its state, `raft/log.redb` and
-`raft/snapshot.json`, each saying its format, 1 or 2 (a file from before the number is 1).
+`raft/snapshot.json`, each saying its format, 1, 2 or 3 (a file from before the number is 1).
 Format 2 keeps when each resource was first made, apart from its history (which is trimmed): it
 says which of two Services naming one host was there first. A state stays in format 1 until the
 cluster's leader marks the store with one entry in the log, once every other node that keeps the
@@ -204,13 +204,17 @@ files. So:
    when each resource was first made`, and there is no going back short of that backup. A
    cluster of one node has nobody to wait for: it marks its store as soon as the new kithd
    starts.
+4. Format 3 comes the same way, once every node's kithd says it reads format 3: the leader
+   says `the store keeps from now on the nonces of signed entries`. It is format 2 with a book
+   of the nonces of signed writes in the log, kept so that each is run once; a kithd that
+   reads format 3 refuses every such write for now, and none is written yet.
 
 What there was at the mark counts as made at the time of its oldest revision still kept: a
 Service edited more than a hundred times before may count as newer than one that names its host.
 Where that matters, keep the host with its Namespace's `hosts` before updating.
 
-- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1` and `format-2`
-  are a state as each format writes it. A build that changes what is written takes the next
+- A kithd reads every format up to its own: `crates/kith-store/fixtures/format-1`, `format-2` and
+  `format-3` are a state as each format writes it. A build that changes what is written takes the next
   number, adds a fixture and keeps the old ones.
 - A kithd refuses a newer format and leaves the files as they were. Going back to an older
   release is sure only while the state is in a format that release reads.

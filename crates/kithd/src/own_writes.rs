@@ -239,6 +239,11 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
         // store is marked already. Unmarked, it is the leader's to make.)
         Command::Mark if store.marked() => Ok(Command::Mark),
         Command::Mark => Err(refused("the store's format", "only the leader changes it")),
+        // (The same for format 3: a no-op where the store keeps nonces already.)
+        Command::MarkSigned if store.signing() => Ok(Command::MarkSigned),
+        Command::MarkSigned => Err(refused("the store's format", "only the leader changes it")),
+        // A person signs a change and the leader writes it as it came: never a node's own write.
+        Command::Signed { .. } => Err(refused("a signed change", "a control node signs none of its own")),
     }
 }
 
@@ -409,6 +414,25 @@ mod tests {
         assert!(checked(&shared, "mark-c", Command::Mark).is_err());
         shared.store.lock().unwrap().store.mark();
         assert!(checked(&shared, "mark-c", Command::Mark).is_ok());
+    }
+
+    /// Format 3 is the leader's to make as format 2 is, and a signed entry is never a control
+    /// node's own write, whatever it wraps.
+    #[tokio::test]
+    async fn own_writes_refuse_a_signed_entry_and_an_unmade_format_3() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-signed", node(&ca, "sign-c"), &[]).await;
+        assert!(checked(&shared, "sign-c", Command::MarkSigned).is_err());
+        shared.store.lock().unwrap().store.sign();
+        assert!(checked(&shared, "sign-c", Command::MarkSigned).is_ok());
+        let signed = Command::Signed {
+            header: String::new(),
+            method: "POST".into(),
+            path: "/v1/apply".into(),
+            body: String::new(),
+            command: Box::new(Command::Mark),
+        };
+        assert!(checked(&shared, "sign-c", signed).is_err());
     }
 
     /// Another node's mesh key, said in a control node's own Node, is refused as a worker's is:
