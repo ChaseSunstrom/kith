@@ -229,7 +229,11 @@ fn turns(to: (&str, u16), count: u64) -> Result<f64, String> {
 }
 
 fn asked(host: &str, port: &str) -> std::io::Result<String> {
-    let mut stream = TcpStream::connect((host, port.parse::<u16>().expect("a port")))?;
+    // A policy that drops the SYN leaves the connect hanging; 2 s is the answer a dropped one gets.
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port.parse::<u16>().expect("a port")))?
+        .next()
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "no address"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(b"GET / HTTP/1.0\r\n\r\n")?;
     let mut answer = String::new();

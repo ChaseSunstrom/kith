@@ -621,8 +621,11 @@ These are how kith is today. Each is a decision or a gap that is known; plan aro
   through the log); the node's own check before start still refuses an unlisted namespace.
   Of the node itself, an exit's pod reaches nothing (only answers to the node's own
   questions of it go back). A running pod keeps its tunnel after its namespace is taken
-  off its Exit's list, until it starts again (the node's check is at start). No NetworkPolicy's egress rules are enforced, for an exit's pod or any other (a
-  policy with them says so in its status). Not tested: a tunnel's link or table taken
+  off its Exit's list, until it starts again (the node's check is at start). A NetworkPolicy's egress rules are enforced for the pods of the Workloads it
+  selects, an exit's pod included: each such pod's packets pass only to what a rule allows
+  (written per pod source address in the node's `kith-pods` chain). A policy whose peers are by
+  namespace or selector, or whose rules are not yet written on a node, says `partial` in its
+  status; `enforced` once they are. Not tested: a tunnel's link or table taken
   away by hand on a running node (the code that makes it again is tested in a network
   namespace, not on kith OS), ICMP through or around a tunnel, kithd killed between
   starting a pod and making its rules (the rules come first; nothing shows the order

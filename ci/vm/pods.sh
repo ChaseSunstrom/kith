@@ -98,6 +98,47 @@ EOF
             asks egress 10.0.2.2 $((port + 9))
             pinned=''
             grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
+            # A NetworkPolicy's egress rule holds the pods of app=fenced to this machine's web server
+            # (10.0.2.2, port+9) and no other: a fenced pod reaches it, and asks port+10 of the same
+            # address, where nothing listens, and that connection times out (the policy drops it).
+            # An unlabelled Job asks port+10 too, unfenced: the address answers it (a refusal, not
+            # a timeout), so the timeout is the policy's and not a dead address.
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"NetworkPolicy","metadata":{"name":"fence"},"spec":{"selector":{"app":"fenced"},"egress":[{"action":"allow","peers":[{"cidr":"10.0.2.2/32"}],"ports":[$((port + 9))]}]}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the NetworkPolicy fence was not applied"
+            # NAME, its metadata's labels (what the policy selects), and the port it asks 10.0.2.2:
+            # what it heard is in $work/NAME.out.
+            ask_port() {
+                cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Job","metadata":{"name":"$1"$2},"spec":{"retries":0,"template":{"pod":true,"containers":[
+  {"name":"ask","image":"kith.test/pod:user","command":["/bin/pod","ask","10.0.2.2","$3"]}]}}}]
+EOF
+                any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Job $1 was not applied"
+                waited=0
+                until line=$(units Job "$1") && printf '%s\n' "$line" | grep -Eq '^[0-9]+ (succeeded|failed)( |$)'; do
+                    waited=$((waited + 1))
+                    [ "$waited" -lt 240 ] || fail "waited for the Job $1; it says: $line"
+                    sleep 1
+                done
+                any GET "/v1/logs/Job/default/$1" >"$work/$1.out" || fail "what the Job $1 wrote could not be read"
+                printf '%s\n' "$line" | grep -Eq '^[0-9]+ succeeded' || fail "the Job $1 failed: $line: $(cat "$work/$1.out")"
+            }
+            ask_port fenced-allowed ',"labels":{"app":"fenced"}' $((port + 9))
+            grep -q 'HTTP/1.0 200 OK' "$work/fenced-allowed.out" || fail "the fenced pod did not reach 10.0.2.2:$((port + 9)), which its egress rule allows: $(cat "$work/fenced-allowed.out")"
+            ask_port fenced-other ',"labels":{"app":"fenced"}' $((port + 10))
+            grep -qi 'failed: 10.0.2.2: connection timed out' "$work/fenced-other.out" || fail "the fenced pod was not kept from 10.0.2.2:$((port + 10)) by its egress rule: $(cat "$work/fenced-other.out")"
+            ! grep -q 'HTTP/1.0' "$work/fenced-other.out" || fail "the fenced pod reached 10.0.2.2:$((port + 10)): $(cat "$work/fenced-other.out")"
+            ask_port unfenced '' $((port + 10))
+            ! grep -qi 'timed out' "$work/unfenced.out" || fail "an unfenced pod timed out on 10.0.2.2:$((port + 10)), so the fenced pod's timeout proves nothing: $(cat "$work/unfenced.out")"
+            waited=0
+            until line=$(units NetworkPolicy fence) && case $line in '0 enforced'*) true ;; *) false ;; esac; do
+                waited=$((waited + 1))
+                [ "$waited" -lt 60 ] || fail "the NetworkPolicy fence does not say its egress is enforced: $line"
+                sleep 1
+            done
+            api 1 DELETE /v1/resources/NetworkPolicy/default/fence >/dev/null || fail "the NetworkPolicy fence was not deleted"
+            echo "vm.sh: ok: a NetworkPolicy's egress rule let a pod of app=fenced reach 10.0.2.2:$((port + 9)) and kept it from 10.0.2.2:$((port + 10)), which an unfenced pod reaches (refused, not timed out); the policy says enforced" >&2
             # A Workload of an image nothing else uses, deleted once it runs: its image is
             # looked for again at the end.
             cat >"$work/apply.json" <<EOF

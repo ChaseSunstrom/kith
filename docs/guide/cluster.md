@@ -222,10 +222,14 @@ Service that selects its Workload.
   once and relays everything.
 
 A `NetworkPolicy` decides who may connect to the Workloads it selects through a Service: the
-first ingress rule that fits wins, none means refused. Peers are a `node` or a `cidr`; peers by
-`namespace` or `selector` cannot be told apart yet (allow lets nobody in, deny keeps everyone
-out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
-to a node's own address bypasses it.
+first ingress rule that fits wins, none means refused. It also decides where the pods of the
+Workloads it selects may connect: their egress rules are written into the node's `kith-pods`
+nftables chain, per pod source address, and kithd writes them again when a policy changes. A pod
+reaches only what a rule allows, its DNS included, so a policy that holds a pod names the
+resolver it needs; answers to a connection that came in still pass. Peers are a `node` or a
+`cidr`; peers by `namespace` or `selector` cannot be told apart yet (an allow rule fits nobody,
+a deny rule everybody), and the status says `partial` and why until every rule is written on
+the node, then `enforced`. A connection to a node's own address bypasses the ingress rules.
 
 ### Ingress: a host of its own, with a certificate
 
