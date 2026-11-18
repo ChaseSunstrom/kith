@@ -393,6 +393,35 @@ each of the three control nodes. It starts the two sealed ones first and has the
 with the third still off, then starts the third and a worker, which are handed their keys. Plan
 for the quorum, not for one machine: with three control nodes, two sealed and started are enough.
 
+## A node away from its cluster
+
+A node that starts with no leader in reach (a laptop at a café, an edge worker on a bad link)
+waits, by default, for one: it starts nothing until a write comes back from the cluster. Set
+`alone: run` on its Node and it does not wait forever:
+
+```yaml
+spec:
+  alone: run   # no leader for 30 s: run what this node's own copy of the store places here
+```
+
+After 30 seconds with no leader answering, the node starts the Workloads and NodeWorkloads its
+copy places on it. **Jobs are not started alone**: their runs are the cluster's to start, and a Job waits for a leader.
+The console says what the node runs alone and its risks, and the Node's status records
+`alone: {since, until, risks}`, the time it began and the time a leader answered. The status is
+written once a write comes back, because none can before then.
+
+The risks, said on the console and in that status:
+
+- a replica moved off this node while it was away runs twice, since the cluster started it elsewhere;
+- a Secret or a ConfigMap changed in the meantime is still the old one here;
+- a Job is not started alone.
+
+When a leader answers, the node catches up as it does on any store change: what was moved off is
+stopped, and what changed is replaced. A state the node cannot open alone does not open: an
+encrypted state whose key the cluster holds is opened only once a control node is up (see
+[when every node was off](#when-every-node-was-off)), so such a node runs nothing alone. Seal it,
+or keep its state unencrypted, for `alone: run` to help.
+
 ## DNS
 
 ```sh

@@ -258,6 +258,9 @@ struct Controller {
     /// What this node last found its own hardware to be (`devices::scan`), and when: kept for
     /// `SCAN_KEPT`, where a pass at each change of the store would walk `/sys` every time.
     scanned: Option<(Instant, Vec<Resource>)>,
+    /// The node runs alone (`alone: run`, no leader answered at its start) until a write comes back
+    /// (`record_alone`): its Jobs wait meanwhile (`held_alone`).
+    alone: std::sync::Arc<AtomicBool>,
 }
 
 /// How long a look at the node's own hardware is gone by (a walk of `/sys` measured 3.3 ms in
@@ -286,6 +289,87 @@ struct Job<T> {
 
 /// How long a job runs before it is said not to have ended: a thread cannot be killed.
 const HUNG: Duration = Duration::from_secs(60);
+
+/// How long a node whose Node spec says `alone: run` waits, with no write come back, before it runs alone.
+const ALONE_AFTER: Duration = Duration::from_secs(30);
+/// What running alone risks: said on the console and in the Node's `alone` status.
+const ALONE_RISKS: &str = "A replica moved off this node meanwhile runs twice; a Secret or ConfigMap changed meanwhile is the old one; a Job is not started alone.";
+
+/// How a node's start went: a write came back (its copy is the cluster's), or none did in time and
+/// it runs alone from its copy, with the last error it had.
+#[derive(Debug, PartialEq)]
+enum Start {
+    Leader,
+    Alone(String),
+}
+
+/// Waits for a write to come back. Alone (`alone`), gives up after `after` with none and says `Start::Alone`;
+/// otherwise waits as long as it takes.
+async fn started<T, E: std::fmt::Display, F: std::future::Future<Output = Result<T, E>>>(
+    alone: bool,
+    after: Duration,
+    submit: impl Fn() -> F,
+) -> Start {
+    let mut last = String::new();
+    let caught_up = async {
+        let mut said = false;
+        loop {
+            match submit().await {
+                Ok(_) => return Start::Leader,
+                Err(e) => {
+                    last = e.to_string();
+                    if !std::mem::replace(&mut said, true) {
+                        eprintln!("kithd: workloads start once this node has the cluster's store: {e}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    };
+    if !alone {
+        return caught_up.await;
+    }
+    tokio::time::timeout(after, caught_up)
+        .await
+        .unwrap_or(Start::Alone(last))
+}
+
+/// Whether a resource of this kind waits while its node runs alone. A Job does: its runs are the
+/// cluster's to start. A Workload or a NodeWorkload runs from the copy.
+fn held_alone(kind: &str, alone: bool) -> bool {
+    alone && kind == "Job"
+}
+
+fn unix(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// The Node's `alone` status: since when the node ran alone, until when (the write that came back),
+/// and the risks.
+fn alone_status(since: SystemTime, until: SystemTime) -> serde_json::Map<String, Value> {
+    let alone = json!({ "since": unix(since), "until": unix(until), "risks": ALONE_RISKS });
+    json!({ "alone": alone }).as_object().cloned().unwrap_or_default()
+}
+
+/// Writes the `alone` status once a write comes back: that is a leader answering, which none can do
+/// before it does. Then the node is no longer alone, so the reconcile may start Jobs and catch up.
+fn record_alone(shared: std::sync::Arc<Shared>, node: String, alone: std::sync::Arc<AtomicBool>, since: SystemTime) {
+    tokio::spawn(async move {
+        let key = format!("Node/{node}");
+        loop {
+            let statuses = vec![(key.clone(), alone_status(since, SystemTime::now()))];
+            match shared.submit(kith_store::Command::Patch { statuses }).await {
+                Ok(_) => break,
+                Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+            }
+        }
+        alone.store(false, Ordering::Relaxed);
+        eprintln!(
+            "kithd: a leader answers: this node ran alone since unix {}s; it catches up with the cluster's store",
+            unix(since)
+        );
+    });
+}
 
 pub async fn run(
     shared: std::sync::Arc<Shared>,
@@ -343,22 +427,34 @@ pub async fn run(
     // After a restart this node's copy of the store is old news: a replica that was moved
     // off it while it was away is still written down as its own. So first catch up: a
     // write that has come back has everything before it.
-    // ponytail: so a node that restarts while the cluster has no leader runs nothing until
-    // it has one. Running from the old copy instead would be a setting, if that is wanted.
-    if shared.cluster.is_some() {
-        let caught_up = async {
-            let nothing = || kith_store::Command::Patch { statuses: Vec::new() };
-            let mut said = false;
-            while let Err(e) = shared.submit(nothing()).await {
-                if !std::mem::replace(&mut said, true) {
-                    eprintln!("kithd: workloads start once this node has the cluster's store: {e}");
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+    // With no leader, a node whose copy says `alone: run` goes on from the copy after `ALONE_AFTER`,
+    // and says so (`record_alone`); any other waits for one.
+    let alone = std::sync::Arc::new(AtomicBool::new(false));
+    if let Some(cluster) = &shared.cluster {
+        let runs_alone = {
+            let file_store = shared.store.lock().expect("a handler panicked holding the store");
+            file_store
+                .store
+                .get(&format!("Node/{}", cluster.me.name))
+                .is_some_and(|node| node.spec["alone"] == "run")
         };
-        tokio::select! {
-            () = caught_up => {}
+        let nothing = || kith_store::Command::Patch { statuses: Vec::new() };
+        let start = tokio::select! {
+            start = started(runs_alone, ALONE_AFTER, || shared.submit(nothing())) => start,
             _ = stopping.changed() => return,
+        };
+        if let Start::Alone(last) = start {
+            eprintln!(
+                "kithd: no leader answered for {}s ({last}): running alone from this node's copy of the store. {ALONE_RISKS}",
+                ALONE_AFTER.as_secs()
+            );
+            alone.store(true, Ordering::Relaxed);
+            record_alone(
+                shared.clone(),
+                cluster.me.name.clone(),
+                alone.clone(),
+                SystemTime::now(),
+            );
         }
     }
     let mut exited = signal(SignalKind::child()).expect("installing a signal handler");
@@ -391,6 +487,7 @@ pub async fn run(
         projects,
         scanned: None,
         adopted,
+        alone,
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -799,6 +896,7 @@ impl Controller {
         // Alone, this node runs everything; in a cluster, the replicas the scheduler bound
         // to it (`nodes` in the status), and a Job when its one binding is here.
         let me = shared.cluster.as_ref().map(|cluster| cluster.me.name.as_str());
+        let alone = self.alone.load(Ordering::Relaxed);
         // Per key: how many replicas the spec asks for; and the keys this node has a say on.
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
         let mut ours: BTreeSet<String> = BTreeSet::new();
@@ -886,8 +984,8 @@ impl Controller {
                 let bound = |status: &Value| status["nodes"][replica.to_string()] == *me.unwrap_or_default();
                 allowed && (me.is_none() || resource.status.as_ref().is_some_and(bound))
             };
-            if resource.kind == "Job" && !here(0) {
-                // Bound here again later, it starts over, like after a restart.
+            if (resource.kind == "Job" && !here(0)) || held_alone(&resource.kind, alone) {
+                // Bound here again later, or back from alone, it starts over, like after a restart.
                 self.jobs.remove(&key);
                 continue;
             }
@@ -3215,5 +3313,59 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         }
         assert!(store.get("Volume/default/db").is_none());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A node set to run alone goes on from its copy once no write has come back for `ALONE_AFTER`.
+    #[tokio::test(start_paused = true)]
+    async fn alone_start_goes_on_from_the_copy_after_thirty_seconds() {
+        let began = tokio::time::Instant::now();
+        let never = || async { Err::<(), String>("no leader".into()) };
+        assert!(matches!(started(true, ALONE_AFTER, never).await, Start::Alone(_)));
+        assert_eq!(began.elapsed(), ALONE_AFTER);
+    }
+
+    /// A leader that answers before the wait is up wins: the start is the cluster's, not alone.
+    #[tokio::test(start_paused = true)]
+    async fn alone_a_leader_that_answers_first_wins() {
+        let began = tokio::time::Instant::now();
+        let answers = || async move {
+            match began.elapsed() < Duration::from_secs(10) {
+                true => Err("no leader".to_string()),
+                false => Ok(()),
+            }
+        };
+        assert_eq!(started(true, ALONE_AFTER, answers).await, Start::Leader);
+        assert!(began.elapsed() < ALONE_AFTER, "{:?}", began.elapsed());
+    }
+
+    /// A node that is not set to run alone waits for a write for as long as it takes.
+    #[tokio::test(start_paused = true)]
+    async fn alone_wait_keeps_waiting_however_long() {
+        let never = || async { Err::<(), String>("no leader".into()) };
+        let waited = tokio::time::timeout(Duration::from_secs(600), started(false, ALONE_AFTER, never)).await;
+        assert!(waited.is_err());
+    }
+
+    /// Jobs are held while alone; Workloads and NodeWorkloads are started from the copy as before.
+    #[test]
+    fn alone_jobs_are_not_started_and_workloads_are() {
+        assert!(held_alone("Job", true));
+        assert!(!held_alone("Job", false));
+        assert!(!held_alone("Workload", true));
+        assert!(!held_alone("NodeWorkload", true));
+    }
+
+    /// The Node's status says the risks and since when the node ran alone, and until when.
+    #[test]
+    fn alone_status_says_the_risks_and_since_when() {
+        let since = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let until = since + Duration::from_secs(90);
+        let status = alone_status(since, until);
+        assert_eq!(status["alone"]["since"], 1_700_000_000u64);
+        assert_eq!(status["alone"]["until"], 1_700_000_090u64);
+        let risks = status["alone"]["risks"].as_str().expect("the risks are said");
+        for said in ["runs twice", "the old one", "Job"] {
+            assert!(risks.contains(said), "{said} is not in {risks}");
+        }
     }
 }
