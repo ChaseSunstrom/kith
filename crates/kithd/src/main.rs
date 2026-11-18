@@ -646,9 +646,12 @@ async fn replica(
     let _ = reach.set(Arc::downgrade(&shared));
     // ponytail: an empty Raft is opened and ended again, so that what reads `shared.raft`
     // (who leads, who votes) needs no second path on a worker: it leads nothing and has no members.
-    if let Some((store, at, _)) = view {
+    if let Some((mut store, at, _)) = view {
         let _ = shared.raft.shutdown().await;
-        shared.store.lock().expect("nothing panics holding the store").store = store;
+        let mut state = shared.store.lock().expect("nothing panics holding the store");
+        store.continue_changes(&state.store);
+        state.store = store;
+        drop(state);
         shared.view.send_replace(Some(at));
         return Ok(shared);
     }
