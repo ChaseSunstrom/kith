@@ -398,6 +398,8 @@ Where the build differs from the text above:
   share a public key, one is given its addresses: the one already holding an address of ours,
   else the smallest name. The others are refused, naming it, and keep any address they held, so
   a refusal never frees one. A refusal names no address.
+- A refused peer keeps its addresses reserved in its status. Slice B, which routes or writes
+  WireGuard config, uses a peer's addresses only when its `refused` is empty.
 
 ## Open
 
