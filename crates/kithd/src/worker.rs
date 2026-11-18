@@ -593,7 +593,10 @@ pub fn checked(store: &Store, who: &Worker, command: Command) -> Result<Command,
         Command::Delete { key } => delete(store, who, &key).map(|()| Command::Delete { key }),
         Command::Rollback { key, .. } => Err(refused(key, "a rollback is asked of a control node")),
         Command::Import { .. } => Err(refused("a whole store", "only a control node brings one in")),
-        Command::Mark => Err(refused("the store's format", "only the leader changes it")),
+        Command::Mark | Command::MarkSigned | Command::MarkChecked => {
+            Err(refused("the store's format", "only the leader changes it"))
+        }
+        Command::Signed { .. } => Err(refused("a signed entry", "no worker writes one")),
     }
 }
 

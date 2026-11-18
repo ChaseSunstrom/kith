@@ -35,6 +35,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// What this node says of itself under `status.mesh`. `kept`: its kithd keeps the connections
+/// other nodes pass a Service's on by; `link`: it takes a link to another node's kithd, a
+/// stream for each (services.rs). A node of before says neither, and is reached as it was.
+fn says_of(public: &[u8], address: Ipv6Addr, port: u16) -> Value {
+    json!({ "key": hex(public), "address": address.to_string(), "port": port, "kept": true, "link": true })
+}
+
 pub(crate) fn key_of(hex: &str) -> Option<Key> {
     let byte = |at: usize| u8::from_str_radix(hex.get(2 * at..2 * at + 2)?, 16).ok();
     let bytes: Vec<u8> = (0..32).map_while(byte).collect();
@@ -304,8 +311,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         }
     };
     eprintln!("kithd: mesh address {address} on {}", options.interface);
-    // (`kept`: this node's kithd keeps the connections other nodes pass a Service's on by, services.rs.)
-    let base = json!({ "key": hex(&public), "address": address.to_string(), "port": options.port, "kept": true });
+    let base = says_of(&public, address, options.port);
     let node = format!("Node/{me}");
     let first = told(&first_peers(&options.key));
     let mut known = BTreeMap::new();
@@ -443,6 +449,18 @@ mod tests {
     /// `store` with what Node c says replaced.
     fn store_with(store: &Store, status: Value) -> Store {
         store_with_node(store, "Node/c", status)
+    }
+
+    /// A node says it keeps connections and takes links, which is what the other nodes' kithds read
+    /// before they open a stream on a link ([`crate::services`]) or keep a connection.
+    #[test]
+    fn a_node_says_it_takes_links_beside_keeping_connections() {
+        let says = says_of(&[7; 32], Ipv6Addr::LOCALHOST, 4000);
+        assert_eq!(
+            (&says["kept"], &says["link"], &says["port"]),
+            (&json!(true), &json!(true), &json!(4000))
+        );
+        assert_eq!(says["key"], "07".repeat(32));
     }
 
     #[test]

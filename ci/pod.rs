@@ -679,7 +679,9 @@ fn main() {
             // mknod(2): std makes no device nodes.
             let made = syscall(133, [name.as_ptr() as u64, mode, device, 0, 0]);
             let read = std::fs::File::open(path).and_then(|mut node| node.read(&mut [0; 512]));
-            println!("node: made {made}, read {read:?}");
+            let status = std::fs::read_to_string("/proc/self/status").expect("a /proc to read itself in");
+            let eff = status.lines().find_map(|line| line.strip_prefix("CapEff:")).map_or("?", str::trim);
+            println!("node: made {made}, read {read:?}, caps eff {eff}");
         }
         [how @ ("ids" | "stays"), paths @ ..] => {
             use std::os::unix::fs::MetadataExt;

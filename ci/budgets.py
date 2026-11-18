@@ -56,6 +56,9 @@ RSS_BUDGETS = {"kith apply": (["apply", "-f", "examples"], 4 * MB)}
 # Seconds, one per timed path: twice the slowest of three runs (each a median of RUNS) on main on the CI runner
 # (apply 85.3, 88.1, 78.3 ms; status 4.7, 4.8, 4.8 ms; DNS 2.9, 3.1, 3.5 ms), rounded up.
 # A ceiling for a regression, not a claim of speed. None would mean no budget (printed only).
+# Each is scaled by the host's load, measured once before the timed runs: the 1-minute load over
+# the CPU count, at least 1 (printed beside it). A quiet host (CI's runner) holds the budget as
+# written; a host busy with other builds, where the same code times slower, gets that much more.
 TIME_BUDGETS = {
     "apply to a running container": 0.180,
     "a status change reaching a second kithd": 0.010,
@@ -106,7 +109,11 @@ class Daemon:
         self.proc = subprocess.Popen(argv, cwd=dir, stdout=self.log, stderr=subprocess.STDOUT)
         wait_until(lambda: os.path.exists(os.path.join(dir, self.socket)) or self.proc.poll() is not None, "kithd to serve")
         if self.proc.poll() is not None:
-            sys.exit(f"kithd did not start: see {self.log.name}")
+            # The log is deleted with the run's folder: say why here, in the exit message.
+            self.log.flush()
+            with open(self.log.name) as log:
+                tail = log.read()[-2000:]
+            sys.exit(f"kithd did not start: see {self.log.name}\n{tail}")
 
     def kith(self, *args):
         argv = [os.path.join(self.bins, "kith"), "--socket", self.socket, *args]
@@ -176,7 +183,8 @@ def crossing(bins, dir):
     first = Daemon(bins, os.path.join(dir, "a"), "--name", "a", "--listen", address)
     try:
         token = first.kith("node", "token").strip()
-        second = Daemon(bins, os.path.join(dir, "b"), "--name", "b", "--join", address, "--token", token)
+        # Its own loopback port: kithd's --join alone listens on 0.0.0.0:7443, which two runs at once share.
+        second = Daemon(bins, os.path.join(dir, "b"), "--name", "b", "--listen", f"127.0.0.1:{free_port()}", "--join", address, "--token", token)
         try:
             def config(value):
                 return {"apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": {"name": "crossing"}, "spec": {"data": {"k": value}}}
@@ -259,12 +267,17 @@ def check(name, what, actual, limit):
     return ok
 
 
-def check_time(name, seconds, budget):
+def load_factor():
+    """The host's 1-minute load over its CPU count, at least 1: what a timing budget is scaled by."""
+    return max(1.0, os.getloadavg()[0] / (os.cpu_count() or 1))
+
+
+def check_time(name, seconds, budget, factor=1.0):
     if budget is None:
         print(f"time {name}: {seconds * 1000:.1f} ms (no budget yet: printed, not enforced)")
         return True
-    ok = not over(seconds, budget)
-    print(f"{'ok  ' if ok else 'FAIL'} {name}: {seconds * 1000:.1f} ms (budget {budget * 1000:.1f} ms)")
+    ok = not over(seconds, budget * factor)
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: {seconds * 1000:.1f} ms (budget {budget * 1000:.1f} ms x {factor:.2f} for load = {budget * factor * 1000:.1f} ms)")
     return ok
 
 
@@ -438,16 +451,21 @@ def main():
         if not self_test and not os.environ.get("CI"):
             order = os.path.join(os.path.dirname(os.path.abspath(__file__)), "order.py")
             results.append(subprocess.run([sys.executable, order, "--stale"]).returncode == 0)
+        # The self-test keeps 1 ms as it is: every check must still fail against it.
+        factor = 1.0 if self_test else load_factor()
         timed = medians(bin_dir, tmp, 1 if self_test else RUNS)
         for name in TIMED:
             budget = 0.001 if self_test else TIME_BUDGETS[name]
             if name in timed:
-                results.append(check_time(name, timed[name][0], budget))
+                results.append(check_time(name, timed[name][0], budget, factor))
             elif not self_test and budget is not None:
                 # (A path with a budget is held to it: where it cannot be run, that is a failure.)
                 print(f"FAIL {name}: it has a budget and could not be run here")
                 results.append(False)
     if self_test:
+        # The load factor scales a timing budget: 11.4 ms is over 7 ms at a factor of 1, under it at 2.
+        if check_time("scaled, factor 1", 0.0114, 0.007) or not check_time("scaled, factor 2", 0.0114, 0.007, 2.0):
+            sys.exit("self-test failed: a timing budget is not scaled by the load factor")
         # With 1-byte and 1 ms budgets every check must fail; otherwise the checks check nothing.
         if any(results):
             sys.exit("self-test failed: a check passed against a 1-byte or 1 ms budget")

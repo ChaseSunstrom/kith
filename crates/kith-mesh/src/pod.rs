@@ -386,17 +386,31 @@ pub fn node(range: Range, guarded: bool, mesh: &str, pods: &[Served]) -> Result<
 
 /// A pod this node serves: its number, whether it leaves by an exit (its link is then
 /// [`crate::exit::link`]'s, not [`link_of`]'s), and its address on the mesh, if it has one
-/// (its IPv4 address is [`addresses`]').
+/// (its IPv4 address is [`addresses`]'). `egress`, when it has rules (a NetworkPolicy
+/// selects the pod): what the pod may reach, see [`Egress`]; `None` holds it to nothing.
 pub struct Served {
     pub number: u16,
     pub exit: bool,
     pub v6: Option<Ipv6Addr>,
+    pub egress: Option<Vec<Egress>>,
+}
+
+/// One egress rule of a pod, in the order given: the first that fits what the pod sends
+/// says, an allow lets it be, a deny drops it, and when none fits it is dropped. It fits what
+/// goes to one of the networks `to` (any, if none) at one of `ports` (any TCP or UDP port, or
+/// no port, if none: a rule with ports fits TCP and UDP only). What answers what came to the
+/// pod passes before any rule; nothing else does, DNS at the node's resolver included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Egress {
+    pub allow: bool,
+    pub to: Vec<(IpAddr, u8)>,
+    pub ports: Vec<u16>,
 }
 
 fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[Served]) -> Result<bool> {
     crate::address4(1, range.gateway(), 32, None)?;
     let passes = "/proc/sys/net/ipv6/conf/all/forwarding";
-    let guard = guarded || !std::fs::read_to_string(passes).is_ok_and(|said| said.trim() == "1");
+    let guard = guard_wanted(guarded, std::fs::read_to_string(passes).ok().as_deref());
     nat(range, guard, masquerade, mesh, pods)?;
     // A machine that passes packets on stops listening to its router's advertisements,
     // unless told to go on (2): the node's own way out must not be lost to this.
@@ -409,6 +423,12 @@ fn node_with(range: Range, guarded: bool, masquerade: bool, mesh: &str, pods: &[
     std::fs::write(passes, "1")?;
     std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
     Ok(guard)
+}
+
+/// Whether the guard is wanted: when the node was `guarded` before, or when it did not pass
+/// packets on until now (`forwarding` is what its IPv6 forwarding said, `None` if unread).
+pub(crate) fn guard_wanted(guarded: bool, forwarding: Option<&str>) -> bool {
+    guarded || !forwarding.is_some_and(|said| said.trim() == "1")
 }
 
 /// Whether the tables [`node`] makes are there (gone with `nft flush ruleset`, say).
@@ -458,6 +478,20 @@ pub(crate) fn link_name(which: u32) -> Vec<u8> {
 pub(crate) fn verdict(code: u32) -> Vec<u8> {
     let verdict = attribute(2 | NESTED, &attribute(2 | NESTED, &number(1, code)));
     expression("immediate", &[number(1, 0), verdict])
+}
+
+/// A jump to the chain `name` (NFT_JUMP, -3), which a rule of its own may return from.
+pub(crate) fn jump(name: &str) -> Vec<u8> {
+    let told = [number(1, (-3i32) as u32), text(2, name)].concat();
+    expression(
+        "immediate",
+        &[number(1, 0), attribute(2 | NESTED, &attribute(2 | NESTED, &told))],
+    )
+}
+
+/// A return (NFT_RETURN, -5) to the chain that jumped.
+pub(crate) fn ret() -> Vec<u8> {
+    verdict((-5i32) as u32)
 }
 
 /// It came in by a link whose name begins with `name`.
@@ -535,7 +569,9 @@ pub(crate) fn l4proto(protocol: u8) -> Vec<u8> {
 /// (`kpx`) gets nothing more, its DNS and Services among them; any pod gets DNS at the
 /// gateway (UDP and TCP, port 53) and TCP to a Service (IPv6, bytes 6..10 all ff); the rest
 /// is dropped. An answer is the state of a connection seen both ways or made by one, or
-/// IPv6's neighbour discovery (not tracked).
+/// IPv6's neighbour discovery (not tracked). A pod with egress rules (see [`Egress`]) jumps
+/// to its own chain from `passed` and, after the first rule, from `in`: so its DNS and
+/// Services are held to its rules too.
 fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<u8>>)> {
     let gateway = range.gateway().octets();
     let dns = |protocol: u8| {
@@ -549,14 +585,22 @@ fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<
         ]
     };
     let mut rules = Vec::new();
+    // Each held pod's jump to its chain, in what is passed on (first: before the kpx rules
+    // that follow) and, but for an exit's pod (it has no more than answers), what comes to
+    // the node, after the answers (made to pass by the first rule of `in`).
+    let mut held_passed = Vec::new();
+    let mut held_in = Vec::new();
     for served in pods {
-        let link = if served.exit {
-            crate::exit::link(served.number)
-        } else {
-            link_of(served.number)
-        };
+        let link = link_for(served);
         // (Whole, with its end: `kp1` is not `kp10`.)
         let named = [link_name(6), is(&[link.as_bytes(), &[0]].concat())].concat();
+        if served.egress.is_some() {
+            let rule = vec![named.clone(), jump(&egress_chain(served))];
+            held_passed.push(("passed", rule.clone()));
+            if !served.exit {
+                held_in.push(("in", rule));
+            }
+        }
         let (v4, _) = addresses(range, None, served.number);
         rules.push((
             "check",
@@ -567,8 +611,10 @@ fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<
         }
     }
     rules.push(("check", vec![came_by(b"kp"), verdict(0)]));
+    rules.extend(held_passed);
+    rules.push(("in", vec![came_by(b"kp"), state(2 | 4 | 64), verdict(1)]));
+    rules.extend(held_in);
     rules.extend([
-        ("in", vec![came_by(b"kp"), state(2 | 4 | 64), verdict(1)]),
         ("in", vec![came_by(b"kpx"), verdict(0)]),
         ("in", dns(17)),
         ("in", dns(6)),
@@ -585,6 +631,106 @@ fn pod_guard_rules(range: Range, pods: &[Served]) -> Vec<(&'static str, Vec<Vec<
         ("in", vec![came_by(b"kp"), verdict(0)]),
     ]);
     rules
+}
+
+/// The name of a pod's link: `kpN`, or an exit's pod's `kpxN`.
+fn link_for(served: &Served) -> String {
+    if served.exit {
+        crate::exit::link(served.number)
+    } else {
+        link_of(served.number)
+    }
+}
+
+/// The chain of a held pod's egress rules.
+fn egress_chain(served: &Served) -> String {
+    format!("e-{}", link_for(served))
+}
+
+/// What goes to `address`'s first `prefix` bits (a prefix over the address's size is the
+/// whole): its family, then its bytes, those of the whole bytes of the prefix compared as
+/// they are and a part of a byte masked first. A prefix of 0 is any address of the family.
+fn towards(address: IpAddr, prefix: u8) -> Vec<Vec<u8>> {
+    let (family, offset, octets) = match address {
+        IpAddr::V4(address) => (2, 16, address.octets().to_vec()),
+        IpAddr::V6(address) => (10, 24, address.octets().to_vec()),
+    };
+    let bits = usize::from(prefix).min(octets.len() * 8);
+    let (whole, part) = (bits / 8, bits % 8);
+    let mut rule = vec![nfproto(family)];
+    if part == 0 {
+        if whole > 0 {
+            rule.push(at(1, offset, &octets[..whole]));
+        }
+        return rule;
+    }
+    let length = whole + 1;
+    let mut mask = vec![0xff; whole];
+    mask.push(0xff << (8 - part));
+    let network: Vec<u8> = octets.iter().zip(&mask).map(|(byte, mask)| byte & mask).collect();
+    let load = expression(
+        "payload",
+        &[number(1, 1), number(2, 1), number(3, offset), number(4, length as u32)],
+    );
+    let masked = expression(
+        "bitwise",
+        &[
+            number(1, 1),
+            number(2, 1),
+            number(3, length as u32),
+            attribute(4 | NESTED, &attribute(1, &mask)),
+            attribute(5 | NESTED, &attribute(1, &vec![0; length])),
+        ],
+    );
+    rule.extend([load, masked, is(&network)]);
+    rule
+}
+
+/// The chains of the held pods' egress rules (each as chain name and rules), one per pod
+/// with `egress`: first what answers is returned (to the rules after the jump), then each
+/// rule of the pod's own as it was given: an allow returns, a deny drops; what none fits is
+/// dropped. A rule with several networks and ports is a rule for each of them (a network, a
+/// port, then TCP and UDP).
+// ponytail: that product is not bounded: a set per rule, if policies with many peers and ports come.
+fn egress_rules(pods: &[Served]) -> Vec<(String, Vec<Vec<Vec<u8>>>)> {
+    let mut chains = Vec::new();
+    for served in pods {
+        let Some(egress) = &served.egress else { continue };
+        let mut rules = vec![vec![answering(), ret()]];
+        for rule in egress {
+            let end = if rule.allow { ret() } else { verdict(0) };
+            // (No network: any, with no family said either.)
+            let networks: Vec<Vec<Vec<u8>>> = if rule.to.is_empty() {
+                vec![vec![]]
+            } else {
+                rule.to
+                    .iter()
+                    .map(|&(address, prefix)| towards(address, prefix))
+                    .collect()
+            };
+            for network in networks {
+                let ports: Vec<Option<(u8, u16)>> = if rule.ports.is_empty() {
+                    vec![None]
+                } else {
+                    rule.ports
+                        .iter()
+                        .flat_map(|&port| [Some((6, port)), Some((17, port))])
+                        .collect()
+                };
+                for port in ports {
+                    let mut said = network.clone();
+                    if let Some((protocol, port)) = port {
+                        said.extend([l4proto(protocol), at(2, 2, &port.to_be_bytes())]);
+                    }
+                    said.push(end.clone());
+                    rules.push(said);
+                }
+            }
+        }
+        rules.push(vec![verdict(0)]);
+        chains.push((egress_chain(served), rules));
+    }
+    chains
 }
 
 /// The tables: `ip kith-pods` sends what comes from a pod's IPv4 address out as the
@@ -621,8 +767,18 @@ fn nat(range: Range, guard: bool, masquerade: bool, mesh: &str, pods: &[Served])
     batch.chain(INET, "check", "filter", 0, (-100i32) as u32, None);
     // What comes to the node itself (hook 1): the pods' rules, see `pod_guard_rules`.
     batch.chain(INET, "in", "filter", 1, 0, Some(1));
+    // The held pods' chains, made before the rules that jump to them.
+    let held = egress_rules(pods);
+    for (name, _) in &held {
+        batch.plain(INET, name);
+    }
     for (chain, rule) in pod_guard_rules(range, pods) {
         batch.rule(INET, chain, &rule);
+    }
+    for (name, rules) in &held {
+        for rule in rules {
+            batch.rule(INET, name, rule);
+        }
     }
     let to = |name: &[u8]| [link_name(7), is(name)].concat();
     let mesh = [mesh.as_bytes(), &[0]].concat();
@@ -803,6 +959,19 @@ mod tests {
 
     fn range(text: &str) -> std::result::Result<Range, String> {
         text.parse()
+    }
+
+    /// The guard is wanted when the node was guarded before, or when it did not pass packets
+    /// on until now (forwarding read as not 1, or not read at all): a machine that already
+    /// passed them on keeps doing so, and gets no guard.
+    #[test]
+    fn guard_wanted_is_true_when_guarded_before_or_forwarding_was_off() {
+        assert!(guard_wanted(true, Some("1")));
+        assert!(guard_wanted(false, Some("0")));
+        assert!(guard_wanted(false, Some("0\n")));
+        assert!(guard_wanted(false, None));
+        assert!(!guard_wanted(false, Some("1")));
+        assert!(!guard_wanted(false, Some("1\n")));
     }
 
     #[test]
@@ -1001,11 +1170,13 @@ mod tests {
                 number: 2,
                 exit: false,
                 v6: addresses(range, Some(net), 2).1,
+                egress: None,
             },
             Served {
                 number: 3,
                 exit: true,
                 v6: None,
+                egress: None,
             },
         ];
         let check: Vec<Vec<u8>> = pod_guard_rules(range, &pods)
@@ -1071,6 +1242,154 @@ mod tests {
         assert_eq!(rest, &[came_by(b"kp"), verdict(0)].concat(), "and the rest is dropped");
     }
 
+    fn served_with(number: u16, egress: Option<Vec<Egress>>) -> Served {
+        Served {
+            number,
+            exit: false,
+            v6: None,
+            egress,
+        }
+    }
+
+    /// A pod with egress rules is sent to a chain of its own, from what is passed on and from
+    /// what comes to the node (where DNS and the Services are): the chain returns what
+    /// answers, then each rule in turn (an allow returns, a deny drops), and drops what none
+    /// takes. A pod with none has no chain and no jump.
+    #[test]
+    fn egress_rules_make_a_chain_per_pod_in_the_order_given() {
+        let range = range("198.18.16.0/20").unwrap();
+        let rules = vec![
+            Egress {
+                allow: false,
+                to: vec![("10.1.2.3".parse().unwrap(), 32)],
+                ports: vec![],
+            },
+            Egress {
+                allow: true,
+                to: vec![("10.0.0.0".parse().unwrap(), 8), ("fd00::".parse().unwrap(), 64)],
+                ports: vec![443],
+            },
+        ];
+        let pods = [served_with(2, Some(rules)), served_with(3, None)];
+        let all = pod_guard_rules(range, &pods);
+        let chain = |name: &str| -> Vec<Vec<u8>> {
+            let of = all.iter().filter(|(chain, _)| *chain == name);
+            of.map(|(_, rule)| rule.concat()).collect()
+        };
+        let named = [link_name(6), is(b"kp2\0")].concat();
+        for hook in ["passed", "in"] {
+            let jumps = chain(hook);
+            assert!(
+                jumps
+                    .iter()
+                    .any(|rule| rule == &[named.clone(), jump("e-kp2")].concat()),
+                "{hook}"
+            );
+            assert!(
+                !jumps.iter().any(|rule| contains(rule, b"e-kp3")),
+                "{hook}: a pod with none has no jump"
+            );
+        }
+        // In `in`, the jump is ahead of the generic DNS accept, so a pod's policy gates it.
+        let input = chain("in");
+        let at = |part: &[u8]| input.iter().position(|rule| contains(rule, part)).unwrap();
+        assert!(at(b"e-kp2") < at(&is(&53u16.to_be_bytes())));
+
+        let own = egress_rules(&pods);
+        let [(name, rules)] = own.as_slice() else {
+            panic!("one chain, for the one pod with rules")
+        };
+        assert_eq!(name, "e-kp2");
+        let rules: Vec<Vec<u8>> = rules.iter().map(|rule| rule.concat()).collect();
+        // Answers, the deny, the allow for each of its two networks with the port in TCP and in
+        // UDP, and the drop of the rest.
+        assert_eq!(rules.len(), 1 + 1 + 2 * 2 + 1);
+        assert_eq!(rules[0], [answering(), ret()].concat());
+        assert!(contains(&rules[1], &is(&[10, 1, 2, 3])) && rules[1].ends_with(&verdict(0)));
+        assert!(
+            contains(&rules[2], &is(&[10])) && rules[2].ends_with(&ret()),
+            "10.0.0.0/8: masked, then compared"
+        );
+        assert!(contains(&rules[2], &is(&443u16.to_be_bytes())) && contains(&rules[2], &is(&[6])));
+        assert!(contains(&rules[3], &is(&[17])), "the same port by UDP");
+        assert!(contains(&rules[4], &is(&[10])), "IPv6's");
+        assert_eq!(rules.last().unwrap(), &verdict(0), "what no rule takes is dropped");
+    }
+
+    /// A pod with egress rules reaches the peers they allow and no other; one without them, and
+    /// what comes to a pod, are not held (`KITH_E2E=1 unshare -Urn cargo test -p kith-mesh
+    /// egress`).
+    #[test]
+    fn egress_reaches_only_the_peers_allowed() {
+        if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh egress");
+        }
+        // The namespace is left as found, a panic too: the other tests take forwarding off as a
+        // sign of a node not yet guarded.
+        struct Forwarding;
+        impl Drop for Forwarding {
+            fn drop(&mut self) {
+                let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "0");
+            }
+        }
+        let _forwarding = Forwarding;
+        up(1).unwrap();
+        let range = range("198.18.16.0/20").unwrap();
+        let net = crate::node_net(crate::prefix(b"test"), "alpha");
+        // The first pod is held; the others are not. Each listens on 80 and 81. (Numbers of
+        // their own: the namespace is the other tests' too.)
+        let pods: Vec<_> = [12u16, 13, 14]
+            .map(|number| {
+                let (v4, v6) = addresses(range, Some(net), number);
+                let namespace = make(range, number, v6, None).unwrap();
+                let listeners: Vec<_> = [80, 81]
+                    .map(|port| within(&namespace, || TcpListener::bind(("::", port))).unwrap().unwrap())
+                    .into();
+                (namespace, listeners, v4, v6.unwrap())
+            })
+            .into();
+        let host = |address: Ipv6Addr| IpAddr::from(address);
+        let egress = vec![
+            Egress {
+                allow: false,
+                to: vec![(host(pods[2].3), 128)],
+                ports: vec![81],
+            },
+            Egress {
+                allow: true,
+                to: vec![(host(pods[1].3), 128), (host(pods[2].3), 128)],
+                ports: vec![],
+            },
+        ];
+        let served = |number: u16, egress: Option<Vec<Egress>>| Served {
+            v6: addresses(range, Some(net), number).1,
+            ..served_with(number, egress)
+        };
+        let served = [served(12, Some(egress)), served(13, None), served(14, None)];
+        // (Without masquerade: a kernel may have none in a namespace.)
+        assert!(node_with(range, true, false, "kith0", &served).unwrap());
+        let connect = |from: usize, to: IpAddr, port: u16| {
+            let to = SocketAddr::from((to, port));
+            within(&pods[from].0, || {
+                TcpStream::connect_timeout(&to, Duration::from_secs(2))
+            })
+            .unwrap()
+            .is_ok()
+        };
+        // The first rule that fits says: pod 4's port 81 is denied, its 80 and all of 3's allowed.
+        let (second, third) = (host(pods[1].3), host(pods[2].3));
+        assert!(connect(0, second, 80) && connect(0, second, 81));
+        assert!(connect(0, third, 80), "an allow with no port: any");
+        assert!(!connect(0, third, 81), "the deny is first");
+        // Nothing fits: no (the other pod's IPv4 address is no rule's peer).
+        assert!(!connect(0, pods[1].2.into(), 80));
+        // Others are not held, and the held pod answers what comes to it.
+        assert!(connect(1, host(pods[0].3), 80) && connect(1, third, 81));
+        // A second time changes nothing.
+        assert!(node_with(range, true, false, "kith0", &served).unwrap());
+        assert!(connect(0, second, 80) && !connect(0, third, 81));
+    }
+
     /// Two pods of one node, as root of a network namespace (`unshare -Urn cargo test -p
     /// kith-mesh pods`): both listen on port 80, each is reached in its own namespace,
     /// at its own address from the node and from the other pod, and what one sends to the
@@ -1108,6 +1427,7 @@ mod tests {
                 number,
                 exit: false,
                 v6: addresses(range, Some(net), number).1,
+                egress: None,
             })
             .into();
         assert!(node_with(range, true, masquerade, "kith0", &served).unwrap());

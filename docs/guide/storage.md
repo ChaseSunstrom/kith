@@ -32,8 +32,13 @@ spec:
   show the pairing). If its Volume is deleted it takes no other: make the Volume again, or
   delete the claim and apply it again.
 - `provision: true` on a claim with no Volume makes one of its name and size on the ready node
-  with the fewest Volumes; it goes with the claim, its directory stays. Whoever applies such a
-  claim must be allowed to apply a Volume.
+  with the fewest Volumes. Whoever applies such a claim must be allowed to apply a Volume.
+- Deleting a claim that provisioned its Volume deletes the Volume and its data on its node
+  (only the directory kithd made for it; a link inside that points elsewhere is removed, not
+  followed), as Kubernetes does by default. To keep the data, put the annotation
+  `kith.dev/reclaim: retain` on the claim: the Volume goes and its directory stays, and a later
+  claim of the same name that provisions finds that data in its place. A Volume you applied
+  yourself is never deleted with a claim, nor is its data: it is free again for another claim.
 - The container sees a bind mount (`readOnly: true` for read-only) of
   `<state>/volumes/<namespace>/<name>/<path>`. `path` must be relative, with no `..` or symbolic
   link in it (in `kith-system`, an absolute host path). A container path that is relative, has

@@ -89,10 +89,23 @@ impl Log {
             let mut table = txn.open_table(LOG).map_err(writing)?;
             for entry in entries {
                 // (With the entry, or not at all: a build from before cannot read the entry,
-                // and is told the format, not a line of JSON.)
-                if matches!(entry.payload, openraft::EntryPayload::Normal(crate::Command::Mark)) {
+                // and is told the format, not a line of JSON. Never lowered: a Mark after
+                // the store is in format 3 leaves the file in format 3. Only the marks raise it:
+                // a signed entry before MarkSigned is refused at apply, and the store stays in
+                // format 2, T-0779.)
+                let format = match &entry.payload {
+                    openraft::EntryPayload::Normal(crate::Command::Mark) => 2,
+                    openraft::EntryPayload::Normal(crate::Command::MarkSigned) => 3,
+                    openraft::EntryPayload::Normal(crate::Command::MarkChecked) => 4,
+                    _ => 0,
+                };
+                if format > 1 {
                     let mut meta = txn.open_table(META).map_err(writing)?;
-                    meta.insert("format", b"2".as_slice()).map_err(writing)?;
+                    let old = meta.get("format").map_err(writing)?;
+                    let old = old.and_then(|value| serde_json::from_slice::<u32>(value.value()).ok());
+                    if old.is_none_or(|old| old < format) {
+                        meta.insert("format", format.to_string().as_bytes()).map_err(writing)?;
+                    }
                 }
                 let value = serde_json::to_vec(&entry).map_err(writing)?;
                 table.insert(entry.log_id.index, value.as_slice()).map_err(writing)?;
