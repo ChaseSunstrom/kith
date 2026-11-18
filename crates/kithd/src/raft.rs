@@ -826,6 +826,29 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
+        // A signed apply, delete or rollback goes to the leader as it came (its method, path, body and
+        // header), and the leader runs it as its own route would (its audit names that route): a
+        // Command re-serialized would not be what was signed. `carries` checks the route matches.
+        if let Some(relay) = access_sign::current().and_then(|signed| signed.relay)
+            && relay.carries(command)
+        {
+            let url = format!("https://{at}{}", relay.path);
+            let call = match command {
+                Command::Delete { .. } => client.delete(url),
+                _ => client.post(url),
+            }
+            .header(access::FOR, relay.who.to_string())
+            .header("content-type", "application/json")
+            .body(relay.body.clone());
+            return self.relayed(access_sign::pass_on(call), at, &relay).await;
+        }
+        // A signed request's change that is not carried is not sent on as this node's own write: the
+        // leader would take it as none, with no signature checked there. (A Mark is this node's own.)
+        if access_sign::current().is_some() && !matches!(command, Command::Mark) {
+            let why = "refused: a signed request's change that is not passed on as it came (the route is \
+                       not one the leader checks the signature of); send it to the leader directly";
+            return Forward::Failed(Error::Invalid(why.into()));
+        }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
         // Whose write it is, for the leader to decide again in the log's order (`write`).
         if let Some(name) = who.and_then(Caller::identity) {
@@ -849,6 +872,56 @@ impl Shared {
             }
             // Never reached it (or refused it, which is the same to the change): nothing
             // happened, and asking again is safe.
+            Err(e) if e.is_connect() => Forward::Again(Some(format!(
+                "the leader at {at} was not reached: {}",
+                crate::cluster::why(&e)
+            ))),
+            Err(e) => {
+                let why = format!(
+                    "the leader at {at} did not answer ({}); look before trying again",
+                    crate::cluster::why(&e)
+                );
+                Forward::Failed(unavailable(why))
+            }
+        }
+    }
+
+    /// What the leader did with a signed write passed on as it came (`call`), as this node's
+    /// reply, read as the route `relay` came by answers (`api.rs`: a delete a Resource, a rollback
+    /// a Change, an apply its Changes). The leader's write is in the log before it answers: a
+    /// `Mark` after it has the index this node waits for.
+    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str, relay: &access_sign::Relay) -> Forward {
+        let route = relay.path.split('?').next().unwrap_or("");
+        match call.timeout(PATIENCE).send().await {
+            Ok(reply) if reply.status().is_success() => {
+                let done = if relay.method == "DELETE" {
+                    reply
+                        .json::<kith_api::Resource>()
+                        .await
+                        .map(|r| Done::Deleted(Box::new(r)))
+                } else if route.starts_with("/v1/rollback/") {
+                    reply
+                        .json::<kith_api::store::Change>()
+                        .await
+                        .map(|c| Done::Changes(vec![c]))
+                } else {
+                    reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes)
+                };
+                let Ok(done) = done else {
+                    let why = format!("the leader at {at} did not answer with the changes it made");
+                    return Forward::Failed(unavailable(why));
+                };
+                let index = match Box::pin(self.write_as(Command::Mark, None)).await {
+                    Ok((_, index)) => index,
+                    Err(e) => return Forward::Failed(e),
+                };
+                let caught_up = self.raft.wait(Some(PATIENCE));
+                let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
+                Forward::Done(Ok(done), index)
+            }
+            // (The leader refused it: what it says is the reply, as for a write.)
+            Ok(reply) => Forward::Failed(Error::Invalid(reply.text().await.unwrap_or_default())),
+            // Never reached it: nothing happened, and asking again is safe.
             Err(e) if e.is_connect() => Forward::Again(Some(format!(
                 "the leader at {at} was not reached: {}",
                 crate::cluster::why(&e)
