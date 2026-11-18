@@ -22,11 +22,15 @@
     <b>kith</b>
   </a>
   <nav aria-label="On this page">
+    <a href="#stick">Stick</a>
     <a href="#disk">Disk</a>
+    <a href="#name">Name</a>
     <a href="#network">Network</a>
     <a href="#cluster">Cluster</a>
-    <a href="#safety">Safety</a>
-    <a href="#stick">Stick</a>
+    <a href="#encryption">Encryption</a>
+    <a href="#policy">Policy</a>
+    <a href="#writing">Writing</a>
+    <a href="#recovery">Key</a>
   </nav>
   <button class="button quiet" id="motion" type="button" aria-pressed="false" hidden>Pause</button>
   <a class="button quiet" href="guide/os.html#installing-on-a-machine">Guide</a>
@@ -40,7 +44,19 @@
   <h1>Answer once. <span class="under">It installs without asking.</span></h1>
   <p class="lead">The installer asks at the machine's console: which disk, what name, what address, which cluster. Answer here instead, and this page writes <code>kith-install.yaml</code> for the stick. The machine then asks nothing.</p>
   <p class="fine">The file is made in this page, in your browser. Nothing you type is sent anywhere or kept.</p>
-  <noscript><p class="fine need">The form needs JavaScript, which is all this page runs. Without it, the example under "The stick" shows every field, and <a href="guide/os.html#installing-on-a-machine">the guide</a> says what each does.</p></noscript>
+  <noscript><p class="fine need">The form needs JavaScript, which is all this page runs. Without it, the example under "Writing" shows every field, and <a href="guide/os.html#installing-on-a-machine">the guide</a> says what each does.</p></noscript>
+</section>
+
+<section id="stick" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>01</b> The stick</p>
+    <h2>Start with a USB stick.</h2>
+    <p>Write the installer to it: <code>dd if=kith-os-installer.raw of=/dev/sdX</code>. <code>sh os/build.sh</code> makes the file. Everything on that stick is lost. The answers go on it as one more file, at "Writing" below.</p>
+  </div>
+  <div class="net">
+    <h3>Several machines, no stick?</h3>
+    <p>A node can install the machines beside it from the network (PXE), and hand each the installer once. A form on the node's own web UI will do for netboot what this page does for one stick; it is not written yet. Today it is <code>kith node netboot</code>, which <a href="guide/os.html#installing-from-the-network">the guide</a> describes.</p>
+  </div>
 </section>
 
 <div class="install">
@@ -49,7 +65,7 @@
 
 <section id="disk" class="part" data-step data-see>
   <div class="head">
-    <p class="no"><b>01</b> The disk</p>
+    <p class="no"><b>02</b> The disk</p>
     <h2>Which disk is erased?</h2>
     <p>The installer erases the disk the answers name, in whatever machine the stick starts, and asks nobody. Name it so it cannot be another.</p>
   </div>
@@ -70,16 +86,24 @@
   </fieldset>
 </section>
 
-<section id="network" class="part" data-step data-see>
+<section id="name" class="part" data-step data-see>
   <div class="head">
-    <p class="no"><b>02</b> The network</p>
-    <h2>What is it called, and where is it?</h2>
-    <p>Leave a field empty and the machine asks the network (DHCP) and names itself from its network card's address.</p>
+    <p class="no"><b>03</b> The name</p>
+    <h2>What is the machine called?</h2>
+    <p>Leave it empty and the machine names itself from its network card's address.</p>
   </div>
   <div class="field">
     <label class="lab" for="hostname">Name <span class="dim">(empty: made from its network card's address)</span></label>
     <input type="text" id="hostname" name="hostname" placeholder="alpha" maxlength="63" spellcheck="false" autocapitalize="none">
     <p class="hint">Lower-case letters, digits and <code>-</code>, as a DNS label.</p>
+  </div>
+</section>
+
+<section id="network" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>04</b> The network</p>
+    <h2>Where is it?</h2>
+    <p>Leave a field empty and the machine asks the network (DHCP).</p>
   </div>
   <fieldset class="field">
     <legend class="lab">Address</legend>
@@ -100,7 +124,7 @@
 
 <section id="cluster" class="part" data-step data-see>
   <div class="head">
-    <p class="no"><b>03</b> The cluster</p>
+    <p class="no"><b>05</b> The cluster</p>
     <h2>Alone, or beside others?</h2>
     <p>A node that starts a cluster offers a claim on its console. A node that joins needs the address of one of the cluster's nodes and a token that node made.</p>
   </div>
@@ -117,14 +141,23 @@
   </fieldset>
 </section>
 
-<section id="safety" class="part" data-step data-see>
+<section id="encryption" class="part" data-step data-see>
   <div class="head">
-    <p class="no"><b>04</b> What it keeps</p>
-    <h2>And what it refuses.</h2>
-    <p>All of this can wait: leave it as it is and the node is as every kith OS node is, and the cluster can change most of it later.</p>
+    <p class="no"><b>06</b> Encryption</p>
+    <h2>Is its state locked?</h2>
+    <p>Leave it off and the node is as every kith OS node is. The cluster can change most of what follows later.</p>
   </div>
   <div class="field">
     <label class="switch"><input type="checkbox" role="switch" name="encrypt"><i class="line"><i></i></i><span class="say">Encrypt its state <small>Its state is under a key the cluster holds. <a href="guide/os.html#encrypted-state">Encrypted state</a>.</small></span></label>
+    <p class="hint key">With this on, the installer shows a recovery key once, on the machine's console, and then powers off. Be at the console, or watching it, and write the key down: it is the last stop on this page.</p>
+  </div>
+</section>
+
+<section id="policy" class="part" data-step data-see>
+  <div class="head">
+    <p class="no"><b>07</b> What it accepts</p>
+    <h2>And what it refuses.</h2>
+    <p>Leave it as it is and the cluster may have this node do anything.</p>
   </div>
   <div class="field">
     <label class="lab" for="releaseKey">Release key <span class="dim">(empty: the keys the image was built with)</span></label>
@@ -171,19 +204,20 @@
 
 </div>
 
-<section id="stick" class="part" data-see>
+<section id="writing" class="part" data-see>
   <div class="head">
-    <p class="no"><b>05</b> The stick</p>
+    <p class="no"><b>08</b> Writing</p>
     <h2>Put it where the installer looks.</h2>
     <p>Nothing is asked or confirmed after this: a stick with answers erases the disk they name in whatever machine it starts. Start only machines you mean to erase.</p>
   </div>
+  <p class="warn keep">The file names the disk it erases, and holds the join token and the release key. Keep the stick, and the file, private.</p>
   <div class="pair wide">
     <figure class="panel">
       <figcaption>on the stick</figcaption>
       <ol class="path">
-        <li>Write the installer to a USB stick: <code>dd if=kith-os-installer.raw of=/dev/sdX</code>. <code>sh os/build.sh</code> makes the file. Everything on that stick is lost too.</li>
         <li>Save <code>kith-install.yaml</code> on the stick's first partition, which is FAT.</li>
-        <li>Start the machine from the stick (UEFI). It copies kith OS to the disk, reads it back, and powers off: take the stick out and start it.</li>
+        <li>Start the machine from the stick (UEFI). It copies kith OS to the disk and reads it back. With encryption on, it shows the recovery key here: see the next stop.</li>
+        <li>It powers off. Take the stick out and start the machine.</li>
       </ol>
     </figure>
     <figure class="panel">
@@ -193,7 +227,7 @@
         <label class="lab" for="installUrl">Where the file will be</label>
         <input type="text" id="installUrl" placeholder="http://10.0.2.2/alpha.yaml" maxlength="300" spellcheck="false" autocapitalize="none" autocomplete="off">
       </div>
-      <pre class="cmd" id="cmdline" data-needs-js aria-live="polite">kith.install=http://HOST/FILE#sha256=HEX</pre>
+      <pre class="cmd" id="cmdline" data-needs-js>kith.install=http://HOST/FILE#sha256=HEX</pre>
       <p class="fine" id="cmdsay" data-needs-js>The digest is of the file as it is now. A change to an answer changes it. <code>sha256sum kith-install.yaml</code> prints the same.</p>
     </figure>
   </div>
@@ -212,10 +246,26 @@ lanReleases: true
 nodePolicy: hardened
 </pre>
   </div>
-  <div class="net">
-    <h3>Several machines at once?</h3>
-    <p>A node can install the machines beside it from the network (PXE), and hand each the installer once. A form on the node's own web UI will do for netboot what this page does for one stick; it is not written yet. Today it is <code>kith node netboot</code>, which <a href="guide/os.html#installing-from-the-network">the guide</a> describes.</p>
+  <div class="panel example">
+    <figcaption>an example, a fixed address and a policy of its own words</figcaption>
+<pre data-answers="custom" data-fields='{"diskKind":"name","diskName":"nvme0n1","hostname":"beta","ipKind":"static","ipAddress":"10.0.0.6/24","ipGateway":"10.0.0.1","clusterKind":"join","joinAddress":"10.0.0.7:7443","joinToken":"3f9a1c7e5b2d4a60.beta","policyKind":"custom","policyWords":"hardened,vms,devices=gpu+input"}'>disk: nvme0n1
+hostname: beta
+ip: 10.0.0.6/24,10.0.0.1
+join:
+  address: 10.0.0.7:7443
+  token: "3f9a1c7e5b2d4a60.beta"
+nodePolicy: "hardened,vms,devices=gpu+input"
+</pre>
   </div>
+</section>
+
+<section id="recovery" class="part" data-see>
+  <div class="head">
+    <p class="no"><b>09</b> The recovery key</p>
+    <h2>Write it down when it appears.</h2>
+    <p>Only if you turned encryption on. Before it powers off, the installer prints the node's recovery key once, on the machine's console: 32 digits in groups of four. Be there, or watch the console, and write it down. It is shown that once, and kept nowhere you can read it later.</p>
+  </div>
+  <p class="fine">Typed at a waiting machine's console, the key opens the node's state where no cluster answers. An install nobody watched has a key nobody saw: <code>kith node recovery NODE</code> makes a new one, shown once.</p>
   <p class="acts">
     <a class="button" href="guide/os.html#installing-on-a-machine">The guide has the rest</a>
     <a class="button quiet" href="index.html">Back to kith</a>

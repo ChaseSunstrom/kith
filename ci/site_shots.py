@@ -51,6 +51,20 @@ YAML = """<!doctype html><iframe id=f src="install.html" style="width:1440px;hei
   out.example = shown() === wanted("example") && d.getElementById("get").disabled === false;
   d.getElementById("reset").click();
   out.reset = shown() === wanted("default");
+  // the form filled in by hand (the page's data-fields), as a person would: a fixed address, a join, a policy of its own words
+  const fill = fields => { for (const [name, value] of Object.entries(fields)) {
+    const radio = d.querySelector('input[name="' + name + '"][type=radio][value="' + value + '"]');
+    if (radio) radio.click();
+    else { const input = d.getElementById(name); input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); }
+  } };
+  fill(JSON.parse(source.querySelector("pre[data-answers=custom]").dataset.fields));
+  out.custom = shown() === wanted("custom") && d.getElementById("get").disabled === false;
+  // and what must not say Ready: a third piece in the address, a half address, a half join address
+  const refused = (fields, ok) => { d.getElementById("reset").click(); fill(fields); return d.getElementById("get").disabled === !ok; };
+  out.refuses = refused({ ipKind: "static", ipAddress: "10.0.0.5/24/3" }, false) && refused({ ipKind: "static", ipAddress: "10.0.0.5/24" }, true)
+    && refused({ dns: "1:2" }, false) && refused({ dns: "fe80::1" }, true)
+    && refused({ clusterKind: "join", joinAddress: "10.0.0.7:", joinToken: "abc.def" }, false) && refused({ clusterKind: "join", joinAddress: "10.0.0.7:7443", joinToken: "abc.def" }, true);
+  d.getElementById("reset").click();
   setTimeout(() => document.body.textContent = "YAML " + JSON.stringify(out), 300);
 };</script>"""
 
@@ -90,7 +104,9 @@ def main():
         said = subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--virtual-time-budget=4000", "--dump-dom", base + "yaml-check.html"], check=True, capture_output=True, text=True, timeout=120).stdout
         checked = re.search(r"YAML (\{.*?\})", said)
         print(f"the form's yaml is the page's own examples: {checked.group(1) if checked else said[:200]}")
-        failed |= not (checked and "false" not in checked.group(1))
+        yaml_failed = not (checked and "false" not in checked.group(1))
+    else:
+        yaml_failed = False
     for width in (360, 768, 1440):
         # first what sticks out and how tall the page is: the window below is made that tall
         said = subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--force-prefers-reduced-motion", "--virtual-time-budget=4000", "--dump-dom", base + f"probe-{width}.html"], check=True, capture_output=True, text=True, timeout=120).stdout
@@ -117,6 +133,8 @@ def main():
         # and the first screen as it moves, five seconds in (no reduced motion: the map is running)
         live = out / "top" / f"{'live' if stem == 'site' else stem + '-live'}-{width}.png"
         subprocess.run([chrome, "--no-sandbox", "--disable-gpu", "--hide-scrollbars", f"--window-size={width},{780 if width < 768 else 900}", "--virtual-time-budget=5000", f"--screenshot={live}", address], check=True, capture_output=True, timeout=120)
+    if yaml_failed:
+        sys.exit("the form's yaml is not the page's own examples (a false above): fix the form or the examples" + ("; and something is wider than the screen" if failed else ""))
     if failed:
         sys.exit("something is wider than the screen: see above")
 

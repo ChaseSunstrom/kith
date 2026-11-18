@@ -17,7 +17,7 @@ motion.onclick = () => {
 
 // What the installer accepts, as it checks it (install.rs, init.rs, policy.rs): said here first.
 const octets = s => { const p = s.split("."); return p.length === 4 && p.every(o => /^(0|[1-9][0-9]{0,2})$/.test(o) && +o <= 255); };
-const ipv6 = s => /^[0-9a-fA-F:.]{2,45}$/.test(s) && (s.match(/:/g) || []).length >= 2;
+const ipv6 = s => { try { return /^[0-9a-fA-F:.]{2,45}$/.test(s) && !!new URL(`http://[${s}]`); } catch { return false; } }; // the browser's own parser, as the installer's is a real one
 const KEYS = ["exec-units", "root-containers", "unconfined", "node-network", "vms", "vm-paths", "passthrough", "host-paths", "run", "wipe"];
 const CLASSES = ["gpu", "display", "input", "audio", "usb", "camera", "other"];
 const policyWord = w => w === "hardened" || KEYS.includes(w) || (w.startsWith("no-") && KEYS.includes(w.slice(3)))
@@ -26,7 +26,7 @@ const policyWord = w => w === "hardened" || KEYS.includes(w) || (w.startsWith("n
 // A value is written as it is when YAML would read it back as the same text, and in quotes when it
 // might be a number, a truth or a null (a hostname `123`, a disk `n`).
 const WORDS = /^(true|false|null|yes|no|on|off|y|n|~)$/i;
-const plain = s => /^[A-Za-z0-9][A-Za-z0-9._:/,-]*$/.test(s) && !WORDS.test(s) && !Number.isFinite(Number(s))
+const plain = s => /^[A-Za-z0-9]([A-Za-z0-9._:/,-]*[A-Za-z0-9._/,-])?$/.test(s) && !WORDS.test(s) && !Number.isFinite(Number(s))
   && !/^[0-9_:]+(\.[0-9_]*)?$/.test(s) && !/^0[box]/i.test(s);
 const text = s => (plain(s) ? s : JSON.stringify(s));
 
@@ -57,9 +57,9 @@ function compile() {
   else if (host) lines.push(`hostname: ${text(host)}`);
 
   if (f("ipKind").value === "static") {
-    const [address, bits = ""] = val("ipAddress").split("/"), way = val("ipGateway");
+    const parts = val("ipAddress").split("/"), [address, bits = ""] = parts, way = val("ipGateway");
     if (!val("ipAddress")) missing("ipAddress", "give the fixed address, as 10.0.0.5/24.");
-    else if (!octets(address) || !/^(0|[1-9][0-9]?)$/.test(bits) || +bits > 32) wrong("ipAddress", "the address is ADDRESS/BITS, as 10.0.0.5/24.");
+    else if (parts.length !== 2 || !octets(address) || !/^(0|[1-9][0-9]?)$/.test(bits) || +bits > 32) wrong("ipAddress", "the address is ADDRESS/BITS, as 10.0.0.5/24.");
     else if (way && !octets(way)) wrong("ipGateway", "the way out is an IPv4 address, as 10.0.0.1.");
     else lines.push(`ip: ${text(val("ipAddress") + (way ? "," + way : ""))}`);
   }
@@ -72,7 +72,7 @@ function compile() {
     const address = val("joinAddress"), token = val("joinToken");
     let bad = false;
     if (!address) (bad = true, missing("joinAddress", "give the address of one of the cluster's nodes."));
-    else if (!/^[A-Za-z0-9.:\[\]-]+$/.test(address) || !address.includes(":") || address.startsWith("-")) (bad = true, wrong("joinAddress", "a node's address is ADDRESS:PORT, as 10.0.0.7:7443."));
+    else if (!/^[A-Za-z0-9.:\[\]-]+$/.test(address) || !/:[0-9]{1,5}$/.test(address) || address.startsWith("-")) (bad = true, wrong("joinAddress", "a node's address is ADDRESS:PORT, as 10.0.0.7:7443."));
     if (!token) (bad = true, missing("joinToken", "give the join token."));
     else if (!/^[A-Za-z0-9.-]+$/.test(token) || token.startsWith("-")) (bad = true, wrong("joinToken", "that is not a join token: \"kith node token\" on the cluster makes them."));
     if (!bad) lines.push("join:", `  address: ${text(address)}`, `  token: ${JSON.stringify(token)}`);
