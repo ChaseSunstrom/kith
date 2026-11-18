@@ -166,7 +166,8 @@
         (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
         web=$!
         # (The nodes' port 80 is this server: only where it runs, as a guest with no listener there cannot start.)
-        guest=",guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:$((port + 9))"
+        # (cmd: each guest connection gets its own socat to that port.)
+        guest=",guestfwd=tcp:10.0.2.100:80-cmd:socat - TCP:127.0.0.1:$((port + 9))"
       fi
 
         # Each node: a card on a network the three share (QEMU passes it over multicast on

@@ -126,7 +126,7 @@
         vm install-beta $(drive beta.stick) -device virtio-scsi-pci,id=scsi \
             -drive "file=$work/spare.disk,format=raw,if=none,id=spare" -device scsi-hd,drive=spare,serial=kith-spare \
             -drive "file=$work/beta.disk,format=raw,if=none,id=beta" -device scsi-hd,drive=beta,serial=kith-beta \
-            -netdev "user,id=out,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:$((port + 9))${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=out \
+            -netdev "user,id=out,guestfwd=tcp:10.0.2.100:80-cmd:socat - TCP:127.0.0.1:$((port + 9))${net_restrict-,restrict=on}" -device virtio-net-pci,netdev=out \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.100/beta.yaml#sha256=$pin"
         installed install-beta sd
         grep -aq 'kith OS is on sd[a-z] (.*serial kith-beta)' "$work/install-beta.log" || fail "install-beta did not install on the disk with serial kith-beta"
