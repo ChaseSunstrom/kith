@@ -320,7 +320,7 @@ pub fn provision(store: &Store, ready: &dyn Fn(&str) -> bool) -> (Vec<Resource>,
 
 /// On a VolumeClaim, and copied to the Volume made for it: `retain` keeps the Volume's data
 /// on its node when the claim is deleted. Without it a deleted claim loses its data.
-// README: say there that deleting a claim that provisioned its Volume deletes its data, and this.
+// (docs/guide/storage.md says so.)
 pub const RECLAIM: &str = "kith.dev/reclaim";
 const RETAIN: &str = "retain";
 
@@ -376,7 +376,16 @@ pub fn wipe(state: &Path, dir: &Dir) -> Result<(), String> {
     if real != path || !real.starts_with(&state) {
         return Err(format!("{} is outside {}", real.display(), state.display()));
     }
-    std::fs::remove_dir_all(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))
+    // The removal a pod's old files get: each directory held by its descriptor and opened from the
+    // one above it, a link unlinked and never followed, and no file system but this one's.
+    // Where it fails, what it did not remove is in the Volume's directory and in `scratch.*`
+    // directories beside it; the Volume stays and the next pass removes the directory again.
+    // ponytail: a `scratch.*` beside a failed removal is not looked for again; delete it by hand.
+    match crate::controller::storage::remove_tree(&path, &|| false) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
+    }
 }
 
 /// The names of the volumes a workload's containers mount.
@@ -1128,6 +1137,82 @@ spec: { node: a, path: tiny, size: 1Gi }
             node: "a".into(),
             encrypted: false,
         }
+    }
+
+    /// A claim's deletion takes the Volume it made and nothing else: one applied by hand stays
+    /// (and its data, which `wipe` is never asked for), and `retain` keeps the data.
+    #[test]
+    fn provisioned_only_a_made_volume_without_retain_is_wiped_when_its_claim_goes() {
+        let source = [
+            res("Volume", "default", "by-hand", "{ node: a, path: data, size: 1Gi }"),
+            res("VolumeClaim", "default", "by-hand", "{ size: 1Gi, provision: true }"),
+            made("auto", "a", false),
+            res("VolumeClaim", "default", "auto", "{ size: 1Gi, provision: true }"),
+            made("kept", "a", true),
+            res("VolumeClaim", "default", "kept", "{ size: 1Gi, provision: true }"),
+        ]
+        .concat();
+        let mut store = store(&source);
+        let names = |dirs: Vec<Dir>| dirs.into_iter().map(|dir| dir.name).collect::<Vec<_>>();
+        // With their claims, none is touched.
+        assert!(wipes(&store, "a").is_empty());
+        assert!(provision(&store, &|_| true).1.is_empty());
+        for claim in ["by-hand", "auto", "kept"] {
+            store.delete(&format!("VolumeClaim/default/{claim}")).unwrap();
+        }
+        // The made one has its data removed first by its node; the retained one is deleted at
+        // once, its data left; the one applied by hand is in neither list.
+        assert_eq!(names(wipes(&store, "a")), ["auto"]);
+        assert!(wipes(&store, "b").is_empty());
+        assert_eq!(provision(&store, &|_| true).1, ["Volume/default/kept"]);
+        // The mark is the Volume's, not the claim's: a hand-applied Volume does not take it on
+        // when a claim of its name says `provision`, or `retain`.
+        let hand = store.get("Volume/default/by-hand").unwrap();
+        assert!(!hand.metadata.annotations.contains_key(MADE_FOR_CLAIM));
+    }
+
+    #[test]
+    fn provisioned_wipe_never_leaves_the_volumes_own_directory() {
+        let state = state("contained");
+        let at = |ns: &str, name: &str| state.join("volumes").join(ns).join(name);
+        let outside = state.join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("sub/precious"), "x").unwrap();
+        std::fs::write(state.join("file"), "x").unwrap();
+        let near = at("shop", "other");
+        std::fs::create_dir_all(near.join("data")).unwrap();
+        std::fs::write(near.join("data/file"), "x").unwrap();
+        // Links a container made in the Volume, at every depth, to a directory, to a file, to the
+        // namespace's directory, and one that is dangling: unlinked, never followed.
+        let deep = at("shop", "data").join("data/a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("file"), "x").unwrap();
+        for (name, to) in [
+            ("data/out", outside.clone()),
+            ("data/a/b/out", outside.join("sub")),
+            ("data/f", state.join("file")),
+            ("data/up", at("shop", "")),
+            ("data/gone", state.join("nothing")),
+        ] {
+            std::os::unix::fs::symlink(to, at("shop", "data").join(name)).unwrap();
+        }
+        // A directory the container shut itself out of, and one inside it.
+        let shut = at("shop", "data").join("data/shut");
+        std::fs::create_dir_all(shut.join("in")).unwrap();
+        std::fs::write(shut.join("in/file"), "x").unwrap();
+        std::fs::set_permissions(shut.join("in"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        wipe(&state, &dir("shop", "data")).unwrap();
+        assert!(
+            at("shop", "data").symlink_metadata().is_err(),
+            "the Volume's directory is gone"
+        );
+        assert!(outside.join("sub/precious").exists() && state.join("file").exists());
+        assert!(near.join("data/file").exists());
+        // Nothing of it is left beside it either (no level of the removal).
+        let beside: Vec<_> = std::fs::read_dir(at("shop", "")).unwrap().flatten().collect();
+        assert_eq!(beside.len(), 1, "{beside:?}");
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
