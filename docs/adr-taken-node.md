@@ -363,6 +363,42 @@ text above, the safe way was taken, and each is said here:
 - The first `adminKey` is written unsigned, while the cluster is `open`; after that the
   key and `spec.signing` change only by a write the admin signed.
 
+### Layer 3 as built: slice 2 (T-0783)
+
+Slice 1 (T-0779) put `Signed { header, method, path, body, command }` in the store, its
+per-signer nonce book, and FORMAT 3 (`MarkSigned`), proposed once every member reads it.
+Slice 2 makes the entry mean something:
+
+- **The leader writes it.** At format 3, a signed apply, delete or rollback the leader
+  applies goes in the log as `Signed`, with the header, method, path (query included) and
+  body (base64) it came with, around the command (`Shared::write_as`). Below format 3 it
+  is written bare. Any other signed route (a drain, a `kith run`) stays bare, as before.
+- **Every node checks it at apply** (`access_sign::admit`, run under the store's lock by
+  the hook main.rs hands the state machine), in this order, from the entry and its store
+  only: the signature holds by the store's keys (`access_sign::signature`: `verify` split,
+  no clock and no nonce); the target is `*` or the node that wrote the entry; the method,
+  path and body make the carried command over that store (re-derived as the route does:
+  `stamped`, a release's history for its rollback; never trusted); `Grants::of` lets the
+  signer do it, and the admin's key and `spec.signing` change only by the admin; and the
+  signer's book takes the nonce. A refusal applies nothing, on every node alike, and is
+  written in the audit log as `signed`. The edge keeps its clock and its in-memory nonce
+  cache (`verify`, as before).
+- **What a kind's admission may rewrite is taken as carried.** A custom kind's module runs
+  once, at the leader, and its answer is not deterministic to re-run: for those resources
+  only spec, labels and annotations come from the carried command; all else must match.
+  An apply's `at` is the leader's and is not compared.
+- **The nonce book is capped**: 4096 entries per signer within five minutes of each other
+  (`SIGNED_NONCES`), past which a signed entry is refused, so a key can't grow the store
+  without bound. Time is only the entries' `expires`.
+- **Only the leader writes Mark, MarkSigned and Signed.** `/v1/raft/write` and a control
+  node's own writes (`own_writes::checked`) refuse all three from any other node. A
+  follower's relayed write waited on a `Mark`; it now waits on an empty `Patch`. A follower
+  still on the older kithd sends a `Mark` there and is refused until it is updated.
+- **What slice 2 leaves:** a definition or a key that changes between the write and its
+  apply can refuse a write the leader took (the signer sends it again); a refused entry
+  replayed from the log is audited again; the controllers' entries (the table above) are
+  not signed yet.
+
 ## Why not short-lived node certificates
 
 They were weighed and are not part of this:

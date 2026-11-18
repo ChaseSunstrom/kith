@@ -255,7 +255,7 @@ pub struct Shared {
     /// Where the output of every unit goes: `<unit id>.out` and `.err`.
     pub logs: PathBuf,
     /// Who changed what, and who was refused.
-    pub audit: audit::Audit,
+    pub audit: Arc<audit::Audit>,
     /// The WASM modules of `KindDefinition`s, compiled.
     pub wasm: Arc<wasm::Modules>,
     /// Counts changes to the store, for `GET /v1/watch`. Bumped while the store is
@@ -611,22 +611,21 @@ async fn replica(
             _ => {}
         }
     }
-    // What each entry is asked once the store is in format 3: a signed one is refused (no
-    // kithd checks its signature in the log yet), so none is ever run. (Under the store's
-    // lock, and deterministic: it reads the command alone.)
-    let check: kith_store::Check = Arc::new(|_, command, _| match command {
-        kith_store::Command::Signed { .. } => Err(kith_api::store::Error::Invalid(
-            "refused: a signed entry, which this kithd does not check yet".into(),
-        )),
-        _ => Ok(()),
-    });
+    // What each entry is asked once the store is in format 3: a signed one is applied only
+    // where its signature, command, signer's rights and nonce hold by the store
+    // (`access_sign::admit`; under the store's lock, and deterministic).
+    let audit = Arc::new(audit::Audit::new(state.join("audit.log")));
+    let id = cluster
+        .as_ref()
+        .and_then(|cluster| pki::fingerprint(&cluster.me.ca).ok());
+    let check = access_sign::hook(id, audit.clone());
     let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
         raft: replica.raft,
         changed,
         logs: state.join("logs"),
-        audit: audit::Audit::new(state.join("audit.log")),
+        audit,
         wasm: Arc::default(),
         generation,
         members: members::Members::new(name),

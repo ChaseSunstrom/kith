@@ -92,7 +92,13 @@ type Undo = BTreeMap<String, Option<Vec<Revision>>>;
 /// How long before a signer's newest `expires` one of its signed entries may say, in seconds:
 /// one older is refused, and the nonces that old are dropped.
 #[cfg(feature = "signing")]
-const SIGNED_SKEW: u64 = 300;
+pub const SIGNED_SKEW: u64 = 300;
+
+/// The most nonces one signer's book holds at once: past it the signer's entries are refused
+/// until a later `expires` lets the old ones go. A signer's own flood fills its book, not the
+/// store (T-0783).
+#[cfg(feature = "signing")]
+pub const SIGNED_NONCES: usize = 4096;
 
 /// One signer's book: the newest `expires` its signed entries said, and the nonces taken
 /// (each with its `expires`) not yet [`SIGNED_SKEW`] older than that. (Written as a pair,
@@ -200,13 +206,10 @@ impl Store {
         self.signers = from.signers;
     }
 
-    /// Take `nonce` for a signed entry of `who` that says `expires`. Refused, and nothing
-    /// changed, when the store does not keep nonces, when `who` took it already, or when
-    /// `expires` is [`SIGNED_SKEW`] or more before the newest `who` said: its nonce may be
-    /// one dropped. Deterministic: every input is the entry's, or the store's.
+    /// Would [`Store::nonce`] take `nonce`? The same refusals, nothing changed.
     #[cfg(feature = "signing")]
-    pub fn nonce(&mut self, who: &str, expires: u64, nonce: &str) -> Result<(), Error> {
-        let Some(signers) = self.signers.as_mut() else {
+    pub fn takes_nonce(&self, who: &str, expires: u64, nonce: &str) -> Result<(), Error> {
+        let Some(signers) = self.signers.as_ref() else {
             return Err(Error::Invalid("a signed entry before the store is in format 3".into()));
         };
         let book = signers.get(who);
@@ -219,6 +222,32 @@ impl Store {
         if book.is_some_and(|book| book.1.contains_key(nonce)) {
             return Err(Error::Invalid(format!("the nonce {nonce} of {who} was seen already")));
         }
+        // What the book would keep with this one in: past the cap, refused.
+        let newest = newest.max(expires);
+        let kept = book.map_or(0, |book| {
+            let kept = book.1.values().filter(|e| e.saturating_add(SIGNED_SKEW) > newest);
+            kept.count()
+        });
+        if kept >= SIGNED_NONCES {
+            return Err(Error::Invalid(format!(
+                "the nonce book of {who} is full ({SIGNED_NONCES} signed entries within {SIGNED_SKEW} s of each other)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Take `nonce` for a signed entry of `who` that says `expires`. Refused, and nothing
+    /// changed, when the store does not keep nonces, when `who` took it already, when
+    /// `expires` is [`SIGNED_SKEW`] or more before the newest `who` said (its nonce may be
+    /// one dropped), or when `who`'s book holds [`SIGNED_NONCES`] already. Deterministic:
+    /// every input is the entry's, or the store's.
+    #[cfg(feature = "signing")]
+    pub fn nonce(&mut self, who: &str, expires: u64, nonce: &str) -> Result<(), Error> {
+        self.takes_nonce(who, expires, nonce)?;
+        let signers = self
+            .signers
+            .as_mut()
+            .expect("takes_nonce refuses a store that keeps none");
         let book = signers.entry(who.to_string()).or_default();
         book.0 = book.0.max(expires);
         book.1.insert(nonce.to_string(), expires);
