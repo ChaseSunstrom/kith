@@ -1953,9 +1953,14 @@ impl Controller {
                         if let Some((handle, _)) = taken {
                             eprintln!("kithd: {id}: taken back, as it ran");
                             if let Some((pod, _)) = slot.pod.as_ref().filter(|_| nix::unistd::getuid().is_root()) {
+                                let egress = {
+                                    let held = shared.store.lock().expect("a handler panicked holding the store");
+                                    let prefix = crate::services::mesh_prefix(shared);
+                                    crate::services::egress_of(&held.store, &slot.owner, prefix)
+                                };
                                 let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
                                 let state = self.logs.parent().unwrap_or(&self.logs);
-                                if let Err(e) = pods.adopt(state, pod, handle.pid()) {
+                                if let Err(e) = pods.adopt(state, pod, handle.pid(), &slot.owner, egress) {
                                     eprintln!("kithd: {id}: {e}");
                                 }
                             }
@@ -3001,9 +3006,15 @@ async fn start(
         // (Only root can make a network: elsewhere the pod shares the node's.)
         if nix::unistd::getuid().is_root() {
             let net = mesh.map(|(prefix, me)| kith_mesh::node_net(prefix, me));
+            // What its policies let it reach, asked of the store before the pods' lock (the
+            // pod is made with it: held from its first moment).
+            let egress = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                crate::services::egress_of(&state.store, &slot.owner, crate::services::mesh_prefix(shared))
+            };
             let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
             let exit = exit.as_ref().map(|(tunnel, dns)| (*tunnel, dns.as_slice()));
-            let given = pods.given(state, pod, namespace, hostname, net, exit)?;
+            let given = pods.given(state, pod, namespace, hostname, net, exit, &slot.owner, egress)?;
             unit.netns = Some(given.netns);
             unit.hostname = Some(given.hostname);
             address = pods.address(pod).or(address);

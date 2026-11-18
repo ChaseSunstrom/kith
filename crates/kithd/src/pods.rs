@@ -27,6 +27,11 @@ struct Pod {
     namespace: OwnedFd,
     address: IpAddr,
     dir: PathBuf,
+    /// The key of the resource it is a replica of: its NetworkPolicies are that one's (the
+    /// pod's id is a hash of it, and cannot be turned back).
+    owner: String,
+    /// What it may reach (a NetworkPolicy holds it), see [`crate::services::egress_of`]; `None`: all.
+    egress: Option<Vec<kith_mesh::pod::Egress>>,
 }
 
 /// What a container of a pod is given.
@@ -52,6 +57,8 @@ pub struct Pods {
     live: BTreeMap<String, String>,
     /// The mesh's link: an exit's pods pass on to the mesh by it, and by no other link of the node's.
     pub mesh: String,
+    /// Set when the tables could not be made again for a change of egress rules: tried again.
+    unsent: bool,
 }
 
 /// Where each pod made is written down (its number, its exit's tunnel, its address) for a
@@ -75,7 +82,10 @@ pub fn range() -> kith_mesh::pod::Range {
 impl Pods {
     /// The pod `id` (of `namespace`, called `hostname`), made if it is not there yet.
     /// `net`: this node's /80 of the mesh, where there is a cluster. `exit`: the tunnel it
-    /// leaves by, and where it asks for names (through it), for one of an exit's.
+    /// leaves by, and where it asks for names (through it), for one of an exit's. `owner`
+    /// and `egress`: the resource it is a replica of, and what its policies let it reach, which
+    /// the tables of a pod made are made with (it starts held: not for a moment unheld).
+    #[allow(clippy::too_many_arguments)]
     pub fn given(
         &mut self,
         state: &Path,
@@ -84,6 +94,8 @@ impl Pods {
         hostname: &str,
         net: Option<Ipv6Addr>,
         exit: Option<(u16, &[Ipv4Addr])>,
+        owner: &str,
+        egress: Option<Vec<kith_mesh::pod::Egress>>,
     ) -> Result<Given, String> {
         let failed = |e: std::io::Error| format!("the pod's network: {e}");
         let range = range();
@@ -127,6 +139,8 @@ impl Pods {
                 namespace,
                 address,
                 dir,
+                owner: owner.into(),
+                egress,
             };
             // (For a kithd started again: what it needs to take the pod back, its network held by its processes.)
             let record = format!("{number} {} {address}\n", tunnel.map_or("-".into(), |t| t.to_string()));
@@ -168,16 +182,25 @@ impl Pods {
         });
         if self.made.len() < before {
             // (Rebuilt without the pods gone, so their links' rules go with them.)
-            if let Err(e) = self.serve() {
-                eprintln!("kithd: making the tables of this node's pods again: {e}");
+            // (Whole again, with every rule now wanted: nothing is left unsent when it went through.)
+            match self.serve() {
+                Ok(_) => self.unsent = false,
+                Err(e) => eprintln!("kithd: making the tables of this node's pods again: {e}"),
             }
             self.moved.notify_one();
         }
     }
 
     /// The pod `id` made by a kithd before this one, taken back with its network from
-    /// process `pid`, one of its containers' that still runs.
-    pub fn adopt(&mut self, state: &Path, id: &str, pid: i32) -> Result<(), String> {
+    /// process `pid`, one of its containers' that still runs. `owner` and `egress` as for [`Pods::given`].
+    pub fn adopt(
+        &mut self,
+        state: &Path,
+        id: &str,
+        pid: i32,
+        owner: &str,
+        egress: Option<Vec<kith_mesh::pod::Egress>>,
+    ) -> Result<(), String> {
         if self.made.contains_key(id) {
             return Ok(());
         }
@@ -202,6 +225,8 @@ impl Pods {
             namespace: namespace.into(),
             address,
             dir,
+            owner: owner.into(),
+            egress,
         };
         self.made.insert(id.into(), pod);
         self.serve().map_err(|e| failed(&e))?;
@@ -242,6 +267,32 @@ impl Pods {
         }
     }
 
+    /// Whether the tables could not be made again for a change of egress rules (tried again).
+    pub fn unsent(&self) -> bool {
+        self.unsent
+    }
+
+    /// The keys of the resources the pods made are replicas of.
+    pub fn owners(&self) -> BTreeSet<String> {
+        self.made.values().map(|pod| pod.owner.clone()).collect()
+    }
+
+    /// Take `wanted` (what each owner's pods may reach now, by its key) for the pods of those
+    /// owners; one `wanted` does not name keeps its own. Whether any pod's rules changed (the
+    /// tables are then made again: [`hold_again`]).
+    fn follow(&mut self, wanted: &BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>>) -> bool {
+        let mut changed = false;
+        for pod in self.made.values_mut() {
+            if let Some(egress) = wanted.get(&pod.owner)
+                && pod.egress != *egress
+            {
+                pod.egress = egress.clone();
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// The node's tables, made again for the pods now made: each pod's link passes its own
     /// addresses and nothing else (`kith_mesh::pod::node`). Fails closed: a link with no rule
     /// is dropped.
@@ -256,6 +307,7 @@ impl Pods {
                     IpAddr::V6(v6) => Some(v6),
                     IpAddr::V4(_) => None,
                 },
+                egress: pod.egress.clone(),
             })
             .collect();
         kith_mesh::pod::node(range(), Path::new(GUARDED).exists(), &self.mesh, &served)
@@ -281,6 +333,52 @@ pub async fn connect(pod: Option<(&Shared, &str)>, port: u16) -> std::io::Result
     match socket(true)?.connect((Ipv4Addr::LOCALHOST, port).into()).await {
         Ok(stream) => Ok(stream),
         Err(_) => socket(false)?.connect((Ipv6Addr::LOCALHOST, port).into()).await,
+    }
+}
+
+/// Keep what each pod may reach in step with its policies: `wanted` is the rules of each
+/// owner's pods now (`services::egress_of`). The tables are made again, whole, when any
+/// differs (a change that could not be sent is tried again on the next call).
+pub fn hold_again(shared: &Shared, wanted: &BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>>) {
+    let mut pods = shared.pods.lock().expect("nothing panics holding the pods");
+    if !pods.follow(wanted) && !pods.unsent {
+        return;
+    }
+    pods.unsent = match pods.serve() {
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!("kithd: making the tables of this node's pods again, for their policies: {e}");
+            true
+        }
+    };
+}
+
+/// Keeps every pod here in step with its policies until stopped, on a node in a cluster or
+/// alone (a node alone runs pods too): each time the store changes, and every few seconds
+/// (a change that could not be sent is tried again). A pod is made with its rules, so this
+/// is only for the rules that change after it.
+pub async fn keep_held(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+    let mut generation = shared.generation.subscribe();
+    loop {
+        // The owners asked of the pods, the rules of the store, then the pods told: never both locks at once.
+        let owners = shared.pods.lock().expect("nothing panics holding the pods").owners();
+        if !owners.is_empty() {
+            let prefix = crate::services::mesh_prefix(&shared);
+            let held: BTreeMap<String, Option<Vec<kith_mesh::pod::Egress>>> = {
+                let state = shared.store.lock().expect("nothing panics holding the store");
+                // (One no longer in the store keeps its rules until its pods go: not let loose.)
+                let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
+                present
+                    .map(|owner| (owner.clone(), crate::services::egress_of(&state.store, owner, prefix)))
+                    .collect()
+            };
+            hold_again(&shared, &held);
+        }
+        tokio::select! {
+            _ = generation.changed() => {}
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            _ = stopping.changed() => return,
+        }
     }
 }
 
@@ -842,6 +940,50 @@ pub async fn names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pod(owner: &str, number: u16, egress: Option<Vec<kith_mesh::pod::Egress>>) -> Pod {
+        Pod {
+            number,
+            exit: None,
+            namespace: std::fs::File::open("/dev/null").unwrap().into(),
+            address: Ipv4Addr::LOCALHOST.into(),
+            dir: PathBuf::new(),
+            owner: owner.into(),
+            egress,
+        }
+    }
+
+    /// The egress rules of each pod follow its Workload's policies: a pod's rules are wanted
+    /// again when a policy changes, a pod of an owner nobody asked about keeps its own, and
+    /// the tables are made again (by the caller) only when something differs.
+    #[test]
+    fn egress_follows_the_policies_of_each_pods_workload() {
+        use kith_mesh::pod::Egress;
+        let rule = |port| Egress {
+            allow: true,
+            to: vec![],
+            ports: vec![port],
+        };
+        let mut pods = Pods::default();
+        pods.made.insert("a".into(), pod("Workload/default/web", 2, None));
+        pods.made.insert("b".into(), pod("Workload/default/web", 3, None));
+        pods.made
+            .insert("c".into(), pod("Workload/default/other", 4, Some(vec![rule(1)])));
+        assert_eq!(
+            pods.owners(),
+            BTreeSet::from(["Workload/default/web".to_string(), "Workload/default/other".to_string()])
+        );
+        let web = |egress| BTreeMap::from([("Workload/default/web".to_string(), egress)]);
+        assert!(!pods.follow(&web(None)), "nothing differs: no new tables");
+        assert!(pods.follow(&web(Some(vec![rule(80)]))), "a policy came");
+        assert_eq!(pods.made["a"].egress, Some(vec![rule(80)]));
+        assert_eq!(pods.made["b"].egress, Some(vec![rule(80)]));
+        assert_eq!(pods.made["c"].egress, Some(vec![rule(1)]), "not asked: kept");
+        assert!(!pods.follow(&web(Some(vec![rule(80)]))), "the same again: nothing");
+        assert!(pods.follow(&web(Some(vec![rule(80), rule(81)]))), "a rule was added");
+        assert!(pods.follow(&web(None)), "the policy went");
+        assert_eq!(pods.made["a"].egress, None);
+    }
 
     /// A port kithd serves on itself on this node is not published, whichever pod asks,
     /// and the log says which and why.
