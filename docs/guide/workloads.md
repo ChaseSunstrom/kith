@@ -203,8 +203,9 @@ spec:
   - Only someone with rights over the whole cluster can apply a `Cluster`. Every node must run a
     build that reads rules: an older one runs an image as before.
   - At most 32 rules, 16 keys each. A rule by mistake stops new containers under it from starting
-    (the refusal names it); take it out of the `Cluster` to go back. `spec.images` is all kithd
-    reads of a `Cluster` today; `kith lint`, `diff` and `apply` say so of its other fields.
+    (the refusal names it); take it out of the `Cluster` to go back. `spec.images` and `spec.home`
+    (the [house address](cluster.md#one-address-for-the-house)) are all kithd reads of a `Cluster` today;
+    `kith lint`, `diff` and `apply` say so of its other fields.
 - **What it still reaches.** The node's network, the kernel through every call the filter lets by,
   and the devices it claims (a GPU's render node is a wide door into a kernel driver). Untrusted
   programs belong in a VM ([Virtual machines](hardware.md#virtual-machines)), which is what a

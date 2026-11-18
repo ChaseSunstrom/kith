@@ -152,22 +152,31 @@ pub async fn ask(card: &Card, hostname: &str) -> Result<Lease> {
 /// own, since the kernel would send it from an address of another card's (a pod's gateway,
 /// say) while this one has none.
 fn broadcast(card: &Card, message: &[u8]) -> Result<()> {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, bind, send, socket};
+    send_frame(card, &frame(card.mac, message))
+}
+
+/// Send `frame`, an Ethernet frame whole, out of `card` as it is.
+pub fn send_frame(card: &Card, frame: &[u8]) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = packet_socket(card, false)?;
+    nix::sys::socket::send(fd.as_raw_fd(), frame, nix::sys::socket::MsgFlags::empty())?;
+    Ok(())
+}
+
+/// A raw socket on `card`: sends whole Ethernet frames, and hears every frame that comes or
+/// goes on the card if `hear` (else nothing).
+pub fn packet_socket(card: &Card, hear: bool) -> Result<std::os::fd::OwnedFd> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType, bind, socket};
     use std::os::fd::AsRawFd;
     // (The card's own link address, as the kernel gives it, names it to bind to.)
     let link = nix::ifaddrs::getifaddrs()?
         .filter(|a| a.interface_name == card.name)
         .find_map(|a| a.address.and_then(|a| a.as_link_addr().copied()))
         .ok_or_else(|| Error::new(ErrorKind::NotFound, format!("no card {}", card.name)))?;
-    // (No protocol: it hears nothing.)
-    let fd = socket(AddressFamily::Packet, SockType::Raw, SockFlag::SOCK_CLOEXEC, None)?;
+    let protocol = hear.then_some(SockProtocol::EthAll);
+    let fd = socket(AddressFamily::Packet, SockType::Raw, SockFlag::SOCK_CLOEXEC, protocol)?;
     bind(fd.as_raw_fd(), &link)?;
-    send(
-        fd.as_raw_fd(),
-        &frame(card.mac, message),
-        nix::sys::socket::MsgFlags::empty(),
-    )?;
-    Ok(())
+    Ok(fd)
 }
 
 /// The Ethernet frame of a client's DHCP `message`: from `mac` and 0.0.0.0:68 to everyone's

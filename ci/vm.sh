@@ -16,6 +16,9 @@
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #   sh ci/vm.sh --test tpm      the same machine with a TPM: its key sealed to the system it runs
 #   sh ci/vm.sh --test duress   the same machine given a new recovery key and a duress code, which is typed
+#   sh ci/vm.sh --test blackout four encrypted nodes (three control, two of them with a TPM, and a worker)
+#                               losing power at once in the middle of writes and started again: nothing
+#                               typed, a leader from the two sealed ones, no write lost
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -39,6 +42,9 @@
 #                               disk never has another's, and what it does with no control node in reach
 #   sh ci/vm.sh --test chaos    three nodes taking writes: each in turn cut off from the others, each
 #                               in turn losing power, then all at once; what was acknowledged is on all three
+#   sh ci/vm.sh --test home     three nodes with a house address in the Cluster: one MAC answers for it
+#                               and DNS answers from it; the holder reset, and the next stopped: another
+#                               announces it within 10 s and two are never heard at once
 #   sh ci/vm.sh --test access   three nodes: a write let through by a node that had not heard its
 #                               RoleBinding was deleted is refused where the log is kept
 #   sh ci/vm.sh --test policy   two nodes whose policy turns off exec units, VM paths and /v1/run: kithd
@@ -113,6 +119,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    runs on until unlocked; its own duress code, typed at its waiting
                    console, is answered as a wrong key is, its lock record is erased,
                    the cluster forgets its key, and nothing opens it after
+  --test blackout  instead: four nodes the installer made, each with its state
+                   encrypted: three control nodes (two sealed by their TPMs, swtpm, the
+                   third not) and a worker, with writes going in and a Workload on the
+                   worker and on a control node; all four lose power at the same moment,
+                   a write in flight, and start again with nothing typed at any console:
+                   the two sealed nodes open from their TPMs and elect a leader with the
+                   third still off, which then, and the worker, are handed their keys;
+                   every acknowledged write is on all three control nodes and both
+                   Workloads are started again; needs swtpm
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
@@ -213,6 +228,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    writes each time, a cut-off node acknowledges none, every write
                    that was acknowledged is on all three nodes at the end, and the
                    three hold the same; needs what --test rollout needs
+  --test home      instead: three nodes as for rollout, a house address (10.9.0.100/24)
+                   in the Cluster, and a machine on their network (ci/lan_probe.py)
+                   that asks who has it four times a second. Expected: one card
+                   answers and announces it, DNS asked of it answers from it, with
+                   the holder reset by the hypervisor and then (after it is back)
+                   the next one stopped, another announces it within 10 s (the
+                   seconds are printed), and two cards are never heard answering at
+                   once, not when the stopped one goes on again; needs socat and
+                   python3 as --test chaos does
   --test access    instead: three nodes as for rollout, and the cluster's admin
                    writing through n2 and n3 by a RoleBinding that is deleted through
                    n1, once while n2 is cut off from the others. Expected: no write
@@ -266,11 +290,12 @@ while [ $# -gt 0 ]; do
     *) echo "vm.sh: unknown option $1 (try --help)" >&2; exit 2 ;;
     esac
 done
-case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | share | pods | poddns | services | compose | quota | kube | worker | chaos | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, share, pods, poddns, services, compose, quota, kube, worker, chaos, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
+case $test in '' | init | image | update | rollout | install | vps | netboot | crypt | tpm | duress | blackout | share | pods | poddns | services | compose | quota | kube | worker | chaos | home | access | policy | tunnel | outlive) ;; *) echo "vm.sh: --test knows: init, image, update, rollout, install, vps, netboot, crypt, tpm, duress, blackout, share, pods, poddns, services, compose, quota, kube, worker, chaos, home, access, policy, tunnel, outlive" >&2; exit 2 ;; esac
 # (From here on the TPM test is the encrypted one, with its own end.)
 sealing='' duress=''
 [ "$test" != tpm ] || test=crypt sealing=1
 [ "$test" != duress ] || test=crypt duress=1
+[ "$test" != blackout ] || sealing=1
 case $time in '' | *[!0-9]*) echo "vm.sh: --time wants whole seconds" >&2; exit 2 ;; esac
 if [ -n "$disk" ]; then
     case $(realpath -m "$disk") in
@@ -297,7 +322,10 @@ vms='' web=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
 # TERM alone would clean up and then go on running the test.)
-trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; rm -rf "$work"' EXIT
+# A write a control node makes as itself that the leader refused (raft.rs `write`, own_writes.rs)
+# is a call site no suite expects: the run fails whatever the suite said, and names the lines.
+refusals() { grep -ahs "refused a control node.s own write" "$work"/log "$work"/*.log | head -n 3; }
+trap 'kill $vms $web 2>/dev/null || true; [ -z "${KITH_VM_LOGS:-}" ] || cp "$work"/*.log "$work"/log "$KITH_VM_LOGS"/ 2>/dev/null || true; found=$(refusals); rm -rf "$work"; [ -z "$found" ] || { echo "vm.sh: FAIL: a write a control node made as itself was refused, which no suite expects:" >&2; echo "$found" >&2; exit 1; }' EXIT
 trap 'exit 1' INT TERM
 said() { grep -aq "$1" "$work/log" 2>/dev/null; }
 fail() { cat "$work/log"; echo "vm.sh: FAIL: $1" >&2; exit 1; }

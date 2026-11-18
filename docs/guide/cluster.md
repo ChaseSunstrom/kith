@@ -280,6 +280,45 @@ and drops what a client claims about its origin (`Forwarded`, other `X-Forwarded
 `X-Real-IP`, headers with `_`). Ambiguous framing gets 400; a head is at most 100 headers, ~64
 KiB, 30 seconds. WebSocket is the only upgrade; no HTTP/2, and no `proxyProtocol`.
 
+### One address for the house
+
+A router can name one address for the whole cluster (as its DHCP server's DNS server, option 6,
+or as the target of a port forward) and the cluster answers it from whichever node leads. Give it
+in the `Cluster`, in the network of a node's LAN card:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Cluster
+metadata: {name: home}
+spec:
+  home:
+    address: 192.168.1.250/24
+    endpoint: house.example.org:51820   # kept, and not acted on yet
+```
+
+The leader puts the address on that card, tells the LAN with ARP announcements, and the node's
+DNS (`--dns`) answers on it, from it. Every node reads the same `Cluster` and only the confirmed
+leader holds the address, for no more than three seconds at a time, renewed twice a second: a
+leader that hangs or is cut off loses it by itself, and one that wakes from a pause adds nothing
+before a new confirmation. A new leader waits four seconds, asks the LAN with ARP probes whether
+something else has the address, and does not take it if so (the log says "the house address ... is
+in use by MAC ...: not taken", again as a warning each minute it stays so). In all, the address
+moves within about ten seconds of the leader going away (at most 12), and two cards do not answer
+for it for longer than the three seconds (a machine frozen by its hypervisor keeps the address
+until it runs again and takes it off). A node says why it does not hold it in its log ("not the
+confirmed leader", "no card of this node is in its network", "already an address of ... on this
+node"), when that changes. The address is checked when the `Cluster` is applied: an IPv4 address
+with its prefix length that is not a network or broadcast address, loopback, multicast,
+link-local, nor in the default pod and people ranges (100.88.0.0/16, 100.89.0.0/16); and it must
+not be one the node already has (a static address or a lease).
+
+Three voters are needed for it to move: with two, the one that is left cannot confirm that it
+leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
+LAN from claiming the address: the holder announces it again when it hears another card answer
+for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
+still take traffic. Only DNS answers on it so far; UDP 51820 and TCP 443 are for the nodes' own
+addresses still.
+
 ### Not yet
 
 - Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh
@@ -348,6 +387,50 @@ spec:
 The GPU is a `DeviceClaim` ([Hardware](hardware.md#hardware)); the checkpoint format is the
 program's. `sh ci/vm.sh --test pods` runs this around a drain: the Job waits while its node is
 drained, then resumes from the step it left.
+
+## When every node was off
+
+A power cut takes every node at once, and a cluster of [encrypted
+nodes](os.md#encrypted-state) must then come back with nobody at a console. It does, when it was
+set up for it:
+
+```sh
+kith node recovery n1                  # an unattended install showed nobody a recovery key: make one, keep it
+kith node seal n1                      # each control node (a voter) keeps its own key in its TPM
+kith node seal n2
+kith get NodeKey                       # says which nodes are sealed
+sh ci/vm.sh --test blackout            # three control nodes (two sealed) and a worker, killed at once, started again
+```
+
+- **The machines must start by themselves.** Set the BIOS (or the board's firmware) to
+  "Restore on AC power loss: Power On" (or "Last State"), or start them over the network by
+  Wake-on-LAN from another machine that stays up. A machine that waits for a button is a node that
+  is off.
+- **Seal every control node.** A sealed control node opens its state from its own TPM with no node asked,
+  so the voters start without each other, elect a leader and a quorum forms. If one voter is not
+  sealed it waits for a sealed one to answer, and while it waits it is not a voter. Seal at least
+  as many as make a quorum; sealing all of them is the plain rule.
+- **Unsealed nodes and workers wait for a sealed node.** A node with no seal (a worker, say) asks
+  the control nodes it knows for its key every few seconds, and is handed it as soon as one of
+  them is up; nothing is typed. Its workloads start again after that.
+- **A node that was changed is refused by its TPM.** One that was updated, or whose firmware
+  changed, since it was sealed is not given the key: it asks the cluster for it instead. So after
+  every firmware or OS update, check that `kith get NodeKey` still says the node is `sealed`; if
+  it does not, seal it again: `kith node seal n1 --off`, then `kith node seal n1`. When every node
+  was off and one of them was changed, that one waits for the others, which open from their TPMs;
+  from three control nodes on, the cluster does not need it to start (two of three voters are a
+  quorum). With two control nodes there is one voter, and that node has to start.
+- **The last way is a recovery key.** If no sealed node will open (every TPM was replaced, or the
+  machines were moved), type one control node's [recovery
+  key](os.md#encrypted-state) at its console. That node opens its state and, with the cluster's
+  records in it, hands each of the others its key as they ask: only the one recovery key is
+  typed. An install nobody watched (from a URL, or the network) shows the key to nobody, so run
+  `kith node recovery n1` ahead of time and keep what it shows; without it there is no last way.
+
+Writes the cluster acknowledged before the cut are there after it: the test checks every one, on
+each of the three control nodes. It starts the two sealed ones first and has them elect a leader
+with the third still off, then starts the third and a worker, which are handed their keys. Plan
+for the quorum, not for one machine: with three control nodes, two sealed and started are enough.
 
 ## DNS
 

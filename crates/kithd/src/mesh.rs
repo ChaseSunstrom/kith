@@ -48,7 +48,7 @@ pub fn prefix(ca: &str) -> Ipv6Addr {
 }
 
 /// This node's private key: made the first time, and never anywhere but in its file.
-fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
+pub(crate) fn private_key(path: &std::path::Path) -> std::io::Result<Key> {
     use std::io::{Error, Write};
     use std::os::unix::fs::OpenOptionsExt;
     match std::fs::read_to_string(path) {
@@ -206,9 +206,9 @@ fn members(
     members
 }
 
-/// Set `mesh` in the status of Node `node`: what this node says of itself, or null to take it back.
-async fn say(shared: &Shared, node: &str, mesh: Value) -> Result<(), String> {
-    let fields = serde_json::Map::from_iter([("mesh".to_string(), mesh)]);
+/// Set `field` in the status of Node `node`: what this node says of itself under it, or null to take it back.
+pub(crate) async fn say(shared: &Shared, node: &str, field: &str, value: Value) -> Result<(), String> {
+    let fields = serde_json::Map::from_iter([(field.to_string(), value)]);
     let statuses = vec![(node.to_string(), fields)];
     let patch = shared.submit(kith_store::Command::Patch { statuses }).await;
     patch.map(drop).map_err(|e| e.to_string())
@@ -278,7 +278,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             eprintln!("kithd: mesh: the services' addresses on {}: {e}", options.interface);
         }
         // (Its own Node may not be there yet, right after joining: next time round.)
-        if !said && let Err(e) = say(&shared, &node, mine).await {
+        if !said && let Err(e) = say(&shared, &node, "mesh", mine).await {
             eprintln!("kithd: mesh: telling the cluster this node's key: {e}");
         }
         let forwards = || std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding");
@@ -319,9 +319,9 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     }
 }
 
-/// A node started without the mesh that still says it is on it has left: take back what
-/// it said, so the others stop calling it.
-pub async fn left(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
+/// A node started without the mesh (or without the people's device) that still says it is on
+/// it has left: take back what it said under `field`, so the others stop calling it.
+pub async fn left(shared: Arc<Shared>, field: &str, mut stopping: watch::Receiver<bool>) {
     let Some(cluster) = &shared.cluster else { return };
     let node = format!("Node/{}", cluster.me.name);
     loop {
@@ -329,11 +329,11 @@ pub async fn left(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         let says = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let own = state.store.get(&node).map(|own| own.status.as_ref());
-            own.map(|status| status.is_some_and(|status| !status["mesh"].is_null()))
+            own.map(|status| status.is_some_and(|status| !status[field].is_null()))
         };
         match says {
             Some(false) => return,
-            Some(true) => match say(&shared, &node, Value::Null).await {
+            Some(true) => match say(&shared, &node, field, Value::Null).await {
                 Ok(()) => return,
                 Err(e) => eprintln!("kithd: mesh: taking back this node's mesh status: {e}"),
             },
