@@ -1,4 +1,4 @@
-# T-0326 slice C: ci/compare.sh --only kith, KITH_COMPARE_ONLY=web,where, three runs each, on the same VMs
+# T-0326 slice C (T-0826): ci/compare.sh --only kith, KITH_COMPARE_ONLY=web,where, three runs each, on the same VMs
 # (before = main at 754a5803 before T-0806; after = slice B's links). Lines: `before|after ROW median load`:
 # the median of three runs, and the median of the three runs' 1-minute loadavg at their start.
 # ROW: rps = a new connection each (3 web); kept = connections kept, 3 web (requests a second);
@@ -7,6 +7,9 @@
 # after: 39.04 44.92 57.50), so single runs spread 3x (rps before: 4029 1208 1173; after: 5247 2615 4220):
 # read the medians as one reading each, not a measurement of the links' own size.
 # Runs were taken in turn (before 1, after 1, before 2, ...) so the load drift falls on both alike.
+# Verdict: paths links do not touch (direct_rps, mesh_rps, lan_kept) moved +35 to +43% between the two sets, so that is the noise.
+# Clear of it: rps (+249%) and kept (+90%). far_rps (+62%) is near the noise. far_kept (+8%) is unchanged within noise.
+# Only rps has its three raw runs above. A rerun on a quiet machine (load under 12) is what would settle far_rps and far_kept.
 before rps 1208 39.12
 after rps 4220 44.92
 before kept 6915 39.12
