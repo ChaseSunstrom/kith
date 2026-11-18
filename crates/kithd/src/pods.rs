@@ -67,6 +67,17 @@ const GUARDED: &str = "/run/kith-pods";
 /// The range this node's pods get their addresses from (`--pod-range`), set once at start.
 static RANGE: std::sync::OnceLock<kith_mesh::pod::Range> = std::sync::OnceLock::new();
 
+/// Whether the node was told that it passed packets on already (once per kithd, see `given`).
+static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What kithd says when a machine that already passed packets on makes its first pod: no guard,
+/// only the pods' own rules. `None` when the guard is installed (`guarded`).
+fn guard_said(guarded: bool) -> Option<String> {
+    (!guarded).then(|| {
+        "kithd: pods: this machine already passed packets on, so it keeps doing that for everyone: only the pods' own rules are installed (set net.ipv6.conf.all.forwarding=0 before kithd to have the guard)".into()
+    })
+}
+
 pub fn set_range(range: kith_mesh::pod::Range) {
     let _ = RANGE.set(range);
 }
@@ -99,6 +110,10 @@ impl Pods {
             let guarded = self.serve().map_err(failed)?;
             if guarded {
                 let _ = std::fs::write(GUARDED, "");
+            } else if let Some(said) = guard_said(guarded)
+                && !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                eprintln!("{said}");
             }
             self.up.notify_one();
         }
@@ -921,6 +936,14 @@ pub async fn names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unguarded_machine_is_told_so_once() {
+        let said = guard_said(false).expect("a machine that passed packets on is told so");
+        assert!(said.contains("already passed packets on"), "{said}");
+        assert!(said.contains("net.ipv6.conf.all.forwarding=0"), "{said}");
+        assert_eq!(guard_said(true), None);
+    }
 
     fn pod(owner: &str, number: u16, egress: Option<Vec<kith_mesh::pod::Egress>>) -> Pod {
         Pod {
