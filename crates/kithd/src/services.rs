@@ -590,7 +590,11 @@ impl Proxy {
     /// A replica on this machine, wherever it listens: on the machine's own loopback, or
     /// in its pod.
     async fn local(&self, workload: &str, replica: Option<u32>, port: u16) -> std::io::Result<TcpStream> {
-        let pod = replica.map(|replica| crate::controller::pod_of(workload, replica));
+        let pod = replica.map(|replica| {
+            let pod = crate::controller::pod_of(workload, replica);
+            let pods = self.shared.pods.lock().expect("nothing panics holding the pods");
+            pods.live_id(&pod).to_string()
+        });
         let pod = pod.as_deref().map(|pod| (&*self.shared, pod));
         within(crate::pods::connect(pod, port)).await
     }
@@ -1354,7 +1358,8 @@ fn where_asked(shared: &Shared, plans: &[Plan]) -> BTreeMap<Backend, Vec<Ipv6Add
     let pods = shared.pods.lock().expect("nothing panics holding the pods");
     let at = |(_, _, workload, replica): &Backend| {
         let pod = replica.map_or_else(Vec::new, |replica| {
-            pods.addresses(&crate::controller::pod_of(workload, replica))
+            let pod = crate::controller::pod_of(workload, replica);
+            pods.addresses(pods.live_id(&pod))
         });
         reachable(*replica, pod)
     };

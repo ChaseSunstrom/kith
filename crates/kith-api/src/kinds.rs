@@ -635,6 +635,11 @@ spec! {
         pub timeout_seconds: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub failure_threshold: Option<u32>,
+        /// A liveness probe's start deadline: the container is restarted if it has not passed once
+        /// this long after it started (until then a failure does not count). Kubernetes'
+        /// `initialDelaySeconds` becomes this.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub start_seconds: Option<u32>,
     }
 
     pub struct HttpProbe {

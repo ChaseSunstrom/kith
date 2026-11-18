@@ -5,9 +5,12 @@
 // ponytail: this node's share of each (the scheduler says which replicas are its own).
 // Not handled, and said so in the status where it matters: exec probes. A container's
 // ports only name them (units share the host's network).
-// A rolling update replaces one replica at a time, the old one stopped before the
-// new one starts: unit ids (cgroup, log file) are per replica, so two generations
-// of a replica cannot run side by side. Images are pulled one at a time.
+// A rolling update replaces one replica at a time. A replica that is a pod (as root, no
+// device, seat or volume, and room on the node for a second) is replaced by surge: the new
+// one starts beside the old (the generations take turns at ids with and without a `b`:
+// `unit_id`, `pod_id`), and the old is stopped once the new is ready and has answered for
+// a `DRAIN`. Any other is stopped before its replacement starts, and says why in a note.
+// Images are pulled one at a time.
 // A Job's progress lives in memory: kithd restarted under a running Job starts it over.
 
 mod prune;
@@ -258,6 +261,14 @@ struct Controller {
     /// What this node last found its own hardware to be (`devices::scan`), and when: kept for
     /// `SCAN_KEPT`, where a pass at each change of the store would walk `/sys` every time.
     scanned: Option<(Instant, Vec<Resource>)>,
+    /// Per (Workload, replica) that has been replaced by surge: which generation is the current
+    /// one (false: the ids a replica has always had; true: those with a `b`).
+    gens: BTreeMap<(String, u32), bool>,
+    /// Per replica being replaced by surge: `None` while the new generation is not ready, then
+    /// when it became ready (the old one goes `DRAIN` after).
+    surging: BTreeMap<(String, u32), Option<Instant>>,
+    /// Per Workload (alone on a node): why its replicas are stopped before they are replaced.
+    stopped_first: BTreeMap<String, String>,
 }
 
 /// How long a look at the node's own hardware is gone by (a walk of `/sys` measured 3.3 ms in
@@ -391,6 +402,9 @@ pub async fn run(
         projects,
         scanned: None,
         adopted,
+        gens: BTreeMap::new(),
+        surging: BTreeMap::new(),
+        stopped_first: BTreeMap::new(),
     };
     loop {
         let wake = controller.reconcile(&shared, &stopping).await;
@@ -666,7 +680,8 @@ fn pod_limits(slots: &BTreeMap<String, Slot>) -> BTreeMap<String, Option<u64>> {
     limits
 }
 
-fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
+/// The id of a unit: of the second generation of its replica where `b` (see `pod_id`).
+fn unit_id(prefix: &str, replica: u32, b: bool, unit: &str) -> Result<String, String> {
     // (Not `.` or `..`: a unit's name is a directory's too, under its replica's.)
     let ok = !unit.is_empty()
         && unit.bytes().any(|b| b != b'.')
@@ -674,9 +689,110 @@ fn unit_id(prefix: &str, replica: u32, unit: &str) -> Result<String, String> {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
     match ok {
-        true => Ok(format!("{prefix}{replica}_{unit}")),
+        true => Ok(format!("{prefix}{replica}{}_{unit}", if b { "b" } else { "" })),
         false => Err(format!("unit name `{unit}`: use letters, digits, `-` and `.`")),
     }
+}
+
+/// The pod of one generation of a replica: `pod_of`'s for the first, and for the second (the new
+/// replica a rolling update starts beside the old) another network namespace, as its own.
+fn pod_id(owner: &str, replica: u32, b: bool) -> String {
+    format!("{}{}", pod_of(owner, replica), if b { "b" } else { "" })
+}
+
+/// A slot of the second generation of its replica (its pod is not the one `pod_of` names).
+fn is_second(slot: &Slot) -> bool {
+    slot.pod
+        .as_ref()
+        .is_some_and(|(pod, _)| *pod != pod_of(&slot.owner, slot.replica))
+}
+
+/// The generation that answers for a replica (true: the second): the one its update began,
+/// once that is ready, or the only one.
+fn live_gen(
+    gens: &BTreeMap<(String, u32), bool>,
+    surging: &BTreeMap<(String, u32), Option<Instant>>,
+    slots: &BTreeMap<String, Slot>,
+    owner: &str,
+    replica: u32,
+) -> bool {
+    let key = (owner.to_string(), replica);
+    let new = gens.get(&key).copied().unwrap_or(false);
+    match surging.contains_key(&key) && !second_is_live(slots, owner, replica, new) {
+        true => !new,
+        false => new,
+    }
+}
+
+/// Every unit of the generation `b` of the replica is ready: it answers for the replica.
+fn second_is_live(slots: &BTreeMap<String, Slot>, owner: &str, replica: u32, b: bool) -> bool {
+    let units: Vec<&Slot> = slots
+        .values()
+        .filter(|slot| slot.owner == owner && slot.replica == replica && is_second(slot) == b)
+        .collect();
+    !units.is_empty() && units.iter().all(|slot| slot.ready())
+}
+
+/// How long the old replica of a surge runs on once its replacement is ready: what a Service on
+/// another node, still going to it, is given to see the new one answers.
+const DRAIN: Duration = Duration::from_secs(3);
+
+fn drained(ready_since: Option<Instant>) -> bool {
+    ready_since.is_some_and(|at| at.elapsed() >= DRAIN)
+}
+
+/// Why a replica of these units (as the update wants them) cannot run twice at once, if it
+/// cannot: what is held once on a node (its network, a device, a volume) or not a container.
+fn no_surge(units: &[&Slot], root: bool) -> Option<String> {
+    let reason = if !root || units.iter().any(|slot| slot.pod.is_none()) {
+        "its units share the node's network (a pod, which kithd makes as root, has its own)"
+    } else if units
+        .iter()
+        .any(|slot| !slot.devices.is_empty() || slot.seat.is_some() || !slot.dmem.is_empty())
+    {
+        "it holds a device or a seat, which a second replica could not have as well"
+    } else if units.iter().any(|slot| !slot.volumes.is_empty()) {
+        "it mounts a volume, which a second replica could not have as well"
+    } else if units.iter().any(|slot| !matches!(slot.run, Run::Container(_))) {
+        "it has a unit that is not a container"
+    } else {
+        return None;
+    };
+    Some(reason.into())
+}
+
+/// The CPUs and bytes of memory the units ask for.
+fn asks(slot: &Slot) -> (f64, f64) {
+    let resources = match &slot.run {
+        Run::Container(c) => &c.resources,
+        Run::Exec(e) => &e.resources,
+    };
+    let each = |q: Option<&kith_api::kinds::Quantity>| q.map_or(0.0, |q| q.value());
+    resources
+        .as_ref()
+        .map_or((0.0, 0.0), |r| (each(r.cpu.as_ref()), each(r.memory.as_ref())))
+}
+
+/// Why the node, which has `capacity` (CPUs, bytes of memory), has no room for the units `new`
+/// beside what its slots ask for, if it has none. What asks for nothing needs no room, and a
+/// capacity not known (0) is no ground to refuse.
+fn no_room(capacity: (f64, f64), slots: &BTreeMap<String, Slot>, new: &[&Slot]) -> Option<String> {
+    let sum = |units: &mut dyn Iterator<Item = &Slot>| {
+        units.map(asks).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1))
+    };
+    let extra = sum(&mut new.iter().copied());
+    let used = sum(&mut slots.values());
+    if capacity.0 > 0.0 && extra.0 > 0.0 && used.0 + extra.0 > capacity.0 {
+        return Some(format!("this node has no CPU to spare for a second replica ({} of {})", used.0 + extra.0, capacity.0));
+    }
+    if capacity.1 > 0.0 && extra.1 > 0.0 && used.1 + extra.1 > capacity.1 {
+        return Some(format!(
+            "this node has no memory to spare for a second replica ({} of {} bytes)",
+            used.1 + extra.1,
+            capacity.1
+        ));
+    }
+    None
 }
 
 /// The replica numbers the scheduler gave to the nodes of a NodeWorkload (not in a row:
@@ -739,8 +855,13 @@ pub fn log_of(resource: &Resource, unit: Option<&str>, replica: u32) -> Result<(
     }
     let namespace = resource.metadata.namespace.as_deref().unwrap_or_default();
     let prefix = id_prefix(&resource.kind, namespace, &resource.metadata.name);
-    let id = unit_id(&prefix, replica, name).map_err(Error::Invalid)?;
     let status = resource.status.as_ref();
+    // (A replica a rolling update has replaced runs as its second generation: status says so.)
+    let second = status.is_some_and(|s| {
+        let mut units = s["containers"].as_array().into_iter().flatten();
+        units.any(|u| u["replica"] == replica && u["gen"] == 1)
+    });
+    let id = unit_id(&prefix, replica, second, name).map_err(Error::Invalid)?;
     let more = match status.and_then(|s| s["state"].as_str()) {
         // A Job: until it is over, another run may write more.
         Some(state) => state == "running",
@@ -923,7 +1044,7 @@ impl Controller {
                     // The units a run really has: a name counts once, and only if it can be an id.
                     let first = template.init_containers.iter().map(|c| &c.name);
                     let names: BTreeSet<_> = template.units().chain(first).collect();
-                    let units = names.iter().filter(|name| unit_id(&prefix, 0, name).is_ok()).count();
+                    let units = names.iter().filter(|name| unit_id(&prefix, 0, false, name).is_ok()).count();
                     let (runs, not_before) = self.job_runs(&key, resource, replicas, units).await;
                     // A Job retries whole runs, so a unit that exits stays exited.
                     (runs, not_before, RestartPolicy::Never)
@@ -987,6 +1108,16 @@ impl Controller {
                 .collect();
             let files: Vec<_> = units.iter().map(|unit| files_of(shared, &namespace, unit)).collect();
             for replica in replicas {
+                // Which generation of the replica is wanted: the second where a rolling update has
+                // started it beside the old (see `gens`); one found running as it, by a kithd that
+                // was started again, is the one it was.
+                let second = resource.kind == "Workload" && template.pod == Some(true) && {
+                    let ran = format!("{prefix}{replica}b_");
+                    *self
+                        .gens
+                        .entry((key.clone(), replica))
+                        .or_insert_with(|| self.adopted.keys().any(|id| id.starts_with(&ran)))
+                };
                 for (at, ((unit, env), files)) in units.iter().zip(&envs).zip(&files).enumerate() {
                     // What a variable says of the replica itself (its address is known when
                     // it starts: `start`).
@@ -1007,7 +1138,7 @@ impl Controller {
                             *was = value;
                         }
                     }
-                    match unit_id(&prefix, replica, unit.name()) {
+                    match unit_id(&prefix, replica, second, unit.name()) {
                         // Every node that runs a replica says so, in the same words (one status).
                         Err(e) if !note.contains(&e) => note.push(e),
                         Err(_) => {}
@@ -1022,7 +1153,7 @@ impl Controller {
                             probes: None,
                             pod: (template.pod == Some(true)).then(|| {
                                 let name = &resource.metadata.name;
-                                (pod_of(&key, replica), format!("{name}-{replica}"))
+                                (pod_id(&key, replica, second), format!("{name}-{replica}"))
                             }),
                             exit: template.exit.clone().filter(|_| template.pod == Some(true)),
                             notes: template.annotations.clone(),
@@ -1109,8 +1240,21 @@ impl Controller {
             }
         }
         let mut stale: Vec<String> = Vec::new();
+        let mut again_now = false;
         fn of(slot: &Slot) -> (&str, u32) {
             (slot.owner.as_str(), slot.replica)
+        }
+        // A replica nothing wants any more is no longer being replaced; and a replica whose new
+        // generation is ready since a while (and stays so) has its old one let go below.
+        let wants = |owner: &str, replica: u32| wanted.values().any(|new| new.owner == owner && new.replica == replica);
+        self.surging.retain(|(owner, replica), _| wants(owner, *replica));
+        self.gens.retain(|(owner, replica), _| wants(owner, *replica));
+        for ((owner, replica), since) in self.surging.iter_mut() {
+            let new = self.gens.get(&(owner.clone(), *replica)).copied().unwrap_or(false);
+            *since = match (second_is_live(&self.slots, owner, *replica, new), *since) {
+                (true, was) => was.or(Some(Instant::now())),
+                (false, _) => None,
+            };
         }
         // Per owner, the replicas with something to replace.
         let mut changed: BTreeMap<&str, BTreeSet<u32>> = BTreeMap::new();
@@ -1135,16 +1279,30 @@ impl Controller {
                 continue;
             }
             let Some(new) = wanted.get(id) else {
-                stale.push(id.clone());
+                // What a replica's replacement began beside stays until that answers (and its
+                // drain is over): only then is it not wanted.
+                let held = self.surging.get(&(slot.owner.clone(), slot.replica));
+                if !held.is_some_and(|ready_since| !drained(*ready_since)) {
+                    stale.push(id.clone());
+                }
                 continue;
             };
             if differs(new, slot) {
                 changed.entry(&slot.owner).or_default().insert(slot.replica);
             }
         }
+        self.surging.retain(|_, ready_since| !drained(*ready_since));
+        // What a note on a replica stopped first says is kept while its update goes on.
+        self.stopped_first.retain(|owner, _| {
+            changed.contains_key(owner.as_str()) || self.slots.values().any(|s| s.owner == *owner && !s.ready())
+        });
         for (owner, replicas) in changed {
             let mine = || self.slots.values().filter(move |slot| slot.owner == owner);
-            let ready = |replica: u32| mine().filter(|slot| slot.replica == replica).all(Slot::ready);
+            // (Of a replica being replaced beside the old, the one that answers.)
+            let live = |slot: &Slot| {
+                is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
+            };
+            let ready = |replica: u32| mine().filter(|slot| slot.replica == replica && live(slot)).all(Slot::ready);
             let rolling = wanted.values().any(|new| new.owner == owner && new.rolling);
             let go: Vec<u32> = if rolling {
                 // One replica at a time: one that is down anyway first; a ready one only
@@ -1155,19 +1313,55 @@ impl Controller {
                     .find(|r| !ready(*r))
                     .or(replicas.first().copied());
                 let pick = pick.expect("a changed owner has a changed replica");
-                let others_ready = mine().all(|slot| slot.replica == pick || ready(slot.replica));
-                if !ready(pick) || others_ready {
-                    vec![pick]
-                } else {
-                    // (No note in a cluster: a status field only one node would say is
-                    // rewritten by the others for ever.)
-                    if me.is_none() {
-                        let note = notes.entry(owner.into()).or_default();
-                        note.push(format!(
-                            "rolling update: replica {pick} is next, once the others are ready"
-                        ));
+                let others_ready =
+                    mine().all(|slot| slot.replica == pick || (ready(slot.replica) && !self.surging.contains_key(&(owner.to_string(), slot.replica))));
+                let (ready_pick, at) = (ready(pick), (owner.to_string(), pick));
+                match (self.surging.get(&at).copied(), ready_pick) {
+                    // Its new replica is not ready, and what it was started as is not what is
+                    // wanted now: it is replaced (the old one answers meanwhile).
+                    (Some(None), _) | (None, false) => vec![pick],
+                    // Its new replica answers and the old one is draining: the next update waits.
+                    (Some(Some(_)), _) => Vec::new(),
+                    (None, true) if !others_ready => {
+                        // (No note in a cluster: a status field only one node would say is
+                        // rewritten by the others for ever.)
+                        if me.is_none() {
+                            let note = notes.entry(owner.into()).or_default();
+                            note.push(format!(
+                                "rolling update: replica {pick} is next, once the others are ready"
+                            ));
+                        }
+                        Vec::new()
                     }
-                    Vec::new()
+                    (None, true) => {
+                        // Beside the old, the new one starts first, unless it holds what is held
+                        // once, or the node has no room for both.
+                        let units: Vec<&Slot> = wanted
+                            .values()
+                            .filter(|new| new.owner == owner && new.replica == pick)
+                            .collect();
+                        let room = shared.members.capacity(shared.members.me());
+                        let why = no_surge(&units, nix::unistd::getuid().is_root())
+                            .or_else(|| room.and_then(|room| no_room(room, &self.slots, &units)));
+                        match why {
+                            None => {
+                                let was = self.gens.get(&at).copied().unwrap_or(false);
+                                self.gens.insert(at.clone(), !was);
+                                self.surging.insert(at, None);
+                                // (The new one is wanted from the next pass.)
+                                again_now = true;
+                                Vec::new()
+                            }
+                            Some(why) => {
+                                let said = format!("rolling update: replica {pick} is stopped first: {why}");
+                                match me {
+                                    None => drop(self.stopped_first.insert(owner.into(), said)),
+                                    Some(_) => eprintln!("kithd: {owner}: {said}"),
+                                }
+                                vec![pick]
+                            }
+                        }
+                    }
                 }
             } else {
                 replicas.into_iter().collect()
@@ -1337,10 +1531,19 @@ impl Controller {
         // what a rolling update waits for in step 2: go round again at once.
         let mut job_moved = false;
         // Per replica: how many of its init containers have run to their end, well.
-        let mut first: BTreeMap<(String, u32), u32> = BTreeMap::new();
+        // (Of each generation of a replica: the new one runs its init containers itself.)
+        let mut first: BTreeMap<(String, u32, bool), u32> = BTreeMap::new();
         for slot in self.slots.values().filter(|slot| slot.done()) {
-            *first.entry((slot.owner.clone(), slot.replica)).or_default() += 1;
+            *first.entry((slot.owner.clone(), slot.replica, is_second(slot))).or_default() += 1;
         }
+        // Where a Service looks for a replica: the generation that answers for it.
+        let answering: BTreeMap<String, String> = self
+            .gens
+            .keys()
+            .filter(|(owner, replica)| live_gen(&self.gens, &self.surging, &self.slots, owner, *replica))
+            .map(|(owner, replica)| (pod_of(owner, *replica), pod_id(owner, *replica, true)))
+            .collect();
+        shared.pods.lock().expect("nothing panics holding the pods").set_live(answering);
         // The units still stopping, with their devices: what is due waits for them (see
         // held_by_leaving). One that starts stopping in this pass is added as it does.
         let mut leaving: Vec<(String, String, Vec<PathBuf>)> = self
@@ -1400,7 +1603,10 @@ impl Controller {
                     continue;
                 }
             }
-            let ended = first.get(&(slot.owner.clone(), slot.replica)).copied().unwrap_or(0);
+            let ended = first
+                .get(&(slot.owner.clone(), slot.replica, is_second(slot)))
+                .copied()
+                .unwrap_or(0);
             slot.held = slot.start_at.is_some() && ended < slot.after;
             if slot.held {
                 slot.message = Some(match slot.init {
@@ -1531,8 +1737,13 @@ impl Controller {
         // 4. Report.
         let mut statuses = Vec::new();
         let node = shared.members.me();
-        for (key, notes) in notes {
-            let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).collect();
+        for (key, mut notes) in notes {
+            notes.extend(self.stopped_first.get(&key).cloned());
+            // Of a replica being replaced beside the old, the one that answers.
+            let answers = |slot: &&Slot| {
+                is_second(slot) == live_gen(&self.gens, &self.surging, &self.slots, &slot.owner, slot.replica)
+            };
+            let mine: Vec<&Slot> = self.slots.values().filter(|slot| slot.owner == key).filter(answers).collect();
             let units: Vec<Value> = mine
                 .iter()
                 .map(|slot| {
@@ -1542,6 +1753,10 @@ impl Controller {
                     }
                     if let Some(message) = &slot.message {
                         c["message"] = json!(message);
+                    }
+                    // (The logs of a replica replaced beside the old are those of the new: `log_of`.)
+                    if is_second(slot) {
+                        c["gen"] = json!(1);
                     }
                     // Where kithd is root: whether its users are the node's (no range of its own:
                     // a NodeWorkload, a pod, devices, or a volume no id-mapped mount takes).
@@ -1606,12 +1821,18 @@ impl Controller {
             }));
         }
 
-        if job_moved {
+        if job_moved || again_now {
             return Duration::ZERO;
         }
         let waiting = self.slots.values().filter(|slot| !slot.held);
         let next = waiting.filter_map(|slot| slot.start_at).min();
-        next.map_or(TICK, |at| at.saturating_duration_since(Instant::now()).min(TICK))
+        let next = next.map_or(TICK, |at| at.saturating_duration_since(Instant::now()).min(TICK));
+        // A replica being replaced beside the old is looked at often: its new one answers and its
+        // old one goes in about the drain.
+        match self.surging.is_empty() {
+            true => next,
+            false => next.min(DRAIN / 3),
+        }
     }
 
     /// Move one Job along: account for the runs that ended since the last pass, and
@@ -2982,6 +3203,109 @@ mod tests {
         }
     }
 
+    /// A unit of replica 0 of the pod `Workload/x/a`, of generation `b` (false: the first, true: the second).
+    fn surge_unit(b: bool, state: &'static str) -> (String, Slot) {
+        let mut slot = slot_of("Workload/x/a", &[], "app");
+        slot.pod = Some((pod_id("Workload/x/a", 0, b), "a-0".into()));
+        slot.state = state;
+        (unit_id("w_x_a_", 0, b, "app").unwrap(), slot)
+    }
+
+    /// The two generations of a replica are told apart by their ids and their pods, so both can
+    /// run at once; the first has the ids it always had (a kithd started again takes its units back).
+    #[test]
+    fn surge_gives_each_generation_its_own_ids() {
+        assert_eq!(unit_id("w_x_a_", 0, false, "app").unwrap(), "w_x_a_0_app");
+        assert_eq!(unit_id("w_x_a_", 0, true, "app").unwrap(), "w_x_a_0b_app");
+        assert_eq!(pod_id("Workload/x/a", 0, false), pod_of("Workload/x/a", 0));
+        assert_ne!(pod_id("Workload/x/a", 0, true), pod_of("Workload/x/a", 0));
+        let (_, old) = surge_unit(false, "running");
+        let (_, new) = surge_unit(true, "running");
+        assert!(!is_second(&old) && is_second(&new));
+        // (One that is of no pod has one generation.)
+        assert!(!is_second(&slot_of("Workload/x/a", &[], "app")));
+    }
+
+    /// The new generation is started beside the old, and the old stays what answers (what is
+    /// reported, what a Service goes to) until every unit of the new is ready: at no step is there
+    /// no generation ready.
+    #[test]
+    fn surge_keeps_the_old_until_the_new_is_ready() {
+        let mut slots = BTreeMap::new();
+        let (old_id, old) = surge_unit(false, "running");
+        slots.insert(old_id, old);
+        let (new_id, new) = surge_unit(true, "pending");
+        slots.insert(new_id.clone(), new);
+        let ready = |slots: &BTreeMap<String, Slot>, b: bool| {
+            slots.values().filter(|s| is_second(s) == b).all(Slot::ready)
+        };
+        // Starting: the old answers.
+        assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
+        assert!(ready(&slots, false) && !ready(&slots, true));
+        // The new one runs: it answers, and the old one still runs, for the drain.
+        slots.get_mut(&new_id).unwrap().state = "running";
+        assert!(second_is_live(&slots, "Workload/x/a", 0, true));
+        assert!(ready(&slots, false) && ready(&slots, true));
+        // The old is let go only once the drain is over, and not before it began.
+        assert!(!drained(None));
+        assert!(!drained(Some(Instant::now())));
+        assert!(drained(Some(Instant::now() - DRAIN)));
+        // A new unit that failed to start does not take over.
+        slots.get_mut(&new_id).unwrap().state = "failed";
+        assert!(!second_is_live(&slots, "Workload/x/a", 0, true));
+    }
+
+    /// What is held once (a volume, a device, the node's network) is not held by two replicas
+    /// at once: its replica is stopped first, and the note says why.
+    #[test]
+    fn surge_stops_first_what_holds_one_of_something() {
+        let (_, plain) = surge_unit(true, "pending");
+        assert_eq!(no_surge(&[&plain], true), None);
+        let host = slot_of("Workload/x/a", &[], "app");
+        assert!(no_surge(&[&host], true).unwrap().contains("network"));
+        assert!(no_surge(&[&plain], false).unwrap().contains("network"));
+        let mut device = surge_unit(true, "pending").1;
+        device.devices = vec!["/dev/dri/card0".into()];
+        assert!(no_surge(&[&device], true).unwrap().contains("device"));
+        let mut seat = surge_unit(true, "pending").1;
+        seat.seat = Some(("s".into(), false));
+        assert!(no_surge(&[&seat], true).unwrap().contains("device"));
+        let mut volume = surge_unit(true, "pending").1;
+        let dir = crate::volumes::Dir {
+            namespace: "x".into(),
+            name: "v".into(),
+            path: "/v".into(),
+            node: "n".into(),
+            encrypted: false,
+        };
+        volume.volumes = vec![(dir, "/data".into(), false)];
+        assert!(no_surge(&[&volume], true).unwrap().contains("volume"));
+        let mut exec = surge_unit(true, "pending").1;
+        exec.run = Run::Exec(serde_json::from_value(json!({ "name": "x", "command": ["true"] })).unwrap());
+        assert!(no_surge(&[&exec], true).unwrap().contains("container"));
+    }
+
+    /// A node with no room for the new replica beside the old stops the old first.
+    #[test]
+    fn surge_needs_room_on_the_node() {
+        let asking = |cpu: f64, memory: f64| {
+            let mut slot = surge_unit(false, "running").1;
+            let Run::Container(c) = &mut slot.run else { unreachable!() };
+            c.resources = serde_json::from_value(json!({ "cpu": cpu.to_string(), "memory": memory.to_string() })).ok();
+            assert!(c.resources.is_some());
+            slot
+        };
+        let mut slots = BTreeMap::new();
+        slots.insert("a".to_string(), asking(1.0, 4e9));
+        // 2 CPUs and 8 GB: another replica like it fits; with 6 GB it does not, nor with 1 CPU.
+        let new = asking(1.0, 4e9);
+        assert_eq!(no_room((2.0, 8e9), &slots, &[&new]), None);
+        assert!(no_room((2.0, 6e9), &slots, &[&new]).unwrap().contains("memory"));
+        assert!(no_room((1.0, 8e9), &slots, &[&new]).unwrap().contains("CPU"));
+        // A replica that asks for nothing is never held back for room.
+        assert_eq!(no_room((0.5, 1e6), &slots, &[&surge_unit(true, "pending").1]), None);
+    }
+
     /// A unit is taken back by the slot that would start it only when its mark is the slot's:
     /// the same for what a unit's life changes (its state, restarts, when it started), another
     /// for what it was started as (what it runs, its devices, its environment).
@@ -3093,10 +3417,10 @@ mod tests {
     #[test]
     fn ids_and_backoff() {
         let prefix = id_prefix("Workload", "default", "web.v2");
-        assert_eq!(unit_id(&prefix, 1, "app").unwrap(), "w_default_web.v2_1_app");
+        assert_eq!(unit_id(&prefix, 1, false, "app").unwrap(), "w_default_web.v2_1_app");
         assert_eq!(id_prefix("Job", "default", "web.v2"), "j_default_web.v2_");
         for bad in ["", "a/b", "..\\x", "a_b", "a b"] {
-            assert!(unit_id(&prefix, 0, bad).is_err(), "{bad:?}");
+            assert!(unit_id(&prefix, 0, false, bad).is_err(), "{bad:?}");
         }
         // What runs first is run until it ends well, whatever the others are; a Job's never again.
         use RestartPolicy::{Always, Never, OnFailure};
@@ -3106,7 +3430,7 @@ mod tests {
             started_again,
             [(true, true), (false, true), (false, true), (false, false)]
         );
-        assert!(unit_id("w_a_b_", 0, "..").is_err() && unit_id("w_a_b_", 0, "a.b").is_ok());
+        assert!(unit_id("w_a_b_", 0, false, "..").is_err() && unit_id("w_a_b_", 0, false, "a.b").is_ok());
         assert_eq!(backoff(0), Duration::from_secs(1));
         assert_eq!(backoff(3), Duration::from_secs(8));
         assert_eq!(backoff(40), Duration::from_secs(60));

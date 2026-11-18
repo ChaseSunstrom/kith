@@ -3349,6 +3349,15 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "startSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "description": "A liveness probe's start deadline: the container is restarted if it has not passed once\nthis long after it started (until then a failure does not count). Kubernetes'\n`initialDelaySeconds` becomes this."
         }
       },
       "description": "Exactly one of `http`, `tcp` or `exec`."
