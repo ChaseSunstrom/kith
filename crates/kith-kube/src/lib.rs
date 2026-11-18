@@ -2167,7 +2167,8 @@ spec:
     #[test]
     fn import_the_ten_kinds_translate_and_validate() {
         let (all, report) = run(TEN);
-        // kith has no headless Service name to carry; it is the one thing left out.
+        // A headless Service is carried (its name answers the ready replicas); serviceName is
+        // the one thing left out: kith names each replica under every Service selecting it.
         assert_eq!(
             report,
             ["StatefulSet/db: spec.serviceName is taken and changes nothing: kith has no use for it"]

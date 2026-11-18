@@ -232,6 +232,11 @@ fn finish<S: Spec + Serialize + DeserializeOwned>(
     }
     let mut metadata = typed.metadata;
     check_name(&metadata.name).map_err(|msg| err(&["metadata", "name"], msg))?;
+    // (A Service's name is a DNS label: a dotted one is another replica's name under another Service.)
+    if matches!(info.kind, "Service" | "Namespace") && metadata.name.contains('.') {
+        let msg = format!("{} names are one DNS label: no `.` in `{}`", info.kind, metadata.name);
+        return Err(err(&["metadata", "name"], msg));
+    }
     match (&metadata.namespace, info.namespaced) {
         (Some(_), false) => {
             let msg = format!("{} is cluster-scoped and takes no namespace", info.kind);

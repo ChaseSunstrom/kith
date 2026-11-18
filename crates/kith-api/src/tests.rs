@@ -563,6 +563,45 @@ fn expose_host_is_a_domain_name() {
     assert!(service(&long).unwrap_err().contains("expose.host"));
 }
 
+/// A Service's and a Namespace's name is one DNS label: no `.` (Kubernetes allows none, and a
+/// dotted one would name another replica: `db-0.db-replicas` is replica 0 of `db` under
+/// `db-replicas`). Other kinds keep their dots.
+#[test]
+fn a_service_and_a_namespace_name_is_one_dns_label() {
+    let read = |kind: &str, name: &str, spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: '{name}' }}\n{spec}");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    let service = "spec: { selector: { app: web }, ports: [{ port: 80 }] }\n";
+    read("Service", "web", service).unwrap();
+    read("Namespace", "media", "").unwrap();
+    for bad in ["db-0.db-replicas", "a.b"] {
+        let said = read("Service", bad, service).unwrap_err();
+        assert!(said.contains("one DNS label") && said.contains(bad), "{bad}: {said}");
+        let said = read("Namespace", bad, "").unwrap_err();
+        assert!(said.contains("one DNS label") && said.contains(bad), "{bad}: {said}");
+    }
+    read("Secret", "a.b", "spec: { data: { k: v } }\n").unwrap();
+}
+
+/// A headless Service has no address to send a host to: it is refused with `expose` at apply,
+/// and not served without its host (its name answers its replicas, and nothing else).
+#[test]
+fn a_headless_service_has_no_expose() {
+    let read = |spec: &str| {
+        let text = format!("apiVersion: kith.dev/v1\nkind: Service\nmetadata: {{ name: web }}\n{spec}");
+        let read = Resource::from_source(&text).and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>());
+        read.map(drop).map_err(|e| e.msg)
+    };
+    read("spec: { selector: { app: web }, ports: [{ port: 80 }], headless: true }\n").unwrap();
+    let said = read(
+        "spec: { selector: { app: web }, ports: [{ port: 80 }], headless: true, expose: { host: shop.example.org, via: edge } }\n",
+    )
+    .unwrap_err();
+    assert!(said.contains("headless") && said.contains("expose"), "{said}");
+}
+
 #[test]
 fn expose_host_is_one_a_certificate_authority_issues_for() {
     for bad in [

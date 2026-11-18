@@ -15,7 +15,8 @@ spec:
           command: ["/bin/pod", "ask", "shop", "80", "db", "80"]
 ---
 # What a pod is told of the replicas: each replica's own name and the headless Service's
-# name, as the resolver gives them (AAAA: the addresses the Workload's replicas are on).
+# name, as the resolver gives them (AAAA: the addresses the Workload's replicas are on), and
+# the db Service's name, which is the Service's own address, not a replica's.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -33,6 +34,7 @@ spec:
             - lookup
             - db-0.db-replicas.default.svc.cluster.local
             - db-replicas.default.svc.cluster.local
+            - db.default.svc.cluster.local
 ---
 apiVersion: batch/v1
 kind: CronJob
