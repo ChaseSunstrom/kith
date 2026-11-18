@@ -508,6 +508,11 @@ pub fn writes(store: &Store) -> Vec<(String, Option<Value>)> {
         .collect()
 }
 
+/// Whether `p` names something under /dev, with no `..` to climb out of it.
+fn in_dev(p: &str) -> bool {
+    p.starts_with("/dev/") && !p.split('/').any(|c| c == "..")
+}
+
 /// What to give each workload that is placed on `me` with claims: its key, the paths of
 /// its device nodes and the seat whose directory it has, for what runs there. Only
 /// `Device`s of `me` are ever in it. `sys` is `/sys`.
@@ -537,6 +542,10 @@ pub fn granted(store: &Store, me: &str, sys: &Path) -> BTreeMap<String, Granted>
                 continue;
             };
             if spec.node != me || !(whole || spec.class == DeviceClass::Gpu) {
+                continue;
+            }
+            // The store is not trusted for a path: one outside /dev, or with a `..`, grants nothing.
+            if !spec.path.iter().chain(&spec.nodes).all(|p| in_dev(p)) {
                 continue;
             }
             classes.push((name.clone(), spec.class.clone()));
@@ -1267,6 +1276,28 @@ spec: { node: b, devices: [b-usb0] }
             ["/dev/nvidia0", "/dev/nvidiactl"].map(PathBuf::from)
         );
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// A Device the store holds with a path or node outside /dev, or with a `..`, grants nothing.
+    #[test]
+    fn forged_device_outside_dev_grants_nothing() {
+        let empty = sys("forged");
+        std::fs::remove_dir_all(empty.join("class")).unwrap();
+        for spec in [
+            "{ node: a, class: gpu, path: /etc/shadow }",
+            "{ node: a, class: gpu, path: /dev/../etc/shadow }",
+            "{ node: a, class: gpu, path: dev/dri/card1 }",
+            "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [/etc/shadow] }",
+            "{ node: a, class: gpu, path: /dev/dri/card1, nodes: [/dev/../etc/passwd] }",
+            "{ node: a, class: gpu, nodes: [/proc/kcore] }",
+        ] {
+            let forged = format!("---\napiVersion: kith.dev/v1\nkind: Device\nmetadata: {{ name: a-gpu-card1 }}\nspec: {spec}\n");
+            let source = [forged, claim("cuda", "{ device: a-gpu-card1 }"), workload("train", "[cuda]")].concat();
+            let on_a = granted(&self::store(&source), "a", &empty);
+            assert!(on_a["Workload/default/train"].devices.is_empty(), "{spec}");
+            assert!(on_a["Workload/default/train"].classes.is_empty(), "{spec}");
+        }
         let _ = std::fs::remove_dir_all(&empty);
     }
 
