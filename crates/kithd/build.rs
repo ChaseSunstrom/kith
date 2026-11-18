@@ -13,6 +13,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    write_site(&dir, &PathBuf::from(std::env::var("OUT_DIR").unwrap()));
     println!("cargo::rerun-if-changed=../kith-cli/no-unwind.ld");
     println!("cargo::rerun-if-changed=kithd.order");
     println!("cargo::rerun-if-changed=no-unwind-lld.ld");
@@ -58,6 +60,55 @@ fn main() {
     arg(format!("-Wl,-T,{}", script.display()));
     arg("-Wl,--no-eh-frame-hdr".into());
     arg("-Wl,-z,pack-relative-relocs".into());
+}
+
+/// What the installer's picture (src/install/fb.rs) is drawn with, written to OUT_DIR/site.rs:
+/// the colours of docs/site.css's first `:root` block (read here, not copied: a colour the
+/// site changes is the one the installer draws), and the glyphs of kithd's font, one per
+/// printable ASCII character from the space on, seven rows of five bits each.
+fn write_site(dir: &Path, out: &Path) {
+    println!("cargo::rerun-if-changed=../../docs/site.css");
+    println!("cargo::rerun-if-changed=font/glyphs.txt");
+    let css = std::fs::read_to_string(dir.join("../../docs/site.css")).expect("docs/site.css");
+    let root = css.find(":root {").expect("docs/site.css has a :root block");
+    let block = &css[root..];
+    let block = &block[..block.find('}').expect("the :root block closes")];
+    let mut code = String::new();
+    for line in block.lines() {
+        let Some((name, value)) = line.trim().strip_prefix("--").and_then(|rest| rest.split_once(':')) else {
+            continue;
+        };
+        let Some(hex) = value.trim().trim_end_matches(';').strip_prefix('#') else {
+            continue;
+        };
+        if hex.len() != 6 {
+            continue;
+        }
+        let [r, g, b] = [0, 2, 4].map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("a hex colour"));
+        let name = name.trim().replace('-', "_").to_uppercase();
+        code += &format!("#[allow(dead_code)]\npub const SITE_{name}: [u8; 3] = [{r:#04x}, {g:#04x}, {b:#04x}];\n");
+    }
+    let font = std::fs::read_to_string(dir.join("font/glyphs.txt")).expect("kithd's font");
+    let glyphs: Vec<[u8; 7]> = font
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let rows: Vec<&str> = line.split_whitespace().collect();
+            assert!(rows.len() == 7 && rows.iter().all(|row| row.len() == 5), "a glyph is seven rows of five: {line}");
+            let mut glyph = [0u8; 7];
+            for (bits, row) in glyph.iter_mut().zip(rows) {
+                *bits = u8::from_str_radix(row, 2).expect("a row of 0s and 1s");
+            }
+            glyph
+        })
+        .collect();
+    assert_eq!(glyphs.len(), 95, "the font has a glyph for each printable ASCII character");
+    code += "#[allow(dead_code)]\npub const GLYPHS: [[u8; 7]; 95] = [\n";
+    for glyph in &glyphs {
+        code += &format!("    {glyph:?},\n");
+    }
+    code += "];\n";
+    std::fs::write(out.join("site.rs"), code).expect("OUT_DIR/site.rs");
 }
 
 /// The directory of the toolchain's `ld.lld` (the one rustc itself links with where lld is

@@ -324,6 +324,13 @@ another size, or a disk named by serial that now gives another, writes nothing; 
 name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
+On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
+look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
+being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
+stays on the serial line. An encrypted install's recovery key is shown on the screen too, and that
+screen holds until a key is pressed, then clears; the key is written to the serial line as before,
+and to no log or kernel ring.
+
 Without anyone there, put the answers on the stick as `kith-install.yaml` on its first partition
 (FAT), or at a URL on the kernel command line (`kith.install=https://10.0.0.2/alpha.yaml`; a
 hypervisor gives it as the SMBIOS string `io.systemd.stub.kernel-cmdline-extra=`). Over plain

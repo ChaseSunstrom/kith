@@ -86,6 +86,39 @@ fn ioctl(file: &File, number: u32, bytes: &mut [u8]) -> Result<i32> {
     }
 }
 
+/// The ioctl `number` on `file` with `value` as its argument (a number, not a pointer).
+fn ioctl_value(file: &File, number: u32, value: u64) -> Result<i32> {
+    // SAFETY: the kernel takes `value` as a number and reads no memory through it.
+    let said = unsafe { libc::ioctl(file.as_raw_fd(), number as _, value as libc::c_ulong) };
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(said)
+    }
+}
+
+/// The bit each of the red, green and blue channels starts at in a pixel of the framebuffer
+/// `file` (a /dev/fbN), as FBIOGET_VSCREENINFO reports them.
+pub fn fb_channels(file: &File) -> Result<[u32; 3]> {
+    const GET_SCREEN_INFO: u32 = 0x4600; // FBIOGET_VSCREENINFO
+    // (struct fb_var_screeninfo is 160 bytes; the `offset` of each channel's fb_bitfield,
+    // red, green and blue, is the u32 at 32, 44 and 56.)
+    let mut screen = vec![0u8; 160];
+    ioctl(file, GET_SCREEN_INFO, &mut screen)?;
+    let at = |byte: usize| u32::from_ne_bytes([screen[byte], screen[byte + 1], screen[byte + 2], screen[byte + 3]]);
+    Ok([at(32), at(44), at(56)])
+}
+
+/// Put the console `tty` (/dev/tty0) in graphics mode, where the kernel draws no text over
+/// a picture on the framebuffer, or back in text mode.
+pub fn set_graphics(tty: &File, graphics: bool) -> Result<()> {
+    const SET_MODE: u32 = 0x4B3A; // KDSETMODE
+    const KD_TEXT: u64 = 0;
+    const KD_GRAPHICS: u64 = 1;
+    ioctl_value(tty, SET_MODE, if graphics { KD_GRAPHICS } else { KD_TEXT })?;
+    Ok(())
+}
+
 /// Give `file` a block device (`/dev/loopN`): what `losetup --find` does. The device is
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.
