@@ -25,6 +25,10 @@ jobs:
       - run: cargo fmt --all --check
       # Every link between the README and docs/guide/, and to each heading, goes somewhere.
       - run: python3 ci/doclinks.py --self-test && python3 ci/doclinks.py
+      # Compares files only: docs/guide/*.md, the ADRs and the docs/*.html they make. Here, before the cargo
+      # steps, so a failure of those does not skip it.
+      - name: The guide's pages are what its markdown makes
+        run: python3 ci/site_docs.py --self-test && python3 ci/site_docs.py --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       # A container of a kithd that is not root goes beside kithd's own cgroup, which has to be the

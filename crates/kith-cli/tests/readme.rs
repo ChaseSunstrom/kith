@@ -41,6 +41,8 @@ fn every_guide_is_read() {
     let mut there: Vec<String> = std::fs::read_dir(root().join("docs/guide"))
         .unwrap()
         .map(|entry| format!("docs/guide/{}", entry.unwrap().file_name().to_string_lossy()))
+        // (The .html beside each is ci/site_docs.py's page of it, checked by that.)
+        .filter(|path| path.ends_with(".md"))
         .collect();
     there.sort();
     let mut read: Vec<&str> = DOCS
