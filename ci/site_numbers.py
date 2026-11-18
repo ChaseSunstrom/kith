@@ -8,7 +8,9 @@ Where each comes from:
     kith.size, kithd.size, kithd.idle, apply.peak   ci/budgets.py (the static binaries, run here)
     os.update, os.image, os.root                    target/os/ (sh os/build.sh), in MB
     kinds                                           README.md's count, which a test holds to the code
-    tests, vm_tests, crates, rust_lines, refused,   counted in the sources\n    refused.names, by_crate
+    tests, vm_tests, crates, rust_lines, refused,   counted in the sources
+    refused.names, by_crate
+    remote.tests                                    docs/guide/development.md: the seconds ci/remote.sh took on a node
     cmp.*                                           ci/compare.txt (sh ci/compare.sh): the middle run
 The comparison is drawn too, for README.md: docs/assets/diagrams/beside-k3s-light.svg and
 -dark.svg, from the same cmp.* numbers (--check fails on a drawing of other numbers).
@@ -49,6 +51,10 @@ def measured(old):
     n["rust_lines"] = sum(t.count("\n") for t in text.values())
     n["refused.names"] = re.findall(r'^\s+\("(\w+)", libc::SYS_', (ROOT / "crates/kith-runtime/src/seccomp.rs").read_text(), re.M)
     n["refused"] = len(n["refused.names"])
+    # The seconds a node's pod took for the workspace's tests: written in the development guide, from one run of ci/remote.sh
+    took = re.search(r"whole workspace took (\d+) s", (ROOT / "docs/guide/development.md").read_text())
+    if took:
+        n["remote.tests"] = int(took.group(1))
     n["by_crate"] = {}  # crate: [lines, tests]
     for path, t in text.items():
         lines, tests = n["by_crate"].setdefault(path.relative_to(ROOT / "crates").parts[0], [0, 0])
