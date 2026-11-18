@@ -46,6 +46,16 @@ const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 /// The most of an error's answer is read to be shown: its envelope is a few hundred bytes.
 const ERROR_LIMIT: usize = 64 << 10;
 
+/// The slowest a layer may arrive at, in bytes a second: its pull has the metadata wait and its size
+/// at this rate. (A read timeout is idle only: a registry sending a byte every 29 s would hold a
+/// pull for ever without this.)
+const LAYER_FLOOR: f64 = (100 << 10) as f64;
+
+/// The most time a layer of `size` bytes may take to arrive: `metadata` and its size at [`LAYER_FLOOR`].
+pub(crate) fn layer_wait(metadata: Duration, size: i64) -> Duration {
+    metadata + Duration::from_secs_f64(size.max(0) as f64 / LAYER_FLOOR)
+}
+
 /// What a registry said of a thing asked for: the thing, or that it has no such thing (or refused),
 /// with what it said of it.
 pub(crate) enum Lookup<T> {

@@ -16,8 +16,8 @@ kith-dm-sys = { path = "../kith-dm-sys" }
 # TLS through rustls with ring: smaller than the default aws-lc and no cmake.
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 # The metadata GETs oci-client buffers whole (manifests, configs, referrers), read with a cap and
-# the same timeouts as the blobs. The same features as kithd's (both in the tree already).
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+# the same timeouts as the blobs. Only rustls: no json or stream, which nothing here uses.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { version = "1", features = ["fs", "rt"] }
 tar = { version = "0.4", default-features = false }

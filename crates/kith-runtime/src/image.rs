@@ -12,7 +12,7 @@
 //!                                    inode, which each of them and this name link to
 //! ```
 
-use crate::outside::{Capped, Patience, Remote, within};
+use crate::outside::{Capped, Patience, Remote, layer_wait, within};
 use crate::{Context, Result, err};
 use oci_client::Reference;
 use oci_client::config::ConfigFile;
@@ -506,11 +506,16 @@ impl ImageStore {
                 // refuses more than the layer's descriptor says it is.
                 let partial = blob.with_extension(scratch_name("partial"));
                 let mut file = tokio::fs::File::create(&partial).await.ctx("storing a layer")?;
-                let mut pulled = remote
-                    .oci
-                    .pull_blob(&reference, layer, &mut Capped::new(&mut file, layer.size))
-                    .await
-                    .ctx(format!("pulling layer {} of {reference}", layer.digest));
+                let what = format!("pulling layer {} of {reference} ({} bytes)", layer.digest, layer.size);
+                let wait = layer_wait(self.patience.metadata, layer.size);
+                let mut pulled = within(
+                    wait,
+                    what,
+                    remote
+                        .oci
+                        .pull_blob(&reference, layer, &mut Capped::new(&mut file, layer.size)),
+                )
+                .await;
                 if pulled.is_ok() {
                     // On disk before it gets its final name: a crash must not leave half a layer there.
                     pulled = file.sync_all().await.ctx("storing a layer");
@@ -1476,6 +1481,8 @@ mod tests {
     }
 
     type Files = Arc<std::sync::Mutex<std::collections::HashMap<String, (String, Vec<u8>)>>>;
+    /// The kind of a file sent a byte every 200 ms, for as long as the client stays.
+    const TRICKLE: &str = "trickle";
 
     // (A test-only certificate for `localhost` and 127.0.0.1, valid for a hundred years and not
     // a CA, with its key below, made with openssl: nothing trusts it but these tests' clients,
@@ -1699,7 +1706,11 @@ mod tests {
         reply.push_str("\r\n");
         let _ = conn.write_all(reply.as_bytes());
         // Counted as it goes: a client that closes early stops the count there.
-        for chunk in body.chunks(64 << 10) {
+        let trickle = kind == TRICKLE;
+        for chunk in body.chunks(if trickle { 1 } else { 64 << 10 }) {
+            if trickle {
+                std::thread::sleep(Duration::from_millis(200));
+            }
             if conn.write_all(chunk).is_err() {
                 break;
             }
@@ -2133,6 +2144,51 @@ mod tests {
             fs::read_dir(&blobs).unwrap().count(),
             0,
             "a layer past its size was kept"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A layer whose registry sends a byte every 200 ms (no idle read, so the read timeout does not
+    /// catch it) fails its pull at its deadline: the metadata wait, here 3 s, and its size at the
+    /// floor, and not when the trickle would end (1024 bytes is 205 s of it).
+    #[tokio::test]
+    async fn outside_blob_layer_that_trickles_fails_in_its_deadline() {
+        let (dir, _) = sandbox("outside-trickle-layer");
+        let registry = Registry::start(false);
+        let layer = vec![b'x'; 1024];
+        let layer_digest = sha(&layer);
+        registry.publish_layer("1", "/bin/one", layer.clone(), layer.len());
+        registry
+            .files
+            .lock()
+            .unwrap()
+            .get_mut(&format!("/v2/team/hello/blobs/{layer_digest}"))
+            .unwrap()
+            .0 = TRICKLE.into();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.patience = short_patience();
+        let started = std::time::Instant::now();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still waiting on a trickling layer after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled a layer that trickled");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        let said = reason.to_string();
+        assert!(said.contains(&layer_digest) && said.contains("1024 bytes"), "{said}");
+        assert!(said.contains("no answer in"), "{said}");
+        assert_eq!(
+            fs::read_dir(dir.join("store/blobs/sha256")).unwrap().count(),
+            0,
+            "a layer that trickled was kept"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
