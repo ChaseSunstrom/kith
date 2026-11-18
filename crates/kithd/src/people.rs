@@ -433,7 +433,7 @@ pub struct Add {
     pub replace: bool,
 }
 
-/// Keys made at once and lately, for `POST /v1/peers` (one of these in `Shared`).
+/// Keys made at once and lately, for `POST /v1/peers` (one of these in the `Cluster`).
 pub struct Making {
     /// The names a request is making a key for now: two for one name cannot both be let in.
     names: Mutex<std::collections::BTreeSet<String>>,

@@ -438,10 +438,13 @@ part: there is no root part yet (T-0334). When there is, the key's making moves 
 handler asks for it.
 
 Three guards stand before the key is made. Keys are rationed by one token bucket in the
-`Cluster` (5 a minute, a burst of 5), checked after the refusals that cost nothing, so a refused
-request spends no token; an empty bucket answers 429 with `no-store`. The bucket is per kithd
-process, not shared by the cluster: a request a control node takes is limited by that node's own
-bucket, so the cluster's rate is at most 5 a minute for each node asked; a restart starts a full one. A name being added is held in a set until its answer is made: a second add of it
+`Cluster` (5 a minute, a burst of 5), checked after the refusals that cost nothing (the asker's
+right, the body, a name already taken), so those spend no token; refusals found once the key is
+made (a plan that clashes, a node endpoint or level DNS that will not do) spend one, so a node
+set up wrong uses the burst up. An empty bucket answers 429 with `no-store`. The bucket is per
+kithd process, not shared by the cluster: a request a control node takes is limited by that
+node's own bucket, so the cluster's rate is at most 5 a minute for each node asked; a restart
+starts a full one. A name being added is held in a set until its answer is made: a second add of it
 meanwhile answers 409 "being added", so two concurrent asks cannot both answer 200 with two
 keys. The kernel's answer for the node's public key (`derive`, blocking netlink) runs under
 `spawn_blocking`, so a slow netlink does not hold a runtime thread.
@@ -451,9 +454,10 @@ key through netlink, as the mesh does; no key file is read for it.
 
 The private key is held in `Zeroizing` buffers in the handler: the 32 bytes, the copy moved into
 `spawn_blocking`, its base64, the configuration text and the answer's body, which the response
-owns and wipes when hyper drops it. They are zeroed before the store is written, where they can
-be (the key is dropped before `applied(...).await`). Copies inside hyper's and the socket's
-buffers are not ours to wipe. The key is in the CLI's or the page's variables while they show it.
+owns and wipes when hyper drops it. The 32 bytes are dropped before `applied(...).await`; the
+configuration text lives across it until the answer is built. Copies kithd cannot wipe: the
+netlink attribute and message buffers `kith_mesh::public_of` builds from the key, the stack
+temporaries a dereference of the key leaves, and hyper's and the socket's buffers. The key is in the CLI's or the page's variables while they show it.
 It is not in the store, the history, the audit line or kithd's log: the tests `peers_route*` and
 `peers_config*` look for it in each of them, and in the applied resource.
 
