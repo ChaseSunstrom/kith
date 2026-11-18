@@ -112,6 +112,7 @@ pub struct Store {
 
 /// The same store when it holds the same resources, histories and clock: the change counts are
 /// not compared (a store from a snapshot counts none, and is the same store).
+/// A new field of `Store` must be added here too, unless it is a count or derived from one.
 impl PartialEq for Store {
     fn eq(&self, other: &Self) -> bool {
         self.resources == other.resources
