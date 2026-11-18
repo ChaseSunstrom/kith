@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::watch;
 
@@ -221,6 +221,77 @@ fn held(dir: &Path) -> (BTreeSet<String>, Vec<(PathBuf, Duration)>) {
     (blobs, others)
 }
 
+/// The copies being made, by the file each makes. A caller that asks for a blob while it is
+/// copied waits for that copy; its entry goes when the copy ends, however it ends.
+static COPYING: Mutex<BTreeMap<PathBuf, watch::Receiver<Option<Result<(), String>>>>> = Mutex::new(BTreeMap::new());
+
+/// Takes a copy off COPYING when the copy ends (a panic too).
+struct Copying(PathBuf);
+
+impl Drop for Copying {
+    fn drop(&mut self) {
+        COPYING.lock().unwrap_or_else(PoisonError::into_inner).remove(&self.0);
+    }
+}
+
+/// `name` into `dir`, from the first of `from` (node, address) that gives it. The copy runs in
+/// a task of its own: it goes on, and is kept, when the caller that asked is gone; a caller
+/// that asks while it runs waits for that one copy and makes none.
+async fn copied(client: &reqwest::Client, dir: &Path, name: &str, from: Vec<(String, String)>) -> Result<(), String> {
+    let path = dir.join(name);
+    let mut answers = {
+        let mut copying = COPYING.lock().unwrap_or_else(PoisonError::into_inner);
+        match copying.get(&path).cloned() {
+            Some(answers) => answers,
+            None if path.exists() => return Ok(()),
+            None => {
+                let (tell, answers) = watch::channel(None);
+                copying.insert(path.clone(), answers.clone());
+                tokio::spawn(copying_task(
+                    client.clone(),
+                    dir.to_path_buf(),
+                    name.to_string(),
+                    from,
+                    tell,
+                ));
+                answers
+            }
+        }
+    };
+    let answer = answers.wait_for(Option::is_some).await.map(|answer| (*answer).clone());
+    match answer {
+        Ok(Some(answer)) => answer,
+        _ => Err(format!("the copy of blob {name} ended with no answer")),
+    }
+}
+
+/// The copy `copied` waits on: from each of `from` in turn until one gives the blob, and then
+/// whoever waits is told how it came to.
+async fn copying_task(
+    client: reqwest::Client,
+    dir: PathBuf,
+    name: String,
+    from: Vec<(String, String)>,
+    tell: watch::Sender<Option<Result<(), String>>>,
+) {
+    // ponytail: QUIET bounds each chunk, not the copy: a node that trickles bytes holds it as
+    // long as it trickles, with nobody waiting; a whole-copy deadline is the fix if that happens.
+    // (A caller that finds the copy under way waits on it, and its own `from` is not asked.)
+    let copying = Copying(dir.join(&name));
+    let mut answer = Err(format!("no node says it holds blob {name}"));
+    for (node, address) in from {
+        answer = fetch(&client, &address, &name, &dir)
+            .await
+            .map_err(|e| format!("blob {name} was not copied from node {node}: {e}"));
+        if answer.is_ok() {
+            break;
+        }
+    }
+    // (Off the map before anyone is told: a caller after this finds the file, or copies again.)
+    drop(copying);
+    tell.send_replace(Some(answer));
+}
+
 /// `name` from the node at `address`, into `dir` under its name if its bytes are its.
 async fn fetch(client: &reqwest::Client, address: &str, name: &str, dir: &Path) -> Result<(), String> {
     // (A node that stops answering halfway must not hold up every other blob.)
@@ -289,19 +360,15 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
         // ponytail: one blob at a time; fetch several at once when there are many to move.
         for (name, from) in fetches {
             let Some(cluster) = &shared.cluster else { break };
-            let mut failed = String::new();
-            for node in &from {
-                let Some(address) = addresses.get(node) else { continue };
-                match fetch(&cluster.client, address, &name, &dir).await {
-                    Ok(()) => {
-                        failed.clear();
-                        break;
-                    }
-                    Err(e) => failed = format!("blob {name} was not copied from node {node}: {e}"),
-                }
+            let from: Vec<(String, String)> = from
+                .into_iter()
+                .filter_map(|node| Some((node.clone(), addresses.get(&node)?.clone())))
+                .collect();
+            if from.is_empty() {
+                continue;
             }
-            if !failed.is_empty() {
-                saying = failed;
+            if let Err(e) = copied(&cluster.client, &dir, &name, from).await {
+                saying = e;
             }
         }
         // Read again, and nothing awaited from here to the removals: a Blob put while this
@@ -402,15 +469,10 @@ pub async fn here(shared: &Shared, key: &str) -> Result<PathBuf, String> {
     if path.exists() {
         return Ok(path);
     }
-    let mut failed = format!("no node says it holds blob {name}");
-    for (node, address) in from {
-        let Some(cluster) = &shared.cluster else { break };
-        match fetch(&cluster.client, &address, name, &dir).await {
-            Ok(()) => return Ok(path),
-            Err(e) => failed = format!("blob {name} was not copied from node {node}: {e}"),
-        }
-    }
-    Err(failed)
+    let Some(cluster) = &shared.cluster else {
+        return Err(format!("no node says it holds blob {name}"));
+    };
+    copied(&cluster.client, &dir, name, from).await.map(|()| path)
 }
 
 fn io(what: String) -> ApiError {
@@ -718,5 +780,138 @@ mod tests {
         let want = &wants[&name];
         assert_eq!((want.copies, want.keys.len()), (3, 2));
         assert_eq!(want.keys[1].1, BTreeSet::from(["a".to_string()]));
+    }
+
+    const BYTES: &[u8] = b"the first half of a blob, and then the rest of it";
+
+    /// A node that holds BYTES and serves them in two pieces: the first at once, the rest once
+    /// `gate` is open. Each request is counted in `served`, and `started` is told of it.
+    struct Holder {
+        address: String,
+        served: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        gate: watch::Sender<bool>,
+    }
+
+    async fn serving(ca: &crate::pki::Ca) -> Holder {
+        use crate::cluster::{listen, pinned_peer::node};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap().to_string();
+        let listener = listen(tcp, crate::pki::server_config(&node(ca, "b")).unwrap()).unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (gate, open) = watch::channel(false);
+        let (count, tell) = (served.clone(), started.clone());
+        let app = axum::Router::new().fallback(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            tell.notify_one();
+            let mut open = open.clone();
+            async move {
+                let half = BYTES.len() / 2;
+                let head = futures_util::stream::once(async move { Ok::<_, std::io::Error>(BYTES[..half].to_vec()) });
+                let rest = futures_util::stream::once(async move {
+                    let _ = open.wait_for(|open| *open).await;
+                    Ok::<_, std::io::Error>(BYTES[half..].to_vec())
+                });
+                axum::body::Body::from_stream(futures_util::StreamExt::chain(head, rest))
+            }
+        });
+        tokio::spawn(async move { drop(axum::serve(listener, app.into_make_service()).await) });
+        Holder {
+            address,
+            served,
+            started,
+            gate,
+        }
+    }
+
+    /// Node `a` with the Blob of BYTES, which says node `b` holds it; `b` is `serving`.
+    async fn copier(tag: &str) -> (Arc<Shared>, String, Holder) {
+        use crate::cluster::pinned_peer::{at, node, shared_with};
+        let ca = crate::pki::Ca::create().unwrap();
+        let holder = serving(&ca).await;
+        let shared = shared_with(tag, node(&ca, "a"), &[at("b", &holder.address, None)]).await;
+        let name = blake3::hash(BYTES).to_hex()[..62].to_string();
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: Blob\nmetadata: {{ name: {name} }}\nspec: {{ size: {} }}\n",
+            BYTES.len()
+        );
+        {
+            let blob = kith_api::Resource::from_source(&source).unwrap().remove(0).unwrap();
+            let mut state = shared.store.lock().unwrap();
+            state.store.apply(blob).unwrap();
+            let status = Some(json!({ "nodes": ["b"] }));
+            state.store.set_status(&format!("Blob/default/{name}"), status).unwrap();
+        }
+        (shared, name, holder)
+    }
+
+    #[tokio::test]
+    async fn blob_copy_goes_on_when_its_caller_is_dropped() {
+        use std::sync::atomic::Ordering;
+        let (shared, name, holder) = copier("copy-dropped").await;
+        let key = format!("Blob/default/{name}");
+        let path = dir(&shared).join(&name);
+        let caller = tokio::spawn({
+            let shared = shared.clone();
+            let key = key.clone();
+            async move { here(&shared, &key).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), holder.started.notified())
+            .await
+            .expect("nothing asked the node for the blob");
+        // The caller goes mid-copy, and nothing waits for the copy any more.
+        caller.abort();
+        let _ = caller.await;
+        holder.gate.send_replace(true);
+        for _ in 0..500 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            BYTES,
+            "the copy did not go on to the end"
+        );
+        assert_eq!(holder.served.load(Ordering::SeqCst), 1);
+        // The next caller finds the blob there: no second copy.
+        assert_eq!(here(&shared, &key).await.unwrap(), path);
+        assert_eq!(holder.served.load(Ordering::SeqCst), 1, "the blob was copied again");
+        let _ = std::fs::remove_dir_all(dir(&shared));
+    }
+
+    #[tokio::test]
+    async fn blob_copy_second_caller_waits_on_the_copy_in_progress() {
+        use std::sync::atomic::Ordering;
+        let (shared, name, holder) = copier("copy-shared").await;
+        let key = format!("Blob/default/{name}");
+        let path = dir(&shared).join(&name);
+        let ask = |shared: &Arc<Shared>, key: &String| {
+            let (shared, key) = (shared.clone(), key.clone());
+            tokio::spawn(async move { here(&shared, &key).await })
+        };
+        let first = ask(&shared, &key);
+        tokio::time::timeout(Duration::from_secs(10), holder.started.notified())
+            .await
+            .expect("nothing asked the node for the blob");
+        let second = ask(&shared, &key);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished(), "the second caller did not wait for the copy");
+        holder.gate.send_replace(true);
+        let both = async { (first.await.unwrap(), second.await.unwrap()) };
+        let (one, two) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("the callers did not get the blob");
+        assert_eq!((one.unwrap(), two.unwrap()), (path.clone(), path.clone()));
+        assert_eq!(
+            holder.served.load(Ordering::SeqCst),
+            1,
+            "one copy was not made for both callers"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), BYTES);
+        let _ = std::fs::remove_dir_all(dir(&shared));
     }
 }
