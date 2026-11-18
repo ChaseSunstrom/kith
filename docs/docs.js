@@ -9,7 +9,13 @@ const scrolled = () => document.documentElement.classList.toggle("scrolled", scr
 
 // On a narrow screen the pages start shut, under their summary.
 const rail = $(".rail");
-if (rail && matchMedia("(max-width: 960px)").matches) rail.open = false;
+// Above that width the summary is hidden, so the pages are always open there.
+if (rail) {
+  const narrow = matchMedia("(max-width: 960px)");
+  const fit = () => { rail.open = !narrow.matches; };
+  fit();
+  narrow.addEventListener("change", fit);
+}
 
 // Spy: the last heading above the top of the window is the one you are in.
 const heads = $$(".page :is(h2, h3)[id]");
@@ -75,6 +81,9 @@ if (form && box && found) {
       }
     };
     box.addEventListener("input", show);
+    form.addEventListener("submit", ev => ev.preventDefault()); // Enter opens the first hit (below); the form never goes anywhere
+    const lit = link => { $$("li", found).forEach(li => li.classList.toggle("on", li.contains(link))); };
+    found.addEventListener("focusin", ev => lit(ev.target.closest("a")));
     box.addEventListener("keydown", ev => {
       const links = $$("a", found), at = links.indexOf(document.activeElement);
       if (ev.key === "Escape") { box.value = ""; show(); }

@@ -239,8 +239,11 @@ class Doc:
             if j > i and nxt and len(nxt.group(1)) == base and nxt.group(2)[0].isdigit() == ordered:
                 loose, i = True, j
         tag = "ol" if ordered else "ul"
+        start = int(first.group(2)[:-1]) if ordered else 1
+        # the CSS draws the numbers with a counter, which ignores start: reset it to one before the first
+        opening = f'<ol start="{start}" style="counter-reset:n {start - 1}">' if start != 1 else f"<{tag}>"
         lis = "".join(f"<li>{''.join(self.blocks(it, tight=not loose))}</li>" for it in items)
-        return f"<{tag}>{lis}</{tag}>", i
+        return f"{opening}{lis}</{tag}>", i
 
     def blocks(self, lines, tight=False):
         out, i, n = [], 0, len(lines)
@@ -291,14 +294,19 @@ class Doc:
 
     def summary(self):
         """The first paragraph that is not a status line, as one plain sentence or two."""
+        lead = ""  # a paragraph that ends in a colon only introduces what follows; used when nothing else is left
         for block in re.findall(r"<p>(.*?)</p>", self.body, flags=re.S):
             text = plain(block).strip()
-            if text and not text.startswith("Status:"):
-                if len(text) <= 220:
-                    return text
-                cut = text[:200].rsplit(" ", 1)[0].rstrip(",;:")
-                return cut + "..."
-        return ""
+            if not text or text.startswith("Status:"):
+                continue
+            if text.endswith(":"):
+                lead = lead or text
+                continue
+            if len(text) <= 220:
+                return text
+            cut = text[:200].rsplit(" ", 1)[0].rstrip(",;:")
+            return cut + "..."
+        return lead
 
 
 # ----- the site's pages
@@ -307,7 +315,7 @@ class Page:
     def __init__(self, src, known):
         self.src = src
         self.out = src[:-3] + ".html"
-        self.doc = Doc(src, (ROOT / src).read_text(), known)
+        self.doc = Doc(src, (ROOT / src).read_text(encoding="utf-8"), known)
         self.title = self.doc.title
         name = self.title.removeprefix("Decision: ")
         head, colon, _ = name.partition(":")
@@ -318,7 +326,8 @@ class Page:
 def sources():
     guide = {p.stem: f"docs/guide/{p.name}" for p in (ROOT / "docs/guide").glob("*.md")}
     first = [guide.pop(name) for name in ORDER if name in guide]
-    decisions = [f"docs/{p.name}" for p in sorted((ROOT / "docs").glob("*.md"))]
+    # only these names: write mode owns docs/adr-*.html and docs/security-review-*.html, never another docs/*.html
+    decisions = [f"docs/{p.name}" for p in sorted([*(ROOT / "docs").glob("adr-*.md"), *(ROOT / "docs").glob("security-review-*.md")])]
     return first + [guide[name] for name in sorted(guide)], decisions
 
 
@@ -437,8 +446,8 @@ def index_body(pages, notes):
 
 def used_tokens():
     """Every var(--x) of docs.css must be one site.css defines (the page may be redrawn there)."""
-    have = set(re.findall(r"(--[\w-]+)\s*:", (ROOT / "docs/site.css").read_text()))
-    mine = (ROOT / "docs/docs.css").read_text()
+    have = set(re.findall(r"(--[\w-]+)\s*:", (ROOT / "docs/site.css").read_text(encoding="utf-8")))
+    mine = (ROOT / "docs/docs.css").read_text(encoding="utf-8")
     own = set(re.findall(r"(--[\w-]+)\s*:", mine))
     return sorted(set(re.findall(r"var\((--[\w-]+)", mine)) - have - own)
 
@@ -451,9 +460,10 @@ def main():
     if args.self_test:
         return self_test()
     out, problems = build()
-    stale = [f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text() != text]
-    stale += [str(f.relative_to(ROOT)) for f in (ROOT / "docs/guide").glob("*.html") if str(f.relative_to(ROOT)) not in out]
-    stale += [str(f.relative_to(ROOT)) for f in (ROOT / "docs").glob("*.html") if str(f.relative_to(ROOT)) not in out and f.name != "index.html"]
+    stale = [f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
+    # what is ours and no longer made: the pages of docs/guide, and the ADR and review pages of docs/. Never another docs/*.html.
+    ours = [*(ROOT / "docs/guide").glob("*.html"), *(ROOT / "docs").glob("adr-*.html"), *(ROOT / "docs").glob("security-review-*.html")]
+    stale += [str(f.relative_to(ROOT)) for f in ours if str(f.relative_to(ROOT)) not in out]
     missing = used_tokens()
     if problems or missing:
         print("\n".join(problems) + ("\ndocs.css uses tokens site.css does not define: " + " ".join(missing) if missing else ""), file=sys.stderr)
@@ -468,7 +478,7 @@ def main():
         if f not in out:
             (ROOT / f).unlink()
     for f, text in out.items():
-        (ROOT / f).write_text(text)
+        (ROOT / f).write_text(text, encoding="utf-8")
     print(f"wrote {len(out)} files")
     return 0
 
@@ -516,6 +526,11 @@ def self_test():
     assert one('<picture><img src="x.png" onerror="alert(1)"></picture>').problems
     assert one("<picture><script>x</script></picture>").problems
     assert one("\x00 `a` \x000\x00").body.count("\x00") == 0
+    # a numbered list that starts at 6 (after a paragraph that split it) keeps its numbers, in the markup and for the CSS counter
+    eq(md("6. a\n7. b"), '<ol start="6" style="counter-reset:n 5"><li>a</li><li>b</li></ol>')
+    # a summary skips a paragraph that only introduces what follows
+    eq(one("# T\n\nThe parts:\n\n- a\n\nReal one.").summary(), "Real one.")
+    eq(one("# T\n\nOnly this:\n").summary(), "Only this:")
     print("site_docs self-test: ok")
     return 0
 
