@@ -401,7 +401,8 @@ Slice 2 makes the entry mean something:
   This build's barrier is an empty `Patch`.
 - **What slice 2 leaves:**
   - A taken leader can still write any bare `Apply` or `Delete`. Slice 2 stops only
-    forged Signed entries. Bare user writes are refused only with slices 3 and 6.
+    forged Signed entries. Bare access writes are refused by slice 3 (below); every
+    other bare spec write only with slice 6.
   - A Signed entry's `at` is not compared on `Apply` or `Rollback`: the revision and
     `born` the leader stamps are taken as carried.
   - A header held back can be applied late, past its `expires`, and after a newer one
@@ -415,6 +416,40 @@ Slice 2 makes the entry mean something:
     write the leader took. The signer sends it again.
   - A refused entry replayed from the log is audited again.
   - The controllers' entries (the table above) are not signed yet.
+
+### Layer 3 as built: slice 3 (T-0825)
+
+Under `spec.signing: required` at format 4, `access_sign::admit` refuses a bare command
+that changes access, on every node, from the entry alone (`bare`). It is the same
+predicate the leader's edge uses, so a taken leader's bare write is refused by the other
+nodes too, and a replay decides alike.
+
+- **What is refused bare:** an `Apply`, `Delete` or `Rollback` of a Role, RoleBinding,
+  Identity, KindDefinition or Cluster (`raft::changes_access`, which looks into a `Patch`
+  or a batch and a Signed entry's command), and any `Import`. A refusal applies nothing and
+  is audited as `signed`, as in slice 2. An open cluster, and a store below format 4, take
+  them as before: the hook decides nothing until `Store::checking()`.
+- **The certificate route writes its Identity Signed.** The admin signs an empty
+  `POST /v1/identities/NAME/certificate` at the CA node's local socket; the node makes the
+  key after the signature and writes the Identity (with its `publicKey`) as a Signed entry
+  around it. Every node takes it through `certified`: one `Apply` of the Identity as the
+  store has it, with only a valid P-256 `publicKey` changed. A forged or changed entry is
+  refused. The route is signed but never relayed (`Relay::signs` is the wrap predicate,
+  `Relay::carries` the relay one): the CA node must be the leader.
+- **A signed write sent to a follower over TLS** is relayed as it came (method, path, body
+  and header unchanged), and the leader writes it Signed; both nodes apply it alike. Bare,
+  the follower and the local socket refuse it, as in layer 1.
+- **What stays bare, for later slices:** the node's own writes, ACME, the scheduler and
+  cron (slice 5); a Release, Source, registry, update or wasm write, and refusing every
+  bare spec write (slice 6). The forge VM test is slice 4.
+- **What it costs:** `kith node claim` (a bare Identity, Role and RoleBinding) and a
+  restore (`Import`) are refused under `required`; sign them as a change, or set `open`
+  first. A rolling upgrade from slice 2 can part: a slice 2 node takes a bare access write
+  at format 4 that a slice 3 node refuses, so update every node before `required`.
+- **What a taken leader can still do:** put its own `publicKey` on an Identity the admin
+  signed the route for: `certified` checks the key is a valid P-256 point and that nothing
+  else changed, but not whose it is, as the key is made after the signature (see "What
+  stays open").
 
 ## Why not short-lived node certificates
 

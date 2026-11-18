@@ -860,7 +860,7 @@ impl Shared {
                 .checking();
             let relay = access_sign::current().and_then(|signed| Some((signed.header, signed.relay?)));
             match relay {
-                Some((header, relay)) if checking && relay.carries(&command) => Command::Signed {
+                Some((header, relay)) if checking && relay.signs(&command) => Command::Signed {
                     header,
                     method: relay.method,
                     path: relay.path,
@@ -1049,7 +1049,7 @@ impl Shared {
 }
 
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
-fn changes_access(command: &Command) -> bool {
+pub(crate) fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
         // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
         // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)

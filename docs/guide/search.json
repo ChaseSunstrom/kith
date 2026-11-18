@@ -135,6 +135,7 @@
 {"u":"adr-taken-node.html#slices","t":"A taken control node is not the cluster taken","h":"Slices"},
 {"u":"adr-taken-node.html#layer-1a-as-built-t-0743-and-where-the-code-said-otherwise","t":"A taken control node is not the cluster taken","h":"Layer 1a as built (T-0743), and where the code said otherwise"},
 {"u":"adr-taken-node.html#layer-3-as-built-slice-2-t-0783","t":"A taken control node is not the cluster taken","h":"Layer 3 as built: slice 2 (T-0783)"},
+{"u":"adr-taken-node.html#layer-3-as-built-slice-3-t-0825","t":"A taken control node is not the cluster taken","h":"Layer 3 as built: slice 3 (T-0825)"},
 {"u":"adr-taken-node.html#why-not-short-lived-node-certificates","t":"A taken control node is not the cluster taken","h":"Why not short-lived node certificates"},
 {"u":"adr-taken-node.html#what-stays-open","t":"A taken control node is not the cluster taken","h":"What stays open"},
 {"u":"adr-unlock.html","t":"The ways into a node's encrypted state, and what each leaves open","h":""},

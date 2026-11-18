@@ -1461,6 +1461,126 @@ fn a_signed_write_through_a_follower_is_taken_as_signed() {
     assert!(alpha.ok(&["get", "configmap/relayed"]).contains("relayed"));
 }
 
+/// Under `spec.signing: required` at format 4 every node refuses a bare write that changes access:
+/// a signed one made at the follower is relayed as it came, written Signed by the leader and
+/// applied alike on both; the certificate route (at the leader, the CA's node) writes its Identity
+/// Signed; an unsigned one, at either local socket or passed on by a node, is refused.
+#[test]
+fn signed_access_writes_are_applied_alike_and_bare_ones_are_refused_under_required() {
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_access", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster =
+        format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n");
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+    // Every member reads format 4 (a signed write is wrapped as Signed only from there).
+    let checked = r#""payload":{"Normal":"MarkChecked"}"#;
+    wait_for("both logs to hold the format 4 mark", || {
+        [&alpha, &beta]
+            .iter()
+            .all(|node| running_log_entries(node).is_some_and(|log| log.contains(checked)))
+    });
+
+    let at = |node: &Node, method: &str, path: &str, target: &str, nonce: u32, body: &str| {
+        let header = signed_by_admin(&id, target, method, path, body.as_bytes(), nonce);
+        let mut curl = Command::new("curl");
+        curl.current_dir(&node.dir).args(["--unix-socket", "kithd.sock"]);
+        let body = (!body.is_empty()).then_some(body);
+        ask(curl, method, &format!("http://kithd{path}"), &[(signed, &header)], body)
+    };
+    let bare_at = |node: &Node, body: &str| {
+        let mut curl = Command::new("curl");
+        curl.current_dir(&node.dir).args(["--unix-socket", "kithd.sock"]);
+        ask(curl, "POST", "http://kithd/v1/apply", &[], Some(body))
+    };
+    let required = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let (code, said) = at(&beta, "POST", "/v1/apply", "*", 1, &required);
+    assert_eq!(code, "200", "{said}");
+
+    // A signed Role, written at the follower: the leader and the follower both hold it.
+    let role = |name: &str| {
+        serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Role", "metadata": { "name": name },
+            "spec": { "rules": [{ "kinds": ["ConfigMap"], "verbs": ["get"] }] } }])
+        .to_string()
+    };
+    let (code, said) = at(&beta, "POST", "/v1/apply", "*", 2, &role("signed-role"));
+    assert_eq!(code, "200", "{said}");
+    for node in [&alpha, &beta] {
+        wait_for("both to hold the signed Role", || {
+            node.kith(&["get", "role/signed-role"]).0 == 0
+        });
+    }
+    // Written Signed: the leader's log holds the entry with its path.
+    wait_for("the leader's log to hold the Signed entry", || {
+        running_log_entries(&alpha).is_some_and(|log| log.contains("\"Signed\""))
+    });
+
+    // Bare: at either local socket (no signature), and passed on by beta for the local socket.
+    for node in [&alpha, &beta] {
+        let (code, said) = bare_at(node, &role("bare-role"));
+        assert!(
+            code == "403" && said.contains("requires the admin's signature"),
+            "{code} {said}"
+        );
+    }
+    let betas = beta.dir.join("state/pki");
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "POST",
+        "/v1/apply",
+        &[(by, "local socket")],
+        Some(&role("bare-role")),
+    );
+    assert!(
+        code == "403" && said.contains("an unsigned caller passed on by node beta"),
+        "{code} {said}"
+    );
+    for node in [&alpha, &beta] {
+        assert!(node.kith(&["get", "role/bare-role"]).0 != 0, "a bare Role was written");
+    }
+
+    // The certificate route at the leader writes the Identity Signed, and both hold its key.
+    let path = "/v1/identities/carol/certificate";
+    let (code, said) = at(&alpha, "POST", path, "alpha", 3, "");
+    assert_eq!(code, "200", "{said}");
+    let public = |node: &Node| {
+        let said = node.kith(&["get", "identity/carol", "-o", "json"]).1;
+        let (begin, end) = ("-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----");
+        let from = said.find(begin)?;
+        said.find(end).map(|to| said[from..to].to_string())
+    };
+    wait_for("both to hold carol's key", || {
+        let (one, two) = (public(&alpha), public(&beta));
+        one.is_some() && one == two
+    });
+    wait_for("the leader's log to hold the certificate's Signed entry", || {
+        running_log_entries(&alpha).is_some_and(|log| log.contains(path))
+    });
+    // Replayed, it is refused (its nonce was taken in the log).
+    let (code, said) = at(&alpha, "POST", path, "alpha", 3, "");
+    assert!(code == "401" && said.contains("used already"), "{code} {said}");
+}
+
 /// A signed delete and a signed rollback made at a follower reach the leader as the admin signed
 /// them, as an apply does: the follower passes each on as it came (its method, path and
 /// signature). A delete a node passes on with no signature is refused where the leader is.
