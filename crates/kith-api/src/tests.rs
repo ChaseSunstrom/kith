@@ -1370,6 +1370,67 @@ fn cluster_fields_nothing_reads_are_named() {
     assert!(read(other).not_acted_on().is_empty());
 }
 
+/// The house address and its endpoint are checked when a Cluster is applied, by the one parser
+/// kithd reads them with: each thing a LAN cannot have is refused, and says which.
+#[test]
+fn the_house_address_and_endpoint_are_checked_when_a_cluster_is_applied() {
+    let cluster = |home: &str| {
+        let text =
+            format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec:\n  home: {home}\n");
+        Resource::from_source(&text)
+            .and_then(|docs| docs.into_iter().collect::<Result<Vec<_>, _>>())
+            .map(drop)
+            .map_err(|e| e.msg)
+    };
+    assert_eq!(
+        kinds::home_address("10.9.0.100/24"),
+        Ok((std::net::Ipv4Addr::new(10, 9, 0, 100), 24))
+    );
+    cluster("{ address: 192.168.1.250/24, endpoint: 'house.example.org:51820' }").unwrap();
+    cluster("{ address: 192.168.1.250/24, endpoint: '203.0.113.7:51820' }").unwrap();
+    cluster("{ address: 192.168.1.250/24, endpoint: '[2001:db8::1]:51820' }").unwrap();
+    for (wrong, said) in [
+        ("", "IPv4 address with its prefix"),
+        ("10.9.0.100", "IPv4 address with its prefix"),
+        (" 10.9.0.100/24", "IPv4 address with its prefix"),
+        ("house.example.org/24", "IPv4 address with its prefix"),
+        ("fd00::1/64", "IPv4 address with its prefix"),
+        ("10.9.0.100/0", "prefix length is 1 to 30"),
+        ("10.9.0.100/31", "prefix length is 1 to 30"),
+        ("10.9.0.100/33", "prefix length is 1 to 30"),
+        ("10.9.0.0/24", "network address of its prefix"),
+        ("10.9.0.255/24", "broadcast address of its prefix"),
+        ("127.0.0.1/8", "loopback"),
+        ("224.0.0.1/24", "multicast"),
+        ("169.254.1.1/16", "link-local"),
+        ("0.1.2.3/24", "0.0.0.0/8"),
+        ("0.0.0.0/24", "0.0.0.0/8"),
+        ("255.255.255.255/24", "broadcast address 255.255.255.255"),
+        ("100.88.3.4/16", "default pod range"),
+        ("100.89.3.4/24", "people range"),
+    ] {
+        let e = kinds::home_address(wrong).unwrap_err();
+        assert!(e.contains(said), "{wrong:?}: {e}");
+        let e = cluster(&format!("{{ address: \"{wrong}\" }}")).unwrap_err();
+        assert!(e.contains("spec.home.address") && e.contains(said), "{wrong:?}: {e}");
+    }
+    // (10.9.0.255 is no broadcast address of a /23, only of a /24.)
+    assert!(kinds::home_address("10.9.0.255/23").is_ok());
+    for wrong in [
+        "house.example.org",
+        "house.example.org:0",
+        "house.example.org:70000",
+        ":51820",
+        "a b:80",
+        "-a.example:80",
+        "[nope]:80",
+        "a..b:80",
+    ] {
+        let e = cluster(&format!("{{ address: 10.9.0.100/24, endpoint: \"{wrong}\" }}")).unwrap_err();
+        assert!(e.contains("spec.home.endpoint"), "{wrong:?}: {e}");
+    }
+}
+
 /// An identity among a rule's signers (signed without a kept key): its issuer, its subject,
 /// its authority's certificates and its log's key, each checked for its shape when the
 /// Cluster is applied; and what is neither a key nor an identity refused.
@@ -2145,4 +2206,55 @@ fn an_identity_names_the_workloads_that_run_as_it() {
             .into(),
     );
     assert!(exec.unwrap_err().contains("only containers"));
+}
+
+const ALPHA: &str = "apiVersion: kith.dev/v1\nkind: Node\nmetadata: { name: alpha }\nspec: {}\n";
+const HOME_ZONE: &str =
+    "apiVersion: kith.dev/v1\nkind: DNSZone\nmetadata: { name: home }\nspec: { domain: home.example }\n";
+
+#[test]
+fn changes_count_an_apply_a_status_and_a_delete_of_their_kind_only() {
+    let mut store = Store::default();
+    assert_eq!(store.changes("Node"), 0);
+    store.apply(one(ALPHA)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 0));
+    store.apply(one(HOME_ZONE)).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (1, 1));
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 1));
+    store.delete("DNSZone/home").unwrap();
+    assert_eq!((store.changes("Node"), store.changes("DNSZone")), (2, 2));
+    assert_eq!(store.changes("Service"), 0);
+}
+
+#[test]
+fn changes_of_a_write_that_changes_nothing_move_nothing() {
+    let mut store = Store::default();
+    store.apply(one(ALPHA)).unwrap();
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    let before = store.changes("Node");
+    // The same spec again, and the same status again: no change.
+    assert_eq!(store.apply(one(ALPHA)).unwrap().action, Action::Unchanged);
+    store.set_status("Node/alpha", Some(json!({"state": "ready"}))).unwrap();
+    // A delete that finds nothing, and a status for a key there is not.
+    assert!(store.delete("Node/ghost").is_err());
+    assert!(store.set_status("Node/ghost", None).is_err());
+    assert_eq!(store.changes("Node"), before);
+    assert_eq!(store.changes("DNSZone"), 0);
+}
+
+#[test]
+fn changes_go_on_when_a_store_is_replaced_whole() {
+    let mut before = Store::default();
+    before.apply(one(ALPHA)).unwrap();
+    // A store brought in (an import, a snapshot) keeps no counts, and has a zone this one lacks.
+    let mut brought = Store::default();
+    brought.apply(one(HOME_ZONE)).unwrap();
+    brought.apply(one(ALPHA)).unwrap();
+    let mut brought: Store = serde_json::from_str(&serde_json::to_string(&brought).unwrap()).unwrap();
+    assert_eq!(brought.changes("Node"), 0);
+    brought.continue_changes(&before);
+    assert!(brought.changes("Node") > before.changes("Node"));
+    assert!(brought.changes("DNSZone") > before.changes("DNSZone"));
+    assert!(brought.get("Node/alpha").is_some());
 }

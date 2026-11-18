@@ -460,6 +460,8 @@ impl Follower<'_> {
                 }
                 {
                     let mut state = shared.store.lock().expect("a handler panicked holding the store");
+                    // The counts go on from the store replaced, so a reader that saw it sees each kind move.
+                    store.continue_changes(&state.store);
                     state.store = store;
                     shared.view.send_replace(Some(at));
                     poke();
@@ -1182,6 +1184,81 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
         // From here on a change is asked of the control node, and Raft's routes are not served.
         let write = shared.write(Command::Patch { statuses: Vec::new() }).await;
         assert!(write.unwrap_err().to_string().contains("this node is a worker"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_whole_view_that_replaces_the_store_moves_the_zone_counts() {
+        use axum::routing::get;
+        let dir = std::env::temp_dir().join(format!("kith-replace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = pki::Ca::create().unwrap();
+        let node = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            pki::Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, w) = (node("a"), node("w"));
+        let cluster = crate::cluster::Cluster::new(w, None).unwrap();
+        let shared = crate::replica(Some(cluster), &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        // The control node says Node/a is at one address, then at another: the same resources,
+        // so the store that replaces the one a worker has is the same shape.
+        let whole = |address: &str| {
+            let mut node = store().get("Node/a").unwrap().clone();
+            let mut status = node.status.take().unwrap_or(json!({}));
+            status["address"] = json!(address);
+            node.status = Some(status);
+            let line = format!(
+                "{}\n",
+                serde_json::to_string(&Sent::Whole {
+                    at: 5,
+                    resources: vec![node]
+                })
+                .unwrap()
+            );
+            axum::Router::new().route("/v1/view", get(move || std::future::ready(line.clone())))
+        };
+        let first = None;
+        let mut follower = Follower {
+            shared: &shared,
+            state: &dir,
+            first: &first,
+            stale: false,
+            saved: Instant::now(),
+            kept: false,
+        };
+        let mut stopping = shared.stop.subscribe();
+        let print = pki::print_of(&a.cert).unwrap();
+        let at = |port: u16| Upstream {
+            name: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+            certificate: Some(print.clone()),
+        };
+
+        let port = serve_as(&a, whole("10.1.2.3:7443")).await;
+        assert_eq!(stream(&mut follower, &at(port), &mut stopping).await, Ok(true));
+        let mut built = crate::dns::Built::default();
+        let (node_count, zones) = {
+            let state = shared.store.lock().unwrap();
+            (state.store.changes("Node"), built.changed(&state.store))
+        };
+        assert!(zones, "the first view builds the zones");
+
+        // The same shape, with only Node/a's address moved: its zones must be built again.
+        let port = serve_as(&a, whole("10.9.9.9:7443")).await;
+        assert_eq!(stream(&mut follower, &at(port), &mut stopping).await, Ok(true));
+        let state = shared.store.lock().unwrap();
+        assert!(
+            state.store.changes("Node") > node_count,
+            "the Node count moved past the old store's"
+        );
+        assert!(built.changed(&state.store), "a changed Node address is a changed zone");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

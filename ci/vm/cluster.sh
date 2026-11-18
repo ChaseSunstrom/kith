@@ -10,6 +10,7 @@
         helms=$(printf '%s' "${KITH_HELM:-$(command -v helm || true)}" | tr ':' ' ')
         [ "$test" != kube ] || [ -x "$kubectl" ] || skip "no kubectl (KITH_KUBECTL names one; sh ci/kube.sh --vm fetches one)"
         [ "$test" != quota ] || command -v socat >/dev/null 2>&1 || skip "no socat to restart a node with"
+        [ "$test" != home ] || command -v socat >/dev/null 2>&1 || skip "no socat to reset and stop a node with"
         if [ "$test" = pods ]; then
             command -v socat >/dev/null 2>&1 || skip "no socat to plug a keyboard in with"
         fi
@@ -247,6 +248,8 @@ EOF
         # unrestricted: this test's nodes keep their card out open; the value is put back after.)
         keep=${net_restrict-,restrict=on}
         [ "$test" != pods ] || net_restrict=''
+        # (home: every node serves DNS on all its addresses, the house address too once it holds it.)
+        [ "$test" != home ] || { first='--dns 0.0.0.0:5353'; joined='--dns 0.0.0.0:5353'; }
         node 1 "--claim ${first:-}"
         net_restrict=$keep
         tries=0
@@ -371,6 +374,9 @@ EOF
 
         if [ "$test" = chaos ]; then
             . "$root/ci/vm/chaos.sh"
+        fi
+        if [ "$test" = home ]; then
+            . "$root/ci/vm/home.sh"
         fi
 
         # Before any release, each node says it takes releases from its image's keys (each

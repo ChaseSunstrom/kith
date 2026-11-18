@@ -1,9 +1,30 @@
 # kithd in two parts: what reads the network holds no root
 
-Status: design, before any code (T-0334). Nothing here is built. A security review reads
-this record before the first line of the split is written; what it finds is decided at
-the end ("Review"). The first cut ("Step A") ships by itself and is worth having even if
-the rest is never built.
+Status: design, partly built (T-0334). Built: Step A, the node's own policy
+(`crates/kithd/src/policy.rs`, read and applied in `main.rs:729-734`), and the seam of the
+split in `crates/kithd/src/root_part.rs`, with listeners as its first family. Not built:
+the socket, the second process, every other family, the serving part's confinement. A
+security review read this record before the split was written; what it found is decided
+at the end ("Review"). Step A ships by itself and is worth having even if the rest is
+never built.
+
+What is built, where the code is the word where this record differs:
+
+- **Step A** (`policy.rs`): `read` takes `KITH_NODE_POLICY` or the flag, `cut` applies it,
+  `set`/`get` hold it for the process; its status is in the node's status (`main.rs:1121`).
+- **`root_part.rs`**: the `Request` enum (only `Bind` so far, `deny_unknown_fields`), its
+  wire (`decode`: JSON, at most `MAX_REQUEST` = 256 KiB, unknown fields and variants
+  refused; nothing reads a wire yet, the tests do), `check` (a request is refused for what
+  it is, never for who asks; `Bind` refuses kithd's own ports 7443, 5000, 51820 and
+  multicast addresses), and the `Root` trait with its in-process `Direct`.
+- **`Bind`** is used by `share.rs`'s NFS listener (`share.rs:397`).
+- There is no socket and no second process yet.
+
+The carve of the rest, one task each: T-0808 pods and Services behind `Root`, with a
+counter of crossings; T-0809 mesh, images, units, volumes and node; T-0810 the socket
+pair transport, `--split` off by default; T-0811 confinement of the serving part, tied
+lifetimes of the two parts, and the VM test of privilege; T-0812 the before and after
+runs, the budgets, and `--split` on by default.
 
 ## The problem
 
@@ -190,6 +211,9 @@ what it is, never for who asked.
 |---|---|---|
 | Listeners | `Bind(address, port, tcp or udp)` → a socket | not a port the root part uses itself; counted |
 | Mesh | `Mesh(peers, addresses)` | every allowed address inside the cluster's mesh and pod ranges, which the root part has from the node's own configuration, and none of them this node's own; the private key never leaves it. **Not checked, and it cannot be**: that a peer's key is the node whose address it is given. A node's mesh address comes from its name (`kith-mesh`, `node_address`) and who has which key is the store's word, so a hole in the store can stand at another node's mesh address (and be that node to an NFS share, which knows clients by address). Said in SECURITY.md |
+| People: device | `PeopleUp` → the device `kwg0` up with the people key, its port, `100.89.0.1/16` and the people /64's `::1`, and no peers | nothing from the asker: the port and the addresses come from the node's own `--people` and configuration, the key is made here once in `pki/people.key` (mode 0600) and kept, and the reply carries only the public key |
+| People: table | `PeopleTable` → the `inet kith-people` table, written before the device | nothing from the asker: the rules are kith-mesh's `people::build` from the node's own settings, with default drop and the masquerade rules required, so a kernel without them refuses and `--people` does not start |
+| People: remove | `PeopleGone` → the device and the table removed | only the names kithd makes (`kwg0`, `kith-people`); what an earlier start left is taken away the same way when `--people` is not given |
 | Pods | `PodNode` (once), `Pod(number)`, `PodGone(number)`, `PodSockets(number, count)` → up to 16 sockets made inside the pod's namespace | the number in range and made by this root part; count at most 16; at most 32 unused sockets a pod and a time after which unused ones are closed |
 | Services | `ServiceTable(entries)` | the root part builds the BPF program itself; every entry inside the cluster's Service range, sent to this node only |
 | Images | `Unpack(manifest's layer digests, layers as file handles)`, `Drop(digest)` | the root part hashes each layer itself as it reads it and refuses one that is not the digest named (today the pulling code does, which becomes the serving part); the same containment as `unpack_layer` today (nothing outside the image's root, what it refuses today refused); the path is the root part's own for that digest. This is integrity, not authority: the asker picks the image |
@@ -405,7 +429,8 @@ used by `share.rs`'s NFS listener). No socket and no second process yet.
 Taken in step 4 on the commit before Step A and again after the split, three runs each
 on the same VMs: apply to ready, and requests a second through a Service
 (`ci/compare.sh`'s rows by those names), and idle memory of both parts together (each
-part's proportional share, summed). The before runs are written here when taken. Two
+part's proportional share, summed). The before and after runs are taken and written here
+by T-0812, not before. Two
 processes of one binary share its text; the root part's own memory is what is added.
 The 9.00 MB idle budget is not moved by this task: if the sum passes what the single
 process holds today, the owner is asked.
