@@ -345,7 +345,25 @@ fn cidr_parses_and_matches() {
     assert!("0.0.0.0/0".parse::<Cidr>().unwrap().contains(LOCAL));
     assert!("::/0".parse::<Cidr>().unwrap().contains("fd00::1".parse().unwrap()));
     assert!("1.2.3.4".parse::<Cidr>().unwrap().contains("1.2.3.4".parse().unwrap()));
-    for bad in ["1.2.3.4/33", "::/129", "x/8", "1.2.3.4/", "1.2.3.4/-1", ""] {
+    // An IPv4 network written as IPv6 (`::ffff:a.b.c.d`) names those IPv4 clients.
+    let mapped: Cidr = "::ffff:10.1.0.0/112".parse().unwrap();
+    assert!(mapped.contains("10.1.2.3".parse().unwrap()) && mapped.contains("::ffff:10.1.2.3".parse().unwrap()));
+    assert!(!mapped.contains("10.2.0.0".parse().unwrap()));
+    assert!(
+        "::ffff:1.2.3.4"
+            .parse::<Cidr>()
+            .unwrap()
+            .contains("1.2.3.4".parse().unwrap())
+    );
+    for bad in [
+        "1.2.3.4/33",
+        "::/129",
+        "x/8",
+        "1.2.3.4/",
+        "1.2.3.4/-1",
+        "",
+        "::ffff:0.0.0.0/95",
+    ] {
         assert!(bad.parse::<Cidr>().is_err(), "{bad}");
     }
 }

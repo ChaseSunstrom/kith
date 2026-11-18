@@ -237,16 +237,23 @@ impl Cidr {
 impl FromStr for Cidr {
     type Err = String;
 
-    /// `10.0.0.0/8`, `fd00::/8`, or a bare address for one host.
+    /// `10.0.0.0/8`, `fd00::/8`, or a bare address for one host. An IPv4 network written as
+    /// IPv6 (`::ffff:10.0.0.0/104`) is that IPv4 network, as a client's address is taken
+    /// ([`Cidr::contains`]); one wider than all of IPv4 (under /96) is refused.
     fn from_str(s: &str) -> Result<Cidr, String> {
         let (addr, bits) = s.split_once('/').map_or((s, None), |(a, b)| (a, Some(b)));
         let addr: IpAddr = addr.parse().map_err(|_| format!("invalid network {s:?}"))?;
         let max = if addr.is_ipv4() { 32 } else { 128 };
-        let bits = bits.map_or(Some(max), |b| b.parse().ok().filter(|b| *b <= max));
-        Ok(Cidr {
-            addr,
-            bits: bits.ok_or_else(|| format!("invalid prefix length in {s:?}"))?,
-        })
+        let bits: u8 = bits
+            .map_or(Some(max), |b| b.parse().ok().filter(|b| *b <= max))
+            .ok_or_else(|| format!("invalid prefix length in {s:?}"))?;
+        match addr.to_canonical() {
+            IpAddr::V4(v4) if addr.is_ipv6() => match bits.checked_sub(96) {
+                Some(bits) => Ok(Cidr { addr: v4.into(), bits }),
+                None => Err(format!("{s:?} is wider than IPv4 written as IPv6 (::ffff:0.0.0.0/96)")),
+            },
+            _ => Ok(Cidr { addr, bits }),
+        }
     }
 }
 
