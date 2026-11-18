@@ -1,7 +1,8 @@
 //! `kith`: the command line for kith.
 //!
-//! Commands talk to kithd over its unix socket, or with `--store` work on a
-//! store file directly (no daemon, nothing runs).
+//! Commands talk to kithd over its unix socket, or with `--server` over TLS to a node
+//! (cargo feature `remote`), or with `--store` work on a store file directly (no daemon,
+//! nothing runs).
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kith_api::store::{self, Action, Change, FileStore, Revision, Store, rfc3339};
@@ -12,7 +13,11 @@ use std::process::ExitCode;
 
 mod import;
 mod remote;
+mod signing;
 mod ui;
+mod wire;
+
+use wire::{Route, Wire};
 
 #[derive(Parser)]
 #[command(
@@ -34,9 +39,15 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     timeout: u64,
-    /// Work on a store file directly instead of talking to kithd (wins over --socket)
+    /// Work on a store file directly instead of talking to kithd (wins over --server and --socket)
     #[arg(long, env = "KITH_STORE", global = true, value_name = "FILE")]
     store: Option<PathBuf>,
+    /// kithd on a node, over TLS: the node's --listen address (wins over --socket; needs --identity)
+    #[arg(long, env = "KITH_SERVER", global = true, value_name = "HOST:PORT")]
+    server: Option<String>,
+    /// The identity directory to show the node: its ca.crt, and NAME.crt with NAME.key
+    #[arg(long, env = "KITH_IDENTITY", global = true, value_name = "DIR")]
+    identity: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -153,6 +164,11 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// The admin's key: what signs the cluster's writes under `spec.signing: required`
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
     /// Show who changed what through this node, and who was refused
     Audit {
         /// How many of the last entries to show (1000 at most)
@@ -229,6 +245,13 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     text
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    /// Set the Cluster's spec.adminKey from a passphrase typed now (kept nowhere): the key
+    /// that signs writes under `spec.signing: required`, the same one each time it is typed
+    Key,
 }
 
 #[derive(Subcommand)]
@@ -394,6 +417,12 @@ enum NodeCommand {
     },
     /// Say which node leads the store, which nodes vote, and how far this one has got
     Status,
+    /// Print the `--spec` file of the features NAME's hardware wants, from its PCI cards:
+    /// `kith node features NAME > NAME.yaml`, then `sh os/build.sh --spec NAME.yaml --out DIR`
+    Features {
+        /// The node, as `kith get Node` names it
+        name: String,
+    },
     /// Move what runs on NAME to other nodes, and keep new replicas off it: each replica that
     /// cannot move is said first. A running Job and a replica pinned to NAME stay where they are
     Drain {
@@ -585,6 +614,8 @@ impl Backend {
 
     /// All or nothing. A dry run reports the same changes and keeps none of them.
     fn apply(&self, resources: Vec<Resource>, dry_run: bool) -> Result<Vec<Change>, String> {
+        // (Refused here as kithd refuses it, so a local store takes no dotted name either.)
+        resources.iter().try_for_each(Resource::submitted)?;
         match self {
             Backend::Local(path) => Self::local(path, !dry_run, |store| store.apply_all(resources)),
             Backend::Daemon(socket) => {
@@ -651,7 +682,7 @@ impl Backend {
 }
 
 struct Kithd {
-    socket: PathBuf,
+    route: Route,
     /// How long it may stay silent.
     timeout: std::time::Duration,
 }
@@ -670,9 +701,9 @@ fn escape(key: &str) -> String {
         .collect()
 }
 
-/// What is typed at the terminal after `prompt`, unseen and twice the same; from a pipe,
-/// its first line.
-fn secret(prompt: &str) -> Result<String, String> {
+/// What is typed at the terminal after `prompt`, unseen (and, when `twice`, again to be the
+/// same); from a pipe, its first line.
+fn secret(prompt: &str, twice: bool) -> Result<String, String> {
     use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
     use std::io::IsTerminal;
     let stdin = std::io::stdin();
@@ -697,24 +728,96 @@ fn secret(prompt: &str) -> Result<String, String> {
         eprintln!();
         typed
     };
-    let (first, again) = (typed(prompt)?, typed("Once more: ")?);
+    let first = typed(prompt)?;
+    if !twice {
+        return Ok(first);
+    }
+    let again = typed("Once more: ")?;
     if first != again {
         return fail("the two are not the same: nothing was done");
     }
     Ok(first)
 }
 
-/// kithd's socket, open.
-fn connect(kithd: &Kithd) -> Result<std::os::unix::net::UnixStream, String> {
-    let socket = &kithd.socket;
-    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
-        let socket = socket.display();
-        format!("error: cannot reach kithd at {socket}: {e}\nStart kithd, or work on a store file with --store FILE.")
-    })?;
+/// Where the admin's passphrase comes from: the terminal, else one line of stdin, which no
+/// line can give when stdin carries the input (`apply -f -`): then the manifest goes as a file.
+#[derive(Debug, PartialEq)]
+enum Source {
+    Tty,
+    Stdin,
+    Refuse,
+}
+
+fn passphrase_source(tty_opens: bool, stdin_is_input: bool) -> Source {
+    match (tty_opens, stdin_is_input) {
+        (true, _) => Source::Tty,
+        (false, false) => Source::Stdin,
+        (false, true) => Source::Refuse,
+    }
+}
+
+/// Set once a command reads its input from stdin (`apply -f -`, `volume put -`).
+static STDIN_WAS_INPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The admin's passphrase: typed at /dev/tty with echo off (twice, when `twice`), else one line
+/// of stdin.
+fn admin_passphrase(prompt: &str, twice: bool) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty");
+    let source = passphrase_source(tty.is_ok(), STDIN_WAS_INPUT.load(Ordering::SeqCst));
+    match source {
+        Source::Tty => typed_on(&tty.expect("chosen only when /dev/tty opened"), prompt, twice),
+        Source::Stdin => one_line(&mut std::io::stdin().lock()),
+        Source::Refuse => fail(
+            "the admin's passphrase is typed at a terminal, and stdin holds the manifest: give the manifest as a file (kith apply -f FILE)",
+        ),
+    }
+}
+
+/// What is typed on `tty` after `prompt`, unseen (and, when `twice`, again to be the same).
+fn typed_on(tty: &std::fs::File, prompt: &str, twice: bool) -> Result<String, String> {
+    use nix::sys::termios::{LocalFlags, SetArg, tcgetattr, tcsetattr};
+    use std::io::{BufReader, Write};
+    let shown = tcgetattr(tty).or_else(|e| fail(format!("/dev/tty: {e}")))?;
+    let mut unseen = shown.clone();
+    unseen.local_flags.remove(LocalFlags::ECHO);
+    let mut out = tty;
+    let mut input = BufReader::new(tty);
+    let mut typed = |prompt: &str| {
+        let _ = out.write_all(prompt.as_bytes()).and_then(|()| out.flush());
+        let _ = tcsetattr(tty, SetArg::TCSANOW, &unseen);
+        let typed = one_line(&mut input);
+        let _ = tcsetattr(tty, SetArg::TCSANOW, &shown);
+        let _ = out.write_all(b"\n");
+        typed
+    };
+    let first = typed(prompt)?;
+    if !twice {
+        return Ok(first);
+    }
+    let again = typed("Once more: ")?;
+    if first != again {
+        return fail("the two are not the same: nothing was done");
+    }
+    Ok(first)
+}
+
+/// The next line of `input`, without its line end.
+fn one_line(input: &mut impl std::io::BufRead) -> Result<String, String> {
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .or_else(|e| fail(format!("reading the passphrase: {e}")))?;
+    Ok(line.trim().to_string())
+}
+
+/// kithd, open: its socket, or a node over TLS.
+fn connect(kithd: &Kithd) -> Result<Wire, String> {
     // A kithd that accepts and then says nothing must not hang a script forever.
-    let timeout = Some(kithd.timeout);
-    let _ = stream.set_read_timeout(timeout).and(stream.set_write_timeout(timeout));
-    Ok(stream)
+    Wire::connect(&kithd.route, Some(kithd.timeout)).map_err(|e| {
+        let name = kithd.route.name();
+        format!("error: cannot reach kithd at {name}: {e}\nStart kithd, or work on a store file with --store FILE.")
+    })
 }
 
 /// What a reply that is not a yes says: API errors are `{"error": "..."}`; anything else
@@ -746,6 +849,16 @@ fn unchunk(from: &mut impl std::io::BufRead, to: &mut dyn std::io::Write) -> std
 /// (written to `to` as it comes) is too long to hold: a volume's files. The reply's body,
 /// when it did not go to `to`. An error reading `from` ends the request unfinished, which
 /// kithd takes as no request at all.
+/// Why a body sent as a stream (a volume's files put from stdin or a tar) cannot be sent to a
+/// cluster that says `signing: required`: the digest the signature covers is not known until the
+/// body is all sent, so it goes unsigned, and kithd refuses an unsigned change there. Stays so.
+fn streamed_refusal(status: &serde_json::Value) -> Option<&'static str> {
+    (status["signing"] == "required").then_some(
+        "this cluster requires the admin's signature (spec.signing: required), and a volume's files \
+         sent as a stream cannot be signed yet, so the put is refused: nothing was sent",
+    )
+}
+
 fn carry(
     kithd: &Kithd,
     method: &str,
@@ -754,13 +867,31 @@ fn carry(
     to: Option<&mut dyn std::io::Write>,
 ) -> Result<Vec<u8>, String> {
     use std::io::{BufRead, Write};
+    // (A body sent in chunks is not signed: its digest is not known before it is sent. Where the
+    // cluster requires the admin's signature kithd refuses it unsigned, so it is refused here, and
+    // says why, before any of it is sent. That stays so until a streamed body can be signed.)
+    if from.is_some() && matches!(kithd.route, Route::Socket(_)) {
+        let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+        if let Some(why) = streamed_refusal(&status) {
+            return fail(why);
+        }
+    }
+    let asked = if from.is_none() {
+        signed(kithd, method, path, b"")?
+    } else {
+        None
+    };
+    let signed = match asked {
+        Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
+        None => String::new(),
+    };
     let mut stream = connect(kithd)?;
     let framing = if from.is_some() {
         "Transfer-Encoding: chunked\r\n"
     } else {
         ""
     };
-    let head = format!("{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n{framing}\r\n");
+    let head = format!("{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\n{framing}{signed}\r\n");
     let mut sent = stream.write_all(head.as_bytes());
     if let Some(from) = from {
         let mut chunk = vec![0; 64 << 10];
@@ -873,12 +1004,64 @@ fn request<T: serde::de::DeserializeOwned>(kithd: &Kithd, method: &str, path: &s
     serde_json::from_slice(&reply).or_else(|e| fail(format!("reading kithd's reply: {e}")))
 }
 
+/// The passphrase typed for this run's signed writes: asked for once, when the first is signed.
+static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The admin's key from it, for the cluster kithd named: one cluster per run.
+static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
+
+/// The signature a request to kithd's socket carries where the cluster says `signing: required`
+/// (none for a node over TLS, an open cluster, or a read of the node's own: kithd reads those as
+/// its own). A read another node may pass on is signed: the logs and a volume's files (kithd's
+/// and this crate's `passed_on`, kith-api). Its key is the passphrase's, salted with the cluster id kithd gives.
+fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option<String>, String> {
+    if (matches!(method, "GET" | "HEAD") && !kith_api::passed_on(method, path))
+        || !matches!(kithd.route, Route::Socket(_))
+    {
+        return Ok(None);
+    }
+    let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+    if status["signing"] != "required" {
+        return Ok(None);
+    }
+    let Some(cluster) = status["clusterId"].as_str() else {
+        return fail("kithd gave no cluster id to sign with: update kithd");
+    };
+    // (The key is derived once per run: PBKDF2 at 600000 rounds is the slow part, and a follow polls.)
+    let key = match KEY.get() {
+        Some(key) => key,
+        None => {
+            if PASSPHRASE.get().is_none() {
+                let typed = admin_passphrase("The admin's passphrase, which signs this change: ", false)?;
+                let _ = PASSPHRASE.set(typed);
+            }
+            KEY.get_or_init(|| signing::key(PASSPHRASE.get().map_or("", String::as_str), cluster))
+        }
+    };
+    let asked = signing::Request { method, path, body };
+    // "*": this node is the one it is sent to, and a node passes it on only to where it belongs.
+    let header = signing::header(
+        key,
+        cluster,
+        "*",
+        &asked,
+        kith_api::store::now() + 300,
+        &signing::nonce()?,
+    );
+    Ok(Some(header))
+}
+
 /// The same, the reply's body as it came.
 fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     use std::io::Write;
+    // (Before the connection: a signed write first asks kithd for its cluster's id.)
+    let signed = match signed(kithd, method, path, body)? {
+        Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
+        None => String::new(),
+    };
     let mut stream = connect(kithd)?;
     let head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: kithd\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{signed}\r\n",
         body.len()
     );
     let mut reply = Vec::new();
@@ -927,13 +1110,28 @@ fn raw(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, 
 }
 
 fn run(cli: Cli) -> Result<ExitCode, String> {
-    let backend = || match (&cli.store, cli.socket.clone().or_else(kith_api::default_socket)) {
-        (Some(path), _) => Ok(Backend::Local(path.clone())),
-        (None, Some(socket)) => Ok(Backend::Daemon(Kithd {
-            socket,
-            timeout: std::time::Duration::from_secs(cli.timeout),
+    let timeout = std::time::Duration::from_secs(cli.timeout);
+    let backend = || match (
+        &cli.store,
+        &cli.server,
+        cli.socket.clone().or_else(kith_api::default_socket),
+    ) {
+        (Some(path), _, _) => Ok(Backend::Local(path.clone())),
+        (None, Some(server), _) => match &cli.identity {
+            Some(identity) => Ok(Backend::Daemon(Kithd {
+                route: Route::Node {
+                    server: server.clone(),
+                    identity: identity.clone(),
+                },
+                timeout,
+            })),
+            None => fail("--server needs --identity DIR: the identity kithd is to see (kith identity makes one)"),
+        },
+        (None, None, Some(socket)) => Ok(Backend::Daemon(Kithd {
+            route: Route::Socket(socket),
+            timeout,
         })),
-        (None, None) => fail("no kithd socket: set --socket, or --store for a store file"),
+        (None, None, None) => fail("no kithd socket: set --socket or --server, or --store for a store file"),
     };
     match cli.command {
         Command::Import { command } => return import::run(command),
@@ -1237,6 +1435,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 VolumeCommand::Put { name, path, namespace } => {
                     let route = route(&namespace, &name);
                     let done = if path.as_os_str() == "-" {
+                        STDIN_WAS_INPUT.store(true, std::sync::atomic::Ordering::SeqCst);
                         carry(&kithd, "PUT", &route, Some(&mut std::io::stdin().lock()), None)?
                     } else {
                         // A directory's content, or the one file, under the name it has.
@@ -1462,7 +1661,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let passphrase = match off {
                 true => None,
-                false => Some(secret(&format!("A passphrase for {name}'s state: "))?),
+                false => Some(secret(&format!("A passphrase for {name}'s state: "), true)?),
             };
             let body = serde_json::json!({ "passphrase": passphrase }).to_string();
             let _: serde_json::Value =
@@ -1492,7 +1691,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             // it for itself alone and passes it on to no node.)
             let pin = match off {
                 true => None,
-                false => Some(secret(&format!("A PIN for {name}'s state, 6 to 32 digits: "))?),
+                false => Some(secret(&format!("A PIN for {name}'s state, 6 to 32 digits: "), true)?),
             };
             let body = serde_json::json!({ "pin": pin, "untried": untried_tpm }).to_string();
             let said: serde_json::Value = request(&kithd, "POST", &format!("/v1/lock/{name}/pin"), body.as_bytes())?;
@@ -1502,6 +1701,28 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 ),
                 None => println!("{name} has no PIN: it asks the cluster for the key of its state"),
             }
+        }
+        Command::Admin {
+            command: AdminCommand::Key,
+        } => {
+            let backend = backend()?;
+            let Backend::Daemon(kithd) = &backend else {
+                return fail("the admin's key is set through kithd: leave out --store");
+            };
+            let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+            let Some(cluster_id) = status["clusterId"].as_str() else {
+                return fail("kithd gave no cluster id to derive the key with: update kithd");
+            };
+            let passphrase = admin_passphrase("A passphrase for the admin's key: ", true)?;
+            let public = signing::public(&signing::key(&passphrase, cluster_id));
+            // (The write below is signed with this same passphrase: the key it sets, if it is the one there.)
+            let _ = PASSPHRASE.set(passphrase);
+            let clusters = backend.list(Some("Cluster"))?;
+            let [mut cluster] = <[Resource; 1]>::try_from(clusters)
+                .map_err(|all| format!("error: {} Clusters: exactly one is needed to set its key", all.len()))?;
+            cluster.spec["adminKey"] = serde_json::json!(public);
+            backend.apply(vec![cluster], false)?;
+            println!("The Cluster's spec.adminKey is set: writes signed with this passphrase are its admin's");
         }
         Command::Identity {
             command: IdentityCommand::Cert { name, out },
@@ -1572,7 +1793,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let Backend::Daemon(kithd) = backend()? else {
                 return fail("the web UI is kithd's: leave out --store");
             };
-            ui::serve(&kithd.socket, port)?;
+            ui::serve(&kithd.route, port)?;
         }
         Command::Audit { tail } => {
             let Backend::Daemon(kithd) = backend()? else {
@@ -1597,6 +1818,12 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 ]
             });
             print_table(["WHEN", "WHO", "DID", "WHAT", "OUTCOME"], rows.collect());
+        }
+        Command::Node {
+            command: NodeCommand::Features { name },
+        } => {
+            let node = backend()?.get(&format!("Node/{name}"))?;
+            print!("{}", features_spec(&node)?);
         }
         Command::Node {
             command: NodeCommand::Status,
@@ -1891,7 +2118,12 @@ fn watch_get(kithd: &Kithd, kind: Option<&str>, keep: impl Fn(&Resource) -> bool
             Ok(now) => now,
             // A kithd too busy to answer in time has not changed anything we would miss: ask again.
             Err(e) if after.is_some() && e.contains("has not answered") => continue,
-            Err(e) if after.is_some() && (e.contains("cannot reach kithd") || e.contains("sent no reply")) => {
+            Err(e)
+                if after.is_some()
+                    && (e.contains("cannot reach kithd")
+                        || e.contains("sent no reply")
+                        || e.contains("without closing TLS")) =>
+            {
                 return fail("kithd stopped");
             }
             Err(e) => return Err(e),
@@ -2111,6 +2343,7 @@ fn load(files: &Files) -> Result<Vec<Resource>, String> {
             continue;
         }
         let (name, src) = if path.as_os_str() == "-" {
+            STDIN_WAS_INPUT.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut src = String::new();
             std::io::stdin()
                 .read_to_string(&mut src)
@@ -2163,6 +2396,73 @@ fn print_rows(header: &[&str], rows: &[Vec<String>]) {
     line(header.to_vec());
     for row in rows {
         line(row.iter().map(String::as_str).collect());
+    }
+}
+
+/// The `--spec` file of the features NAME's hardware wants (`status.os.wants`, from its PCI cards
+/// matched by os/features' `# pci:` ids), for os/build.sh. A name that is not a feature name is
+/// refused: os/build.sh reads the list as names, so a comma in one would add a feature.
+fn features_spec(node: &Resource) -> Result<String, String> {
+    let name = &node.metadata.name;
+    let wants = node
+        .status
+        .as_ref()
+        .and_then(|status| status["os"]["wants"].as_array())
+        .ok_or_else(|| {
+            format!("{name} has not said what its hardware wants: it runs no kith OS, or its kithd is older")
+        })?;
+    let names = wants
+        .iter()
+        .map(|want| {
+            want.as_str()
+                .filter(|want| {
+                    !want.is_empty()
+                        && want
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                })
+                .ok_or_else(|| format!("{name}'s wants are not feature names"))
+        })
+        .collect::<Result<Vec<&str>, String>>()?;
+    let mut text = if names.is_empty() {
+        format!("# {name}: no feature matches its PCI cards, so none is wanted\n")
+    } else {
+        format!("# {name}: the features its hardware wants, from its PCI cards (os/features' # pci: ids)\n")
+    };
+    text.push_str(&format!("features: [{}]\n", names.join(", ")));
+    Ok(text)
+}
+
+#[cfg(test)]
+mod passphrase_tests {
+    use super::{Source, passphrase_source};
+
+    #[test]
+    fn the_admin_passphrase_comes_from_the_terminal_or_one_stdin_line_never_a_manifest() {
+        assert_eq!(passphrase_source(true, false), Source::Tty);
+        assert_eq!(passphrase_source(true, true), Source::Tty);
+        assert_eq!(passphrase_source(false, false), Source::Stdin);
+        assert_eq!(passphrase_source(false, true), Source::Refuse);
+    }
+
+    #[test]
+    fn a_read_another_node_may_pass_on_is_signed_and_the_rest_are_not() {
+        // (The list is kith-api's, shared with kithd: its own test checks each route.)
+        assert!(kith_api::passed_on("GET", "/v1/logs/Workload/default/web?replica=0"));
+        assert!(kith_api::passed_on("GET", "/v1/volumes/default/data/files"));
+        assert!(!kith_api::passed_on("GET", "/v1/cluster"));
+        assert!(!kith_api::passed_on("GET", "/v1/resources?namespace=default"));
+    }
+
+    #[test]
+    fn a_streamed_put_is_refused_where_writes_must_be_signed_and_says_why() {
+        use super::streamed_refusal;
+        let why = streamed_refusal(&serde_json::json!({"signing": "required"})).unwrap();
+        assert!(
+            why.contains("as a stream") && why.contains("spec.signing: required"),
+            "{why}"
+        );
+        assert!(streamed_refusal(&serde_json::json!({"signing": "open"})).is_none());
     }
 }
 
@@ -2226,5 +2526,30 @@ mod drain_tests {
             json!({ "address": "198.51.100.9:7443", "state": "ready", "serves": {} }),
         );
         assert_eq!(table_row(&plain)[4], "ready at 198.51.100.9:7443");
+    }
+
+    #[test]
+    fn node_features_prints_the_spec_the_node_wants() {
+        use super::features_spec;
+        use kith_api::Resource;
+        let node = |status: serde_json::Value| {
+            let node = json!({
+                "apiVersion": "kith.dev/v1", "kind": "Node", "metadata": { "name": "n1" },
+                "spec": {}, "status": status,
+            });
+            serde_json::from_value::<Resource>(node).unwrap()
+        };
+        let spec = features_spec(&node(json!({ "os": { "wants": ["gpu-amd-phoenix", "nic-x"] } }))).unwrap();
+        assert_eq!(
+            spec,
+            "# n1: the features its hardware wants, from its PCI cards (os/features' # pci: ids)\nfeatures: [gpu-amd-phoenix, nic-x]\n"
+        );
+        let none = features_spec(&node(json!({ "os": { "wants": [] } }))).unwrap();
+        assert!(none.contains("# n1: no feature matches its PCI cards"), "{none}");
+        assert!(none.ends_with("features: []\n"), "{none}");
+        // Not a kith OS node (no status.os.wants at all): said, not an empty spec.
+        assert!(features_spec(&node(json!({ "state": "ready" }))).is_err());
+        // A name that is not a feature name is refused, so none can add a feature to the spec.
+        assert!(features_spec(&node(json!({ "os": { "wants": ["a, gpu"] } }))).is_err());
     }
 }

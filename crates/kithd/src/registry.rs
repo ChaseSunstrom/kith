@@ -68,8 +68,11 @@ fn place(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Clien
     };
     // (Errors only if a provider is already installed, which is just as good.)
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let patience = kith_runtime::Patience::default();
     let config = ClientConfig {
         protocol,
+        connect_timeout: Some(patience.connect),
+        read_timeout: Some(patience.read),
         ..ClientConfig::default()
     };
     // For what oci-client reads whole or follows anywhere: a redirect stays on the
@@ -88,6 +91,8 @@ fn place(url: &str, name: &str, version: &str, outward: bool) -> Fallible<(Clien
     });
     let http = reqwest::Client::builder()
         .redirect(policy)
+        .connect_timeout(patience.connect)
+        .read_timeout(patience.read)
         .timeout(PATIENCE)
         .build()
         .map_err(|e| format!("setting up the registry client: {e}"))?;
@@ -116,11 +121,14 @@ struct Web {
 async fn held(url: &reqwest::Url) -> Fallible<reqwest::Client> {
     // (Its origin only: what follows, a query too, is not what is connected to.)
     let (host, _, addresses) = crate::sources::vetted(&url.origin().ascii_serialization(), false).await?;
+    let patience = kith_runtime::Patience::default();
     let client = reqwest::Client::builder()
         .resolve_to_addrs(&host, &addresses)
         // (Nor a proxy, which would look the name up again itself.)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(patience.connect)
+        .read_timeout(patience.read)
         .timeout(PATIENCE);
     client
         .build()
@@ -194,16 +202,9 @@ async fn capped(
     }
 }
 
-/// What `reply` says, at most `limit` bytes of it.
-async fn read(mut reply: reqwest::Response, limit: usize) -> Fallible<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) = reply.chunk().await.map_err(|e| e.to_string())? {
-        if body.len() + chunk.len() > limit {
-            return Err(format!("more than {limit} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+/// What `reply` says, at most `limit` bytes of it (kith-runtime reads the same way for its own).
+async fn read(reply: reqwest::Response, limit: usize) -> Fallible<Vec<u8>> {
+    kith_runtime::read_capped(reply, limit).await.map_err(|e| e.to_string())
 }
 
 /// A token for pulling `reference`, from the realm a `challenge` (the registry's

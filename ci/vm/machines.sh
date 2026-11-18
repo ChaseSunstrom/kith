@@ -39,7 +39,7 @@
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
                 -machine q35 -bios "$firmware" "$@" \
                 -chardev "socket,id=tty,path=$work/$name.tty,server=on,wait=off,logfile=$work/$name.log" -serial chardev:tty \
-                -monitor none </dev/null >/dev/null 2>&1 &
+                -monitor "${monitor:-none}" </dev/null >/dev/null 2>&1 &
             vm=$!
             vms="$vms $vm"
         }
@@ -110,10 +110,11 @@
         }
         join=$(api POST /v1/tokens | field token) || fail "no join token over TLS"
 
-        # Answers from a URL: the disk by name where there are two, and the network asked
-        # for an address. The other disk is not touched.
+        # Answers from a URL: the disk by its serial where there are two (on a SCSI
+        # controller, where the kernel's names are in the order the disks answer), and the
+        # network asked for an address. The other disk is not touched.
         mkdir "$work/www"
-        printf 'disk: vdc\nhostname: beta\n' >"$work/www/beta.yaml"
+        printf 'disk: serial:kith-beta\nhostname: beta\n' >"$work/www/beta.yaml"
         # (Over plain http the answers are taken only with their hash pinned in the URL.)
         pin=$(sha256sum "$work/www/beta.yaml" | cut -d' ' -f1)
         (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
@@ -122,9 +123,13 @@
         blank beta
         blank spare
         # shellcheck disable=SC2046
-        vm install-beta $(drive beta.stick) $(drive spare.disk) $(drive beta.disk) -netdev user,id=out -device virtio-net-pci,netdev=out \
+        vm install-beta $(drive beta.stick) -device virtio-scsi-pci,id=scsi \
+            -drive "file=$work/spare.disk,format=raw,if=none,id=spare" -device scsi-hd,drive=spare,serial=kith-spare \
+            -drive "file=$work/beta.disk,format=raw,if=none,id=beta" -device scsi-hd,drive=beta,serial=kith-beta \
+            -netdev user,id=out -device virtio-net-pci,netdev=out \
             -smbios "type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.install=http://10.0.2.2:$((port + 9))/beta.yaml#sha256=$pin"
-        installed install-beta vdc
+        installed install-beta sd
+        grep -aq 'kith OS is on sd[a-z] (.*serial kith-beta)' "$work/install-beta.log" || fail "install-beta did not install on the disk with serial kith-beta"
         cmp -s -n $((64 << 20)) "$work/spare.disk" /dev/zero || fail "the disk that was not chosen was written to"
         beta() { # LOG: the installed disk, started
             # shellcheck disable=SC2046
@@ -145,12 +150,37 @@
         # twice, so nothing is written), then a node that joins alpha's cluster by token.
         stick gamma
         blank gamma
+        # (A monitor socket, for the screendump below; the other machines have none.)
+        monitor=unix:$work/install-gamma.mon,server=on,wait=off
         # shellcheck disable=SC2046
         vm install-gamma $(drive gamma.stick) $(drive gamma.disk)
+        monitor=
         typed() { # WAIT-FOR LINE
             hears install-gamma "$1"
             printf '%s\n' "$2" | socat - "unix-connect:$work/install-gamma.tty" >/dev/null
         }
+        # The picture while the disk question is asked: the console's framebuffer (kithd draws
+        # the question on it) is mostly paper, with the accent on the current stop. Retried, as
+        # the picture is drawn just after the question's text is on the serial console.
+        hears install-gamma 'Install kith OS on which'
+        tries=0
+        until printf 'screendump %s\n' "$work/install-gamma.ppm" | socat -t 2 - "unix-connect:$work/install-gamma.mon" >/dev/null 2>&1 \
+            && python3 -c '
+import collections, sys
+data = open(sys.argv[1], "rb").read()
+header = data.split(b"\n", 3)
+if header[0] != b"P6":
+    sys.exit(1)
+pixels = header[3]
+colours = collections.Counter(pixels[i:i + 3] for i in range(0, len(pixels), 3))
+paper, accent = bytes((246, 245, 241)), bytes((47, 95, 224))
+if colours.most_common(1)[0][0] != paper or colours[accent] < 100:
+    sys.exit(1)
+' "$work/install-gamma.ppm" 2>/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 50 ] || fail "the install's question is not on the screen as drawn"
+            sleep 0.2
+        done
         typed 'Install kith OS on which' vdb
         typed "The node's name" gamma
         typed 'Its address, as' ''
@@ -174,5 +204,5 @@
             [ "$tries" -lt 150 ] || fail "the node installed with a join token is not in alpha's cluster"
             sleep 0.2
         done
-        echo "vm.sh: ok: no disk, nothing installed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the disk named of two, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token"
+        echo "vm.sh: ok: no disk, nothing installed; from answers on the stick, a node (alpha) that starts a cluster at its fixed address; from a URL, onto the one of two disks its serial names, a node (beta, $first) that asks its network and keeps its state; from the console, after a slip that wrote nothing, a node (gamma) that joined alpha's cluster by token"
         exit 0

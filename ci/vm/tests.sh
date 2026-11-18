@@ -46,7 +46,7 @@
     # into $who.
     who() {
         tries=0
-        until openssl s_client -connect "127.0.0.1:$port" </dev/null 2>/dev/null >"$work/hello" \
+        until timeout 10 openssl s_client -connect "127.0.0.1:$port" </dev/null 2>/dev/null >"$work/hello" \
             && who=$(openssl x509 -noout -fingerprint -sha256 <"$work/hello" 2>/dev/null); do
             tries=$((tries + 1))
             [ "$tries" -lt 100 ] || fail "nobody answered TLS on the node's port"

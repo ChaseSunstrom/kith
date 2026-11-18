@@ -7,6 +7,7 @@
 //! a Raft replica either way (`raft.rs`): alone, this node is all of its voters.
 
 mod access;
+mod access_sign;
 mod acme;
 mod api;
 mod audit;
@@ -35,8 +36,10 @@ mod kube;
 mod kubeproto;
 mod members;
 mod mesh;
+mod modules;
 mod netboot;
 mod os;
+mod people;
 mod pki;
 mod pods;
 mod policy;
@@ -236,6 +239,8 @@ pub struct Shared {
     /// The order access is decided in, where a change is put in the log: a change to access
     /// holds it alone until applied, an Identity's write shared once decided again (`raft.rs`).
     pub order: tokio::sync::RwLock<()>,
+    /// The nonces of the signed requests this node has taken (`access_sign.rs`).
+    pub nonces: access_sign::Nonces,
     /// On a worker that runs from a view (`view`): the index of the store its view is at.
     /// `None` on every other node, which keeps the store.
     pub view: watch::Sender<Option<u64>>,
@@ -387,7 +392,10 @@ async fn within(
 /// Call inside the runtime.
 fn stops() -> std::io::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
     use tokio::signal::unix::{SignalKind, signal};
-    Ok((signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?))
+    let heard = (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?);
+    // (A kept kithd inherits the keeper's blocked mask: unblocked once these handlers are set.)
+    keeper::unblock_heard();
+    Ok(heard)
 }
 
 fn default_state() -> Option<PathBuf> {
@@ -579,6 +587,7 @@ async fn replica(
         exits: Mutex::default(),
         dry_runs: tokio::sync::Semaphore::new(DRY_RUNS),
         order: tokio::sync::RwLock::default(),
+        nonces: access_sign::Nonces::default(),
         view: watch::channel(None).0,
         upstream: Mutex::default(),
         lost_after,
@@ -868,11 +877,12 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             }
         });
         let mut server_stop = stopping.clone();
-        // Whoever can open the socket is the machine's admin.
+        // Whoever can open the socket is the machine's admin: under `spec.signing: required`,
+        // with the admin's signature (`access_sign::local`).
         let local = api::router(shared.clone())
-            .layer(axum::Extension(access::Caller::Admin))
             .merge(cluster::admin_router(shared.clone()))
-            .merge(ui::pages());
+            .merge(ui::pages())
+            .layer(axum::middleware::from_fn_with_state(shared.clone(), access_sign::local));
         let server =
             axum::serve(listener, local).with_graceful_shutdown(async move { drop(server_stop.changed().await) });
         let server = within(server, stopping.clone());
@@ -978,9 +988,11 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let hardware = devices::run(shared.clone(), stopping.clone(), dmem);
             let crons = cron::run(shared.clone(), stopping.clone());
             let exits = exits::run(shared.clone(), stopping.clone());
+            let people = people::run(shared.clone(), stopping.clone());
             let published = pods::publish(shared.clone(), own_ports(&args), stopping.clone());
             tokio::join!(
                 apart(exits),
+                apart(people),
                 apart(published),
                 apart(units),
                 apart(releases),
@@ -1013,11 +1025,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
         };
         let (strays, taken) = tokio::sync::mpsc::unbounded_channel();
         let taken = args.ingress.then_some(taken);
-        let proxy = async {
-            if let Some(port) = args.mesh {
-                services::run(shared.clone(), port, taken, stopping.clone()).await;
-            }
-        };
+        // (Without a mesh too: a node's Services answer its pods there as well, T-0723.)
+        let proxy = services::run(shared.clone(), args.mesh, taken, stopping.clone());
         let ingress = async {
             // (A control node with --acme alone orders for the workers that serve ingress.)
             if args.ingress || args.acme.is_some() {

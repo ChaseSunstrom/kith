@@ -775,6 +775,8 @@ pub fn first_things() {
 /// (`again`), it reads the command line and the config as before and changes nothing: the
 /// state is mounted, the TPM measured, the disk grown already.
 pub fn early(again: bool) -> Boot {
+    // Drivers first (a started-again kithd finds them loaded, and only listens again).
+    crate::modules::start();
     // (Before anything is read from the root's disk: see `check_boot_disk`.)
     if !again && let Err(e) = check_boot_disk() {
         eprintln!("kithd: init: {e}");

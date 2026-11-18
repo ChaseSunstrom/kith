@@ -14,11 +14,12 @@
 
 pub mod exit;
 mod netlink;
+pub mod people;
 pub mod pod;
 
-pub use netlink::{Card, Device, Seen, address4, cards, up};
+pub use netlink::{Card, Device, Seen, address4, addresses6, cards, hold, up};
 use sha2::{Digest, Sha256};
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 /// A WireGuard key, private or public.
 pub type Key = [u8; 32];
@@ -70,6 +71,11 @@ pub fn in_mesh(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
     prefix.octets()[..6] == address.octets()[..6]
 }
 
+/// Is `address` a Service's of the cluster `prefix`: in its services' /80?
+pub fn is_service_address(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
+    in_mesh(prefix, address) && address.octets()[6..10] == SERVICES
+}
+
 /// The node's own address: the first of its /80.
 pub fn node_address(prefix: Ipv6Addr, name: &str) -> Ipv6Addr {
     let mut bytes = node_net(prefix, name).octets();
@@ -103,8 +109,9 @@ pub struct Member {
 pub struct Peer {
     pub key: Key,
     pub endpoint: Option<SocketAddr>,
-    /// The nodes (their /80s) whose traffic goes to and comes from this peer.
-    pub allowed: Vec<Ipv6Addr>,
+    /// The addresses (address and length: a node's /80, IPv4 or IPv6) whose traffic goes to
+    /// and comes from this peer.
+    pub allowed: Vec<(IpAddr, u8)>,
     pub keepalive: u16,
 }
 
@@ -146,12 +153,13 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
         edges.iter().copied().find(|edge| says(edge)).or(edges.first().copied())
     };
     let peer = |member: &Member| {
+        let node = |name: &str| (IpAddr::V6(node_net(prefix, name)), NODE_BITS);
         let mut allowed = Vec::new();
         if through(member).is_none() {
-            allowed.push(node_net(prefix, &member.name));
+            allowed.push(node(&member.name));
         }
         let relayed = others().filter(|other| through(other).is_some_and(|relay| relay.key == member.key));
-        allowed.extend(relayed.map(|other| node_net(prefix, &other.name)));
+        allowed.extend(relayed.map(|other| node(&other.name)));
         Peer {
             key: member.key,
             endpoint: endpoint(member),
@@ -165,6 +173,19 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an address in the services' /80 of this cluster is a Service's: not a node's, not another cluster's.
+    #[test]
+    fn a_service_address_is_in_the_services_80_of_the_cluster() {
+        let mesh = prefix(b"a cluster");
+        assert!(is_service_address(mesh, service_address(mesh, "default", "web")));
+        assert!(!is_service_address(mesh, node_address(mesh, "alpha")));
+        assert!(!is_service_address(
+            prefix(b"another"),
+            service_address(mesh, "default", "web")
+        ));
+        assert!(!is_service_address(mesh, Ipv6Addr::LOCALHOST));
+    }
 
     /// A member an edge node saw behind another NAT is called there; behind this node's own NAT,
     /// or seen by none, where it said it is; reached or not, the same.
@@ -247,8 +268,19 @@ mod tests {
             reaches: Vec::new(),
             seen: None,
         };
+        // (Each allowed address is a node's /80: the nets compared are the /80s' addresses.)
         let nets = |peers: &[Peer]| -> Vec<(u8, Vec<Ipv6Addr>)> {
-            let of = |peer: &Peer| (peer.key[0], peer.allowed.clone());
+            let of = |peer: &Peer| {
+                let nets = peer
+                    .allowed
+                    .iter()
+                    .map(|&(net, bits)| match net {
+                        IpAddr::V6(net) if bits == NODE_BITS => net,
+                        other => panic!("not a node's /80: {other}/{bits}"),
+                    })
+                    .collect();
+                (peer.key[0], nets)
+            };
             peers.iter().map(of).collect()
         };
         // Everyone reached: every other node is a peer with its own /80, and not oneself.
