@@ -418,9 +418,9 @@ pub fn tables() -> Result<bool> {
 
 // ---- nftables, as the kernel takes it (nfnetlink): a few attributes by hand ----
 
-const NESTED: u16 = 0x8000;
+pub(crate) const NESTED: u16 = 0x8000;
 
-fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+pub(crate) fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(value.len() + 8);
     bytes.extend((value.len() as u16 + 4).to_ne_bytes());
     bytes.extend(kind.to_ne_bytes());
@@ -429,7 +429,7 @@ fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn text(kind: u16, text: &str) -> Vec<u8> {
+pub(crate) fn text(kind: u16, text: &str) -> Vec<u8> {
     attribute(kind, &[text.as_bytes(), &[0]].concat())
 }
 
@@ -438,19 +438,19 @@ pub(crate) fn number(kind: u16, number: u32) -> Vec<u8> {
 }
 
 /// An expression of a rule: its name and what it is told.
-fn expression(name: &str, told: &[Vec<u8>]) -> Vec<u8> {
+pub(crate) fn expression(name: &str, told: &[Vec<u8>]) -> Vec<u8> {
     let told = attribute(2 | NESTED, &told.concat());
     attribute(1 | NESTED, &[text(1, name), told].concat())
 }
 
 /// Register 1 is what `bytes` are (the comparison every rule here ends its looking with).
-fn is(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn is(bytes: &[u8]) -> Vec<u8> {
     let value = attribute(3 | NESTED, &attribute(1, bytes));
     expression("cmp", &[number(1, 1), number(2, 0), value])
 }
 
 /// The name of the link a packet came in by (6) or goes out by (7), in register 1.
-fn link_name(which: u32) -> Vec<u8> {
+pub(crate) fn link_name(which: u32) -> Vec<u8> {
     expression("meta", &[number(2, which), number(1, 1)])
 }
 
@@ -505,7 +505,7 @@ fn marked() -> Vec<u8> {
 
 /// The bytes `bytes` are at `offset` into the packet's header `base` (1: network, 2:
 /// transport), compared in register 1.
-fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
     let load = expression(
         "payload",
         &[
@@ -519,12 +519,12 @@ fn at(base: u32, offset: u32, bytes: &[u8]) -> Vec<u8> {
 }
 
 /// The packet's family is `family` (meta nfproto: 2 IPv4, 10 IPv6).
-fn nfproto(family: u8) -> Vec<u8> {
+pub(crate) fn nfproto(family: u8) -> Vec<u8> {
     [expression("meta", &[number(2, 15), number(1, 1)]), is(&[family])].concat()
 }
 
 /// The packet's transport protocol is `protocol` (meta l4proto: 6 TCP, 17 UDP).
-fn l4proto(protocol: u8) -> Vec<u8> {
+pub(crate) fn l4proto(protocol: u8) -> Vec<u8> {
     [expression("meta", &[number(2, 16), number(1, 1)]), is(&[protocol])].concat()
 }
 
@@ -652,6 +652,8 @@ pub(crate) struct Batch {
     bytes: Vec<u8>,
     sequence: u32,
     table: &'static str,
+    /// Where the last message said starts in `bytes`.
+    last: usize,
 }
 
 impl Batch {
@@ -660,6 +662,7 @@ impl Batch {
             bytes: Vec::new(),
             sequence: 0,
             table,
+            last: 0,
         };
         batch.say(0x10, 0, 10, &[]); // a batch begins
         batch
@@ -668,15 +671,17 @@ impl Batch {
     fn say(&mut self, kind: u16, family: u8, subsystem: u16, attributes: &[Vec<u8>]) {
         let attributes = attributes.concat();
         self.sequence += 1;
+        self.last = self.bytes.len();
         let bytes = &mut self.bytes;
         bytes.extend((attributes.len() as u32 + 20).to_ne_bytes());
         bytes.extend(kind.to_ne_bytes());
-        // A request; what is not the batch's own beginning or end: acknowledged, and may
-        // create; a rule after the chain's others (append: else the kernel puts it first,
-        // and a chain runs backwards, its drop ahead of the accept meant to come before).
+        // A request; what is not the batch's own beginning or end: may create; a rule after
+        // the chain's others (append: else the kernel puts it first, and a chain runs
+        // backwards, its drop ahead of the accept meant to come before). Not acknowledged
+        // here: `finish` asks for the one ack the batch needs, on its last message.
         let flags: u16 = match (subsystem, kind) {
-            (0, 0xa06) => 0xc05,
-            (0, _) => 0x405,
+            (0, 0xa06) => 0xc01,
+            (0, _) => 0x401,
             _ => 1,
         };
         bytes.extend(flags.to_ne_bytes());
@@ -705,6 +710,11 @@ impl Batch {
         self.say(0xa03, family, 0, &chain);
     }
 
+    /// A chain of the table no hook reaches: a rule jumps to it.
+    pub(crate) fn plain(&mut self, family: u8, name: &str) {
+        self.say(0xa03, family, 0, &[text(1, self.table), text(3, name)]);
+    }
+
     /// A rule at the end of `chain`, of `expressions`.
     pub(crate) fn rule(&mut self, family: u8, chain: &str, expressions: &[Vec<u8>]) {
         let rule = [
@@ -715,9 +725,20 @@ impl Batch {
         self.say(0xa06, family, 0, &rule);
     }
 
-    pub(crate) fn send(mut self) -> Result<()> {
+    /// The batch's bytes, ended, and the sequence of the one message asked to be acknowledged:
+    /// the batch's last. The kernel says no for any message that fails, so that yes is all a
+    /// whole batch needs (one per message would flood the socket's receive buffer).
+    pub(crate) fn finish(mut self) -> (Vec<u8>, u32) {
+        let at = self.last + 6;
+        let flags = u16::from_ne_bytes([self.bytes[at], self.bytes[at + 1]]) | 4;
+        self.bytes[at..at + 2].copy_from_slice(&flags.to_ne_bytes());
         self.say(0x11, 0, 10, &[]); // and ends
-        netfilter(&self.bytes, self.sequence - 1)
+        (self.bytes, self.sequence - 1)
+    }
+
+    pub(crate) fn send(self) -> Result<()> {
+        let (bytes, last) = self.finish();
+        netfilter(&bytes, last)
     }
 }
 
@@ -743,6 +764,8 @@ pub(crate) fn has_table(family: u8, name: &str) -> Result<bool> {
 /// Send netfilter `batch`, and take its answers: a no is the answer, or message `last`'s yes.
 pub(crate) fn netfilter(batch: &[u8], last: u32) -> Result<()> {
     let socket = crate::netlink::socket(12)?; // netfilter's
+    // A whole table in one batch can be bigger than the default send buffer (EMSGSIZE).
+    crate::netlink::raise_send_buffer(&socket, batch.len())?;
     socket.send(batch, 0)?;
     // The kernel answers each message in turn: a no is the answer, or the last one's yes.
     loop {
@@ -917,7 +940,29 @@ mod tests {
         let start = batch.bytes.len();
         batch.rule(INET, "c", &[verdict(1)]);
         let flags = u16::from_ne_bytes([batch.bytes[start + 6], batch.bytes[start + 7]]);
-        assert_eq!(flags, 0xc05);
+        assert_eq!(flags, 0xc01);
+    }
+
+    #[test]
+    fn a_batch_asks_for_one_acknowledgement_only_its_last_message() {
+        // (An ack per rule queues a reply per rule in the socket's receive buffer: a table of
+        // hundreds of peers overflowed it, ENOBUFS.)
+        let mut batch = Batch::new("t");
+        batch.table(INET);
+        batch.rule(INET, "c", &[verdict(1)]);
+        batch.rule(INET, "c", &[verdict(1)]);
+        let (bytes, _) = batch.finish();
+        let mut flags = Vec::new();
+        let mut rest = &bytes[..];
+        while rest.len() >= 16 {
+            let length = u32::from_ne_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            flags.push(u16::from_ne_bytes([rest[6], rest[7]]));
+            rest = &rest[length.max(16)..];
+        }
+        // Begin, the three table messages, two rules, end.
+        assert_eq!(flags.len(), 7);
+        let acked: Vec<usize> = (0..flags.len()).filter(|&at| flags[at] & 4 != 0).collect();
+        assert_eq!(acked, vec![5], "{flags:x?}");
     }
 
     #[test]
