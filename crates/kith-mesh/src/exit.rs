@@ -246,10 +246,27 @@ pub fn people_rules() -> Result<Vec<(u32, bool, Option<Ipv4Addr>)>> {
             RuleAttribute::Source(IpAddr::V4(from)) => Some(*from),
             _ => None,
         });
-        seen.extend(priority.map(|priority| (priority, rule.header.family == AddressFamily::Inet6, source)));
+        let v6 = rule.header.family == AddressFamily::Inet6;
+        // (Only a rule that is the whole rule counts: one by kwg0 at 9010 with another table, or
+        // without the suppress, is not the people's.)
+        seen.extend(
+            priority
+                .filter(|&priority| is_whole(&rule, v6, priority, source))
+                .map(|priority| (priority, v6, source)),
+        );
     }
     seen.sort();
     Ok(seen)
+}
+
+/// Is `rule` the people's rule at `priority` (of `v6`, from `source`) with all of what it is made
+/// of: its action, its lengths, its table and its suppress? (The kernel adds attributes of its own.)
+fn is_whole(rule: &RuleMessage, v6: bool, priority: u32, source: Option<Ipv4Addr>) -> bool {
+    let want = people_rule(v6, priority, source, (priority != PEOPLE_NOWHERE).then_some(254)).message();
+    rule.header.action == want.header.action
+        && rule.header.src_len == want.header.src_len
+        && rule.header.dst_len == want.header.dst_len
+        && want.attributes.iter().all(|a| rule.attributes.contains(a))
 }
 
 /// Hold the people's device (before it is made: the last rule, which lets nothing out, goes first):
@@ -260,7 +277,8 @@ pub fn people_hold() -> Result<()> {
         people_rule(v6, PEOPLE_NOWHERE, None, None).set(true)?;
     }
     for rule in people_dump()? {
-        if !rule.attributes.contains(&RuleAttribute::Priority(PEOPLE_NOWHERE)) {
+        let v6 = rule.header.family == AddressFamily::Inet6;
+        if !is_whole(&rule, v6, PEOPLE_NOWHERE, None) {
             delete(rule)?;
         }
     }
@@ -529,6 +547,41 @@ mod tests {
         // A tunnel that is not there is taken away all the same (the kernel says ENODEV of a
         // link it does not know by name: the first `ensure` of each tunnel removes one).
         remove(8, Some("10.2.0.2".parse().unwrap())).unwrap();
+    }
+
+    /// A rule by kwg0 at the people's priority with another table, or no suppress, is not the people's
+    /// rule: not counted, and `people_hold` puts the right one in its place (`KITH_E2E=1 unshare -Urn
+    /// cargo test -p kith-mesh people_rules`).
+    #[test]
+    fn people_rules_are_the_whole_rule() {
+        if !nix::unistd::getuid().is_root() || std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: KITH_E2E=1 unshare -Urn cargo test -p kith-mesh people_rules");
+        }
+        let right = vec![
+            (PEOPLE_MAIN, false, None),
+            (PEOPLE_MAIN, true, None),
+            (PEOPLE_NOWHERE, false, None),
+            (PEOPLE_NOWHERE, true, None),
+        ];
+        people_release().unwrap();
+        people_hold().unwrap();
+        assert_eq!(people_rules().unwrap(), right);
+
+        // 9010 with another table; 9010 with no suppress; 9012 that sends to a table.
+        people_release().unwrap();
+        let by_hand = |priority, table, suppress| Rule {
+            suppress,
+            ..people_rule(false, priority, None, table)
+        };
+        by_hand(PEOPLE_MAIN, Some(100), Some(0)).set(true).unwrap();
+        by_hand(PEOPLE_MAIN, Some(254), None).set(true).unwrap();
+        by_hand(PEOPLE_NOWHERE, Some(100), None).set(true).unwrap();
+        assert_eq!(people_rules().unwrap(), [], "none of the three is the people's");
+
+        people_hold().unwrap();
+        assert_eq!(people_rules().unwrap(), right);
+        assert_eq!(people_dump().unwrap().len(), 4, "the others are gone");
+        people_release().unwrap();
     }
 
     /// A tunnel is made, made again, and taken away (`KITH_E2E=1 unshare -Urn cargo test

@@ -326,14 +326,35 @@ pub(crate) fn up_with(
     people64: Ipv6Addr,
     table: impl FnOnce() -> std::io::Result<()>,
 ) -> std::io::Result<kith_mesh::Key> {
-    let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
-    // (The order of docs/adr-people.md: the table with its drops, the rules that send nowhere, the
-    // device with no peers. `levels` adds the levels' chains and the peers, after.)
-    table()?;
-    kith_mesh::exit::people_hold()?;
-    let found = kith_mesh::people::device(&key, port, people64)?;
-    crate::levels::DEVICE_UP.store(true, std::sync::atomic::Ordering::Release);
-    Ok(found.public_key)
+    let made = (|| {
+        let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+        // (The order of docs/adr-people.md: the table with its drops, the rules that send nowhere, the
+        // device with no peers. `levels` adds the levels' chains and the peers, after.)
+        table()?;
+        kith_mesh::exit::people_hold()?;
+        kith_mesh::people::device(&key, port, people64)
+    })();
+    match made {
+        Ok(found) => {
+            crate::levels::DEVICE_UP.store(true, std::sync::atomic::Ordering::Release);
+            Ok(found.public_key)
+        }
+        Err(e) => {
+            // (An old kwg0 would keep last run's peers and rules, with nothing tending them.)
+            take_away();
+            Err(e)
+        }
+    }
+}
+
+/// Take kwg0, its rules and its table away (best effort), once no pass of `levels` is in flight and
+/// none will start: else one would make the table and the rules again.
+pub(crate) fn take_away() {
+    crate::levels::DEVICE_UP.store(false, std::sync::atomic::Ordering::Release);
+    let _tending = crate::levels::TENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = kith_mesh::people::remove() {
+        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
+    }
 }
 
 /// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that
@@ -415,9 +436,7 @@ pub async fn device(
             _ = stopping.changed() => break,
         }
     }
-    if let Err(e) = kith_mesh::people::remove() {
-        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
-    }
+    take_away();
     if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
         eprintln!("kithd: people: taking back this node's people: {e}");
     }
@@ -715,6 +734,7 @@ mod tests {
     /// its public key is said; a second start keeps the key and empties the peers. Without the
     /// flag, the start itself takes all of that away.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn people_device() {
         use base64::Engine as _;
         use std::os::unix::fs::PermissionsExt;
@@ -726,6 +746,8 @@ mod tests {
         if !alone {
             return eprintln!("skipped: not in a network namespace of its own");
         }
+        // (One at a time with the levels' tests, which share this namespace.)
+        let _kernel = crate::levels::tests::KERNEL.lock().unwrap_or_else(|e| e.into_inner());
         let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
         std::fs::create_dir_all(state.join("pki")).unwrap();
         let (port, people64) = (51821, people());

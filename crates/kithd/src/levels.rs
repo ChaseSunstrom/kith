@@ -34,6 +34,8 @@ pub struct Config {
     pub interface: String,
     pub networks: Vec<(IpAddr, u8)>,
     pub api: u16,
+    /// The pods' IPv4 range (`--pod-range`): no level's network lies over it, nor over the people's.
+    pub pods: (Ipv4Addr, u8),
 }
 
 /// `--people-networks`: `ADDRESS/LENGTH`, IPv4 or IPv6, never `/0` (that is the internet's).
@@ -142,8 +144,22 @@ fn level_of(
             notes.push(format!("level {name}: network `{net}` is not ADDRESS/LENGTH"));
             continue;
         };
+        // (The store refuses these IPv4 ranges at the Apply; a status or a stored level of an older
+        // kithd is not trusted to have been through that.)
+        let taken = [
+            (Ipv4Addr::new(100, 89, 0, 0), 16),
+            (Ipv4Addr::new(100, 88, 0, 0), 16),
+            config.pods,
+        ]
+        .into_iter()
+        .map(|(address, bits)| (IpAddr::V4(address), bits))
+        .find(|taken| within(*taken, parsed) || within(parsed, *taken));
         if let Some(why) = crate::people::over(net, mesh, people64) {
             notes.push(format!("level {name}: {why}"));
+        } else if let Some((range, bits)) = taken {
+            notes.push(format!(
+                "level {name}: network `{net}` overlaps the pods' or the people's range {range}/{bits}"
+            ));
         } else if !config.networks.iter().any(|outer| within(*outer, parsed)) {
             notes.push(format!(
                 "level {name}: network `{net}` is not in this node's --people-networks"
@@ -208,7 +224,8 @@ fn candidate(resource: &Resource, node: &str, people64: Ipv6Addr, notes: &mut Ve
     };
     let offset = u16::from_be_bytes([high, low]);
     let six = u128::from(v6);
-    if offset < 2 || six >> 64 != u128::from(people64) >> 64 || (six as u64) < 2 {
+    // (Not the first two addresses of the range, nor its last: docs/adr-people.md, Review 5.)
+    if !(2..0xffff).contains(&offset) || six >> 64 != u128::from(people64) >> 64 || (six as u64) < 2 {
         notes.push(format!("peer {name}: {v4} and {v6} are not the people's to give"));
         return None;
     }
@@ -407,11 +424,12 @@ impl Tend {
                     for offset in &gone {
                         self.device.remove(offset);
                     }
+                    self.flush.extend(&gone);
                 }
-                // (The table below cuts them as well, and the next pass asks again.)
+                // (The table below cuts them as well, and the next pass asks again. Their
+                // connections are flushed only once they are off: one still on would connect again.)
                 Err(e) => notes.push(format!("taking peers off {}: {e}", kith_mesh::people::DEVICE)),
             }
-            self.flush.extend(gone);
         }
 
         // 2. The table and the rules.
@@ -426,7 +444,32 @@ impl Tend {
             return notes;
         }
 
-        // 3. Their connections, once nothing lets them through.
+        // 3. Onto the device, behind all of it. What the kernel has is what was last set without
+        // an error: after a failure the next pass asks again (and a peer still wrongly on it goes).
+        let all: Vec<Peer> = w.people.iter().map(|(_, peer)| peer.clone()).collect();
+        let there: Vec<&Peer> = self.device.values().collect();
+        if all.iter().collect::<Vec<_>>() != there {
+            step(&mut self.steps, "peers".into());
+            match (self.kernel.set_peers)(&all) {
+                Ok(()) => {
+                    // (Those that could not be taken off in step 1 are off now.)
+                    self.flush.extend(
+                        self.device
+                            .iter()
+                            .filter(|(offset, peer)| wanted.get(offset) != Some(peer))
+                            .map(|(offset, _)| *offset),
+                    );
+                    self.device = w
+                        .people
+                        .iter()
+                        .map(|(person, peer)| (person.offset, peer.clone()))
+                        .collect();
+                }
+                Err(e) => notes.push(format!("setting peers on {}: {e}", kith_mesh::people::DEVICE)),
+            }
+        }
+
+        // 4. The connections of those off the device, once nothing lets them through.
         for offset in self.flush.clone() {
             let mark = 0x6b79_0000 | u32::from(offset);
             step(&mut self.steps, format!("flush {mark:#x}"));
@@ -436,22 +479,6 @@ impl Tend {
                 }
                 Err(e) => notes.push(format!("flushing the connections of peer {offset:#06x}: {e}")),
             }
-        }
-
-        // 4. Onto the device, behind all of it.
-        let all: Vec<Peer> = w.people.iter().map(|(_, peer)| peer.clone()).collect();
-        let there: Vec<&Peer> = self.device.values().collect();
-        if all.iter().collect::<Vec<_>>() != there {
-            step(&mut self.steps, "peers".into());
-            let result = (self.kernel.set_peers)(&all);
-            if let Err(e) = result {
-                notes.push(format!("setting peers on {}: {e}", kith_mesh::people::DEVICE));
-            }
-            self.device = w
-                .people
-                .iter()
-                .map(|(person, peer)| (person.offset, peer.clone()))
-                .collect();
         }
         notes
     }
@@ -497,6 +524,17 @@ impl Tend {
     }
 }
 
+/// Held by a pass while it works the kernel, and by the device's teardown while it takes the
+/// device away: a pass in flight finishes first, and one after sees `DEVICE_UP` unset.
+pub static TENDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// One pass, but none once the device is being (or has been) taken away: that would make the table
+/// and the rules again. `None` then.
+pub fn tend_once(tend: &mut Tend, w: &Wanted) -> Option<Vec<String>> {
+    let _tending = TENDING.lock().unwrap_or_else(|e| e.into_inner());
+    DEVICE_UP.load(Ordering::Acquire).then(|| tend.pass(w))
+}
+
 /// The notes as the Node's status has them: a few short lines, or null.
 fn said_notes(notes: &[String]) -> Value {
     if notes.is_empty() {
@@ -529,9 +567,10 @@ pub async fn run(shared: Arc<Shared>, config: Option<Config>, mut stopping: watc
     loop {
         let up = DEVICE_UP.load(Ordering::Acquire);
         if up {
+            let links = own_links();
             let (asked, said) = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                let asked = wanted(&state.store, prefixes, &cluster.me.name, &config, own_links());
+                let asked = wanted(&state.store, prefixes, &cluster.me.name, &config, links);
                 let said = state.store.get(&node).map(|own| {
                     own.status
                         .as_ref()
@@ -545,7 +584,18 @@ pub async fn run(shared: Arc<Shared>, config: Option<Config>, mut stopping: watc
                 .as_ref()
                 .is_none_or(|(before, at)| *before != asked || at.elapsed() >= EVERY);
             if due {
-                let notes = tend.pass(&asked);
+                // (Netlink, the nft batch and conntrack block: not on the runtime's threads.)
+                let work = tokio::task::spawn_blocking(move || {
+                    let notes = tend_once(&mut tend, &asked);
+                    (tend, asked, notes)
+                })
+                .await;
+                let Ok((back, asked, Some(notes))) = work else {
+                    // (Torn down, or a pass that panicked and took its state: nothing more to do until stopped.)
+                    let _ = stopping.changed().await;
+                    break;
+                };
+                tend = back;
                 for note in &notes {
                     eprintln!("kithd: people: {note}");
                 }
@@ -572,7 +622,7 @@ pub async fn run(shared: Arc<Shared>, config: Option<Config>, mut stopping: watc
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::Engine as _;
     use kith_store::Command;
@@ -620,6 +670,80 @@ mod tests {
             interface: "kith0".into(),
             networks: networks.iter().map(|net| network(net).unwrap()).collect(),
             api: 7443,
+            pods: (Ipv4Addr::new(172, 20, 0, 0), 16),
+        }
+    }
+
+    /// Review 5: the range's last address is never given, nor the first two.
+    #[test]
+    fn people_levels_range_ends() {
+        let (mesh, people64) = ids();
+        let mut store = Store::default();
+        apply(&mut store, &level_yaml("family", "{ services: ['*'] }"));
+        for (name, n) in [("first", 1), ("second", 2), ("last", 3), ("one-before", 4)] {
+            apply(&mut store, &peer_yaml(name, "n1", "family", n));
+        }
+        let at = |name: &str, offset: u16| {
+            let four = Ipv4Addr::new(100, 89, (offset >> 8) as u8, offset as u8);
+            let six = Ipv6Addr::from(u128::from(people64) | u128::from(offset));
+            let fields = serde_json::Map::from_iter([(
+                "addresses".to_string(),
+                serde_json::json!({"ipv4": four.to_string(), "ipv6": six.to_string()}),
+            )]);
+            (format!("RemotePeer/{name}"), fields)
+        };
+        let statuses = vec![
+            at("first", 1),
+            at("second", 2),
+            at("last", 0xffff),
+            at("one-before", 0xfffe),
+        ];
+        kith_store::run(&mut store, Command::Patch { statuses }).unwrap();
+        let asked = wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new());
+        let mut offsets: Vec<u16> = asked.people.iter().map(|(person, _)| person.offset).collect();
+        offsets.sort();
+        assert_eq!(offsets, [2, 0xfffe], "{:?}", asked.notes);
+        let said = asked.notes.join("\n");
+        for name in ["first", "last"] {
+            assert!(
+                said.contains(&format!("peer {name}: ")) && said.contains("not the people's to give"),
+                "{said}"
+            );
+        }
+    }
+
+    /// A level naming the people's range, the pods' or 100.64.0.0/10 over them is left out at
+    /// `level_of` (the store's Apply refuses it too, but a stored level is not trusted to have been through it).
+    #[test]
+    fn people_levels_overlap() {
+        let (mesh, people64) = ids();
+        let store = Store::default();
+        let flag = config(&["172.16.0.0/12", "100.64.0.0/10", "192.168.0.0/16"]);
+        let spec: AccessLevelSpec = serde_json::from_value(serde_json::json!({
+            "networks": [
+                "100.64.0.0/10", "100.89.4.0/24", "100.88.0.0/17", "100.89.0.0/16",
+                "172.20.0.0/16", "172.20.9.0/24", "172.16.0.0/12", "192.168.4.0/24", "100.96.0.0/16"
+            ]
+        }))
+        .unwrap();
+        let (level, _, notes) = level_of(&store, &spec, "family", (mesh, people64), &flag);
+        assert_eq!(
+            level.networks,
+            vec![network("192.168.4.0/24").unwrap(), network("100.96.0.0/16").unwrap()],
+            "{notes:?}"
+        );
+        // (172.16.0.0/12 holds the pods' /16: left out as well.)
+        let said = notes.join("\n");
+        for net in [
+            "100.64.0.0/10",
+            "100.89.4.0/24",
+            "100.88.0.0/17",
+            "100.89.0.0/16",
+            "172.20.0.0/16",
+            "172.20.9.0/24",
+            "172.16.0.0/12",
+        ] {
+            assert!(said.contains(&format!("`{net}` overlaps")), "{net}: {said}");
         }
     }
 
@@ -780,7 +904,8 @@ mod tests {
 
     // The tests below set up kwg0 in a network namespace of their own (`KITH_E2E=1 unshare -Urn`),
     // one at a time.
-    static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // (`people::tests::people_device` takes it too: it is in the same namespace.)
+    pub(crate) static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A namespace of its own, with nothing of the people's left in it; else the test is skipped.
     fn alone() -> Option<(std::sync::MutexGuard<'static, ()>, std::path::PathBuf)> {
@@ -987,6 +1112,105 @@ mod tests {
         assert!(sources().is_empty());
 
         kith_mesh::people::remove().unwrap();
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A device that will not take the peers off keeps them in the pass's memory too: nothing is
+    /// flushed (they would connect again), and the next pass asks again, then flushes.
+    #[test]
+    fn people_removed_when_the_device_will_not_change() {
+        let Some((_guard, state)) = alone() else { return };
+        start(&state);
+        let mut tend = tend();
+        assert!(tend.pass(&asks(&[2, 3], Vec::new())).is_empty());
+        tend.steps.clear();
+
+        tend.kernel.set_peers = |_| failing();
+        let notes = tend.pass(&asks(&[3], Vec::new()));
+        assert_eq!(
+            tend.steps,
+            ["off the device", "table", "rule 9011 - 100.89.0.2", "peers"]
+        );
+        let said = notes.join("\n");
+        assert!(
+            said.contains("taking peers off") && said.contains("setting peers"),
+            "{said}"
+        );
+        assert_eq!(peers_on_device(), 2, "still there");
+        assert_eq!(tend.device.len(), 2, "and remembered as there");
+
+        tend.kernel.set_peers = kith_mesh::people::set_peers;
+        tend.steps.clear();
+        assert!(tend.pass(&asks(&[3], Vec::new())).is_empty());
+        assert_eq!(tend.steps, ["off the device", "flush 0x6b790002"]);
+        assert_eq!(peers_on_device(), 1);
+        tend.steps.clear();
+        assert!(tend.pass(&asks(&[3], Vec::new())).is_empty() && tend.steps.is_empty());
+
+        // The fail-closed emptying that fails flushes nothing either.
+        tend.kernel.set_peers = |_| failing();
+        tend.kernel.internet = |_, _| failing();
+        tend.steps.clear();
+        let notes = tend.pass(&asks(&[], Vec::new()));
+        assert_eq!(
+            tend.steps,
+            ["off the device", "table", "rule 9011 - 100.89.0.3", "peers emptied"]
+        );
+        assert!(notes.iter().any(|note| note.contains("emptying")), "{notes:?}");
+        assert_eq!(peers_on_device(), 1);
+        tend.kernel = Kernel::real();
+        tend.kernel.table = kith_mesh::people::send_without_masquerade;
+        tend.steps.clear();
+        assert!(tend.pass(&asks(&[], Vec::new())).is_empty());
+        assert_eq!(
+            tend.steps,
+            ["off the device", "table", "rule 9011 - 100.89.0.3", "flush 0x6b790003"]
+        );
+        assert_eq!(peers_on_device(), 0);
+
+        kith_mesh::people::remove().unwrap();
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A start that fails takes away what an earlier start left (its peers and rules): the device is
+    /// not left with last run's peers and nothing tending them.
+    #[test]
+    fn people_order_a_failed_start_takes_the_old_device_away() {
+        let Some((_guard, state)) = alone() else { return };
+        start(&state);
+        let mut tend = tend();
+        assert!(tend.pass(&asks(&[2], Vec::new())).is_empty());
+        assert_eq!(peers_on_device(), 1);
+
+        let people64 = ids().1;
+        let failed = crate::people::up_with(&state, 51821, people64, failing);
+        assert!(failed.is_err());
+        assert!(kith_mesh::people::device_found().unwrap().is_none(), "no kwg0");
+        assert!(!kith_mesh::people::table_present().unwrap());
+        assert!(kith_mesh::exit::people_rules().unwrap().is_empty());
+        assert!(!DEVICE_UP.load(Ordering::Acquire));
+
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Once the device is taken away, no pass makes its table and rules again; a start allows them.
+    #[test]
+    fn people_order_no_pass_after_the_teardown() {
+        let Some((_guard, state)) = alone() else { return };
+        start(&state);
+        let mut tend = tend();
+        assert_eq!(tend_once(&mut tend, &asks(&[2], Vec::new())), Some(Vec::new()));
+        assert_eq!(peers_on_device(), 1);
+
+        crate::people::take_away();
+        assert_eq!(tend_once(&mut tend, &asks(&[2], Vec::new())), None);
+        assert!(!kith_mesh::people::table_present().unwrap(), "no table made again");
+        assert!(
+            kith_mesh::exit::people_rules().unwrap().is_empty(),
+            "no rules made again"
+        );
+        assert!(kith_mesh::people::device_found().unwrap().is_none());
+
         let _ = std::fs::remove_dir_all(&state);
     }
 }

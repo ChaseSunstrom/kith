@@ -429,19 +429,27 @@ RemotePeers, their AccessLevels and Services) and makes what the kernel holds ma
 - Rules 9010 (main table, `suppress_prefixlen 0`), 9012 (unreachable) for both families, and 9011
   (the peer's /32, the full main table) for each peer of a level with `internet: true`, all `iif
   kwg0`. exit.rs's 9000-9005 are untouched; its `Rule` gained `suppress`.
-- Order of a pass: the peers leaving come off kwg0 first; then the table, then the rules; only
-  then do the peers go on. Any failed step empties kwg0's peers (fail closed) and says why.
+- Order of a pass: the peers leaving come off kwg0 first; then the table, then the rules; then
+  the peers go on; the connections of those that left are flushed last, and only once they are
+  really off the device (a `set_peers` that failed leaves the pass's memory of the device as it
+  was, so the next pass asks again and nothing is flushed meanwhile). Any failed step empties
+  kwg0's peers (fail closed) and says why. A pass is run in `spawn_blocking`, and none runs once
+  the device is being taken away (a lock shared with the teardown). A start that fails takes the
+  old kwg0, its rules and its table away.
+- The rules counted as held are the whole rule (action, lengths, table, suppress): one by kwg0 at
+  9010 to 9012 that differs is not counted, and `people_hold` replaces it.
 - The kernel is read again each pass (table present, rules), so a rule or table removed by hand
   is put back within 10 s; an unchanged pass writes nothing. `Tend` starts only after `up` has
   finished its own order (the device, the table, the 9010/9012 base).
 - A peer's AllowedIPs on kwg0 are its own /32 and /128 and nothing else (condition 8 on this
   side; what the client's shown configuration holds is slice D).
 - `--people-networks A,B` (env `KITH_PEOPLE_NETWORKS`; needs `--people`) names what a level's
-  `networks` may hold: a level's network outside them, or overlapping the mesh /48 or the people
-  /64, is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
+  `networks` may hold: a level's network outside them, or overlapping the mesh /48, the people
+  /64, 100.89.0.0/16, 100.88.0.0/16 or the pods' range (`--pod-range`), is left out with a note (condition 7: narrows, never widens). A Service reached only on UDP
   is left out (an empty port list means all ports). A level that names an `exit` has no internet
   until slice E2 ("exit X is not held yet").
-- Two peers with one address or key are both left out (condition 5). A level the store does not
+- Two peers with one address or key are both left out, as is an address that is the range's first
+  two or its last (condition 5). A level the store does not
   have leaves its people out. What was left out, and why, is the Node's `peopleNotes` (up to 16
   lines of 200 characters; a worker may say only its own).
 

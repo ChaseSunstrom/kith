@@ -1078,6 +1078,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
                 interface: args.mesh_interface.clone(),
                 networks: args.people_networks.clone(),
                 api: args.listen.map_or(7443, |at| at.port()),
+                pods: args.pod_range.network(),
             });
             let device = people::device(
                 shared.clone(),
