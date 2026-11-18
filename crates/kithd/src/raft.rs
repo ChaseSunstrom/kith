@@ -432,6 +432,10 @@ pub(crate) fn wait_of(reply: &reqwest::Response) -> Duration {
 
 /// What a worker's write becomes, held to what a worker may write (`crate::worker`):
 /// `Ok(None)` for a barrier that comes too soon after its last (asked again in a moment).
+/// The header by which a control node that passes a worker's write on says whose it is: the
+/// leader holds it to that worker's list, not to the control node's (`held`).
+pub(crate) const WORKER: &str = "x-kith-worker";
+
 fn from_worker(shared: &Shared, name: &str, command: Command) -> Result<Option<Command>, String> {
     if matches!(&command, Command::Patch { statuses } if statuses.is_empty()) {
         let mut last = BARRIERS.lock().expect("nothing panics holding the barriers");
@@ -486,9 +490,50 @@ fn signer(
     let header = headers
         .get(access_sign::SIGNED)
         .map(|header| header.to_str().unwrap_or_default());
-    // (`who` is the Identity, as the node names it: not the node it came through.)
-    let named = who.and_then(Caller::identity).map(|name| Caller::Identity(name.into()));
+    // (`who` is the Identity, as the node names it: not the node it came through. The local
+    // socket is named too: unsigned, where `required`, it is refused, or any node could claim it.)
+    let named = match who {
+        Some(Caller::Admin) => Some(Caller::Admin),
+        _ => who.and_then(Caller::identity).map(|name| Caller::Identity(name.into())),
+    };
     access_sign::hop(shared, &sent_by(peer), header, &asked, named.as_ref(), true)
+}
+
+/// Held to the list of the control node `peer` that sent it, where no Identity or local socket
+/// is named: its own write (`own_writes`), or a worker's that it passed on (`WORKER`), held to
+/// the worker's list. `None`: asked again (a worker's rate). A refusal is audited by the node's
+/// name and said on the console.
+fn held(
+    shared: &Shared,
+    peer: &Peer,
+    headers: &axum::http::HeaderMap,
+    who: Option<&Caller>,
+    command: Command,
+) -> Result<Option<Command>, String> {
+    let node = match &peer.subject {
+        Some(pki::Subject::Node(node, ..)) if who.is_none() => node.clone(),
+        _ => return Ok(Some(command)),
+    };
+    let checked = match headers.get(WORKER).map(|name| name.to_str().unwrap_or_default()) {
+        Some(worker) => {
+            let worker_now = {
+                let state = shared.store.lock().expect("a handler panicked holding the store");
+                sender(&state.store, worker) == Some(true)
+            };
+            match worker_now {
+                true => from_worker(shared, worker, command),
+                false => Err(format!("{WORKER} names {worker}, which is no worker here")),
+            }
+        }
+        None => crate::own_writes::checked(shared, &node, command).map(Some),
+    };
+    checked.inspect_err(|why| {
+        match headers.contains_key(WORKER) {
+            true => eprintln!("kithd: refused a worker's write that {node} passed on: {why}"),
+            false => eprintln!("kithd: refused a control node's own write: {node}: {why}"),
+        }
+        audit(shared, &node, why.clone());
+    })
 }
 
 /// A change another node passes to the leader: the reply and where in the log it is. A
@@ -529,6 +574,8 @@ async fn write(
         {
             None => None,
             Some(Some(Caller::Identity(name))) => Some(Caller::Via(sent_by(&peer), Box::new(Caller::Identity(name)))),
+            // The local socket of the node it came through: an admin's write, not the node's own.
+            Some(Some(Caller::Admin)) => Some(Caller::Admin),
             Some(_) => {
                 let why = format!("{} names no Identity", access::FOR);
                 return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
@@ -544,6 +591,11 @@ async fn write(
         if !leads {
             return Json(None::<(Reply, u64)>).into_response();
         }
+        let command = match held(&shared, &peer, &headers, who.as_ref(), command) {
+            Ok(Some(command)) => command,
+            Ok(None) => return Json(None::<(Reply, u64)>).into_response(),
+            Err(why) => return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response(),
+        };
         let signed = match signer(&shared, &peer, &headers, &uri, &bytes, who.as_ref()) {
             Ok(signed) => signed,
             Err(why) => {
@@ -628,7 +680,7 @@ async fn write(
     };
     match from_worker(&shared, &name, command) {
         // (Through this node to whichever leads: a worker asks one control node.)
-        Ok(Some(command)) => Json(passed(&shared, command).await).into_response(),
+        Ok(Some(command)) => Json(passed(&shared, &name, command).await).into_response(),
         Ok(None) => Json(None::<(Reply, u64)>).into_response(),
         Err(why) => audited(why),
     }
@@ -636,8 +688,10 @@ async fn write(
 
 /// A worker's change that was held to its list, made as this node's own: asked again
 /// (`None`) while the store takes no change.
-async fn passed(shared: &Shared, command: Command) -> Option<(Reply, u64)> {
-    match shared.write_at(command).await {
+async fn passed(shared: &Shared, name: &str, command: Command) -> Option<(Reply, u64)> {
+    // (Its name goes with it, so the leader holds it to this worker's list, not to ours.)
+    let worker = Caller::Node(name.to_string());
+    match shared.write_as(command, Some(&worker)).await {
         Ok((done, index)) => Some((Ok(done), index)),
         Err(Error::Io(_)) => None,
         Err(refused) => Some((Err(refused), 0)),
@@ -848,9 +902,16 @@ impl Shared {
             return Forward::Failed(Error::Invalid(why.into()));
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
-        // Whose write it is, for the leader to decide again in the log's order (`write`).
-        if let Some(name) = who.and_then(Caller::identity) {
-            call = call.header(access::FOR, name);
+        // Whose write it is, for the leader to decide again in the log's order (`write`): an
+        // Identity's, the local socket's (an admin's), or a worker's that this node passed on.
+        match who {
+            Some(Caller::Admin) => call = call.header(access::FOR, "local socket"),
+            Some(Caller::Node(worker)) => call = call.header(WORKER, worker.as_str()),
+            _ => {
+                if let Some(name) = who.and_then(Caller::identity) {
+                    call = call.header(access::FOR, name);
+                }
+            }
         }
         match call.timeout(PATIENCE).json(command).send().await {
             // Only a worker is held to a rate (this one keeps the log, as a learner): it sends
@@ -1240,8 +1301,19 @@ async fn tend_once(shared: &Shared) -> Result<(), String> {
         }
     }
     if !statuses.is_empty() {
-        let written = shared.submit(Command::Patch { statuses }).await;
-        written.map_err(|e| format!("writing down which nodes are there: {e}"))?;
+        // Put here, never forwarded: a forward that finds a new leader reaches it as this node's own
+        // write, which it refuses for another node's Node (own_writes.rs). Not if leadership has
+        // moved: the next tick says it, as the leader then.
+        let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(Command::Patch { statuses })).await;
+        match written {
+            Ok(Ok(written)) => written
+                .data
+                .map(drop)
+                .map_err(|e| format!("writing down which nodes are there: {e}"))?,
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_)))) => {}
+            Ok(Err(e)) => return Err(format!("writing down which nodes are there: {e}")),
+            Err(_) => return Err("writing down which nodes are there: no majority in time".into()),
+        }
     }
     let membership = metrics.membership_config.membership();
     let known: BTreeMap<NodeId, BasicNode> = membership.nodes().map(|(id, node)| (*id, node.clone())).collect();
@@ -2390,14 +2462,16 @@ mod tests {
         let revoke = |key: &str| Command::Delete { key: key.into() };
         shared.write(revoke("RoleBinding/via-bound")).await.unwrap();
         // A name that is no Identity's is not taken as one, nor one that is not text.
-        for name in [&b"local socket"[..], b"\xff"] {
-            let said = send_as(&client, apply("via-2"), Some(name)).await;
-            assert!(
-                matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("names no Identity")),
-                "{said:?}"
-            );
-        }
+        let said = send_as(&client, apply("via-2"), Some(b"\xff")).await;
+        assert!(
+            matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("names no Identity")),
+            "{said:?}"
+        );
         assert!(!holds(&shared, "ConfigMap/default/via-2"));
+        // The admin's own write, forwarded by a follower, says `local socket`: taken as the admin's.
+        let said = send_as(&client, apply("via-admin"), Some(b"local socket")).await;
+        assert!(matches!(said, Some((Ok(_), index)) if index > 0), "{said:?}");
+        assert!(holds(&shared, "ConfigMap/default/via-admin"));
         shared.write(unbind()).await.unwrap();
         shared.write(revoke("RoleBinding/alice-keys")).await.unwrap();
 
@@ -2458,10 +2532,14 @@ mod tests {
             _ => panic!("the leader was not reached"),
         }
         assert!(!holds(&shared, "ConfigMap/default/via-3"));
-        // The same write as the node's own (no one named) is the node's to make.
+        // The same write sent as the node's own (no one named) is held to the node's list, where a
+        // ConfigMap is an admin's kind: refused, and not written.
         let said = send(apply("via-4"), None).await;
-        assert!(matches!(said, Some((Ok(_), _))), "{said:?}");
-        assert!(holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
+        assert!(
+            matches!(&said, Some((Err(Error::Invalid(why)), 0)) if why.contains("does not write this kind as itself")),
+            "{said:?}"
+        );
+        assert!(!holds(&shared, "ConfigMap/default/via-4") && holds(&shared, "ConfigMap/default/via-1"));
     }
 
     /// A write passed on to a node that does not lead (any more) is not decided there, on a

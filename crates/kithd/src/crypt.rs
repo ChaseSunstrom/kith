@@ -1440,7 +1440,7 @@ pub async fn set(
             // recovery key, gives the cluster its key to hold as a new node does.)
             "unlock" if held.spec["forgotten"] == true => {
                 let key = held.key();
-                let deleted = shared.submit(Command::Delete { key }).await;
+                let deleted = shared.submit_as(Command::Delete { key }, Some(&caller)).await;
                 let said = json!({ "node": name, "locked": false, "wiped": false, "seal": false });
                 return deleted.map(|_| said).map_err(|e| e.to_string());
             }
@@ -1474,8 +1474,8 @@ pub async fn set(
             said["code"] = code.into();
         }
         let (resources, at) = (vec![held], kith_api::store::now());
-        let applied = shared.submit(Command::Apply { resources, at }).await;
-        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await?;
+        let applied = shared.submit_as(Command::Apply { resources, at }, Some(&caller)).await;
+        stays_forgotten(&shared, &caller, &applied.map_err(|e| e.to_string())?).await?;
         Ok(said)
     }
     .await;
@@ -1505,14 +1505,14 @@ fn put_back(done: &kith_store::Done) -> Vec<kith_api::Resource> {
 
 /// Forgotten stays forgotten: what [`put_back`] names of a write that was `done` is
 /// written as it was, and the write is said to have failed.
-async fn stays_forgotten(shared: &Shared, done: &kith_store::Done) -> Result<(), String> {
+async fn stays_forgotten(shared: &Shared, caller: &Caller, done: &kith_store::Done) -> Result<(), String> {
     let back = put_back(done);
     if back.is_empty() {
         return Ok(());
     }
     let names: Vec<String> = back.iter().map(|key| key.metadata.name.clone()).collect();
     let (resources, at) = (back, kith_api::store::now());
-    let again = shared.submit(Command::Apply { resources, at }).await;
+    let again = shared.submit_as(Command::Apply { resources, at }, Some(caller)).await;
     let names = names.join(", ");
     Err(match again {
         Ok(_) => format!("a duress code was typed meanwhile: the cluster has forgotten the key of {names}"),
@@ -1672,12 +1672,15 @@ pub async fn duress_all(
             return Err("the cluster holds no node's key: no node's state is encrypted".to_string());
         }
         let applied = shared
-            .submit(Command::Apply {
-                resources: keys,
-                at: kith_api::store::now(),
-            })
+            .submit_as(
+                Command::Apply {
+                    resources: keys,
+                    at: kith_api::store::now(),
+                },
+                Some(&caller),
+            )
             .await;
-        stays_forgotten(&shared, &applied.map_err(|e| e.to_string())?).await
+        stays_forgotten(&shared, &caller, &applied.map_err(|e| e.to_string())?).await
     }
     .await;
     let about = names.iter().map(|name| format!("NodeKey/{name}")).collect();
@@ -1836,7 +1839,10 @@ pub async fn forget(State(shared): State<Arc<Shared>>, Json(asked): Json<Forget>
     }
     let about: Vec<String> = wiped.iter().map(kith_api::Resource::key).collect();
     let (resources, at) = (wiped, kith_api::store::now());
-    let applied = shared.submit(Command::Apply { resources, at }).await;
+    // (The duress code typed at this node's console is the authority here, as the console token is
+    // for `claim`: the admin's. A node that is not the leader passes it on as the admin's write.)
+    let admin = crate::access::Caller::Admin;
+    let applied = shared.submit_as(Command::Apply { resources, at }, Some(&admin)).await;
     let applied = applied.map(drop).map_err(|e| e.to_string());
     eprintln!("kithd: a duress code was typed: forgetting {}", about.join(", "));
     shared.audit.record(&"a duress code", "forget", about, applied.clone());

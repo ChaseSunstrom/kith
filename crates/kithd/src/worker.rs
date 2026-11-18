@@ -3,8 +3,9 @@
 //! A node sends its writes to the node that leads (`/v1/raft/write`), which gives them to
 //! Raft as they come. From a worker each one is held to the list here first, against the
 //! store of the control node that was asked: what a node says about itself, and nothing
-//! of anyone else's (docs/adr-workers.md, "Writes"). A control node's writes are not
-//! looked at: one that is taken is the cluster taken.
+//! of anyone else's (docs/adr-workers.md, "Writes"). A control node's own writes (no caller
+//! named) are held to the list in `own_writes.rs` instead, which reuses these checks for
+//! the kinds a control node holds and refuses the rest.
 
 use kith_api::Resource;
 use kith_api::store::Store;
@@ -156,7 +157,63 @@ fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
+/// Refused where the mesh key `fields` say is another node's: two nodes that say one key are both
+/// left out of the mesh, so saying another's cuts it off. (A Node's own patch, by a worker or a
+/// control node alike: `own_writes` calls it too.)
+pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &Fields) -> Result<(), String> {
+    let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
+    let theirs = |other: &Resource| {
+        let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
+        other.metadata.name != node && has.is_some() && has == said
+    };
+    match store.list(Some("Node")).find(|other| theirs(other)) {
+        Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
+        None => Ok(()),
+    }
+}
+
+/// What a node says of its people's device (`status.people`): null, or the device's public key
+/// (32 bytes, base64), its port and its endpoint (a string or null), and nothing else.
+fn people_shape(key: &str, people: &Value) -> Result<(), String> {
+    use base64::Engine as _;
+    let fields = match people {
+        Value::Null => return Ok(()),
+        Value::Object(fields) => fields,
+        _ => {
+            return Err(refused(
+                key,
+                "`people` is null or the people's device: publicKey, port, endpoint",
+            ));
+        }
+    };
+    if let Some(other) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "publicKey" | "port" | "endpoint"))
+    {
+        return Err(refused(key, format!("people has no {other}")));
+    }
+    let public = fields.get("publicKey").and_then(Value::as_str);
+    let public = public.and_then(|public| base64::engine::general_purpose::STANDARD.decode(public).ok());
+    if public.is_none_or(|public| public.len() != 32) {
+        return Err(refused(key, "`publicKey` is a 32-byte key in base64"));
+    }
+    if !fields
+        .get("port")
+        .and_then(Value::as_u64)
+        .is_some_and(|port| (1..=65535).contains(&port))
+    {
+        return Err(refused(key, "`port` is a port from 1 to 65535"));
+    }
+    if !fields
+        .get("endpoint")
+        .is_some_and(|endpoint| endpoint.is_null() || endpoint.is_string())
+    {
+        return Err(refused(key, "`endpoint` is a string or null"));
+    }
+    Ok(())
+}
+
+pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
         // (A key that is gone is skipped by the store: nothing to refuse.)
@@ -164,7 +221,10 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint"])?;
+            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint", "people"])?;
+            if let Some(people) = fields.get("people") {
+                people_shape(key, people)?;
+            }
             // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
             let small = |policy: &Value| match policy {
                 Value::Null => true,
@@ -213,16 +273,7 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
                     ));
                 }
             }
-            // Two nodes that say one key are both left out of the mesh: saying another's cuts it off.
-            let said = fields.get("mesh").and_then(|mesh| mesh["key"].as_str());
-            let theirs = |other: &Resource| {
-                let has = other.status.as_ref().and_then(|status| status["mesh"]["key"].as_str());
-                other.metadata.name != node && has.is_some() && has == said
-            };
-            match store.list(Some("Node")).find(|other| theirs(other)) {
-                Some(other) => Err(refused(key, format!("the mesh key is node {}'s", other.metadata.name))),
-                None => Ok(()),
-            }
+            mesh_key_elsewhere(store, node, key, fields)
         }
         "Blob" => {
             only(key, fields, &["nodes"])?;
@@ -288,7 +339,7 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     }
 }
 
-fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Result<(), String> {
+pub(crate) fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Result<(), String> {
     let Some(live) = store.get(key) else { return Ok(()) };
     let fields = match said {
         Some(Value::Object(fields)) => fields.clone(),
@@ -320,7 +371,7 @@ fn status(store: &Store, who: &Worker, key: &str, said: Option<&Value>) -> Resul
 
 /// What is taken of what the worker says of the units of `key`: `Err` when none of it is
 /// its to say, and the units of replicas the scheduler gave another node are left out.
-fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result<Option<Value>, String> {
+pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result<Option<Value>, String> {
     let (Some(live), Some(said)) = (store.get(key), said) else {
         // (Gone: skipped by the store. Nothing said: its own units are taken out.)
         return Ok(None);
@@ -366,8 +417,18 @@ fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result
     };
     let units = said.remove("containers");
     let units: Vec<Value> = units.as_ref().and_then(Value::as_array).cloned().unwrap_or_default();
-    const UNIT: [&str; 9] = [
-        "name", "replica", "state", "ready", "restarts", "revision", "exitCode", "message", "address",
+    // (`hostUsers`: whether a container keeps the node's users, which the node says of its own unit.)
+    const UNIT: [&str; 10] = [
+        "name",
+        "replica",
+        "state",
+        "ready",
+        "restarts",
+        "revision",
+        "exitCode",
+        "message",
+        "address",
+        "hostUsers",
     ];
     for unit in &units {
         match unit.as_object() {
@@ -397,7 +458,7 @@ fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>) -> Result
     Ok(Some(said.into()))
 }
 
-fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), String> {
+pub(crate) fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), String> {
     let (key, node) = (resource.key(), who.name);
     let live = store.get(&key);
     let spec = resource.spec.as_object().cloned().unwrap_or_default();
@@ -482,7 +543,7 @@ fn apply(store: &Store, who: &Worker, resource: &mut Resource) -> Result<(), Str
     }
 }
 
-fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
+pub(crate) fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), String> {
     let Some(live) = store.get(key) else { return Ok(()) };
     let discovered = live.metadata.labels.get(DISCOVERED).is_some_and(|made| made == "true");
     let made_here = live.metadata.annotations.get(MADE_ON).is_some_and(|on| on == who.name);
@@ -665,6 +726,47 @@ spec: { volume: there, every: 1d }
         Command::Patch {
             statuses: vec![(key.to_string(), fields)],
         }
+    }
+
+    #[test]
+    fn a_worker_says_its_people_device_in_its_shape() {
+        use base64::Engine as _;
+        let store = store();
+        let people = |said: Value| patch_of("Node/w", json!({ "people": said }));
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let device = |public: Value, port: Value, endpoint: Value| json!({ "publicKey": public, "port": port, "endpoint": endpoint });
+        // Its device, with or without an endpoint; null when the device is taken away.
+        for said in [
+            device(json!(key), json!(51821), Value::Null),
+            device(json!(key), json!(65535), json!("203.0.113.5:51821")),
+            Value::Null,
+        ] {
+            assert!(try_as(&store, "w", people(said.clone())).is_ok(), "{said}");
+        }
+        // Outside its shape: a key that is not 32 bytes in base64, a port out of range or not a
+        // number, an endpoint that is neither a string nor null, another field, a field missing.
+        let short = base64::engine::general_purpose::STANDARD.encode([7u8; 31]);
+        let outside = [
+            device(json!(short), json!(51821), Value::Null),
+            device(json!("not base64!"), json!(51821), Value::Null),
+            device(json!(7), json!(51821), Value::Null),
+            device(json!(key), json!(0), Value::Null),
+            device(json!(key), json!(65536), Value::Null),
+            device(json!(key), json!("51821"), Value::Null),
+            device(json!(key), json!(51821), json!(5)),
+            json!({ "publicKey": key, "port": 51821, "endpoint": null, "lan": "192.0.2.5" }),
+            json!({ "publicKey": key, "port": 51821 }),
+            json!("yes"),
+        ];
+        for said in outside {
+            assert!(try_as(&store, "w", people(said.clone())).is_err(), "{said}");
+        }
+        // Another node's device.
+        let theirs = patch_of(
+            "Node/w",
+            json!({ "people": device(json!(key), json!(51821), Value::Null) }),
+        );
+        assert!(try_as(&store, "w-b", theirs).is_err());
     }
 
     #[test]
@@ -996,6 +1098,15 @@ spec: { volume: there, every: 1d }
         // A unit that says which node runs it, or anything else a unit does not say today.
         let elsewhere = json!({ "containers": [unit(0, json!({ "node": "a" }))] });
         assert!(try_as(&store, "w", report_of("w", "Workload/default/web", elsewhere)).is_err());
+    }
+
+    /// Whether a unit keeps the node's users (`hostUsers`, where kithd is root) is the node's to say.
+    #[test]
+    fn a_unit_says_whether_it_keeps_the_nodes_users() {
+        let store = store();
+        let said = json!({ "containers": [unit(0, json!({ "hostUsers": false }))] });
+        let taken = reported(try_as(&store, "w", report_of("w", "Workload/default/web", said)).unwrap()).unwrap();
+        assert_eq!(taken["containers"], json!([unit(0, json!({ "hostUsers": false }))]));
     }
 
     #[test]

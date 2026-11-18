@@ -3,8 +3,10 @@
 //! kithd yet; this module only builds the table and its chains, and reads them back.
 
 use crate::pod::{
-    Batch, INET, NESTED, answering, at, attribute, expression, is, l4proto, link_name, nfproto, number, text, verdict,
+    Batch, INET, NESTED, answering, at, attribute, expression, has_table, is, l4proto, link_name, nfproto, number,
+    text, verdict,
 };
+use crate::{Key, Peer};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A level's reach: the networks it may reach, its Services' addresses and ports, its API's
@@ -188,6 +190,31 @@ pub fn send(
     build(&table(people64, people, levels, mesh, links).map_err(std::io::Error::other)?)
 }
 
+/// `send` with no masquerade rules. A kernel with no masquerade (a test namespace) has no way to
+/// take them; kith OS has them (CONFIG_NFT_MASQ=y), so only tests on such a host call this.
+#[doc(hidden)]
+pub fn send_without_masquerade(
+    people64: Ipv6Addr,
+    people: &[Person],
+    levels: &[(String, Level)],
+    mesh: &str,
+    links: &[(IpAddr, u8)],
+) -> std::io::Result<()> {
+    let mut chains = table(people64, people, levels, mesh, links).map_err(std::io::Error::other)?;
+    without_masquerade(&mut chains);
+    build(&chains)
+}
+
+/// `chains` with no masquerade rule (the kernel has none in a namespace).
+fn without_masquerade(chains: &mut [Chain]) {
+    let masq = expression("masq", &[]);
+    for chain in chains {
+        chain
+            .rules
+            .retain(|rule| rule.windows(masq.len()).all(|window| window != masq.as_slice()));
+    }
+}
+
 /// Makes `chains` the table, in one batch (see `send`).
 fn build(chains: &[Chain]) -> std::io::Result<()> {
     let mut batch = Batch::new(TABLE);
@@ -204,6 +231,70 @@ fn build(chains: &[Chain]) -> std::io::Result<()> {
         }
     }
     batch.send()
+}
+
+/// The people's WireGuard device, in the kernel.
+pub const DEVICE: &str = "kwg0";
+
+/// The people's device as the kernel has it.
+pub struct Found {
+    pub public_key: Key,
+    pub port: u16,
+    pub addresses: Vec<(IpAddr, u8)>,
+    pub peers: usize,
+}
+
+/// The people's device made, or found, with this private key and port, `100.89.0.1/16` and the
+/// people's `::1` (of `people64`, the /64): no peers, and up (see `netlink::Device::ensure_people`).
+pub fn device(key: &Key, port: u16, people64: Ipv6Addr) -> std::io::Result<Found> {
+    let four = (Ipv4Addr::new(100, 89, 0, 1), PEOPLE4.1);
+    let six = (Ipv6Addr::from(u128::from(people64) | 1), 64);
+    found(crate::netlink::Device::ensure_people(DEVICE, key, port, four, six)?)
+}
+
+/// The people's device as it is, if it is there; nothing is made.
+pub fn device_found() -> std::io::Result<Option<Found>> {
+    crate::netlink::Device::open(DEVICE)?.map(found).transpose()
+}
+
+fn found(mut device: crate::netlink::Device) -> std::io::Result<Found> {
+    Ok(Found {
+        public_key: device.public_key()?,
+        port: device.listen_port()?,
+        addresses: device.addresses()?,
+        peers: device.peers()?.len(),
+    })
+}
+
+/// Whether nftables has the people's table.
+pub fn table_present() -> std::io::Result<bool> {
+    has_table(INET, TABLE)
+}
+
+/// Sets the people's device's peers, as the device has them now: kithd's tests seed one (a start
+/// never does). Fails if there is no device to seed.
+#[doc(hidden)]
+pub fn set_peers_for_tests(peers: &[Peer]) -> std::io::Result<()> {
+    match crate::netlink::Device::open(DEVICE)? {
+        Some(mut device) => device.set_peers(peers),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no people device to seed",
+        )),
+    }
+}
+
+/// Takes the people's device and table away, if they are there (the take-away with no flag).
+pub fn remove() -> std::io::Result<()> {
+    if let Some(device) = crate::netlink::Device::open(DEVICE)? {
+        device.remove()?;
+    }
+    if has_table(INET, TABLE)? {
+        let mut batch = Batch::new(TABLE);
+        batch.drop_table(INET);
+        batch.send()?;
+    }
+    Ok(())
 }
 
 /// The level's `-in`: a Service's address and port (each port, or any with none listed), the
@@ -911,14 +1002,6 @@ mod tests {
     /// The table `chains` make, as `listed` should give it back.
     fn expected(chains: &[Chain]) -> Vec<(String, usize)> {
         chains.iter().map(|c| (c.name.clone(), c.rules.len())).collect()
-    }
-
-    /// `chains` with no masquerade rule (the kernel has none in a namespace).
-    fn without_masquerade(chains: &mut [Chain]) {
-        let masq = expression("masq", &[]);
-        for chain in chains {
-            chain.rules.retain(|rule| !rule.contains_slice(&masq));
-        }
     }
 
     /// Fails unless this is root in a network namespace of its own (`unshare -Urn`): the E2E
