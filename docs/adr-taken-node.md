@@ -369,9 +369,13 @@ Slice 1 (T-0779) put `Signed { header, method, path, body, command }` in the sto
 per-signer nonce book, and FORMAT 3 (`MarkSigned`), proposed once every member reads it.
 Slice 2 makes the entry mean something:
 
-- **The leader writes it.** At format 3, a signed apply, delete or rollback the leader
+- **FORMAT 4 (`MarkChecked`).** A T-0779 kithd reads format 3 and refuses every Signed
+  entry at apply; one that checks it would take it, and the stores would part in a rolling
+  upgrade. So the leader proposes `MarkChecked` only once every member says it reads 4
+  (as for 2 and 3), and below 4 every node refuses a Signed entry, as T-0779's does.
+- **The leader writes it.** At format 4, a signed apply, delete or rollback the leader
   applies goes in the log as `Signed`, with the header, method, path (query included) and
-  body (base64) it came with, around the command (`Shared::write_as`). Below format 3 it
+  body (base64) it came with, around the command (`Shared::write_as`). Below format 4 it
   is written bare. Any other signed route (a drain, a `kith run`) stays bare, as before.
 - **Every node checks it at apply** (`access_sign::admit`, run under the store's lock by
   the hook main.rs hands the state machine), in this order, from the entry and its store
@@ -390,14 +394,27 @@ Slice 2 makes the entry mean something:
 - **The nonce book is capped**: 4096 entries per signer within five minutes of each other
   (`SIGNED_NONCES`), past which a signed entry is refused, so a key can't grow the store
   without bound. Time is only the entries' `expires`.
-- **Only the leader writes Mark, MarkSigned and Signed.** `/v1/raft/write` and a control
-  node's own writes (`own_writes::checked`) refuse all three from any other node. A
-  follower's relayed write waited on a `Mark`; it now waits on an empty `Patch`. A follower
-  still on the older kithd sends a `Mark` there and is refused until it is updated.
-- **What slice 2 leaves:** a definition or a key that changes between the write and its
-  apply can refuse a write the leader took (the signer sends it again); a refused entry
-  replayed from the log is audited again; the controllers' entries (the table above) are
-  not signed yet.
+- **Only the leader moves the format and writes Signed.** `/v1/raft/write` and a control
+  node's own writes (`own_writes::checked`) refuse a Signed entry from any other node, and
+  a `Mark`, `MarkSigned` or `MarkChecked` above the store's format. One at or below it is a
+  no-op and is taken: an older follower's relayed write waits on a `Mark` as its barrier.
+  This build's barrier is an empty `Patch`.
+- **What slice 2 leaves:**
+  - A taken leader can still write any bare `Apply` or `Delete`. Slice 2 stops only
+    forged Signed entries. Bare user writes are refused only with slices 3 and 6.
+  - A Signed entry's `at` is not compared on `Apply` or `Rollback`: the revision and
+    `born` the leader stamps are taken as carried.
+  - A header held back can be applied late, past its `expires`, and after a newer one
+    from the same signer. Apply has no clock. Each signer's book is measured only by
+    that signer's newest `expires`, so a header stays good until the book holds one
+    expiring 300 s (`SIGNED_SKEW`) or more after it.
+  - A newest `expires` across all signers was weighed and not done. One signer, or a
+    taken leader, writing a far-future `expires` would lock every other signer out for
+    good.
+  - A definition or a key that changes between the write and its apply can refuse a
+    write the leader took. The signer sends it again.
+  - A refused entry replayed from the log is audited again.
+  - The controllers' entries (the table above) are not signed yet.
 
 ## Why not short-lived node certificates
 

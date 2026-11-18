@@ -340,7 +340,8 @@ fn same(store: &Store, derived: Command, carried: &Command) -> Result<(), String
 }
 
 /// May a node apply `command`, an entry of the log the node `leader` wrote, to `store`? Anything
-/// but a signed entry may. A signed one only where all of these hold, in this order: its
+/// but a signed entry may. A signed one only where all of these hold, in this order: `store` is
+/// in format 4 ([`Store::checking`]); its
 /// signature holds by `store`'s keys, for `*` or for `leader`; its method, path and body make
 /// its command ([`derived`], [`same`]); its signer may make it ([`crate::api::refused`], and
 /// the admin's key and `spec.signing` change only by the admin's: [`guard`]); and the signer's
@@ -357,6 +358,11 @@ pub fn admit(store: &Store, cluster: &str, command: &Command, leader: kith_store
     else {
         return Ok(());
     };
+    // Before format 4 a member may be on a kithd that refuses every signed entry (T-0779's):
+    // refused here too, so the stores stay alike.
+    if !store.checking() {
+        return Err("the store is not in format 4, where every member checks signed entries".into());
+    }
     let target = kith_store::header(header)?.target;
     if target != "*" && kith_store::node_id(target) != leader {
         return Err(format!("signed for {target}, not for the node that wrote it"));
@@ -735,7 +741,8 @@ fn clusters_after(store: &Store, command: &Command) -> Result<Option<BTreeMap<St
         | Command::Patch { .. }
         | Command::Report { .. }
         | Command::Mark
-        | Command::MarkSigned => return Ok(None),
+        | Command::MarkSigned
+        | Command::MarkChecked => return Ok(None),
     }
     Ok(Some(after))
 }
@@ -1202,10 +1209,10 @@ mod tests {
     /// The leader every entry of these tests is written by.
     const LEADER: &str = "n2";
 
-    /// A store in format 3 whose Cluster has the admin's key.
+    /// A store in format 4 whose Cluster has the admin's key.
     fn signing_store() -> Store {
         let mut store = store_with(admin().public_key().as_ref(), "");
-        kith_store::run(&mut store, Command::MarkSigned).unwrap();
+        kith_store::run(&mut store, Command::MarkChecked).unwrap();
         store
     }
 
@@ -1330,6 +1337,10 @@ mod tests {
             assert_eq!(one, two);
             let names: Vec<_> = one.list(Some("ConfigMap")).map(|m| m.metadata.name.clone()).collect();
             assert_eq!(names, ["a", "b"]);
+            // In format 3 none is taken: a T-0779 kithd, a member then, refuses them all.
+            let mut three = store_with(admin().public_key().as_ref(), "");
+            kith_store::run(&mut three, Command::MarkSigned).unwrap();
+            assert_eq!(feed(&mut three, &log), [false; 7], "expires {expires}");
         }
     }
 
@@ -1431,9 +1442,10 @@ mod tests {
     }
 
     /// The leader writes a signed request it applies as a signed entry once the store is in
-    /// format 3, and bare before; one whose command is not what its body says is nothing.
+    /// format 4, and bare before (in 3 a member may refuse every signed entry); one whose
+    /// command is not what its body says is nothing.
     #[tokio::test]
-    async fn signed_wrap_at_format_3_and_bare_below() {
+    async fn signed_wrap_at_format_4_and_bare_below() {
         use crate::cluster::pinned_peer::{node, shared_with};
         let ca = crate::pki::Ca::create().unwrap();
         let shared = shared_with("signed-wrap", node(&ca, "wrap-c"), &[]).await;
@@ -1483,10 +1495,14 @@ mod tests {
         };
         // Format 1: written bare (a signed entry would be refused there).
         apply(1, &["a"], "a").await.unwrap();
+        // Format 3: bare too, a member may be a T-0779 kithd that refuses every signed entry.
         shared.write(Command::MarkSigned).await.unwrap();
         assert!(book(1), "below format 3 no nonce is taken");
+        apply(4, &["d"], "d").await.unwrap();
+        assert!(book(4), "at format 3 the entry is bare, and no nonce taken");
+        shared.write(Command::MarkChecked).await.unwrap();
         apply(2, &["b"], "b").await.unwrap();
-        assert!(!book(2), "at format 3 the entry is signed, and its nonce taken");
+        assert!(!book(2), "at format 4 the entry is signed, and its nonce taken");
         // Its command is not what its body says: refused on every node, and written down.
         assert!(apply(3, &["c"], "x").await.is_err());
         let state = shared.store.lock().unwrap();

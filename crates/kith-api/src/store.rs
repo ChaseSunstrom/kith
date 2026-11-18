@@ -124,6 +124,11 @@ pub struct Store {
     #[cfg(feature = "signing")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signers: Option<BTreeMap<String, Signer>>,
+    /// Whether every node checks signed entries at apply ([`Store::check`]): until then
+    /// none is run. Not written while false: a store from before is written as it was.
+    #[cfg(feature = "signing")]
+    #[serde(default, skip_serializing_if = "<&bool as std::ops::Not>::not")]
+    checked: bool,
     /// Where in the log the next changes are ([`Store::entry`]).
     #[serde(skip)]
     entry: u64,
@@ -199,11 +204,25 @@ impl Store {
         self.signers.is_some()
     }
 
-    /// The signers' books of `from` in place of these: what an import brings in is a store,
-    /// not the cluster's record of what was signed.
+    /// From here on every node checks a signed entry before it runs it (format 4): the
+    /// leader writes signed requests as signed entries only then. Done once: again, nothing.
+    #[cfg(feature = "signing")]
+    pub fn check(&mut self) {
+        self.checked = true;
+    }
+
+    /// Whether [`Store::check`] was done.
+    #[cfg(feature = "signing")]
+    pub fn checking(&self) -> bool {
+        self.checked
+    }
+
+    /// The signers' books of `from` in place of these, and whether it is checked: what an
+    /// import brings in is a store, not the cluster's record of what was signed.
     #[cfg(feature = "signing")]
     pub fn keep_signers(&mut self, from: Store) {
         self.signers = from.signers;
+        self.checked = from.checked;
     }
 
     /// Would [`Store::nonce`] take `nonce`? The same refusals, nothing changed.

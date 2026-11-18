@@ -613,11 +613,15 @@ async fn replica(
     }
     // What each entry is asked once the store is in format 3: a signed one is applied only
     // where its signature, command, signer's rights and nonce hold by the store
-    // (`access_sign::admit`; under the store's lock, and deterministic).
+    // (`access_sign::admit`; under the store's lock, and deterministic). A CA whose fingerprint
+    // cannot be read stops the start: without it every signed entry would be refused here
+    // alone, and this store would part from the others'.
     let audit = Arc::new(audit::Audit::new(state.join("audit.log")));
     let id = cluster
         .as_ref()
-        .and_then(|cluster| pki::fingerprint(&cluster.me.ca).ok());
+        .map(|cluster| pki::fingerprint(&cluster.me.ca))
+        .transpose()
+        .map_err(|e| format!("the cluster CA's fingerprint: {e}"))?;
     let check = access_sign::hook(id, audit.clone());
     let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
