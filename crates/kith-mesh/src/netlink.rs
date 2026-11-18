@@ -353,11 +353,28 @@ fn put_address(index: u32, address: Ipv6Addr, bits: u8, there: bool) -> Result<(
     ask(protocols::NETLINK_ROUTE, message, NLM_F_ACK | flags).map(drop)
 }
 
+/// The IPv6 addresses (of 128 bits) the interface `index` has.
+pub fn addresses6(index: u32) -> Result<Vec<Ipv6Addr>> {
+    let mut message = AddressMessage::default();
+    message.header.family = AddressFamily::Inet6;
+    let found = ask_route(RouteNetlinkMessage::GetAddress(message), NLM_F_DUMP)?;
+    Ok(found
+        .into_iter()
+        .filter_map(|found| match found {
+            RouteNetlinkMessage::NewAddress(found) if found.header.index == index && found.header.prefix_len == 128 => {
+                found.attributes.into_iter().find_map(|attribute| match attribute {
+                    AddressAttribute::Address(std::net::IpAddr::V6(address)) => Some(address),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
 /// Make the further addresses of the interface `index` (besides its own) `wanted`; `held` is
 /// what this caller put there before, and the only addresses it takes off again. (The
 /// mesh's WireGuard interface, or the loopback where there is no mesh.)
-//
-// ponytail: addresses left by a kithd that was killed stay until the interface goes.
 pub fn hold(index: u32, held: &mut BTreeSet<Ipv6Addr>, wanted: &BTreeSet<Ipv6Addr>) -> Result<()> {
     // All are tried; the first that failed is told. (One that would not go, because it
     // was gone already, say, is not tried again.)

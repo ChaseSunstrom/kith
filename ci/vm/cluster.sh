@@ -29,7 +29,7 @@
         fail() { tail -n 30 "$work"/n?.log || true; echo "vm.sh: FAIL: $1" >&2; exit 1; }
         cargo build -q --manifest-path "$root/Cargo.toml" -p kith-cli >&2
         # (rollout, chaos and access: three nodes and nothing more said to kithd; share, pods, kube and
-        # worker: two, on the mesh; services and quota: one, on the mesh.)
+        # worker: two, on the mesh; quota: one, on the mesh; services: one, with no mesh.)
         others='2 3' more='' inside=2049 lan='' base=$root/target/os out='' dumps='' gateway='' https=''
         seed() { :; }
       if [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then

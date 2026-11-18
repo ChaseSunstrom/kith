@@ -16,7 +16,7 @@ pub mod exit;
 mod netlink;
 pub mod pod;
 
-pub use netlink::{Card, Device, Seen, address4, cards, hold, up};
+pub use netlink::{Card, Device, Seen, address4, addresses6, cards, hold, up};
 use sha2::{Digest, Sha256};
 use std::net::{Ipv6Addr, SocketAddr};
 
@@ -68,6 +68,11 @@ pub fn service_address(prefix: Ipv6Addr, namespace: &str, name: &str) -> Ipv6Add
 /// Is `address` one of the cluster's (a node's, a service's)?
 pub fn in_mesh(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
     prefix.octets()[..6] == address.octets()[..6]
+}
+
+/// Is `address` a Service's of the cluster `prefix`: in its services' /80?
+pub fn is_service_address(prefix: Ipv6Addr, address: Ipv6Addr) -> bool {
+    in_mesh(prefix, address) && address.octets()[6..10] == SERVICES
 }
 
 /// The node's own address: the first of its /80.
@@ -165,6 +170,19 @@ pub fn wanted(prefix: Ipv6Addr, me: &str, members: &[Member]) -> Vec<Peer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an address in the services' /80 of this cluster is a Service's: not a node's, not another cluster's.
+    #[test]
+    fn a_service_address_is_in_the_services_80_of_the_cluster() {
+        let mesh = prefix(b"a cluster");
+        assert!(is_service_address(mesh, service_address(mesh, "default", "web")));
+        assert!(!is_service_address(mesh, node_address(mesh, "alpha")));
+        assert!(!is_service_address(
+            prefix(b"another"),
+            service_address(mesh, "default", "web")
+        ));
+        assert!(!is_service_address(mesh, Ipv6Addr::LOCALHOST));
+    }
 
     /// A member an edge node saw behind another NAT is called there; behind this node's own NAT,
     /// or seen by none, where it said it is; reached or not, the same.
