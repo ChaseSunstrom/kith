@@ -91,11 +91,13 @@ type Undo = BTreeMap<String, Option<Vec<Revision>>>;
 
 /// How long before a signer's newest `expires` one of its signed entries may say, in seconds:
 /// one older is refused, and the nonces that old are dropped.
+#[cfg(feature = "signing")]
 const SIGNED_SKEW: u64 = 300;
 
 /// One signer's book: the newest `expires` its signed entries said, and the nonces taken
 /// (each with its `expires`) not yet [`SIGNED_SKEW`] older than that. (Written as a pair,
 /// `[newest, {nonce: expires}]`: named fields cost kith 4 KB more of serde, T-0779.)
+#[cfg(feature = "signing")]
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Signer(u64, BTreeMap<String, u64>);
 
@@ -113,6 +115,7 @@ pub struct Store {
     born: Option<BTreeMap<String, (u64, u64)>>,
     /// The nonces each signer's signed entries were taken with ([`Store::nonce`]). `None`
     /// until [`Store::sign`]: a store from before has none, and is written as it was.
+    #[cfg(feature = "signing")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signers: Option<BTreeMap<String, Signer>>,
     /// Where in the log the next changes are ([`Store::entry`]).
@@ -179,17 +182,20 @@ impl Store {
 
     /// Keep from here on the nonces of signed entries ([`Store::nonce`]). Done once: again,
     /// nothing.
+    #[cfg(feature = "signing")]
     pub fn sign(&mut self) {
         self.signers.get_or_insert_with(BTreeMap::new);
     }
 
     /// Whether [`Store::sign`] was done.
+    #[cfg(feature = "signing")]
     pub fn signing(&self) -> bool {
         self.signers.is_some()
     }
 
     /// The signers' books of `from` in place of these: what an import brings in is a store,
     /// not the cluster's record of what was signed.
+    #[cfg(feature = "signing")]
     pub fn keep_signers(&mut self, from: Store) {
         self.signers = from.signers;
     }
@@ -198,6 +204,7 @@ impl Store {
     /// changed, when the store does not keep nonces, when `who` took it already, or when
     /// `expires` is [`SIGNED_SKEW`] or more before the newest `who` said: its nonce may be
     /// one dropped. Deterministic: every input is the entry's, or the store's.
+    #[cfg(feature = "signing")]
     pub fn nonce(&mut self, who: &str, expires: u64, nonce: &str) -> Result<(), Error> {
         let Some(signers) = self.signers.as_mut() else {
             return Err(Error::Invalid("a signed entry before the store is in format 3".into()));

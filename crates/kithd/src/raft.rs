@@ -385,7 +385,7 @@ fn throttled(said: &mut Said, name: &str, kind: &'static str, now: Instant) -> O
     Some(said.insert(key, (now, 0)).map_or(0, |(_, unwritten)| unwritten))
 }
 
-/// Put worker `name`'s refused write in the audit log.
+/// Put the refused write of node `name` (a worker, or a control node) in the audit log.
 fn audit(shared: &Shared, name: &str, why: String) {
     let who = crate::access::Caller::Node(name.to_string());
     shared

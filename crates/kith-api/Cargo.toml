@@ -8,6 +8,9 @@ license.workspace = true
 [features]
 # A binary reads the kinds' schemas out of v1.schema.json (build.rs); this links what makes them.
 generate = ["dep:schemars"]
+# The signers' book a replicated store keeps (format 3, `Store::nonce`): kith-store turns it on.
+# kith's own file store never signs, and links none of it (6 KB of serde, T-0779).
+signing = []
 
 [dependencies]
 kith-yaml.workspace = true
