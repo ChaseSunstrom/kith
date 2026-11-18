@@ -1200,8 +1200,8 @@ spec: { node: a, path: tiny, size: 1Gi }
         let shut = at("shop", "data").join("data/shut");
         std::fs::create_dir_all(shut.join("in")).unwrap();
         std::fs::write(shut.join("in/file"), "x").unwrap();
-        std::fs::set_permissions(shut.join("in"), std::os::unix::fs::PermissionsExt::from_mode(0)).unwrap();
-        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0)).unwrap();
+        std::fs::set_permissions(shut.join("in"), std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&shut, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
         wipe(&state, &dir("shop", "data")).unwrap();
         assert!(
             at("shop", "data").symlink_metadata().is_err(),
