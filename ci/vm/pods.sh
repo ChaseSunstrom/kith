@@ -4,9 +4,8 @@
 # Sourced by ci/vm.sh for --test pods: it runs inside the driver's shell, with its
 # variables and functions; not a script to run alone.
             # This machine, as something outside the cluster a pod asks: the nodes reach it
-            # at 10.0.2.100, port 80, which their card out forwards to this port (the one way
-            # out a restricted network gives them), and only from an address their card out
-            # has (a pod's own is not one the network out there knows).
+            # at 10.0.2.2, and only from an address their card out has (a pod's own is not
+            # one the network out there knows).
             mkdir "$work/www"
             (cd "$work/www" && exec python3 -m http.server --bind 127.0.0.1 $((port + 9))) >/dev/null 2>&1 &
             web=$!
@@ -55,7 +54,7 @@ EOF
             # Each makes a file in its root, as root, before it listens.
             three web '"image":"kith.test/pod:1","command":["/bin/pod","serve"]'
             # Their Service by its short name and by its whole one, and this machine.
-            asks ask web 80 web.default.svc.cluster.local 80 10.0.2.100 80
+            asks ask web 80 web.default.svc.cluster.local 80 10.0.2.2 $((port + 9))
             for heard in web-0 web-1 web-2 'HTTP/1.0 200 OK'; do
                 grep -q "$heard" "$work/ask.out" || fail "the pod that asked did not hear $heard: $(cat "$work/ask.out")"
             done
@@ -87,7 +86,7 @@ EOF
             # And one pod on n2 asks this machine, from behind its node's address: the node
             # sends it as its own only if the masquerade rule matches the range it was told.
             pinned='on-n2'
-            asks egress 10.0.2.100 80
+            asks egress 10.0.2.2 $((port + 9))
             pinned=''
             grep -q 'HTTP/1.0 200 OK' "$work/egress.out" || fail "the pod on n2 (range of --pod-range) did not reach this machine from behind its node: $(cat "$work/egress.out")"
             # A Workload of an image nothing else uses, deleted once it runs: its image is

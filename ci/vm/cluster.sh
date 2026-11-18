@@ -242,7 +242,13 @@ EOF
             joined="--dns 0.0.0.0:5353 --dns-upstream 10.0.2.2:$((port + 9))" # unrestricted: the joined nodes ask this machine's resolver over UDP, which restrict=on drops
             [ "${KITH_POD_NOUPSTREAM:-}" != 1 ] || { first='--dns-upstream 10.9.0.9:5353'; joined='--dns 0.0.0.0:5353 --dns-upstream 10.9.0.9:5353'; }
         fi
+        # (pods: a pod's egress may not reach the node's own subnet (kith's guard refuses it), so
+        # the server its pods ask sits behind the gateway, 10.0.2.2, which restrict=on blocks.
+        # unrestricted: this test's nodes keep their card out open; the value is put back after.)
+        keep=${net_restrict-,restrict=on}
+        [ "$test" != pods ] || net_restrict=''
         node 1 "--claim ${first:-}"
+        net_restrict=$keep
         tries=0
         until token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/n1.log" 2>/dev/null) && [ -n "$token" ] \
             && [ "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 -H 'Content-Type: application/json' -d '{"token":"x","name":"root"}' "https://127.0.0.1:$((port + 1))/v1/claim")" = 403 ]; do
@@ -254,7 +260,6 @@ EOF
         for part in ca cert key; do
             printf '%s' "$claimed" | (umask 077 && field "$part" >"$work/$part.pem") || fail "the claim was refused: $claimed"
         done
-        keep=${net_restrict-,restrict=on}
         for n in $others; do
             # (worker: the node it lets in is one, and is sent a view of the store, never the store.)
             asks=/v1/tokens
@@ -266,7 +271,7 @@ EOF
             # (poddns: a joined node asks this machine's resolver over UDP, which restrict=on
             # drops. unrestricted: only that test's joined nodes keep their card out open; the
             # value is put back after each, so no other node of it is opened.)
-            [ "$test" != poddns ] || net_restrict=''
+            case $test in poddns | pods) net_restrict='' ;; esac
             node "$n" "--join 10.9.0.1:7443 --token $join $range ${joined:-}"
             net_restrict=$keep
         done
