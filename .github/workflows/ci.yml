@@ -37,6 +37,10 @@ jobs:
           sudo loginctl enable-linger "$(id -un)"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           for _ in $(seq 50); do [ -S "/run/user/$(id -u)/systemd/private" ] && break; sleep 0.2; done
+      # Agent mode as a service: dist/kithd.service's lines, run as a transient user unit, its
+      # cgroups (Delegate), a Workload beside kithd, and its stop within TimeoutStopSec.
+      - name: dist/kithd.service under the runner's systemd
+        run: cargo build -p kithd -p kith-cli && sh ci/systemd.sh
       - name: Budget checks can fail
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --self-test
       - name: Binary-size and RSS budgets
