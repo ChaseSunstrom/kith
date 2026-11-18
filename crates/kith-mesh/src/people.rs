@@ -811,8 +811,11 @@ mod tests {
         );
     }
 
-    /// The attributes of one netfilter message, as (kind, payload), in order.
-    fn attributes(mut rest: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    /// A netfilter message's attributes, as (kind, payload), in order.
+    type Attributes = Vec<(u16, Vec<u8>)>;
+
+    /// The attributes of one netfilter message.
+    fn attributes(mut rest: &[u8]) -> Attributes {
         let mut found = Vec::new();
         while let Some(head) = rest.get(..4) {
             let length = u16::from_ne_bytes([head[0], head[1]]) as usize;
@@ -828,7 +831,7 @@ mod tests {
 
     /// Every message of a netfilter dump of `kind` (a GET), each one's attributes, in the
     /// kernel's order: the table's chains are listed in the order they were made.
-    fn dump(kind: u16) -> std::io::Result<Vec<Vec<(u16, Vec<u8>)>>> {
+    fn dump(kind: u16) -> std::io::Result<Vec<Attributes>> {
         // (A dump request: the nfgenmsg's family, INET; the flags, a request that dumps.)
         let mut request = Vec::new();
         request.extend(20u32.to_ne_bytes());
