@@ -14,6 +14,7 @@
 // spec (a new tag is a new image: nodes keep a tag they have pulled); nothing is pushed
 // with the registry protocol; an Image that is deleted leaves its Blobs to be deleted by
 // hand; an Image that waits (no Volume, its Job not done) says nothing in its status.
+// Each is left for later.
 
 use crate::Shared;
 use crate::blobs::Incoming;
