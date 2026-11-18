@@ -18,7 +18,7 @@ use netlink_packet_wireguard::{
 use netlink_sys::{Socket, SocketAddr, protocols};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Error, ErrorKind, Result};
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A peer as the kernel has it.
@@ -159,18 +159,57 @@ impl Device {
         Ok(device)
     }
 
+    /// The WireGuard interface `name` for the people (docs/adr-people.md): made or found, with no
+    /// peers, this private key and UDP port, the two addresses, and up.
+    pub fn ensure_people(
+        name: &str,
+        key: &Key,
+        port: u16,
+        four: (Ipv4Addr, u8),
+        six: (Ipv6Addr, u8),
+    ) -> Result<Device> {
+        let mut device = Device::make(name)?;
+        // (Peers left by an earlier run are not the people's: none is the right set.)
+        device.set_peers(&[])?;
+        device.set(vec![
+            WireguardAttribute::PrivateKey(*key),
+            WireguardAttribute::ListenPort(port),
+        ])?;
+        address4(device.index, four.0, four.1, None)?;
+        put_address(device.index, six.0, six.1, true)?;
+        up(device.index)?;
+        Ok(device)
+    }
+
     /// The WireGuard interface `name`, made if it is not there, as it is.
     pub(crate) fn make(name: &str) -> Result<Device> {
-        let ask_route = |message, flags| ask(protocols::NETLINK_ROUTE, message, flags);
-        let mut new = link(0, Some(name));
-        let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
-        new.attributes.push(kind.clone());
-        let made = ask_route(RouteNetlinkMessage::NewLink(new), NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
-        match made {
-            Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
-            _ => {}
+        let made = Device::lookup(name, true)?;
+        made.ok_or_else(|| Error::other(format!("no word from the kernel about {name}")))
+    }
+
+    /// The WireGuard interface `name` as it is, if it is there; nothing is made.
+    pub fn open(name: &str) -> Result<Option<Device>> {
+        Device::lookup(name, false)
+    }
+
+    /// The WireGuard interface `name`: made first if `make` is set and it is not there. `None`
+    /// when it is not there and was not made.
+    fn lookup(name: &str, make: bool) -> Result<Option<Device>> {
+        if make {
+            let mut new = link(0, Some(name));
+            let kind = LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Wireguard)]);
+            new.attributes.push(kind);
+            let made = ask_route(RouteNetlinkMessage::NewLink(new), NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL);
+            match made {
+                Err(e) if e.kind() != ErrorKind::AlreadyExists => return Err(e),
+                _ => {}
+            }
         }
-        let found = ask_route(RouteNetlinkMessage::GetLink(link(0, Some(name))), NLM_F_ACK)?;
+        let found = match ask_route(RouteNetlinkMessage::GetLink(link(0, Some(name))), NLM_F_ACK) {
+            // (Not there, and not made: the kernel says there is no such device.)
+            Err(e) if !make && e.raw_os_error() == Some(nix::errno::Errno::ENODEV as i32) => return Ok(None),
+            found => found?,
+        };
         let Some(RouteNetlinkMessage::NewLink(found)) = found.into_iter().next() else {
             return Err(Error::other(format!("no word from the kernel about {name}")));
         };
@@ -196,12 +235,12 @@ impl Device {
             _ => None,
         });
         let family = id.next().ok_or_else(|| Error::other("the kernel has no WireGuard"))?;
-        Ok(Device {
+        Ok(Some(Device {
             index,
             family,
             had: None,
             held: BTreeSet::new(),
-        })
+        }))
     }
 
     pub(crate) fn index(&self) -> u32 {
@@ -241,6 +280,33 @@ impl Device {
             _ => None,
         });
         key.ok_or_else(|| Error::other("the interface has no key"))
+    }
+
+    /// The UDP port the interface listens on.
+    pub fn listen_port(&mut self) -> Result<u16> {
+        let port = self.get()?.into_iter().find_map(|attribute| match attribute {
+            WireguardAttribute::ListenPort(port) => Some(port),
+            _ => None,
+        });
+        port.ok_or_else(|| Error::other("the interface has no port"))
+    }
+
+    /// The addresses the interface has, of every family, each with its prefix length.
+    pub fn addresses(&self) -> Result<Vec<(IpAddr, u8)>> {
+        let found = ask_route(RouteNetlinkMessage::GetAddress(AddressMessage::default()), NLM_F_DUMP)?;
+        Ok(found
+            .into_iter()
+            .filter_map(|found| match found {
+                RouteNetlinkMessage::NewAddress(found) if found.header.index == self.index => {
+                    let bits = found.header.prefix_len;
+                    found.attributes.into_iter().find_map(|attribute| match attribute {
+                        AddressAttribute::Address(address) => Some((address, bits)),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            })
+            .collect())
     }
 
     /// The peers the interface has now.
