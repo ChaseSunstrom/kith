@@ -27,8 +27,10 @@ kith package render packages/web --name shop | kith apply -f -
   live resource, `{}` when there is none (`(lookup('Secret', release.namespace, 'db').data |
   default({})).password`): only in the release's own namespace, and only of kinds whoever applied
   the Release may `get`; with `kith package render` nothing is live. The Release is rendered again
-  when a resource it looked up changes; a namespace over 1 MB of specs fails the lookup. A missing value, a template that never ends or
-  writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
+  when a resource it looked up, or a Role or binding of its writer, changes; a namespace over 1
+  MB of specs fails the lookup. What `lookup` reads is decided by the Release's writer alone, not
+  by whoever pushed the package (as with Helm, a package is trusted with what its installer may
+  read). A missing value, a template that never ends or writes over 1 MB is an error. A template reads only its package; `namespace()` is not there.
 - Output is checked like any resource (an error shows the rendered line), put in the release's
   namespace unless it names one, and labelled `kith.dev/release` and `kith.dev/package`.
 - `values.schema.json` may use `type`, `properties`, `required`, `additionalProperties`, `items`,
