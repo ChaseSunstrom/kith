@@ -562,8 +562,33 @@ pub const NODEV: u64 = 0x4;
 /// refuses the whole.
 pub fn mount_mapped(from: &Path, to: &Path, users: BorrowedFd, flags: u64) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let path = |path: &Path| std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(Error::other);
-    let (from, to) = (path(from)?, path(to)?);
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes()).map_err(Error::other)?;
+    mapped(libc::AT_FDCWD, &from, 0, to, users, flags)
+}
+
+/// [`mount_mapped`] of what `from` is open on (from [`beneath`]): nothing is resolved by path
+/// on its side, so what a container wrote there meanwhile changes nothing of what is mounted.
+pub fn mount_mapped_fd(from: BorrowedFd, to: &Path, users: BorrowedFd, flags: u64) -> Result<()> {
+    mapped(
+        from.as_raw_fd(),
+        c"",
+        libc::AT_EMPTY_PATH as libc::c_uint,
+        to,
+        users,
+        flags,
+    )
+}
+
+fn mapped(
+    at: libc::c_int,
+    from: &std::ffi::CStr,
+    empty: libc::c_uint,
+    to: &Path,
+    users: BorrowedFd,
+    flags: u64,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes()).map_err(Error::other)?;
     const OPEN_TREE_CLONE: libc::c_uint = 1;
     const AT_RECURSIVE: libc::c_uint = 0x8000;
     const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
@@ -573,9 +598,9 @@ pub fn mount_mapped(from: &Path, to: &Path, users: BorrowedFd, flags: u64) -> Re
     let tree = unsafe {
         libc::syscall(
             libc::SYS_open_tree,
-            libc::AT_FDCWD,
+            at,
             from.as_ptr(),
-            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE | empty,
         )
     };
     if tree < 0 {
@@ -615,6 +640,86 @@ pub fn mount_mapped(from: &Path, to: &Path, users: BorrowedFd, flags: u64) -> Re
         true => Err(Error::last_os_error()),
         false => Ok(()),
     }
+}
+
+/// The part `part` of the directory `dir`, open (`O_PATH`), for [`mount_mapped_fd`]. What is
+/// in `dir` is a container's to write, links included: no step of `part` may be a link, wherever
+/// it points, nor `..`, nor leave `dir`'s file system. A directory on the way that is not there
+/// is made (as Kubernetes makes a subPath), on the step opened before it.
+/// A directory it makes is its parent's user's and group's, with its parent's mode.
+pub fn beneath(dir: &Path, part: &str) -> Result<OwnedFd> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let steps: Vec<&str> = part
+        .split('/')
+        .filter(|step| !step.is_empty() && *step != ".")
+        .collect();
+    if part.starts_with('/') || steps.is_empty() || steps.contains(&"..") {
+        return Err(Error::other(format!("`{part}` is not a path under the directory")));
+    }
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    let mut at: OwnedFd = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(dir)?
+        .into();
+    for step in steps {
+        let name = std::ffi::CString::new(step).map_err(Error::other)?;
+        let open = |at: &OwnedFd| {
+            // struct open_how: flags, mode, resolve.
+            let how: [u64; 3] = [
+                (libc::O_PATH | libc::O_CLOEXEC) as u64,
+                0,
+                libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_XDEV,
+            ];
+            // SAFETY: openat2 reads `name` and `how`, whose size it is told; both live through it.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    at.as_raw_fd(),
+                    name.as_ptr(),
+                    how.as_ptr(),
+                    std::mem::size_of_val(&how),
+                )
+            };
+            match fd < 0 {
+                true => Err(Error::last_os_error()),
+                // SAFETY: a descriptor the kernel just made for this process, and nobody else's.
+                false => Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) }),
+            }
+        };
+        at = match open(&at) {
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                // SAFETY: fstat writes `parent`, which is its own; `at` is an open descriptor.
+                let mut parent: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(at.as_raw_fd(), &mut parent) } < 0 {
+                    return Err(Error::last_os_error());
+                }
+                // SAFETY: mkdirat reads `name`, which lives through the call. (A name made there
+                // meanwhile, a link say, is EEXIST, and the open after refuses a link.)
+                let made = unsafe { libc::mkdirat(at.as_raw_fd(), name.as_ptr(), parent.st_mode & 0o7777) };
+                if made < 0 && Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                    return Err(Error::last_os_error());
+                }
+                let new = open(&at)?;
+                // SAFETY: fchownat of the descriptor itself (AT_EMPTY_PATH): nothing is resolved.
+                let owned = unsafe {
+                    libc::fchownat(
+                        new.as_raw_fd(),
+                        c"".as_ptr(),
+                        parent.st_uid,
+                        parent.st_gid,
+                        libc::AT_EMPTY_PATH,
+                    )
+                };
+                if owned < 0 {
+                    return Err(Error::last_os_error());
+                }
+                new
+            }
+            other => other.map_err(|e| Error::new(e.kind(), format!("`{step}` of `{part}`: {e}")))?,
+        };
+    }
+    Ok(at)
 }
 
 const PT_LOAD: u32 = 1;
@@ -861,6 +966,55 @@ mod tests {
         set_project_limit(&on, 4242, 0, 0).unwrap();
     }
 
+    /// A part of a directory whose path a container writes (a subPath): opened beneath it, each
+    /// missing directory made, and refused where any step is a link, wherever it points, or
+    /// `..`; what comes back is the part itself, open.
+    #[test]
+    fn subpath_beneath_makes_the_part_and_follows_no_link() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let dir = std::env::temp_dir().join(format!("kith-subpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(dir.join("a/file"), b"x").unwrap();
+        symlink("/", dir.join("root")).unwrap();
+        symlink("a", dir.join("inside")).unwrap();
+        std::fs::create_dir(dir.join("a/real")).unwrap();
+        symlink("/etc", dir.join("a/real/etc")).unwrap();
+        let inode = |fd: &OwnedFd| {
+            std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+                .unwrap()
+                .ino()
+        };
+        let made = beneath(&dir, "a/b/c").unwrap();
+        assert!(dir.join("a/b/c").is_dir());
+        assert_eq!(inode(&made), std::fs::metadata(dir.join("a/b/c")).unwrap().ino());
+        assert_eq!(
+            inode(&beneath(&dir, "a/file").unwrap()),
+            std::fs::metadata(dir.join("a/file")).unwrap().ino()
+        );
+        assert_eq!(
+            inode(&beneath(&dir, "./a//b/").unwrap()),
+            std::fs::metadata(dir.join("a/b")).unwrap().ino()
+        );
+        for refused in [
+            "root",
+            "root/etc",
+            "inside",
+            "inside/b",
+            "a/real/etc",
+            "a/real/etc/x",
+            "..",
+            "a/../a",
+            "/a",
+            "",
+        ] {
+            assert!(beneath(&dir, refused).is_err(), "{refused}");
+        }
+        // (Nothing was made through a link: no `x` under the host's /etc, none under `a`.)
+        assert!(!Path::new("/etc/x").exists() && !dir.join("a/x").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Ids that are not its own are mapped by root alone, and a mapped mount of nothing,
     /// or through what is no user namespace, is refused (a mapped mount that holds is the
     /// VM test's to show: ci/vm.sh --test share).
@@ -871,6 +1025,7 @@ mod tests {
         let no_users = File::open("/proc/self/stat").unwrap();
         let (nowhere, elsewhere) = (Path::new("/nowhere/at/all"), Path::new("/nowhere/else"));
         assert!(mount_mapped(nowhere, elsewhere, no_users.as_fd(), RDONLY).is_err());
+        assert!(mount_mapped_fd(no_users.as_fd(), elsewhere, no_users.as_fd(), RDONLY).is_err());
         assert!(user_namespace(u32::MAX, 2).is_err() && user_namespace(1 << 16, 0).is_err());
         let root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
         match user_namespace(7 << 16, 1 << 16) {

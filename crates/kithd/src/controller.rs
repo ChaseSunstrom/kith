@@ -2198,6 +2198,13 @@ fn mounts_of(unit: &Run, volumes: &BTreeMap<String, crate::volumes::Dir>) -> Vec
     found.collect()
 }
 
+/// The subPath of the volume a container mounts at `at`, if it names one.
+fn part_of(run: &Run, at: &str) -> Option<String> {
+    let Run::Container(c) = run else { return None };
+    let mount = c.volume_mounts.iter().find(|m| m.path == at && m.volume.is_some())?;
+    mount.sub_path.clone()
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -2245,6 +2252,7 @@ async fn start(
             // (Not a directory of the host's that an admin named: that one is theirs. Nor
             // what it only reads: another workload's user may be who writes it.)
             give: dir.namespace != crate::volumes::SYSTEM && !*read_only,
+            part: part_of(&slot.run, at),
         });
     }
     // What it mounts that is no Volume: its maps' files, and directories of the replica's own.
@@ -2277,6 +2285,9 @@ async fn start(
                 // A scratch is anyone's as it is made; a map's files are made the container's
                 // user's, who may be the only one its mode lets read them.
                 give: mount.scratch.is_none(),
+                // (A map's one file is kithd's, found above; a scratch's part is the runtime's
+                // to open beneath it.)
+                part: mount.scratch.as_ref().and(mount.sub_path.clone()),
             });
         }
     }
@@ -2299,6 +2310,7 @@ async fn start(
                 read_only: true,
                 // (Made the container's user's: its mode lets nobody else read them.)
                 give: true,
+                part: None,
             });
         }
     }
@@ -2314,6 +2326,7 @@ async fn start(
             container: "/run/seat".into(),
             read_only: *client,
             give: !*client,
+            part: None,
         });
     }
     // Its address, for a variable that asks: its pod's on the mesh, or else its node's.
@@ -2342,6 +2355,7 @@ async fn start(
                     container: at.into(),
                     read_only: true,
                     give: false,
+                    part: None,
                 });
             }
         }

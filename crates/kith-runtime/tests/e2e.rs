@@ -152,6 +152,7 @@ async fn read_only_root() {
             container: "/kept".into(),
             read_only: false,
             give: true,
+            part: None,
         };
         let unit = Unit {
             user,

@@ -1425,6 +1425,8 @@ fn a_template_says_what_a_pod_says() {
         "secret: tls, path: /etc/tls/key.pem, subPath: tls.key, mode: 400",
         "scratch: cache, path: /cache",
         "scratch: cache, path: /cache, memory: true",
+        "volume: data, path: /var/lib/postgresql/data, subPath: pg/15",
+        "scratch: cache, path: /cache, subPath: a",
     ] {
         mount(good).unwrap_or_else(|e| panic!("{good}: {e}"));
     }
@@ -1462,12 +1464,12 @@ fn a_template_says_what_a_pod_says() {
             "items: `..data` is not a path inside it",
         ),
         (
-            "volume: v, path: /d, subPath: pg/15",
-            "`subPath` is one file of a `configMap` or a `secret`",
+            "volume: v, path: /d, subPath: pg/../../etc",
+            "subPath: `pg/../../etc` is not a path inside it",
         ),
         (
-            "scratch: s, path: /d, subPath: a",
-            "a volume or a scratch is mounted whole",
+            "scratch: s, path: /d, subPath: /etc",
+            "subPath: `/etc` is not a path inside it",
         ),
         (
             "secret: s, path: /d, items: { a: f, b: f }",

@@ -324,12 +324,22 @@ fn stage(image: &Image, unit: &Unit, bundle: &Path, base: u32) -> io::Result<()>
     }
     for (n, volume) in unit.mounts.iter().enumerate() {
         let at = stage.join(format!("v{n}"));
-        match fs::metadata(&volume.host)?.is_dir() {
+        let only = if volume.read_only { RDONLY } else { 0 };
+        let Some(part) = &volume.part else {
+            match fs::metadata(&volume.host)?.is_dir() {
+                true => fs::create_dir(&at)?,
+                false => drop(File::create(&at)?),
+            }
+            mount_mapped(&volume.host, &at, users.as_fd(), NOSUID | NODEV | only)?;
+            continue;
+        };
+        let opened = kith_dm_sys::beneath(&volume.host, part)
+            .map_err(|e| io::Error::new(e.kind(), format!("subPath `{part}` of {}: {e}", volume.host.display())))?;
+        match File::from(opened.try_clone()?).metadata()?.is_dir() {
             true => fs::create_dir(&at)?,
             false => drop(File::create(&at)?),
         }
-        let only = if volume.read_only { RDONLY } else { 0 };
-        mount_mapped(&volume.host, &at, users.as_fd(), NOSUID | NODEV | only)?;
+        kith_dm_sys::mount_mapped_fd(opened.as_fd(), &at, users.as_fd(), NOSUID | NODEV | only)?;
     }
     // Its network is joined here, by the thread it is made from: from inside its own user
     // namespace it may not join one the node's root made.
@@ -374,6 +384,11 @@ pub struct Mount {
     /// container's user is not, it is made that user's, with all that is in it, unless it
     /// is theirs already.
     pub give: bool,
+    /// Only this part of `host` (a subPath: `data`, `a/b`), made if it is not there. `host`
+    /// is the container's to write, links included, so the part is opened beneath it with no
+    /// link followed and mounted as opened ([`kith_dm_sys::beneath`]): only where the
+    /// container has users of its own, as an id-mapped mount; elsewhere it is not created.
+    pub part: Option<String>,
 }
 
 /// A created container or exec unit. Dropping it does not stop it; call [`Handle::delete`].
@@ -496,6 +511,18 @@ impl Runtime {
             Some(Ok(false)) | None => None,
         };
         let shift = range.as_ref().map(|range| range.0);
+        // (A part of a volume is mounted as opened, beneath it: only an id-mapped mount does,
+        // and a bind by path would follow what the container left there.)
+        if let Some(volume) = unit
+            .mounts
+            .iter()
+            .find(|volume| volume.part.is_some() && shift.is_none())
+        {
+            return crate::err(format!(
+                "{what}: subPath of {}: a part of a volume is mounted only for a container with users of its own (not one that keeps the node's users: a NodeWorkload, the host's network, devices, a volume on a file system that takes no id-mapped mount, or kithd not root)",
+                volume.container
+            ));
+        }
         let spec = spec_shifted(id, image, unit, &cgroup, &bundle, (uid, gid), shift).ctx(&what)?;
         // (The spec names a user only where kithd is root: see `spec_shifted`.)
         let user = spec.process().as_ref().map(|process| process.user());
@@ -1932,6 +1959,7 @@ mod tests {
             container: at.into(),
             read_only,
             give: false,
+            part: None,
         }
     }
 

@@ -1051,7 +1051,6 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_p
         let read_only = cx.flag(&mut mount, "readOnly", &mp);
         let part = cx.text(&mut mount, "subPath", &mp).filter(|part| !part.is_empty());
         cx.rest(mount, &mp);
-        let whole = "not translated: kith mounts a claim or an emptyDir whole, and one file of a ConfigMap or a Secret";
         match (vols.get(&volume), path) {
             (_, None) => cx.note(&mp, "has no mountPath: not translated"),
             (None, _) => cx.note(&mp, "not translated: the pod has no volume of that name"),
@@ -1060,17 +1059,18 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_p
                     "not translated: its volume is not a PersistentVolumeClaim, a ConfigMap, a Secret or an emptyDir";
                 cx.note(&mp, why)
             }
-            (Some(Vol::Claim(_) | Vol::Scratch(..)), _) if part.is_some() => cx.note(&join(&mp, "subPath"), whole),
             (Some(Vol::Claim(claim)), Some(path)) => mounts.push(obj([
                 ("volume", Some(json!(claim))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
+                ("subPath", some(part)),
             ])),
             (Some(Vol::Scratch(memory, _)), Some(path)) => mounts.push(obj([
                 ("scratch", Some(json!(volume))),
                 ("path", Some(json!(path))),
                 ("readOnly", some(read_only)),
                 ("memory", memory.then(|| json!(true))),
+                ("subPath", some(part)),
             ])),
             (
                 Some(Vol::Files {
@@ -2448,17 +2448,22 @@ spec:
             "{ name: work, mountPath: /work, subPath: a }",
         );
         let more = part.replace("drop: [ALL]", "drop: [ALL], add: [NET_ADMIN]");
-        let (_, said) = run(&more);
+        let (made, said) = run(&more);
         let places: Vec<&str> = said.iter().filter_map(|line| line.split(' ').nth(1)).collect();
         let at = "spec.template.spec";
         assert_eq!(
             places,
-            [
-                format!("{at}.initContainers[first].volumeMounts[work].subPath"),
-                format!("{at}.containers[web].volumeMounts[work].subPath"),
-                format!("{at}.containers[web].securityContext.capabilities.add"),
-            ],
+            [format!("{at}.containers[web].securityContext.capabilities.add")],
             "{said:?}"
+        );
+        // (A part of an emptyDir or a claim is carried: kith opens it beneath, no link followed.)
+        let mounts = &made[0].spec["template"]["containers"][0]["volumeMounts"];
+        assert!(
+            mounts
+                .as_array()
+                .unwrap()
+                .contains(&json!({ "scratch": "work", "path": "/work", "subPath": "a" })),
+            "{mounts}"
         );
         // A volume is from one place, as Kubernetes has it: not the last of those it names.
         let two = chart.replace("emptyDir: {}", "emptyDir: {}\n          configMap: { name: site }");

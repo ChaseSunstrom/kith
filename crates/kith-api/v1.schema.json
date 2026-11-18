@@ -4296,7 +4296,7 @@
             "string",
             "null"
           ],
-          "description": "Of a `configMap` or `secret`: mount this one file of it at `path`, and not the\ndirectory. It stays as it was when the container started."
+          "description": "Of a `configMap` or `secret`: mount this one file of it at `path`, and not the\ndirectory. It stays as it was when the container started. Of a `volume` or a\n`scratch`: mount this directory (or file) of it alone, made if it is not there; no\nstep of it may be a link, and it is mounted only for a container with users of its\nown (not a NodeWorkload's, nor one on the host's network or given devices)."
         },
         "memory": {
           "type": [

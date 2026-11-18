@@ -174,6 +174,41 @@ EOF
             sandbox rooted ',"runAsUser":0,"userNamespaces":true' 'userNamespaces: this container is the node.s root'
             ! grep -q nested "$work/rooted.out" || fail "the node's root was let make a user namespace: $(cat "$work/rooted.out")"
 
+            # A part of a Volume alone (subPath): made where it is not there, and opened beneath
+            # the Volume with no link followed (the kubelet's CVE-2017-1002101). A pod leaves a
+            # link to / in the Volume: a pod that mounts that link as its part does not start,
+            # and one that mounts a plain part sees what another wrote there. (NAME, the
+            # command's words, more of its mount, and what its Job comes to say.)
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Volume","metadata":{"name":"parts"},"spec":{"node":"n2","path":"parts"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Volume parts was not applied"
+            part() { job "$1" '"pod":true,' "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",$2],\"volumeMounts\":[{\"volume\":\"parts\",\"path\":\"/v\"$3}]" "$4"; }
+            part plant '"link","/","/v/escape"' '' '^[0-9]+ succeeded'
+            grep -q 'link: /v/escape -> /: Ok' "$work/plant.out" || fail "the pod that plants a link did not make it: $(cat "$work/plant.out" "$work/plant.err")"
+            part escape '"ids","/v/sbin/init"' ',"subPath":"escape"' 'subPath .escape.'
+            ! grep -q 'opens Ok' "$work/escape.out" || fail "a pod reached its node's root through a link in its Volume: $(cat "$work/escape.out")"
+            api 1 DELETE /v1/resources/Job/default/escape >/dev/null || fail "the Job escape was not deleted"
+            part writer '"ids","+/v/note"' ',"subPath":"shared/deep"' '^[0-9]+ succeeded'
+            part reader '"ids","=/v/note"' ',"subPath":"shared/deep"' '^[0-9]+ succeeded'
+            grep -q 'ids: =/v/note holds Ok("made")' "$work/reader.out" || fail "a pod did not see in its part what another wrote there: $(cat "$work/writer.out" "$work/reader.out" "$work/reader.err")"
+            echo "vm.sh: ok: a subPath through a link to / was refused at its start; a plain one, made, was shared" >&2
+
+            # A tun device (a VPN's): the one way a pod has it is a Device of class other with its
+            # path, given to the namespace and claimed (docs/guide/hardware.md). Without the claim
+            # a root pod has no /dev/net/tun to open; with it, it opens.
+            tun() { job "$1" "\"pod\":true,$2" "\"image\":\"kith.test/pod:1\",\"command\":[\"/bin/pod\",\"ids\",\"/dev/net/tun\"]" '^[0-9]+ succeeded'; }
+            tun notun ''
+            ! grep -q 'opens Ok' "$work/notun.out" || fail "a pod with no claim opened /dev/net/tun: $(cat "$work/notun.out")"
+            cat >"$work/apply.json" <<EOF
+[{"apiVersion":"kith.dev/v1","kind":"Device","metadata":{"name":"n2-tun","labels":{"kith.dev/namespaces":"default"}},"spec":{"node":"n2","class":"other","path":"/dev/net/tun"}},
+ {"apiVersion":"kith.dev/v1","kind":"DeviceClaim","metadata":{"name":"tun"},"spec":{"device":"n2-tun"}}]
+EOF
+            any POST /v1/apply "$work/apply.json" >/dev/null || fail "the Device n2-tun and its claim were not applied"
+            tun withtun '"deviceClaims":["tun"],'
+            grep -q 'ids: /dev/net/tun /dev/net/tun owner [0-9]* opens Ok' "$work/withtun.out" || fail "a pod whose claim names the tun Device did not open /dev/net/tun: $(cat "$work/withtun.out" "$work/withtun.err")"
+            echo "vm.sh: ok: /dev/net/tun opens only in a pod that claims a Device of it" >&2
+
             # The seat is kith-system's until its label names the namespace that claims it: the
             # node's discovered Seat is given to default here, as an admin would label it.
             any GET /v1/resources >"$work/seat.json" || fail "the resources could not be read"

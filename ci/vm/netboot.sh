@@ -394,7 +394,7 @@ with open(sys.argv[1], "r+b") as disk:
                     wait "$vm" 2>/dev/null || true
                     [ "$(says "$work/beta.disk")" = 'sealed none' ] || fail "the disk of the machine its duress code was typed at, read from outside: $(says "$work/beta.disk")"
                     beta beta4 ''
-                    hears beta4 'the state partition is damaged'
+                    hears beta4 "kithd: init: this node's lock record was erased"
                     echo "vm.sh: ok: a machine installed with its state encrypted and nobody watching: the cluster warned that nobody saw a recovery key and made no duress code for all; the machine made a new recovery key, shown once, and the warning went; its key forgotten as the cluster's code forgets it, it ran on, gave no key and was held again once unlocked; given a duress code of its own and locked, it waited: a wrong key, the installer's old recovery key and the duress code were each answered with the same line; the code erased its lock record and had the other node forget its key, the new recovery key opened nothing after, and its disk opens for nobody"
                     exit 0
                 fi
@@ -489,7 +489,7 @@ with open(sys.argv[1], "r+b") as disk:
                 [ "$(says "$work/beta.disk")" = 'sealed none' ] || fail "the wiped machine's disk, read from outside: $(says "$work/beta.disk")"
                 lock unlock | grep -qF 'was wiped' || fail "a wiped machine could be unlocked"
                 beta beta5 ''
-                hears beta5 'the state partition is damaged'
+                hears beta5 "kithd: init: this node's lock record was erased"
                 echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; given a passphrase (through the node, which kept none of it) and started without its card, it opened its state once the passphrase was typed at it, and not for another; locked again, it dropped the passphrase, and the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody"
                 exit 0
             fi

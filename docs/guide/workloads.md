@@ -344,6 +344,9 @@ spec:
             mode: "0400"           # [0444]
           - scratch: work          # an empty directory of this replica's
             path: /work
+          - volume: data
+            path: /var/lib/postgresql/data
+            subPath: pg/15         # this directory of it alone, made if it is not there
           - scratch: cache
             path: /var/cache
             memory: true           # kept in memory [on the node's state disk]
@@ -368,4 +371,10 @@ spec:
   applied, and an image that names root, or (in a pod) no user, when it starts.
   **`dropCapabilities`** takes capabilities (`NET_RAW`, without `CAP_`) from what the container
   would have had: a pod's root has fourteen, root on kith OS three, anyone else none or one.
-- **Not yet:** `subPath` of a volume or of a scratch, and a mode for one file among the others.
+- **`subPath` of a volume or a scratch** mounts that directory (or file) of it alone, made where
+  it is not there, its parent's user's. What is in a volume is its containers' to write, links
+  included, so no step of the path may be a link (wherever it points: the container does not
+  start, and its status says which step), and the part is mounted as it was opened, never looked
+  up again. It is mounted only for a container with users of its own: a NodeWorkload's, one on
+  the host's network or given devices, or one where kithd is not root does not start with one.
+- **Not yet:** a mode for one file among the others.

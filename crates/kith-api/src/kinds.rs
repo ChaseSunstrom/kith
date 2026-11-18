@@ -588,7 +588,10 @@ spec! {
         #[cfg_attr(feature = "generate", schemars(extend("pattern" = "^0?[0-7]{3}$")))]
         pub mode: Option<String>,
         /// Of a `configMap` or `secret`: mount this one file of it at `path`, and not the
-        /// directory. It stays as it was when the container started.
+        /// directory. It stays as it was when the container started. Of a `volume` or a
+        /// `scratch`: mount this directory (or file) of it alone, made if it is not there; no
+        /// step of it may be a link, and it is mounted only for a container with users of its
+        /// own (not a NodeWorkload's, nor one on the host's network or given devices).
         #[serde(skip_serializing_if = "Option::is_none")]
         pub sub_path: Option<String>,
         /// Of a `scratch`: keep it in memory (it counts against the container's).
@@ -1874,14 +1877,6 @@ impl VolumeMount {
         let data = self.config_map.is_some() || self.secret.is_some();
         if !data && (!self.items.is_empty() || self.mode.is_some()) {
             return Err("`items` and `mode` are a `configMap`'s or a `secret`'s".into());
-        }
-        // ponytail: no part of a volume or a scratch alone. What is in one is the container's
-        // to write, links included: a part of it has to be opened with no link followed and
-        // mounted by what was opened, which the runtime's mounts by path cannot.
-        if !data && self.sub_path.is_some() {
-            return Err(
-                "`subPath` is one file of a `configMap` or a `secret`: a volume or a scratch is mounted whole".into(),
-            );
         }
         if self.memory.is_some() && self.scratch.is_none() {
             return Err("`memory` is a `scratch`'s".into());
