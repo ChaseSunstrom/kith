@@ -27,6 +27,7 @@ mod encrypted;
 mod exits;
 mod files;
 mod gpt;
+mod home;
 mod images;
 mod ingress;
 mod init;
@@ -39,6 +40,7 @@ mod mesh;
 mod modules;
 mod netboot;
 mod os;
+mod own_writes;
 mod people;
 mod pki;
 mod pods;
@@ -609,7 +611,16 @@ async fn replica(
             _ => {}
         }
     }
-    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke).await?;
+    // What each entry is asked once the store is in format 3: a signed one is refused (no
+    // kithd checks its signature in the log yet), so none is ever run. (Under the store's
+    // lock, and deterministic: it reads the command alone.)
+    let check: kith_store::Check = Arc::new(|_, command, _| match command {
+        kith_store::Command::Signed { .. } => Err(kith_api::store::Error::Invalid(
+            "refused: a signed entry, which this kithd does not check yet".into(),
+        )),
+        _ => Ok(()),
+    });
+    let replica = kith_store::open(&state.join("raft"), kith_store::node_id(name), network, poke, check).await?;
     let shared = Arc::new(Shared {
         store: replica.state,
         raft: replica.raft,
@@ -1113,7 +1124,8 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             let format = raft::tend_format(shared.clone(), stopping.clone());
             tokio::join!(say_serves(shared.clone(), says, stopping.clone()), format);
         };
-        let (served, nodes, (), (), (), (), (), (), (), _) = tokio::join!(
+        let house = home::run(shared.clone(), stopping.clone());
+        let (served, nodes, (), (), (), (), (), (), (), (), _) = tokio::join!(
             server,
             apart(nodes),
             apart(work),
@@ -1123,6 +1135,7 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             apart(proxy),
             apart(ingress),
             apart(saying),
+            apart(house),
             apart(storage)
         );
         let _ = shared.raft.shutdown().await;

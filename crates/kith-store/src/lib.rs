@@ -35,13 +35,74 @@ use std::sync::{Arc, Mutex};
 ///
 /// This is the newest a build reads. What it writes is [`format_of`] its store: 1 until the
 /// cluster's one [`Command::Mark`], so a kithd started on a format 1 state leaves it one an
-/// older kithd reads, and going back is possible until every member has the newer.
-pub const FORMAT: u32 = 2;
+/// older kithd reads, and going back is possible until every member has the newer. Format 3
+/// is the same after [`Command::MarkSigned`].
+pub const FORMAT: u32 = 3;
 
-/// The format `store` is written in: 2 once it keeps when each resource was first made
-/// (an older build would drop that, and order by what is left), 1 before.
+/// The format `store` is written in: 3 once it keeps the nonces of signed entries (an older
+/// build would drop them, and could not run one), 2 once it keeps when each resource was
+/// first made (an older build would drop that, and order by what is left), 1 before.
 pub fn format_of(store: &Store) -> u32 {
-    if store.marked() { 2 } else { 1 }
+    match (store.signing(), store.marked()) {
+        (true, _) => 3,
+        (false, true) => 2,
+        (false, false) => 1,
+    }
+}
+
+/// What a node's state machine asks of each entry once the store is in format 3, before it
+/// runs it: the store as it is then, the entry's command, and the node that led the term
+/// that wrote it. Refused, the entry is nothing on every node, its answer the refusal.
+/// Deterministic, as [`run`] is: it reads nothing but what it is given (no clock, no file,
+/// nothing random), and it is called with the state locked, so it never locks it.
+pub type Check = Arc<dyn Fn(&Store, &Command, NodeId) -> Result<(), Error> + Send + Sync>;
+
+/// A signed request's header (`v1; who=..; target=..; expires=..; nonce=..; sig=..`), read.
+/// Its signature is left as it came (base64): what checks it decodes it.
+pub struct Header<'a> {
+    pub who: &'a str,
+    pub target: &'a str,
+    pub expires: u64,
+    pub nonce: &'a str,
+    pub sig: &'a str,
+}
+
+/// Read a signed request's header: what kithd checks a request by, and what a signed entry
+/// carries. Each refusal begins `x-kith-signed: `.
+pub fn header(header: &str) -> Result<Header<'_>, String> {
+    let bad = |why: String| format!("x-kith-signed: {why}");
+    let mut parts = header.split(';').map(str::trim);
+    if parts.next() != Some("v1") {
+        return Err(bad("not v1".into()));
+    }
+    let mut fields = std::collections::BTreeMap::new();
+    for part in parts {
+        let Some((name, value)) = part.split_once('=') else {
+            return Err(bad(format!("{part:?} is no name=value")));
+        };
+        let known = matches!(name, "who" | "target" | "expires" | "nonce" | "sig");
+        if !known || value.is_empty() || fields.insert(name, value).is_some() {
+            return Err(bad(format!("{name:?} is unknown, empty or said twice")));
+        }
+    }
+    let field = |name: &str| fields.get(name).copied().ok_or_else(|| bad(format!("no {name}")));
+    let expires = field("expires")?;
+    let expires = match expires.bytes().all(|b| b.is_ascii_digit()) {
+        true => expires.parse().map_err(|_| bad("expires is too large".into()))?,
+        false => return Err(bad("expires is seconds since 1970, in digits".into())),
+    };
+    let nonce = field("nonce")?;
+    if nonce.len() != 32 || !nonce.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(bad("nonce is 32 lower-case hex".into()));
+    }
+    let sig = field("sig")?;
+    Ok(Header {
+        who: field("who")?,
+        target: field("target")?,
+        expires,
+        nonce,
+        sig,
+    })
 }
 
 /// A file in a format this build does not know is refused, never read as if it were its own.
@@ -95,6 +156,20 @@ pub enum Command {
     /// is in format 2. Once in a cluster's life, proposed by the leader when every member's
     /// kithd reads it: a build from before reads neither this entry nor what follows it.
     Mark,
+    /// A request a signer signed, and what it asks: run once the store keeps the nonces
+    /// ([`Command::MarkSigned`]) and the node's [`Check`] lets it, its nonce taken first
+    /// ([`Store::nonce`]). What was signed is all here: the header as it came, the method,
+    /// the path and query, and the body (base64), as [`Check`] needs them.
+    Signed {
+        header: String,
+        method: String,
+        path: String,
+        body: String,
+        command: Box<Command>,
+    },
+    /// From here on the store keeps the nonces of signed entries ([`Store::sign`]), marked
+    /// first if it was not, and is in format 3: once, as [`Command::Mark`] is.
+    MarkSigned,
 }
 
 /// What a command that worked gives back.
@@ -159,18 +234,42 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
         }
         Command::Import { store: imported } => {
             // (What comes in is from before replication, and so from before the mark.)
-            let marked = store.marked();
-            *store = imported;
+            let before = std::mem::replace(store, imported);
             store.cut_node_key_histories();
-            if marked {
+            if before.marked() {
                 store.mark();
             }
+            store.keep_signers(before);
             Ok(Done::Nothing)
         }
         Command::Mark => {
             store.mark();
             Ok(Done::Nothing)
         }
+        Command::MarkSigned => {
+            store.mark();
+            store.sign();
+            Ok(Done::Nothing)
+        }
+        Command::Signed { header, command, .. } => {
+            if !store.signing() {
+                return Err(Error::Invalid("a signed entry before the store is in format 3".into()));
+            }
+            if matches!(*command, Command::Signed { .. }) {
+                return Err(Error::Invalid("a signed entry inside another".into()));
+            }
+            let signed = self::header(&header).map_err(Error::Invalid)?;
+            store.nonce(signed.who, signed.expires, signed.nonce)?;
+            run(store, *command)
+        }
+    }
+}
+
+/// What `command` asks, under the signature it may be wrapped in.
+fn inner(command: &Command) -> &Command {
+    match command {
+        Command::Signed { command, .. } => command,
+        command => command,
     }
 }
 
@@ -180,13 +279,18 @@ pub fn run(store: &mut Store, command: Command) -> Reply {
 pub fn keys(command: &Command) -> Option<Vec<String>> {
     let named = |statuses: &mut dyn Iterator<Item = &String>| statuses.cloned().collect();
     Some(match command {
+        Command::Signed { command, .. } => return keys(command),
         Command::Import { .. } => return None,
         Command::Status { statuses } | Command::Report { statuses, .. } => {
             named(&mut statuses.iter().map(|(key, _)| key))
         }
         Command::Patch { statuses } => named(&mut statuses.iter().map(|(key, _)| key)),
         // (The mark: what there is keeps the order it had, by its oldest kept revision.)
-        Command::Apply { .. } | Command::Delete { .. } | Command::Rollback { .. } | Command::Mark => Vec::new(),
+        Command::Apply { .. }
+        | Command::Delete { .. }
+        | Command::Rollback { .. }
+        | Command::Mark
+        | Command::MarkSigned => Vec::new(),
     })
 }
 
@@ -210,7 +314,7 @@ pub fn wrapped(key: &Resource) -> Option<&str> {
 /// NodeKeys it applies, and of every revision of every NodeKey in a store it brings in.
 fn carried(command: &Command) -> Vec<(String, String)> {
     let pair = |key: &Resource| wrapped(key).map(|wrapped| (key.key(), wrapped.to_string()));
-    match command {
+    match inner(command) {
         Command::Apply { resources, .. } => resources.iter().filter_map(pair).collect(),
         Command::Import { store } => store
             .list(Some("NodeKey"))
@@ -386,12 +490,14 @@ fn settings() -> openraft::Config {
 
 /// Open (or create) the replica kept in `dir` and start Raft on it. A new directory
 /// becomes node `id`; an old one stays the node it was. `changed` is called with every
-/// change to the state, while the state is locked.
+/// change to the state, while the state is locked; `check` with each entry once the store
+/// is in format 3 ([`Check`]).
 pub async fn open<N>(
     dir: &Path,
     id: NodeId,
     network: N,
     changed: Arc<dyn Fn() + Send + Sync>,
+    check: Check,
 ) -> Result<Replica, String>
 where
     N: openraft::RaftNetworkFactory<TypeConfig>,
@@ -416,7 +522,7 @@ where
         }
     };
     let mut log = Log::open(&dir.join("log.redb"))?;
-    let machine = Machine::open(dir, changed)?;
+    let machine = Machine::open(dir, changed, check)?;
     let mut forgotten = machine.forgot.subscribe();
     let state = machine.state.clone();
     // The snapshot may have a forget in it (or have cut a key from before) whose log this

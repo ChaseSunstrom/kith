@@ -8,3 +8,5 @@ docs/shots/site-*.png
 docs/shots/install-*.png
 # (Edit lists a session leaves behind.)
 .fm-scratch/
+# (Sampo points a lane's cargo at its own build folder through this file.)
+.cargo/config.toml

@@ -308,6 +308,45 @@ and drops what a client claims about its origin (`Forwarded`, other `X-Forwarded
 `X-Real-IP`, headers with `_`). Ambiguous framing gets 400; a head is at most 100 headers, ~64
 KiB, 30 seconds. WebSocket is the only upgrade; no HTTP/2, and no `proxyProtocol`.
 
+### One address for the house
+
+A router can name one address for the whole cluster (as its DHCP server's DNS server, option 6,
+or as the target of a port forward) and the cluster answers it from whichever node leads. Give it
+in the `Cluster`, in the network of a node's LAN card:
+
+```yaml
+apiVersion: kith.dev/v1
+kind: Cluster
+metadata: {name: home}
+spec:
+  home:
+    address: 192.168.1.250/24
+    endpoint: house.example.org:51820   # kept, and not acted on yet
+```
+
+The leader puts the address on that card, tells the LAN with ARP announcements, and the node's
+DNS (`--dns`) answers on it, from it. Every node reads the same `Cluster` and only the confirmed
+leader holds the address, for no more than three seconds at a time, renewed twice a second: a
+leader that hangs or is cut off loses it by itself, and one that wakes from a pause adds nothing
+before a new confirmation. A new leader waits four seconds, asks the LAN with ARP probes whether
+something else has the address, and does not take it if so (the log says "the house address ... is
+in use by MAC ...: not taken", again as a warning each minute it stays so). In all, the address
+moves within about ten seconds of the leader going away (at most 12), and two cards do not answer
+for it for longer than the three seconds (a machine frozen by its hypervisor keeps the address
+until it runs again and takes it off). A node says why it does not hold it in its log ("not the
+confirmed leader", "no card of this node is in its network", "already an address of ... on this
+node"), when that changes. The address is checked when the `Cluster` is applied: an IPv4 address
+with its prefix length that is not a network or broadcast address, loopback, multicast,
+link-local, nor in the default pod and people ranges (100.88.0.0/16, 100.89.0.0/16); and it must
+not be one the node already has (a static address or a lease).
+
+Three voters are needed for it to move: with two, the one that is left cannot confirm that it
+leads. Choose an address outside the router's DHCP range. ARP cannot stop a hostile host on the
+LAN from claiming the address: the holder announces it again when it hears another card answer
+for it (at most once a second) and logs the other MAC, but a host that keeps claiming it can
+still take traffic. Only DNS answers on it so far; UDP 51820 and TCP 443 are for the nodes' own
+addresses still.
+
 ### Not yet
 
 - Non-roaming nodes talk at their plain addresses, not over the mesh; workloads have no mesh
