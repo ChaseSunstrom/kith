@@ -205,7 +205,7 @@ Only the newest version is fixed. There are no security releases of older ones.
   UDP and TCP port 53 to the gateway, and TCP to a Service's address, with nothing else of the node's (kithd's API among
   it) reached, ICMP included. An exit's pod (`kpx`) gets neither of those.
 - **A machine that already passed packets on** (IPv6 forwarding was `1` before kithd
-  first made a pod, a router or a Docker host, say) gets no guard: `inet kith-pods`
+  first made a pod, a router, say) gets no guard: `inet kith-pods`
   passes on what the node passes on for anyone, and only the pods' own rules are added.
   A machine that did not forward gets the guard, which drops whatever is not a pod's, so
   the two differ on purpose. kithd says so once, when it makes its first pod. To have the
