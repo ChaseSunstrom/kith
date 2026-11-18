@@ -420,6 +420,9 @@ struct Follower<'a> {
     saved: Instant,
     /// The copy of the store this node kept until its first view is still to erase.
     kept: bool,
+    /// What the control node last failed to send, as it was said (`follow`): said again once a
+    /// line of its view is taken.
+    said: String,
 }
 
 /// A view that only statuses changed in is written this often: a unit that reports does not
@@ -576,7 +579,12 @@ async fn stream(
     // No other node's certificate is taken at that address: a worker cannot stand in for it.
     let client = cluster.to(upstream)?;
     let asked = client.get(format!("https://{}/v1/view", upstream.address));
-    let mut reply = asked.send().await.map_err(failed)?;
+    // (Its headers within SILENT, or another control node is called: a view that never starts
+    // holds nothing up. The body is not timed here: it is followed for as long as it comes.)
+    let sent = tokio::time::timeout(SILENT, asked.send())
+        .await
+        .map_err(|_| "it sent no reply".to_string())?;
+    let mut reply = sent.map_err(failed)?;
     if reply.status() == StatusCode::NOT_FOUND {
         return Err(OLDER.into());
     }
@@ -605,6 +613,12 @@ async fn stream(
             let line: Vec<u8> = buffer.drain(..=end).collect();
             let sent = serde_json::from_slice(&line).map_err(|e| format!("a line of the view: {e}"))?;
             follower.take(sent).await?;
+            if !heard {
+                // (A view that was said to fail is said to come back once a line of it is taken.)
+                if let Some(line) = back(&mut follower.said, &upstream.name, &upstream.address) {
+                    eprintln!("{line}");
+                }
+            }
             heard = true;
         }
     }
@@ -630,8 +644,9 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
         stale: false,
         saved: Instant::now(),
         kept: false,
+        said: String::new(),
     };
-    let (mut turn, mut said) = (0usize, String::new());
+    let mut turn = 0usize;
     while !*stopping.borrow() {
         let mut nodes = control_nodes(&shared, &me);
         if nodes.is_empty() {
@@ -657,18 +672,13 @@ pub async fn follow(shared: Arc<Shared>, state: PathBuf, ingress: bool, mut stop
             let upstream = &nodes[turn % nodes.len()];
             match stream(&mut follower, upstream, &mut stopping).await {
                 // (It was there: called again first, at once.)
-                Ok(_) => {
-                    if let Some(line) = back(&mut said, &upstream.name, &upstream.address) {
-                        eprintln!("{line}");
-                    }
-                    pause = Duration::from_secs(1);
-                }
+                Ok(_) => pause = Duration::from_secs(1),
                 Err(why) => {
                     turn += 1;
                     let why = format!("node {} ({}) sends no view: {why}", upstream.name, upstream.address);
-                    if why != said {
+                    if why != follower.said {
                         eprintln!("kithd: {why}");
-                        said = why;
+                        follower.said = why;
                     }
                 }
             }
@@ -1159,6 +1169,7 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
             stale: false,
             saved: Instant::now(),
             kept: false,
+            said: String::new(),
         };
         let mut stopping = shared.stop.subscribe();
         let print = pki::print_of(&a.cert).unwrap();

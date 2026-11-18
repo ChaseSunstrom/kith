@@ -131,6 +131,31 @@ fn named(status: Option<&Value>) -> Vec<&str> {
     image.chain(backups).collect()
 }
 
+/// A node's own `alone` status: null, or the unix seconds it ran alone (`since`, `until`) and the
+/// risks it says, and nothing else.
+fn alone_shape(key: &str, alone: &Value) -> Result<(), String> {
+    let well = match alone {
+        Value::Null => true,
+        Value::Object(fields) => {
+            fields.len() <= 3
+                && fields.iter().all(|(name, value)| match (name.as_str(), value) {
+                    ("since" | "until", Value::Number(_)) => true,
+                    ("risks", Value::String(risks)) => risks.len() <= 1024,
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    if well {
+        Ok(())
+    } else {
+        Err(refused(
+            key,
+            "`alone` is null or the times a node ran alone (since, until) and its risks",
+        ))
+    }
+}
+
 /// What a node says it serves (`status.serves`): null, or `dns` a port and `ingress` true, and nothing else.
 fn serving_shape(key: &str, serves: &Value) -> Result<(), String> {
     let fields = match serves {
@@ -205,9 +230,16 @@ fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint", "people"])?;
+            only(
+                key,
+                fields,
+                &["os", "mesh", "serves", "policy", "thumbprint", "people", "alone"],
+            )?;
             if let Some(people) = fields.get("people") {
                 people_shape(key, people)?;
+            }
+            if let Some(alone) = fields.get("alone") {
+                alone_shape(key, alone)?;
             }
             // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
             let small = |policy: &Value| match policy {
@@ -758,6 +790,29 @@ spec: { volume: there, every: 1d }
         assert!(try_as(&store, "w", patch_of("Node/w", json!({ "os": { "version": "1.0.1" } }))).is_ok());
         let mesh = json!({ "mesh": { "key": "TkVX", "port": 51820, "reaches": ["a"] } });
         assert!(try_as(&store, "w", patch_of("Node/w", mesh)).is_ok());
+    }
+
+    /// A worker that ran alone writes its own `alone` status (what it runs alone since, and its
+    /// risks), in that shape and no other.
+    #[test]
+    fn a_worker_says_its_own_alone_status_in_its_shape() {
+        let store = store();
+        let ran = json!({ "since": 1_700_000_000u64, "until": 1_700_000_090u64, "risks": "a replica runs twice" });
+        assert!(try_as(&store, "w", patch_of("Node/w", json!({ "alone": ran.clone() }))).is_ok());
+        assert!(try_as(&store, "w", patch_of("Node/w", json!({ "alone": null }))).is_ok());
+        for said in [
+            json!("yes"),
+            json!({ "since": "x" }),
+            json!({ "since": 1, "until": 2, "risks": "r", "more": 1 }),
+            json!({ "risks": 5 }),
+        ] {
+            assert!(
+                try_as(&store, "w", patch_of("Node/w", json!({ "alone": said.clone() }))).is_err(),
+                "{said}"
+            );
+        }
+        // Another node's status is not its own to say.
+        assert!(try_as(&store, "w-b", patch_of("Node/w", json!({ "alone": ran }))).is_err());
     }
 
     #[test]

@@ -11,6 +11,7 @@
 # runs alone from its own copy of the store after about 30 s. Then the replica runs there, and the
 # Job is held. n1 is started again: the worker catches up, and the replica, placed on n1 meanwhile,
 # is stopped on n2.
+# (The scenario's own budget: at least 1800 s for its VMs, whatever --time says; its waits stop it sooner.)
 [ "$time" -gt 1800 ] || time=1800
 
 # The cluster's admin, through node N: N METHOD PATH [FILE with JSON to send].
@@ -166,7 +167,7 @@ hears n1b 'kithd: node n1 serving other nodes'
 waited=0
 until grep -aqF 'a leader answers: this node ran alone since' "$work/n2b.log"; do
     waited=$((waited + 1))
-    [ "$waited" -lt 300 ] || { keep; fail "waited $waited s for: the worker's status is taken by a leader"; }
+    [ "$waited" -lt 300 ] || { keep; fail "waited $waited s for: the worker's alone status is written by a leader"; }
     sleep 1
 done
 until_ok "n2's status says since when it ran alone, and until when" recorded

@@ -356,11 +356,18 @@ fn alone_status(since: SystemTime, until: SystemTime) -> serde_json::Map<String,
 fn record_alone(shared: std::sync::Arc<Shared>, node: String, alone: std::sync::Arc<AtomicBool>, since: SystemTime) {
     tokio::spawn(async move {
         let key = format!("Node/{node}");
+        let mut said = false;
         loop {
             let statuses = vec![(key.clone(), alone_status(since, SystemTime::now()))];
             match shared.submit(kith_store::Command::Patch { statuses }).await {
                 Ok(_) => break,
-                Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+                Err(e) => {
+                    // (Said once: a refusal that stays is not repeated every two seconds.)
+                    if !std::mem::replace(&mut said, true) {
+                        eprintln!("kithd: the alone status is not written yet: {e}");
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
             }
         }
         alone.store(false, Ordering::Relaxed);
