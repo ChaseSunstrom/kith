@@ -12,35 +12,29 @@
 //!                                    inode, which each of them and this name link to
 //! ```
 
+use crate::outside::{Capped, Patience, Remote, within};
 use crate::{Context, Result, err};
-use oci_client::client::ClientConfig;
+use oci_client::Reference;
 use oci_client::config::ConfigFile;
 use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 #[derive(Clone)]
 pub struct ImageStore {
     root: PathBuf,
     /// This node's own registry, where it serves one.
     pub local: Option<Local>,
-    /// How long the own registry may take to accept a connection, and to answer one read
-    /// ([`OWN_CONNECT`], [`OWN_READ`]). Tests shorten them.
-    pub own_timeouts: (Duration, Duration),
+    /// How long a pull from a registry is waited for: a connection, each read, and a metadata
+    /// fetch as a whole. A start awaits its pull inside the controller's pass, so a registry
+    /// that stalls would hold every unit's start with it; past these, the pull fails with its
+    /// reason instead. Tests shorten them.
+    pub patience: Patience,
 }
-
-/// Waiting for the node's own registry to accept a connection. It is on this machine: a
-/// connection that takes longer than this is a registry that is not there.
-const OWN_CONNECT: Duration = Duration::from_secs(10);
-/// Waiting for the node's own registry to answer a read. A start awaits its pull inside the
-/// controller's pass, so a registry that accepts and then stalls would hold every unit's start
-/// with it; past this, the start fails with its reason instead.
-const OWN_READ: Duration = Duration::from_secs(30);
 
 /// This node's own registry of the cluster's Images, as its kithd made it at this start.
 /// It is asked over TLS, trusting the one certificate it was started with and no other,
@@ -176,7 +170,7 @@ impl ImageStore {
         Ok(ImageStore {
             root,
             local: None,
-            own_timeouts: (OWN_CONNECT, OWN_READ),
+            patience: Patience::default(),
         })
     }
 
@@ -468,35 +462,26 @@ impl ImageStore {
         }
         // The node's own registry is shown its password only once it has shown the
         // certificate it was started with: whatever else listens on that port is not it.
-        let (config, auth) = match own {
+        let (certificate, auth, plain) = match own {
             Some(local) => (
-                ClientConfig {
-                    protocol: oci_client::client::ClientProtocol::Https,
-                    tls_certs_only: vec![oci_client::client::Certificate {
-                        encoding: oci_client::client::CertificateEncoding::Der,
-                        data: (local.certificate)().ctx("the node's registry")?,
-                    }],
-                    connect_timeout: Some(self.own_timeouts.0),
-                    read_timeout: Some(self.own_timeouts.1),
-                    ..ClientConfig::default()
-                },
+                Some((local.certificate)().ctx("the node's registry")?),
                 RegistryAuth::Basic("kithd".into(), local.password.clone()),
+                false,
             ),
             None => (
-                ClientConfig {
-                    protocol: protocol(reference.registry()),
-                    ..ClientConfig::default()
-                },
+                None,
                 RegistryAuth::Anonymous,
+                matches!(protocol(reference.registry()), oci_client::client::ClientProtocol::Http),
             ),
         };
-        // (Not `Client::new`: it falls back to a client with every usual root when it is
-        // given a certificate it cannot read.)
-        let client = Client::try_from(config).ctx("setting up the registry client")?;
-        let (manifest, digest, config, list) = client
-            .pull_manifest_and_config_and_list_digest(&reference, &auth)
-            .await
-            .ctx(format!("pulling {reference}"))?;
+        // The metadata is read by kith (capped, within the waits); the layers by oci-client.
+        let remote = Remote::new(plain, certificate, auth, self.patience)?;
+        let (manifest, digest, config, list) = within(
+            self.patience.metadata,
+            format!("pulling {reference}"),
+            remote.image(&reference),
+        )
+        .await?;
         // Whose it is, before anything of it but its manifest and its config is here. (A
         // signature of an image for several machines is of the list this one was in.)
         let mut signed_by = here
@@ -505,7 +490,7 @@ impl ImageStore {
             .unwrap_or_default();
         if !keys.is_empty() {
             let digests: Vec<&str> = list.iter().map(String::as_str).chain([digest.as_str()]).collect();
-            let by = crate::signed::signer(&client, &reference, &digests, &keys).await?;
+            let by = crate::signed::signer(&remote, &reference, &digests, &keys, self.patience.metadata).await?;
             signed_by.retain(|key| *key != by);
             signed_by.push(by);
         }
@@ -517,11 +502,13 @@ impl ImageStore {
         for layer in &manifest.layers {
             let blob = self.root.join("blobs/sha256").join(sha256_hex(&layer.digest)?);
             if !blob.exists() {
-                // oci-client checks the bytes against the layer digest as they stream.
+                // oci-client checks the bytes against the layer digest as they stream; the writer
+                // refuses more than the layer's descriptor says it is.
                 let partial = blob.with_extension(scratch_name("partial"));
                 let mut file = tokio::fs::File::create(&partial).await.ctx("storing a layer")?;
-                let mut pulled = client
-                    .pull_blob(&reference, layer, &mut file)
+                let mut pulled = remote
+                    .oci
+                    .pull_blob(&reference, layer, &mut Capped::new(&mut file, layer.size))
                     .await
                     .ctx(format!("pulling layer {} of {reference}", layer.digest));
                 if pulled.is_ok() {
@@ -1053,6 +1040,7 @@ fn unpack_layer_capped(blob: &Path, media_type: &str, rootfs: &Path, budget: &mu
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::Duration;
     use tar::{Builder, EntryType, Header};
 
     enum E<'a> {
@@ -1504,6 +1492,7 @@ mod tests {
         certificate: Vec<u8>,
         files: Files,
         asked: Arc<std::sync::atomic::AtomicUsize>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -1532,8 +1521,10 @@ mod tests {
             });
             let files: Files = Arc::default();
             let asked = Arc::new(AtomicUsize::new(0));
+            let sent = Arc::new(AtomicUsize::new(0));
             let stop = Arc::new(AtomicBool::new(false));
-            let (serve_files, serve_asked, serve_stop) = (files.clone(), asked.clone(), stop.clone());
+            let (serve_files, serve_asked, serve_sent, serve_stop) =
+                (files.clone(), asked.clone(), sent.clone(), stop.clone());
             let thread = std::thread::spawn(move || {
                 while !serve_stop.load(Ordering::SeqCst) {
                     let Ok((mut tcp, _)) = listener.accept() else {
@@ -1542,14 +1533,16 @@ mod tests {
                     };
                     let _ = tcp.set_nonblocking(false);
                     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    // (A client that stops reading is given up on, not waited for.)
+                    let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(10)));
                     match &config {
                         Some(config) => {
                             if let Ok(conn) = rustls::ServerConnection::new(config.clone()) {
                                 let mut tls = rustls::StreamOwned::new(conn, tcp);
-                                serve_one(&mut tls, &serve_files, &serve_asked);
+                                serve_one(&mut tls, &serve_files, &serve_asked, &serve_sent);
                             }
                         }
-                        None => serve_one(&mut tcp, &serve_files, &serve_asked),
+                        None => serve_one(&mut tcp, &serve_files, &serve_asked, &serve_sent),
                     }
                 }
             });
@@ -1558,6 +1551,7 @@ mod tests {
                 certificate,
                 files,
                 asked,
+                sent,
                 stop,
                 thread: Some(thread),
             }
@@ -1577,6 +1571,12 @@ mod tests {
             self.asked.load(std::sync::atomic::Ordering::SeqCst)
         }
 
+        /// The bytes of response bodies handed to a client so far (a client that closes early
+        /// gets fewer than were there).
+        fn sent(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
         /// Publishes `team/hello` at `tag` with this entrypoint, and returns its manifest digest.
         /// Its one layer holds `bin/hello`, so an Image pulled again unchanged has a layer to not fetch.
         fn publish(&self, tag: &str, entrypoint: &str) -> String {
@@ -1586,6 +1586,12 @@ mod tests {
             h.set_mode(0o755);
             tar.append_data(&mut h, "bin/hello", &b"hello"[..]).unwrap();
             let layer = tar.into_inner().unwrap();
+            let size = layer.len();
+            self.publish_layer(tag, entrypoint, layer, size)
+        }
+
+        /// As `publish`, with `layer` as the one layer and a descriptor that says it is `size` bytes.
+        fn publish_layer(&self, tag: &str, entrypoint: &str, layer: Vec<u8>, size: usize) -> String {
             let layer_digest = sha(&layer);
             let config = serde_json::json!({
                 "architecture": "amd64", "os": "linux",
@@ -1602,7 +1608,7 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.config.v1+json",
                     "digest": config_digest, "size": config.len(),
                 },
-                "layers": [{ "mediaType": TAR, "digest": layer_digest, "size": layer.len() }],
+                "layers": [{ "mediaType": TAR, "digest": layer_digest, "size": size }],
             })
             .to_string()
             .into_bytes();
@@ -1655,7 +1661,12 @@ mod tests {
     }
 
     /// Answers one request on `conn`, then closes it.
-    fn serve_one<S: Read + Write>(conn: &mut S, files: &Files, asked: &std::sync::atomic::AtomicUsize) {
+    fn serve_one<S: Read + Write>(
+        conn: &mut S,
+        files: &Files,
+        asked: &std::sync::atomic::AtomicUsize,
+        sent: &std::sync::atomic::AtomicUsize,
+    ) {
         let mut head = Vec::new();
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
@@ -1687,8 +1698,52 @@ mod tests {
         }
         reply.push_str("\r\n");
         let _ = conn.write_all(reply.as_bytes());
-        let _ = conn.write_all(&body);
+        // Counted as it goes: a client that closes early stops the count there.
+        for chunk in body.chunks(64 << 10) {
+            if conn.write_all(chunk).is_err() {
+                break;
+            }
+            sent.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+        }
         let _ = conn.flush();
+    }
+
+    /// A body of `head` (a JSON object, whole) and then spaces, to `total` bytes or its own length.
+    fn padded(head: &str, total: usize) -> Vec<u8> {
+        let mut body = head.as_bytes().to_vec();
+        body.resize(total.max(body.len()), b' ');
+        body
+    }
+
+    /// Puts `config` at its digest, and a manifest of it at `tag` that is `manifest_size` bytes.
+    fn publish_manifest(registry: &Registry, tag: &str, config: &[u8], manifest_size: usize) {
+        let config_digest = sha(config);
+        let manifest = padded(
+            &format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[]}}"#,
+                config.len()
+            ),
+            manifest_size,
+        );
+        let mut files = registry.files.lock().unwrap();
+        files.insert(
+            format!("/v2/team/hello/blobs/{config_digest}"),
+            ("application/octet-stream".into(), config.to_vec()),
+        );
+        files.insert(
+            format!("/v2/team/hello/manifests/{tag}"),
+            ("application/vnd.oci.image.manifest.v1+json".into(), manifest),
+        );
+    }
+
+    /// Timeouts short enough for a test: a stall is cut at 1.5 s, a trickle of a byte a second
+    /// is not an idle read, and the whole metadata fetch is at 3 s.
+    fn short_patience() -> Patience {
+        Patience {
+            connect: Duration::from_millis(500),
+            read: Duration::from_millis(1500),
+            metadata: Duration::from_secs(3),
+        }
     }
 
     const POLICIES: [PullPolicy; 3] = [PullPolicy::IfNotPresent, PullPolicy::Always, PullPolicy::Never];
@@ -1876,7 +1931,11 @@ mod tests {
             password: "open-sesame".into(), // pragma: allowlist secret
             certificate: Arc::new(move || Ok(certificate.clone())),
         });
-        store.own_timeouts = (Duration::from_millis(200), Duration::from_millis(200));
+        store.patience = Patience {
+            connect: Duration::from_millis(200),
+            read: Duration::from_millis(200),
+            ..Patience::default()
+        };
         let reference = format!("localhost:{port}/team/hello:1");
         let started = std::time::Instant::now();
         let Ok(result) =
@@ -1894,6 +1953,187 @@ mod tests {
         );
         assert!(reason.to_string().contains(&reference), "{reason}");
         drop(silent);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const SIXTY_FOUR_MIB: usize = 64 << 20;
+
+    /// A manifest of 64 MiB from an outside registry is refused naming the limit, and not more
+    /// than the limit (and a buffer or two) of it is taken from the registry.
+    #[tokio::test]
+    async fn outside_capped_manifest_is_refused_naming_the_limit_and_takes_no_more() {
+        let (dir, _) = sandbox("outside-capped-manifest");
+        let registry = Registry::start(false);
+        let config = br#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/one"]}}"#;
+        publish_manifest(&registry, "1", config, SIXTY_FOUR_MIB);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still reading the manifest after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled from a manifest of 64 MiB");
+        };
+        assert!(reason.to_string().contains("4 MiB"), "{reason}");
+        let sent = registry.sent();
+        assert!(
+            sent <= 16 << 20,
+            "{sent} bytes of the manifest were sent before it was refused"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The same for a config of 64 MiB, behind a small manifest.
+    #[tokio::test]
+    async fn outside_capped_config_is_refused_naming_the_limit_and_takes_no_more() {
+        let (dir, _) = sandbox("outside-capped-config");
+        let registry = Registry::start(false);
+        let config = padded(
+            r#"{"architecture":"amd64","os":"linux","config":{"Entrypoint":["/bin/one"]}}"#,
+            SIXTY_FOUR_MIB,
+        );
+        publish_manifest(&registry, "1", &config, 0);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still reading the config after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled from a config of 64 MiB");
+        };
+        assert!(reason.to_string().contains("4 MiB"), "{reason}");
+        let sent = registry.sent();
+        assert!(
+            sent <= 16 << 20,
+            "{sent} bytes of the config were sent before it was refused"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A registry that accepts a connection and never answers fails a pull with its reason in
+    /// time, rather than holding the pull for as long as it stalls.
+    #[tokio::test]
+    async fn outside_patience_accept_and_never_answer_fails_in_time() {
+        let (dir, _) = sandbox("outside-stalls");
+        // The kernel accepts a connection to it; nothing ever reads it or answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reference = format!("127.0.0.1:{}/team/hello:1", silent.local_addr().unwrap().port());
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.patience = short_patience();
+        let started = std::time::Instant::now();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still waiting on a registry that never answers after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled from a registry that never answered");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(reason.to_string().contains(&reference), "{reason}");
+        drop(silent);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Answers `/v2/`, and then any other request with a manifest of a thousand bytes sent a byte
+    /// a second, for as long as the client stays.
+    fn trickle(mut stream: std::net::TcpStream) {
+        let mut head = Vec::new();
+        let mut byte = [0u8];
+        while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+            head.push(byte[0]);
+        }
+        let target = String::from_utf8_lossy(&head)
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        if target == "/v2/" {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            return;
+        }
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n",
+        );
+        for _ in 0..1000 {
+            std::thread::sleep(Duration::from_secs(1));
+            if stream.write_all(b" ").is_err() {
+                return;
+            }
+        }
+    }
+
+    /// A registry that trickles its manifest a byte a second fails the pull in time. (That is no
+    /// idle read, so the read timeout does not catch it: the metadata's deadline does.)
+    #[tokio::test]
+    async fn outside_patience_trickle_one_byte_a_second_fails_in_time() {
+        let (dir, _) = sandbox("outside-trickles");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let reference = format!("127.0.0.1:{}/team/hello:1", listener.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || trickle(stream));
+            }
+        });
+        let mut store = ImageStore::new(dir.join("store")).unwrap();
+        store.patience = short_patience();
+        let started = std::time::Instant::now();
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still waiting on a trickling manifest after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled from a manifest that trickled");
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        assert!(reason.to_string().contains(&reference), "{reason}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A layer whose registry sends more than its descriptor says is refused at the descriptor's
+    /// size, and nothing of it is kept.
+    #[tokio::test]
+    async fn outside_blob_layer_more_than_its_descriptor_is_refused() {
+        let (dir, _) = sandbox("outside-blob");
+        let registry = Registry::start(false);
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(64 << 10);
+        h.set_mode(0o644);
+        tar.append_data(&mut h, "bin/hello", &vec![b'x'; 64 << 10][..]).unwrap();
+        let layer = tar.into_inner().unwrap();
+        // The descriptor says a kibibyte; its digest is of what is sent, so only the size is wrong.
+        registry.publish_layer("1", "/bin/one", layer.clone(), 1024);
+        let store = ImageStore::new(dir.join("store")).unwrap();
+        let reference = format!("127.0.0.1:{}/team/hello:1", registry.port);
+        let Ok(result) =
+            tokio::time::timeout(Duration::from_secs(20), store.pull(&reference, PullPolicy::Always)).await
+        else {
+            panic!("the pull was still storing the layer after 20 s");
+        };
+        let Err(reason) = result else {
+            panic!("pulled a layer of {} bytes as one of 1024", layer.len());
+        };
+        assert!(reason.to_string().contains("1024"), "{reason}");
+        let blobs = dir.join("store/blobs/sha256");
+        assert_eq!(
+            fs::read_dir(&blobs).unwrap().count(),
+            0,
+            "a layer past its size was kept"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2385,7 +2625,7 @@ mod tests {
         ];
         let (dir, _) = sandbox("shared-measured");
         let store = ImageStore::new(dir.join("store")).unwrap();
-        let client = Client::try_from(ClientConfig::default()).unwrap();
+        let client = oci_client::Client::try_from(oci_client::client::ClientConfig::default()).unwrap();
         let mut images = Vec::new();
         for reference in references {
             store.pull(reference, PullPolicy::Always).await.unwrap();
