@@ -79,7 +79,7 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
             (usable && Some(&*name) != booted && !other.iter().any(|kind| name.starts_with(kind))).then(|| Disk {
                 model: said(&entry.path(), "device/model"),
                 serial: serial(&entry.path()),
-                removable: said(&entry.path(), "removable") == "1",
+                removable: said(&entry.path(), "removable") != "0",
                 name,
                 bytes,
             })
@@ -585,6 +585,20 @@ fn exclusive(device: &Path) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", device.display()))
 }
 
+/// The opened disk's own size (its end, as BLKGETSIZE64 gives) against the planned one: sysfs
+/// names a disk, /dev/NAME is what was opened, and they can differ. Left at its start.
+fn opened_size(disk: &mut File, planned: u64) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("the opened disk's size could not be read: {e}; nothing was written");
+    let got = disk.seek(SeekFrom::End(0)).map_err(io)?;
+    disk.seek(SeekFrom::Start(0)).map_err(io)?;
+    if got == planned {
+        return Ok(());
+    }
+    Err(format!(
+        "the disk opened is {got} bytes, not the {planned} planned; nothing was written"
+    ))
+}
+
 /// Clears both partition tables of an open disk, so nothing on it is found to boot from.
 fn clear_table(disk: &mut File) -> Result<(), String> {
     // (The size of a block device is its end, which a file's length is not.)
@@ -696,6 +710,7 @@ pub async fn run(source: String) -> ! {
         // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
         size_unchanged(Path::new("/sys/block"), &planned)?;
         let mut disk = exclusive(&device)?;
+        opened_size(&mut disk, planned.bytes)?;
         if let Err(e) = write(&mut image, &mut disk, &config, |tenths| {
             eprintln!("kithd: install: {}%", tenths * 10)
         }) {
@@ -996,6 +1011,23 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_opened_at_another_size_is_not_written() {
+        let path = std::env::temp_dir().join(format!("kith-install-opened-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        assert!(opened_size(&mut file, 4096).is_ok());
+        // Left at its start, for the write.
+        assert_eq!(file.stream_position().unwrap(), 0);
+        let why = opened_size(&mut file, 8192).unwrap_err();
+        assert!(
+            why.contains("4096") && why.contains("8192") && why.contains("nothing was written"),
+            "{why}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn a_disk_that_changed_size_is_not_written() {
         let sys = std::env::temp_dir().join(format!("kith-install-resized-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sys);
@@ -1081,6 +1113,17 @@ mod tests {
             joined,
             "-- --listen 0.0.0.0:7443 --join 10.0.0.7:7443 --token kith1.ab.cd.ef.node-1" // pragma: allowlist secret
         );
+
+        // A disk whose sysfs has no removable file is not known to be fixed: never the one `only` means.
+        let sys = std::env::temp_dir().join(format!("kith-install-noremovable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        std::fs::create_dir_all(sys.join("sda")).unwrap();
+        std::fs::write(sys.join("sda/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sda/ro"), "0").unwrap();
+        let unknown = disks(&sys, None);
+        assert!(unknown[0].removable);
+        assert!(config("disk: only\n", &unknown).unwrap_err().contains("removable"));
+        std::fs::remove_dir_all(&sys).unwrap();
 
         // `only` is for a machine with one disk; a name must be one that is there.
         assert_eq!(config("disk: only\n", &two[..1]).unwrap().0.name, "sda");
