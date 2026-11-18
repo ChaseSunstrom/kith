@@ -66,7 +66,8 @@ fn plan_examples_validate_and_normalise() {
 #[test]
 fn session_example_carries_the_client_settings() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/session/");
-    let read = |file: &str| std::fs::read_to_string(format!("{dir}{file}")).unwrap_or_else(|e| panic!("{dir}{file}: {e}"));
+    let read =
+        |file: &str| std::fs::read_to_string(format!("{dir}{file}")).unwrap_or_else(|e| panic!("{dir}{file}: {e}"));
     let docs = load(&read("session.yaml"));
     let keys: Vec<String> = docs.iter().map(Resource::key).collect();
     assert_eq!(
@@ -81,10 +82,17 @@ fn session_example_carries_the_client_settings() {
         ]
     );
     let find = |key: &str| -> serde_json::Value {
-        docs.iter().find(|r| r.key() == key).unwrap_or_else(|| panic!("no {key}")).spec.clone()
+        docs.iter()
+            .find(|r| r.key() == key)
+            .unwrap_or_else(|| panic!("no {key}"))
+            .spec
+            .clone()
     };
     let (session, client) = (find("Workload/desktop/session"), find("Workload/desktop/flatpak-app"));
-    let (session_c, client_c) = (&session["template"]["containers"][0], &client["template"]["containers"][0]);
+    let (session_c, client_c) = (
+        &session["template"]["containers"][0],
+        &client["template"]["containers"][0],
+    );
     let var = |c: &serde_json::Value, name: &str| -> String {
         c["env"]
             .as_array()
@@ -96,10 +104,15 @@ fn session_example_carries_the_client_settings() {
             .to_string()
     };
     // The client runs as the session's user, whose alone the seat's directory is.
-    let uid = session_c["runAsUser"].as_u64().expect("the session runs as a user number");
+    let uid = session_c["runAsUser"]
+        .as_u64()
+        .expect("the session runs as a user number");
     assert_eq!(client_c["runAsUser"], json!(uid));
     let recipe = read("Containerfile");
-    assert!(recipe.contains(&format!("-u {uid} ")), "the image's user is not uid {uid}");
+    assert!(
+        recipe.contains(&format!("-u {uid} ")),
+        "the image's user is not uid {uid}"
+    );
     // The rest of the T-0369 settings: a sandbox inside it, a root file system it may write, its home on a Volume.
     assert_eq!(client_c["userNamespaces"], json!(true));
     assert_eq!(client_c["readOnlyRoot"], json!(false));
@@ -116,8 +129,14 @@ fn session_example_carries_the_client_settings() {
     assert_ne!(var(client_c, "XDG_RUNTIME_DIR"), seat_dir);
     assert_eq!(var(client_c, "WAYLAND_DISPLAY"), format!("{seat_dir}/wayland-0"));
     assert_eq!(var(client_c, "DBUS_SESSION_BUS_ADDRESS"), "unix:path=/run/seat/bus");
-    assert_eq!(var(session_c, "DBUS_SESSION_BUS_ADDRESS"), var(client_c, "DBUS_SESSION_BUS_ADDRESS"));
-    assert!(read("session-start.sh").contains("/run/seat/bus"), "the session starts no bus at the address the client is given");
+    assert_eq!(
+        var(session_c, "DBUS_SESSION_BUS_ADDRESS"),
+        var(client_c, "DBUS_SESSION_BUS_ADDRESS")
+    );
+    assert!(
+        read("session-start.sh").contains("/run/seat/bus"),
+        "the session starts no bus at the address the client is given"
+    );
     // The claims: the session holds the seat, the client is a client of it.
     assert_eq!(session["template"]["deviceClaims"], json!(["desk-seat"]));
     assert_eq!(client["template"]["deviceClaims"], json!(["desk-apps"]));
