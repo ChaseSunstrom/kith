@@ -14,7 +14,7 @@
     if [ "$test" = rollout ] || [ "$test" = share ] || [ "$test" = pods ] || [ "$test" = poddns ] || [ "$test" = services ] || [ "$test" = compose ] || [ "$test" = quota ] || [ "$test" = kube ] || [ "$test" = worker ] || [ "$test" = chaos ] || [ "$test" = home ] || [ "$test" = access ] || [ "$test" = policy ] || [ "$test" = tunnel ] || [ "$test" = outlive ]; then
         . "$root/ci/vm/cluster.sh"
     fi
-    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ]; then
+    if [ "$test" = install ] || [ "$test" = vps ] || [ "$test" = netboot ] || [ "$test" = crypt ] || [ "$test" = blackout ]; then
         . "$root/ci/vm/machines.sh"
     fi
     # A copy: the node writes its state to the disk, and this test damages its root.
