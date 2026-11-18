@@ -476,7 +476,11 @@ fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<
     use std::io::{BufRead, Read};
     let mut line = Vec::new();
     // (Bytes that are no text are typed too, on a serial line: they end nothing.)
-    while (&mut console).take(4096).read_until(b'\n', &mut line).is_ok_and(|read| read > 0) {
+    while (&mut console)
+        .take(4096)
+        .read_until(b'\n', &mut line)
+        .is_ok_and(|read| read > 0)
+    {
         if lines.send(String::from_utf8_lossy(&line).trim().to_string()).is_err() {
             return;
         }
@@ -782,7 +786,11 @@ mod tests {
         lines_of(&sent[..], &lines);
         drop(lines);
         let got: Vec<String> = typed_in.iter().collect();
-        assert!(got.iter().all(|piece| piece.len() <= 4096), "{:?}", got.iter().map(String::len).collect::<Vec<_>>());
+        assert!(
+            got.iter().all(|piece| piece.len() <= 4096),
+            "{:?}",
+            got.iter().map(String::len).collect::<Vec<_>>()
+        );
         assert_eq!(got.iter().map(String::len).sum::<usize>(), 10_004);
         assert_eq!(got.last().map(String::as_str), Some("1234"));
     }
