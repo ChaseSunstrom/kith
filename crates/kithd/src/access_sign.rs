@@ -83,48 +83,13 @@ pub struct Asked<'a> {
     pub body: &'a [u8],
 }
 
-struct Header<'a> {
-    who: &'a str,
-    target: &'a str,
-    expires: u64,
-    nonce: &'a str,
-    sig: Vec<u8>,
-}
-
-fn parse(header: &str) -> Result<Header<'_>, String> {
-    let bad = |why: String| format!("{SIGNED}: {why}");
-    let mut parts = header.split(';').map(str::trim);
-    if parts.next() != Some("v1") {
-        return Err(bad("not v1".into()));
-    }
-    let mut fields = HashMap::new();
-    for part in parts {
-        let Some((name, value)) = part.split_once('=') else {
-            return Err(bad(format!("{part:?} is no name=value")));
-        };
-        let known = matches!(name, "who" | "target" | "expires" | "nonce" | "sig");
-        if !known || value.is_empty() || fields.insert(name, value).is_some() {
-            return Err(bad(format!("{name:?} is unknown, empty or said twice")));
-        }
-    }
-    let field = |name: &str| fields.get(name).copied().ok_or_else(|| bad(format!("no {name}")));
-    let expires = field("expires")?;
-    let expires = match expires.bytes().all(|b| b.is_ascii_digit()) {
-        true => expires.parse().map_err(|_| bad("expires is too large".into()))?,
-        false => return Err(bad("expires is seconds since 1970, in digits".into())),
-    };
-    let nonce = field("nonce")?;
-    if nonce.len() != 32 || !nonce.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(bad("nonce is 32 lower-case hex".into()));
-    }
-    let sig = base64::engine::general_purpose::STANDARD.decode(field("sig")?);
-    Ok(Header {
-        who: field("who")?,
-        target: field("target")?,
-        expires,
-        nonce,
-        sig: sig.map_err(|e| bad(format!("sig is not base64: {e}")))?,
-    })
+/// A header read ([`kith_store::header`]: a signed entry in the log carries one too), and
+/// its signature decoded.
+fn parse(header: &str) -> Result<(kith_store::Header<'_>, Vec<u8>), String> {
+    let read = kith_store::header(header)?;
+    let sig = base64::engine::general_purpose::STANDARD.decode(read.sig);
+    let sig = sig.map_err(|e| format!("{SIGNED}: sig is not base64: {e}"))?;
+    Ok((read, sig))
 }
 
 /// The bytes a signature is over, each field ending in one `\n`.
@@ -211,7 +176,7 @@ pub fn verify(
     now: u64,
     nonces: &Nonces,
 ) -> Result<Caller, String> {
-    let signed = parse(header)?;
+    let (signed, sig) = parse(header)?;
     if !targets.contains(&signed.target) {
         return Err(format!(
             "signed for {}, not for {}",
@@ -231,7 +196,7 @@ pub fn verify(
     let message = bytes(cluster, signed.target, asked, signed.who, signed.expires, signed.nonce);
     let holds = |(algorithm, key): &Key| {
         UnparsedPublicKey::new(*algorithm, key)
-            .verify(message.as_bytes(), &signed.sig)
+            .verify(message.as_bytes(), &sig)
             .is_ok()
     };
     if !keys.iter().any(holds) {
@@ -575,7 +540,12 @@ fn clusters_after(store: &Store, command: &Command) -> Result<Option<BTreeMap<St
             after.insert(name, was.resource.spec.clone());
         }
         Command::Import { store } => after = specs(store),
-        Command::Status { .. } | Command::Patch { .. } | Command::Report { .. } | Command::Mark => return Ok(None),
+        Command::Signed { command, .. } => return clusters_after(store, command),
+        Command::Status { .. }
+        | Command::Patch { .. }
+        | Command::Report { .. }
+        | Command::Mark
+        | Command::MarkSigned => return Ok(None),
     }
     Ok(Some(after))
 }

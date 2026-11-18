@@ -89,6 +89,18 @@ impl Change {
 /// What a key's history was before a batch changed it; none: it was not there.
 type Undo = BTreeMap<String, Option<Vec<Revision>>>;
 
+/// How long before a signer's newest `expires` one of its signed entries may say, in seconds:
+/// one older is refused, and the nonces that old are dropped.
+#[cfg(feature = "signing")]
+const SIGNED_SKEW: u64 = 300;
+
+/// One signer's book: the newest `expires` its signed entries said, and the nonces taken
+/// (each with its `expires`) not yet [`SIGNED_SKEW`] older than that. (Written as a pair,
+/// `[newest, {nonce: expires}]`: named fields cost kith 4 KB more of serde, T-0779.)
+#[cfg(feature = "signing")]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Signer(u64, BTreeMap<String, u64>);
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Store {
     /// Revisions per resource key, oldest first. The last one is live.
@@ -101,6 +113,11 @@ pub struct Store {
     /// written as it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     born: Option<BTreeMap<String, (u64, u64)>>,
+    /// The nonces each signer's signed entries were taken with ([`Store::nonce`]). `None`
+    /// until [`Store::sign`]: a store from before has none, and is written as it was.
+    #[cfg(feature = "signing")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signers: Option<BTreeMap<String, Signer>>,
     /// Where in the log the next changes are ([`Store::entry`]).
     #[serde(skip)]
     entry: u64,
@@ -161,6 +178,53 @@ impl Store {
     /// Whether [`Store::mark`] was done.
     pub fn marked(&self) -> bool {
         self.born.is_some()
+    }
+
+    /// Keep from here on the nonces of signed entries ([`Store::nonce`]). Done once: again,
+    /// nothing.
+    #[cfg(feature = "signing")]
+    pub fn sign(&mut self) {
+        self.signers.get_or_insert_with(BTreeMap::new);
+    }
+
+    /// Whether [`Store::sign`] was done.
+    #[cfg(feature = "signing")]
+    pub fn signing(&self) -> bool {
+        self.signers.is_some()
+    }
+
+    /// The signers' books of `from` in place of these: what an import brings in is a store,
+    /// not the cluster's record of what was signed.
+    #[cfg(feature = "signing")]
+    pub fn keep_signers(&mut self, from: Store) {
+        self.signers = from.signers;
+    }
+
+    /// Take `nonce` for a signed entry of `who` that says `expires`. Refused, and nothing
+    /// changed, when the store does not keep nonces, when `who` took it already, or when
+    /// `expires` is [`SIGNED_SKEW`] or more before the newest `who` said: its nonce may be
+    /// one dropped. Deterministic: every input is the entry's, or the store's.
+    #[cfg(feature = "signing")]
+    pub fn nonce(&mut self, who: &str, expires: u64, nonce: &str) -> Result<(), Error> {
+        let Some(signers) = self.signers.as_mut() else {
+            return Err(Error::Invalid("a signed entry before the store is in format 3".into()));
+        };
+        let book = signers.get(who);
+        let newest = book.map_or(0, |book| book.0);
+        if expires.saturating_add(SIGNED_SKEW) <= newest {
+            return Err(Error::Invalid(format!(
+                "a signed entry of {who} expiring at {expires}, five minutes or more before one already taken"
+            )));
+        }
+        if book.is_some_and(|book| book.1.contains_key(nonce)) {
+            return Err(Error::Invalid(format!("the nonce {nonce} of {who} was seen already")));
+        }
+        let book = signers.entry(who.to_string()).or_default();
+        book.0 = book.0.max(expires);
+        book.1.insert(nonce.to_string(), expires);
+        let newest = book.0;
+        book.1.retain(|_, expires| expires.saturating_add(SIGNED_SKEW) > newest);
+        Ok(())
     }
 
     /// When `key` was first made: the log's entry that made it, and the time that entry

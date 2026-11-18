@@ -318,7 +318,7 @@ fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
-vms='' web=''
+vms='' web='' found=''
 # (What a test left running goes with it; its consoles' logs are kept where KITH_VM_LOGS
 # names a directory, for a failure that does not come again. Stopped, it ends there: a trap on
 # TERM alone would clean up and then go on running the test.)
