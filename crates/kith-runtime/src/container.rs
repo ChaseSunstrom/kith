@@ -3034,6 +3034,11 @@ mod tests {
             .err()
             .expect("a rootfs that is a file makes no container")
             .to_string();
+        // (A CI runner's cgroup may take no pids limit: the create fails before the rootfs.)
+        if said.contains("cgroup error") {
+            let _ = fs::remove_dir_all(&root);
+            return eprintln!("skipped: this host's cgroup takes no container ({said})");
+        }
         assert!(said.contains("failed to prepare rootfs"), "{said}");
         assert!(
             said.contains("rootfs-is-a-file"),
@@ -3108,7 +3113,13 @@ mod tests {
             )
         };
         let (out, err) = files();
-        let first = runtime.create("a", &image, &unit, out, err).unwrap();
+        let first = match runtime.create("a", &image, &unit, out, err) {
+            Err(e) if e.to_string().contains("cgroup error") => {
+                let _ = fs::remove_dir_all(&root);
+                return eprintln!("skipped: this host's cgroup takes no container ({e})");
+            }
+            made => made.unwrap(),
+        };
         let refused = runtime.overlay_refused.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             first.note.is_some(),
