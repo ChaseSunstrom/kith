@@ -29,8 +29,10 @@
 #   sh ci/vm.sh --test services one node: every byte through a Service to a pod on the same node comes
 #                               back in order, however its connection ends, passed by kithd from a pod
 #                               and by the kernel from the node's own network
-#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) imported with
-#                               kith import compose, applied, ready, each asked for by its compose name
+#   sh ci/vm.sh --test compose  one node: ci/compose/stack.yml (four services of the test pod) and media.yml
+#                               (eight, the media stack's shape) imported with kith import compose, applied,
+#                               ready, each asked for by its compose name; KITH_E2E=1 also runs media.yml
+#                               under docker compose up on an Alpine machine, timed beside kith's
 #   sh ci/vm.sh --test outlive  one node: kithd killed under a pod, an exec unit and Jobs: the machine
 #                               stays up, kithd serves again and takes them back as they ran; ten
 #                               kills in a minute restart the machine

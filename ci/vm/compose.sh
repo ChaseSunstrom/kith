@@ -3,6 +3,12 @@
 # shellcheck disable=SC2015 # (as the script had them before it was cut)
 # Sourced by ci/vm.sh for --test compose: it runs inside the driver's shell, with its
 # variables and functions; not a script to run alone.
+# (The tools the docker half needs are checked before the kith half runs, as ci/compare.sh checks its own.)
+if [ "${KITH_E2E:-}" = 1 ]; then
+    for tool in xorriso ssh-keygen scp qemu-img curl sha512sum; do
+        command -v "$tool" >/dev/null 2>&1 || fail "$tool is needed for KITH_E2E=1 (the docker machine)"
+    done
+fi
 kith=$(sh "$root/ci/musl.sh")/kith
 # stack TAG FILE NAMES ASKS: a compose file of the test pod's, as kith resources: made on this machine by
 # the kith that is built here (exit 0 is all of it translated; 1 says what was left out), applied to
@@ -39,7 +45,7 @@ json.dump(found, sys.stdout)
     done
     elapsed=$((($(date +%s%N) - started) / 1000000))
     seconds=$(printf '%d.%03d' $((elapsed / 1000)) $((elapsed % 1000)))
-    echo "vm.sh: compose: $tag apply to all ready: $seconds s" >&2
+    echo "vm.sh: compose: $tag apply to all ready: $seconds s (one run, ready includes HTTP probes, 512 MB node)" >&2
     # Each name, then, as a Job in a pod of its own asks for it (40 times: pod ask,
     # ci/pod.rs): its Service has an address and its pod answers with its own name.
     for pair in $asks; do
@@ -96,15 +102,16 @@ dock() {
     [ "$(sha512sum "$img" | cut -d ' ' -f 1)" = '8d756f6fc7653daa4fb4e2e213d8a66007bcb1e5a846e28891af62c47b90685c694486c2746099ad99e9e8f5278db76b69d11dfe1e9361aa4c8406df16929a9c' ] || fail "$img is not the Alpine image ci/compare.sh names (remove it to fetch it again)"
     # The test pod as an image docker can import: its binary at /bin/pod, as the compose file runs it.
     mkdir -p "$work/dock/bin" && cp "$work/pod" "$work/dock/bin/pod" && tar -C "$work/dock" -cf "$work/dock.tar" bin || fail "the test pod was not put in a tar"
-    ssh-keygen -q -t ed25519 -N '' -f "$work/dock-id"
+    ssh-keygen -q -t ed25519 -N '' -f "$work/dock-id" || fail "ssh-keygen could not make the docker machine's key"
     mkdir "$work/dock-seed"
     printf 'instance-id: dock\nlocal-hostname: dock\n' >"$work/dock-seed/meta-data"
     printf 'version: 2\nethernets:\n  eth0: { dhcp4: true }\n' >"$work/dock-seed/network-config"
     printf '#cloud-config\nssh_authorized_keys:\n  - %s\n' "$(cat "$work/dock-id.pub")" >"$work/dock-seed/user-data"
-    xorriso -as mkisofs -quiet -V cidata -J -r -o "$work/dock-seed.iso" "$work/dock-seed" 2>/dev/null
-    qemu-img create -q -f qcow2 -b "$img" -F qcow2 "$work/dock.qcow2" 8G
+    xorriso -as mkisofs -quiet -V cidata -J -r -o "$work/dock-seed.iso" "$work/dock-seed" 2>/dev/null || fail "xorriso could not make the docker machine's seed"
+    qemu-img create -q -f qcow2 -b "$img" -F qcow2 "$work/dock.qcow2" 8G || fail "qemu-img could not make the docker machine's disk"
     # (The kith node goes first: this machine is the only one running while docker is timed.)
     kill $vms 2>/dev/null || true
+    wait $vms 2>/dev/null || true
     vms=''
     # (Installing and three runs take longer than the kith machines' time.)
     time=1800
@@ -121,7 +128,7 @@ dock() {
         sleep 0.5
     done
     # (coreutils: busybox's date has no %N, so the runs would be timed in whole seconds, 0 ms.)
-    ssh_dock 'doas apk add -q --no-cache docker docker-cli-compose coreutils && doas rc-service -q cgroups start; doas rc-service -q docker start; mkdir -p stack/config/vpn stack/config/films' || fail "docker was not installed on the Alpine machine"
+    ssh_dock 'doas apk add -q --no-cache docker docker-cli-compose coreutils && doas rc-service -q cgroups start && doas rc-service -q docker start && mkdir -p stack/config/vpn stack/config/films' || fail "docker was not installed on the Alpine machine"
     scp -q -i "$work/dock-id" -P "$((port + 20))" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$work/dock.tar" alpine@127.0.0.1: || fail "the test pod's tar was not copied"
     scp -q -i "$work/dock-id" -P "$((port + 20))" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$root/ci/compose/media.yml" alpine@127.0.0.1:stack/compose.yml || fail "media.yml was not copied"
     # (What the machine does: the daemon up, the image imported, and three timed runs; "run N MS" each.)
@@ -134,6 +141,7 @@ until doas docker info >/dev/null 2>&1; do
     [ "$tries" -lt 300 ] || { echo "docker's daemon did not start" >&2; exit 1; }
     sleep 1
 done
+echo "docker $(doas docker version --format '{{.Server.Version}}')"
 doas docker import "$HOME/dock.tar" kith.test/pod:1 >/dev/null
 cd "$HOME/stack"
 for run in 1 2 3; do
@@ -155,17 +163,23 @@ EOF
     [ "$(printf '%s\n' "$ms" | wc -l)" -eq 3 ] || fail "docker's three runs were not all timed: $(cat "$work/dock.out")"
     [ "$(printf '%s\n' "$ms" | sed -n 1p)" -gt 0 ] || fail "docker's fastest run took 0 ms, so the clock is wrong: $(cat "$work/dock.out")"
     seconds() { printf '%d.%03d' $(($1 / 1000)) $(($1 % 1000)); }
-    echo "vm.sh: compose: docker compose up of the same file to all eight running: $(seconds "$(printf '%s\n' "$ms" | sed -n 2p)") s (median of three; runs$(awk '$1 == "run" { printf " %s", $3 }' "$work/dock.out") ms)" >&2
+    docker_seconds=$(seconds "$(printf '%s\n' "$ms" | sed -n 2p)")
+    docker_version=$(awk '$1 == "docker" { print $2 }' "$work/dock.out")
+    [ -n "$docker_version" ] || fail "docker's version was not read: $(cat "$work/dock.out")"
+    echo "vm.sh: compose: docker compose up of the same file to all eight running: $docker_seconds s (median of three, running only, no health wait, 2048 MB VM, docker $docker_version)" >&2
 }
 # (A pod is named for its Workload: web's alias, frontend, is answered by web-0.)
 stack stack "$root/ci/compose/stack.yml" 'api:1 db:1 cache:1 web:1' 'api db cache web frontend:web'
 # (The eight services of the media stack: downloader shares vpn's pod (network_mode), so it has no
 # Service of its own; its container is ready with vpn's (two of vpn's pod's containers).)
 stack media "$root/ci/compose/media.yml" 'vpn:2 indexer:1 shows:1 films:1 requests:1 media:1 subtitles:1' 'vpn indexer shows films requests media mediaserver:media subtitles'
+media_seconds=$seconds
 ! grep -al 'Kernel panic' "$work"/n?.log || fail "a kernel panicked"
 # (With KITH_E2E=1 the same media file under docker, after the kith node is stopped.)
+docker_note=''
 if [ "${KITH_E2E:-}" = 1 ]; then
     dock
+    docker_note="; docker compose up of the same file to all eight running $docker_seconds s (median of three, running only, no health wait, 2048 MB VM, docker $docker_version)"
 fi
-echo "vm.sh: ok: one node, kith import compose of ci/compose/stack.yml (four services of the test pod) and of ci/compose/media.yml (eight services, the media stack's shape on the test pod), nothing left out: each applied and all ready, and each name asked for from a Job in a pod, and answered by its own pod"
+echo "vm.sh: ok: one node, kith import compose of ci/compose/stack.yml (four services of the test pod) and of ci/compose/media.yml (eight services, the media stack's shape on the test pod), nothing left out: each applied and all ready, and each name asked for from a Job in a pod, and answered by its own pod; media apply to all ready $media_seconds s (one run, ready includes HTTP probes, 512 MB node)$docker_note"
 exit 0
