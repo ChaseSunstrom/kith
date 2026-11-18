@@ -1437,7 +1437,7 @@ fn a_brought_in_store_moves_the_counts_of_the_kinds_it_changes() {
 
     let dir = Scratch::new();
     block(async {
-        let mut machine = Machine::open(&dir.0, Arc::new(|| {})).unwrap();
+        let mut machine = Machine::open(&dir.0, Arc::new(|| {}), any()).unwrap();
         install(&mut machine, &node_at("10.1.2.3:7443"), 3).await;
         let before = machine.state.lock().unwrap().store.changes("Node");
         install(&mut machine, &node_at("10.9.9.9:7443"), 4).await;
