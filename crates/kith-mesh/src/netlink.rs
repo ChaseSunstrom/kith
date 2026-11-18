@@ -596,7 +596,10 @@ pub fn gateway4(index: u32, gateway: Ipv4Addr) -> Result<()> {
     }
     let mut message = address_message(index, gateway, 32);
     message.attributes.push(AddressAttribute::Label(GATEWAY_LABEL.into()));
-    let put = ask_route(RouteNetlinkMessage::NewAddress(message), NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE);
+    let put = ask_route(
+        RouteNetlinkMessage::NewAddress(message),
+        NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE,
+    );
     failed.and(put.map(drop))
 }
 
@@ -655,7 +658,11 @@ mod tests {
     }
 
     fn now() -> Vec<Ipv4Addr> {
-        let mut now: Vec<_> = lo_addresses4(1).unwrap().into_iter().map(|(address, ..)| address).collect();
+        let mut now: Vec<_> = lo_addresses4(1)
+            .unwrap()
+            .into_iter()
+            .map(|(address, ..)| address)
+            .collect();
         now.sort();
         now
     }
@@ -673,7 +680,11 @@ mod tests {
         up(1).unwrap();
         drop(Clean); // what another test left on this namespace's loopback
         let _clean = Clean;
-        let (a, b, other) = (Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(198, 51, 100, 2), Ipv4Addr::new(198, 51, 100, 9));
+        let (a, b, other) = (
+            Ipv4Addr::new(198, 51, 100, 1),
+            Ipv4Addr::new(198, 51, 100, 2),
+            Ipv4Addr::new(198, 51, 100, 9),
+        );
         // A gateway put by an earlier kithd (no label), and an address of another's.
         address4(1, a, 32, None).unwrap();
         address4(1, other, 32, None).unwrap();
