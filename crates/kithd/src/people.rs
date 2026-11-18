@@ -1,8 +1,10 @@
 //! The people's addresses (docs/adr-people.md, "Addresses come from the name"). Each RemotePeer
 //! is given an IPv4 in `100.89.0.0/16` and an IPv6 in the cluster's people /64, both from its
-//! name, and keeps them in its status once given. The leader writes them: a later peer with a
-//! taken address, or a public key that two peers hold, is refused in status and named. An
-//! AccessLevel whose network lies over the mesh's /48 or the people /64 is refused the same way.
+//! name, and keeps them in its status once given. The leader writes them once its store has
+//! applied its log. A later peer with a taken address is refused in status and named, and a public
+//! key that two peers hold gives its address to one of them and refuses the rest, naming it. A
+//! refusal names no address. An AccessLevel whose network lies over the mesh's /48 or the people
+//! /64 is refused the same way.
 //!
 //! ponytail: 16 bits of a name's hash for the IPv4 address: about 7% of 100 peers collide, and
 //! the later one is told to be named otherwise. No allocator.
@@ -40,11 +42,12 @@ pub struct Asked {
     pub held: Option<(Ipv4Addr, Ipv6Addr)>,
 }
 
-/// What the leader says of a RemotePeer: its two addresses, or why it has none.
+/// What the leader says of a RemotePeer: its two addresses, or why it has none. A refused one
+/// keeps the addresses it held, if it held any, so that a refusal never frees one.
 #[derive(Debug, PartialEq)]
 pub enum Said {
     Given(Ipv4Addr, Ipv6Addr),
-    Refused(String),
+    Refused(String, Option<(Ipv4Addr, Ipv6Addr)>),
 }
 
 /// The IPv4 offset in [`RANGE`] (16 bits) and the interface id of the IPv6 address (64 bits) of
@@ -92,10 +95,10 @@ struct Held {
 impl Held {
     fn take(&mut self, name: &str, (four, six): (Ipv4Addr, Ipv6Addr)) -> Result<(), String> {
         if let Some(other) = self.four.get(&four) {
-            return Err(format!("{four} is {other}'s: name it otherwise"));
+            return Err(format!("its IPv4 address is {other}'s: name it otherwise"));
         }
         if let Some(other) = self.six.get(&six) {
-            return Err(format!("{six} is {other}'s: name it otherwise"));
+            return Err(format!("its IPv6 address is {other}'s: name it otherwise"));
         }
         self.four.insert(four, name.to_string());
         self.six.insert(six, name.to_string());
@@ -103,53 +106,72 @@ impl Held {
     }
 }
 
-/// What each RemotePeer is given, by name. A public key on two or more peers refuses each of
-/// them, naming another. The addresses already held are kept first, by name; the others draw
-/// from their names, and a draw at the range's ends or one taken is refused, naming the holder.
+/// The addresses a peer holds, when they are ours (a status a hand wrote may not be).
+fn valid(people: Ipv6Addr, peer: &Asked) -> Option<(Ipv4Addr, Ipv6Addr)> {
+    peer.held.filter(|&pair| ours(people, pair))
+}
+
+/// What each RemotePeer is given, by name. A public key on two or more peers gives its address
+/// to one of them, the keeper: the one already holding an address of ours, else the smallest
+/// name. The others are refused, naming the keeper. Held addresses are kept first, by name, the
+/// refused peers' too; the others draw from their names, and a draw at the range's ends or one
+/// taken is refused, naming the holder.
 pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
-    let mut said = BTreeMap::new();
-    let mut by_key: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut by_key: BTreeMap<&str, Vec<&Asked>> = BTreeMap::new();
     for peer in asked {
-        by_key.entry(peer.key.as_str()).or_default().push(peer.name.as_str());
+        by_key.entry(peer.key.as_str()).or_default().push(peer);
     }
-    let mut order: Vec<&Asked> = Vec::new();
-    for peer in asked {
-        let holders = &by_key[peer.key.as_str()];
-        match holders.iter().copied().find(|other| *other != peer.name.as_str()) {
-            Some(other) => {
-                let why = format!("publicKey: the same as {other}'s: name it otherwise");
-                said.insert(peer.name.clone(), Said::Refused(why));
-            }
-            None => order.push(peer),
+    let mut lot: Vec<(&Asked, Option<String>)> = Vec::new();
+    for holders in by_key.values() {
+        let Some(keeper) = holders
+            .iter()
+            .min_by_key(|peer| (valid(people, peer).is_none(), peer.name.as_str()))
+        else {
+            continue;
+        };
+        for &peer in holders {
+            let why = (peer.name != keeper.name)
+                .then(|| format!("publicKey: the same as {}'s: name it otherwise", keeper.name));
+            lot.push((peer, why));
         }
     }
-    order.sort_by(|a, b| a.name.cmp(&b.name));
+    // Keepers first: a refused peer's held address is kept only where no keeper holds it.
+    // Keepers first: a refused peer's held address is kept only where no keeper holds it.
+    lot.sort_by(|a, b| (a.1.is_some(), &a.0.name).cmp(&(b.1.is_some(), &b.0.name)));
 
+    let mut said = BTreeMap::new();
     let mut held = Held::default();
     let mut draws = Vec::new();
-    for peer in order {
-        match peer.held.filter(|&pair| ours(people, pair)) {
-            Some(pair) => {
-                let now = match held.take(&peer.name, pair) {
-                    Ok(()) => Said::Given(pair.0, pair.1),
-                    Err(why) => Said::Refused(why),
+    for (peer, why) in lot {
+        match (valid(people, peer), why) {
+            (Some(pair), why) => {
+                let now = match (held.take(&peer.name, pair), why) {
+                    (Ok(()), None) => Said::Given(pair.0, pair.1),
+                    (Ok(()), Some(why)) => Said::Refused(why, Some(pair)),
+                    (Err(err), None) => Said::Refused(err, None),
+                    (Err(_), Some(why)) => Said::Refused(why, None),
                 };
                 said.insert(peer.name.clone(), now);
             }
-            None => draws.push(peer),
+            (None, Some(why)) => {
+                said.insert(peer.name.clone(), Said::Refused(why, None));
+            }
+            (None, None) => draws.push(peer),
         }
     }
     for peer in draws {
         let (offset, iid) = drawn(&peer.name);
         let (four, six) = addresses(people, offset, iid);
-        let now = if reserved4(offset) || reserved6(iid) {
-            Said::Refused(format!(
-                "{four} is the range's first two or last, never given: name it otherwise"
-            ))
+        let now = if reserved4(offset) {
+            let why = "its IPv4 address is the range's first two or last, never given: name it otherwise";
+            Said::Refused(why.into(), None)
+        } else if reserved6(iid) {
+            let why = "its IPv6 address is the people /64's first two or last, never given: name it otherwise";
+            Said::Refused(why.into(), None)
         } else {
             match held.take(&peer.name, (four, six)) {
                 Ok(()) => Said::Given(four, six),
-                Err(why) => Said::Refused(why),
+                Err(why) => Said::Refused(why, None),
             }
         };
         said.insert(peer.name.clone(), now);
@@ -196,9 +218,27 @@ fn changed(resource: &Resource, want: Vec<(&str, Value)>) -> Option<(String, Map
     (!differ.is_empty()).then(|| (resource.key(), differ))
 }
 
+/// The `addresses` field of a RemotePeer's status: its two addresses, or none.
+fn address_value(pair: Option<(Ipv4Addr, Ipv6Addr)>) -> Value {
+    pair.map_or(
+        Value::Null,
+        |(four, six)| json!({"ipv4": four.to_string(), "ipv6": six.to_string()}),
+    )
+}
+
+/// Has a store applied its leader's log? One that has not is planned from statuses it lacks, and
+/// would overwrite the ones a leader before it gave.
+fn caught_up(last_log: Option<u64>, applied: Option<u64>) -> bool {
+    last_log.is_none_or(|last| applied.is_some_and(|index| index >= last))
+}
+
 /// The status fields to write now: a RemotePeer's `addresses` and `refused`, an AccessLevel's
-/// `refused`. Nothing is written that the store already says.
-pub fn statuses(store: &Store, mesh: Ipv6Addr, people: Ipv6Addr) -> Vec<(String, Map<String, Value>)> {
+/// `refused`. Nothing is written that the store already says, and nothing while the store has not
+/// applied its log (`caught_up`).
+pub fn statuses(store: &Store, mesh: Ipv6Addr, people: Ipv6Addr, caught_up: bool) -> Vec<(String, Map<String, Value>)> {
+    if !caught_up {
+        return Vec::new();
+    }
     let mut asked = Vec::new();
     for resource in store.list(Some("RemotePeer")) {
         let Ok(spec) = serde_json::from_value::<RemotePeerSpec>(resource.spec.clone()) else {
@@ -219,11 +259,13 @@ pub fn statuses(store: &Store, mesh: Ipv6Addr, people: Ipv6Addr) -> Vec<(String,
         let want = match now {
             Said::Given(four, six) => {
                 vec![
-                    ("addresses", json!({"ipv4": four.to_string(), "ipv6": six.to_string()})),
+                    ("addresses", address_value(Some((*four, *six)))),
                     ("refused", Value::Null),
                 ]
             }
-            Said::Refused(why) => vec![("addresses", Value::Null), ("refused", json!(why))],
+            Said::Refused(why, kept) => {
+                vec![("addresses", address_value(*kept)), ("refused", json!(why))]
+            }
         };
         out.extend(changed(resource, want));
     }
@@ -248,9 +290,10 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     loop {
         let metrics = shared.raft.metrics().borrow().clone();
         if metrics.current_leader == Some(metrics.id) {
+            let applied = metrics.last_applied.map(|log| log.index);
             let statuses = {
                 let state = shared.store.lock().expect("nothing panics holding the store");
-                statuses(&state.store, mesh, people)
+                statuses(&state.store, mesh, people, caught_up(metrics.last_log_index, applied))
             };
             if !statuses.is_empty()
                 && let Err(e) = shared.submit(Command::Patch { statuses }).await
@@ -291,9 +334,35 @@ mod tests {
 
     fn refused(said: &BTreeMap<String, Said>, name: &str) -> String {
         match said.get(name) {
-            Some(Said::Refused(why)) => why.clone(),
+            Some(Said::Refused(why, _)) => why.clone(),
             other => panic!("{name}: {other:?}"),
         }
+    }
+
+    const KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+
+    fn apply_peer(store: &mut Store, name: &str, key: &str) {
+        let source = format!(
+            "apiVersion: kith.dev/v1\nkind: RemotePeer\nmetadata: {{ name: {name} }}\nspec: {{ node: n1, level: family, publicKey: '{key}' }}\n"
+        );
+        for resource in Resource::from_source(&source).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+    }
+
+    fn status_of(store: &Store, key: &str, field: &str) -> Value {
+        store
+            .get(key)
+            .and_then(|resource| resource.status.as_ref())
+            .and_then(|status| status.get(field))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Writes the statuses the leader would, as a leader that has applied its log does.
+    fn settle(store: &mut Store, mesh: Ipv6Addr, people: Ipv6Addr) {
+        let statuses = statuses(store, mesh, people, true);
+        kith_store::run(store, Command::Patch { statuses }).unwrap();
     }
 
     #[test]
@@ -360,14 +429,125 @@ mod tests {
     }
 
     #[test]
-    fn a_key_on_two_peers_refuses_both_naming_the_other() {
+    fn a_key_on_two_peers_gives_the_smallest_name_and_refuses_the_rest() {
         let said = plan(
-            &[asked("phone-1", "K"), asked("phone-2", "K"), asked("phone-3", "J")],
+            &[asked("phone-2", "K"), asked("phone-1", "K"), asked("phone-3", "J")],
             people(),
         );
-        assert!(refused(&said, "phone-1").contains("phone-2"));
-        assert!(refused(&said, "phone-2").contains("phone-1"));
+        given(&said, "phone-1");
+        assert!(refused(&said, "phone-2").contains("phone-1's"));
         given(&said, "phone-3");
+    }
+
+    #[test]
+    fn a_key_on_two_peers_gives_the_one_already_holding_an_address() {
+        let held = addresses(people(), 0x0707, 0x1234_5678);
+        let mut holder = asked("phone-2", "K");
+        holder.held = Some(held);
+        let said = plan(&[asked("phone-1", "K"), holder], people());
+        assert_eq!(given(&said, "phone-2"), held);
+        assert!(refused(&said, "phone-1").contains("phone-2's"));
+    }
+
+    #[test]
+    fn a_refused_peer_never_frees_its_address() {
+        // (a1 and z1 share a key and z1 holds an address. A third peer q with z1's key comes and
+        // goes: z1 keeps its address through all of it.)
+        let (mesh, people) = (kith_mesh::prefix(b"a cluster"), people());
+        let held = addresses(people, 0x0707, 0x1234_5678);
+        let mut store = Store::default();
+        apply_peer(&mut store, "a1", KEY);
+        apply_peer(&mut store, "z1", KEY);
+        store
+            .set_status("RemotePeer/z1", Some(json!({"addresses": address_value(Some(held))})))
+            .unwrap();
+        settle(&mut store, mesh, people);
+        assert!(
+            status_of(&store, "RemotePeer/a1", "refused")
+                .as_str()
+                .is_some_and(|why| why.contains("z1's"))
+        );
+        assert_eq!(
+            status_of(&store, "RemotePeer/z1", "addresses"),
+            address_value(Some(held))
+        );
+        apply_peer(&mut store, "q", KEY);
+        settle(&mut store, mesh, people);
+        assert_eq!(
+            status_of(&store, "RemotePeer/z1", "addresses"),
+            address_value(Some(held))
+        );
+        store.delete("RemotePeer/q").unwrap();
+        settle(&mut store, mesh, people);
+        assert_eq!(
+            status_of(&store, "RemotePeer/z1", "addresses"),
+            address_value(Some(held))
+        );
+    }
+
+    #[test]
+    fn a_refused_peer_never_takes_a_keepers_address() {
+        // (a0 keeps key J's address. a1, refused for that key, holds an address that z1, the keeper
+        // of key K, holds too: z1 keeps it, and a1 keeps none.)
+        let (x, y) = (addresses(people(), 0x0707, 0x1111), addresses(people(), 0x0909, 0x2222));
+        let mut a0 = asked("a0", "J");
+        a0.held = Some(y);
+        let mut a1 = asked("a1", "J");
+        a1.held = Some(x);
+        let mut z1 = asked("z1", "K");
+        z1.held = Some(x);
+        let said = plan(&[a0, a1, z1], people());
+        assert_eq!(given(&said, "z1"), x);
+        assert_eq!(given(&said, "a0"), y);
+        assert!(matches!(said.get("a1"), Some(Said::Refused(why, None)) if why.contains("a0's")));
+    }
+
+    #[test]
+    fn the_leader_writes_only_once_its_store_has_applied_its_log() {
+        let mut store = Store::default();
+        apply_peer(&mut store, "phone-1", KEY);
+        let (mesh, people) = (kith_mesh::prefix(b"a cluster"), people());
+        assert!(statuses(&store, mesh, people, false).is_empty());
+        assert!(!statuses(&store, mesh, people, true).is_empty());
+        assert!(caught_up(None, None));
+        assert!(!caught_up(Some(5), None));
+        assert!(!caught_up(Some(5), Some(4)));
+        assert!(caught_up(Some(5), Some(5)));
+    }
+
+    #[test]
+    fn no_refusal_names_an_address() {
+        let people = people();
+        let stem = people.segments()[..4]
+            .iter()
+            .map(|segment| format!("{segment:x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let mut a1 = asked("k-a1", "k1");
+        a1.held = Some(addresses(people, 0x0707, 0x1111));
+        let mut a2 = asked("k-a2", "k2");
+        a2.held = Some(addresses(people, 0x0707, 0x2222));
+        let mut a3 = asked("k-a3", "k3");
+        a3.held = Some(addresses(people, 0x0708, 0x1111));
+        let end = (0u64..)
+            .map(|i| format!("peer{i}"))
+            .find(|name| drawn(name).0 == 0)
+            .expect("some name draws the range's first address");
+        let said = plan(
+            &[a1, a2, a3, asked(&end, "k4"), asked("k-s1", "K"), asked("k-s2", "K")],
+            people,
+        );
+        let refusals: Vec<&String> = said
+            .values()
+            .filter_map(|said| match said {
+                Said::Refused(why, _) => Some(why),
+                Said::Given(..) => None,
+            })
+            .collect();
+        assert_eq!(refusals.len(), 4, "{said:?}");
+        for why in refusals {
+            assert!(!why.contains("100.89.") && !why.contains(&stem), "{why}");
+        }
     }
 
     #[test]
@@ -381,7 +561,7 @@ mod tests {
             store.apply(resource.unwrap()).unwrap();
         }
         let mesh = kith_mesh::prefix(b"a cluster");
-        let first = statuses(&store, mesh, people());
+        let first = statuses(&store, mesh, people(), true);
         let peer = first
             .iter()
             .find(|(key, _)| key == "RemotePeer/phone-1")
@@ -401,6 +581,6 @@ mod tests {
                 .is_some_and(|why| why.contains("overlaps the mesh's /48"))
         );
         kith_store::run(&mut store, Command::Patch { statuses: first }).unwrap();
-        assert!(statuses(&store, mesh, people()).is_empty());
+        assert!(statuses(&store, mesh, people(), true).is_empty());
     }
 }
