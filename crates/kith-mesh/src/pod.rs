@@ -701,6 +701,12 @@ impl Batch {
         }
     }
 
+    /// The table of `family` taken away, with its chains and rules. The table must be there
+    /// (see `has_table`): nftables says no to a delete of one that is not.
+    pub(crate) fn drop_table(&mut self, family: u8) {
+        self.say(0xa02, family, 0, &[text(1, self.table)]);
+    }
+
     /// A chain of the table, at `hook` with `priority`, and `policy` (accept, 1, or drop,
     /// 0) for what no rule of it takes.
     pub(crate) fn chain(&mut self, family: u8, name: &str, kind: &str, hook: u32, priority: u32, policy: Option<u32>) {

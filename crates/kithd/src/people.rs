@@ -17,6 +17,7 @@ use kith_store::Command;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -309,6 +310,114 @@ pub async fn run(shared: Arc<Shared>, mut stopping: watch::Receiver<bool>) {
     }
 }
 
+/// The people's device made or found on `port`, up, with the people's table written first and no
+/// peers (docs/adr-people.md, "Built"). Its key is `pki/people.key`, made the first time and kept.
+/// Says the device's public key.
+pub fn up(state: &Path, port: u16, interface: &str, people64: Ipv6Addr) -> std::io::Result<kith_mesh::Key> {
+    up_with(state, port, people64, || {
+        kith_mesh::people::send(people64, &[], &[], interface, &[]).map_err(no_masquerade)
+    })
+}
+
+/// `up`, with the table made by `table` (the tests make theirs without masquerade: see `table_here`).
+fn up_with(
+    state: &Path,
+    port: u16,
+    people64: Ipv6Addr,
+    table: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<kith_mesh::Key> {
+    let key = crate::mesh::private_key(&state.join("pki").join("people.key"))?;
+    table()?;
+    Ok(kith_mesh::people::device(&key, port, people64)?.public_key)
+}
+
+/// A kernel with no nftables masquerade (CONFIG_NFT_MASQ) refuses the table's post chain: that
+/// is said plainly, where a bare ENOENT would not say what is missing. Other errors pass as they are.
+fn no_masquerade(e: std::io::Error) -> std::io::Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        std::io::Error::new(
+            e.kind(),
+            "this kernel has no nftables masquerade (CONFIG_NFT_MASQ): --people needs it",
+        )
+    } else {
+        e
+    }
+}
+
+/// What this node says of its people's device in its status (`people`): the device's public key
+/// (base64, as a RemotePeer's is), its port and its endpoint. Null without a device.
+pub fn said(key: Option<&kith_mesh::Key>, port: u16, endpoint: Option<&str>) -> Value {
+    use base64::Engine as _;
+    match key {
+        Some(key) => json!({
+            "publicKey": base64::engine::general_purpose::STANDARD.encode(key),
+            "port": port,
+            "endpoint": endpoint,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// The people's device (see `up`), until stopped, then taken away with its table; `people` said in
+/// this node's status while it is up. Without a port, what an earlier start left is taken away
+/// now, and what this node said of it is taken back.
+pub async fn device(
+    shared: Arc<Shared>,
+    state: PathBuf,
+    port: Option<u16>,
+    endpoint: Option<String>,
+    interface: String,
+    mut stopping: watch::Receiver<bool>,
+) {
+    let Some(port) = port else {
+        // (Only root can take the device and table away: a start without root has nothing to say.)
+        if nix::unistd::getuid().is_root()
+            && let Err(e) = kith_mesh::people::remove()
+        {
+            eprintln!("kithd: people: taking away what an earlier start left: {e}");
+        }
+        return crate::mesh::left(shared, "people", stopping).await;
+    };
+    let Some(cluster) = &shared.cluster else {
+        return eprintln!("kithd: --people is for a node of a cluster (--mesh): no people");
+    };
+    let node = format!("Node/{}", cluster.me.name);
+    let people64 = prefix(&cluster.me.ca);
+    let public = match up(&state, port, &interface, people64) {
+        Ok(public) => public,
+        Err(e) => {
+            eprintln!("kithd: no people: {e} (it takes root)");
+            // (No device, so what an earlier start said of one is taken back.)
+            return crate::mesh::left(shared, "people", stopping).await;
+        }
+    };
+    eprintln!("kithd: people on {}: UDP port {port}", kith_mesh::people::DEVICE);
+    let status = said(Some(&public), port, endpoint.as_deref());
+    let mut generation = shared.generation.subscribe();
+    loop {
+        // (Said again whenever the store does not have it: the Node may not be there yet.)
+        let there = {
+            let store = shared.store.lock().expect("nothing panics holding the store");
+            let own = store.store.get(&node);
+            own.is_some_and(|own| own.status.as_ref().is_some_and(|held| held["people"] == status))
+        };
+        if !there && let Err(e) = crate::mesh::say(&shared, &node, "people", status.clone()).await {
+            eprintln!("kithd: people: telling the cluster: {e}");
+        }
+        tokio::select! {
+            _ = generation.changed() => {}
+            () = tokio::time::sleep(Duration::from_secs(10)) => {}
+            _ = stopping.changed() => break,
+        }
+    }
+    if let Err(e) = kith_mesh::people::remove() {
+        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
+    }
+    if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
+        eprintln!("kithd: people: taking back this node's people: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +691,146 @@ mod tests {
         );
         kith_store::run(&mut store, Command::Patch { statuses: first }).unwrap();
         assert!(statuses(&store, mesh, people(), true).is_empty());
+    }
+
+    /// The table `up` writes, on a kernel with no masquerade here (this namespace): without its
+    /// masquerade rules, and saying so (as kith-mesh's own tests do).
+    fn table_here(people64: Ipv6Addr) -> std::io::Result<()> {
+        match kith_mesh::people::send(people64, &[], &[], "kith0", &[]) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("this kernel has no masquerade here: without");
+                kith_mesh::people::send_without_masquerade(people64, &[], &[], "kith0", &[])
+            }
+            done => done,
+        }
+    }
+
+    /// The people device (docs/adr-people.md, "Built"), in a namespace of its own: with the flag,
+    /// kwg0 holds this node's key, the port, its two addresses and no peers, behind the table, and
+    /// its public key is said; a second start keeps the key and empties the peers. Without the
+    /// flag, the start itself takes all of that away.
+    #[tokio::test]
+    async fn people_device() {
+        use base64::Engine as _;
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("KITH_E2E").is_none() {
+            return eprintln!("skipped: set KITH_E2E=1 under unshare -Urn");
+        }
+        let alone = std::fs::read_to_string("/proc/net/dev")
+            .is_ok_and(|dev| dev.lines().skip(2).all(|line| line.trim_start().starts_with("lo:")));
+        if !alone {
+            return eprintln!("skipped: not in a network namespace of its own");
+        }
+        let state = std::env::temp_dir().join(format!("kithd-people-{}", std::process::id()));
+        std::fs::create_dir_all(state.join("pki")).unwrap();
+        let (port, people64) = (51821, people());
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "a");
+        let shared = crate::cluster::pinned_peer::shared_with("people-device", me, &[]).await;
+
+        let key = super::up_with(&state, port, people64, || table_here(people64)).expect("the device comes up");
+        let peer = kith_mesh::Peer {
+            key: [7; 32],
+            endpoint: None,
+            allowed: vec![(IpAddr::V4(Ipv4Addr::new(100, 89, 0, 2)), 32)],
+            keepalive: 0,
+        };
+        kith_mesh::people::set_peers_for_tests(std::slice::from_ref(&peer)).expect("a peer is seeded");
+        assert_eq!(
+            kith_mesh::people::device_found().unwrap().unwrap().peers,
+            1,
+            "a peer is there"
+        );
+        assert_eq!(
+            super::up_with(&state, port, people64, || table_here(people64)).unwrap(),
+            key,
+            "a start keeps the key"
+        );
+        let file = state.join("pki").join("people.key");
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+
+        assert!(kith_mesh::people::table_present().unwrap(), "the table is in place");
+        let found = kith_mesh::people::device_found().unwrap().expect("kwg0 is up");
+        assert_eq!(found.public_key, key);
+        assert_eq!(found.port, port);
+        assert_eq!(found.peers, 0);
+        assert!(
+            found
+                .addresses
+                .contains(&(IpAddr::V4(Ipv4Addr::new(100, 89, 0, 1)), 16))
+        );
+        let six = Ipv6Addr::from(u128::from(people64) | 1);
+        assert!(found.addresses.contains(&(IpAddr::V6(six), 64)));
+
+        let said = super::said(Some(&key), port, None);
+        assert_eq!(said["port"].as_u64(), Some(u64::from(port)));
+        assert!(said["endpoint"].is_null());
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        assert_eq!(said["publicKey"].as_str(), Some(encoded.as_str()));
+
+        // Without the flag, the start itself takes what the last one left away (the peer too).
+        let (stop, stopping) = tokio::sync::watch::channel(false);
+        stop.send(true).unwrap();
+        super::device(shared, state.clone(), None, None, "kith0".into(), stopping).await;
+        assert!(kith_mesh::people::device_found().unwrap().is_none(), "kwg0 is gone");
+        assert!(!kith_mesh::people::table_present().unwrap(), "the table is gone");
+        assert!(super::said(None, port, None).is_null());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A start whose device does not come up takes back what an earlier start said of it, so no
+    /// status names a device that is not there. (No pki directory: the key cannot be made, so no
+    /// netlink is reached and no root is needed.)
+    #[tokio::test]
+    async fn a_start_whose_device_fails_takes_back_its_status() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "a");
+        let upstream = crate::view::Upstream {
+            name: "a".into(),
+            address: "127.0.0.1:1".into(),
+            certificate: None,
+        };
+        let shared = crate::cluster::pinned_peer::shared_with("people-failed", me, &[upstream]).await;
+        {
+            // (Set in the store as `shared_of` sets a Node's status.)
+            let said_before = super::said(Some(&[7; 32]), 51821, None);
+            let mut state = shared.store.lock().expect("nothing panics holding the store");
+            state
+                .store
+                .set_status("Node/a", Some(serde_json::json!({ "people": said_before })))
+                .unwrap();
+        }
+        // (A leader of its own, as `leading` in raft.rs makes one: the take-back is a write.)
+        let id = shared.raft.metrics().borrow().id;
+        let one = std::collections::BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        shared
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .current_leader(id, "leads")
+            .await
+            .unwrap();
+
+        let state = std::env::temp_dir().join(format!("kithd-people-failed-{}", std::process::id()));
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        super::device(shared.clone(), state, Some(51821), None, "kith0".into(), stopping).await;
+
+        let store = shared.store.lock().expect("nothing panics holding the store");
+        let status = store.store.get("Node/a").unwrap().status.as_ref().unwrap();
+        assert!(status["people"].is_null(), "the status no longer names the device");
+    }
+
+    /// The masquerade message: a kernel with no nftables masquerade says so (CONFIG_NFT_MASQ), and
+    /// any other error is passed on as it is.
+    #[test]
+    fn no_masquerade_says_why() {
+        let missing = super::no_masquerade(std::io::ErrorKind::NotFound.into());
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            missing.to_string(),
+            "this kernel has no nftables masquerade (CONFIG_NFT_MASQ): --people needs it"
+        );
+        let other = super::no_masquerade(std::io::Error::other("elsewhere"));
+        assert_eq!(other.to_string(), "elsewhere");
     }
 }

@@ -172,6 +172,47 @@ pub(crate) fn mesh_key_elsewhere(store: &Store, node: &str, key: &str, fields: &
     }
 }
 
+/// What a node says of its people's device (`status.people`): null, or the device's public key
+/// (32 bytes, base64), its port and its endpoint (a string or null), and nothing else.
+fn people_shape(key: &str, people: &Value) -> Result<(), String> {
+    use base64::Engine as _;
+    let fields = match people {
+        Value::Null => return Ok(()),
+        Value::Object(fields) => fields,
+        _ => {
+            return Err(refused(
+                key,
+                "`people` is null or the people's device: publicKey, port, endpoint",
+            ));
+        }
+    };
+    if let Some(other) = fields
+        .keys()
+        .find(|key| !matches!(key.as_str(), "publicKey" | "port" | "endpoint"))
+    {
+        return Err(refused(key, format!("people has no {other}")));
+    }
+    let public = fields.get("publicKey").and_then(Value::as_str);
+    let public = public.and_then(|public| base64::engine::general_purpose::STANDARD.decode(public).ok());
+    if public.is_none_or(|public| public.len() != 32) {
+        return Err(refused(key, "`publicKey` is a 32-byte key in base64"));
+    }
+    if !fields
+        .get("port")
+        .and_then(Value::as_u64)
+        .is_some_and(|port| (1..=65535).contains(&port))
+    {
+        return Err(refused(key, "`port` is a port from 1 to 65535"));
+    }
+    if !fields
+        .get("endpoint")
+        .is_some_and(|endpoint| endpoint.is_null() || endpoint.is_string())
+    {
+        return Err(refused(key, "`endpoint` is a string or null"));
+    }
+    Ok(())
+}
+
 pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> Result<(), String> {
     let node = who.name;
     let Some(live) = store.get(key) else {
@@ -180,7 +221,10 @@ pub(crate) fn patch(store: &Store, who: &Worker, key: &str, fields: &Fields) -> 
     };
     match live.kind.as_str() {
         "Node" if live.metadata.name == node => {
-            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint"])?;
+            only(key, fields, &["os", "mesh", "serves", "policy", "thumbprint", "people"])?;
+            if let Some(people) = fields.get("people") {
+                people_shape(key, people)?;
+            }
             // (Its own policy, as it says it: null, or a small object of yes and no and the classes of Device.)
             let small = |policy: &Value| match policy {
                 Value::Null => true,
@@ -681,6 +725,47 @@ spec: { volume: there, every: 1d }
         Command::Patch {
             statuses: vec![(key.to_string(), fields)],
         }
+    }
+
+    #[test]
+    fn a_worker_says_its_people_device_in_its_shape() {
+        use base64::Engine as _;
+        let store = store();
+        let people = |said: Value| patch_of("Node/w", json!({ "people": said }));
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let device = |public: Value, port: Value, endpoint: Value| json!({ "publicKey": public, "port": port, "endpoint": endpoint });
+        // Its device, with or without an endpoint; null when the device is taken away.
+        for said in [
+            device(json!(key), json!(51821), Value::Null),
+            device(json!(key), json!(65535), json!("203.0.113.5:51821")),
+            Value::Null,
+        ] {
+            assert!(try_as(&store, "w", people(said.clone())).is_ok(), "{said}");
+        }
+        // Outside its shape: a key that is not 32 bytes in base64, a port out of range or not a
+        // number, an endpoint that is neither a string nor null, another field, a field missing.
+        let short = base64::engine::general_purpose::STANDARD.encode([7u8; 31]);
+        let outside = [
+            device(json!(short), json!(51821), Value::Null),
+            device(json!("not base64!"), json!(51821), Value::Null),
+            device(json!(7), json!(51821), Value::Null),
+            device(json!(key), json!(0), Value::Null),
+            device(json!(key), json!(65536), Value::Null),
+            device(json!(key), json!("51821"), Value::Null),
+            device(json!(key), json!(51821), json!(5)),
+            json!({ "publicKey": key, "port": 51821, "endpoint": null, "lan": "192.0.2.5" }),
+            json!({ "publicKey": key, "port": 51821 }),
+            json!("yes"),
+        ];
+        for said in outside {
+            assert!(try_as(&store, "w", people(said.clone())).is_err(), "{said}");
+        }
+        // Another node's device.
+        let theirs = patch_of(
+            "Node/w",
+            json!({ "people": device(json!(key), json!(51821), Value::Null) }),
+        );
+        assert!(try_as(&store, "w-b", theirs).is_err());
     }
 
     #[test]
