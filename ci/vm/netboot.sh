@@ -13,17 +13,24 @@
             # (Six starts of the machine: the node has to outlast them all.)
             [ "$test" = netboot ] || more='&encrypt=true' time=$((time * 2))
             [ -z "$sealing" ] || time=$((time * 3 / 2))
-            python3 "$root/ci/dhcpd.py" "$((port + 9))" 52:54:00:00:09:01=10.9.0.1 "$mac=10.9.0.2" &
-            vms="$vms $!"
-            sleep 0.5
+            # Alpha and the DHCP server of its hub, started again where a test takes alpha off:
+            # the server ends when the hub's connection to it does, so it goes with alpha.
+            start_alpha() {
+                python3 "$root/ci/dhcpd.py" "$((port + 9))" 52:54:00:00:09:01=10.9.0.1 "$mac=10.9.0.2" &
+                dhcp=$!
+                vms="$vms $dhcp"
+                sleep 0.5
+                # shellcheck disable=SC2046
+                vm alpha $(drive alpha.disk) \
+                    -netdev "socket,id=d,connect=127.0.0.1:$((port + 9))" -netdev hubport,id=h0,hubid=0,netdev=d \
+                    -netdev "socket,id=s,listen=127.0.0.1:$((port + 8))" -netdev hubport,id=h1,hubid=0,netdev=s \
+                    -netdev hubport,id=h2,hubid=0 -device virtio-net-pci,netdev=h2,mac=52:54:00:00:09:01 \
+                    -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 1))-10.0.2.15:7443" -device virtio-net-pci,netdev=u \
+                    -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.9.0.1:7443 --claim'
+                alpha=$vm
+            }
             cp "$out/kith-os.raw" "$work/alpha.disk"
-            # shellcheck disable=SC2046
-            vm alpha $(drive alpha.disk) \
-                -netdev "socket,id=d,connect=127.0.0.1:$((port + 9))" -netdev hubport,id=h0,hubid=0,netdev=d \
-                -netdev "socket,id=s,listen=127.0.0.1:$((port + 8))" -netdev hubport,id=h1,hubid=0,netdev=s \
-                -netdev hubport,id=h2,hubid=0 -device virtio-net-pci,netdev=h2,mac=52:54:00:00:09:01 \
-                -netdev "user,id=u,restrict=on,hostfwd=tcp:127.0.0.1:$((port + 1))-10.0.2.15:7443" -device virtio-net-pci,netdev=u \
-                -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.hostname=alpha -- --listen 0.0.0.0:7443 --advertise 10.9.0.1:7443 --claim'
+            start_alpha
             hears alpha 'kithd: node alpha serving other nodes on 0.0.0.0:7443'
             hears alpha 'sends this token to /v1/claim does: kith1.'
             token=$(grep -ao 'sends this token to /v1/claim does: kith1\.[0-9a-f.]*' "$work/alpha.log")
@@ -423,6 +430,67 @@ with open(sys.argv[1], "r+b") as disk:
                 done
                 echo "vm.sh: the machine gave its key again after $tries tries of 0.2 s"
                 ! grep -aqF 'has locked this node' "$work/beta3.log" || fail "the unlocked machine restarted as if locked"
+                # An update given to a node whose key holder is off: it is written to slot b and started
+                # there with no key, so slot b stays on trial (not marked good), and after three starts
+                # without its key the boot loader is back on slot a. Read from beta's ESP, where the counter is.
+                command -v mdir >/dev/null 2>&1 || mdir() { nix shell nixpkgs#mtools -c mdir "$@"; }
+                espat() { # NAME: where the partition NAME of beta's disk starts
+                    python3 -c '
+import struct, sys
+disk = open(sys.argv[1], "rb")
+disk.seek(512 + 72)
+entries = struct.unpack("<Q", disk.read(8))[0] * 512
+for index in range(128):
+    disk.seek(entries + index * 128)
+    entry = disk.read(128)
+    if entry[56:].decode("utf-16-le").rstrip("\0") == sys.argv[2]:
+        print(struct.unpack("<Q", entry[32:40])[0] * 512, end="")
+        sys.exit(0)
+sys.exit(1)' "$work/beta.disk" "$1"
+                }
+                ondisk() { # SLOT TRIES: beta's ESP holds SLOT's boot file with TRIES tries left (kith-N-SLOT+TRIES.efi, or +TRIES-DONE once tried), and no other for SLOT
+                    names=$(mdir -b -i "$work/beta.disk@@$(espat esp)" ::EFI/Linux) || fail "beta's ESP could not be read"
+                    [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1\+$2(-[0-9]+)?\.efi$")" = 1 ] || fail "beta's ESP does not have slot $1 with $2 tries left: $names"
+                }
+                kill "$vm"
+                wait "$vm" 2>/dev/null || true
+                kill "$alpha"
+                wait "$alpha" 2>/dev/null || true
+                wait "$dhcp" 2>/dev/null || true
+                KITH_OS_VERSION=0.0.0-test sh "$root/os/build.sh" --out "$work/next" >&2
+                cp "$work/next/kith-os.update" "$work/good.update"
+                truncate -s %1M "$work/good.update"
+                vm slotb -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
+                    -drive "file=$work/good.update,format=raw,if=virtio,readonly=on" \
+                    -netdev user,id=out -device virtio-net-pci,netdev=out \
+                    -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.update=vdb'
+                hears slotb 'kithd: init: kith OS 0.0.0-test from vdb is in the other slot'
+                wait "$vm" || fail "the update was not written to slot b while the key holder was off"
+                ondisk b 3
+                # Started from its disk with no way to alpha: each start waits for its key, and is still on
+                # trial 15 s on, one try fewer each time; the third leaves none, so the next start is slot a.
+                trial() { # LOG TRIES: a start of beta's disk with no card that reaches alpha
+                    vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
+                        -netdev user,id=out -device virtio-net-pci,netdev=out
+                    hears "$1" 'asking the cluster for its key'
+                    hears "$1" 'still locked: 10.9.0.1:7443 cannot be reached'
+                    sleep 15
+                    ! grep -aqF 'slot b is good' "$work/$1.log" || fail "slot b was marked good without its key ($1)"
+                    ondisk b "$2"
+                    kill "$vm"
+                    wait "$vm" 2>/dev/null || true
+                }
+                trial trial1 2
+                trial trial2 1
+                trial trial3 0
+                # Alpha back, its DHCP server with it: the fourth start is slot a, which opens its state.
+                start_alpha
+                hears alpha 'kithd: node alpha serving other nodes on 0.0.0.0:7443'
+                beta slota ''
+                up slota
+                grep -aq 'Kernel command line:.*kith.slot=a' "$work/slota.log" || fail "the node did not start slot a after three tries on slot b"
+                hears slota 'slot b did not come up in 3 tries: this is slot a'
+                ondisk b 0
                 # A passphrase, given through the other node (which keeps none of it): too short
                 # a one is refused; taken away, the disk has no line of it; given again, it has.
                 pass() { api POST /v1/lock/kith-000902/passphrase -H 'Content-Type: application/json' -d "$1"; }
@@ -443,7 +511,7 @@ with open(sys.argv[1], "r+b") as disk:
                 pass '{"passphrase":"correct horse battery"}' | grep -q '"passphrase": *true' || fail "the machine was given no passphrase a second time"
                 passes 1
                 ! api GET /v1/resources | grep -qF 'correct horse' || fail "the passphrase is in the store"
-                ! grep -aqF 'correct horse' "$work/alpha.log" "$work/beta3.log" || fail "a node said the passphrase"
+                ! grep -aqF 'correct horse' "$work/alpha.log" "$work/beta3.log" "$work/slota.log" || fail "a node said the passphrase"
                 kill "$vm"
                 wait "$vm" 2>/dev/null || true
                 [ "$(says "$work/beta.disk")" = 'sealed held passphrase' ] || fail "the disk of the machine with a passphrase, read from outside: $(says "$work/beta.disk")"
@@ -490,7 +558,7 @@ with open(sys.argv[1], "r+b") as disk:
                 lock unlock | grep -qF 'was wiped' || fail "a wiped machine could be unlocked"
                 beta beta5 ''
                 hears beta5 "kithd: init: this node's lock record was erased"
-                echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; given a passphrase (through the node, which kept none of it) and started without its card, it opened its state once the passphrase was typed at it, and not for another; locked again, it dropped the passphrase, and the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody"
+                echo "vm.sh: ok: a machine installed with its state encrypted joined, and the node took its key to hold: the disk read from outside shows no file system and no key; started again it asked the node for its key; locked, it restarted and waited until unlocked; given a passphrase (through the node, which kept none of it) and started without its card, it opened its state once the passphrase was typed at it, and not for another; locked again, it dropped the passphrase, and the recovery key typed at it opened it; wiped, it erased its record and its disk opens for nobody; given an update while its key holder was off, it wrote it to slot b and tried slot b three times without its key, none of them marked good, and once its key holder was back it opened on slot a: slot b did not come up in 3 tries"
                 exit 0
             fi
             echo "vm.sh: ok: a node told to install the machine with card $mac answered its network boot (beside the network's own DHCP server), served it the installer once over TFTP; the machine installed on its only disk, started from it and joined the node's cluster; netboot off again"
