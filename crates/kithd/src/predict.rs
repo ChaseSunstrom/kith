@@ -5,7 +5,8 @@
 //! crypto-agile one the kernel gives (SHA-256 digests); it is replayed, and only where the
 //! replay is what TPM2_PCR_Read gave is anything predicted. The event that holds the
 //! running boot file's PE Authenticode hash is then made again from the new file.
-//! (PCR 9's command line, `tpm-next:` and the update's hook are later slices.)
+//! PCR 9 is one extend of the command line, and `predict_pcrs` gives both values.
+//! (`tpm-next:` and the update's hook are later slices.)
 
 // Nothing calls these until the update's hook does (the next slice of step 4).
 #![allow(dead_code)]
@@ -196,6 +197,31 @@ pub fn predict_pcr4(log: &[u8], read: &Hash, running: &[u8], new: &[u8]) -> Resu
         _ => return Err(NO_BOOT_FILE.into()),
     }
     Ok(replay(&events)?[4])
+}
+
+/// The PCR 9 a start will read when the boot file's command line is `cmdline` and nothing
+/// else is measured into it: one extend, of the SHA-256 of the line as UTF-16 little-endian
+/// with its ending zero (the way the EFI stub measures what it was started with).
+/// ponytail: only that form; the ADR's UTF-8 and no-zero forms (matched against the
+/// running log) come with the hook that has the running log's PCR 9 event to match.
+pub fn pcr9(cmdline: &str) -> Result<Hash, String> {
+    if cmdline.contains('\0') {
+        return Err("a command line with a zero in it".into());
+    }
+    let wide: Vec<u8> = cmdline.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    Ok(extend(&[0; 32], &Sha256::digest(wide).into()))
+}
+
+/// The PCR 4 and PCR 9 a new slot will measure: `new` the boot file it will start and
+/// `cmdline` its command line. PCR 4 is `predict_pcr4`'s, so is refused when it is.
+pub fn predict_pcrs(
+    log: &[u8],
+    read4: &Hash,
+    running: &[u8],
+    new: &[u8],
+    cmdline: &str,
+) -> Result<(Hash, Hash), String> {
+    Ok((predict_pcr4(log, read4, running, new)?, pcr9(cmdline)?))
 }
 
 #[cfg(test)]
@@ -411,5 +437,40 @@ mod tests {
         );
         // a new file that is not a PE
         assert!(predict_pcr4(&bytes, &read, &running, b"not a PE").is_err());
+    }
+
+    #[test]
+    fn tpm_predict_pcrs() {
+        // "ab" as UTF-16LE with its ending zero, written out by hand
+        let wide: &[u8] = &[0x61, 0, 0x62, 0, 0, 0];
+        let want: Hash = Sha256::digest([&[0u8; 32][..], &Sha256::digest(wide)[..]].concat()).into();
+        assert_eq!(pcr9("ab"), Ok(want));
+        // the empty line is still measured (its zero), a changed one is another value
+        assert_ne!(pcr9(""), Ok([0; 32]));
+        assert_ne!(pcr9("ab"), pcr9("ab "));
+        assert_ne!(pcr9("ab"), pcr9("ba"));
+        // a non-ASCII char is two UTF-16 units past the BMP
+        assert_ne!(pcr9("é"), pcr9("e"));
+        assert!(pcr9("a\0b").is_err());
+
+        let (running, _) = pe(1, &[]);
+        let (mut new, _) = pe(1, &[]);
+        new[0x210] ^= 0xFF;
+        let (r, n) = (authenticode(&running).unwrap(), authenticode(&new).unwrap());
+        let fw = sha("firmware");
+        let bytes = log(&[(4, 0x8000_0003, fw), (4, 0x8000_0003, r)]);
+        let read = chain(&[fw, r]);
+        let both = predict_pcrs(&bytes, &read, &running, &new, "root=/dev/vda quiet").unwrap();
+        assert_eq!(both, (chain(&[fw, n]), pcr9("root=/dev/vda quiet").unwrap()));
+        // a changed command line changes PCR 9 and not PCR 4
+        let other = predict_pcrs(&bytes, &read, &running, &new, "root=/dev/vda debug").unwrap();
+        assert_eq!(other.0, both.0);
+        assert_ne!(other.1, both.1);
+        // a log that does not explain this start, or a bad line, predicts neither
+        assert_eq!(
+            predict_pcrs(&bytes, &chain(&[fw]), &running, &new, "x"),
+            Err(UNEXPLAINED.into())
+        );
+        assert!(predict_pcrs(&bytes, &read, &running, &new, "a\0b").is_err());
     }
 }
