@@ -410,8 +410,8 @@ pub const FIELDS: &[(&str, Field, &str)] = &[
     ("Service.spec.ports[].nodePort", Hint, "30080"),
     ("Service.spec.ports[].appProtocol", Hint, r#""http""#),
     ("Service.spec.type", Hint, r#""LoadBalancer""#),
-    ("Service.spec.clusterIP", Hint, r#""None""#),
-    ("Service.spec.clusterIPs", Hint, r#"["None"]"#),
+    ("Service.spec.clusterIP", Carried, r#""None""#),
+    ("Service.spec.clusterIPs", Carried, r#"["None"]"#),
     ("Service.spec.ipFamilies", Hint, r#"["IPv4"]"#),
     ("Service.spec.ipFamilyPolicy", Hint, r#""SingleStack""#),
     ("Service.spec.sessionAffinity", Hint, r#""ClientIP""#),
@@ -1514,6 +1514,21 @@ fn service(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
     }
     drop_default(&mut spec, "type", json!("ClusterIP"));
     drop_default(&mut spec, "sessionAffinity", json!("None"));
+    // A headless Service says so with `clusterIP: None`: kith's is the name that answers its
+    // ready replicas. Any other address of its own is kith's to give, so it is said.
+    let mut headless = false;
+    if let Some(ip) = cx.text(&mut spec, "clusterIP", "spec") {
+        match ip.as_str() {
+            "None" => headless = true,
+            _ => cx.note("spec.clusterIP", "is an address kith gives: not translated"),
+        }
+    }
+    let ips = cx.strs(&mut spec, "clusterIPs", "spec");
+    match ips.as_slice() {
+        [] => {}
+        [one] if one == "None" => headless = true,
+        _ => cx.note("spec.clusterIPs", "is an address kith gives: not translated"),
+    }
     cx.rest(spec, "spec");
     if selector.is_empty() {
         cx.note(
@@ -1525,7 +1540,11 @@ fn service(cx: &mut Cx, root: &mut Map, meta: Metadata, out: Out) {
     out.push(make(
         "Service",
         meta,
-        obj([("selector", Some(json!(selector))), ("ports", Some(json!(ports)))]),
+        obj([
+            ("selector", Some(json!(selector))),
+            ("ports", Some(json!(ports))),
+            ("headless", headless.then_some(json!(true))),
+        ]),
     ));
 }
 
@@ -2148,7 +2167,8 @@ spec:
     #[test]
     fn import_the_ten_kinds_translate_and_validate() {
         let (all, report) = run(TEN);
-        // kith has no headless Service name to carry; it is the one thing left out.
+        // A headless Service is carried (its name answers the ready replicas); serviceName is
+        // the one thing left out: kith names each replica under every Service selecting it.
         assert_eq!(
             report,
             ["StatefulSet/db: spec.serviceName is taken and changes nothing: kith has no use for it"]
@@ -2310,6 +2330,38 @@ spec:
                 Refused => assert!(!refused.is_empty(), "{row}: {hints:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_headless_service_is_carried_and_an_address_of_its_own_is_said() {
+        let (all, report) = run(r#"
+apiVersion: v1
+kind: Service
+metadata: { name: web, namespace: default }
+spec: { clusterIP: None, selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: api, namespace: default }
+spec: { clusterIPs: [None], selector: { app: web }, ports: [{ port: 80 }] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: db, namespace: default }
+spec: { clusterIP: 10.96.0.9, selector: { app: db }, ports: [{ port: 80 }] }
+"#);
+        assert_eq!(find(&all, "Service", "web").spec["headless"], true);
+        assert_eq!(find(&all, "Service", "api").spec["headless"], true);
+        let db = find(&all, "Service", "db");
+        assert!(db.spec.get("headless").is_none(), "{:?}", db.spec);
+        assert!(
+            report.iter().any(|line| line.starts_with("Service/db: spec.clusterIP")),
+            "{report:?}"
+        );
+        assert!(
+            !report.iter().any(|line| line.contains("web") || line.contains("api")),
+            "{report:?}"
+        );
     }
 
     #[test]

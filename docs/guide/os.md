@@ -82,12 +82,40 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
+the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
+`kith node features` prints them as a spec, which builds that node's image:
+
+```sh
+kith node features n1 > n1.yaml
+sh os/build.sh --spec n1.yaml --out target/os-n1
+```
+
+A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
+`wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
+card the catalogue does not list yet) is chosen by hand, as above.
+
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
 those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
 set it from the GPU it finds yet; see [Rolling a release through the
 cluster](#rolling-a-release-through-the-cluster)). A plain release given to a GPU node takes its
 driver away until the next GPU one.
+
+#### A card put in later, or swapped
+
+The plain image has no `/lib/modules`, and kithd then loads nothing. An image that has one
+(a spec's kernel built with loadable modules, `modules.alias` and `modules.dep` from
+`depmod` beside them) gets its drivers from kithd, the way udev does: before it names the node and brings the
+network up (the network card's driver may be one), kithd matches the `modalias` of every
+device under `/sys/devices` to `modules.alias` and loads what matches, what it needs first
+(`finit_module`), and then, on a thread, does the same for each kernel uevent that adds a
+device. A card swapped for another of a kind
+the image has a driver for needs no restart. Modules in `modules.builtin` or already in
+`/proc/modules` are not loaded; each is tried once, and a failure (a bad signature, a
+missing file) is one console line, never an end. Not supported: module parameters,
+`modprobe.d` (blacklists, options), soft dependencies. Compressed modules (`.ko.xz`,
+`.zst`) are loaded by the kernel itself, from 5.17, if it was built to.
 
 ### Updating a node: two slots
 
@@ -324,6 +352,15 @@ another size, or a disk named by serial that now gives another, writes nothing; 
 name not typed twice the same. It then copies kith OS to
 the disk, reads it back to check, and powers off: take the stick out and start it.
 
+On a screen with 32 bits a pixel (the console's framebuffer), each question is also drawn in the
+look of the [installer's page](../install.html): the install's steps as stops on a rail, the one
+being asked in blue, on paper. The answers are still typed, one line each, as above, and the text
+stays on the serial line. An encrypted install's recovery key is shown on the screen too. When the
+answers were typed, that screen holds until a key is pressed, or for five minutes, then clears; an
+install that was given its answers (from a file, a URL, or the network) does not stop for it. The
+picture is cleared from the text console when the installer hands the screen back. The key is
+written to the serial line as before, and to no log or kernel ring.
+
 Without anyone there, put the answers on the stick as `kith-install.yaml` on its first partition
 (FAT), or at a URL on the kernel command line (`kith.install=https://10.0.0.2/alpha.yaml`; a
 hypervisor gives it as the SMBIOS string `io.systemd.stub.kernel-cmdline-extra=`). Over plain
@@ -349,7 +386,9 @@ nodePolicy: hardened          # what the cluster may not have this node do: see 
 
 Then nothing is asked or confirmed: a stick with answers erases the disk they name in whatever
 machine it starts. A disk that is not there, `only` on a machine with several, or an unknown
-field stops it with the reason on the console and nothing written.
+field stops it with the reason on the console and nothing written. [The installer's
+page](../install.html) is a form that writes this file in your browser, and checks each answer as
+you type.
 
 A kernel's name for a disk (`sda`, `nvme0n1`) can change with the order the disks are found
 in; its serial does not. `serial:` names the disk by what the disk itself reports (NVMe,

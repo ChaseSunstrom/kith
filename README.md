@@ -106,7 +106,9 @@ is still there when it starts again.
 | Turn manifests or a chart into kith's own files | [Importing from Kubernetes and Helm](docs/guide/kubernetes.md#importing-from-kubernetes-and-helm) |
 | Add a kind of your own, with its controller | [Kinds of your own](docs/guide/api.md#kinds-of-your-own) |
 | Let other people and programs in, each with their own rights | [Who may do what](docs/guide/access.md#who-may-do-what) |
+| Run `kith` on a laptop, over TLS to a node | [Use kith from a laptop](docs/guide/access.md#use-kith-from-a-laptop) |
 | Hand out GPUs and seats, run virtual machines | [Hardware](docs/guide/hardware.md#hardware) |
+| Run a Flatpak app in a seat's window | [Running a Flatpak app in a session](docs/guide/hardware.md#running-a-flatpak-app-in-a-session) |
 | Keep data: volumes, shares, replicas, backups | [Storage](docs/guide/storage.md#storage) |
 | Copy files into a volume or out of it, or move a guest's data in | [Files in and out of a volume](docs/guide/storage.md#files-in-and-out-of-a-volume) |
 | See it and change it in a browser | [Web UI](docs/guide/ui.md#web-ui) |

@@ -32,7 +32,7 @@
         "kind",
         "metadata"
       ],
-      "description": "Cluster-wide settings: the keys that sign images (the other fields are kept and not acted on)",
+      "description": "Cluster-wide settings: the keys that sign images, the admin's key and whether callers must sign (the other fields are kept and not acted on)",
       "title": "Cluster",
       "$schema": "https://json-schema.org/draft/2020-12/schema"
     },
@@ -1614,6 +1614,24 @@
             "$ref": "#/$defs/ImageRule"
           },
           "description": "Whose signatures images are taken by: an image under a rule's `prefix` is run only\nif one of the rule's keys signed it, whatever its template says. The rule with the\nlongest prefix an image is under is the one it is held to."
+        },
+        "adminKey": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The admin's Ed25519 public key, as 64 hex: a request it signed (`x-kith-signed`) is\nthe admin's, on whichever node it lands. Changed only by a write it signed."
+        },
+        "signing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Signing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether a caller one node passes on to another, and a write at a node's local\nsocket, must be signed: `open` (left out: unsigned is taken, as before) or\n`required` (unsigned at the local socket is the node itself, which reads). Changed\nonly by a write the admin signed."
         }
       }
     },
@@ -3706,6 +3724,13 @@
               "type": "null"
             }
           ]
+        },
+        "headless": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "No address of its own: its name (`<service>.<namespace>.kith`, and under\n`svc.cluster.local`) answers the addresses of its ready replicas, as a headless\nKubernetes Service does. Off unless true."
         }
       },
       "required": [
@@ -3796,6 +3821,13 @@
         }
       ],
       "description": "One an image may be signed by: a public key's text, or an identity that signed without a\nkept key (cosign's default). docs/adr-keyless.md says what is checked."
+    },
+    "Signing": {
+      "type": "string",
+      "enum": [
+        "open",
+        "required"
+      ]
     },
     "SourceSpec": {
       "type": "object",

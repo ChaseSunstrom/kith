@@ -7,8 +7,8 @@
 //! it must be installed on both ends.
 
 use super::{Kithd, fail};
+use crate::wire::Wire;
 use std::io::{Read, Write};
-use std::net::Shutdown;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -50,14 +50,21 @@ impl Drop for Client {
 }
 
 /// Asks kithd for the tunnel: the connection, once kithd has answered `101`.
-fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<UnixStream, String> {
-    let socket = &kithd.socket;
-    let mut stream = UnixStream::connect(socket)
-        .or_else(|e| fail(format!("cannot reach kithd at {}: {e}\nStart kithd.", socket.display())))?;
-    let _ = stream.set_read_timeout(Some(kithd.timeout));
+fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<Wire, String> {
+    // (Before the connection: a signed request first asks kithd for its cluster's id.)
     let body = body.to_string();
+    let signed = match super::signed(kithd, "POST", "/v1/run", body.as_bytes())? {
+        Some(header) => format!("{}: {header}\r\n", super::signing::SIGNED),
+        None => String::new(),
+    };
+    let mut stream = Wire::connect(&kithd.route, Some(kithd.timeout)).or_else(|e| {
+        fail(format!(
+            "cannot reach kithd at {}: {e}\nStart kithd.",
+            kithd.route.name()
+        ))
+    })?;
     let head = format!(
-        "POST /v1/run HTTP/1.1\r\nHost: kithd\r\nConnection: Upgrade\r\nUpgrade: kith-run\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        "POST /v1/run HTTP/1.1\r\nHost: kithd\r\nConnection: Upgrade\r\nUpgrade: kith-run\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{signed}\r\n",
         body.len()
     );
     let sent = stream
@@ -78,7 +85,7 @@ fn open(kithd: &Kithd, body: &serde_json::Value) -> Result<UnixStream, String> {
     }
     let head = String::from_utf8_lossy(&reply).into_owned();
     if head.split(' ').nth(1) == Some("101") {
-        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_patience(None);
         return Ok(stream);
     }
     // An API error is `{"error": "..."}` with its length given.
@@ -157,26 +164,20 @@ pub fn run(kithd: &Kithd, on: &str, via: Option<&str>, argv: &[String]) -> Resul
     }
     let body = serde_json::json!({ "on": on, "via": via, "argv": argv });
     let tunnel = open(kithd, &body)?;
+    let local = Wire::Socket(local);
     // Either end done ends both. (The app's own exit status does not come back.)
-    let ends = |a: &UnixStream, b: &UnixStream| drop((a.shutdown(Shutdown::Both), b.shutdown(Shutdown::Both)));
-    let (mut tunnel_in, mut local_out) = (
-        tunnel.try_clone().map_err(|e| e.to_string())?,
-        local.try_clone().map_err(|e| e.to_string())?,
-    );
-    let (mut local_in, mut tunnel_out) = (
-        local.try_clone().map_err(|e| e.to_string())?,
-        tunnel.try_clone().map_err(|e| e.to_string())?,
-    );
-    let (a, b) = (
-        local.try_clone().map_err(|e| e.to_string())?,
-        tunnel.try_clone().map_err(|e| e.to_string())?,
-    );
+    let dup = |wire: &Wire| wire.dup().map_err(|e| e.to_string());
+    let (mut tunnel_in, mut local_out) = (dup(&tunnel)?, dup(&local)?);
+    let (mut local_in, mut tunnel_out) = (dup(&local)?, dup(&tunnel)?);
+    let (a, b) = (dup(&local)?, dup(&tunnel)?);
     let up = std::thread::spawn(move || {
         drop(std::io::copy(&mut local_in, &mut tunnel_out));
-        ends(&a, &b);
+        a.end();
+        b.end();
     });
     drop(std::io::copy(&mut tunnel_in, &mut local_out));
-    ends(&local, &tunnel);
+    local.end();
+    tunnel.end();
     drop(up.join());
     drop(client);
     drop(dir);
@@ -256,18 +257,31 @@ c.sendall(tag + c.makefile("rb").readline().upper())
         drop(std::fs::remove_file(&path));
         let listener = UnixListener::bind(&path).unwrap();
         let kithd = Kithd {
-            socket: path,
+            route: crate::wire::Route::Socket(path),
             timeout: Duration::from_secs(10),
         };
         let served = std::thread::spawn(move || {
+            let read_head = |conn: &mut UnixStream| {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0u8];
+                    conn.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                String::from_utf8(head).unwrap()
+            };
             let (mut conn, _) = listener.accept().unwrap();
-            let mut head = Vec::new();
-            while !head.ends_with(b"\r\n\r\n") {
-                let mut byte = [0u8];
-                conn.read_exact(&mut byte).unwrap();
-                head.push(byte[0]);
+            let mut head = read_head(&mut conn);
+            if head.starts_with("GET /v1/cluster ") {
+                // Asked first, to see whether the request is signed: this cluster is open.
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\n{\"signing\":\"open\"}",
+                )
+                .unwrap();
+                drop(conn);
+                conn = listener.accept().unwrap().0;
+                head = read_head(&mut conn);
             }
-            let head = String::from_utf8(head).unwrap();
             let length = head
                 .to_ascii_lowercase()
                 .split("content-length: ")
@@ -325,7 +339,7 @@ c.sendall(tag + c.makefile("rb").readline().upper())
     #[test]
     fn run_on_names_the_program_it_cannot_find_before_asking_kithd() {
         let kithd = Kithd {
-            socket: "/nonexistent/kithd.sock".into(),
+            route: crate::wire::Route::Socket("/nonexistent/kithd.sock".into()),
             timeout: Duration::from_secs(1),
         };
         let said = run(&kithd, "b", Some("/nonexistent/waypipe"), &["true".to_string()]).unwrap_err();

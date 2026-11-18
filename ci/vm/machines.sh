@@ -39,7 +39,7 @@
             timeout "$time" qemu-system-x86_64 -enable-kvm -cpu host -m 512 -smp 2 -display none -no-reboot \
                 -machine q35 -bios "$firmware" "$@" \
                 -chardev "socket,id=tty,path=$work/$name.tty,server=on,wait=off,logfile=$work/$name.log" -serial chardev:tty \
-                -monitor none </dev/null >/dev/null 2>&1 &
+                -monitor "${monitor:-none}" </dev/null >/dev/null 2>&1 &
             vm=$!
             vms="$vms $vm"
         }
@@ -154,12 +154,37 @@
         # twice, so nothing is written), then a node that joins alpha's cluster by token.
         stick gamma
         blank gamma
+        # (A monitor socket, for the screendump below; the other machines have none.)
+        monitor=unix:$work/install-gamma.mon,server=on,wait=off
         # shellcheck disable=SC2046
         vm install-gamma $(drive gamma.stick) $(drive gamma.disk)
+        monitor=
         typed() { # WAIT-FOR LINE
             hears install-gamma "$1"
             printf '%s\n' "$2" | socat - "unix-connect:$work/install-gamma.tty" >/dev/null
         }
+        # The picture while the disk question is asked: the console's framebuffer (kithd draws
+        # the question on it) is mostly paper, with the accent on the current stop. Retried, as
+        # the picture is drawn just after the question's text is on the serial console.
+        hears install-gamma 'Install kith OS on which'
+        tries=0
+        until printf 'screendump %s\n' "$work/install-gamma.ppm" | socat -t 2 - "unix-connect:$work/install-gamma.mon" >/dev/null 2>&1 \
+            && python3 -c '
+import collections, sys
+data = open(sys.argv[1], "rb").read()
+header = data.split(b"\n", 3)
+if header[0] != b"P6":
+    sys.exit(1)
+pixels = header[3]
+colours = collections.Counter(pixels[i:i + 3] for i in range(0, len(pixels), 3))
+paper, accent = bytes((246, 245, 241)), bytes((47, 95, 224))
+if colours.most_common(1)[0][0] != paper or colours[accent] < 100:
+    sys.exit(1)
+' "$work/install-gamma.ppm" 2>/dev/null; do
+            tries=$((tries + 1))
+            [ "$tries" -lt 50 ] || fail "the install's question is not on the screen as drawn"
+            sleep 0.2
+        done
         typed 'Install kith OS on which' vdb
         typed "The node's name" gamma
         typed 'Its address, as' ''

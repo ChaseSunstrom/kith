@@ -448,13 +448,17 @@ fn made_at(resource: &Resource) -> u64 {
     made.and_then(|made| made.parse().ok()).unwrap_or(0)
 }
 
-/// The time (as [`rfc3339`] writes it) of the oldest revision the store kept of `resource`:
-/// when a thing that no client made here (a namespace, a node) was first seen. That is not
-/// always when it was made: a worker that runs from a view has only the revisions the view
-/// carried, and a history that was trimmed starts later.
+/// The time (as [`rfc3339`] writes it) when the store first made `resource` (a namespace, a
+/// node: nothing a client made here says it): [`Store::born`] once the store is marked, which
+/// a trim of the history does not move. Before a mark (a worker's view, a store from before)
+/// it is the oldest revision kept, so it can be later than when the thing was made.
 fn oldest(store: &Store, resource: &Resource) -> String {
-    let first = store.history(&resource.key()).ok().and_then(|history| history.first());
-    rfc3339(first.map_or(0, |first| first.at))
+    let key = resource.key();
+    let at = store
+        .born(&key)
+        .map(|(_, at)| at)
+        .or_else(|| store.history(&key).ok()?.first().map(|first| first.at));
+    rfc3339(at.unwrap_or(0))
 }
 
 /// Sets what is at `path` (`/a/b`) of `at`, making the mappings on the way; nothing where
@@ -557,9 +561,13 @@ fn served(resource: &Resource) -> Option<(&'static Kind, Value)> {
     let said = |field: &str| live.and_then(|live| live[field].as_str());
     match kind.kind {
         // Its address on the mesh; with none it is found by its name alone, which is what
-        // Kubernetes calls a Service with `None` here. (Helm waits for this field to say something.)
+        // Kubernetes calls a Service with `None` here. A headless one has no address, whatever
+        // it had before it was made so. (Helm waits for this field to say something.)
         "Service" if object.pointer("/spec/clusterIP").is_none() => {
-            let address = said("address").unwrap_or("None");
+            let address = match crate::services::headless(resource) {
+                true => "None",
+                false => said("address").unwrap_or("None"),
+            };
             set(&mut object, "/spec/clusterIP", address.into());
             set(&mut object, "/spec/clusterIPs", json!([address]));
         }
@@ -2589,7 +2597,7 @@ impl Watch {
         match (&self.call.caller, &self.call.certificate) {
             (Caller::Identity(_) | Caller::Node(_), Some(shown)) => shown.stands(&self.call.shared),
             (Caller::Identity(_), None) => false,
-            (Caller::Admin, _) => true,
+            (Caller::Admin | Caller::Console(_), _) => true,
             // (A node shows its certificate, and nothing is passed on to a watch.)
             (Caller::Node(_), None) | (Caller::Via(..) | Caller::Checked(..), _) => false,
         }
@@ -2753,6 +2761,38 @@ mod tests {
             assert!(no.why.contains("status is kithd's own"), "{method}: {}", no.why);
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A headless Service has no address, whatever a status kept from before it was made
+    /// headless says: it reads `None`, as Kubernetes reads a headless Service. One that is
+    /// not headless reads the address kithd gave it.
+    #[test]
+    fn a_headless_service_reads_none_whatever_its_stale_address() {
+        let service = |headless: &str| {
+            let sent = json!({
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": { "name": "web", "namespace": "default" },
+                "spec": { "selector": { "app": "web" }, "ports": [{ "port": 80 }] },
+            });
+            let sent = serde_json::to_string(&sent.to_string()).unwrap();
+            let source = format!(
+                "apiVersion: kith.dev/v1\nkind: Service\n\
+                 metadata: {{name: web, namespace: default, annotations: {{{SENT}: {sent}}}}}\n\
+                 spec: {{{headless} selector: {{app: web}}, ports: [{{port: 80}}]}}\n"
+            );
+            let mut resource = kith_api::Resource::from_source(&source)
+                .unwrap()
+                .pop()
+                .unwrap()
+                .unwrap();
+            resource.status = Some(json!({"address": "fd00::7"}));
+            served(&resource).unwrap().1
+        };
+        let headless = service("headless: true,");
+        assert_eq!(headless.pointer("/spec/clusterIP"), Some(&json!("None")));
+        assert_eq!(headless.pointer("/spec/clusterIPs"), Some(&json!(["None"])));
+        let mesh = service("");
+        assert_eq!(mesh.pointer("/spec/clusterIP"), Some(&json!("fd00::7")));
     }
 
     /// Who may write a kind and not read it is not answered with what is there by a
@@ -3214,6 +3254,47 @@ spec: {role: writer, subjects: [carol]}
             assert!(
                 cells[0].1.as_str().is_some_and(|age| age.ends_with('d')),
                 "{of}: {cells:?}"
+            );
+        }
+    }
+
+    /// Once the store is marked, a Node's and a Namespace's creationTimestamp is when the store
+    /// first made it, and it holds when a long edit history trims the revisions kept.
+    #[test]
+    fn the_made_time_holds_past_a_trimmed_history() {
+        let held = |kind: &str, name: &str, n: usize| -> Resource {
+            let mut held: Resource = serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": kind,
+                "metadata": { "name": name }, "spec": {},
+            }))
+            .unwrap();
+            held.metadata.labels.insert("n".into(), n.to_string());
+            if kind == "Node" {
+                held.status = Some(json!({ "address": "10.0.0.2:7000", "state": "reachable" }));
+            }
+            held
+        };
+        let mut store = Store::default();
+        store.at(Some(1_700_000_000));
+        store.apply(held("Namespace", "shop", 0)).unwrap();
+        store.apply(held("Node", "n2", 0)).unwrap();
+        store.mark();
+        store.at(Some(1_700_000_500));
+        let limit = kith_api::store::HISTORY_LIMIT;
+        for n in 1..limit + 50 {
+            store.apply(held("Namespace", "shop", n)).unwrap();
+            store.apply(held("Node", "n2", n)).unwrap();
+        }
+        assert_eq!(store.history("Node/n2").unwrap().len(), limit);
+        let grants = Grants::of(&Caller::Admin, &store);
+        let kind = |of: &str| KINDS.iter().find(|kind| kind.kind == of).unwrap();
+        for (of, name) in [("Namespace", "shop"), ("Node", "n2")] {
+            let found = objects(&store, kind(of), None, Some(name), &grants, &Verb::Get);
+            assert_eq!(found.len(), 1, "{of}");
+            assert_eq!(
+                found[0]["metadata"]["creationTimestamp"],
+                rfc3339(1_700_000_000),
+                "{of}: {found:?}"
             );
         }
     }

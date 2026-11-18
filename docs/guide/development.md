@@ -21,7 +21,7 @@
 | `sdk/kith-controller` | The SDK for controllers and admission hooks in WebAssembly, with an example (its own workspace: it builds for wasm32) |
 | `os/` | kith OS: what builds its image (`build.sh`), an update (`update.sh`) and the installer for a rented machine (`vps.sh`), and the kernel's configuration |
 | `packages/` | Packages that come with kith: `web`, `nas`, `kith-build`, `kith-panel`, and the desktops (`gnome`, `hyprland`, `kiosk`) |
-| `examples/` | Resources to apply as they are |
+| `examples/` | Resources to apply as they are; `examples/session/` is a set of files (a Containerfile, a script, a manifest), and `-f examples/` does not read it |
 | `ci/` | The budgets, the benchmark, the VM tests (`vm.sh`), and what measures and photographs the website (`site_numbers.py`, `site_shots.py`) |
 | `dist/` | A systemd user unit for agent mode |
 | `docs/` | The website (GitHub Pages serves this folder), the pictures the README shows, and `adr-workers.md`, the design for worker nodes that is not built yet |

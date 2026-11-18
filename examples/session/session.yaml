@@ -1,0 +1,58 @@
+# A seat's session and a Flatpak client in its window: docs/guide/hardware.md, "Running a Flatpak app".
+apiVersion: kith.dev/v1
+kind: Namespace
+metadata: { name: desktop }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: app-home, namespace: desktop }
+spec: { node: desk, path: /var/lib/kith/app-home, size: 20Gi }
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: desk-seat, namespace: desktop }
+spec: { seat: desk-seat0, access: exclusive }
+---
+apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: desk-apps, namespace: desktop }
+spec: { seat: desk-seat0, access: client }
+---
+# The holder: it owns the seat, starts the bus and the compositor in the seat's directory.
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: session, namespace: desktop }
+spec:
+  template:
+    containers:
+      - name: session
+        image: registry.example/me/session:1
+        command: [/usr/local/bin/session-start.sh]
+        runAsUser: 1000
+        env:
+          - { name: XDG_RUNTIME_DIR, value: /run/seat }
+          - { name: DBUS_SESSION_BUS_ADDRESS, value: "unix:path=/run/seat/bus" }
+          - { name: HOME, value: /home/app }
+    deviceClaims: [desk-seat]
+---
+# The client: a Flatpak app in the session's window. Same user, its own runtime directory,
+# and its home on a Volume so the app's data outlives the container.
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: flatpak-app, namespace: desktop }
+spec:
+  template:
+    containers:
+      - name: flatpak-app
+        image: registry.example/me/session:1
+        command: ['sh', '-c', 'mkdir -p -m 700 "$XDG_RUNTIME_DIR" && exec flatpak run org.example.App']
+        runAsUser: 1000
+        userNamespaces: true
+        readOnlyRoot: false
+        env:
+          - { name: HOME, value: /home/app }
+          - { name: XDG_RUNTIME_DIR, value: /run/user/1000 }
+          - { name: WAYLAND_DISPLAY, value: /run/seat/wayland-0 }
+          - { name: DBUS_SESSION_BUS_ADDRESS, value: "unix:path=/run/seat/bus" }
+        volumeMounts: [{ volume: app-home, path: /home/app }]
+    deviceClaims: [desk-apps]

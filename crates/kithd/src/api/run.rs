@@ -68,7 +68,7 @@ fn invalid(why: String) -> ApiError {
 
 /// The request's upgrade, and what it asks for. The body is read to its end before anything
 /// is answered, which is what lets the connection be taken over afterwards.
-async fn take(mut request: Request) -> Result<(Spec, OnUpgrade), (StatusCode, String)> {
+async fn take(mut request: Request) -> Result<(Spec, OnUpgrade, axum::body::Bytes), (StatusCode, String)> {
     if request.headers().get(header::UPGRADE).is_none_or(|v| v != PROTOCOL) {
         return Err((StatusCode::BAD_REQUEST, format!("ask with `Upgrade: {PROTOCOL}`")));
     }
@@ -80,7 +80,7 @@ async fn take(mut request: Request) -> Result<(Spec, OnUpgrade), (StatusCode, St
     if spec.argv.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "argv names no program".into()));
     }
-    Ok((spec, upgrade))
+    Ok((spec, upgrade, bytes))
 }
 
 /// The node to run on, and where to reach it (`None`: this one). `on` is a node's name, or
@@ -143,7 +143,7 @@ pub async fn run(
     Extension(caller): Extension<Caller>,
     request: Request,
 ) -> Response {
-    let (spec, upgrade) = match take(request).await {
+    let (spec, upgrade, _) = match take(request).await {
         Ok(taken) => taken,
         Err((status, why)) => return say(status, why),
     };
@@ -189,8 +189,7 @@ async fn forward(
         Ok(client) => client,
         Err(why) => return failed(StatusCode::BAD_GATEWAY, why),
     };
-    let send = client
-        .post(format!("https://{}/v1/run-hop", there.address))
+    let send = crate::access_sign::pass_on(client.post(format!("https://{}/v1/run-hop", there.address)))
         .header(header::CONNECTION, "upgrade")
         .header(header::UPGRADE, PROTOCOL)
         .json(&hop)
@@ -238,7 +237,16 @@ pub async fn hop(
     let Some(Subject::Node(from, ..)) = peer.subject else {
         return say(StatusCode::FORBIDDEN, "this is for the cluster's nodes");
     };
-    let (spec, upgrade) = match take(request).await {
+    let header = request
+        .headers()
+        .get(crate::access_sign::SIGNED)
+        .map(|header| header.to_str().unwrap_or_default().to_string());
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or("/v1/run-hop", |path| path.as_str())
+        .to_string();
+    let (spec, upgrade, body) = match take(request).await {
         Ok(taken) => taken,
         Err((status, why)) => return say(status, why),
     };
@@ -254,6 +262,18 @@ pub async fn hop(
         let why = format!("caller: {:?} is no caller a node passes on", spec.caller);
         return say(StatusCode::BAD_REQUEST, why);
     };
+    // Under `signing: required` the node's word is not enough: the asker's signature is passed
+    // on with it (docs/adr-taken-node.md).
+    let asked = crate::access_sign::Asked {
+        method: "POST",
+        path: &path,
+        body: &body,
+    };
+    if let Err(why) = crate::access_sign::hop(&shared, from.as_str(), header.as_deref(), &asked, Some(&who), false) {
+        let who = crate::access::passed(&shared, from, who);
+        audit(&shared, &who, &me, &spec, Err(why.clone()));
+        return say(StatusCode::FORBIDDEN, why);
+    }
     let who = crate::access::passed(&shared, from, who);
     if let Err(refused) = permit(&shared, &who, Verb::Exec, |_| vec![("Node".into(), None)]) {
         return refused.into_response();

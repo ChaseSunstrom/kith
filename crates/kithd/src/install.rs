@@ -23,6 +23,9 @@
 // spare partition table sits where the image ended, until the node's first start from
 // the disk, which makes both right (`gpt`).
 
+mod fb;
+
+use fb::Panel;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -79,7 +82,7 @@ pub fn disks(sys: &Path, booted: Option<&str>) -> Vec<Disk> {
             (usable && Some(&*name) != booted && !other.iter().any(|kind| name.starts_with(kind))).then(|| Disk {
                 model: said(&entry.path(), "device/model"),
                 serial: serial(&entry.path()),
-                removable: said(&entry.path(), "removable") == "1",
+                removable: said(&entry.path(), "removable") != "0",
                 name,
                 bytes,
             })
@@ -335,17 +338,21 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
     Ok((disk.clone(), config))
 }
 
-/// Ask whoever is at the console. `ask` prints a question and reads a line.
-pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<Answers, String> {
+/// Ask whoever is at the console. `ask` takes the question's stop on the rail (an index into
+/// `fb::STOPS`), prints the question and reads a line.
+pub fn interview(disks: &[Disk], mut ask: impl FnMut(usize, &str) -> String) -> Result<Answers, String> {
     if disks.is_empty() {
         return Err("this machine has no disk to install on".into());
     }
     let listed: Vec<String> = disks.iter().map(|disk| format!("  {disk}\n")).collect();
     let some = |answer: String| Some(answer).filter(|answer| !answer.is_empty());
-    let disk = ask(&format!(
-        "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
-        listed.concat()
-    ));
+    let disk = ask(
+        0,
+        &format!(
+            "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
+            listed.concat()
+        ),
+    );
     let chosen = match disk.strip_prefix("serial:") {
         Some(serial) => by_serial(serial, disks)?,
         None => disks
@@ -354,20 +361,26 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
             .ok_or(format!("there is no disk `{disk}` here"))?,
     };
     let hostname = some(ask(
+        1,
         "The node's name (empty: one made from its network card's address)?",
     ));
-    let ip = some(ask("Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?"));
+    let ip = some(ask(2, "Its address, as 10.0.0.5/24,10.0.0.1 (empty: ask the network)?"));
     let address = some(ask(
+        3,
         "Join a cluster? The address of one of its nodes, as 10.0.0.7:7443 (empty: start a new cluster)",
     ));
     let join = address.map(|address| Join {
         address,
-        token: ask("The join token (`kith node token` there)?"),
+        token: ask(3, "The join token (`kith node token` there)?"),
     });
-    let encrypt = ask("Keep its state encrypted, the key held by its cluster (yes, or empty: no)?") == "yes";
-    let again = ask(&format!(
-        "Everything on {chosen} will be erased. Type its name again to go on:"
-    ));
+    let encrypt = ask(
+        4,
+        "Keep its state encrypted, the key held by its cluster (yes, or empty: no)?",
+    ) == "yes";
+    let again = ask(
+        5,
+        &format!("Everything on {chosen} will be erased. Type its name again to go on:"),
+    );
     if again != disk && again != chosen.name {
         return Err(format!("`{again}` is not `{disk}`: nothing was written"));
     }
@@ -540,6 +553,21 @@ pub fn keyboard() -> std::sync::mpsc::Receiver<String> {
     typed
 }
 
+/// How long a recovery key's screen waits for a line with nobody at the console: then it is
+/// cleared and the install goes on.
+const KEY_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A line typed (any), or `wait` with none: `Ok` either way; `Err` when no console can be
+/// typed at, so no key can be released.
+fn wait_for_key_line(typed: &std::sync::mpsc::Receiver<String>, wait: std::time::Duration) -> std::io::Result<()> {
+    match typed.recv_timeout(wait) {
+        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other("no console can be typed at"))
+        }
+    }
+}
+
 /// Each line read from `console` to `lines`, until it ends or nobody listens. A line is read
 /// 4 KiB at most at a time: one longer (a serial line's noise, no newline) comes in pieces.
 fn lines_of(mut console: impl std::io::BufRead, lines: &std::sync::mpsc::Sender<String>) {
@@ -583,6 +611,20 @@ fn exclusive(device: &Path) -> Result<File, String> {
         .custom_flags(nix::fcntl::OFlag::O_EXCL.bits())
         .open(device)
         .map_err(|e| format!("{}: {e}", device.display()))
+}
+
+/// The opened disk's own size (its end, as BLKGETSIZE64 gives) against the planned one: sysfs
+/// names a disk, /dev/NAME is what was opened, and they can differ. Left at its start.
+fn opened_size(disk: &mut File, planned: u64) -> Result<(), String> {
+    let io = |e: std::io::Error| format!("the opened disk's size could not be read: {e}; nothing was written");
+    let got = disk.seek(SeekFrom::End(0)).map_err(io)?;
+    disk.seek(SeekFrom::Start(0)).map_err(io)?;
+    if got == planned {
+        return Ok(());
+    }
+    Err(format!(
+        "the disk opened is {got} bytes, not the {planned} planned; nothing was written"
+    ))
 }
 
 /// Clears both partition tables of an open disk, so nothing on it is found to boot from.
@@ -666,8 +708,18 @@ pub async fn run(source: String) -> ! {
                 let asked = tokio::task::spawn_blocking(move || {
                     let typed = typed.lock().expect("nothing panics holding the keyboard");
                     let mut gone = false;
-                    let told = interview(&disks, |question| {
+                    // The picture is held while the questions are asked: dropped when this block
+                    // ends, the console is text again (none where there is no 32 bpp framebuffer).
+                    let mut screen = fb::open();
+                    let told = interview(&disks, |stop, question| {
                         eprintln!("\n{question}");
+                        if let Some(device) = screen.as_mut() {
+                            let mut frame = device.frame();
+                            fb::draw_question(&mut frame, &fb::STOPS, stop, question, fb::ANSWER);
+                            if let Err(e) = device.show(&frame) {
+                                eprintln!("kithd: install: the question is not on the screen: {e}");
+                            }
+                        }
                         typed.recv().unwrap_or_else(|_| {
                             gone = true;
                             String::new()
@@ -696,6 +748,7 @@ pub async fn run(source: String) -> ! {
         // (Its size read again just before the open: a disk swapped since the plan is not the one chosen.)
         size_unchanged(Path::new("/sys/block"), &planned)?;
         let mut disk = exclusive(&device)?;
+        opened_size(&mut disk, planned.bytes)?;
         if let Err(e) = write(&mut image, &mut disk, &config, |tenths| {
             eprintln!("kithd: install: {}%", tenths * 10)
         }) {
@@ -721,9 +774,39 @@ pub async fn run(source: String) -> ! {
     match wrote {
         Ok(recovery) => {
             if let Some(recovery) = recovery {
+                // Answers given (a file, a URL) are for an install nobody watches: no screen waits
+                // for the key then. Asked, the Enters typed before now are dropped first, so that
+                // none of them clears the key's screen at once.
+                let asked = given.is_none();
+                if asked {
+                    typed
+                        .lock()
+                        .expect("nothing panics holding the keyboard")
+                        .try_iter()
+                        .for_each(drop);
+                }
                 eprintln!(
                     "kithd: install: the node's state is encrypted. Its recovery key opens it where no cluster answers, and is shown this once: {recovery}"
                 );
+                if asked {
+                    // On the screen too, where there is one: held until a key is pressed (or KEY_WAIT
+                    // goes by), then cleared.
+                    let held = tokio::task::spawn_blocking(move || {
+                        let Some(mut device) = fb::open() else {
+                            return Ok(());
+                        };
+                        let mut frame = device.frame();
+                        let key = format!("Recovery key:\n{recovery}");
+                        fb::draw_question(&mut frame, &fb::STOPS, fb::STOPS.len() - 1, &key, fb::KEY);
+                        let typed = typed.lock().expect("nothing panics holding the keyboard");
+                        fb::hold_until_key(&mut device, &frame, || wait_for_key_line(&typed, KEY_WAIT))
+                    });
+                    match held.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                        Err(e) => eprintln!("kithd: install: the recovery key's screen: {e}"),
+                    }
+                }
             }
             // (Nothing to take out of a machine installed from its own memory: it starts at once.)
             let then = if memory {
@@ -845,6 +928,27 @@ async fn fetched(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recovery key's screen waits for a line typed, or for its wait with none (then the
+    /// install goes on); it is refused only when no console can be typed at at all.
+    #[test]
+    fn install_key_screen_waits_for_a_line_or_gives_up_after_its_wait() {
+        let (lines, typed) = std::sync::mpsc::channel::<String>();
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_ok(),
+            "nobody typed: it gives up"
+        );
+        lines.send(String::new()).expect("a listener");
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_secs(60)).is_ok(),
+            "a line released it"
+        );
+        drop(lines);
+        assert!(
+            wait_for_key_line(&typed, std::time::Duration::from_millis(10)).is_err(),
+            "no console at all is said"
+        );
+    }
 
     /// A console that sends no newline (a serial line's noise) comes in pieces of at most
     /// 4 KiB: what one line holds is bounded. A short line comes whole.
@@ -996,6 +1100,23 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_opened_at_another_size_is_not_written() {
+        let path = std::env::temp_dir().join(format!("kith-install-opened-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        assert!(opened_size(&mut file, 4096).is_ok());
+        // Left at its start, for the write.
+        assert_eq!(file.stream_position().unwrap(), 0);
+        let why = opened_size(&mut file, 8192).unwrap_err();
+        assert!(
+            why.contains("4096") && why.contains("8192") && why.contains("nothing was written"),
+            "{why}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn a_disk_that_changed_size_is_not_written() {
         let sys = std::env::temp_dir().join(format!("kith-install-resized-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sys);
@@ -1081,6 +1202,17 @@ mod tests {
             joined,
             "-- --listen 0.0.0.0:7443 --join 10.0.0.7:7443 --token kith1.ab.cd.ef.node-1" // pragma: allowlist secret
         );
+
+        // A disk whose sysfs has no removable file is not known to be fixed: never the one `only` means.
+        let sys = std::env::temp_dir().join(format!("kith-install-noremovable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sys);
+        std::fs::create_dir_all(sys.join("sda")).unwrap();
+        std::fs::write(sys.join("sda/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sda/ro"), "0").unwrap();
+        let unknown = disks(&sys, None);
+        assert!(unknown[0].removable);
+        assert!(config("disk: only\n", &unknown).unwrap_err().contains("removable"));
+        std::fs::remove_dir_all(&sys).unwrap();
 
         // `only` is for a machine with one disk; a name must be one that is there.
         assert_eq!(config("disk: only\n", &two[..1]).unwrap().0.name, "sda");
@@ -1182,7 +1314,7 @@ mod tests {
         let ask = |lines: &[&str]| {
             let mut lines = lines.iter();
             let mut asked = Vec::new();
-            let told = interview(&two, |question| {
+            let told = interview(&two, |_, question| {
                 asked.push(question.to_string());
                 (*lines.next().unwrap_or(&"")).to_string()
             });
@@ -1222,20 +1354,34 @@ mod tests {
         );
         assert!(ask(&["sda", "", "", "", "", ""]).0.is_err());
         assert!(ask(&["sdz"]).0.unwrap_err().contains("no disk `sdz`"));
-        assert!(interview(&[], |_| String::new()).is_err());
+        assert!(interview(&[], |_, _| String::new()).is_err());
         // At the console a disk may be named by its serial, as in the answers file; the
         // second time, by its serial again or its name.
         let mut two = two;
         two[1].serial = "S4EW0001".into();
         for again in ["serial:S4EW0001", "sdb"] {
             let mut lines = ["serial:S4EW0001", "", "", "", "", again].into_iter();
-            let told = interview(&two, |_| lines.next().unwrap().to_string()).unwrap();
+            let told = interview(&two, |_, _| lines.next().unwrap().to_string()).unwrap();
             assert_eq!(told.disk, "serial:S4EW0001");
         }
         let mut lines = ["serial:S4EW0001", "", "", "", "", "sda"].into_iter();
-        assert!(interview(&two, |_| lines.next().unwrap().to_string()).is_err());
-        let refused = interview(&two, |_| "serial:NONE".into()).unwrap_err();
+        assert!(interview(&two, |_, _| lines.next().unwrap().to_string()).is_err());
+        let refused = interview(&two, |_, _| "serial:NONE".into()).unwrap_err();
         assert!(refused.contains("no disk with serial NONE"), "{refused}");
+    }
+
+    #[test]
+    fn install_asks_each_question_at_its_stop_on_the_rail() {
+        let two = [disk("sda", 8), disk("sdb", 16)];
+        let mut stops = Vec::new();
+        let mut lines = ["sda", "", "10.0.0.5/24", "10.0.0.7:7443", "kith1.ab.cd", "yes", "sda"].into_iter();
+        let told = interview(&two, |stop, _| {
+            stops.push(stop);
+            lines.next().unwrap_or("").to_string()
+        });
+        assert!(told.is_ok(), "{told:?}");
+        // Disk, Name, Address, Join (its address and its token), Encryption, Erase: fb::STOPS.
+        assert_eq!(stops, [0, 1, 2, 3, 3, 4, 5]);
     }
 
     /// A disk image of 64 sectors with a GPT whose third partition is `config`, 4 sectors at sector 40.
@@ -1451,6 +1597,77 @@ mod tests {
         assert!(
             why.contains("the seal failed") && why.contains("failed too") && why.contains("may boot unencrypted"),
             "{why}"
+        );
+    }
+
+    /// docs/install.html makes this file in the browser; its two examples (the form as it
+    /// starts, and the form filled in) are in the page as `<pre data-answers="...">`, and
+    /// ci/site_shots.py checks that the page's script writes them. Here the installer
+    /// reads them: its parser takes every field, and its plan accepts every value.
+    #[test]
+    fn the_install_page_examples_are_answers_the_installer_takes() {
+        const PAGE: &str = include_str!("../../../docs/install.html");
+        let example = |name: &str| {
+            let from = PAGE
+                .find(&format!("<pre data-answers=\"{name}\""))
+                .unwrap_or_else(|| panic!("no {name} example"));
+            let body = &PAGE[from..];
+            let body = &body[body.find('>').unwrap() + 1..body.find("</pre>").unwrap()];
+            let mut text = String::new();
+            let mut in_tag = false;
+            for c in body.chars() {
+                match c {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    c if !in_tag => text.push(c),
+                    _ => {}
+                }
+            }
+            text.replace("&quot;", "\"")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+        };
+        let mut seen = Vec::new();
+        for name in ["default", "example", "custom"] {
+            let yaml = example(name);
+            let told = answers(&yaml).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            let mut one = disk("nvme0n1", 256);
+            one.serial = "S4EWNX0R123456".into();
+            let (_, config) =
+                plan(&told, &[one], 300 << 20, 1 << 20).unwrap_or_else(|e| panic!("{name}:\n{yaml}\n{e}"));
+            seen.push((told, config));
+        }
+        // The default is the one disk and nothing else; the example fills in every field.
+        assert_eq!(
+            seen[0].0,
+            Answers {
+                disk: "only".into(),
+                ..Answers::default()
+            }
+        );
+        let full = &seen[1].0;
+        assert!(full.disk.starts_with("serial:") && full.hostname.is_some() && full.ip.is_some() && full.dns.is_some());
+        assert!(full.join.is_some() && full.encrypt && full.release_key.is_some() && full.lan_releases);
+        assert!(full.node_policy.is_some());
+        assert!(
+            seen[1].1.contains("--join ")
+                && seen[1].1.contains("--release-key ")
+                && seen[1].1.contains("--lan-releases")
+        );
+        // The third is what the form writes for a fixed address with its way out, a join and a policy of its
+        // own words (ci/site_shots.py fills the form from the block's data-fields and compares): the installer
+        // takes the address, the join and the policy as the words the form joined.
+        let custom = &seen[2].0;
+        assert_eq!(custom.disk, "nvme0n1");
+        assert_eq!(custom.ip.as_deref(), Some("10.0.0.6/24,10.0.0.1"));
+        assert_eq!(custom.join.as_ref().map(|j| j.address.as_str()), Some("10.0.0.7:7443"));
+        assert_eq!(custom.node_policy.as_deref(), Some("hardened,vms,devices=gpu+input"));
+        assert!(!custom.encrypt && !custom.lan_releases && custom.release_key.is_none() && custom.dns.is_none());
+        assert!(
+            seen[2].1.contains("--advertise 10.0.0.6:")
+                && seen[2].1.contains("--join 10.0.0.7:7443 --token ")
+                && seen[2].1.contains("--node-policy hardened,vms,devices=gpu+input")
         );
     }
 }

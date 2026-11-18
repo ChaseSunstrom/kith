@@ -12,6 +12,7 @@
 // Fine for stores of a few MB; a binary body is the upgrade if snapshots get slow.
 
 use crate::access::{self, Caller};
+use crate::access_sign;
 use crate::cluster::Peer;
 use crate::{Shared, pki};
 use axum::body::Body;
@@ -459,6 +460,39 @@ fn sender(store: &kith_api::store::Store, name: &str) -> Option<bool> {
     Some(node.spec["trust"] == "worker")
 }
 
+/// The node a change came from.
+fn sent_by(peer: &Peer) -> String {
+    match &peer.subject {
+        Some(pki::Subject::Node(node, ..)) => node.clone(),
+        _ => "unknown".into(),
+    }
+}
+
+/// Who signed a change a control node passed on (its signature for this node, as it came),
+/// where that holds. Under `spec.signing: required` a node's word for whose write it is
+/// (`who`) stands only with their signature; a change it sends as its own is its own.
+fn signer(
+    shared: &Shared,
+    peer: &Peer,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+    body: &[u8],
+    who: Option<&Caller>,
+) -> Result<Option<access_sign::Signed>, String> {
+    let path = uri.path_and_query().map_or(uri.path(), |path| path.as_str());
+    let asked = access_sign::Asked {
+        method: "POST",
+        path,
+        body,
+    };
+    let header = headers
+        .get(access_sign::SIGNED)
+        .map(|header| header.to_str().unwrap_or_default());
+    // (`who` is the Identity, as the node names it: not the node it came through.)
+    let named = who.and_then(Caller::identity).map(|name| Caller::Identity(name.into()));
+    access_sign::hop(shared, &sent_by(peer), header, &asked, named.as_ref(), true)
+}
+
 /// A change another node passes to the leader: the reply and where in the log it is. A
 /// control node's is given to Raft as it comes; a worker's is held to its size, its rate
 /// and its list first.
@@ -466,6 +500,7 @@ async fn write(
     State(shared): State<Arc<Shared>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     body: Body,
 ) -> Response {
     let worker = match &peer.subject {
@@ -495,13 +530,7 @@ async fn write(
             .map(|name| name.to_str().ok().and_then(Caller::named))
         {
             None => None,
-            Some(Some(Caller::Identity(name))) => {
-                let node = match &peer.subject {
-                    Some(pki::Subject::Node(node, ..)) => node.clone(),
-                    _ => "unknown".into(),
-                };
-                Some(Caller::Via(node, Box::new(Caller::Identity(name))))
-            }
+            Some(Some(Caller::Identity(name))) => Some(Caller::Via(sent_by(&peer), Box::new(Caller::Identity(name)))),
             Some(_) => {
                 let why = format!("{} names no Identity", access::FOR);
                 return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
@@ -517,10 +546,20 @@ async fn write(
         if !leads {
             return Json(None::<(Reply, u64)>).into_response();
         }
+        let signed = match signer(&shared, &peer, &headers, &uri, &bytes, who.as_ref()) {
+            Ok(signed) => signed,
+            Err(why) => {
+                let caller = who.clone().unwrap_or_else(|| Caller::Node(sent_by(&peer)));
+                shared
+                    .audit
+                    .record(&caller, "write", vec![uri.path().into()], Err(why.clone()));
+                return Json(Some((Err::<Done, _>(Error::Invalid(why)), 0u64))).into_response();
+            }
+        };
         // On a task of its own: a sender that hangs up neither lets go of the turn while the
         // write is on its way nor stops it.
         let shared = shared.clone();
-        let done = tokio::spawn(async move {
+        let done = tokio::spawn(access_sign::within(signed, async move {
             let turn = shared.turn(&command, who.as_ref()).await?;
             let written = tokio::time::timeout(PATIENCE, shared.raft.client_write(command)).await;
             drop(turn);
@@ -528,7 +567,7 @@ async fn write(
                 Ok(Ok(written)) => Some((written.data, written.log_id.index)),
                 _ => None,
             })
-        });
+        }));
         return Json(match done.await {
             Ok(Ok(written)) => written,
             Ok(Err(refused)) => Some((Err::<Done, Error>(refused), 0u64)),
@@ -701,6 +740,11 @@ impl Shared {
             let state = self.store.lock().expect("a handler panicked holding the store");
             crate::api::refused(&state.store, caller, command)
         });
+        // The admin's key and whether callers sign, by the store as it is in this turn.
+        let refused = refused.or_else(|| {
+            let state = self.store.lock().expect("a handler panicked holding the store");
+            access_sign::guard(&state.store, command, access_sign::by_admin()).err()
+        });
         match refused {
             Some(why) => Err(Error::Invalid(why)),
             None => Ok(Some(held)),
@@ -782,7 +826,30 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
-        let mut call = client.post(format!("https://{at}/v1/raft/write"));
+        // A signed apply, delete or rollback goes to the leader as it came (its method, path, body and
+        // header), and the leader runs it as its own route would (its audit names that route): a
+        // Command re-serialized would not be what was signed. `carries` checks the route matches.
+        if let Some(relay) = access_sign::current().and_then(|signed| signed.relay)
+            && relay.carries(command)
+        {
+            let url = format!("https://{at}{}", relay.path);
+            let call = match command {
+                Command::Delete { .. } => client.delete(url),
+                _ => client.post(url),
+            }
+            .header(access::FOR, relay.who.to_string())
+            .header("content-type", "application/json")
+            .body(relay.body.clone());
+            return self.relayed(access_sign::pass_on(call), at, &relay).await;
+        }
+        // A signed request's change that is not carried is not sent on as this node's own write: the
+        // leader would take it as none, with no signature checked there. (A Mark is this node's own.)
+        if access_sign::current().is_some() && !matches!(command, Command::Mark) {
+            let why = "refused: a signed request's change that is not passed on as it came (the route is \
+                       not one the leader checks the signature of); send it to the leader directly";
+            return Forward::Failed(Error::Invalid(why.into()));
+        }
+        let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
         // Whose write it is, for the leader to decide again in the log's order (`write`).
         if let Some(name) = who.and_then(Caller::identity) {
             call = call.header(access::FOR, name);
@@ -818,13 +885,64 @@ impl Shared {
             }
         }
     }
+
+    /// What the leader did with a signed write passed on as it came (`call`), as this node's
+    /// reply, read as the route `relay` came by answers (`api.rs`: a delete a Resource, a rollback
+    /// a Change, an apply its Changes). The leader's write is in the log before it answers: a
+    /// `Mark` after it has the index this node waits for.
+    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str, relay: &access_sign::Relay) -> Forward {
+        let route = relay.path.split('?').next().unwrap_or("");
+        match call.timeout(PATIENCE).send().await {
+            Ok(reply) if reply.status().is_success() => {
+                let done = if relay.method == "DELETE" {
+                    reply
+                        .json::<kith_api::Resource>()
+                        .await
+                        .map(|r| Done::Deleted(Box::new(r)))
+                } else if route.starts_with("/v1/rollback/") {
+                    reply
+                        .json::<kith_api::store::Change>()
+                        .await
+                        .map(|c| Done::Changes(vec![c]))
+                } else {
+                    reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes)
+                };
+                let Ok(done) = done else {
+                    let why = format!("the leader at {at} did not answer with the changes it made");
+                    return Forward::Failed(unavailable(why));
+                };
+                let index = match Box::pin(self.write_as(Command::Mark, None)).await {
+                    Ok((_, index)) => index,
+                    Err(e) => return Forward::Failed(e),
+                };
+                let caught_up = self.raft.wait(Some(PATIENCE));
+                let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
+                Forward::Done(Ok(done), index)
+            }
+            // (The leader refused it: what it says is the reply, as for a write.)
+            Ok(reply) => Forward::Failed(Error::Invalid(reply.text().await.unwrap_or_default())),
+            // Never reached it: nothing happened, and asking again is safe.
+            Err(e) if e.is_connect() => Forward::Again(Some(format!(
+                "the leader at {at} was not reached: {}",
+                crate::cluster::why(&e)
+            ))),
+            Err(e) => {
+                let why = format!(
+                    "the leader at {at} did not answer ({}); look before trying again",
+                    crate::cluster::why(&e)
+                );
+                Forward::Failed(unavailable(why))
+            }
+        }
+    }
 }
 
 /// Whether `command` can change who may do what: it is put in the log alone ([`Shared::turn`]).
 fn changes_access(command: &Command) -> bool {
     let access = |kind: &str| {
-        // (A KindDefinition says whether a kind is namespaced: which rule matches it.)
-        ["Role", "RoleBinding", "Identity", "KindDefinition"]
+        // (A KindDefinition says whether a kind is namespaced: which rule matches it. A
+        // Cluster holds the admin's key, asked of in the same turn: `access_sign::guard`.)
+        ["Role", "RoleBinding", "Identity", "KindDefinition", "Cluster"]
             .iter()
             .any(|of| of.eq_ignore_ascii_case(kind))
     };
