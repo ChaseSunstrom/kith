@@ -199,11 +199,14 @@ pub fn predict_pcr4(log: &[u8], read: &Hash, running: &[u8], new: &[u8]) -> Resu
     Ok(replay(&events)?[4])
 }
 
-/// The PCR 9 a start will read when the boot file's command line is `cmdline` and nothing
-/// else is measured into it: one extend, of the SHA-256 of the line as UTF-16 little-endian
-/// with its ending zero (the way the EFI stub measures what it was started with).
-/// ponytail: only that form; the ADR's UTF-8 and no-zero forms (matched against the
-/// running log) come with the hook that has the running log's PCR 9 event to match.
+/// The PCR 9 a start would read if `cmdline` were the only thing measured into it: one
+/// extend, of the SHA-256 of the line (exactly this text, no newline added) as UTF-16
+/// little-endian with its ending zero. This is ONE candidate of the four forms the ADR
+/// lists (UTF-16 or UTF-8, with or without the ending zero), and unverified.
+/// ponytail: the ADR's match against the running log's command-line event (adr-unlock.md,
+/// "How the new values are predicted", step 3) must settle the form; that is the update-hook
+/// slice (T-0860). PCR 9 is not replayed or checked against the log here: that slice must
+/// refuse, or give no PCR 9, when the running log has no matching command-line event.
 pub fn pcr9(cmdline: &str) -> Result<Hash, String> {
     if cmdline.contains('\0') {
         return Err("a command line with a zero in it".into());
@@ -445,11 +448,16 @@ mod tests {
         let wide: &[u8] = &[0x61, 0, 0x62, 0, 0, 0];
         let want: Hash = Sha256::digest([&[0u8; 32][..], &Sha256::digest(wide)[..]].concat()).into();
         assert_eq!(pcr9("ab"), Ok(want));
-        // the empty line is still measured (its zero), a changed one is another value
-        assert_ne!(pcr9(""), Ok([0; 32]));
+        // the empty line is still measured: its zero (00 00) alone
+        let zero: Hash = Sha256::digest([&[0u8; 32][..], &Sha256::digest([0u8, 0])[..]].concat()).into();
+        assert_eq!(pcr9(""), Ok(zero));
         assert_ne!(pcr9("ab"), pcr9("ab "));
         assert_ne!(pcr9("ab"), pcr9("ba"));
-        // a non-ASCII char is two UTF-16 units past the BMP
+        // U+1F600 is past the BMP: a surrogate pair, D83D DE00, little-endian 3D D8 00 DE
+        let astral: &[u8] = &[0x3D, 0xD8, 0x00, 0xDE, 0, 0];
+        let want: Hash = Sha256::digest([&[0u8; 32][..], &Sha256::digest(astral)[..]].concat()).into();
+        assert_eq!(pcr9("\u{1F600}"), Ok(want));
+        // é is in the BMP: one unit, so another value than e
         assert_ne!(pcr9("é"), pcr9("e"));
         assert!(pcr9("a\0b").is_err());
 
