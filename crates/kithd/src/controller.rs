@@ -1448,6 +1448,9 @@ impl Controller {
                 tokio::task::yield_now().await;
                 match started {
                     Ok(handle) => {
+                        // How it runs differently from what it asked (its root read-only, where the kernel
+                        // refuses an overlay) is said while it runs.
+                        let note = handle.note;
                         slot.handle = Some(handle);
                         slot.tuned = None;
                         // Why it was replaced for what it wrote stays said while it runs again, once.
@@ -1457,7 +1460,7 @@ impl Controller {
                             .take()
                             .filter(|m| replaced && m.starts_with(storage::REPLACED));
                         (slot.state, slot.message, slot.start_at, slot.started) =
-                            ("running", replaced, None, Instant::now());
+                            ("running", running_said(note, replaced), None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
                             slot.probes = crate::probe::start(shared.clone(), c, pod);
@@ -2296,6 +2299,15 @@ fn part_of(run: &Run, at: &str) -> Option<String> {
     mount.sub_path.clone()
 }
 
+/// What a unit says while it runs: how its handle runs differently from what it asked, then why it
+/// was replaced for what it wrote, each said once.
+fn running_said(note: Option<&str>, replaced: Option<String>) -> Option<String> {
+    note.map(str::to_string)
+        .into_iter()
+        .chain(replaced)
+        .reduce(|said, more| format!("{said}; {more}"))
+}
+
 /// `mesh`: the cluster's mesh and this node's name, for a volume another node serves.
 async fn start(
     shared: &Shared,
@@ -2646,6 +2658,23 @@ mod tests {
         let hour = Duration::from_secs(3600);
         assert_eq!((look(hour), look(hour)), (1, 1));
         assert_eq!((look(Duration::ZERO), look(hour)), (2, 2));
+    }
+
+    /// A running unit's status says how its handle runs differently (its note: its root read-only,
+    /// where the kernel refuses an overlay) and why it was replaced for what it wrote: both, in that
+    /// order, and each alone where the other is not there. (A `Handle` is made only by the runtime,
+    /// so this tests what the start says from the two; the note itself is the runtime's.)
+    #[test]
+    fn a_running_unit_says_its_handles_note_and_why_it_was_replaced() {
+        let note = "root is read-only: this kernel does not mount overlay in a user namespace (kithd is not root)";
+        let replaced = storage::REPLACED.to_string();
+        assert_eq!(
+            running_said(Some(note), Some(replaced.clone())),
+            Some(format!("{note}; {replaced}"))
+        );
+        assert_eq!(running_said(Some(note), None), Some(note.to_string()));
+        assert_eq!(running_said(None, Some(replaced.clone())), Some(replaced));
+        assert_eq!(running_said(None, None), None);
     }
 
     /// A public key's text, as `signedBy` takes it: Ed25519, each `n` another.
