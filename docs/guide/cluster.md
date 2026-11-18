@@ -227,6 +227,34 @@ first ingress rule that fits wins, none means refused. Peers are a `node` or a `
 out) and egress is not enforced; the status says `partial` and why, or `enforced`. A connection
 to a node's own address bypasses it.
 
+### Rolling updates
+
+A changed Workload is replaced one replica at a time, on the node that runs it. The replacement
+starts beside the old replica (its own pod and address, a second copy of the storage limit) and the
+old one stops only once the replacement is ready and has been for 3 seconds, the time a Service
+on another node is given to move to the new address. So a `replicas: 1` Workload behind a Service
+is never without a ready replica.
+
+- **Stopped first.** A replica that holds one of something stops first, as an update did before:
+  a volume, a `scratch` mount, a device or seat, the node's own network (a unit that is not in a
+  pod, or a kithd that is not root), or CPU and memory the node has no room for twice. The unit's
+  `message` in the status says which (`rolling update: replica 0 is stopped first: it mounts a
+  volume`). A ConfigMap's files are shared by both copies and not counted: what is written is
+  what the new one wants.
+- **A replacement that does not come up.** The old replica goes on answering. After 30 seconds
+  (plus the `startSeconds` of its liveness probes) the status says what the replacement lacks,
+  with its own message, e.g. `replica 0's replacement is not ready after 41 s (web: pulling
+  nginx:2: no route to host); the old one still answers`. Change the Workload again to replace
+  the replacement; the old replica is let go only once one answers.
+- **A kithd restarted in the middle.** Both copies are taken back. The one that runs as the
+  Workload says now is the new one (where neither does, the one that started later); the other
+  is kept, its network and Service rules with it, until the new one answers, so a restart never
+  leaves a replica with nothing running. A replica found running as an older definition, with
+  nothing else of it running, is replaced the same way: the new copy starts beside it. A third
+  change within that stretch does not tell the copies apart: the older one is kept either way.
+- **Where it is said.** With one node, in the Workload's `notes`; with several, in the `message`
+  of the replica's units, as each node says only its own.
+
 ### Ingress: a host of its own, with a certificate
 
 With `--ingress` (and `--mesh`; for nodes with a public address) a node serves HTTPS on 443 for
