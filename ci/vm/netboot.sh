@@ -433,6 +433,8 @@ with open(sys.argv[1], "r+b") as disk:
                 # An update given to a node whose key holder is off: it is written to slot b and started
                 # there with no key, so slot b stays on trial (not marked good), and after three starts
                 # without its key the boot loader is back on slot a. Read from beta's ESP, where the counter is.
+                # The update comes by kith.update from a stick (vdb), not from the cluster: update.rs's path
+                # from the OS release is not exercised here.
                 command -v mdir >/dev/null 2>&1 || mdir() { nix shell nixpkgs#mtools -c mdir "$@"; }
                 espat() { # NAME: where the partition NAME of beta's disk starts
                     python3 -c '
@@ -448,30 +450,33 @@ for index in range(128):
         sys.exit(0)
 sys.exit(1)' "$work/beta.disk" "$1"
                 }
-                ondisk() { # SLOT TRIES: beta's ESP holds SLOT's boot file with TRIES tries left (kith-N-SLOT+TRIES.efi, or +TRIES-DONE once tried), and no other for SLOT
+                ondisk() { # SLOT TRIES: beta's ESP holds exactly one boot file for SLOT, with TRIES tries left (kith-N-SLOT+TRIES.efi, or +TRIES-DONE once tried)
                     names=$(mdir -b -i "$work/beta.disk@@$(espat esp)" ::EFI/Linux) || fail "beta's ESP could not be read"
+                    [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1[+.]")" = 1 ] || fail "beta's ESP does not have exactly one boot file for slot $1: $names"
                     [ "$(printf '%s\n' "$names" | grep -cE "/kith-[0-9]*-$1\+$2(-[0-9]+)?\.efi$")" = 1 ] || fail "beta's ESP does not have slot $1 with $2 tries left: $names"
                 }
                 kill "$vm"
                 wait "$vm" 2>/dev/null || true
                 kill "$alpha"
                 wait "$alpha" 2>/dev/null || true
+                kill "$dhcp"
                 wait "$dhcp" 2>/dev/null || true
                 KITH_OS_VERSION=0.0.0-test sh "$root/os/build.sh" --out "$work/next" >&2
                 cp "$work/next/kith-os.update" "$work/good.update"
                 truncate -s %1M "$work/good.update"
                 vm slotb -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
-                    -drive "file=$work/good.update,format=raw,if=virtio,readonly=on" \
-                    -netdev user,id=out -device virtio-net-pci,netdev=out \
+                    -drive "file=$work/good.update,format=raw,if=virtio,readonly=on" -nic none \
                     -smbios 'type=11,value=io.systemd.stub.kernel-cmdline-extra=kith.update=vdb'
                 hears slotb 'kithd: init: kith OS 0.0.0-test from vdb is in the other slot'
                 wait "$vm" || fail "the update was not written to slot b while the key holder was off"
                 ondisk b 3
                 # Started from its disk with no way to alpha: each start waits for its key, and is still on
                 # trial 15 s on, one try fewer each time; the third leaves none, so the next start is slot a.
-                trial() { # LOG TRIES: a start of beta's disk with no card that reaches alpha
+                # The real "not marked good" check is ondisk b N: a slot marked good is renamed to
+                # kith-N-b.efi (settle), which ondisk does not match. The grep is a second look at the log.
+                trial() { # LOG TRIES: a start of beta's disk with no network card at all
                     vm "$1" -m 1024 -drive "file=$work/beta.disk,format=raw,if=none,id=d" -device virtio-blk-pci,drive=d,bootindex=0 \
-                        -netdev user,id=out -device virtio-net-pci,netdev=out
+                        -nic none
                     hears "$1" 'asking the cluster for its key'
                     hears "$1" 'still locked: 10.9.0.1:7443 cannot be reached'
                     sleep 15
