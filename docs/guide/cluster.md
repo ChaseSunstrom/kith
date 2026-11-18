@@ -345,10 +345,11 @@ nodes](os.md#encrypted-state) must then come back with nobody at a console. It d
 set up for it:
 
 ```sh
+kith node recovery n1                  # an unattended install showed nobody a recovery key: make one, keep it
 kith node seal n1                      # each control node (a voter) keeps its own key in its TPM
 kith node seal n2
 kith get NodeKey                       # says which nodes are sealed
-sh ci/vm.sh --test blackout            # two sealed control nodes and a worker, killed at once, started together
+sh ci/vm.sh --test blackout            # three control nodes (two sealed) and a worker, killed at once, started again
 ```
 
 - **The machines must start by themselves.** Set the BIOS (or the board's firmware) to
@@ -363,18 +364,23 @@ sh ci/vm.sh --test blackout            # two sealed control nodes and a worker, 
   the control nodes it knows for its key every few seconds, and is handed it as soon as one of
   them is up; nothing is typed. Its workloads start again after that.
 - **A node that was changed is refused by its TPM.** One that was updated, or whose firmware
-  changed, since it was sealed is not given the key: it asks the cluster for it instead, and seals
-  again once open. When every node was off and one of them was changed, that one waits for the
-  others, which open from their TPMs; the cluster does not need it to start.
+  changed, since it was sealed is not given the key: it asks the cluster for it instead. So after
+  every firmware or OS update, check that `kith get NodeKey` still says the node is `sealed`; if
+  it does not, seal it again: `kith node seal n1 --off`, then `kith node seal n1`. When every node
+  was off and one of them was changed, that one waits for the others, which open from their TPMs;
+  from three control nodes on, the cluster does not need it to start (two of three voters are a
+  quorum). With two control nodes there is one voter, and that node has to start.
 - **The last way is a recovery key.** If no sealed node will open (every TPM was replaced, or the
   machines were moved), type one control node's [recovery
   key](os.md#encrypted-state) at its console. That node opens its state and, with the cluster's
   records in it, hands each of the others its key as they ask: only the one recovery key is
-  typed.
+  typed. An install nobody watched (from a URL, or the network) shows the key to nobody, so run
+  `kith node recovery n1` ahead of time and keep what it shows; without it there is no last way.
 
-Writes the cluster acknowledged before the cut are there after it: the test checks every one.
-Plan for the quorum, not for one machine: with three control nodes, two sealed and started are
-enough.
+Writes the cluster acknowledged before the cut are there after it: the test checks every one, on
+each of the three control nodes. It starts the two sealed ones first and has them elect a leader
+with the third still off, then starts the third and a worker, which are handed their keys. Plan
+for the quorum, not for one machine: with three control nodes, two sealed and started are enough.
 
 ## DNS
 

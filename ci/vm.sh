@@ -16,8 +16,9 @@
 #   sh ci/vm.sh --test crypt    the same machine with its state encrypted: locked, unlocked, wiped
 #   sh ci/vm.sh --test tpm      the same machine with a TPM: its key sealed to the system it runs
 #   sh ci/vm.sh --test duress   the same machine given a new recovery key and a duress code, which is typed
-#   sh ci/vm.sh --test blackout three encrypted nodes (two with a TPM, a worker) losing power at once in the
-#                               middle of writes and started together: nothing typed, a leader, no write lost
+#   sh ci/vm.sh --test blackout four encrypted nodes (three control, two of them with a TPM, and a worker)
+#                               losing power at once in the middle of writes and started again: nothing
+#                               typed, a leader from the two sealed ones, no write lost
 #   sh ci/vm.sh --test share    two nodes: a shared volume of one, mounted by a container on the other;
 #                               an encrypted volume of one, its key kept by the other
 #   sh ci/vm.sh --test pods     two nodes: pods with a network, an address and a root each to write to,
@@ -115,14 +116,15 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    runs on until unlocked; its own duress code, typed at its waiting
                    console, is answered as a wrong key is, its lock record is erased,
                    the cluster forgets its key, and nothing opens it after
-  --test blackout  instead: three nodes the installer made, each with its state
-                   encrypted: two control nodes sealed by their TPMs (swtpm) and a
-                   worker with none, with writes going in and a Workload on the worker
-                   and on a control node; all three lose power at the same moment and
-                   start together, with nothing typed at any console: the control
-                   nodes open from their TPMs, one hands the worker its key, a leader
-                   is elected, every acknowledged write is there and both Workloads
-                   run again; needs swtpm
+  --test blackout  instead: four nodes the installer made, each with its state
+                   encrypted: three control nodes (two sealed by their TPMs, swtpm, the
+                   third not) and a worker, with writes going in and a Workload on the
+                   worker and on a control node; all four lose power at the same moment,
+                   a write in flight, and start again with nothing typed at any console:
+                   the two sealed nodes open from their TPMs and elect a leader with the
+                   third still off, which then, and the worker, are handed their keys;
+                   every acknowledged write is on all three control nodes and both
+                   Workloads are started again; needs swtpm
   --test share    instead: two nodes on the mesh, each with kith as a container image
                    already there: a file a container makes in a shared volume on the
                    node that does not hold it is there on the node that does, and the
