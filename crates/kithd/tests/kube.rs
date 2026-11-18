@@ -734,6 +734,43 @@ fn workflows_json_patch_by_kubectl() {
     );
 }
 
+/// A Deployment with no replicas: the server defaults them to 1, and kubectl reads 1.
+const BARE: &str = r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: mirror.gcr.io/library/busybox:1.36
+          command: [sleep, "3600"]
+"#;
+
+#[test]
+fn workflows_json_patch_sees_what_kubectl_sees() {
+    let Some(cluster) = Cluster::start("kube-json-patch-served") else {
+        return;
+    };
+    cluster.write("api.yaml", BARE);
+    cluster.ok(&["apply", "-f", "api.yaml"]);
+    // The base of the patch is what kubectl reads: the replicas the server defaulted, and the
+    // resourceVersion it reads, so a test of that and a replace of the replicas both find their paths.
+    let version = cluster.got(&["deployment", "api"])["metadata"]["resourceVersion"].clone();
+    let ops = serde_json::json!([
+        { "op": "test", "path": "/metadata/resourceVersion", "value": version },
+        { "op": "replace", "path": "/spec/replicas", "value": 3 },
+    ])
+    .to_string();
+    cluster.ok(&["patch", "deployment", "api", "--type", "json", "-p", ops.as_str()]);
+    assert_eq!(cluster.got(&["deployment", "api"])["spec"]["replicas"], 3);
+}
+
 #[test]
 fn workflows_helm() {
     for (n, helm) in helms().iter().enumerate() {

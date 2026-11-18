@@ -1369,11 +1369,11 @@ fn merged(have: &mut Value, items: Vec<Value>, by: &str) {
     }
 }
 
-/// The most operations a JSON patch has, and the most values its copies make in all: a copy of
+/// The most operations a JSON patch has, and the most bytes its copies make in all: a copy of
 /// a whole document doubles it, so the copies are what is bounded.
 // ponytail: one budget for the whole patch; per-copy limits if a real patch ever meets these.
 const PATCH_OPS: usize = 256;
-const PATCH_COPIES: usize = 1 << 16;
+const PATCH_COPY_BYTES: usize = 16 << 20;
 
 /// RFC 6902's operations applied in order to a copy of `live`, which is what comes back. One
 /// that fails (a `test` not so, a path not there, a pointer not written as one) refuses the
@@ -1412,16 +1412,16 @@ fn json_patch(live: &Value, ops: &Value) -> Result<Value, String> {
             "remove" => drop(take(&mut doc, pointer)?),
             "test" => {
                 let want = value()?;
-                if *find(&mut doc, pointer)? != want {
+                if !same(find(&mut doc, pointer)?, &want) {
                     return Err(format!("test {pointer}: the value is not the one given"));
                 }
             }
             "copy" => {
                 let made = find(&mut doc, source()?)?;
-                copied += weight(made);
-                if copied > PATCH_COPIES {
+                copied += made.to_string().len();
+                if copied > PATCH_COPY_BYTES {
                     return Err(format!(
-                        "copy {pointer}: the copies make more than {PATCH_COPIES} values"
+                        "copy {pointer}: the copies make more than {PATCH_COPY_BYTES} bytes"
                     ));
                 }
                 let made = made.clone();
@@ -1525,12 +1525,20 @@ fn take(doc: &mut Value, pointer: &str) -> Result<Value, String> {
     gone.ok_or_else(|| format!("{pointer}: the path is not there"))
 }
 
-/// How many values a JSON value is, itself counted: what a copy of it makes.
-fn weight(value: &Value) -> usize {
-    1 + match value {
-        Value::Array(items) => items.iter().map(weight).sum(),
-        Value::Object(map) => map.values().map(weight).sum(),
-        _ => 0,
+/// Whether two values are the same as RFC 6902 has it: a number is its value (2 and 2.0 are one
+/// number), a mapping has the same keys with the same values, a list the same items in order.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
+            (Some(x), Some(y), _, _) => x == y,
+            (_, _, Some(x), Some(y)) => x == y,
+            _ => x.as_f64() == y.as_f64(),
+        },
+        (Value::Array(x), Value::Array(y)) => x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y)),
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len() && x.iter().all(|(key, x)| y.get(key).is_some_and(|y| same(x, y)))
+        }
+        _ => a == b,
     }
 }
 
@@ -2390,7 +2398,11 @@ async fn write(
     let read = {
         let state = call.shared.store.lock().expect("a handler panicked holding the store");
         let live = state.store.get(&primary);
-        let before = live.and_then(raw).filter(|(of, _)| std::ptr::eq(*of, kind));
+        // A JSON patch is laid over the object as kubectl reads it (defaults and server fields
+        // in), so its base and what it is diffed against are served; the rest work on what was sent.
+        let before = live
+            .and_then(|live| if how == How::JsonPatch { served(live) } else { raw(live) })
+            .filter(|(of, _)| std::ptr::eq(*of, kind));
         if live.is_some() && !there && how == How::Apply {
             let why = format!("{primary} was made since: apply it again");
             return Err(status(StatusCode::CONFLICT, "Conflict", why));
@@ -3195,6 +3207,31 @@ spec: {role: writer, subjects: [carol]}
             .map(|n| json!({ "op": "copy", "from": "", "path": format!("/k{n}") }))
             .collect();
         assert!(json_patch(&live, &Value::Array(doubling)).is_err_and(|e| e.contains("copies")));
+    }
+
+    /// RFC 6902's `test` compares by value: 2 and 2.0 are one number, at any depth.
+    #[test]
+    fn json_patch_test_compares_numbers_by_value() {
+        let live = json!({ "spec": { "replicas": 2, "ratio": 2.0, "by": { "n": 7 } } });
+        let equal = json!([
+            { "op": "test", "path": "/spec/replicas", "value": 2.0 },
+            { "op": "test", "path": "/spec/ratio", "value": 2 },
+            { "op": "test", "path": "/spec/by", "value": { "n": 7.0 } },
+        ]);
+        assert_eq!(json_patch(&live, &equal), Ok(live.clone()));
+        let other = json!([{ "op": "test", "path": "/spec/replicas", "value": 2.5 }]);
+        assert!(json_patch(&live, &other).is_err_and(|e| e.contains("test /spec/replicas")));
+    }
+
+    /// A copy makes as many bytes as the value it copies has: a megabyte string copied again and
+    /// again is refused, where a count of values would let all 256 copies through.
+    #[test]
+    fn json_patch_bounds_the_bytes_its_copies_make() {
+        let live = json!({ "big": "x".repeat(1 << 20) });
+        let copies: Vec<Value> = (0..256)
+            .map(|n| json!({ "op": "copy", "from": "/big", "path": format!("/c{n}") }))
+            .collect();
+        assert!(json_patch(&live, &Value::Array(copies)).is_err_and(|e| e.contains("copies")));
     }
 
     #[test]
