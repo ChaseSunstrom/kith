@@ -1810,10 +1810,16 @@ spec:
         tokio::join!(carry(held, relay, Duration::from_secs(60)), asking)
     }
 
-    /// A client's connection to [`Proxy::take`] from [::1]: (the client's end, the one held).
+    /// A client's connection to [`Proxy::take`] from loopback, as an IPv4-mapped V6 address:
+    /// (the client's end, the one held). Not `[::1]`: where loopback has no IPv6 that bind
+    /// fails, and the whole workspace gate with it. The mapped address is still a V6 caller to
+    /// `take`, and `Limits` canonicalizes it to the V4 key.
     async fn pair_from_ipv6() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("[::1]:0").await.unwrap();
-        let ours = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let listener = TcpListener::bind("[::]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ours = TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .await
+            .unwrap();
         (ours, listener.accept().await.unwrap().0)
     }
 
@@ -1860,7 +1866,7 @@ spec:
         }
     }
 
-    /// Says `says` to `proxy`'s take over [::1]: what take passed on, and what the client heard.
+    /// Says `says` to `proxy`'s take over loopback: what take passed on, and what the client heard.
     async fn take_says(proxy: &Proxy, says: &str) -> (Option<()>, Vec<u8>) {
         let (mut client, held) = pair_from_ipv6().await;
         let asking = async {
@@ -1877,7 +1883,7 @@ spec:
         .expect("take ends")
     }
 
-    /// What the table asks for over [::1] (this node's `web` on `port`, no replica) reaches the
+    /// What the table asks for over loopback (this node's `web` on `port`, no replica) reaches the
     /// replica, which answers `a:`; the place it holds is held while the connection lasts and
     /// given back when it ends.
     #[tokio::test]
@@ -1887,7 +1893,7 @@ spec:
         let mut proxy = proxy_of(state_with_web("take-asked").await, port, "Workload/default/web", None);
         // One place, so that a second one can be seen to be held.
         proxy.relaying = Limits::new(1, 1).per_node();
-        let caller = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let caller = IpAddr::V6(std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped());
         let (mut client, held) = pair_from_ipv6().await;
         let asking = async {
             client
@@ -1924,7 +1930,7 @@ spec:
         assert_eq!(replicas.load(Ordering::Relaxed), 0);
     }
 
-    /// A NetworkPolicy that does not let [::1] in closes what the table asks for the same way:
+    /// A NetworkPolicy that does not let loopback in closes what the table asks for the same way:
     /// no byte, and no replica is connected.
     #[tokio::test]
     async fn take_closes_what_a_network_policy_refuses_with_no_byte() {
