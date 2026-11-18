@@ -12,7 +12,8 @@ motion.hidden = calm;
 motion.onclick = () => {
   paused = !paused;
   document.documentElement.classList.toggle("paused", paused);
-  motion.setAttribute("aria-pressed", paused); // the label stays "Pause": pressed means the motion is paused
+  motion.setAttribute("aria-pressed", paused);
+  motion.textContent = paused ? "Play" : "Pause";
   for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
 };
 const wait = ms => new Promise(done => setTimeout(done, ms));
@@ -267,7 +268,7 @@ async function live() {
         rep.classList.replace("wait", "on");
       }
     }
-    said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on 4 machines`;
+    said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on ${machines(map)} machines`;
     await sleep(5000);
     await fail();
   }

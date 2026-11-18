@@ -453,8 +453,10 @@ def used_tokens():
 
 
 HAND = ["docs/index.html", "docs/install.html", "docs/404.html"]
-LOOK = re.compile(r'\b(?:href|src)="([^"]*)"')
-IDS = re.compile(r'\bid="([^"]+)"')
+LOOK = re.compile(r'(?<![\w-])(?:href|src|srcset)="([^"]*)"')
+IDS = re.compile(r'(?<![\w-])id="([^"]+)"')
+TITLE = re.compile(r"<title>\s*[^<\s][^<]*</title>")
+OG = r'<meta property="%s" content="\s*[^"\s][^"]*"'
 
 
 def hand_problems():
@@ -478,12 +480,14 @@ def hand_problems():
         for url in found.get(rel, ()):
             if url != "#" and url[1:] not in IDS.findall(text):
                 problems.append(f"{rel}: {url} has no id on the page")
-    for rel in ["docs/index.html", "docs/404.html"]:
+    for rel in HAND:
         text = (ROOT / rel).read_text(encoding="utf-8")
+        if not TITLE.search(text):
+            problems.append(f"{rel}: no title")
         for prop in ["og:title", "og:description", "og:type"] if rel.endswith("index.html") else []:
-            if f'property="{prop}"' not in text:
-                problems.append(f"{rel}: no {prop}")
-        if '<meta name="description"' not in text:
+            if not re.search(OG % prop, text):
+                problems.append(f"{rel}: no {prop}, or it is empty")
+        if rel != "docs/install.html" and not re.search(r'<meta name="description" content="\s*[^"\s]', text):
             problems.append(f"{rel}: no description")
     return problems
 
@@ -570,7 +574,9 @@ def self_test():
     eq(one("# T\n\nOnly this:\n").summary(), "Only this:")
     # the pages written by hand: the links resolve and the landing page carries its metadata
     assert hand_problems() == [], hand_problems()
-    assert LOOK.findall('<a href="x.html#a">') == ["x.html#a"] and IDS.findall('<i id="a">') == ["a"]
+    assert LOOK.findall('<a href="x.html#a"><source srcset="b.png"><i data-href="no">') == ["x.html#a", "b.png"]
+    assert IDS.findall('<i id="a" data-id="no" aria-id="no">') == ["a"]
+    assert TITLE.search("<title>x</title>") and not TITLE.search("<title> </title>") and not re.search(OG % "og:type", '<meta property="og:type" content="">')
     print("site_docs self-test: ok")
     return 0
 

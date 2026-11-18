@@ -1,6 +1,6 @@
 /* kith's page, drawn as a line map: paper, ink, and one blue line (DESIGN.md, "Direction").
    The page's rail is the stem of the k in the bar, carried down; every part is a stop on it. */
-.paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; }
+.paused *, .paused ::before, .paused ::after { animation-play-state: paused !important; transition: none !important; }
 button.button { font-family: inherit; cursor: pointer; }
 [hidden] { display: none !important; }
 
@@ -386,7 +386,8 @@ footer nav a { color: var(--text); text-underline-offset: 4px; text-decoration-c
 footer nav a:hover { text-decoration-color: var(--accent); }
 footer p { min-width: 0; overflow-wrap: anywhere; }
 
-/* 404.html: the map with one stop that is not there. */
+/* 404.html: the map with one stop that is not there. It loads no script, so nothing there can be paused: its two loops end after three turns. */
+.still .map .halo, .still .mark .ring { animation-iteration-count: 3; }
 .hero.lost { display: block; min-height: 0; padding-block: 56px 72px; }
 .hero.lost .map { max-width: 340px; margin-top: 40px; }
 @media (max-width: 860px) { .hero.lost { padding-block: 32px 56px; } }
