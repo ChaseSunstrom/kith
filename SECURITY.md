@@ -256,7 +256,9 @@ Only the newest version is fixed. There are no security releases of older ones.
   here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
   each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
   at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
-  processes included (no per-container limit is set). A port another
+  processes included (no per-container limit is set): a program there that uses
+  select() with an FD_SETSIZE bitmap can be handed a file at or above 1024, so it must
+  lower its own limit (a per-container limit is a possible follow-up). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the

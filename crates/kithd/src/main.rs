@@ -1274,7 +1274,8 @@ mod tests {
         assert_eq!(nofile_soft(1024, 524288), 65536);
         assert_eq!(nofile_soft(1024, 1024), 1024);
         assert_eq!(nofile_soft(100_000, 524288), 100_000);
-        assert_eq!(nofile_soft(5000, 4096), 4096);
+        assert_eq!(nofile_soft(1024, u64::MAX), 65536);
+        assert_eq!(nofile_soft(u64::MAX, u64::MAX), u64::MAX);
     }
 
     #[test]
