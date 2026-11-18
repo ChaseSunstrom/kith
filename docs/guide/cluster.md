@@ -287,6 +287,7 @@ or as the target of a port forward) and the cluster answers it from whichever no
 in the `Cluster`, in the network of a node's LAN card:
 
 ```yaml
+apiVersion: kith.dev/v1
 kind: Cluster
 metadata: {name: home}
 spec:

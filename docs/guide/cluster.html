@@ -130,7 +130,8 @@ spec:
 <p>The longest fitting path wins (<code>/api</code> fits <code>/api/x</code>, not <code>/apiary</code>; <code>exact</code> only itself), unmatched is 404, and an absent Service or closed port is 502; paths are not decoded or rewritten. kith sets <code>Host</code>, <code>X-Forwarded-For</code>, <code>-Proto</code>, <code>-Host</code> and the Service's <code>headers</code>, and drops what a client claims about its origin (<code>Forwarded</code>, other <code>X-Forwarded-*</code>, <code>X-Real-IP</code>, headers with <code>_</code>). Ambiguous framing gets 400; a head is at most 100 headers, ~64 KiB, 30 seconds. WebSocket is the only upgrade; no HTTP/2, and no <code>proxyProtocol</code>.</p>
 <h3 id="one-address-for-the-house">One address for the house <a class="anchor" href="#one-address-for-the-house" aria-label="Link to this section">#</a></h3>
 <p>A router can name one address for the whole cluster (as its DHCP server's DNS server, option 6, or as the target of a port forward) and the cluster answers it from whichever node leads. Give it in the <code>Cluster</code>, in the network of a node's LAN card:</p>
-<pre><code class="language-yaml">kind: Cluster
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Cluster
 metadata: {name: home}
 spec:
   home:
