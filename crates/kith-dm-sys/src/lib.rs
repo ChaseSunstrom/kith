@@ -86,6 +86,45 @@ fn ioctl(file: &File, number: u32, bytes: &mut [u8]) -> Result<i32> {
     }
 }
 
+/// The ioctl `number` on `file` with `value` as its argument (a number, not a pointer).
+fn ioctl_value(file: &File, number: u32, value: u64) -> Result<i32> {
+    // SAFETY: the kernel takes `value` as a number and reads no memory through it.
+    let said = unsafe { libc::ioctl(file.as_raw_fd(), number as _, value as libc::c_ulong) };
+    if said < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(said)
+    }
+}
+
+/// The bit each of the red, green and blue channels starts at in a pixel of the framebuffer
+/// `file` (a /dev/fbN), as FBIOGET_VSCREENINFO reports them.
+pub fn fb_channels(file: &File) -> Result<[u32; 3]> {
+    const GET_SCREEN_INFO: u32 = 0x4600; // FBIOGET_VSCREENINFO
+    let mut screen = vec![0u8; FB_VAR_SCREENINFO];
+    ioctl(file, GET_SCREEN_INFO, &mut screen)?;
+    Ok(fb_channels_of(&screen))
+}
+
+/// `struct fb_var_screeninfo`, in bytes.
+const FB_VAR_SCREENINFO: usize = 160;
+/// Where the `offset` (a u32) of the red, green and blue `fb_bitfield` sit in it.
+const FB_CHANNEL_OFFSETS: [usize; 3] = [32, 44, 56];
+
+fn fb_channels_of(screen: &[u8]) -> [u32; 3] {
+    FB_CHANNEL_OFFSETS.map(|at| u32::from_ne_bytes([screen[at], screen[at + 1], screen[at + 2], screen[at + 3]]))
+}
+
+/// Put the console `tty` (/dev/tty0) in graphics mode, where the kernel draws no text over
+/// a picture on the framebuffer, or back in text mode.
+pub fn set_graphics(tty: &File, graphics: bool) -> Result<()> {
+    const SET_MODE: u32 = 0x4B3A; // KDSETMODE
+    const KD_TEXT: u64 = 0;
+    const KD_GRAPHICS: u64 = 1;
+    ioctl_value(tty, SET_MODE, if graphics { KD_GRAPHICS } else { KD_TEXT })?;
+    Ok(())
+}
+
 /// Give `file` a block device (`/dev/loopN`): what `losetup --find` does. The device is
 /// gone again when the last thing that has it open closes it, so keep what is returned open
 /// until something else (a mapping over it) holds the device.
@@ -750,6 +789,22 @@ pub fn relro_ranges(headers: impl Iterator<Item = (u32, usize, usize)> + Clone, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fb_var_screeninfo_is_160_bytes_with_the_channels_offsets_at_32_44_56() {
+        assert_eq!(FB_VAR_SCREENINFO, 160, "struct fb_var_screeninfo");
+        assert_eq!(
+            FB_CHANNEL_OFFSETS,
+            [32, 44, 56],
+            "red, green and blue fb_bitfield.offset"
+        );
+        // A pixel of BGR: blue in the low byte, red at 16.
+        let mut screen = vec![0u8; FB_VAR_SCREENINFO];
+        for (at, offset) in FB_CHANNEL_OFFSETS.into_iter().zip([16u32, 8, 0]) {
+            screen[at..at + 4].copy_from_slice(&offset.to_ne_bytes());
+        }
+        assert_eq!(fb_channels_of(&screen), [16, 8, 0]);
+    }
 
     const PAGE: usize = 0x1000;
     fn relro(at: usize, size: usize) -> (u32, usize, usize) {
