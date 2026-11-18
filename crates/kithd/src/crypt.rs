@@ -320,11 +320,6 @@ fn unread(read: bool, name: &str, said: &mut dyn FnMut(&str)) {
 }
 
 impl Record {
-    #[cfg(test)]
-    pub fn parse(bytes: &[u8]) -> Option<Record> {
-        Record::parse_said(bytes, &mut |_| {})
-    }
-
     /// The record in `bytes`, and each line of a known kind that was left out (or counts as
     /// there and opens nothing) said to `said`: a flipped byte in one seal does not cost the
     /// seals that still hold.
@@ -2070,6 +2065,13 @@ mod tests {
     use super::*;
     use crate::cluster::pinned_peer::{answering_as, at, node, shared_with};
     use std::sync::atomic::Ordering;
+
+    // (Here, not above `mod tests`: what a file does is read up to its first test attribute.)
+    impl Record {
+        pub fn parse(bytes: &[u8]) -> Option<Record> {
+            Record::parse_said(bytes, &mut |_| {})
+        }
+    }
 
     /// What the web UI shows once, a new recovery key, is kept by no cache: the answer, and a
     /// refusal of it, say `no-store`; an Identity with no right to apply NodeKeys gets a 403.
