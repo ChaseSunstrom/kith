@@ -90,8 +90,8 @@ fn blocks(tag: &str) -> Vec<(usize, String)> {
 }
 
 /// Blocks that are not a whole resource, and so are not checked: two `spec:` parts shown
-/// inside a list, and the installer's file.
-const PARTS: usize = 4;
+/// inside a list, the installer's file, and an OS spec (`os/build.sh --spec`).
+const PARTS: usize = 5;
 
 #[test]
 fn readme_examples_are_taken_by_this_build() {
