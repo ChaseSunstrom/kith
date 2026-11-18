@@ -85,7 +85,10 @@ fn class(p: &[u8], at: usize, c: u8) -> Option<(bool, usize)> {
 
 /// The names in `/proc/modules` (the first word of each line).
 fn loaded(text: &str) -> HashSet<String> {
-    text.lines().filter_map(|l| l.split_whitespace().next()).map(str::to_string).collect()
+    text.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
 }
 
 /// What a uevent says to load: the MODALIAS of an `ACTION=add` (the message is the
@@ -143,7 +146,10 @@ impl Tree {
             .lines()
             .filter_map(|l| {
                 let (path, needs) = l.split_once(':')?;
-                Some((name(path), (path.to_string(), needs.split_whitespace().map(name).collect())))
+                Some((
+                    name(path),
+                    (path.to_string(), needs.split_whitespace().map(name).collect()),
+                ))
             })
             .collect();
         Tree {
@@ -160,7 +166,11 @@ impl Tree {
     fn plan(&self, modalias: &str, skip: &HashSet<String>) -> Vec<(String, PathBuf)> {
         let mut out: Vec<(String, PathBuf)> = Vec::new();
         for (_, module) in self.aliases.iter().filter(|(pattern, _)| glob(pattern, modalias)) {
-            let Some((_, needs)) = self.deps.get(module).filter(|_| !skip.contains(module) && !self.builtin.contains(module)) else {
+            let Some((_, needs)) = self
+                .deps
+                .get(module)
+                .filter(|_| !skip.contains(module) && !self.builtin.contains(module))
+            else {
                 continue;
             };
             for one in needs.iter().rev().chain(std::iter::once(module)) {
@@ -198,10 +208,17 @@ fn finit(module: &str, path: &Path) -> bool {
     use nix::kmod::{ModuleInitFlags, finit_module};
     let compressed = matches!(path.extension().and_then(|e| e.to_str()), Some("xz" | "zst" | "gz"));
     // (MODULE_INIT_COMPRESSED_FILE, 4: nix has no name for it.)
-    let flags = if compressed { ModuleInitFlags::from_bits_retain(4) } else { ModuleInitFlags::empty() };
+    let flags = if compressed {
+        ModuleInitFlags::from_bits_retain(4)
+    } else {
+        ModuleInitFlags::empty()
+    };
     match std::fs::File::open(path).map_err(|e| e.to_string()).and_then(|f| {
         match finit_module(&f, c"", flags) {
             Ok(()) | Err(nix::errno::Errno::EEXIST) => Ok(()),
+            Err(nix::errno::Errno::EINVAL) if compressed => {
+                Err("Invalid argument: the kernel cannot load compressed modules (it needs 5.17 or later and MODULE_DECOMPRESS)".into())
+            }
             Err(e) => Err(e.to_string()),
         }
     }) {
@@ -220,42 +237,52 @@ fn finit(module: &str, path: &Path) -> bool {
 /// `/lib/modules/<release>` (the plain image) it does nothing and starts nothing.
 pub fn start() {
     let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
-    let Some(tree) = Tree::read(&Path::new("/lib/modules").join(release.trim())).filter(|_| !release.trim().is_empty()) else {
+    let Some(tree) = Tree::read(&Path::new("/lib/modules").join(release.trim())).filter(|_| !release.trim().is_empty())
+    else {
         return;
     };
     // The socket first: what the scan loads brings devices, and their uevents wait in it.
-    let socket = listener().map_err(|e| eprintln!("kithd: init: no uevents, modules are loaded for the devices there are: {e}"));
-    // (A thread: kithd does not wait for drivers; a thread that only reads, loads and logs.)
-    std::thread::spawn(move || {
-        let (mut tried, start) = (HashSet::new(), std::time::Instant::now());
-        let count = scan(&tree, &mut tried);
-        eprintln!("kithd: init: {count} kernel modules loaded for the devices there are, in {} ms", start.elapsed().as_millis());
-        if let Ok(socket) = socket {
-            listen(&socket, &tree, tried);
-        }
-    });
+    let socket =
+        listener().map_err(|e| eprintln!("kithd: init: no uevents, modules are loaded for the devices there are: {e}"));
+    // The scan before init goes on: the network card's driver may be a module, and the
+    // node's name is made from its address next.
+    // ponytail: every alias line is matched against every device (a distro's modules.alias
+    // is ~25k lines); bucket the lines by bus if a start is measured slow.
+    let (mut tried, start) = (HashSet::new(), std::time::Instant::now());
+    let count = scan(&tree, &mut tried);
+    eprintln!(
+        "kithd: init: {count} kernel modules loaded for the devices there are, in {} ms",
+        start.elapsed().as_millis()
+    );
+    // (A thread for what is added later: it only reads, loads and logs.)
+    if let Ok(socket) = socket {
+        std::thread::spawn(move || listen(&socket, &tree, tried));
+    }
 }
 
 /// Load for every device in /sys/devices: how many modules were loaded.
 fn scan(tree: &Tree, tried: &mut HashSet<String>) -> usize {
-    let mut count = 0;
-    for alias in modaliases(Path::new("/sys/devices")) {
-        let now = loaded(&std::fs::read_to_string("/proc/modules").unwrap_or_default());
-        count += tree.load_for(&alias, &now, tried, &mut finit);
-    }
-    count
+    // (What was loaded before the scan; what it loads is in `tried`.)
+    let now = loaded(&std::fs::read_to_string("/proc/modules").unwrap_or_default());
+    modaliases(Path::new("/sys/devices"))
+        .iter()
+        .map(|alias| tree.load_for(alias, &now, tried, &mut finit))
+        .sum()
 }
 
 fn listener() -> nix::Result<std::os::fd::OwnedFd> {
-    use nix::sys::socket::{AddressFamily, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, setsockopt, socket, sockopt};
+    use nix::sys::socket::{
+        AddressFamily, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, setsockopt, socket, sockopt,
+    };
     let fd = socket(
         AddressFamily::Netlink,
         SockType::Datagram,
         SockFlag::SOCK_CLOEXEC,
         SockProtocol::NetlinkKObjectUEvent,
     )?;
-    // (A boot's uevents come in a burst: the default buffer is 208 KB.)
-    let _ = setsockopt(&fd, sockopt::RcvBuf, &(1 << 20));
+    // (A boot's uevents come in a burst: the default buffer is 208 KB. Forced, as udev does:
+    // the plain one is capped at net.core.rmem_max even for root. ENOBUFS rescans anyway.)
+    let _ = setsockopt(&fd, sockopt::RcvBufForce, &(1 << 20));
     // Group 1: the kernel's own events (udev's re-sent ones are group 2).
     bind(std::os::fd::AsRawFd::as_raw_fd(&fd), &NetlinkAddr::new(0, 1))?;
     Ok(fd)
@@ -315,7 +342,12 @@ mod tests {
         assert!(glob("v[!8]x", "v7x") && !glob("v[!8]x", "v8x"));
         assert!(glob("v[]]x", "v]x") && glob("a[b", "a[b"));
         assert!(glob("pci:v*d*sv*sd*bc02sc*i*", NIC));
-        assert!(tree().plan("usb:v1D6Bp0003d0100dc09dsc00dp00ic09isc00ip00in00", &HashSet::new()).len() == 1);
+        assert!(
+            tree()
+                .plan("usb:v1D6Bp0003d0100dc09dsc00dp00ic09isc00ip00in00", &HashSet::new())
+                .len()
+                == 1
+        );
         assert!(tree().plan("usb:v1D6Bp0004d0100", &HashSet::new()).is_empty());
     }
 
@@ -325,7 +357,10 @@ mod tests {
         // (modules.dep lists the nearest first: c is the farthest.)
         assert_eq!(plan, ["c", "b", "e1000_x"]);
         let usb = tree().plan("usb:v1D6Bp0002d0001dc00dsc00dp00ic00isc00ip00in00", &HashSet::new());
-        assert_eq!(usb, [("xhci_hcd".to_string(), PathBuf::from("/m/kernel/usb/xhci-hcd.ko"))]);
+        assert_eq!(
+            usb,
+            [("xhci_hcd".to_string(), PathBuf::from("/m/kernel/usb/xhci-hcd.ko"))]
+        );
         // (A module built into the kernel is not loaded.)
         assert!(!plan.contains(&"in_kernel".to_string()));
     }
@@ -383,7 +418,10 @@ mod tests {
                 true
             });
         }
-        assert_eq!(seen.last().unwrap(), &("e1000_x".to_string(), lib.join("kernel/net/e1000_x.ko.xz")));
+        assert_eq!(
+            seen.last().unwrap(),
+            &("e1000_x".to_string(), lib.join("kernel/net/e1000_x.ko.xz"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

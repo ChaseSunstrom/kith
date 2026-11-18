@@ -93,10 +93,11 @@ driver away until the next GPU one.
 
 The plain image has no `/lib/modules`, and kithd then loads nothing. An image that has one
 (a spec's kernel built with loadable modules, `modules.alias` and `modules.dep` from
-`depmod` beside them) gets its drivers from kithd, the way udev does: on a thread, so
-serving does not wait, kithd matches the `modalias` of every device under `/sys/devices` to
-`modules.alias` and loads what matches, what it needs first (`finit_module`), and then does
-the same for each kernel uevent that adds a device. A card swapped for another of a kind
+`depmod` beside them) gets its drivers from kithd, the way udev does: before it names the node and brings the
+network up (the network card's driver may be one), kithd matches the `modalias` of every
+device under `/sys/devices` to `modules.alias` and loads what matches, what it needs first
+(`finit_module`), and then, on a thread, does the same for each kernel uevent that adds a
+device. A card swapped for another of a kind
 the image has a driver for needs no restart. Modules in `modules.builtin` or already in
 `/proc/modules` are not loaded; each is tried once, and a failure (a bad signature, a
 missing file) is one console line, never an end. Not supported: module parameters,
