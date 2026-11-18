@@ -13,8 +13,7 @@
 // ponytail: one layer and no base image (the volume holds the whole root); made once for a
 // spec (a new tag is a new image: nodes keep a tag they have pulled); nothing is pushed
 // with the registry protocol; an Image that is deleted leaves its Blobs to be deleted by
-// hand; an Image that waits (no Volume, its Job not done) says nothing in its status. Each
-// has its own day.
+// hand; an Image that waits (no Volume, its Job not done) says nothing in its status.
 
 use crate::Shared;
 use crate::blobs::Incoming;

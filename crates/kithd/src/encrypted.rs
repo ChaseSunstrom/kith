@@ -23,7 +23,7 @@
 // inode for 32 KiB however big it grows, and a volume is as big as it was made: `size` is
 // read once. A key stays on the other nodes after its Volume is deleted (as the file does
 // on its node). While a volume is open its key is in kithd's memory on its node (as it is
-// in the kernel's), for the nodes that join later. Each has its own day; the first is a key sealed to each holder's TPM.
+// in the kernel's), for the nodes that join later.
 
 use crate::Shared;
 use crate::cluster::Peer;
