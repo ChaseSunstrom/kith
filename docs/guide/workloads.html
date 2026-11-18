@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>What kithd does today: kith</title>
+<meta name="description" content="kithd keeps the store and runs what the resources say: containers, host processes, Jobs and CronJobs. kith talks to it over a unix socket only you can open. A second kithd on one state directory is refused.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/workloads.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li class=here><a href="workloads.html" aria-current="page">What kithd does today</a><ol class="inner"><li class="h2"><a href="#images">Images</a></li><li class="h2"><a href="#cronjobs">CronJobs</a></li><li class="h2"><a href="#not-yet">Not yet</a></li><li class="h2"><a href="#what-a-container-is-kept-from">What a container is kept from</a></li><li class="h2"><a href="#a-replica-as-a-pod">A replica as a pod</a></li><li class="h2"><a href="#a-pod-behind-a-vpn-exit">A pod behind a VPN exit</a></li><li class="h2"><a href="#what-a-container-is-given">What a container is given</a></li></ol></li><li><a href="storage.html">Storage</a></li><li><a href="hardware.html">Hardware</a></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="what-kithd-does-today">What kithd does today</h1>
+<p>kithd keeps the store and runs what the resources say: containers, host processes, Jobs and CronJobs. <code>kith</code> talks to it over a unix socket only you can open. A second kithd on one state directory is refused.</p>
+<div class="table"><table><thead><tr><th>Setting</th><th>Flag, env</th><th>Default</th></tr></thead><tbody><tr><td>Socket</td><td><code>--socket</code>, <code>KITH_SOCKET</code></td><td><code>$XDG_RUNTIME_DIR/kith/kithd.sock</code></td></tr><tr><td>State directory</td><td><code>--state</code>, <code>KITH_STATE</code></td><td><code>~/.local/state/kith/raft</code></td></tr><tr><td>How long <code>kith</code> waits (a change that timed out may still have been applied)</td><td><code>--timeout</code>, <code>KITH_TIMEOUT</code> (s)</td><td>30</td></tr><tr><td>How long an unused image is kept</td><td><code>--image-grace</code> (s)</td><td>a day</td></tr><tr><td>State disk kept free</td><td><code>--storage-reserve</code> (bytes)</td><td>as root: 5% of the disk, at most 1 GiB; else 0</td></tr><tr><td>Log file size before it is moved aside</td><td><code>--log-cap</code> (bytes)</td><td>10 MiB</td></tr></tbody></table></div>
+<ul><li><strong>The store</strong> is a log synced to disk before a change is answered, plus a snapshot now and then: the store a cluster uses, with this node as its only member. <code>kith --store FILE</code> edits a plain file with no daemon, for trying things out.</li><li><strong>Containers.</strong> Each <code>Workload</code> container runs in its own cgroup with youki's <code>libcontainer</code> linked in: no containerd, no shim, no root. Memory and CPU limits, <code>resources.storage</code> (<a href="#a-replica-as-a-pod">below</a>), <code>command</code>/<code>args</code> and <code>env</code> from values, <code>ConfigMap</code>s and <code>Secret</code>s are honoured. A container that exits is restarted per <code>restartPolicy</code>, after a wait that doubles from a second to a minute. <strong>Exec units</strong> are plain processes of the host (its files, network, your user) with the same cgroup, limits and restart policy.</li><li><strong>Jobs.</strong> A <code>Job</code> runs <code>completions</code> runs of its template, <code>parallelism</code> at a time (1). A failed run is tried again after a backoff; <code>retries</code> failures are forgiven (3), one more fails the Job, and so does passing <code>timeoutSeconds</code>. <code>kith get job</code> shows <code>running</code>, <code>succeeded</code> or <code>failed: &lt;why&gt;</code>. A finished Job runs again only when you change it.</li><li><strong>Logs.</strong> <code>kith logs KIND/NAME</code> prints a unit's output; <code>--unit</code>, <code>--replica</code>, <code>--stderr</code>, <code>--tail LINES</code>, <code>--previous</code> (the one old copy) and <code>-f</code> narrow it. Deleting the Workload or Job deletes its logs.</li><li><strong>Probes.</strong> <code>readiness</code> decides whether a replica counts as ready. A <code>liveness</code> probe that fails <code>failureThreshold</code> times in a row (3) restarts the container. <code>tcp</code> and <code>http</code> probes go to <code>localhost</code> every <code>intervalSeconds</code> (10), and once a second until the first success.</li><li><strong>Updates.</strong> A changed Workload (or a changed <code>ConfigMap</code> or <code>Secret</code> value in a unit's <code>env</code>) is replaced one replica at a time, the next once the others are ready: an update that does not come up stops at its first replica and the status says where. <code>strategy: recreate</code> replaces all at once.</li><li><strong>Shutdown.</strong> On SIGTERM kithd stops what it started, answering requests for 3 seconds at most. A second signal ends it at once and its next start stops what was left.</li></ul>
+<h3 id="images">Images <a class="anchor" href="#images" aria-label="Link to this section">#</a></h3>
+<p>Images are pulled into a content-addressed store. One already pulled starts without asking the registry, so <code>pullPolicy: always</code> is how you follow a tag that moves. A file several unpacked images hold alike is one file on the node, hard-linked into each: three nginx images of one Alpine base took 44% less disk. An image no unit uses is removed (kithd's log says so), with its layers no other image has.</p>
+<ul><li><strong>When.</strong> After <code>--image-grace</code> seconds unused; or, while the state disk is under <code>--storage-reserve</code>, oldest first, after two minutes. kithd looks once a minute.</li><li><strong>What stays.</strong> An image a unit has a slot for or a container is made from, and every image while a pull is under way. Time between a Job's or CronJob's runs counts as unused.</li><li><strong>After removal</strong> the image is pulled again when a unit needs it (<code>pullPolicy: never</code> fails). A node off its network (a laptop) wants <code>--image-grace 0</code>, which keeps every image.</li></ul>
+<h4 id="an-image-from-a-nix-closure">An image from a Nix closure <a class="anchor" href="#an-image-from-a-nix-closure" aria-label="Link to this section">#</a></h4>
+<p>A node has no Nix, and needs none: build the image elsewhere with one layer for each store path (nixpkgs' <code>dockerTools.buildLayeredImage</code>, as in <a href="https://github.com/ChaseSunstrom/kith/blob/main/examples/nix-images.nix">examples/nix-images.nix</a>), push it to a registry, and name it in a template like any other image.</p>
+<pre><code class="language-sh">nix-build examples/nix-images.nix -A hello -o hello.tar
+docker load -i hello.tar &amp;&amp; docker tag hello:1 registry.example/hello:1
+docker push registry.example/hello:1
+</code></pre>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Job
+metadata: { name: hello }
+spec:
+  template:
+    containers: [{ name: run, image: "registry.example/hello:1" }]
+</code></pre>
+<p>Two such images share the layers of the store paths they share. The example's two, pulled by one node: <code>hello</code> has 6 layers and <code>figlet</code> 7, 4 of them the same (glibc, libgcc, libidn2, libunistring), so the node keeps 9 layers; unpacked, <code>hello</code> alone is 33 MB, <code>figlet</code> 42 MB, and both together 42 MB. A layer's entries are named from <code>/</code> (<code>/nix/store/…</code>) and land in the image's root, as Docker takes them.</p>
+<h3 id="cronjobs">CronJobs <a class="anchor" href="#cronjobs" aria-label="Link to this section">#</a></h3>
+<p>At each minute its <code>schedule</code> names (cron's five fields, or <code>@hourly</code> and the like; UTC), the node that leads makes a Job of the CronJob's <code>job</code>, called <code>&lt;name&gt;-&lt;minute&gt;</code>. Whoever applies a CronJob must be allowed to apply a Job.</p>
+<div class="table"><table><thead><tr><th>Field</th><th>Meaning</th></tr></thead><tbody><tr><td><code>concurrency: forbid</code> / <code>replace</code></td><td>Wait for a Job still running / remove it first.</td></tr><tr><td><code>successfulJobsHistoryLimit</code>, <code>failedJobsHistoryLimit</code></td><td>Finished Jobs kept (3 each); all go with the CronJob.</td></tr><tr><td><code>startingDeadlineSeconds</code></td><td>Run, once, the latest minute missed since <code>status.last</code> no older than this (a week at most). Without it a missed minute is skipped.</td></tr><tr><td><code>timezone</code> not <code>UTC</code>, a schedule that cannot be read, a name over 54 characters</td><td>The CronJob does not run, and its status says why.</td></tr></tbody></table></div>
+<h3 id="not-yet">Not yet <a class="anchor" href="#not-yet" aria-label="Link to this section">#</a></h3>
+<ul><li><code>exec</code> probes are accepted and do nothing (the status says so). A container's <code>ports</code> only name them for probes and Services; nothing is opened or mapped.</li><li>A replica is stopped before its replacement starts, so <code>replicas: 1</code> is down for a moment during an update. <code>blueGreen</code> is treated as rolling.</li><li>Pulls are anonymous; layers must be gzip or plain tar.</li><li><a href="https://github.com/ChaseSunstrom/kith/blob/main/dist/kithd.service"><code>dist/kithd.service</code></a> is a systemd user unit; <code>sh ci/systemd.sh</code> runs it under your user's systemd and checks its cgroups and its stop. A root service on a distro is untested.</li></ul>
+<h3 id="what-a-container-is-kept-from">What a container is kept from <a class="anchor" href="#what-a-container-is-kept-from" aria-label="Link to this section">#</a></h3>
+<p>Every container is started the same way, whatever it is for, with nothing to say:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata:
+  name: web
+spec:
+  template:
+    containers:
+      - name: web
+        image: registry.example/shop/web:1
+        signedBy:                  # run only if signed by one of these keys [whoever made it]
+          - |
+            -----BEGIN PUBLIC KEY-----
+            MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAERhDxn4VReZhiLBr2unWdvMY/ZNKC
+            MGaYlOciQKQ+hYdtBvtUrt5fB1yFOSdyVJyZGQsBVEz8puMa+EcnvEXHIg==
+            -----END PUBLIC KEY-----
+        runAsUser: 1000            # [the image's User; 65534 if it names none, or root]
+        seccomp:
+          allow: [ptrace]          # refused calls it may make after all [none]
+        userNamespaces: true       # it may start a sandbox of its own inside [false]
+</code></pre>
+<ul><li><p><strong>Who it is.</strong> <code>runAsUser</code> (a number; the group the same), else the image's <code>User</code>, else nobody (65534). An image naming root gets nobody: only <code>runAsUser: 0</code> makes a container root.</p></li><li><p><strong>Nothing more than that user.</strong> No capabilities (on kith OS the one for ports below 1024 is kept) and <code>no_new_privs</code>, so a setuid program in the image is an ordinary program. Its image is read-only, with a tmpfs on <code>/tmp</code> and <code>/run</code>. Where kithd is root, a volume it mounts to write is given to its user: two workloads that write one volume should be one user.</p></li><li><p><strong>Its users</strong> depend on where it runs (its status says: <code>hostUsers: false</code> is a namespace of its own):</p><div class="table"><table><thead><tr><th>Where</th><th>Its users</th></tr></thead><tbody><tr><td>kithd is your service</td><td>A user namespace where its user is the only one (its files are yours on the node); root is root of that namespace alone.</td></tr><tr><td>kith OS, a pod's container (<a href="#a-replica-as-a-pod">a pod</a>)</td><td>A namespace of its own: users 0 to 65535 are 65536 users of the node that no other container has, so <code>runAsUser: 0</code> is root of that namespace alone and 65536 or more is refused. Image and volumes are mounted id-mapped (Linux 5.12; a kernel or file system that refuses one fails the start).</td></tr><tr><td>kith OS, the rest</td><td>The node's users: <code>runAsUser: 0</code> is the node's root with three capabilities (signals, ports below 1024, the audit log). That is a container on the node's network, one whose image or volume is on a file system without id-mapped mounts (ext4, xfs, btrfs and tmpfs have them; NFS does not), one given devices, and a NodeWorkload.</td></tr></tbody></table></div></li><li><p><strong>A filter on its system calls</strong> (seccomp) refuses the calls below and lets the rest through. <code>seccomp: { allow: [NAMES] }</code> lets some of them through again; <code>seccomp: { unconfined: true }</code> is no filter, and a 32-bit program on a 64-bit node needs it.</p><div class="table"><table><thead><tr><th>Kind</th><th>Calls</th></tr></thead><tbody><tr><td>mounts</td><td><code>mount</code>, <code>umount2</code>, <code>pivot_root</code>, <code>open_tree</code>, <code>move_mount</code>, <code>fsopen</code>, <code>fsconfig</code>, <code>fsmount</code>, <code>fspick</code>, <code>mount_setattr</code>, <code>open_by_handle_at</code></td></tr><tr><td>namespaces</td><td><code>unshare</code>, <code>setns</code>, <code>clone</code> when it makes a namespace, <code>clone3</code></td></tr><tr><td>machine and kernel</td><td><code>init_module</code>, <code>finit_module</code>, <code>delete_module</code>, <code>kexec_load</code>, <code>kexec_file_load</code>, <code>reboot</code>, <code>swapon</code>, <code>swapoff</code>, <code>acct</code>, <code>settimeofday</code>, <code>clock_settime</code>, <code>bpf</code>, <code>perf_event_open</code>, <code>userfaultfd</code>, <code>io_uring_setup</code>, <code>io_uring_enter</code>, <code>io_uring_register</code>, <code>add_key</code>, <code>request_key</code>, <code>keyctl</code></td></tr><tr><td>other processes</td><td><code>ptrace</code>, <code>process_vm_readv</code>, <code>process_vm_writev</code>, <code>kcmp</code>, <code>pidfd_getfd</code></td></tr></tbody></table></div></li><li><p><strong>A sandbox of its own inside</strong> (Steam, Flatpak, browsers: bubblewrap) needs <code>userNamespaces: true</code>. It lets the namespace and mount calls through (not <code>open_by_handle_at</code>), leaves <code>/proc</code> and <code>/sys/firmware</code> uncovered, and on kith OS drops the capability for ports below 1024. The cost: inside a user namespace a program reaches kernel code a plain user never calls, where much of what has made a user the node's root was found. The node's root is not started with it.</p></li><li><p><strong>Whose image it is.</strong> With <code>signedBy</code>, the image runs only if one of those keys signed it, as <code>cosign sign --key</code> does: the signature (the tag <code>sha256-DIGEST.sig</code> in the image's repository) is checked against the manifest's digest before any layer is fetched. Keys are ECDSA P-256 or Ed25519: the <code>.pub</code> file's text, or the base64 in it. With no <code>signedBy</code> and no cluster rule (below), an image runs whoever made it.</p></li><li><p><strong>Signed without a kept key</strong> (<code>cosign sign IMAGE</code>): <code>signedBy</code> may name an identity instead. You give the roots you trust (for the public Sigstore instance, from <code>cosign trusted-root create</code>):</p><pre><code class="language-yaml">signedBy:
+  - issuer: https://token.actions.githubusercontent.com
+    subject: https://github.com/acme/tool/.github/workflows/release.yml@refs/heads/main
+    authority: [ "-----BEGIN CERTIFICATE-----\n…", "-----BEGIN CERTIFICATE-----\n…" ]
+    log: "-----BEGIN PUBLIC KEY-----\n…"
+</code></pre><p>The image runs only if a certificate from that authority names exactly that subject and issuer and was valid when the log (under its key) saw the signature. What this proves and what it does not: <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md#what-is-not-defended">SECURITY.md</a> and <a href="../adr-keyless.html">docs/adr-keyless.md</a>.</p></li><li><p><strong>Keys named once, for the cluster.</strong> A <code>Cluster</code>'s <code>spec.images</code> says which keys sign the images under a registry or a path of one, whatever a template says:</p><pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Cluster
+metadata: { name: home }
+spec:
+  images:
+    - prefix: ghcr.io/acme        # ghcr.io/acme/tool, not ghcr.io/acmex
+      signedBy: [MCowBQYDK2VwAyEAGb9ECWmEzf6FQbrBZ9w7lshQhqowtrbLDFw4rXAxZuE=]
+    - signedBy:                   # no prefix: every other image a node pulls
+        - MCowBQYDK2VwAyEAPN3lqZV4Lw1d2sZ0c3gW5vQy8Tn6uJ7kR9xB1mD4hFA=
+</code></pre><p>An image is held to the rule with the longest prefix it is under (<code>nginx</code> is <code>docker.io/library/nginx</code>) and runs only if one of that rule's keys signed it. A template's own <code>signedBy</code> can then only narrow: a key both name must have signed. An image under no rule runs as before, so to cover every image give a rule with no prefix. A rule may name identities too.</p><ul><li>Only someone with rights over the whole cluster can apply a <code>Cluster</code>. Every node must run a build that reads rules: an older one runs an image as before.</li><li>At most 32 rules, 16 keys each. A rule by mistake stops new containers under it from starting (the refusal names it); take it out of the <code>Cluster</code> to go back. <code>spec.images</code> is all kithd reads of a <code>Cluster</code> today; <code>kith lint</code>, <code>diff</code> and <code>apply</code> say so of its other fields.</li></ul></li><li><p><strong>What it still reaches.</strong> The node's network, the kernel through every call the filter lets by, and the devices it claims (a GPU's render node is a wide door into a kernel driver). Untrusted programs belong in a VM (<a href="hardware.html#virtual-machines">Virtual machines</a>), which is what a <code>vms</code> unit is for.</p></li><li><p><strong>Not yet.</strong> No AppArmor or SELinux profile. On kith OS, no user namespace for a container on the node's network, one given devices or one with a volume of another node. A call the kernel gains later is let through until it is named in the filter. A log of Rekor v2 is not read. An <code>exec</code> unit is none of this: it is a process of the host.</p></li></ul>
+<h3 id="a-replica-as-a-pod">A replica as a pod <a class="anchor" href="#a-replica-as-a-pod" aria-label="Link to this section">#</a></h3>
+<p><code>pod: true</code> on a template runs each replica as Kubernetes runs a pod. A Deployment sent through <a href="kubernetes.html#kubectl-and-helm-as-they-are">the Kubernetes API</a> says it, and a kith file can too:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web, labels: { app: web } }
+spec:
+  replicas: 3
+  template:
+    pod: true
+    containers:
+      - name: web
+        image: nginx:1.27-alpine
+        ports: [{ port: 80 }]
+</code></pre>
+<ul><li><strong>A network of its own.</strong> The replica's containers share one: any port is theirs (three replicas on one node each listen on port 80), and <code>localhost</code> is each other. The replica has an address of its own, on the cluster's mesh where there is one (<code>--mesh</code>), so every node reaches it and Services send to it. Its DNS is this node's; outside names go to the node's resolvers, so the node needs one in <code>/etc/resolv.conf</code> or <code>--dns-upstream</code>.</li><li><strong>Its address range</strong> is <code>100.88.0.0/16</code> unless the node's kithd is given another (when its own network or tailnet is in it) with <code>--pod-range ADDRESS/BITS</code> or <code>KITH_POD_RANGE</code>; on kith OS after <code>--</code> on the kernel command line, or in <code>boot.args</code> of the config partition. It is the node's own, from <code>/8</code> to <code>/24</code>, a whole network (<code>10.77.0.0/20</code>, not <code>10.77.0.1/20</code>), never loopback, link-local, multicast or reserved space, and should be private. A node address inside it makes kithd refuse <code>--pod-range</code> and otherwise warn on stderr.</li><li><strong>A root file system to write.</strong> Each container may write its own (what it writes goes when it does), unless it says <code>readOnlyRoot: true</code>. It is the user its image names, root included, with the capabilities a container runtime gives root, behind the same system call filter. On kith OS each container of a pod is a user namespace of its own, so its root is not the node's root (<a href="#what-a-container-is-kept-from">what a container is kept from</a>).</li><li><strong>What it may write.</strong> <code>resources: { storage: 1Gi }</code> on a container bounds what its replica writes outside its Volumes (its roots and scratch on the state disk, summed against the sum of the limits). A limit under 64Ki is refused, and a Node's <code>reserved</code>, a seat's <code>reserve</code> and a Namespace's <code>quota</code> refuse <code>storage</code>. The Node's status says which way a node holds limits:<ul><li>On a kith OS state disk made with project quotas, at the write: each pod is a project, and a write past its limit fails (<code>EDQUOT</code>). A pod also gets a share of the disk's files (4096 at least): a unit with very many small files needs a larger <code>storage</code>.</li><li>Elsewhere, by counting about every 10 seconds: a replica past its limit is replaced, started again from an empty root and scratch, and its status says how much it wrote. A fast writer can pass the limit between counts, and a kithd that is not root counts only what it can read. Under <code>--storage-reserve</code>, the replica that wrote the most is replaced, limit or none, one per count.</li></ul></li></ul>
+<h3 id="a-pod-behind-a-vpn-exit">A pod behind a VPN exit <a class="anchor" href="#a-pod-behind-a-vpn-exit" aria-label="Link to this section">#</a></h3>
+<p>An app that must reach the internet only through a VPN needs no VPN container with <code>NET_ADMIN</code>, <code>/dev/net/tun</code> and a killswitch. The node holds the WireGuard tunnel; the pod gets a network that leads into it:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Secret
+metadata: { name: vpn, namespace: kith-system }
+spec:
+  data:
+    wg0.conf: |              # the file your provider gives you, as it gives it
+      [Interface]
+      PrivateKey = ...
+      Address = 10.2.0.2/32
+      DNS = 10.2.0.1
+      [Peer]
+      PublicKey = ...
+      AllowedIPs = 0.0.0.0/0
+      Endpoint = 192.0.2.10:51820
+---
+apiVersion: kith.dev/v1
+kind: Exit
+metadata: { name: vpn }
+spec:
+  node: n1                   # the node that holds the tunnel; the pods run there
+  secret: vpn                # in kith-system: kithd reads it, no container mounts it
+  namespaces: [media]        # whose pods may leave by it
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: downloads, namespace: media }
+spec:
+  template:
+    pod: true
+    exit: vpn
+    containers:
+      - name: app
+        image: example/downloads:1
+        ports: [{ port: 8080, publish: true }]
+</code></pre>
+<ul><li><strong>Through the tunnel, or nowhere.</strong> Before the pod's link is made, kithd writes rules that send everything the pod sends outside the cluster into the tunnel, or, with no tunnel, nowhere; the firewall drops whatever would leave by any other link, whether kithd runs or not. With the provider silent, or the tunnel or the Exit deleted, the pod reaches nothing outside: it never falls back to the node's own way out. IPv6 never leaves. Nothing comes in from the tunnel that was not started from this side, so the provider reaches none of the node's services.</li><li><strong>Names.</strong> The pod asks the exit's DNS (<code>DNS</code> in the file, or the Exit's <code>dns</code>) through the tunnel, never the node's resolver, so it has no cluster DNS names.</li><li><strong>Only where the tunnel is.</strong> An exit's pods are placed on its node; a node with no tunnel for it, or a kithd that is not root, does not start them. A Workload in a namespace the Exit does not list is refused. Only a Workload's pods leave by an exit, not a Job's, NodeWorkload's or exec unit's.</li><li><strong>Its web UI from the LAN.</strong> <code>publish: true</code> on a port (TCP, or <code>protocol: udp</code>) makes kithd listen on that port of each of the node's IPv4 addresses and pass each connection or datagram to the pod; replies go back the same way, not through the tunnel. <code>publish</code> works for any pod. The app must listen on <code>0.0.0.0</code>, not 127.0.0.1 alone, and sees each client as the pod's own address.<ul><li>A port belongs to the first pod of a namespace that has it; another of the same namespace waits, one of another namespace is refused. At most 8 ports a pod and 64 a node, none below 1024 or one kithd serves on (5000, 7443 and 51820).</li><li>A connection ends after 10 seconds with nothing sent, or 10 minutes once something has been.</li></ul></li><li><strong>An Exit</strong> is cluster-wide: whoever may write one decides which namespaces' pods leave through it, so a Role scoped to a namespace cannot. Only its node is sent it and its Secret. <code>Endpoint</code> has to be an address; the tunnel carries IPv4 only. Changing an Exit's namespaces or <code>dns</code> leaves its tunnel up, and a tunnel, rule or route taken away is made again within a minute.</li><li><strong>Not yet:</strong> OpenVPN, port forwarding, one key on two nodes, an exit's traffic from a pod on another node, and phones or laptops through an exit.</li></ul>
+<h3 id="what-a-container-is-given">What a container is given <a class="anchor" href="#what-a-container-is-given" aria-label="Link to this section">#</a></h3>
+<p>Files from a ConfigMap or a Secret, directories of its replica's own, what it is told from maps and of itself, and containers that run before it. A Deployment sent through <a href="kubernetes.html#kubectl-and-helm-as-they-are">the Kubernetes API</a> says them as Kubernetes does:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: web }
+spec:
+  template:
+    initContainers:                # run first, in this order, each to its end [none]
+      - name: migrate
+        image: registry.example/shop/migrate:1
+        volumeMounts: [{ scratch: work, path: /work }]
+    containers:
+      - name: web
+        image: registry.example/shop/web:1
+        envFrom:
+          - configMap: web-env     # every key of it is a variable
+          - secret: web-keys
+            prefix: KEY_           # put before each name [nothing]
+        env:
+          - name: POD_NAME
+            field: name            # this replica's name | namespace | node | address
+        runAsNonRoot: true         # do not start it as root [false]
+        dropCapabilities: [all]    # start without these, or without `all` [none]
+        volumeMounts:
+          - configMap: web-conf    # each key a file, changed when the ConfigMap is
+            path: /etc/web
+          - configMap: web-conf
+            path: /etc/nginx/nginx.conf
+            subPath: nginx.conf    # one of them alone, at a file's path
+          - secret: web-tls
+            path: /etc/tls
+            items: { tls.key: private/key.pem }   # only these keys, at these paths [every key, by its name]
+            mode: "0400"           # [0444]
+          - scratch: work          # an empty directory of this replica's
+            path: /work
+          - volume: data
+            path: /var/lib/postgresql/data
+            subPath: pg/15         # this directory of it alone, made if it is not there
+          - scratch: cache
+            path: /var/cache
+            memory: true           # kept in memory [on the node's state disk]
+</code></pre>
+<ul><li><strong>Files.</strong> A mounted ConfigMap or Secret is read-only. When it changes, its files change in the running container, all at once, and nothing is restarted (a <code>subPath</code> file stays as it was until its container starts again). A ConfigMap or key that is not there keeps the replica from starting, and its status says which. A Secret's files are in memory, never on a disk (<code>/run/kith</code> on kith OS, your runtime directory where kithd is your service).</li><li><strong>A scratch</strong> is an empty directory the containers of one replica that name it share. It outlives a restarted container and goes with its replica. On the state disk it counts toward <code>resources.storage</code>; in memory, as the memory of the container that wrote it.</li><li><strong><code>envFrom</code></strong> gives every key of a ConfigMap or a Secret as a variable; a variable in <code>env</code> of the same name wins, and a changed value replaces the container. <strong><code>field</code></strong> is the replica's own: <code>name</code> (<code>web-0</code>), <code>namespace</code>, <code>node</code>, or <code>address</code> (a pod's own; otherwise its node's on the mesh, or <code>127.0.0.1</code>).</li><li><strong><code>initContainers</code></strong> run one after the other before the template's containers, each until it ends well (with <code>restartPolicy: never</code> a failed one is not run again and nothing after it starts). They take no probes and run again when their replica is replaced.</li><li><strong><code>runAsNonRoot</code></strong> does not start a container that would be root: <code>runAsUser: 0</code> is refused when applied, and an image that names root, or (in a pod) no user, when it starts. <strong><code>dropCapabilities</code></strong> takes capabilities (<code>NET_RAW</code>, without <code>CAP_</code>) from what the container would have had: a pod's root has fourteen, root on kith OS three, anyone else none or one.</li><li><strong><code>subPath</code> of a volume or a scratch</strong> mounts that directory (or file) of it alone, made where it is not there, its parent's user's. What is in a volume is its containers' to write, links included, so no step of the path may be a link (wherever it points: the container does not start, and its status says which step), and the part is mounted as it was opened, never looked up again. It is mounted only for a container with users of its own: a NodeWorkload's, one on the host's network or given devices, or one where kithd is not root does not start with one.</li><li><strong>Not yet:</strong> a mode for one file among the others.</li></ul>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="cluster.html"><span>Before</span>A cluster</a><a class="after" href="storage.html"><span>After</span>Storage</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/workloads.md">docs/guide/workloads.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>

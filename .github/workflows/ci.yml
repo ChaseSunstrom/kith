@@ -67,3 +67,7 @@ jobs:
       # Compares files only: the page, docs/numbers.json, ci/compare.txt and the README's drawings.
       - name: The website shows the numbers that were measured
         run: python3 ci/site_numbers.py --check
+
+      # Compares files only: docs/guide/*.md, the ADRs and docs/*.html they make.
+      - name: The guide's pages are what its markdown makes
+        run: python3 ci/site_docs.py --self-test && python3 ci/site_docs.py --check

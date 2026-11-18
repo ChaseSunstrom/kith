@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en" data-root="../">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Hardware: kith</title>
+<meta name="description" content="Every node lists its own hardware from /sys and keeps one Device per piece in the store, applied when it turns up and deleted when it is gone (a rescan every half minute): kith get device lists them....">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='10 4 44 56'%3E%3Cg stroke='%238a8f9c' stroke-width='4' stroke-linecap='round'%3E%3Cpath d='M22 14V50M24 36 42 20M26 38 42 50'/%3E%3C/g%3E%3Ccircle cx='24' cy='37' r='6.5' fill='%235b8cff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../site.css">
+<link rel="stylesheet" href="../docs.css">
+<script src="../docs.js" defer></script>
+</head>
+<body>
+<!-- Made by ci/site_docs.py from docs/guide/hardware.md: change the markdown, then run it again. -->
+<header class="bar">
+  <a class="brand" href="../index.html" aria-label="kith: the front page">
+    <svg class="mark" viewBox="12 6 40 52" aria-hidden="true"><line x1="22" y1="14" x2="22" y2="50"/><line x1="24" y1="36" x2="42" y2="20"/><line x1="26" y1="38" x2="42" y2="50"/><circle cx="22" cy="14" r="4"/><circle cx="22" cy="50" r="4"/><circle cx="43" cy="19" r="4.5"/><circle cx="43" cy="50" r="4.5"/><circle class="ring" cx="24" cy="37" r="5.5"/><circle class="hub" cx="24" cy="37" r="5.5"/></svg>
+    <b>kith</b>
+  </a>
+  <nav aria-label="Sections">
+    <a href="../guide/index.html">Guide</a>
+    <a href="../guide/index.html#decisions">Decisions</a>
+    <a href="../index.html#numbers">Numbers</a>
+  </nav>
+  <a class="button quiet" href="https://github.com/ChaseSunstrom/kith">GitHub</a>
+</header>
+<div class="doc">
+<aside class="side">
+  <form class="find" role="search" hidden>
+    <label for="q">Search the headings</label>
+    <input id="q" type="search" placeholder="Search the headings" autocomplete="off" spellcheck="false">
+  </form>
+  <ol class="found" aria-live="polite" hidden></ol>
+  <details class="rail" open>
+    <summary>The guide</summary>
+    <nav aria-label="The guide's pages"><ol class="stops"><li><a href="index.html">All the pages</a></li><li><a href="os.html">kith OS</a></li><li><a href="cluster.html">A cluster</a></li><li><a href="workloads.html">What kithd does today</a></li><li><a href="storage.html">Storage</a></li><li class=here><a href="hardware.html" aria-current="page">Hardware</a><ol class="inner"><li class="h2"><a href="#claiming-hardware">Claiming hardware</a></li><li class="h2"><a href="#an-app-as-a-workload-of-its-own-in-a-sessions-window">An app as a workload of its own, in a session's window</a></li><li class="h2"><a href="#what-a-seat-keeps-for-itself">What a seat keeps for itself</a></li><li class="h2"><a href="#virtual-machines">Virtual machines</a></li><li class="h2"><a href="#switching-one-gpu">Switching one GPU</a></li><li class="h2"><a href="#confidential-machines">Confidential machines</a></li><li class="h2"><a href="#tried-on-a-real-pc">Tried on a real PC</a></li></ol></li><li><a href="packages.html">Packages and Sources</a></li><li><a href="access.html">Access</a></li><li><a href="api.html">Resources and the language</a></li><li><a href="kubernetes.html">Coming from Kubernetes, Helm, Proxmox or compose</a></li><li><a href="ui.html">Web UI</a></li><li><a href="development.html">Working on kith</a></li><li><a href="numbers.html">How the numbers beside k3s were taken</a></li></ol><p class="rail-group">Decisions and reviews</p><ol class="stops"><li><a href="../adr-keyless.html">image signatures made without a kept key (T-0463)</a></li><li><a href="../adr-people.html">People's devices into the home network: peers, levels and where a level holds</a></li><li><a href="../adr-privilege.html">kithd in two parts: what reads the network holds no root</a></li><li><a href="../adr-unlock.html">The ways into a node's encrypted state, and what each leaves open</a></li><li><a href="../adr-workers.html">A worker keeps no Secret that nothing placed on it names</a></li><li><a href="../security-review-2.html">Security review 2</a></li></ol></nav>
+  </details>
+</aside>
+<div class="page" role="main">
+<article>
+<h1 id="hardware">Hardware</h1>
+<p>Every node lists its own hardware from <code>/sys</code> and keeps one <code>Device</code> per piece in the store, applied when it turns up and deleted when it is gone (a rescan every half minute): <code>kith get device</code> lists them. A <code>Device</code> is named <code>NODE-CLASS-NAME</code> (lower case, cut to 63 characters); its <code>spec</code> has <code>node</code>, <code>class</code> and the device node as <code>path</code>. The class is <code>gpu</code> (a DRM card, <code>/dev/dri/card0</code>), <code>display</code> (a connector with a screen; no path), <code>input</code> (<code>/dev/input/event3</code>), <code>audio</code> (a sound card, <code>/dev/snd/controlC0</code>), <code>camera</code> (<code>/dev/video0</code>) or <code>usb</code> (not a hub, <code>/dev/bus/usb/001/004</code>).</p>
+<ul><li><strong>Labels</strong> (a selector can name them). All: <code>kith.dev/node</code>, <code>class</code>, <code>kith.dev/discovered: "true"</code>. GPUs and USB devices also <code>vendor</code>, <code>model</code>; a GPU <code>driver</code> and, where known, <code>vram</code> in bytes, and <code>dmem</code>, the region of its memory where its driver gives the kernel's dmem cgroup one and kithd can give its containers the controller (<code>drm/0000:03:00.0/vram</code>); inputs and sound cards <code>model</code>. An input also <code>identity</code>, a hash of its name, port, serial and ids: another device behind the same event index is taken from its holder. A USB device also <code>bus</code>, its port (<code>1-2</code>), and <code>serial</code>, a hash of its serial where it says one: its ids are the stick's own to say, so name one stick by <code>serial</code> or <code>bus</code> with <code>kith.dev/node</code>; another serial (or none) in its port takes it from its holder.</li><li><code>NODE-seat0</code> is a <code>Seat</code> naming the node's displays, inputs, sound cards and GPUs. What carries <code>kith.dev/discovered</code> is kept in step (rewritten if you edit it, deleted when the hardware goes); a <code>Device</code> or <code>Seat</code> you wrote yourself is never touched.</li><li>Do not name nodes <code>alpha</code> and <code>alpha-gpu</code>: a Device belongs to the node with the longest name that starts it. A join that would take a listed Device is refused.</li><li><strong>NVIDIA's own driver.</strong> A card on it also has <code>nodes</code>: what CUDA, OpenGL and Vulkan open beside the card (<code>/dev/nvidiactl</code>, <code>nvidia-uvm</code>, <code>nvidia-uvm-tools</code>, <code>nvidia-modeset</code>, <code>/dev/nvidiaN</code>), those that exist. <strong>Not tried on a real card.</strong></li></ul>
+<h3 id="claiming-hardware">Claiming hardware <a class="anchor" href="#claiming-hardware" aria-label="Link to this section">#</a></h3>
+<p>A workload names <code>DeviceClaim</code>s (same namespace) in its template's <code>deviceClaims</code>. A claim names a <code>seat</code>, a <code>device</code> or a <code>selector</code> over <code>Device</code> labels, and <code>access: exclusive</code> (default) or <code>shared</code>:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: render }
+spec:
+  selector: { class: gpu, kith.dev/node: n1 }
+  access: exclusive
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: renderer }
+spec:
+  template:
+    containers: [{ name: run, image: example/renderer }]
+    deviceClaims: [render]
+</code></pre>
+<ul><li>The workload runs only on the node of the Devices its claims reach. A selector that matches Devices on several nodes takes those of the lowest-named node; add <code>kith.dev/node</code> to fix the node. Claims that reach two nodes hold nothing (the status says so).</li><li>One workload holds a Device at a time. A second exclusive holder waits (<code>unschedulable</code>: <code>waiting for DeviceClaim render, held by Workload/default/renderer</code>) and takes over when the first is gone. <code>shared</code> claims may have any number of holders, none beside an exclusive one. <code>kith get deviceclaim render -o yaml</code> shows <code>status.node</code>, <code>devices</code>, <code>holders</code> or <code>message</code>.</li><li>A container gets its Devices' nodes in its own <code>/dev</code>, beside <code>null</code>, <code>zero</code>, <code>full</code>, <code>random</code>, <code>urandom</code>, <code>tty</code>; a GPU brings its render node (<code>/dev/dri/renderD*</code>). A missing Device or claim stops the unit and says which. <code>/dev/mem</code>, <code>/dev/kmem</code>, <code>/dev/port</code> and <code>/dev/tpm*</code> are given to no pod, whatever a Device says.</li><li><strong>On kith OS</strong> a device filter on each container's cgroup checks every open and <code>mknod</code>: it lets through the usual few, the terminals of the container's own <code>/dev/pts</code> and each device it was given, and refuses the rest, even to a root pod. A pod that made its own node (<code>/dev/net/tun</code>), or a FUSE program (<code>/dev/fuse</code>; kith OS's kernel has FUSE), needs a <code>Device</code> with <code>class: other</code> and its <code>path</code>, claimed. Where kithd is your own service there is no filter: no one in a user namespace can make a node.</li><li>The right to apply a <code>DeviceClaim</code> and a workload that names it is the grant: a Role rule with <code>kinds: ["*"]</code> covers both, so give it only to someone you trust with any hardware.</li></ul>
+<p><strong>Who may claim what.</strong> A <code>Device</code> or <code>Seat</code> is given to namespaces by its label <code>kith.dev/namespaces</code>, a comma-separated list (<code>default, desktop</code>). A claim in namespace N reaches it only if the label lists N, or N is <code>kith-system</code>, the cluster's own. With no label, a <code>gpu</code> is open to every namespace, and every other <code>Device</code> (<code>input</code>, <code>audio</code>, <code>camera</code>, <code>display</code>, <code>usb</code>, <code>other</code>) and every <code>Seat</code> is <code>kith-system</code>'s alone. A seat claim also needs each of the Seat's labelled Devices to be given to N. The label is an admin's (<code>metadata.labels</code>, <code>kith apply -f</code>): discovery keeps it, and a worker cannot add, change or drop it. Removing it refuses a claim at the next pass; its <code>status.message</code> says why. A labelled <code>Device</code> or <code>Seat</code> whose hardware is gone is kept, so the label is there when it comes back, and marked <code>kith.dev/absent: "true"</code> until then: a claim naming it is refused ("is absent") and a selector passes over it.</p>
+<p><strong>A share of a GPU's vram.</strong> A <code>shared</code> claim may say <code>share: { vram: 512Mi }</code>: what it asks of each Device it holds, counted against the Device's <code>vram</code> label. A workload's shares add up; one that does not fit waits, and its message gives the numbers (<code>status.share</code>). On a Device with a <code>dmem</code> label the share is also a ceiling: each of the workload's containers gets the sum of its shares there as <code>dmem.max</code> in its cgroup, and the kernel refuses it more of the GPU's memory (<code>status.share.DEVICE.enforced: true</code>). That is where the driver gives the region (amdgpu, xe, NVIDIA's) and kithd may hand the controller down to its containers (root, or a delegation with <code>dmem</code>; a kithd that cannot gives its Devices no <code>dmem</code> label). Elsewhere a share is cooperative. Untried: MPS, MIG partitions.</p>
+<h3 id="an-app-as-a-workload-of-its-own-in-a-sessions-window">An app as a workload of its own, in a session's window <a class="anchor" href="#an-app-as-a-workload-of-its-own-in-a-sessions-window" aria-label="Link to this section">#</a></h3>
+<p>A <code>DeviceClaim</code> on a seat with <code>access: client</code> takes none of the seat's devices, so any number of workloads hold it beside the session, each on the seat's node, in the session's namespace and only while a workload of that namespace holds the seat. Each gets the render nodes of the seat's GPUs (not the card) and the seat's directory <code>/run/seat</code>, to read. A session that puts its Wayland and PipeWire sockets there (the desktop packages set <code>XDG_RUNTIME_DIR=/run/seat</code>) is where the app opens its window:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: DeviceClaim
+metadata: { name: office-apps }
+spec: { seat: office-pc-seat0, access: client }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: editor }
+spec:
+  template:
+    deviceClaims: [office-apps]
+    containers:
+      - name: editor
+        image: registry.example/me/editor:3
+        env:
+          - { name: WAYLAND_DISPLAY, value: /run/seat/wayland-0 }
+          - { name: PIPEWIRE_RUNTIME_DIR, value: /run/seat }
+</code></pre>
+<ul><li>The app has its own image, limits, volumes and rollback, and shows as one of the claim's <code>status.holders</code>. It must run as the session's user: the directory is that user's alone.</li><li><strong>Input hot-plug.</strong> An input device plugged in or pulled while a container holds its seat appears in or leaves its <code>/dev/input</code> at the next scan, with no restart (on kith OS, for a container that had an input device at start); elsewhere, or when a changed claim or seat takes one away, the unit restarts. Not yet: an app on another node shown in this session; a NodeWorkload claim. A client of a session is in it: see <a href="https://github.com/ChaseSunstrom/kith/blob/main/SECURITY.md">SECURITY.md</a>.</li></ul>
+<h3 id="what-a-seat-keeps-for-itself">What a seat keeps for itself <a class="anchor" href="#what-a-seat-keeps-for-itself" aria-label="Link to this section">#</a></h3>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Seat
+metadata: { name: desk-seat0 }
+spec:
+  node: desk
+  devices: [desk-gpu-card0]
+  reserve: { cpu: 4, memory: 8Gi }     # kept for whatever holds the seat
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: training }
+spec:
+  template:
+    containers: [{ name: run, image: registry.example/train:1 }]
+    yieldTo: { seat: desk-seat0, when: [fullscreen] }   # step back while a game is up
+</code></pre>
+<ul><li>A seat's <code>reserve</code> comes off its node for every workload that does not hold the seat, held or not. The holder fits only what it wants beyond it; its units are guaranteed the reserve's memory (<code>memory.min</code>) and go first for CPU and disk (<code>cpu.weight</code> and <code>io.weight</code> at 10000; all else 100). CPUs are not pinned; a GPU is not shared out (not yet).</li><li>A session says what its seat is doing with <code>POST /v1/seats/desk-seat0/activity?state=active|idle|fullscreen</code> (it needs an Identity whose Role may apply <code>Seat</code>s); it shows as <code>status.activity</code>. A seat nobody holds is idle.</li><li>A workload with <code>yieldTo</code> runs on a twentieth of a CPU on that seat's node while the seat is in a state it names, and gets its limit back when the state changes (about ten seconds).</li></ul>
+<h3 id="virtual-machines">Virtual machines <a class="anchor" href="#virtual-machines" aria-label="Link to this section">#</a></h3>
+<p>A template's <code>vms</code> are virtual machines, beside or instead of its <code>containers</code> and <code>exec</code> units, in a Workload, a Job or anything with a template:</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: windows }
+spec:
+  placement: { require: { node.labels.seat: desk } }
+  template:
+    deviceClaims: [card]              # a DeviceClaim for a GPU set aside for machines
+    vms:
+      - name: machine
+        firmware: /usr/share/edk2/x64/OVMF.4m.fd
+        disks: [{ path: /var/lib/machines/windows.raw }]
+        cpus: 8
+        memory: 16Gi
+        resources: { cpu: 8, memory: 17Gi }   # what it costs the node; else its cpus and memory
+</code></pre>
+<ul><li>A machine starts from a <code>kernel</code> (a microVM; <code>initrd</code>, <code>cmdline</code>) or from its <code>disks</code> through <code>firmware</code>. <code>memory</code> is required; <code>cpus</code> is 1 unless said. Every path is a file on the node; a disk is a raw image (<code>readOnly: true</code> if it must not be written).</li><li>kithd supervises the hypervisor; the serial console (<code>console=ttyS0</code>) is the unit's log: <code>kith logs Workload/windows --unit machine</code>. <code>hypervisor: qemu</code> (default, with KVM) or <code>cloudHypervisor</code>; the node needs <code>qemu-system-x86_64</code> (<code>-aarch64</code> on arm64) or <code>cloud-hypervisor</code> on its PATH, and <code>/dev/kvm</code>.</li><li><strong>Passing a device through (VFIO).</strong> A PCI device bound to <code>vfio-pci</code> is a <code>Device</code> of class <code>pci</code> (<code>desk-pci-0000-01-00.0</code>; labels <code>driver: vfio-pci</code>, <code>vendor</code>, <code>model</code> and <code>function</code>: <code>gpu</code>, <code>audio</code>, <code>usb</code> or <code>other</code>). It is not in the node's seat and <code>class: gpu</code> never selects it: claim it by name, or by <code>class: pci</code> and its <code>function</code>. A <code>vms</code> unit gets every such Device its template claims; a container never does. The owner binds it before kithd starts (<code>vfio-pci.ids=10de:2684,10de:22ba</code>, IOMMU on).</li><li>Not yet: Firecracker; a network beyond QEMU's own NAT (the machine reaches out, nothing reaches it); a disk from a Volume; kithd binding <code>vfio-pci</code>; <code>vms</code> on kith OS. Tested: a Job boots a kernel under KVM. Not tested: cloud-hypervisor, a real GPU passed through.</li></ul>
+<h3 id="switching-one-gpu">Switching one GPU <a class="anchor" href="#switching-one-gpu" aria-label="Link to this section">#</a></h3>
+<p>A desktop and a machine can take turns on one GPU of a node, with no reboot. It needs an IOMMU on, <code>vfio-pci</code> in the node's kernel (not kith OS's: use an agent-mode node) and the card bound to <code>vfio-pci</code> by its owner (kithd never binds or unbinds a driver). The session and the machine each name one exclusive <code>DeviceClaim</code> for it:</p>
+<pre><code class="language-sh">kith switch gpu windows   # the machine takes the card
+kith switch gpu desktop   # the session takes it back
+</code></pre>
+<ul><li>A claim's <code>holder</code> (exclusive claims only) is the workload that takes the Device ahead of others, from a holder of its own namespace; a holder of another keeps it and the named workload waits. The current holder stops, then the new one starts, and stays until another switch. A card keeps its <code>pci</code> label under either driver: <code>selector: { pci: "0000:01:00.0" }</code>.</li><li><strong>What a switch loses.</strong> It takes seconds: the session stops, its windows are lost and the desktop comes back as a new session. An app that is its own workload waits for a session to hold the seat again; its Volumes are kept.</li><li>Not built: two GPUs at once, a frame relay. <strong>Proven only with stand-ins</strong>: no real GPU, VFIO bind or driver unbind was tried.</li></ul>
+<h3 id="confidential-machines">Confidential machines <a class="anchor" href="#confidential-machines" aria-label="Link to this section">#</a></h3>
+<p><code>confidential: true</code> runs a template's machines in memory the node cannot read (SEV-SNP, TDX):</p>
+<pre><code class="language-yaml">apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: sealed }
+spec:
+  placement: { require: { node.labels.cpu: epyc } }
+  template:
+    confidential: true
+    vms:
+      - name: machine
+        firmware: /usr/share/edk2/x64/OVMF.amdsev.fd   # one built for SEV-SNP (or TDX)
+        disks: [{ path: /var/lib/machines/sealed.raw }]
+        memory: 8Gi
+</code></pre>
+<ul><li>A node runs it only if its KVM has SEV-SNP or TDX (<code>kvm_amd/parameters/sev_snp</code> or <code>kvm_intel/parameters/tdx</code> in <code>/sys/module</code> reads <code>Y</code>). <strong>A node with neither runs none of it</strong> and says why in the status' <code>notes</code>; nothing falls back to memory in the clear. Only <code>vms</code> units with a <code>firmware</code>, under QEMU: any other unit here is refused at apply.</li><li>Not yet: the scheduler knows nothing of which nodes have such a processor (use <code>placement</code>); no attestation; containers inside such a machine; cloud-hypervisor. <strong>Not tested: a guest on SEV-SNP or TDX hardware</strong>, only QEMU's options and the refusal elsewhere.</li></ul>
+<h3 id="tried-on-a-real-pc">Tried on a real PC <a class="anchor" href="#tried-on-a-real-pc" aria-label="Link to this section">#</a></h3>
+<p>kith OS 1.0.0 on an AMD mini PC (a Ryzen with a Radeon 780M), booted over HTTP from the firmware, claimed with <code>--claim</code>, and a desktop Linux PC beside it on the same LAN:</p>
+<ul><li><strong>Ran:</strong> images pulled from Docker Hub; two replicas of a web server, ready by an HTTP probe, one port with <code>publish: true</code> reached from the other PC; pod to pod over IPv4 and IPv6.</li><li><strong>A desktop on the real screen:</strong> a Workload in <code>kith-system</code> claiming the seat (<code>NODE-seat0</code>: the card and two inputs) runs Alpine's weston (DRM backend, pixman renderer) at 2560x1440 with a terminal. seatd in a container cannot make the seat active (there is no VT), so the session runs with <code>LIBSEAT_BACKEND=noop</code>, as root in its container.</li><li><strong>The other PC as a worker:</strong> its kithd (not root, a user's process) joined with a worker token; Jobs placed on it with <code>placement: { require: { kith.dev/trust: worker } }</code> ran an <code>exec</code> unit and a plain container, their logs read through the first node; <code>kith delete node/NAME</code> then took it out. <strong>A <code>pod: true</code> template does not start on a kithd that is not root</strong> ("failed to prepare rootfs").</li><li><strong>Not working yet:</strong> the GPU has only the firmware's framebuffer (no <code>amdgpu</code>: the image builds no driver that needs firmware blobs); a Service has no status and its name reaches nothing on a node started without <code>--mesh</code>, which kith OS's default is.</li></ul>
+</article>
+<footer class="tail"><nav aria-label="Next page"><a class="before" href="storage.html"><span>Before</span>Storage</a><a class="after" href="packages.html"><span>After</span>Packages and Sources</a></nav><p class="fine">This page is <a href="https://github.com/ChaseSunstrom/kith/blob/main/docs/guide/hardware.md">docs/guide/hardware.md</a>.</p></footer>
+</div>
+</div>
+</body>
+</html>
