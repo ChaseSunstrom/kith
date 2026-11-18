@@ -922,6 +922,13 @@ impl Runtime {
     }
 }
 
+/// Held while libcontainer creates or starts a container: it reaches the notify socket by
+/// changing the process's working directory and back, so two at once on different threads would
+/// bind or connect in each other's directory ("failed to bind notify socket").
+// ponytail: one lock for every create and start; a create takes milliseconds, so it holds while
+// pods start one at a time.
+static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The children someone waits for besides the handles' (see [`spawn_awaited`]).
 static AWAITED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
@@ -1176,7 +1183,10 @@ impl Handle {
 
     pub fn start(&mut self) -> Result<()> {
         match &mut self.container {
-            Some(container) => container.start().ctx("starting the container"),
+            Some(container) => {
+                let _cwd = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                container.start().ctx("starting the container")
+            }
             None => {
                 let go = self.go.take().ok_or(crate::Error("it was started before".into()))?;
                 std::io::Write::write_all(&mut &go, b"1").ctx("starting the exec unit")
@@ -1663,7 +1673,10 @@ fn logged_build<T, E: std::fmt::Display>(
 ) -> Result<T> {
     let file = File::create(log).ctx("its init log")?;
     let dispatch = tracing::Dispatch::new(InitLog(Mutex::new(file)));
-    let built = tracing::dispatcher::with_default(&dispatch, build);
+    let built = {
+        let _cwd = CWD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        tracing::dispatcher::with_default(&dispatch, build)
+    };
     drop(dispatch);
     let logged = fs::read(log).unwrap_or_default();
     let _ = fs::remove_file(log);
