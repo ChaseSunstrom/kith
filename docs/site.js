@@ -12,7 +12,8 @@ motion.hidden = calm;
 motion.onclick = () => {
   paused = !paused;
   document.documentElement.classList.toggle("paused", paused);
-  motion.setAttribute("aria-pressed", paused); // the label stays "Pause": pressed means the motion is paused  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
+  motion.setAttribute("aria-pressed", paused); // the label stays "Pause": pressed means the motion is paused
+  for (const svg of $$("svg")) paused ? svg.pauseAnimations() : svg.unpauseAnimations();
 };
 const wait = ms => new Promise(done => setTimeout(done, ms));
 const sleep = async ms => {
@@ -194,10 +195,28 @@ async function disk() {
   }
 }
 
+// The map at the top, and a machine lost from it: where each of its replicas starts instead. Each goes to the machine with
+// the fewest, among those that have a place free. Nothing is changed here: the caller moves them (or, with less motion, at once).
+const label = (map, name) => $(`text[data-node=${name}]`, map).textContent;
+const machines = map => new Set($$(".rep.on", map).map(rep => rep.parentNode.dataset.node)).size;
+const gone = (map, name, is) => $$(`[data-node=${name}]`, map).forEach(el => el.classList.toggle("gone", is));
+const lost = (map, who, total) => `hello: ${$$(".rep.on", map).length} of ${total} replicas ready, on ${machines(map)} machines; ${who} is lost`;
+function lose(map, name) {
+  const taken = new Set(), moves = [];
+  const free = g => $$(".rep", g).find(rep => !rep.classList.contains("on") && !taken.has(rep));
+  const used = g => $$(".rep", g).filter(rep => rep.classList.contains("on") || taken.has(rep)).length;
+  for (const from of $$(".rep.on", $(`.reps[data-node=${name}]`, map))) {
+    const to = $$(".reps", map).filter(g => g.dataset.node !== name && free(g)).sort((a, b) => used(a) - used(b))[0], slot = free(to);
+    taken.add(slot);
+    moves.push([from, slot, to.dataset.node]);
+  }
+  return moves;
+}
+
 // The map at the top: a change to hello rolls through its replicas. A dot runs the line from the hub to
 // a machine, and that machine's replicas each wait while a new one starts, so the count dips by one at a time.
 async function live() {
-  const map = $("#live .map"), said = $("#live-said"), wave = $(".wave", map), ready = () => $$(".rep.on", map).length, total = ready();
+  const map = $("#live .map"), said = $("#live-said"), names = $$(".reps", map).map(g => g.dataset.node), wave = $(".wave", map), ready = () => $$(".rep.on", map).length, total = ready();
   const fly = (line, ms) => new Promise(done => {
     const len = line.getTotalLength();
     let t = 0, last = performance.now();
@@ -213,6 +232,28 @@ async function live() {
       done();
     })(last);
   });
+  // One machine is lost: its replicas still count as ready for a while, then each starts on another machine.
+  let next = names.length - 1;
+  const fail = async () => {
+    do next = (next + 1) % names.length; while (!$(`.reps[data-node=${names[next]}] .rep.on`, map));
+    const name = names[next], who = label(map, name), moves = lose(map, name);
+    gone(map, name, true);
+    said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who} is unreachable, and its ${moves.length} still count`;
+    await sleep(3200);
+    moves.forEach(([from]) => from.classList.remove("on"));
+    for (const [, slot, to] of moves) {
+      said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who}'s replica is starting on ${label(map, to)}`;
+      await fly($(`#m-${to}`), 600);
+      slot.classList.add("wait");
+      await sleep(900);
+      slot.classList.replace("wait", "on");
+    }
+    said.textContent = lost(map, who, total);
+    await sleep(4200);
+    gone(map, name, false);
+    said.textContent = `hello: ${ready()} of ${total} replicas ready; ${who} is back, with nothing on it`;
+    await sleep(3000);
+  };
   await sleep(2600); // the map draws itself first
   map.classList.add("go");
   await sleep(3000);
@@ -228,7 +269,15 @@ async function live() {
     }
     said.textContent = `hello: ${ready()} of ${total} replicas ready, revision ${revision}, on 4 machines`;
     await sleep(5000);
+    await fail();
   }
 }
 
 if (!calm) pulse(), disk(), live();
+// With less motion the story is not told, only where it ends: the old PC lost, its replicas started on the others.
+if (calm) {
+  const map = $("#live .map"), total = $$(".rep.on", map).length;
+  for (const [from, slot] of lose(map, "old")) from.classList.remove("on"), slot.classList.add("on");
+  gone(map, "old", true);
+  $("#live-said").textContent = lost(map, label(map, "old"), total);
+}

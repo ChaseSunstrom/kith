@@ -452,6 +452,42 @@ def used_tokens():
     return sorted(set(re.findall(r"var\((--[\w-]+)", mine)) - have - own)
 
 
+HAND = ["docs/index.html", "docs/install.html", "docs/404.html"]
+LOOK = re.compile(r'\b(?:href|src)="([^"]*)"')
+IDS = re.compile(r'\bid="([^"]+)"')
+
+
+def hand_problems():
+    """The pages written by hand: each relative link goes to a file of docs/ (and its #anchor to an id there); the two that
+    are shared and found need a title, a description and a type for what shows a link."""
+    found, problems = {}, []
+    for rel in HAND:
+        page = ROOT / rel
+        text = page.read_text(encoding="utf-8")
+        for url in LOOK.findall(text):
+            if url.startswith(("#", "data:", "mailto:")) or SCHEME.match(url) or url.startswith("//"):
+                if url.startswith("#"):
+                    found.setdefault(rel, set()).update([url])
+                continue
+            path, _, anchor = url.partition("#")
+            target = ROOT / "docs" / path
+            if not target.resolve().is_relative_to(ROOT / "docs") or not target.is_file():
+                problems.append(f"{rel}: {url} is not a file of docs/")
+            elif anchor and target.suffix == ".html" and anchor not in IDS.findall(target.read_text(encoding="utf-8")):
+                problems.append(f"{rel}: {url} has no #{anchor} on that page")
+        for url in found.get(rel, ()):
+            if url != "#" and url[1:] not in IDS.findall(text):
+                problems.append(f"{rel}: {url} has no id on the page")
+    for rel in ["docs/index.html", "docs/404.html"]:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        for prop in ["og:title", "og:description", "og:type"] if rel.endswith("index.html") else []:
+            if f'property="{prop}"' not in text:
+                problems.append(f"{rel}: no {prop}")
+        if '<meta name="description"' not in text:
+            problems.append(f"{rel}: no description")
+    return problems
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--check", action="store_true")
@@ -460,7 +496,8 @@ def main():
     if args.self_test:
         return self_test()
     out, problems = build()
-    stale = [f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
+    problems += hand_problems()
+    stale =[f for f, text in out.items() if not (ROOT / f).is_file() or (ROOT / f).read_text(encoding="utf-8") != text]
     # what is ours and no longer made: the pages of docs/guide, and the ADR and review pages of docs/. Never another docs/*.html.
     ours = [*(ROOT / "docs/guide").glob("*.html"), *(ROOT / "docs").glob("adr-*.html"), *(ROOT / "docs").glob("security-review-*.html")]
     stale += [str(f.relative_to(ROOT)) for f in ours if str(f.relative_to(ROOT)) not in out]
@@ -531,6 +568,9 @@ def self_test():
     # a summary skips a paragraph that only introduces what follows
     eq(one("# T\n\nThe parts:\n\n- a\n\nReal one.").summary(), "Real one.")
     eq(one("# T\n\nOnly this:\n").summary(), "Only this:")
+    # the pages written by hand: the links resolve and the landing page carries its metadata
+    assert hand_problems() == [], hand_problems()
+    assert LOOK.findall('<a href="x.html#a">') == ["x.html#a"] and IDS.findall('<i id="a">') == ["a"]
     print("site_docs self-test: ok")
     return 0
 
