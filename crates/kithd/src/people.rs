@@ -385,9 +385,13 @@ pub async fn device(
     let people64 = prefix(&cluster.me.ca);
     let public = match up(&state, port, &interface, people64) {
         Ok(public) => public,
-        Err(e) => return eprintln!("kithd: no people: {e} (it takes root)"),
+        Err(e) => {
+            eprintln!("kithd: no people: {e} (it takes root)");
+            // (No device, so what an earlier start said of one is taken back.)
+            return crate::mesh::left(shared, "people", stopping).await;
+        }
     };
-    eprintln!("kithd: people on {interface}: UDP port {port}");
+    eprintln!("kithd: people on {}: UDP port {port}", kith_mesh::people::DEVICE);
     let status = said(Some(&public), port, endpoint.as_deref());
     let mut generation = shared.generation.subscribe();
     loop {
@@ -407,7 +411,7 @@ pub async fn device(
         }
     }
     if let Err(e) = kith_mesh::people::remove() {
-        eprintln!("kithd: people: taking away {interface}'s people: {e}");
+        eprintln!("kithd: people: taking away {}'s people: {e}", kith_mesh::people::DEVICE);
     }
     if let Err(e) = crate::mesh::say(&shared, &node, "people", Value::Null).await {
         eprintln!("kithd: people: taking back this node's people: {e}");
@@ -772,6 +776,48 @@ mod tests {
         assert!(!kith_mesh::people::table_present().unwrap(), "the table is gone");
         assert!(super::said(None, port, None).is_null());
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// A start whose device does not come up takes back what an earlier start said of it, so no
+    /// status names a device that is not there. (No pki directory: the key cannot be made, so no
+    /// netlink is reached and no root is needed.)
+    #[tokio::test]
+    async fn a_start_whose_device_fails_takes_back_its_status() {
+        let ca = crate::pki::Ca::create().unwrap();
+        let me = crate::cluster::pinned_peer::node(&ca, "a");
+        let upstream = crate::view::Upstream {
+            name: "a".into(),
+            address: "127.0.0.1:1".into(),
+            certificate: None,
+        };
+        let shared = crate::cluster::pinned_peer::shared_with("people-failed", me, &[upstream]).await;
+        {
+            // (Set in the store as `shared_of` sets a Node's status.)
+            let said_before = super::said(Some(&[7; 32]), 51821, None);
+            let mut state = shared.store.lock().expect("nothing panics holding the store");
+            state
+                .store
+                .set_status("Node/a", Some(serde_json::json!({ "people": said_before })))
+                .unwrap();
+        }
+        // (A leader of its own, as `leading` in raft.rs makes one: the take-back is a write.)
+        let id = shared.raft.metrics().borrow().id;
+        let one = std::collections::BTreeMap::from([(id, kith_store::openraft::BasicNode::new(""))]);
+        shared.raft.initialize(one).await.unwrap();
+        shared
+            .raft
+            .wait(Some(Duration::from_secs(30)))
+            .current_leader(id, "leads")
+            .await
+            .unwrap();
+
+        let state = std::env::temp_dir().join(format!("kithd-people-failed-{}", std::process::id()));
+        let (_stop, stopping) = tokio::sync::watch::channel(false);
+        super::device(shared.clone(), state, Some(51821), None, "kith0".into(), stopping).await;
+
+        let store = shared.store.lock().expect("nothing panics holding the store");
+        let status = store.store.get("Node/a").unwrap().status.as_ref().unwrap();
+        assert!(status["people"].is_null(), "the status no longer names the device");
     }
 
     /// The masquerade message: a kernel with no nftables masquerade says so (CONFIG_NFT_MASQ), and

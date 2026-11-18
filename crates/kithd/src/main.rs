@@ -160,7 +160,7 @@ struct Args {
     mesh_interface: String,
     /// Run the people's WireGuard device on this UDP port (docs/adr-people.md): kwg0, beside the
     /// mesh's interface. Needs --mesh, and root
-    #[arg(long, env = "KITH_PEOPLE", value_name = "PORT", num_args = 0..=1, default_missing_value = "51821", requires = "mesh")]
+    #[arg(long, env = "KITH_PEOPLE", value_name = "PORT", num_args = 0..=1, default_missing_value = "51821", requires = "mesh", value_parser = clap::value_parser!(u16).range(1..))]
     people: Option<u16>,
     /// Where other nodes reach this node's people's device, as NAME:PORT or ADDRESS:PORT (with --people)
     #[arg(long, env = "KITH_PEOPLE_ENDPOINT", value_name = "NAME:PORT", requires = "people", value_parser = people_endpoint)]
@@ -205,16 +205,25 @@ fn own_ports(args: &Args) -> Vec<(u16, &'static str)> {
 }
 
 /// A `--people-endpoint`: a name or an address, then `:PORT` (the port not 0). An IPv6 address is
-/// in brackets.
+/// in brackets. A name is labels of letters, digits and '-' (not at either end of a label); the
+/// unspecified address (0.0.0.0, ::) is not one a peer can reach.
 fn people_endpoint(at: &str) -> Result<String, String> {
-    let bad = || format!("{at}: wants NAME:PORT or ADDRESS:PORT, the port from 1 to 65535");
+    let bad = || format!("{at}: wants NAME:PORT or ADDRESS:PORT, the port from 1 to 65535, a real address");
     let (host, port) = at.rsplit_once(':').ok_or_else(bad)?;
     if !matches!(port.parse::<u16>(), Ok(port) if port != 0) {
         return Err(bad());
     }
     let fine = match host.strip_prefix('[').and_then(|host| host.strip_suffix(']')) {
-        Some(six) => six.parse::<std::net::Ipv6Addr>().is_ok(),
-        None => !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+        Some(six) => six.parse::<std::net::Ipv6Addr>().is_ok_and(|six| !six.is_unspecified()),
+        None => match host.parse::<std::net::Ipv4Addr>() {
+            Ok(four) => !four.is_unspecified(),
+            Err(_) => host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            }),
+        },
     };
     if fine { Ok(at.to_string()) } else { Err(bad()) }
 }
@@ -1236,7 +1245,26 @@ mod tests {
         assert_eq!(parse(&["--mesh", "--people"]).unwrap().people, Some(51821));
         assert_eq!(parse(&["--mesh", "--people=40000"]).unwrap().people, Some(40000));
         assert_eq!(parse(&["--mesh"]).unwrap().people, None);
-        for ok in ["node-a.example.org:51821", "10.0.0.5:51821", "[fd00::1]:51821"] {
+        assert!(parse(&["--mesh", "--people=0"]).is_err(), "the port is from 1 to 65535");
+        assert!(parse(&["--mesh", "--people=65535"]).is_ok());
+        for bad in [
+            "node-a.:51821",
+            ".node-a:51821",
+            "node..a:51821",
+            "-node-a:51821",
+            "node-a-:51821",
+            "0.0.0.0:51821",
+            "[::]:51821",
+        ] {
+            let endpoint = format!("--people-endpoint={bad}");
+            assert!(parse(&["--mesh", "--people", endpoint.as_str()]).is_err(), "{bad}");
+        }
+        for ok in [
+            "node-a.example.org:51821",
+            "10.0.0.5:51821",
+            "[fd00::1]:51821",
+            "a-b.c1:51821",
+        ] {
             let endpoint = format!("--people-endpoint={ok}");
             assert!(parse(&["--mesh", "--people", endpoint.as_str()]).is_ok(), "{ok}");
         }
