@@ -3706,6 +3706,13 @@
               "type": "null"
             }
           ]
+        },
+        "headless": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "No address of its own: its name (`<service>.<namespace>.kith`, and under\n`svc.cluster.local`) answers the addresses of its ready replicas, as a headless\nKubernetes Service does. Off unless true."
         }
       },
       "required": [
