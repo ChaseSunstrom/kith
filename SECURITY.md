@@ -249,9 +249,14 @@ Only the newest version is fixed. There are no security releases of older ones.
   connection is accepted: a client that fills one port and all that the node shares leaves
   each other port its 2, and a connection past that is ended at once. A new UDP sender
   past that takes the place of the one of its port heard from longest ago. A pod publishes
-  8 ports at most and a node 64, so the relays hold at most 448 files; kithd does not raise
-  its limit of open files (1024), and its listeners, API and ingress take of it too, so a
-  node with many clients of its API or ingress besides can still run out. A port another
+  8 ports at most and a node 64, so the relays hold at most 448 files. kithd raises its
+  soft limit of open files to the hard one at start, 65536 at most, and leaves the hard
+  limit as it is: on kith OS it is the first process, started with the kernel's 1024
+  soft and 4096 hard, so it runs with 4096; on a host under systemd (524288 hard
+  here) it runs with 65536. Its listeners, API and ingress (1024 connections, two files
+  each, so 2048) take of it too, with the relays 448 and 64 guests of the API: about 2700
+  at most, under 4096. The raised limit is passed on to what kithd starts, a pod's
+  processes included (no per-container limit is set). A port another
   namespace's Workload or Job publishes is refused when written, and so is a pod through
   an Exit that does not list its namespace: both are asked of every writer (a person's
   apply, a Release, a Source, kithd's own controllers), where the write goes into the
