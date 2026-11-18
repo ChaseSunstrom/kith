@@ -14,6 +14,7 @@ mod container;
 mod devfilter;
 mod image;
 mod keyless;
+mod outside;
 mod seccomp;
 pub mod signed;
 
@@ -22,6 +23,7 @@ pub use container::{
     spawn_awaited, started, tune,
 };
 pub use image::{Image, ImageStore, Local, PullPolicy, registry, repository};
+pub use outside::{Patience, read_capped};
 pub use seccomp::REFUSED;
 
 /// Where a node's first process (kithd's keeper) writes how each process it reaped ended, one

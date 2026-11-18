@@ -13,6 +13,8 @@ if [ -z "${CC_x86_64_unknown_linux_musl:-}" ] && ! command -v musl-gcc >/dev/nul
     export CC_x86_64_unknown_linux_musl="$root/ci/musl-cc.sh"
 fi
 cd "$root"
+# Made first: the folder is resolved to an absolute path below, before cargo would make it.
+mkdir -p "${CARGO_TARGET_DIR:-target}"
 if [ "${1:-}" = --tests ]; then
     # (Or with --tests: kithd's unit tests, built the same way, and the path of that one file.
     # In a target directory of their own: their link writes kithd.map too, and in kithd's

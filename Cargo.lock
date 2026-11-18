@@ -1420,6 +1420,7 @@ dependencies = [
  "oci-client",
  "oci-spec",
  "rcgen",
+ "reqwest",
  "ring",
  "rustix 1.1.6",
  "rustls",

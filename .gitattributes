@@ -1,0 +1,3 @@
+# Each line of kithd.order is a linker-script pattern: a line both sides of a merge keep twice
+# matches nothing more, so two lanes that each traced it again merge by taking both.
+crates/kithd/kithd.order merge=union
