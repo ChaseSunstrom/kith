@@ -642,3 +642,84 @@ fn limits_hold_a_file_that_gives_a_list_shared_many_times() {
         assert!(said.unwrap_err().contains("did not end in"));
     }
 }
+
+/// A megabyte on one line with a record of many values at its end. A value's place is
+/// counted from its line's start, so a place on a long line must not cost a scan of the
+/// whole line each time: this evaluation has to be quick.
+#[test]
+fn pos_of_a_megabyte_on_one_line_is_quick() {
+    let lets = one_line_of_lets(600_000);
+    let items: String = (0..50_000).map(|n| format!("{n}, ")).collect();
+    let src = format!("{lets}{{ kind: \"ConfigMap\", items: [{items}0] }}");
+    assert!(src.len() < (1 << 20), "{}", src.len());
+    let started = std::time::Instant::now();
+    let output =
+        kith_lang::eval("app.kith", &files(&[("app.kith", src.as_str())]), &[]).unwrap_or_else(|e| panic!("{}", e.msg));
+    let took = started.elapsed();
+    assert_eq!(output.docs.len(), 1);
+    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+}
+
+/// An error at the end of such a line is at the column a plain count gives.
+#[test]
+fn pos_of_an_error_at_the_end_of_a_long_line_is_its_column() {
+    let lets = one_line_of_lets(700_000);
+    let src = format!("{lets}error(\"here\")");
+    let said = kith_lang::eval("app.kith", &files(&[("app.kith", src.as_str())]), &[])
+        .err()
+        .expect("refused");
+    // (A call is said at its bracket: that is where the error is.)
+    let bracket = src.rfind("error(").expect("there") + "error".len();
+    let col = src[..bracket].chars().count() + 1;
+    assert_eq!(
+        said.at,
+        Some(("app.kith".to_string(), 1, col)),
+        "{:?} {}",
+        said.at,
+        said.msg
+    );
+}
+
+/// Lets, one per few bytes, on one line, to about `size` bytes.
+fn one_line_of_lets(size: usize) -> String {
+    let mut lets = String::new();
+    let mut n = 0;
+    while lets.len() < size {
+        lets.push_str(&format!("let v{n} = {n}; "));
+        n += 1;
+    }
+    lets
+}
+
+/// A file that is over the size limit is read no further than one byte past it: a file
+/// of two megabytes gives its first megabyte and one byte (review-2 lang L2).
+#[test]
+fn import_over_the_size_limit_is_read_no_further() {
+    let dir = std::env::temp_dir().join(format!("kith-lang-big-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    std::fs::write(dir.join("big.kith"), vec![b' '; 2 << 20]).expect("write");
+    let read = kith_lang::dir(&dir)("big.kith");
+    let len = read.map(|text| text.len());
+    std::fs::remove_dir_all(&dir).expect("removed");
+    assert_eq!(len, Ok((1 << 20) + 1));
+}
+
+/// Imports are capped in all, not only each: eight files of the size limit are in the
+/// cap, a ninth is refused for the total (review-2 lang L2).
+#[test]
+fn import_totals_are_capped() {
+    let file = format!("0{}", " ".repeat((1 << 20) - 1));
+    let names: Vec<String> = (0..9).map(|n| format!("f{n}.kith")).collect();
+    let imports = |count: usize| {
+        let imported: Vec<String> = (0..count).map(|n| format!("import \"./f{n}.kith\"")).collect();
+        let entry = format!("[{}]", imported.join(", "));
+        let mut tree: Vec<(&str, &str)> = vec![("app.kith", entry.as_str())];
+        tree.extend(names.iter().map(|name| (name.as_str(), file.as_str())));
+        kith_lang::eval("app.kith", &files(&tree), &[])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    };
+    assert!(!imports(8).contains("in all"), "eight are in the cap");
+    assert!(imports(9).contains("bytes in all"), "a ninth is refused");
+}

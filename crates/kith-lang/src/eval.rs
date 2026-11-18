@@ -18,6 +18,9 @@ const DEPTH: u32 = 3000;
 pub(crate) const SIZE: usize = 1 << 20;
 /// How many files one evaluation may read: a position's file is kept in a byte.
 const FILES: usize = 255;
+/// How many bytes of imported files one evaluation may read in all: each file is under
+/// `SIZE`, and 255 of them would be 255 MiB.
+const TOTAL: usize = 8 * SIZE;
 
 #[derive(Clone)]
 pub(crate) enum V {
@@ -96,39 +99,69 @@ fn lookup(env: &Env, name: &str) -> (Option<V>, usize) {
 // A file can hang a hundred thousand names one from another, and nest a value as deep, in
 // fewer steps than it may spend: what lets go of them does so in a loop, not one inside
 // the other, which would take stack by the depth.
+/// What is let go of when a value or a scope is dropped: taken out of the one dropped, so
+/// that each is let go of in one step, whatever it holds.
+enum Held {
+    Value(V),
+    Env(Env),
+}
+
+/// Takes out of `value` what it holds, when nothing else holds the value too (a closure's
+/// scope, a list's items, a record's fields), to be let go of in turn.
+fn release(value: &mut V, more: &mut Vec<Held>) {
+    match value {
+        V::List(items) => {
+            if let Some(items) = Rc::get_mut(items) {
+                more.extend(items.drain(..).map(|(item, _)| Held::Value(item)));
+            }
+        }
+        V::Rec(fields) => {
+            if let Some(fields) = Rc::get_mut(fields) {
+                more.extend(fields.drain(..).map(|field| Held::Value(field.value)));
+            }
+        }
+        V::Fn(closure) => {
+            if let Some(closure) = Rc::get_mut(closure) {
+                more.push(Held::Env(closure.env.take()));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Lets go of what is held, one piece at a time. A scope that nothing else holds gives up
+/// its value and the scope above it.
+fn let_go(mut more: Vec<Held>) {
+    while let Some(held) = more.pop() {
+        match held {
+            Held::Value(mut value) => release(&mut value, &mut more),
+            Held::Env(env) => {
+                if let Some(mut scope) = env.and_then(Rc::into_inner) {
+                    more.push(Held::Env(scope.up.take()));
+                    if let Bound::Value(value) = &mut scope.bound {
+                        more.push(Held::Value(std::mem::replace(value, V::Null)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Drop for Scope {
     fn drop(&mut self) {
-        let mut up = self.up.take();
-        while let Some(mut scope) = up.and_then(Rc::into_inner) {
-            up = scope.up.take();
+        let mut more = vec![Held::Env(self.up.take())];
+        if let Bound::Value(value) = &mut self.bound {
+            more.push(Held::Value(std::mem::replace(value, V::Null)));
         }
+        let_go(more);
     }
 }
 
 impl Drop for V {
     fn drop(&mut self) {
-        fn inside(value: &mut V, more: &mut Vec<V>) {
-            match value {
-                V::List(items) => more.extend(
-                    Rc::get_mut(items)
-                        .into_iter()
-                        .flat_map(|items| items.drain(..))
-                        .map(|(item, _)| item),
-                ),
-                V::Rec(fields) => more.extend(
-                    Rc::get_mut(fields)
-                        .into_iter()
-                        .flat_map(|fields| fields.drain(..))
-                        .map(|field| field.value),
-                ),
-                _ => {}
-            }
-        }
         let mut more = Vec::new();
-        inside(self, &mut more);
-        while let Some(mut value) = more.pop() {
-            inside(&mut value, &mut more);
-        }
+        release(self, &mut more);
+        let_go(more);
     }
 }
 
@@ -261,12 +294,49 @@ fn resolve(from: &str, path: &str) -> std::result::Result<String, String> {
     Ok(parts.join("/"))
 }
 
+/// Where a file's lines start, and how many characters come before each block of 64 bytes:
+/// a place's column is then a count of the bytes after the last of those, not of its line.
+pub(crate) struct Lines {
+    starts: Vec<u32>,
+    /// The characters before byte 64 × n, for each n (and the total at the end).
+    blocks: Vec<u32>,
+}
+
+impl Lines {
+    pub(crate) fn new(text: &str) -> Lines {
+        let starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(at, _)| at as u32 + 1))
+            .collect();
+        let bytes = text.as_bytes();
+        let mut blocks = Vec::with_capacity(bytes.len() / 64 + 1);
+        let mut chars = 0u32;
+        for block in bytes.chunks(64) {
+            blocks.push(chars);
+            chars += block.iter().filter(|byte| **byte & 0xc0 != 0x80).count() as u32;
+        }
+        blocks.push(chars);
+        Lines { starts, blocks }
+    }
+
+    /// The characters of `text` before byte `at`, which is a character's first byte.
+    fn chars_before(&self, text: &str, at: usize) -> usize {
+        let block = at / 64;
+        self.blocks[block] as usize
+            + text.as_bytes()[block * 64..at]
+                .iter()
+                .filter(|byte| **byte & 0xc0 != 0x80)
+                .count()
+    }
+}
+
 pub(crate) struct Machine<'a> {
     load: Load<'a>,
-    /// Each file read: its name, its text, and where each of its lines starts.
-    pub files: Vec<(String, String, Vec<u32>)>,
+    /// Each file read: its name, its text, and where its lines start and its characters are.
+    pub files: Vec<(String, String, Lines)>,
     /// Each file imported, and what it gave once it has.
     imported: Vec<(String, Option<V>)>,
+    /// The bytes of the files imported so far (the first file is not one of them).
+    read: usize,
     /// Where the first file says the value it gives.
     pub gave: At,
     globals: Env,
@@ -284,6 +354,7 @@ impl<'a> Machine<'a> {
             load,
             files: Vec::new(),
             imported: Vec::new(),
+            read: 0,
             gave: At { file: 0, off: 0 },
             globals: env,
             steps: 0,
@@ -311,10 +382,18 @@ impl<'a> Machine<'a> {
                 format!("{name}: more than {SIZE} bytes, or more than {FILES} files"),
             ));
         }
+        // (The first file is no import: it is said nowhere, and is not counted.)
+        if at.file != At::NOWHERE.file {
+            self.read += text.len();
+            if self.read > TOTAL {
+                return Err(fail(
+                    at,
+                    format!("{name}: the imports are more than {TOTAL} bytes in all"),
+                ));
+            }
+        }
         let file = self.files.len() as u8;
-        let lines = std::iter::once(0)
-            .chain(text.match_indices('\n').map(|(at, _)| at as u32 + 1))
-            .collect();
+        let lines = Lines::new(&text);
         self.files.push((name.into(), text, lines));
         self.imported.push((name.into(), None));
         let tree = parse::file(&self.files[usize::from(file)].1).map_err(|mut fail| {
@@ -954,16 +1033,14 @@ impl<'a> Machine<'a> {
     /// high bits (`crate::place` takes them apart again).
     pub fn pos(&self, at: At) -> Pos {
         let (_, text, lines) = &self.files[usize::from(at.file)];
-        let line = lines.partition_point(|start| *start <= at.off) - 1;
+        let line = lines.starts.partition_point(|start| *start <= at.off) - 1;
         // (A place inside a letter of more than one byte is that letter's: never a panic.)
         let off = (0..=at.off as usize)
             .rev()
             .find(|off| text.is_char_boundary(*off))
             .unwrap_or(0);
-        let col = text[lines[line] as usize..off.max(lines[line] as usize)]
-            .chars()
-            .count()
-            + 1;
+        let start = lines.starts[line] as usize;
+        let col = lines.chars_before(text, off) - lines.chars_before(text, start) + 1;
         Pos {
             line: usize::from(at.file) << 24 | (line + 1),
             col,
@@ -1051,5 +1128,67 @@ fn given(value: &serde_json::Value) -> V {
                 })
                 .collect(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::{self, Bind, Is};
+
+    /// `pos` gives a place's line and column as a plain count from the line's start does,
+    /// ASCII and multi-byte alike, for every byte (one inside a letter is that letter's).
+    #[test]
+    fn pos_matches_a_plain_count() {
+        // (Long enough for the counts to pass several blocks of 64 bytes, lines and letters
+        // of every width crossing them.)
+        let long = format!("[\n{}  \"end\" ]", "  \"aé€😀b\",\n".repeat(12));
+        for text in [
+            "[\n  \"ab\", \"cd\",\n  \"ef\" ]",
+            "[\n  \"aé\", \"bö€\",\n  \"c😀d\" ]",
+            long.as_str(),
+        ] {
+            let load = |_: &str| -> std::result::Result<String, String> { Ok(text.to_string()) };
+            let mut machine = Machine::new(&load, &[]);
+            assert!(machine.file("a.kith", At::NOWHERE).is_ok(), "{text}");
+            for off in 0..=text.len() {
+                let start = (0..=off).rev().find(|o| text.is_char_boundary(*o)).unwrap_or(0);
+                let before = &text[..start];
+                let line = before.matches('\n').count() + 1;
+                let col = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                let pos = machine.pos(At {
+                    file: 0,
+                    off: off as u32,
+                });
+                assert_eq!((pos.line, pos.col), (line, col), "{text} at {off}");
+            }
+        }
+    }
+
+    /// A chain of 200000 closures, each holding the one before it in its scope, is let go
+    /// of by a loop: a recursion as deep as the chain would overflow the stack.
+    #[test]
+    fn drop_of_a_chain_of_closures_does_not_recurse() {
+        let thread = std::thread::Builder::new().stack_size(8 << 20).spawn(|| {
+            let Ok(tree) = parse::file("fn f(x) = x; 0") else {
+                panic!("it parses")
+            };
+            let Is::Block(binds, _) = tree.is else {
+                panic!("a block")
+            };
+            let Bind::Fn(lambda) = &binds[0].1 else { panic!("a fn") };
+            let name: Rc<str> = Rc::from("g");
+            let mut value = V::Null;
+            for _ in 0..200_000 {
+                let env = bind(&None, &name, value);
+                value = V::Fn(Rc::new(Closure {
+                    lambda: lambda.clone(),
+                    env,
+                    file: 0,
+                }));
+            }
+            drop(value);
+        });
+        thread.expect("a thread").join().expect("it ends");
     }
 }
