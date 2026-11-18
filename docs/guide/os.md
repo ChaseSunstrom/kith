@@ -82,6 +82,19 @@ update is 43 MB against 34 and the ESP's two kernels 36 of its 64 MB; the root i
 Built and started under UEFI in QEMU, the kernel brings amdgpu up (`amdgpu: Topology: Add CPU
 node`) and kithd serves; on a 780M itself it has not run yet.
 
+A node can say which features it wants itself. kithd matches its PCI cards (`lspci -n` ids) against
+the `# pci:` lines of `os/features/` and lists the features that match as `wants` in its Node status.
+`kith node features` prints them as a spec, which builds that node's image:
+
+```sh
+kith node features n1 > n1.yaml
+sh os/build.sh --spec n1.yaml --out target/os-n1
+```
+
+A node with no card a feature matches prints `features: []`; a node that runs no kith OS has no
+`wants` and the command says so. Only PCI cards are matched. A feature with no `# pci:` line (a
+card the catalogue does not list yet) is chosen by hand, as above.
+
 A cluster runs plain and GPU nodes side by side: sign each image's update as its own
 `OSRelease` and roll each with its own `UpdatePlan`, the GPU one with a `selector` on a label
 those nodes carry (`gpu: amd`, put on the Node as [any label is](cluster.md#where-work-runs): kithd does not
