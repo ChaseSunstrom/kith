@@ -103,7 +103,7 @@ thread_local! {
 /// What the zones were last built from, and the store's change counts of [`ZONE_KINDS`] when
 /// that was last looked at: a store whose counts have not moved is not read at all.
 #[derive(Default)]
-struct Built {
+pub(crate) struct Built {
     counts: Option<[u64; 6]>,
     from: Option<Vec<(String, Value, Option<Value>)>>,
 }
@@ -111,7 +111,7 @@ struct Built {
 impl Built {
     /// Whether the zones now differ from the ones last built. The zone kinds are read only when
     /// one of their counts moved, so a write to any other kind costs six counter reads.
-    fn changed(&mut self, store: &Store) -> bool {
+    pub(crate) fn changed(&mut self, store: &Store) -> bool {
         let counts = ZONE_KINDS.map(|kind| store.changes(kind));
         if self.counts == Some(counts) {
             return false;
