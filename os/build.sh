@@ -235,9 +235,12 @@ $(sed -n 's/^# firmware:[ \t]*//p' "$root/os/features/$f.config")"
     set +f
 fi
 
-# The kernel: built once per (version, config, firmware, compiler).
+# The kernel: built once per (version, settings, firmware, compiler). The key reads the
+# config's settings, '# CONFIG_X is not set' among them, not its other comments or blank lines
+# (a comment edit must not rebuild a kernel: 2.6 GB of tree and an hour). The firmware is
+# in it by its hash and its CONFIG_EXTRA_FIRMWARE line.
 compiler=$(gcc --version | head -n 1)
-key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; cat "$kconfig"; } | sha256sum | cut -c 1-16)
+key=$({ echo "$kernel_version $kernel_sha256 $compiler"; [ -z "$firmware" ] || echo "$firmware_sha256"; sed -e '/^# CONFIG_.* is not set$/b' -e '/^[[:space:]]*\(#\|$\)/d' "$kconfig"; } | sha256sum | cut -c 1-16)
 kernel=$cache/kernel-$key/vmlinuz
 mods=$cache/kernel-$key/mods
 if ! [ -r "$kernel" ]; then

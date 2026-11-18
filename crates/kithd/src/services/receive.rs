@@ -42,8 +42,12 @@ pub(super) struct Bounds {
     pub(super) empty: Duration,
 }
 
+/// Streams at once on one link (times [`link::WINDOW`] is what a link holds at the most). The
+/// node that opens them keeps to it: its next client is on a kept connection instead.
+pub(super) const STREAMS: usize = 256;
+
 pub(super) const BOUNDS: Bounds = Bounds {
-    streams: 256,
+    streams: STREAMS,
     idle: IDLE,
     asking: CONNECT,
     empty: KEPT_THERE,
@@ -236,9 +240,13 @@ mod tests {
         Fut: Future<Output = ()>,
     {
         let (mut client, held) = pair_from_ipv6().await;
-        client.write_all(b"link\n").await.unwrap();
-        let (near, _far) = link::link(client, true);
         let body = async {
+            client.write_all(b"link\n").await.unwrap();
+            // (The node takes the link with a `+`.)
+            let mut answer = [0; 1];
+            timeout(WAIT, client.read_exact(&mut answer)).await.unwrap().unwrap();
+            assert_eq!(answer, *b"+");
+            let (near, _far) = link::link(client, true);
             body(near.clone()).await;
             near.close();
         };
