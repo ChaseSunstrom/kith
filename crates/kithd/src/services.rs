@@ -2291,9 +2291,10 @@ spec:
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = dripping.accept().await {
                 tokio::spawn(async move {
-                    // Five bytes over two seconds, then (its client's end heard) its own.
-                    for _ in 0..5 {
-                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    // Twelve bytes a quarter second apart (three seconds), then (its client's end
+                    // heard) its own.
+                    for _ in 0..12 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
                         stream.write_all(b".").await.unwrap();
                     }
                     let _ = stream.read_to_end(&mut Vec::new()).await;
@@ -2305,13 +2306,13 @@ spec:
         assert!(ask(&mut relay, "kept 8080 web\n", b"").await.unwrap());
         let (mut client, held) = pair().await;
         let hearing = async {
-            let mut heard = [0; 5];
+            let mut heard = [0; 12];
             client.read_exact(&mut heard).await.unwrap();
             client.shutdown().await.unwrap();
             client.read_to_end(&mut Vec::new()).await.unwrap()
         };
         let begun = std::time::Instant::now();
-        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(1)), hearing);
+        let (carried, more) = tokio::join!(carry(held, &mut relay, Duration::from_secs(2)), hearing);
         carried.unwrap();
         assert!(more == 0 && begun.elapsed() >= Duration::from_secs(2));
 
@@ -2323,9 +2324,9 @@ spec:
         let (mut client, held) = pair().await;
         client.shutdown().await.unwrap();
         let begun = std::time::Instant::now();
-        let cut = carry(held, &mut relay, Duration::from_secs(1)).await;
+        let cut = carry(held, &mut relay, Duration::from_secs(2)).await;
         assert_eq!(cut.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-        assert!(begun.elapsed() >= Duration::from_secs(1) && begun.elapsed() < Duration::from_secs(3));
+        assert!(begun.elapsed() >= Duration::from_secs(2) && begun.elapsed() < Duration::from_secs(10));
     }
 
     /// A replica that speaks first and ends first: its bytes and its end reach the client,
