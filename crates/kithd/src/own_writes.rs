@@ -76,6 +76,17 @@ fn kind_of(key: &str) -> &str {
 /// hold it as the node's own write), and no mesh key another node holds (as a worker's may not).
 fn own_node(store: &Store, name: &str, key: &str, fields: &Fields) -> Result<(), String> {
     raft_id(name, key, fields)?;
+    // Which node holds the CA ([`holds_ca`]) is what the CA node's first start wrote, as the one
+    // node, leading: said again the same, never changed by a node of itself.
+    if let Some(said) = fields.get("ca") {
+        let held = store
+            .get(key)
+            .and_then(|node| node.status.as_ref())
+            .map(|status| &status["ca"]);
+        if held != Some(said) {
+            return Err(refused(key, "which node holds the CA is not a node's own to say"));
+        }
+    }
     worker::mesh_key_elsewhere(store, name, key, fields)
 }
 
@@ -594,5 +605,34 @@ mod tests {
             said(forwarded(&key)).await.contains("Ok"),
             "an admin's lock of it, passed on, is let through"
         );
+    }
+
+    /// Which node holds the CA is what its first start wrote (it led alone then): a control node
+    /// does not say so of itself after, or it would admit nodes by a join it cannot sign.
+    #[tokio::test]
+    async fn own_writes_refuse_a_control_node_saying_it_holds_the_ca() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-ca", node(&ca, "ca-c"), &[]).await;
+        let node = |name: &str| {
+            let node = serde_json::json!({
+                "apiVersion": kith_api::API_VERSION, "kind": "Node", "metadata": { "name": name }, "spec": {},
+            });
+            serde_json::from_value::<kith_api::Resource>(node).unwrap()
+        };
+        {
+            let store = &mut shared.store.lock().unwrap().store;
+            store.apply(node("ca-c")).unwrap();
+            store
+                .set_status("Node/ca-c", Some(serde_json::json!({ "ca": true })))
+                .unwrap();
+            store.apply(node("ca-o")).unwrap();
+        }
+        let patch = |name: &str, fields: serde_json::Value| Command::Patch {
+            statuses: vec![(format!("Node/{name}"), fields.as_object().unwrap().clone())],
+        };
+        assert!(checked(&shared, "ca-o", patch("ca-o", serde_json::json!({ "ca": true }))).is_err());
+        assert!(checked(&shared, "ca-c", patch("ca-c", serde_json::json!({ "ca": false }))).is_err());
+        // (The CA node's start says it again: the same, and let through.)
+        assert!(checked(&shared, "ca-c", patch("ca-c", serde_json::json!({ "ca": true }))).is_ok());
     }
 }
