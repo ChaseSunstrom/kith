@@ -108,6 +108,8 @@ pub struct Machine {
     /// snapshot while it installs another, and the older must not replace the newer.
     saved: Arc<Mutex<Option<LogId<u64>>>>,
     changed: Arc<dyn Fn() + Send + Sync>,
+    /// What each entry is asked once the store is in format 3 ([`crate::Check`]).
+    check: crate::Check,
     /// The index of the last write applied here whose log entry holds a wrapped key the
     /// store no longer has, and that key's NodeKey (see [`crate::scrub`]).
     pub(crate) forgot: Arc<tokio::sync::watch::Sender<(u64, String)>>,
@@ -116,7 +118,7 @@ pub struct Machine {
 impl Machine {
     /// Start from the snapshot in `dir`, or empty. One from before a NodeKey kept one
     /// revision is cut, and written so at once.
-    pub fn open(dir: &Path, changed: Arc<dyn Fn() + Send + Sync>) -> Result<Machine, String> {
+    pub fn open(dir: &Path, changed: Arc<dyn Fn() + Send + Sync>, check: crate::Check) -> Result<Machine, String> {
         let file = dir.join("snapshot.json");
         let mut saved = match std::fs::read(&file) {
             Ok(bytes) => Some(read(&bytes, &file)?),
@@ -133,6 +135,7 @@ impl Machine {
             state: Arc::new(Mutex::new(state)),
             file,
             changed,
+            check,
             forgot: Arc::new(tokio::sync::watch::Sender::new((0, String::new()))),
         };
         if let Some(mut saved) = saved.filter(|_| cut) {
@@ -234,16 +237,32 @@ impl RaftStateMachine<TypeConfig> for Machine {
                 replies.push(match entry.payload {
                     EntryPayload::Blank => Ok(crate::Done::Nothing),
                     EntryPayload::Normal(command) => {
-                        let keys = crate::keys(&command);
+                        let mut keys = crate::keys(&command);
                         let mut carried = crate::carried(&command);
                         // (A store brought in replaces this one: the keys this one holds are
                         // in the log's earlier entries, and count like the ones it carries.)
-                        if matches!(command, crate::Command::Import { .. }) {
+                        if matches!(crate::inner(&command), crate::Command::Import { .. }) {
                             carried.extend(crate::held(&state.store));
                         }
-                        state.store.entry(entry.log_id.index);
-                        let reply = run(&mut state.store, command);
-                        state.store.entry(0);
+                        // (Before format 3 nothing is asked: an old log applies as it did.)
+                        let leader = entry.log_id.leader_id.node_id;
+                        let checked = match crate::format_of(&state.store) >= 3 {
+                            true => (self.check)(&state.store, &command, leader),
+                            false => Ok(()),
+                        };
+                        let reply = match checked {
+                            Ok(()) => {
+                                state.store.entry(entry.log_id.index);
+                                let reply = run(&mut state.store, command);
+                                state.store.entry(0);
+                                reply
+                            }
+                            // Refused: nothing on every node, and nothing changed.
+                            Err(refused) => {
+                                keys = Some(Vec::new());
+                                Err(refused)
+                            }
+                        };
                         let keys = keys.map(|named| named.into_iter().chain(crate::changed(&reply)).collect());
                         state.note(entry.log_id.index, keys);
                         // (The entry is in the log as it was sent: refused, or a revision of
