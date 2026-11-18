@@ -379,6 +379,24 @@ kith-mesh people` (the batch taken, rules read back, a peer on the device only a
 rules); `cargo test -q -p kith-cli --test readme`; `crates/kithd/ui/test.mjs` (`qr.js`
 against a reference matrix); `python3 ci/budgets.py`.
 
+## Built: slice A
+
+`AccessLevel` and `RemotePeer` are kinds kith-api applies and checks (`kinds!`, `Spec::check`),
+and `crates/kithd/src/people.rs` gives each peer its two addresses on the leader and keeps them
+in its status, with the refusals of review condition 5. Not built, as the plan says: the device,
+the nftables table, `--people`, the configuration shown once, DNS and exits (slices B to D).
+
+Where the build differs from the text above:
+
+- An IPv6 overlap is not refused at apply: the mesh /48 and the people /64 come from the CA,
+  which kith-api does not hold. kithd refuses an AccessLevel over either in its `refused` status
+  instead. An IPv4 overlap with the people ranges or `100.88.0.0/16` is refused at apply.
+- The pods range checked is the default `100.88.0.0/16`. The start-time check of the people
+  ranges against `--pod-range` and the connected networks (condition 4) is not done yet.
+- An IPv4 address is 16 bits of the name's SHA-256 inside `100.89.0.0/16`; the IPv6 address is
+  the people /64 with the name's SHA-256 bytes 8 to 16 as its interface id. A peer refused for
+  a shared key gives up the address it held; the first holder keeps its own.
+
 ## Open
 
 - **Should the filter tell people apart?** Then the router routes `100.89.0.0/16` to the node
