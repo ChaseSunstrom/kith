@@ -24,6 +24,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// First argument of the helper an exec unit starts as (see [`exec_shim`]).
 const SHIM: &str = "--kith-exec-unit";
@@ -62,7 +63,15 @@ pub struct Runtime {
     /// Where each unit started is written down, for a kithd started again to take it back
     /// ([`Runtime::adopt`]): set under a keeper (kith OS), where units outlive kithd.
     pub records: Option<PathBuf>,
+    /// Set once a create of a writable root, where kithd is not root, failed for the kernel's
+    /// refusal of the overlay: every later one is read-only, without trying it again.
+    overlay_refused: AtomicBool,
 }
+
+/// What a unit's status says when its root is read-only because this kernel does not mount an
+/// overlay in a user namespace: where a writable root is asked of a kithd that is not root.
+const ROOT_READ_ONLY: &str =
+    "root is read-only: this kernel does not mount overlay in a user namespace (kithd is not root)";
 
 /// What to run. Everything is already resolved: the controller turns a
 /// `Workload`'s container (quantities, secrets, config maps) into this.
@@ -112,7 +121,8 @@ pub struct Unit {
     pub as_image: bool,
     /// The root file system is the container's own to write: what it writes is kept
     /// beside it, never in the image, and goes when it is deleted. Without it the root is
-    /// the image, read-only.
+    /// the image, read-only. Where kithd is not root and the kernel refuses the overlay that
+    /// holds it, the root is read-only instead, and the handle's `note` says so.
     pub writable: bool,
     /// The network namespace it is put in (a pod's), by path. Without one: the host's.
     pub netns: Option<PathBuf>,
@@ -416,6 +426,9 @@ pub struct Handle {
     /// Taken back from a kithd before this one ([`Runtime::adopt`]): its main is no child of
     /// this process, and is known by its start time; how it ended, by what process 1 wrote.
     adopted: Option<u64>,
+    /// How it runs differently from what it asked, for its unit's status: its root is read-only
+    /// ([`ROOT_READ_ONLY`]) where the kernel refused the overlay its writable root asked for.
+    pub note: Option<&'static str>,
 }
 
 impl Runtime {
@@ -436,6 +449,7 @@ impl Runtime {
             // Not `current_exe()`: after an upgrade replaces the file, that names a path that is gone.
             shim: "/proc/self/exe".into(),
             records: None,
+            overlay_refused: AtomicBool::new(false),
         })
     }
 
@@ -556,6 +570,7 @@ impl Runtime {
                 cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
                 range,
                 adopted: Some(start),
+                note: None,
             };
             taken.insert(id, (handle, mark.to_string()));
         }
@@ -617,10 +632,43 @@ impl Runtime {
     /// Create the container `id`: namespaces and cgroup are set up and the
     /// process is ready, but it does not run until [`Handle::start`].
     ///
+    /// Where kithd is not root, a writable root is an overlay first. Where the kernel refuses that
+    /// (linux-hardened does, in a user namespace), the root is read-only, for this runtime from then
+    /// on, and the handle's `note` says so.
     // ponytail: the image's rootfs is shared read-only, with tmpfs on /tmp and /run, and
     // the host's network, unless the unit says otherwise (`writable`, `netns`). What a
     // writable root holds is on the state's disk with no limit of its own.
     pub fn create(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
+        if !(unit.writable && !nix::unistd::getuid().is_root()) {
+            return self.create_once(id, image, unit, stdout, stderr);
+        }
+        if self.overlay_refused.load(Ordering::Relaxed) {
+            return self.create_read_only(id, image, unit, stdout, stderr);
+        }
+        let what = format!("creating container `{id}`");
+        let (out, errs) = (stdout.try_clone().ctx(&what)?, stderr.try_clone().ctx(&what)?);
+        match self.create_once(id, image, unit, stdout, stderr) {
+            Err(e) if refuses_overlay(&e.to_string()) => {
+                self.overlay_refused.store(true, Ordering::Relaxed);
+                self.create_read_only(id, image, unit, out, errs)
+            }
+            done => done,
+        }
+    }
+
+    /// [`Runtime::create`] with the root read-only, which is said in the log and in the handle.
+    fn create_read_only(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
+        eprintln!("kith: container `{id}`: {ROOT_READ_ONLY}");
+        let read_only = Unit {
+            writable: false,
+            ..unit.clone()
+        };
+        let mut handle = self.create_once(id, image, &read_only, stdout, stderr)?;
+        handle.note = Some(ROOT_READ_ONLY);
+        Ok(handle)
+    }
+
+    fn create_once(&self, id: &str, image: &Image, unit: &Unit, stdout: File, stderr: File) -> Result<Handle> {
         let what = format!("creating container `{id}`");
         let bundle = self.root.join("containers").join(id);
         let cgroup = format!("{}/kith-{id}", self.cgroup_parent);
@@ -756,6 +804,7 @@ impl Runtime {
             cgroup: cgroup_dir,
             range: shift,
             adopted: None,
+            note: None,
         };
         // Before its program runs: the devices it may open, and no other. (Where kithd is
         // root; elsewhere the container is a user namespace, which makes no device node.)
@@ -830,6 +879,7 @@ impl Runtime {
             cgroup: Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/')),
             range: None,
             adopted: None,
+            note: None,
         };
         let manager = manager(&cgroup);
         let options = ControllerOpt {
@@ -1568,6 +1618,13 @@ fn spec_of(
     spec_shifted(id, image, unit, cgroup, bundle, (uid, gid), None)
 }
 
+/// Whether a failed create is the kernel refusing an overlay root: the init process logs the mount it
+/// could not make, which names the overlay in its debug form (`typ: Some("overlay")`), and the errno
+/// it got (`Nix(EPERM)`).
+fn refuses_overlay(said: &str) -> bool {
+    said.contains("\"overlay\"") && said.contains("EPERM")
+}
+
 /// Most of what an init process logged that is said after a failed build.
 const LOG_BYTES: usize = 2048;
 
@@ -1714,11 +1771,9 @@ fn spec_shifted(
     // (A range's image is its id-mapped mount, made by `stage`; so are its own layer and volumes.)
     let staged = |name: &str| Path::new(STAGE).join(name);
     let image_root = shift.map_or(image.rootfs.clone(), |_| staged("root"));
-    // (Where kithd is not root a writable root cannot be an overlay: the kernel refuses one in a
-    // user namespace, so the image is read-only and the pod's writes go to its tmpfs.)
-    let rootfs = RootBuilder::default()
-        .path(&image_root)
-        .readonly(!(unit.writable && uid.is_root()));
+    // (A writable root is an overlay of the image, where kithd is not root too; where the kernel
+    // refuses that, `create` asks for the unit read-only.)
+    let rootfs = RootBuilder::default().path(&image_root).readonly(!unit.writable);
     spec.set_root(Some(rootfs.build()?));
     // Linux refuses hostnames over 64 bytes; ids are ASCII (validated by the caller).
     let hostname = unit.hostname.as_deref().unwrap_or(id);
@@ -1835,7 +1890,7 @@ fn spec_shifted(
             .build()?)
     };
     let mut mounts = spec.mounts().clone().unwrap_or_default();
-    if unit.writable && root {
+    if unit.writable {
         // The first mount, on the root itself: the image below, the container's own layer
         // over it, and everything after is mounted on the two together. (It is made in the
         // container's mount namespace, and goes with it.)
@@ -1846,8 +1901,9 @@ fn spec_shifted(
             format!("upperdir={}", layer("upper")),
             format!("workdir={}", layer("work")),
         ];
-        if shift.is_some() {
-            // (What a range's user namespace may write its bookkeeping in.)
+        if shift.is_some() || !root {
+            // (What a user namespace may write its bookkeeping in: a range's, or kithd's own
+            // where kithd is not root, which is a user namespace too.)
             options.push("userxattr".into());
         }
         let over = MountBuilder::default().destination("/").typ("overlay");
@@ -2620,11 +2676,33 @@ mod tests {
         assert_eq!((process.user().uid(), process.user().gid()), (101, 0));
         let kept = Some(HashSet::from([Capability::NetBindService]));
         assert_eq!(process.capabilities().as_ref().unwrap().bounding(), &kept);
-        // Where kithd is not root, the overlay is refused inside its user namespace (the kernel
-        // says so on this host, with or without userxattr), so the image is the root, read-only,
-        // and the pod still runs: its tmpfs /tmp and /run are what it writes.
+        // Where kithd is not root, its writable root is an overlay too, with userxattr (what a
+        // user namespace may write its bookkeeping in): kithd's own user is the one the overlay
+        // is mounted for.
         let (uid, gid) = (nix::unistd::Uid::from_raw(1000), nix::unistd::Gid::from_raw(1000));
         let made = spec_of("a", &image, &unit, "/kith/a", Path::new("/b"), uid, gid).unwrap();
+        assert_eq!(made.root().as_ref().unwrap().readonly(), Some(false));
+        let first = &made.mounts().as_ref().unwrap()[0];
+        assert_eq!(
+            (first.destination().to_str(), first.typ().as_deref()),
+            (Some("/"), Some("overlay"))
+        );
+        assert_eq!(
+            first.options().as_ref().unwrap(),
+            &[
+                "lowerdir=/images/x/rootfs",
+                "upperdir=/b/upper",
+                "workdir=/b/work",
+                "userxattr"
+            ]
+        );
+        // Where the kernel refuses that overlay (`ROOT_READ_ONLY`), the image is the root, read-only,
+        // and the pod still runs: its tmpfs /tmp and /run are what it writes.
+        let refused = Unit {
+            writable: false,
+            ..unit.clone()
+        };
+        let made = spec_of("a", &image, &refused, "/kith/a", Path::new("/b"), uid, gid).unwrap();
         assert_eq!(made.root().as_ref().unwrap().readonly(), Some(true));
         assert!(
             made.mounts()
@@ -2746,6 +2824,7 @@ mod tests {
                 cgroup: cgroup.clone(),
                 range: None,
                 adopted: None,
+                note: None,
             }
         };
         // Processes still listed: the handle comes back and the bundle is kept.
@@ -2783,6 +2862,7 @@ mod tests {
                 cgroup: cgroup.clone(),
                 range: None,
                 adopted: None,
+                note: None,
             }
         };
         discard_leftovers(&state, fresh("4242\n").finish(err("removing the cgroup")));
@@ -2820,6 +2900,7 @@ mod tests {
             cgroup: cgroup.clone(),
             range: None,
             adopted: None,
+            note: None,
         };
         let saved = || Spec::load(bundle.join("config.json")).unwrap();
         let nodes = || saved().linux().as_ref().unwrap().devices().clone().unwrap_or_default();
@@ -2918,6 +2999,77 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Only the overlay's EPERM is the kernel refusing the overlay root: the other failures of a
+    /// create, and EPERM of another mount, are not, and stay errors.
+    #[test]
+    fn refused_overlay_is_the_only_failure_that_makes_the_root_read_only() {
+        // The text a create of this host's overlay root gets (its init process's log, after the top error).
+        let refused = r#"failed to prepare rootfs; its init process logged: failed to mount Mount { destination: "/", typ: Some("overlay"), source: Some("overlay"), options: Some(["lowerdir=/r", "upperdir=/b/upper"]) }: syscall; failed to prepare rootfs err=Mount(Syscall(Nix(EPERM)))"#;
+        assert!(refuses_overlay(refused));
+        let other_mount = r#"failed to prepare rootfs; its init process logged: failed to mount Mount { destination: "/proc", typ: Some("proc") }: syscall; err=Mount(Syscall(Nix(EPERM)))"#;
+        assert!(!refuses_overlay(other_mount));
+        let missing = r#"failed to prepare rootfs; its init process logged: failed to mount Mount { destination: "/", typ: Some("overlay") }: syscall; err=Mount(Syscall(Nix(ENOENT)))"#;
+        assert!(!refuses_overlay(missing));
+        assert!(!refuses_overlay("failed to prepare rootfs"));
+    }
+
+    /// Where kithd is not root, a writable unit's root is an overlay first; where the kernel refuses
+    /// that, the unit runs with a read-only root and says so, and this runtime does not try the
+    /// overlay again. Where the kernel allows it, neither happens. Either way the unit is made.
+    #[test]
+    fn a_rootless_writable_root_is_read_only_only_where_the_kernel_refuses_overlay() {
+        if nix::unistd::getuid().is_root() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("kith-overlay-refused-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("runtime")).unwrap();
+        // The directories a read-only root needs for its mounts: the image's own, not the pod's.
+        let rootfs = root.join("rootfs");
+        for dir in ["dev", "etc", "proc", "run", "sys", "tmp", "bin"] {
+            fs::create_dir_all(rootfs.join(dir)).unwrap();
+        }
+        // (Only found, not run: the init process checks the entrypoint is there.)
+        fs::copy("/bin/true", rootfs.join("bin/true")).unwrap();
+        let image = Image {
+            rootfs: rootfs.clone(),
+            entrypoint: vec!["/bin/true".into()],
+            ..Image::default()
+        };
+        let unit = Unit {
+            writable: true,
+            ..Unit::default()
+        };
+        let files = || {
+            (
+                File::create(root.join("out")).unwrap(),
+                File::create(root.join("err")).unwrap(),
+            )
+        };
+        let (out, err) = files();
+        let first = runtime.create("a", &image, &unit, out, err).unwrap();
+        let refused = runtime.overlay_refused.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            first.note.is_some(),
+            refused,
+            "the note is there where the overlay is refused, and only then"
+        );
+        if refused {
+            assert_eq!(first.note, Some(ROOT_READ_ONLY));
+            assert!(
+                !root.join("runtime/containers/a/upper").exists(),
+                "a read-only root makes no upper layer"
+            );
+        }
+        // Once refused, the next create does not try the overlay: it is read-only from the start.
+        let (out, err) = files();
+        let second = runtime.create("b", &image, &unit, out, err).unwrap();
+        assert_eq!(second.note.is_some(), refused);
+        first.discard(&root.join("runtime/state/a"));
+        second.discard(&root.join("runtime/state/b"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A record says a unit's pid, its start time and its mark; a kithd after takes back none
     /// whose pid ended, started at another time, is process 1 or is outside the unit's cgroup
     /// (this test's own process is in no kith- cgroup), and removes each record it did not take.
@@ -2932,6 +3084,7 @@ mod tests {
             images: ImageStore::new(root.join("images")).unwrap(),
             shim: "/proc/self/exe".into(),
             records: Some(records.clone()),
+            overlay_refused: AtomicBool::new(false),
         };
         let own = Pid::this();
         let start = started(own).expect("this process's start time");
@@ -2944,6 +3097,7 @@ mod tests {
             cgroup: root.join("cgroup"),
             range: None,
             adopted: None,
+            note: None,
         };
         runtime.record("own", &handle, "m1");
         assert_eq!(
@@ -3282,6 +3436,7 @@ mod tests {
             cgroup: cgroup.clone(),
             range: None,
             adopted: None,
+            note: None,
         };
         let state = root.join("state");
         fs::create_dir_all(&state).unwrap();
@@ -3291,6 +3446,7 @@ mod tests {
             images: ImageStore::new(root.join("images")).unwrap(),
             shim: "/proc/self/exe".into(),
             records: None,
+            overlay_refused: AtomicBool::new(false),
         };
         // (Each is made as the lowest free range, so the one a take gives after its removal is the same.)
         let freed = |name: &str, remove: &dyn Fn()| {
@@ -3398,6 +3554,7 @@ mod tests {
             images: ImageStore::new(root.join("images")).unwrap(),
             shim: "/proc/self/exe".into(),
             records: None,
+            overlay_refused: AtomicBool::new(false),
         };
         fs::create_dir_all(root.join("state")).unwrap();
         for name in ["torn", "running"] {

@@ -1448,6 +1448,9 @@ impl Controller {
                 tokio::task::yield_now().await;
                 match started {
                     Ok(handle) => {
+                        // How it runs differently from what it asked (its root read-only, where the kernel
+                        // refuses an overlay) is said while it runs.
+                        let note = handle.note.map(str::to_string);
                         slot.handle = Some(handle);
                         slot.tuned = None;
                         // Why it was replaced for what it wrote stays said while it runs again, once.
@@ -1457,7 +1460,7 @@ impl Controller {
                             .take()
                             .filter(|m| replaced && m.starts_with(storage::REPLACED));
                         (slot.state, slot.message, slot.start_at, slot.started) =
-                            ("running", replaced, None, Instant::now());
+                            ("running", note.or(replaced), None, Instant::now());
                         if let Run::Container(c) = &slot.run {
                             let pod = slot.pod.as_ref().map(|(pod, _)| pod.clone());
                             slot.probes = crate::probe::start(shared.clone(), c, pod);
