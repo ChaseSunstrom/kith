@@ -68,6 +68,15 @@ EOF
             # what they were told, and the db, which has started once.
             must 'kubectl apply of the Job and the CronJob' k apply -f "$root/ci/kube/jobs.yaml"
             heard ask 'shop-0 hello hunter2' 'shop-1 hello hunter2' 'shop-2 hello hunter2' 'db-0 started 1'
+            # The replica's own name and the headless Service's name answer an address each
+            # (AAAA: a client that asks for IPv6, which getaddrinfo does); the pod says so, a
+            # line a name. Anchored, so each line is its own name's: with one replica the
+            # headless answer is db-0's address, and not the db Service's.
+            heard replicas '^db-0.db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db-replicas.default.svc.cluster.local: \["[0-9a-f]*:' '^db.default.svc.cluster.local: \["[0-9a-f]*:'
+            own=$(sed -n 's/^db-0\.db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
+            headless=$(sed -n 's/^db-replicas\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
+            svc=$(sed -n 's/^db\.default\.svc\.cluster\.local: //p' "$work/replicas.out")
+            [ -n "$own" ] && [ "$headless" = "$own" ] && [ -n "$svc" ] && [ "$svc" != "$own" ] || fail "the headless name does not answer db-0's address, or the db Service's is its own: $(cat "$work/replicas.out")"
             waited=0
             until tick=$(k get jobs -o name 2>/dev/null | grep -m 1 '^job.batch/tick-'); do
                 waited=$((waited + 1))

@@ -614,6 +614,8 @@ impl Backend {
 
     /// All or nothing. A dry run reports the same changes and keeps none of them.
     fn apply(&self, resources: Vec<Resource>, dry_run: bool) -> Result<Vec<Change>, String> {
+        // (Refused here as kithd refuses it, so a local store takes no dotted name either.)
+        resources.iter().try_for_each(Resource::submitted)?;
         match self {
             Backend::Local(path) => Self::local(path, !dry_run, |store| store.apply_all(resources)),
             Backend::Daemon(socket) => {

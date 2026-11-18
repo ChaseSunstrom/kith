@@ -362,6 +362,24 @@ impl Resource {
         }
     }
 
+    /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
+    /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
+    /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
+    /// validates every logged resource too, and a log written before this rule holds dotted ones.
+    pub fn submitted(&self) -> Result<(), String> {
+        let one_label = |what: &str, name: &str| match name.contains('.') {
+            true => Err(format!("{what} names are one DNS label: no `.` in `{name}`")),
+            false => Ok(()),
+        };
+        if matches!(self.kind.as_str(), "Service" | "Namespace") {
+            one_label(&self.kind, &self.metadata.name)?;
+        }
+        self.metadata
+            .namespace
+            .as_deref()
+            .map_or(Ok(()), |ns| one_label("namespace", ns))
+    }
+
     /// What can be checked of a resource whose kind is not kith's own without the
     /// `KindDefinition` (the store has that, and checks the rest: see `Store::plan`).
     fn custom(self) -> Result<Resource, String> {
