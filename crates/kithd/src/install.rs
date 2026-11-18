@@ -103,10 +103,37 @@ fn serial(disk: &Path) -> String {
         .find_map(|file| std::fs::read_to_string(disk.join(file)).ok())
         .or_else(page)
         .unwrap_or_default();
-    said.trim()
-        .chars()
-        .filter(|c| c.is_ascii_graphic() || *c == ' ')
-        .collect()
+    // (Kept bytes first, then trimmed: a page padded "ABC \0" is the serial "ABC".)
+    let kept: String = said.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').collect();
+    kept.trim().to_string()
+}
+
+/// The one disk that gives `serial` (after `serial:`), or why none is.
+fn by_serial<'a>(serial: &str, disks: &'a [Disk]) -> Result<&'a Disk, String> {
+    let serial = serial.trim();
+    if serial.is_empty() {
+        return Err("`disk: serial:` names no serial".into());
+    }
+    let listed = || disks.iter().map(Disk::to_string).collect::<Vec<_>>().join(", ");
+    let found: Vec<&Disk> = disks.iter().filter(|disk| disk.serial == serial).collect();
+    match found.as_slice() {
+        [one] => Ok(one),
+        [] if disks.is_empty() => Err("this machine has no disk to install on".into()),
+        [] => Err(format!(
+            "no disk with serial {serial} to install on; there is: {}",
+            listed()
+        )),
+        // (Cheap USB bridges, and an NVMe drive's namespaces, give several disks one serial:
+        // then it names none of them.)
+        several => {
+            let names: Vec<&str> = several.iter().map(|disk| disk.name.as_str()).collect();
+            Err(format!(
+                "{} disks give serial {serial}: {}. Name the disk",
+                several.len(),
+                names.join(", ")
+            ))
+        }
+    }
 }
 
 /// Whether `disk` is still the size it was planned at, as `sys` (`/sys/block`) says now. A
@@ -116,6 +143,17 @@ pub fn size_unchanged(sys: &Path, disk: &Disk) -> Result<(), String> {
         .ok()
         .and_then(|sectors| sectors.trim().parse::<u64>().ok())
         .and_then(|sectors| sectors.checked_mul(512));
+    // (A disk named by serial is asked for it again: another disk of its size could have
+    // taken its name since.)
+    if !disk.serial.is_empty() {
+        let serial_now = serial(&sys.join(&disk.name));
+        if serial_now != disk.serial {
+            return Err(format!(
+                "{disk} gives serial {serial_now:?} now, not {}: nothing was written",
+                disk.serial
+            ));
+        }
+    }
     match now {
         Some(bytes) if bytes == disk.bytes => Ok(()),
         Some(bytes) => Err(format!(
@@ -201,32 +239,7 @@ pub fn plan(answers: &Answers, disks: &[Disk], image: u64, room: u64) -> Result<
                 _ => return Err(format!("`disk: only` and this machine has several: {}", listed())),
             }
         }
-        serial if serial.starts_with("serial:") => {
-            let serial = serial["serial:".len()..].trim();
-            if serial.is_empty() {
-                return Err("`disk: serial:` names no serial".into());
-            }
-            let found: Vec<&Disk> = disks.iter().filter(|disk| disk.serial == serial).collect();
-            match found.as_slice() {
-                [one] => *one,
-                [] if disks.is_empty() => return Err("this machine has no disk to install on".into()),
-                [] => {
-                    return Err(format!(
-                        "no disk with serial {serial} to install on; there is: {}",
-                        listed()
-                    ));
-                }
-                // (Cheap USB bridges give every disk one serial: then it names none of them.)
-                several => {
-                    let names: Vec<&str> = several.iter().map(|disk| disk.name.as_str()).collect();
-                    return Err(format!(
-                        "{} disks give serial {serial}: {}. Name the disk",
-                        several.len(),
-                        names.join(", ")
-                    ));
-                }
-            }
-        }
+        serial if serial.starts_with("serial:") => by_serial(&serial["serial:".len()..], disks)?,
         name => disks.iter().find(|disk| disk.name == name).ok_or_else(|| match disks {
             [] => format!("no disk {name}: this machine has no disk to install on"),
             _ => format!("no disk {name} to install on; there is: {}", listed()),
@@ -330,11 +343,16 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
     let listed: Vec<String> = disks.iter().map(|disk| format!("  {disk}\n")).collect();
     let some = |answer: String| Some(answer).filter(|answer| !answer.is_empty());
     let disk = ask(&format!(
-        "This machine's disks:\n{}Install kith OS on which (its name)?",
+        "This machine's disks:\n{}Install kith OS on which (its name, or serial:X)?",
         listed.concat()
     ));
-    let chosen = disks.iter().find(|found| found.name == disk);
-    let chosen = chosen.ok_or(format!("there is no disk `{disk}` here"))?;
+    let chosen = match disk.strip_prefix("serial:") {
+        Some(serial) => by_serial(serial, disks)?,
+        None => disks
+            .iter()
+            .find(|found| found.name == disk)
+            .ok_or(format!("there is no disk `{disk}` here"))?,
+    };
     let hostname = some(ask(
         "The node's name (empty: one made from its network card's address)?",
     ));
@@ -350,7 +368,7 @@ pub fn interview(disks: &[Disk], mut ask: impl FnMut(&str) -> String) -> Result<
     let again = ask(&format!(
         "Everything on {chosen} will be erased. Type its name again to go on:"
     ));
-    if again != disk {
+    if again != disk && again != chosen.name {
         return Err(format!("`{again}` is not `{disk}`: nothing was written"));
     }
     Ok(Answers {
@@ -902,7 +920,7 @@ mod tests {
         // SATA disk its page 0x80 (four bytes of header, then the serial, padded).
         std::fs::write(sys.join("nvme0n1/device/serial"), "S4EW0001      \n").unwrap();
         std::fs::write(sys.join("vda/serial"), "vd-two").unwrap();
-        std::fs::write(sys.join("sda/device/vpd_pg80"), b"\0\x80\0\x0cSCSI-ONE    ").unwrap();
+        std::fs::write(sys.join("sda/device/vpd_pg80"), b"\0\x80\0\x0cSCSI-ONE  \0\0").unwrap();
         let found = disks(&sys, None);
         std::fs::remove_dir_all(&sys).unwrap();
         let serials: Vec<_> = found.iter().map(|d| (d.name.as_str(), d.serial.as_str())).collect();
@@ -994,6 +1012,14 @@ mod tests {
             "{why}"
         );
         assert!(why.contains("nothing was written"), "{why}");
+        // A disk named by serial: another of the same size under its name is refused too.
+        std::fs::write(sys.join("sdb/size"), "4000000000").unwrap();
+        std::fs::write(sys.join("sdb/serial"), "ONE").unwrap();
+        let planned = disks(&sys, None).remove(0);
+        assert!(size_unchanged(&sys, &planned).is_ok());
+        std::fs::write(sys.join("sdb/serial"), "TWO").unwrap();
+        let why = size_unchanged(&sys, &planned).unwrap_err();
+        assert!(why.contains("\"TWO\"") && why.contains("nothing was written"), "{why}");
         // A disk whose size can no longer be read is refused as well.
         std::fs::remove_dir_all(sys.join("sdb")).unwrap();
         assert!(size_unchanged(&sys, &planned).is_err());
@@ -1197,6 +1223,19 @@ mod tests {
         assert!(ask(&["sda", "", "", "", "", ""]).0.is_err());
         assert!(ask(&["sdz"]).0.unwrap_err().contains("no disk `sdz`"));
         assert!(interview(&[], |_| String::new()).is_err());
+        // At the console a disk may be named by its serial, as in the answers file; the
+        // second time, by its serial again or its name.
+        let mut two = two;
+        two[1].serial = "S4EW0001".into();
+        for again in ["serial:S4EW0001", "sdb"] {
+            let mut lines = ["serial:S4EW0001", "", "", "", "", again].into_iter();
+            let told = interview(&two, |_| lines.next().unwrap().to_string()).unwrap();
+            assert_eq!(told.disk, "serial:S4EW0001");
+        }
+        let mut lines = ["serial:S4EW0001", "", "", "", "", "sda"].into_iter();
+        assert!(interview(&two, |_| lines.next().unwrap().to_string()).is_err());
+        let refused = interview(&two, |_| "serial:NONE".into()).unwrap_err();
+        assert!(refused.contains("no disk with serial NONE"), "{refused}");
     }
 
     /// A disk image of 64 sectors with a GPT whose third partition is `config`, 4 sectors at sector 40.
