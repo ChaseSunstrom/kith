@@ -1210,6 +1210,58 @@ spec: { selector: { app: api }, ports: [{ port: 80 }], expose: { host: api.examp
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A control node that completes the handshake and then never answers the request gives up its
+    /// headers after `SILENT`: the request is not held up past that, and another control node is called.
+    /// (A node that does not even complete the handshake is cut off by the client's 5 s connect timeout.)
+    #[tokio::test(start_paused = true)]
+    async fn a_view_request_that_gets_no_reply_gives_up_after_silent() {
+        let dir = std::env::temp_dir().join(format!("kith-stalled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ca = pki::Ca::create().unwrap();
+        let node = |name: &str| {
+            let (cert, key) = ca.issue(name).unwrap();
+            pki::Identity {
+                name: name.into(),
+                ca: ca.cert.clone(),
+                cert,
+                key,
+            }
+        };
+        let (a, w) = (node("a"), node("w"));
+        let cluster = crate::cluster::Cluster::new(w, None).unwrap();
+        let shared = crate::replica(Some(cluster), &dir, std::time::Duration::from_secs(300))
+            .await
+            .unwrap();
+        let first = None;
+        let mut follower = Follower {
+            shared: &shared,
+            state: &dir,
+            first: &first,
+            stale: false,
+            saved: Instant::now(),
+            kept: false,
+            said: String::new(),
+        };
+        let mut stopping = shared.stop.subscribe();
+        // Its certificate is `a`'s; its view is never answered.
+        let silent = axum::Router::new().route("/v1/view", axum::routing::get(std::future::pending::<&'static str>));
+        let port = serve_as(&a, silent).await;
+        let upstream = Upstream {
+            name: "a".into(),
+            address: format!("127.0.0.1:{port}"),
+            certificate: Some(pki::print_of(&a.cert).unwrap()),
+        };
+        let began = tokio::time::Instant::now();
+        let said = stream(&mut follower, &upstream, &mut stopping).await;
+        assert_eq!(said, Err("it sent no reply".to_string()));
+        assert!(
+            began.elapsed() >= SILENT && began.elapsed() < SILENT + std::time::Duration::from_secs(1),
+            "{:?}",
+            began.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_view_is_kept_whole_for_kithd_alone_and_read_back() {
         use std::os::unix::fs::PermissionsExt;

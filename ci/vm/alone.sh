@@ -66,7 +66,7 @@ viewed() { api 1 GET /v1/resources/Node/n2 | python3 -c 'import json, sys; sys.e
 # this is read, so the worker's own disk is what is looked at.
 headers() { grep -ao 'KIND  *NAMESPACE' "$work/n2.disk" | wc -l; }
 # On a failed wait: both nodes' logs are copied into the lane's .fm-scratch, to read after the run.
-keep() { for n in n1b n2b; do cp "$work/$n.log" "$root/.fm-scratch/alone-$n.log"; done; }
+keep() { mkdir -p "$root/.fm-scratch" && for n in n1b n2b; do cp "$work/$n.log" "$root/.fm-scratch/alone-$n.log"; done; }
 # PATH NODE: a unit of the resource is ready on NODE (the replica runs there).
 on() { api 1 GET "$1" | python3 -c '
 import json, sys

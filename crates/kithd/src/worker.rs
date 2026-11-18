@@ -139,8 +139,8 @@ fn alone_shape(key: &str, alone: &Value) -> Result<(), String> {
         Value::Object(fields) => {
             fields.len() <= 3
                 && fields.iter().all(|(name, value)| match (name.as_str(), value) {
-                    ("since" | "until", Value::Number(_)) => true,
-                    ("risks", Value::String(risks)) => risks.len() <= 1024,
+                    ("since" | "until", Value::Number(n)) => n.is_u64(),
+                    ("risks", Value::String(risks)) => risks.len() <= 1024 && !risks.chars().any(char::is_control),
                     _ => false,
                 })
         }
@@ -805,6 +805,10 @@ spec: { volume: there, every: 1d }
             json!({ "since": "x" }),
             json!({ "since": 1, "until": 2, "risks": "r", "more": 1 }),
             json!({ "risks": 5 }),
+            json!({ "since": -1, "until": 2 }),
+            json!({ "since": 1, "until": 2.5 }),
+            json!({ "risks": "a replica runs twice\u{7}" }),
+            json!({ "risks": "two lines\nin one status" }),
         ] {
             assert!(
                 try_as(&store, "w", patch_of("Node/w", json!({ "alone": said.clone() }))).is_err(),

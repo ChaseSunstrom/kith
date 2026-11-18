@@ -61,7 +61,8 @@ join token": update the joiner first.)
   reads one. With no cluster: one copy if the selector is empty, else none.
 - A replica stays put. After its node is unreachable for five minutes (`--lost-after SECONDS`)
   it is started elsewhere and stays there; a Job starts over. A restarted node runs nothing
-  until it has caught up with the store, so not while there is no leader.
+  until it has caught up with the store, so not while there is no leader, unless its Node says
+  `alone: run` ([a node away from its cluster](#a-node-away-from-its-cluster)).
 
 ### The mesh
 
@@ -126,7 +127,7 @@ spec: { trust: worker }         # or `control`, which is what a Node without it 
 | A worker | |
 |---|---|
 | votes | never, and no Raft message from it is taken. A voter made a worker hands its vote on within seconds; to cut one off at once, delete its Node. Fewer than three control nodes: one votes |
-| writes | only what it says of itself: its units' state, its Node's `os`, `mesh`, `serves` and `thumbprint`, its Devices and Seats, its Volumes' backups and images. Anything else is refused and audited under its name (`kith audit`) |
+| writes | only what it says of itself: its units' state, its Node's `os`, `mesh`, `serves`, `thumbprint` and `alone`, its Devices and Seats, its Volumes' backups and images. Anything else is refused and audited under its name (`kith audit`) |
 | answers | no person: point `kith`, a kubeconfig, `curl` and the web UI at a control node (`this node is a worker and answers no one by their rights: ask a control node (ADDRESS)`). `kith logs`, `kith volume put`/`get`, `kith node passphrase`, a restore and `kith run` asked of a worker for another node are refused (`node NAME is a worker: its word for who asked is not taken: ask a control node`); asked of a control node they reach the worker as usual |
 | holds | no copy of the store, only a view (below); no blob it is not using; no encrypted Volume's key. Its replica of a Volume takes over only when no control node has one |
 | does not yet | order ACME certificates, or write `DNSRecord`/`DNSBlockList` status (it answers DNS; control nodes report) |

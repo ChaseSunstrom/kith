@@ -351,26 +351,49 @@ fn alone_status(since: SystemTime, until: SystemTime) -> serde_json::Map<String,
     json!({ "alone": alone }).as_object().cloned().unwrap_or_default()
 }
 
-/// Writes the `alone` status once a write comes back: that is a leader answering, which none can do
-/// before it does. Then the node is no longer alone, so the reconcile may start Jobs and catch up.
+/// How many times the `alone` status is written once a leader answers, two seconds apart.
+const ALONE_STATUS_TRIES: usize = 3;
+
+/// Ends running alone once a leader answers `probe` (an empty write: a refusal of the status is an
+/// answer too, so an old leader that lacks the field cannot keep the node alone). Then the status is
+/// written up to `ALONE_STATUS_TRIES` times, and a refusal that stays is said once.
+async fn end_alone<
+    T,
+    E: std::fmt::Display,
+    P: std::future::Future<Output = Result<T, E>>,
+    S: std::future::Future<Output = Result<T, E>>,
+>(
+    alone: &AtomicBool,
+    probe: impl Fn() -> P,
+    status: impl Fn() -> S,
+) {
+    while probe().await.is_err() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    alone.store(false, Ordering::Relaxed);
+    for attempt in 1..=ALONE_STATUS_TRIES {
+        match status().await {
+            Ok(_) => break,
+            Err(e) => {
+                if attempt == 1 {
+                    eprintln!("kithd: the alone status is not written: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
+
+/// Ends running alone once a leader answers, and writes the `alone` status then. The node is no
+/// longer alone from that answer on, so the reconcile may start Jobs and catch up.
 fn record_alone(shared: std::sync::Arc<Shared>, node: String, alone: std::sync::Arc<AtomicBool>, since: SystemTime) {
     tokio::spawn(async move {
         let key = format!("Node/{node}");
-        let mut said = false;
-        loop {
-            let statuses = vec![(key.clone(), alone_status(since, SystemTime::now()))];
-            match shared.submit(kith_store::Command::Patch { statuses }).await {
-                Ok(_) => break,
-                Err(e) => {
-                    // (Said once: a refusal that stays is not repeated every two seconds.)
-                    if !std::mem::replace(&mut said, true) {
-                        eprintln!("kithd: the alone status is not written yet: {e}");
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
-        }
-        alone.store(false, Ordering::Relaxed);
+        let nothing = || kith_store::Command::Patch { statuses: Vec::new() };
+        let status = || kith_store::Command::Patch {
+            statuses: vec![(key.clone(), alone_status(since, SystemTime::now()))],
+        };
+        end_alone(&alone, || shared.submit(nothing()), || shared.submit(status())).await;
         eprintln!(
             "kithd: a leader answers: this node ran alone since unix {}s; it catches up with the cluster's store",
             unix(since)
@@ -3351,6 +3374,38 @@ spec: { template: { containers: [{ name: run, image: img, volumeMounts: [{ volum
         let never = || async { Err::<(), String>("no leader".into()) };
         let waited = tokio::time::timeout(Duration::from_secs(600), started(false, ALONE_AFTER, never)).await;
         assert!(waited.is_err());
+    }
+
+    /// A leader that answers ends alone even when the status write is refused every time (an old leader
+    /// may not know the field): the status is tried a few times, not forever, and the node starts its Jobs.
+    #[tokio::test(start_paused = true)]
+    async fn alone_a_refused_status_still_ends_alone() {
+        let alone = std::sync::atomic::AtomicBool::new(true);
+        let tries = std::sync::atomic::AtomicUsize::new(0);
+        let answers = || async { Ok::<(), String>(()) };
+        let refused = || async {
+            tries.fetch_add(1, Ordering::Relaxed);
+            Err::<(), String>("`alone` is not a field this leader knows".into())
+        };
+        end_alone(&alone, answers, refused).await;
+        assert!(!alone.load(Ordering::Relaxed));
+        assert_eq!(tries.load(Ordering::Relaxed), ALONE_STATUS_TRIES);
+    }
+
+    /// While no leader answers, the node stays alone and writes no status.
+    #[tokio::test(start_paused = true)]
+    async fn alone_stays_alone_while_no_leader_answers() {
+        let alone = std::sync::atomic::AtomicBool::new(true);
+        let wrote = std::sync::atomic::AtomicUsize::new(0);
+        let never = || async { Err::<(), String>("no leader".into()) };
+        let written = || async {
+            wrote.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), String>(())
+        };
+        let waited = tokio::time::timeout(Duration::from_secs(600), end_alone(&alone, never, written)).await;
+        assert!(waited.is_err());
+        assert!(alone.load(Ordering::Relaxed));
+        assert_eq!(wrote.load(Ordering::Relaxed), 0);
     }
 
     /// Jobs are held while alone; Workloads and NodeWorkloads are started from the copy as before.
