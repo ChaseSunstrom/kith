@@ -37,10 +37,6 @@ jobs:
           sudo loginctl enable-linger "$(id -un)"
           echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
           for _ in $(seq 50); do [ -S "/run/user/$(id -u)/systemd/private" ] && break; sleep 0.2; done
-      # Agent mode as a service: dist/kithd.service's lines, run as a transient user unit, its
-      # cgroups (Delegate), a Workload beside kithd, and its stop within TimeoutStopSec.
-      - name: dist/kithd.service under the runner's systemd
-        run: cargo build -p kithd -p kith-cli && sh ci/systemd.sh
       - name: Budget checks can fail
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --self-test
       - name: Binary-size and RSS budgets
@@ -63,6 +59,11 @@ jobs:
       # Times are printed, not enforced: the budget is set from these medians (twice the slowest) once three runs are in.
       - name: Times on the CI runner (printed, not enforced)
         run: systemd-run --user --scope --quiet python3 ci/budgets.py --times
+      # Agent mode as a service: dist/kithd.service's lines, run as a transient user unit, its
+      # cgroups (Delegate), a Workload beside kithd, and its stop within TimeoutStopSec.
+      # (After the budgets: run before them, kithd's idle RSS there read 9.42 MB, not 5.42.)
+      - name: dist/kithd.service under the runner's systemd
+        run: cargo build -p kithd -p kith-cli && sh ci/systemd.sh
       # Compares files only: the page, docs/numbers.json, ci/compare.txt and the README's drawings.
       - name: The website shows the numbers that were measured
         run: python3 ci/site_numbers.py --check
