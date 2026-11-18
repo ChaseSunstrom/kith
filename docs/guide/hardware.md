@@ -229,7 +229,7 @@ spec:
 ### Switching one GPU
 
 A desktop and a machine can take turns on one GPU of a node, with no reboot. It needs an IOMMU
-on, `vfio-pci` in the node's kernel (not kith OS's: use an agent-mode node) and the card bound
+on, `vfio-pci` in the node's kernel (on kith OS the [`vfio` spec](os.md#a-node-that-needs-more-a-spec) prepares the kernel with both; the rest, `vms` on kith OS, is not there yet) and the card bound
 to `vfio-pci` by its owner (kithd never binds or unbinds a driver). The session and the machine
 each name one exclusive `DeviceClaim` for it:
 
