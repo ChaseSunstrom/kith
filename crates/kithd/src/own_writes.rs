@@ -1,6 +1,7 @@
 //! What a control node may write as itself (`raft.rs` `write`, a write that names no caller):
 //! its own Node's status, its units' status, the Devices, Blobs, NodeKey and Volume syncs it
-//! holds. Default-deny: a kind that is not in [`CLASSES`] is refused, and a refusal is audited
+//! holds. (A Cluster's `status.home` is the leader's, written locally, never through here.)
+//! Default-deny: a kind that is not in [`CLASSES`] is refused, and a refusal is audited
 //! by the node's name and said on the console (`refused a control node's own write`).
 
 use crate::worker::{self, Worker};
@@ -639,6 +640,53 @@ mod tests {
             said(forwarded(&key)).await.contains("Ok"),
             "an admin's lock of it, passed on, is let through"
         );
+    }
+
+    /// The holder of the house address is the leader, and its own writes never come through here
+    /// (they are not forwarded): a write of a Cluster that is forwarded, status.home as the
+    /// holder's own included, is a taken control node's and is refused.
+    #[tokio::test]
+    async fn own_writes_refuse_a_forwarded_home_status_and_every_other_write_of_a_cluster() {
+        let ca = pki::Ca::create().unwrap();
+        let shared: Arc<Shared> = shared_with("own-home", node(&ca, "home-c"), &[]).await;
+        for (name, spec) in [("house", "{home: {address: 10.9.0.100/24}}"), ("bare", "{}")] {
+            let text = format!("apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{name: {name}}}\nspec: {spec}\n");
+            let cluster = kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap();
+            shared.store.lock().unwrap().store.apply(cluster).unwrap();
+        }
+        let patch = |key: &str, fields: serde_json::Value| Command::Patch {
+            statuses: vec![(key.to_string(), fields.as_object().unwrap().clone())],
+        };
+        let since = "2026-11-18T10:00:00Z";
+        let holder = |who: &str| serde_json::json!({ "home": { "holder": who, "since": since } });
+        let refused = [
+            patch("Cluster/house", holder("home-c")),
+            patch("Cluster/house", holder("home-o")),
+            patch("Cluster/bare", holder("home-c")),
+            patch("Cluster/house", serde_json::json!({ "home": { "holder": "home-c" } })),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": { "holder": "home-c", "since": 5 } }),
+            ),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": { "holder": "home-c", "since": since, "x": 1 } }),
+            ),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": holder("home-c")["home"], "signing": "open" }),
+            ),
+            patch("Cluster/house", serde_json::json!({ "adminKey": "x" })),
+            Command::Status {
+                statuses: vec![("Cluster/house".into(), Some(holder("home-c")))],
+            },
+            Command::Delete {
+                key: "Cluster/house".into(),
+            },
+        ];
+        for command in refused {
+            assert!(checked(&shared, "home-c", command.clone()).is_err(), "{command:?}");
+        }
     }
 
     /// Which node holds the CA is what its first start wrote (it led alone then): a control node
