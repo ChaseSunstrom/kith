@@ -705,6 +705,11 @@ spec! {
         pub ports: Vec<ServicePort>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub expose: Option<Expose>,
+        /// No address of its own: its name (`<service>.<namespace>.kith`, and under
+        /// `svc.cluster.local`) answers the addresses of its ready replicas, as a headless
+        /// Kubernetes Service does. Off unless true.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub headless: Option<bool>,
     }
 
     pub struct ServicePort {
@@ -2382,6 +2387,12 @@ impl Spec for ServiceSpec {
     fn check(&self) -> Result<(), String> {
         if self.ports.is_empty() {
             return Err("ports: needs at least one port".into());
+        }
+        // (A headless one has no address for a host to go to: refused, not left unserved.)
+        if self.headless == Some(true) && self.expose.is_some() {
+            return Err(
+                "expose: a headless Service has no address to send a host to: its name answers its replicas".into(),
+            );
         }
         // (The host is asked for in TLS, named in a Secret and in DNS: a name, not a URL.)
         let Some(expose) = &self.expose else { return Ok(()) };

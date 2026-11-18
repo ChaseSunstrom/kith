@@ -257,11 +257,67 @@ pub fn requires(shared: &Shared) -> bool {
     required(&shared.store.lock().expect("a handler panicked holding the store").store)
 }
 
-/// A request's signer, and the header to pass on with it.
+/// A request's signer, the header to pass on with it, and the request itself where a change to
+/// the log may be passed on as it came ([`Relay`]).
 #[derive(Clone, Debug)]
 pub struct Signed {
     pub header: String,
     pub who: Caller,
+    pub relay: Option<Relay>,
+}
+
+/// A signed change as it came (`POST /v1/apply`, `DELETE /v1/resources/…` or `POST
+/// /v1/rollback/…`): a control node that is not the leader sends the leader this method, path and
+/// body, with the same header, and the leader checks them as signed.
+#[derive(Clone, Debug)]
+pub struct Relay {
+    pub method: String,
+    pub path: String,
+    pub body: axum::body::Bytes,
+    /// Who signed it, as the FOR header names them.
+    pub who: Caller,
+    /// The room this request holds in [`HOLDING`], kept while the relay is held: its body is
+    /// held with it until the leader has answered.
+    #[allow(dead_code, reason = "held for its drop: the room is given back when the relay is")]
+    pub room: Arc<tokio::sync::SemaphorePermit<'static>>,
+}
+
+impl Relay {
+    /// Is this request the route `command` is made by? Only then is it passed on as it came: a
+    /// write a handler makes on its own (a `Mark`, a restore's, a lock's) is not this request. A
+    /// Release, Source, KindDefinition or Package rollback is applied as it goes back, so it is an
+    /// Apply made by a rollback route.
+    pub fn carries(&self, command: &Command) -> bool {
+        let route = self.path.split('?').next().unwrap_or("");
+        match command {
+            Command::Apply { .. } => {
+                self.method == "POST" && (route == "/v1/apply" || route.starts_with("/v1/rollback/"))
+            }
+            Command::Delete { .. } => self.method == "DELETE" && route.starts_with("/v1/resources/"),
+            Command::Rollback { .. } => self.method == "POST" && route.starts_with("/v1/rollback/"),
+            _ => false,
+        }
+    }
+}
+
+impl Signed {
+    /// This request as it came (`method`, `path`, `body`), to be passed on as it is.
+    fn relayed(
+        mut self,
+        method: &str,
+        path: &str,
+        body: &axum::body::Bytes,
+        room: tokio::sync::SemaphorePermit<'static>,
+    ) -> Signed {
+        self.relay = Some(Relay {
+            method: method.into(),
+            path: path.into(),
+            body: body.clone(),
+            who: self.who.clone(),
+            room: Arc::new(room),
+        });
+        self
+    }
 }
 
 /// [`verify`] on this node: its cluster, store, clock and nonces.
@@ -275,6 +331,7 @@ pub fn check(shared: &Shared, header: &str, targets: &[&str], asked: &Asked) -> 
     Ok(Signed {
         header: header.into(),
         who,
+        relay: None,
     })
 }
 
@@ -380,15 +437,17 @@ pub async fn passed(
     request: Request,
 ) -> (Request, Result<Option<Signed>, String>) {
     let (method, path) = (request.method().to_string(), path(&request));
+    // (A write to the log may be signed for `*`: a control node passes it on to the leader.)
+    let log = method != "GET";
     let Some(header) = header(&request) else {
         let asked = Asked {
             method: &method,
             path: &path,
             body: &[],
         };
-        return (request, hop(shared, node, None, &asked, Some(named), false));
+        return (request, hop(shared, node, None, &asked, Some(named), log));
     };
-    let (request, bytes, _room) = match read(request).await {
+    let (request, bytes, room) = match read(request).await {
         Ok(read) => read,
         // (The body is gone: refused, whatever the setting.)
         Err(why) => return (Request::new(Body::empty()), Err(why)),
@@ -398,7 +457,11 @@ pub async fn passed(
         path: &path,
         body: &bytes,
     };
-    (request, hop(shared, node, Some(&header), &asked, Some(named), false))
+    let signed = hop(shared, node, Some(&header), &asked, Some(named), log);
+    (
+        request,
+        signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes, room))),
+    )
 }
 
 /// Is an unsigned call at the local socket taken under `required`, as the node, which reads?
@@ -457,12 +520,15 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
             signed.who
         )),
     });
+    // (A signed request keeps its room while it is relayed, so the body's bound covers the forward.)
     let signed = match checked {
-        Ok(signed) => Some(signed),
+        Ok(signed) => Some(signed.relayed(&method, &path, &bytes, room)),
         Err(why) if required => return refused(StatusCode::UNAUTHORIZED, format!("refused: {why}")),
-        Err(_) => None,
+        Err(_) => {
+            drop(room);
+            None
+        }
     };
-    drop(room);
     request.extensions_mut().insert(Caller::Admin);
     within(signed, next.run(request)).await
 }
@@ -631,6 +697,36 @@ mod tests {
             "xg8X9H2TtapH9pPFxpL8y5SUjEDAGR8N1xg9mYUfgt9JmMTgu5/oya1QhKFhcZumr6GWD9t3gCVuOfrlOflGDQ=="
         );
         assert_eq!(check(&by_admin(&good())), Ok(Caller::Admin));
+    }
+
+    /// kith-cli's pinned header (its `signed_cross_vector_is_kithds`): from its passphrase, the
+    /// key kith derives here as kith does, and kithd's own `verify` takes the header as it is.
+    #[test]
+    fn signed_header_from_the_cli_verifies() {
+        let mut seed = [0u8; 32];
+        let rounds = std::num::NonZeroU32::new(600_000).unwrap();
+        let passphrase = b"correct horse battery staple";
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            rounds,
+            CLUSTER.as_bytes(),
+            passphrase,
+            &mut seed,
+        );
+        let key = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+        assert_eq!(
+            crate::pki::hex(key.public_key().as_ref()),
+            "45adefd230fccdc0edc77acb13998359d12eeb0ab7a4fdd1c49a2203fb8eb183"
+        );
+        let header = "v1; who=local socket; target=*; expires=1800000300; nonce=00112233445566778899aabbccddeeff; sig=a70zVltHfKC0JVo4PtNzEiwAsqr/KLbBg1ITbXFjm/5TA4bG8PX3zj/35f76yW68aScPFOH4Ks62okBH8wDvBQ==";
+        let store = store_with(key.public_key().as_ref(), "");
+        let asked = Asked {
+            method: "POST",
+            path: "/v1/apply",
+            body: b"[]",
+        };
+        let checked = verify(header, CLUSTER, &["*"], &asked, &store, NOW, &Nonces::default());
+        assert_eq!(checked, Ok(Caller::Admin));
     }
 
     fn refused(header: &str, why: &str) {
