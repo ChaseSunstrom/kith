@@ -18,7 +18,7 @@
 
 use super::link::{self, Link, Rx, Stream, Tx};
 use super::{CONNECT, FOUND, IDLE, KEPT_THERE, Relay, over_limit};
-use crate::ingress::Limits;
+use crate::ingress::{Limits, Place};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use std::net::IpAddr;
@@ -90,7 +90,11 @@ where
                 None => return Some(()),
                 // (Over the cap: nothing of it is read, and its drop resets it.)
                 Some(stream) if running.len() >= bounds.streams => drop(stream),
-                Some(stream) => running.push(one(stream, &relaying, caller, bounds, &find)),
+                // (A place before its line, so that streams still asking are held to the node's limit too.)
+                Some(stream) => match relaying.take(caller) {
+                    Some(place) => running.push(one(stream, place, bounds, &find)),
+                    None => over_limit(caller),
+                },
             },
             Some(()) = running.next(), if !running.is_empty() => {}
             () = tokio::time::sleep(bounds.empty), if running.is_empty() => return Some(()),
@@ -108,19 +112,16 @@ impl Drop for Down {
     }
 }
 
-/// One stream: its line, a place of its own, the replica, and then the bytes. Whatever is not
-/// as it should be resets the stream (the no), and nothing else.
-async fn one<F, Fut>(stream: Stream, relaying: &Limits, caller: IpAddr, bounds: Bounds, find: &F)
+/// One stream, with the relaying place of its own that it has held since it was accepted: its
+/// line, the replica, and then the bytes. Whatever is not as it should be resets the stream
+/// (the no), and nothing else.
+async fn one<F, Fut>(stream: Stream, _place: Place, bounds: Bounds, find: &F)
 where
     F: Fn(u16, String, Option<u32>) -> Fut,
     Fut: Future<Output = Option<TcpStream>>,
 {
     let Stream { mut tx, mut rx } = stream;
     let Ok(Some((port, workload, replica, early))) = tokio::time::timeout(bounds.asking, asked(&mut rx)).await else {
-        return tx.reset();
-    };
-    let Some(_place) = relaying.take(caller) else {
-        over_limit(caller);
         return tx.reset();
     };
     let found = tokio::time::timeout(FOUND, find(port, workload, replica)).await;
@@ -185,7 +186,10 @@ async fn between(tx: &mut Tx, rx: &mut Rx, replica: TcpStream, early: Vec<u8>, i
         let mut chunk = vec![0; 16 * 1024];
         loop {
             match from.read(&mut chunk).await? {
-                0 => return Ok(tx.end()),
+                0 => {
+                    tx.end();
+                    return Ok(());
+                }
                 size => {
                     tx.write(&chunk[..size]).await?;
                     moves();
@@ -482,9 +486,18 @@ mod tests {
         bounds: Bounds,
         find: impl Fn(u16, String, Option<u32>) -> Connecting + Send + Sync + 'static,
     ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Option<()>>) {
+        raw_with(Limits::new(4096, 4096), bounds, find)
+    }
+
+    /// [`raw`] with the places `relaying` has.
+    fn raw_with(
+        relaying: Limits,
+        bounds: Bounds,
+        find: impl Fn(u16, String, Option<u32>) -> Connecting + Send + Sync + 'static,
+    ) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<Option<()>>) {
         let (near, far) = tokio::io::duplex(8192);
         let caller = IpAddr::V6(Ipv6Addr::LOCALHOST);
-        let task = tokio::spawn(serve(far, Limits::new(4096, 4096), caller, bounds, find));
+        let task = tokio::spawn(serve(far, relaying, caller, bounds, find));
         (near, task)
     }
 
@@ -704,6 +717,43 @@ mod tests {
             .await
             .expect("the replica was let go");
         }
+    }
+
+    /// A stream waiting for its line holds a relaying place from the moment it is accepted, so
+    /// that what a node relays (these too) is held to its limit: with places for three, the
+    /// fourth and fifth stream are reset at once, though they have said nothing, and a link
+    /// that opens streams without end and reads nothing has none past the places.
+    #[tokio::test]
+    async fn link_a_stream_that_has_not_said_its_line_holds_a_place() {
+        let (mut raw, task) = raw_with(Limits::new(3, 3), LOOSE, finder(vec![]));
+        for id in [1, 3, 5, 7, 9] {
+            raw.write_all(&frame(id, OPEN, b"")).await.unwrap();
+        }
+        for id in [7, 9] {
+            assert_eq!(heard(&mut raw, id, &[1, 3, 5]).await, (Vec::new(), true), "stream {id}");
+        }
+        assert!(!task.is_finished(), "the link is up");
+    }
+
+    /// A peer that opens streams it is refused (or sends frames that are refused) and reads
+    /// nothing cannot grow what is queued to it without end: the link goes down once the
+    /// writer, which the peer's full pipe stops, has too many resets waiting.
+    #[tokio::test]
+    async fn link_a_peer_that_never_reads_cannot_grow_the_queue_without_end() {
+        let (mut raw, task) = raw(LOOSE, finder(vec![]));
+        let flood = frame(0, OPEN, b"");
+        for _ in 0..200_000 {
+            if raw.write_all(&flood).await.is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the link is down")
+                .unwrap(),
+            Some(())
+        );
     }
 
     /// Twenty-four clients at once on one link: each its own bytes to its replica and back, in
