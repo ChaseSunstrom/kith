@@ -154,7 +154,12 @@ def filled(page, n):
     named = len(re.findall(r"<span>\w+</span>", kinds.group(0))) if kinds else 0
     if named != n.get("kinds"):
         missing.append(f"(kinds: {named} named, {n.get('kinds')} counted)")
-    return block.sub(lambda f: f.group(1) + json.dumps(n) + f.group(2), page), missing
+    return block.sub(lambda f: f.group(1) + dumped(n) + f.group(2), page), missing
+
+
+def dumped(n):
+    """The numbers as one line for a page's #measured block: a '<' is written \\u003c (ci/site_docs.py does the same)."""
+    return json.dumps(n).replace("<", "\\u003c")
 
 
 def embedded(page):
@@ -181,7 +186,7 @@ def main():
             if not file.exists() or file.read_text() != drawn:
                 sys.exit(f"{file.relative_to(ROOT)} draws other numbers than docs/numbers.json: python3 ci/site_numbers.py draws it again")
         # The guide's numbers page draws its bars in the browser from the block it embeds: that block is this file, whole.
-        if embedded(GUIDE.read_text(encoding="utf-8")) != json.dumps(n):
+        if embedded(GUIDE.read_text(encoding="utf-8")) != dumped(n):
             sys.exit("docs/guide/numbers.html embeds other numbers than docs/numbers.json: python3 ci/site_docs.py writes it again")
         print(f"ok: {len(re.findall('data-n=', page))} numbers in the page, all from docs/numbers.json")
         return

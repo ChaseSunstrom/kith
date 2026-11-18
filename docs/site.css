@@ -281,8 +281,8 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 .versus h3, .where h3 { font-size: var(--head); letter-spacing: -0.02em; margin-bottom: 12px; }
 .versus .panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 400px), 1fr)); gap: 36px 48px; margin-block: 16px; padding-top: 18px; }
 .versus section { display: grid; gap: 20px; align-content: start; }
-.versus h4 { font-size: var(--small); letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim); border-bottom: 1px solid var(--dim); padding-bottom: 6px; }
-.versus h4 small { font-size: inherit; letter-spacing: 0; text-transform: none; }
+.versus .vg { font-size: var(--note); font-weight: 700; color: var(--dim); border-bottom: 1px solid var(--dim); padding-bottom: 6px; margin: 0; }
+.versus section > .fine { margin: -10px 0 0; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 24px; margin: 18px 0 0; font-size: var(--note); }
 .legend span { display: inline-flex; align-items: center; gap: 8px; }
 .legend i { width: 28px; height: 14px; color: var(--accent); background: linear-gradient(currentColor, currentColor) no-repeat center / 100% var(--stroke); position: relative; }
@@ -302,7 +302,7 @@ html:not(.js) .track { display: none; } /* a bar is drawn by the script: without
 .vs-table table { width: 100%; border-collapse: collapse; }
 .vs-table th, .vs-table td { padding: 7px 14px 7px 0; border-bottom: 1px solid var(--hair); text-align: left; vertical-align: top; }
 .vs-table thead th { border-bottom: var(--stroke) solid var(--text); }
-.vs-table th[scope=rowgroup] { padding-top: 16px; font-size: var(--small); letter-spacing: 0.06em; text-transform: uppercase; color: var(--dim); }
+.vs-table th[scope=rowgroup] { padding-top: 16px; font-size: var(--note); font-weight: 700; color: var(--dim); }
 .vs-table td:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vs-table th:nth-child(n+3) { text-align: right; }
 .where .row { grid-template-columns: 150px 1fr 210px; }
