@@ -5,6 +5,7 @@
 // What is shown is other people's text (names, messages, logs): it goes into the page as
 // text nodes only, and the page's policy allows no script or style but its own files.
 import { at, blank, diffLines, entriesCheck, health, keyOf, lamps, resourceOf, shape, summary, written } from './forms.js';
+import { installPart } from './install.js';
 
 const $ = (id) => document.getElementById(id);
 const PROPERTIES = new Set(['value', 'checked', 'disabled', 'hidden', 'open', 'readOnly', 'selected']);
@@ -46,10 +47,12 @@ const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 /** One call of kithd's API; an error carries what kithd said. */
 async function api(method, what, body) {
+  // (A file goes as it is, as the bytes it is; anything else as JSON.)
+  const file = body instanceof Blob;
   const asked = await fetch(`../v1/${what}`, {
     method,
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
+    headers: body === undefined ? {} : { 'content-type': file ? 'application/octet-stream' : 'application/json' },
+    body: body === undefined ? undefined : file ? body : JSON.stringify(body),
   });
   const text = await asked.text();
   let said = text;
@@ -93,15 +96,23 @@ function ask({ title, body, yes, danger = false, act = async () => true }) {
   go.textContent = yes ?? '';
   go.className = danger ? 'danger' : 'primary';
   no.textContent = yes ? 'Cancel' : 'Close';
+  // (One question at a time: a second, asked while the first is open, would be closed by the
+  // first's late answer, and the first's would never come.)
+  if (dialog.open) return Promise.reject(new Error('another question is still open: answer it first'));
   return new Promise((done) => {
     const finish = (result) => {
       go.onclick = no.onclick = dialog.oncancel = null;
       dialog.close();
+      // (What it showed goes with it: a token or a key is kept by nothing once it is closed.)
+      $('dialog-body').replaceChildren();
       done(result);
     };
     no.onclick = () => finish(undefined);
     dialog.oncancel = (event) => {
       event.preventDefault();
+      // (While `act` runs the dialog stays: Esc would close it over a call that goes on, and
+      // what it brings, a new key, would be shown to no one.)
+      if (go.disabled) return;
       finish(undefined);
     };
     go.onclick = async () => {
@@ -727,6 +738,9 @@ async function route() {
   let asked = '';
   try { asked = decodeURIComponent(location.hash.replace(/^#\/?/, '')); } catch { /* a hash that is no address: the start */ }
   const [name, ...rest] = asked.split('/');
+  // (The Install part is a view of its own, not a kind: the board is out of sight while it is in.)
+  if (name === 'install') return install.show(true);
+  install.show(false);
   const kind = kindNamed(name) ?? kindNamed(state.kind) ?? kindNamed('Workload') ?? state.kinds[0];
   const key = rest.length === 0 ? null : rest[0] === '+' ? '+' : [kind?.kind, ...rest].join('/');
   if (state.draft?.dirty && (key !== state.key || kind?.kind !== state.kind)) {
@@ -776,6 +790,7 @@ async function watch() {
       $('warning').hidden = !warning;
       $('generation').textContent = got.generation == null ? '' : `generation ${got.generation}`;
       drawPulse();
+      install.draw();
       if (first) await route();
       else {
         drawKinds();
@@ -796,6 +811,7 @@ async function watch() {
   }
 }
 
+const install = installPart({ $, h, api, ask, toast, say, state, may: (verb, kind) => may(verb, kindNamed(kind)) });
 $('filter').addEventListener('input', (event) => {
   state.filter = event.target.value;
   drawTable();
