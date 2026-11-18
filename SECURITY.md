@@ -204,6 +204,13 @@ Only the newest version is fixed. There are no security releases of older ones.
   dropped, so a pod sends with only its own address, even as root, and a pod reaches its node only for DNS and Services:
   UDP and TCP port 53 to the gateway, and TCP to a Service's address, with nothing else of the node's (kithd's API among
   it) reached, ICMP included. An exit's pod (`kpx`) gets neither of those.
+- **A machine that already passed packets on** (IPv6 forwarding was `1` before kithd
+  first made a pod, a router or a Docker host, say) gets no guard: `inet kith-pods`
+  passes on what the node passes on for anyone, and only the pods' own rules are added.
+  A machine that did not forward gets the guard, which drops whatever is not a pod's, so
+  the two differ on purpose. kithd says so once, when it makes its first pod. To have the
+  guard on such a machine, set `net.ipv6.conf.all.forwarding=0` before kithd starts. The
+  guard is kept across a kithd restart (`/run/kith-pods`), until the machine restarts.
 - **A pod behind an Exit** (`exit:` on a Workload's template) leaves by that WireGuard
   tunnel or by nothing, and is given no capability, sysctl or device for it: kithd holds
   the tunnel (`kx` and a number) on the Exit's node. Before the pod's host link is made,
