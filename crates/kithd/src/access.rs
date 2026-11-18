@@ -203,25 +203,6 @@ pub fn for_identities(path: &str) -> bool {
     FOR_IDENTITIES.iter().any(open)
 }
 
-/// Is `path` a request one node passes on to another for whoever asked it (a unit's output,
-/// a Volume's files, a node's passphrase or new recovery key, a backup's restore: each is done by the node that
-/// has the thing)? On these alone is a node's word for who asked ([`FOR`]) read.
-fn passed_on(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/v1/") else {
-        return false;
-    };
-    let parts: Vec<&str> = rest.split('/').collect();
-    matches!(
-        parts[..],
-        ["logs", _, ..]
-            | ["volumes", _, _, "files"]
-            | ["lock", _, "passphrase" | "recovery"]
-            | ["backups", _, _, "restore"]
-            // (A control node that is not the leader passes a change to it as it came.)
-            | ["apply"]
-    )
-}
-
 /// Whose the certificate a request came with is: a watch asks again whether it still stands
 /// for them once its wait is over.
 #[derive(Clone)]
@@ -368,7 +349,7 @@ pub fn who(
             let caller = Caller::Node(node.clone());
             let (status, why) = if !crate::cluster::admitted(shared, node, key) {
                 (StatusCode::UNAUTHORIZED, crate::cluster::EVICTED.to_string())
-            } else if !passed_on(path) {
+            } else if !kith_api::passed_on(method, path) {
                 // Where nodes pass nothing on it is the node, with no right, whatever it names.
                 return Ok(caller);
             } else if worker(shared, node) {

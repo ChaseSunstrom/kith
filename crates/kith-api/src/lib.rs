@@ -16,6 +16,28 @@ use std::collections::BTreeMap;
 pub const API_VERSION: &str = "kith.dev/v1";
 pub const DEFAULT_NAMESPACE: &str = "default";
 
+/// Is `method` `path` a request one node passes on to another for whoever asked it: a unit's logs,
+/// a Volume's files, a node's passphrase or new recovery key, a backup's restore, and a change to
+/// the store a control node that is not the leader passes on as it came (an apply, a delete, a
+/// rollback). kithd reads the signer of such a request from the node that passed it on (`FOR`);
+/// the CLI signs a read of one, and any other request it signs anyway. The one list for both.
+pub fn passed_on(method: &str, path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or("");
+    let Some(rest) = path.strip_prefix("/v1/") else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('/').collect();
+    match parts[..] {
+        ["logs", _, ..] | ["volumes", _, _, "files"] | ["lock", _, "passphrase" | "recovery"] | ["backups", _, _, "restore"] => {
+            true
+        }
+        ["apply"] => method == "POST",
+        ["resources", ..] => method == "DELETE",
+        ["rollback", ..] => method == "POST",
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "generate", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

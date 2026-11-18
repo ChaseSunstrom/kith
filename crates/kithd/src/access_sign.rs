@@ -266,20 +266,37 @@ pub struct Signed {
     pub relay: Option<Relay>,
 }
 
-/// A signed request to `/v1/apply` as it came: a control node that is not the leader sends
-/// the leader this path and body, with the same header, and the leader checks them as signed.
+/// A signed change as it came (`POST /v1/apply`, `DELETE /v1/resources/…` or `POST
+/// /v1/rollback/…`): a control node that is not the leader sends the leader this method, path and
+/// body, with the same header, and the leader checks them as signed.
 #[derive(Clone, Debug)]
 pub struct Relay {
+    pub method: String,
     pub path: String,
     pub body: axum::body::Bytes,
     /// Who signed it, as the FOR header names them.
     pub who: Caller,
 }
 
+impl Relay {
+    /// Is this request the route `command` is made by? Only then is it passed on as it came: a
+    /// write a handler makes on its own (a `Mark`, a restore's, a lock's) is not this request.
+    pub fn carries(&self, command: &Command) -> bool {
+        let route = self.path.split('?').next().unwrap_or("");
+        match command {
+            Command::Apply { .. } => self.method == "POST" && route == "/v1/apply",
+            Command::Delete { .. } => self.method == "DELETE" && route.starts_with("/v1/resources/"),
+            Command::Rollback { .. } => self.method == "POST" && route.starts_with("/v1/rollback/"),
+            _ => false,
+        }
+    }
+}
+
 impl Signed {
-    /// This request as it came (`path`, `body`), to be passed on as it is.
-    fn relayed(mut self, path: &str, body: &axum::body::Bytes) -> Signed {
+    /// This request as it came (`method`, `path`, `body`), to be passed on as it is.
+    fn relayed(mut self, method: &str, path: &str, body: &axum::body::Bytes) -> Signed {
         self.relay = Some(Relay {
+            method: method.into(),
             path: path.into(),
             body: body.clone(),
             who: self.who.clone(),
@@ -426,7 +443,7 @@ pub async fn passed(
         body: &bytes,
     };
     let signed = hop(shared, node, Some(&header), &asked, Some(named), log);
-    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&path, &bytes))))
+    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes))))
 }
 
 /// Is an unsigned call at the local socket taken under `required`, as the node, which reads?
@@ -486,7 +503,7 @@ pub async fn local(State(shared): State<Arc<Shared>>, request: Request, next: Ne
         )),
     });
     let signed = match checked {
-        Ok(signed) => Some(signed.relayed(&path, &bytes)),
+        Ok(signed) => Some(signed.relayed(&method, &path, &bytes)),
         Err(why) if required => return refused(StatusCode::UNAUTHORIZED, format!("refused: {why}")),
         Err(_) => None,
     };

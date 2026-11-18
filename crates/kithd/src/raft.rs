@@ -826,16 +826,20 @@ impl Shared {
             Ok(_) => return Forward::Again(None),
             Err(e) => return Forward::Again(Some(e)),
         };
-        // A signed apply goes to the leader as it came (its path, body and header), and the leader
-        // runs it as `/v1/apply` would: a Command re-serialized would not be what was signed.
+        // A signed apply, delete or rollback goes to the leader as it came (its method, path, body and
+        // header), and the leader runs it as its own route would (its audit names that route): a
+        // Command re-serialized would not be what was signed. `carries` checks the route matches.
         if let Some(relay) = access_sign::current().and_then(|signed| signed.relay) {
-            if matches!(command, Command::Apply { .. }) {
-                let call = client
-                    .post(format!("https://{at}{}", relay.path))
-                    .header(access::FOR, relay.who.to_string())
-                    .header("content-type", "application/json")
-                    .body(relay.body);
-                return self.relayed(access_sign::pass_on(call), at).await;
+            if relay.carries(command) {
+                let url = format!("https://{at}{}", relay.path);
+                let call = match command {
+                    Command::Delete { .. } => client.delete(url),
+                    _ => client.post(url),
+                }
+                .header(access::FOR, relay.who.to_string())
+                .header("content-type", "application/json")
+                .body(relay.body);
+                return self.relayed(access_sign::pass_on(call), at, command).await;
             }
         }
         let mut call = access_sign::pass_on(client.post(format!("https://{at}/v1/raft/write")));
@@ -875,13 +879,23 @@ impl Shared {
         }
     }
 
-    /// What the leader did with a signed apply passed on as it came (`call`), as this node's
-    /// reply. The leader's write is in the log before it answers: a `Mark` after it has the
-    /// index this node waits for, so the changes it returns are read back here too.
-    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str) -> Forward {
+    /// What the leader did with a signed write passed on as it came (`call`), as this node's
+    /// reply, read as the route `command` came from answers (`api.rs`: a delete a Resource, a
+    /// rollback a Change, an apply its Changes). The leader's write is in the log before it
+    /// answers: a `Mark` after it has the index this node waits for.
+    async fn relayed(&self, call: reqwest::RequestBuilder, at: &str, command: &Command) -> Forward {
         match call.timeout(PATIENCE).send().await {
             Ok(reply) if reply.status().is_success() => {
-                let Ok(changes) = reply.json::<Vec<kith_api::store::Change>>().await else {
+                let done = match command {
+                    Command::Delete { .. } => {
+                        reply.json::<kith_api::Resource>().await.map(|r| Done::Deleted(Box::new(r)))
+                    }
+                    Command::Rollback { .. } => {
+                        reply.json::<kith_api::store::Change>().await.map(|c| Done::Changes(vec![c]))
+                    }
+                    _ => reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes),
+                };
+                let Ok(done) = done else {
                     let why = format!("the leader at {at} did not answer with the changes it made");
                     return Forward::Failed(unavailable(why));
                 };
@@ -891,7 +905,7 @@ impl Shared {
                 };
                 let caught_up = self.raft.wait(Some(PATIENCE));
                 let _ = caught_up.applied_index_at_least(Some(index), "own write").await;
-                Forward::Done(Ok(Done::Changes(changes)), index)
+                Forward::Done(Ok(done), index)
             }
             // (The leader refused it: what it says is the reply, as for a write.)
             Ok(reply) => Forward::Failed(Error::Invalid(reply.text().await.unwrap_or_default())),

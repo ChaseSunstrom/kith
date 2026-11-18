@@ -1455,6 +1455,101 @@ fn a_signed_write_through_a_follower_is_taken_as_signed() {
     assert!(alpha.ok(&["get", "configmap/relayed"]).contains("relayed"));
 }
 
+/// A signed delete and a signed rollback made at a follower reach the leader as the admin signed
+/// them, as an apply does: the follower passes each on as it came (its method, path and
+/// signature). A delete a node passes on with no signature is refused where the leader is.
+#[test]
+fn signed_delete_and_rollback_through_a_follower_are_taken_as_signed() {
+    use ring::signature::KeyPair;
+    let (test, signed, by) = ("signed_delete", "x-kith-signed", "x-kith-for");
+    let alpha = Node::start(test, "alpha", &[]);
+    wait_for("alpha to list itself", || {
+        alpha.kith(&["get", "node"]).0 == 0 && alpha.nodes().len() == 1
+    });
+    let token = alpha.ok(&["node", "token"]);
+    let id = token.trim().split('.').nth(2).unwrap().to_string();
+    let beta = Node::start(test, "beta", &["--join", &alpha.address(), "--token", token.trim()]);
+    wait_for("beta to have the store", || beta.nodes().len() == 2);
+    let key = admin_key()
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let cluster = format!(
+        "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {{ name: home }}\nspec: {{ adminKey: {key} }}\n"
+    );
+    std::fs::write(alpha.dir.join("cluster.yaml"), cluster).unwrap();
+    alpha.ok(&["apply", "-f", "cluster.yaml"]);
+    wait_for("beta to hold the admin's key", || {
+        beta.kith(&["get", "cluster/home", "-o", "json"]).1.contains(&key)
+    });
+
+    // A signed request at beta's local socket, as the admin signed it.
+    let at_beta = |method: &str, path: &str, nonce: u32, body: &str| {
+        let header = signed_by_admin(&id, "*", method, path, body.as_bytes(), nonce);
+        let mut curl = Command::new("curl");
+        curl.current_dir(&beta.dir).args(["--unix-socket", "kithd.sock"]);
+        let body = (!body.is_empty()).then_some(body);
+        ask(curl, method, &format!("http://kithd{path}"), &[(signed, &header)], body)
+    };
+    let config = |name: &str, data: &str| {
+        serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "ConfigMap", "metadata": { "name": name },
+            "spec": { "data": { "a": data } } }])
+        .to_string()
+    };
+    let required = serde_json::json!([{ "apiVersion": "kith.dev/v1", "kind": "Cluster", "metadata": { "name": "home" },
+        "spec": { "adminKey": key, "signing": "required" } }])
+    .to_string();
+    let (code, said) = at_beta("POST", "/v1/apply", 1, &required);
+    assert_eq!(code, "200", "{said}");
+    assert!(alpha.ok(&["get", "cluster/home", "-o", "json"]).contains("\"signing\": \"required\""));
+
+    // Two revisions of `kept`, then a signed rollback to the first, made at beta.
+    let (code, said) = at_beta("POST", "/v1/apply", 2, &config("kept", "one"));
+    assert_eq!(code, "200", "{said}");
+    let (code, said) = at_beta("POST", "/v1/apply", 3, &config("kept", "two"));
+    assert_eq!(code, "200", "{said}");
+    let (code, said) = at_beta("POST", "/v1/rollback/ConfigMap/default/kept?to=1", 4, "");
+    assert_eq!(code, "200", "{said}");
+    let kept = alpha.ok(&["get", "configmap/kept", "-o", "json"]);
+    assert!(kept.contains("\"one\"") && !kept.contains("\"two\""), "{kept}");
+    let audit = alpha.ok(&["audit", "--tail", "1000"]);
+    assert!(
+        audit.lines().any(|line| line.contains("rollback") && line.contains("local socket via node beta")),
+        "{audit}"
+    );
+
+    // A signed delete made at beta removes the ConfigMap at the leader.
+    let (code, said) = at_beta("POST", "/v1/apply", 5, &config("gone", "bye"));
+    assert_eq!(code, "200", "{said}");
+    let (code, said) = at_beta("DELETE", "/v1/resources/ConfigMap/default/gone", 6, "");
+    assert_eq!(code, "200", "{said}");
+    assert!(alpha.kith(&["get", "configmap/gone"]).0 != 0, "the delete did not reach the leader");
+    // The leader took it as the admin's, passed on by beta: its audit names the signer via beta.
+    let audit = alpha.ok(&["audit"]);
+    assert!(
+        audit.lines().any(|line| line.contains("delete") && line.contains("local socket via node beta")),
+        "{audit}"
+    );
+
+    // A delete beta passes on with no signature is refused where the leader is, and removes nothing.
+    let betas = beta.dir.join("state/pki");
+    let (code, said) = ask_as_node_with(
+        &alpha.address(),
+        &betas,
+        "DELETE",
+        "/v1/resources/ConfigMap/default/kept",
+        &[(by, "local socket")],
+        None,
+    );
+    assert!(
+        code == "403" && said.contains("an unsigned caller passed on by node beta"),
+        "{code} {said}"
+    );
+    assert!(alpha.ok(&["get", "configmap/kept"]).contains("kept"));
+}
+
 /// The status names the cluster (the id a signer salts its key with, the print of the CA the
 /// join token carries) and says `open` until the Cluster says `signing: required`.
 #[test]

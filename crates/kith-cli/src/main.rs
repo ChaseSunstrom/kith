@@ -845,6 +845,16 @@ fn unchunk(from: &mut impl std::io::BufRead, to: &mut dyn std::io::Write) -> std
 /// (written to `to` as it comes) is too long to hold: a volume's files. The reply's body,
 /// when it did not go to `to`. An error reading `from` ends the request unfinished, which
 /// kithd takes as no request at all.
+/// Why a body sent as a stream (a volume's files put from stdin or a tar) cannot be sent to a
+/// cluster that says `signing: required`: the digest the signature covers is not known until the
+/// body is all sent, so it goes unsigned, and kithd refuses an unsigned change there. Stays so.
+fn streamed_refusal(status: &serde_json::Value) -> Option<&'static str> {
+    (status["signing"] == "required").then_some(
+        "this cluster requires the admin's signature (spec.signing: required), and a volume's files \
+         sent as a stream cannot be signed yet, so the put is refused: nothing was sent",
+    )
+}
+
 fn carry(
     kithd: &Kithd,
     method: &str,
@@ -853,7 +863,15 @@ fn carry(
     to: Option<&mut dyn std::io::Write>,
 ) -> Result<Vec<u8>, String> {
     use std::io::{BufRead, Write};
-    // (A body sent in chunks is not signed: its digest is not known before it is sent.)
+    // (A body sent in chunks is not signed: its digest is not known before it is sent. Where the
+    // cluster requires the admin's signature kithd refuses it unsigned, so it is refused here, and
+    // says why, before any of it is sent. That stays so until a streamed body can be signed.)
+    if from.is_some() && matches!(kithd.route, Route::Socket(_)) {
+        let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
+        if let Some(why) = streamed_refusal(&status) {
+            return fail(why);
+        }
+    }
     let asked = if from.is_none() { signed(kithd, method, path, b"")? } else { None };
     let signed = match asked {
         Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
@@ -984,18 +1002,14 @@ static PASSPHRASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// The admin's key from it, for the cluster kithd named: one cluster per run.
 static KEY: std::sync::OnceLock<ring::signature::Ed25519KeyPair> = std::sync::OnceLock::new();
 
-/// Whether a read of `path` is one another node may pass on (kithd's `passed_on`): such a read
-/// is signed, as a change is, and any other read is the node's own.
-fn read_passed_on(path: &str) -> bool {
-    path.starts_with("/v1/logs/") || path.starts_with("/v1/volumes/")
-}
-
 /// The signature a request to kithd's socket carries where the cluster says `signing: required`
 /// (none for a node over TLS, an open cluster, or a read of the node's own: kithd reads those as
 /// its own). A read another node may pass on is signed: the logs and a volume's files (kithd's
-/// `passed_on`, access.rs). Its key is the passphrase's, salted with the cluster id kithd gives.
+/// and this crate's `passed_on`, kith-api). Its key is the passphrase's, salted with the cluster id kithd gives.
 fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option<String>, String> {
-    if (matches!(method, "GET" | "HEAD") && !read_passed_on(path)) || !matches!(kithd.route, Route::Socket(_)) {
+    if (matches!(method, "GET" | "HEAD") && !kith_api::passed_on(method, path))
+        || !matches!(kithd.route, Route::Socket(_))
+    {
         return Ok(None);
     }
     let status: serde_json::Value = request(kithd, "GET", "/v1/cluster", b"")?;
@@ -2418,11 +2432,19 @@ mod passphrase_tests {
 
     #[test]
     fn a_read_another_node_may_pass_on_is_signed_and_the_rest_are_not() {
-        use super::read_passed_on;
-        assert!(read_passed_on("/v1/logs/Workload/default/web?replica=0"));
-        assert!(read_passed_on("/v1/volumes/default/data/files"));
-        assert!(!read_passed_on("/v1/cluster"));
-        assert!(!read_passed_on("/v1/resources?namespace=default"));
+        // (The list is kith-api's, shared with kithd: its own test checks each route.)
+        assert!(kith_api::passed_on("GET", "/v1/logs/Workload/default/web?replica=0"));
+        assert!(kith_api::passed_on("GET", "/v1/volumes/default/data/files"));
+        assert!(!kith_api::passed_on("GET", "/v1/cluster"));
+        assert!(!kith_api::passed_on("GET", "/v1/resources?namespace=default"));
+    }
+
+    #[test]
+    fn a_streamed_put_is_refused_where_writes_must_be_signed_and_says_why() {
+        use super::streamed_refusal;
+        let why = streamed_refusal(&serde_json::json!({"signing": "required"})).unwrap();
+        assert!(why.contains("as a stream") && why.contains("spec.signing: required"), "{why}");
+        assert!(streamed_refusal(&serde_json::json!({"signing": "open"})).is_none());
     }
 }
 
