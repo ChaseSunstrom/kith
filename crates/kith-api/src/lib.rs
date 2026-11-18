@@ -232,11 +232,6 @@ fn finish<S: Spec + Serialize + DeserializeOwned>(
     }
     let mut metadata = typed.metadata;
     check_name(&metadata.name).map_err(|msg| err(&["metadata", "name"], msg))?;
-    // (A Service's name is a DNS label: a dotted one is another replica's name under another Service.)
-    if matches!(info.kind, "Service" | "Namespace") && metadata.name.contains('.') {
-        let msg = format!("{} names are one DNS label: no `.` in `{}`", info.kind, metadata.name);
-        return Err(err(&["metadata", "name"], msg));
-    }
     match (&metadata.namespace, info.namespaced) {
         (Some(_), false) => {
             let msg = format!("{} is cluster-scoped and takes no namespace", info.kind);
@@ -342,6 +337,24 @@ impl Resource {
             None if self.api_version != API_VERSION => self.custom(),
             None => Err(format!("unknown kind `{}`", self.kind)),
         }
+    }
+
+    /// What a new resource must meet beyond `validated`: a Service's and a Namespace's name, and a
+    /// namespace, are one DNS label (a dot makes another Service's or replica's name). Asked where
+    /// a resource is submitted (kithd's apply and plan, the CLI's apply), not in `validated`: replay
+    /// validates every logged resource too, and a log written before this rule holds dotted ones.
+    pub fn submitted(&self) -> Result<(), String> {
+        let one_label = |what: &str, name: &str| match name.contains('.') {
+            true => Err(format!("{what} names are one DNS label: no `.` in `{name}`")),
+            false => Ok(()),
+        };
+        if matches!(self.kind.as_str(), "Service" | "Namespace") {
+            one_label(&self.kind, &self.metadata.name)?;
+        }
+        self.metadata
+            .namespace
+            .as_deref()
+            .map_or(Ok(()), |ns| one_label("namespace", ns))
     }
 
     /// What can be checked of a resource whose kind is not kith's own without the
