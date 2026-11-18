@@ -356,7 +356,7 @@ sh ci/vm.sh --test blackout            # three control nodes (two sealed) and a 
   "Restore on AC power loss: Power On" (or "Last State"), or start them over the network by
   Wake-on-LAN from another machine that stays up. A machine that waits for a button is a node that
   is off.
-- **Seal every voter.** A sealed control node opens its state from its own TPM with no node asked,
+- **Seal every control node.** A sealed control node opens its state from its own TPM with no node asked,
   so the voters start without each other, elect a leader and a quorum forms. If one voter is not
   sealed it waits for a sealed one to answer, and while it waits it is not a voter. Seal at least
   as many as make a quorum; sealing all of them is the plain rule.
