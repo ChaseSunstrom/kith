@@ -2,7 +2,6 @@
    at every part. Colour, type and timing come from site.css's tokens; the bar and the buttons are site.css's too.
    ci/site_docs.py --check fails on a token used here that site.css does not define. */
 
-.scrolled .bar { border-bottom: 1px solid var(--hair); padding-bottom: 11px; }
 /* The bar: the mark is drawn whole from the first paint (a page you turn to does not draw it again), and its links stay at every width. */
 .bar .mark line { animation: none; stroke-dasharray: none; }
 .bar .mark circle:not(.ring) { animation: none; }
@@ -45,9 +44,11 @@
 .inner a[aria-current] { color: var(--accent-text); border-left-color: var(--accent); font-weight: 700; }
 
 /* The page: its h1 is where you are (a blue stop); each h2 is a stop on the line; an h3 is a tick on it. */
-.page { --run: 0; position: relative; min-width: 0; padding-left: 44px; max-width: 820px; }
+.page { position: relative; min-width: 0; padding-left: 44px; max-width: 820px; }
 /* The line fills with blue as far as the page has been read (docs.js sets --run, 0 to 1; each stop passed turns blue too). */
-.page::before { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: linear-gradient(var(--accent), var(--accent)) no-repeat 0 0 / 100% calc(var(--run, 0) * 100%), var(--text); }
+.page::before, .reading { content: ""; position: absolute; left: 6px; top: 0; bottom: 0; width: var(--stroke); background: var(--text); }
+.reading { --run: 0; background: var(--accent); transform: scaleY(var(--run)); transform-origin: top; pointer-events: none; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .page::after { content: ""; position: absolute; left: -3px; bottom: 0; width: 21px; height: var(--stroke); background: var(--text); }
 .page > * { min-width: 0; }
 .page h1, .page h2, .page h3, .page h4 { position: relative; line-height: 1.2; letter-spacing: -0.015em; }
@@ -93,12 +94,11 @@
 /* A block's Copy button (docs.js wraps the pre): a row above the code, on the same ground and ink line. */
 .code { margin: 20px 0; background: var(--sunken); border-left: var(--stroke) solid var(--text); min-width: 0; }
 .code pre { margin: 0; border-left: 0; padding-top: 4px; }
-.copy { display: block; margin: 0 0 0 auto; padding: 3px 12px; border: 0; border-left: 1px solid var(--hair); border-bottom: 1px solid var(--hair); background: var(--bg); color: var(--text); font: 700 var(--small) / 1.4 var(--sans); cursor: pointer; }
+.page pre:focus-visible { outline: var(--stroke) solid var(--accent); outline-offset: -3px; }
+.copy { display: block; margin: 0 0 0 auto; min-height: 40px; min-width: 72px; padding: 6px 16px; border: var(--stroke) solid var(--text); background: var(--bg); color: var(--text); font: 700 var(--small) / 1.4 var(--sans); cursor: pointer; }
 .copy:hover, .copy:focus-visible { background: var(--text); color: var(--bg); }
-@media (prefers-reduced-motion: no-preference) {
-  .copy { transition: background var(--quick), color var(--quick); }
-  .copy[data-state="done"] { color: var(--accent-text); border-bottom-color: var(--accent); }
-}
+.copy[data-state] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+@media (prefers-reduced-motion: no-preference) { .copy { transition: background var(--quick), color var(--quick); } }
 
 /* Tables: hairlines between rows, an ink line under the head; wider than the page, they scroll. */
 .table { margin: 24px 0; overflow-x: auto; }

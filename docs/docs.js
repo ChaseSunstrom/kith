@@ -39,12 +39,17 @@ function spy() {
   }
 }
 // The reading line: the page's line fills with blue as far as you have read (to 55% down the window), and each h2 passed is blue.
-const page = $(".page"), h2s = $$(".page h2");
+const page = $(".page"), h2s = $$(".page h2"), reading = document.createElement("i");
+reading.className = "reading";
+reading.setAttribute("aria-hidden", "true");
+if (page) page.append(reading);
+let lastRun = "";
 function readLine() {
   if (!page) return;
-  const box = page.getBoundingClientRect();
-  page.style.setProperty("--run", Math.max(0, Math.min(1, (innerHeight * 0.55 - box.top) / box.height)).toFixed(4));
-  for (const h of h2s) h.classList.toggle("read", h.getBoundingClientRect().top < innerHeight * 0.55);
+  const box = page.getBoundingClientRect(), tops = h2s.map((h) => h.getBoundingClientRect().top); // every rect read before any write
+  const run = Math.max(0, Math.min(1, (innerHeight * 0.55 - box.top) / box.height)).toFixed(3);
+  if (run !== lastRun) { lastRun = run; reading.style.setProperty("--run", run); }
+  h2s.forEach((h, i) => h.classList.toggle("read", tops[i] < innerHeight * 0.55));
 }
 const frame = () => { queued = false; spy(); readLine(); };
 addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(frame); } }, { passive: true });
@@ -56,7 +61,7 @@ spy();
 // newline is left off, so a command pasted into a terminal waits for you.
 async function copyText(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
-  const area = document.createElement("textarea"); // a page opened from a file, or over plain http, has no clipboard API
+  const was = document.activeElement, area = document.createElement("textarea"); // a page opened from a file, or over plain http, has no clipboard API
   area.value = text;
   area.setAttribute("readonly", "");
   area.style.cssText = "position:fixed;top:0;left:0;opacity:0";
@@ -64,23 +69,29 @@ async function copyText(text) {
   area.select();
   const ok = document.execCommand("copy");
   area.remove();
+  if (was && was.focus) was.focus();
   if (!ok) throw new Error("copy refused");
 }
+const said = document.createElement("p"); // one polite line for a screen reader: the button's own label stays "Copy"
+said.className = "sr";
+said.setAttribute("role", "status");
+document.body.append(said);
 for (const pre of $$(".page pre")) {
+  pre.tabIndex = 0; // a block that scrolls sideways must be reachable by keyboard
   const wrap = document.createElement("div"), button = document.createElement("button");
   wrap.className = "code";
   button.type = "button";
   button.className = "copy";
   button.textContent = "Copy";
-  button.setAttribute("aria-label", "Copy this code");
   let timer = 0;
   button.addEventListener("click", async () => {
-    let said = "Copied";
-    try { await copyText(pre.textContent.replace(/\n+$/, "")); } catch { said = "Not copied"; }
-    button.textContent = said;
-    button.dataset.state = said === "Copied" ? "done" : "failed";
+    let msg = "Copied";
+    try { await copyText(pre.textContent.replace(/\n+$/, "")); } catch { msg = "Not copied"; }
+    button.textContent = msg;
+    said.textContent = msg;
+    button.dataset.state = msg === "Copied" ? "done" : "failed";
     clearTimeout(timer);
-    timer = setTimeout(() => { button.textContent = "Copy"; delete button.dataset.state; }, 1500);
+    timer = setTimeout(() => { button.textContent = "Copy"; said.textContent = ""; delete button.dataset.state; }, 1500);
   });
   pre.replaceWith(wrap);
   wrap.append(button, pre);

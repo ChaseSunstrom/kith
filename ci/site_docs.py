@@ -420,7 +420,7 @@ def build():
         up = "../" * (p.out.count("/") - 1)
         near = [("Previous", "prev", allp[n - 1]) if n else None, ("Next", "next", allp[n + 1]) if n + 1 < len(allp) else None]
         links = "".join(f'<a class="{r}" rel="{r}" href="{posixpath.relpath(q.out, posixpath.dirname(p.out))}"><span>{w}</span>{esc(q.label)}</a>' for w, r, q in filter(None, near))
-        foot = f'<footer class="tail"><nav aria-label="Next page">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
+        foot = f'<footer class="tail"><nav aria-label="Previous and next pages">{links}</nav><p class="fine">This page is <a href="{REPO}/blob/main/{p.src}">{p.src}</a>.</p></footer>'
         body = f'<article>\n{p.doc.body}\n</article>'
         out[p.out] = shell(p.title, p.doc.summary(), up, rail(pages, notes, p), body, foot, p.src)
     out["docs/guide/index.html"] = shell("The guide", "kith's guide and the decisions behind it, one page for each part.", "../", rail(pages, notes, None), index_body(pages, notes), "")
@@ -471,7 +471,7 @@ def chrome(out):
         for want in ('<a href="%sinstall.html">Install</a>' % ("../" * (f.count("/") - 1)), MARK):
             if want not in text:
                 bad.append(f"{f}: no {want[:30]} in its header")
-        if f != "docs/guide/index.html" and not re.search(r'<footer class="tail"><nav aria-label="Next page"><a class="(prev|next)" rel=', text):
+        if f != "docs/guide/index.html" and not re.search(r'<footer class="tail"><nav aria-label="Previous and next pages"><a class="(prev|next)" rel=', text):
             bad.append(f"{f}: no link to the page before or after")
     js, css = ((ROOT / "docs" / n).read_text(encoding="utf-8") for n in ("docs.js", "docs.css"))
     for what, ok in (
