@@ -274,8 +274,10 @@ c.sendall(tag + c.makefile("rb").readline().upper())
             let mut head = read_head(&mut conn);
             if head.starts_with("GET /v1/cluster ") {
                 // Asked first, to see whether the request is signed: this cluster is open.
-                conn.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\n{\"signing\":\"open\"}")
-                    .unwrap();
+                conn.write_all(
+                    b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 18\r\n\r\n{\"signing\":\"open\"}",
+                )
+                .unwrap();
                 drop(conn);
                 conn = listener.accept().unwrap().0;
                 head = read_head(&mut conn);

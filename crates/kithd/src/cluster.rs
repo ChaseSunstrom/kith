@@ -885,7 +885,10 @@ async fn status(State(shared): State<Arc<Shared>>) -> Json<serde_json::Value> {
     };
     // What a signer needs (kith's passphrase key is salted with the cluster id): the id is the
     // print of the CA, and `signing` says whether writes must be signed.
-    let id = shared.cluster.as_ref().and_then(|cluster| crate::pki::fingerprint(&cluster.me.ca).ok());
+    let id = shared
+        .cluster
+        .as_ref()
+        .and_then(|cluster| crate::pki::fingerprint(&cluster.me.ca).ok());
     let signing = match crate::access_sign::requires(&shared) {
         true => "required",
         false => "open",

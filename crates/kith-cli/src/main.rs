@@ -803,7 +803,9 @@ fn typed_on(tty: &std::fs::File, prompt: &str, twice: bool) -> Result<String, St
 /// The next line of `input`, without its line end.
 fn one_line(input: &mut impl std::io::BufRead) -> Result<String, String> {
     let mut line = String::new();
-    input.read_line(&mut line).or_else(|e| fail(format!("reading the passphrase: {e}")))?;
+    input
+        .read_line(&mut line)
+        .or_else(|e| fail(format!("reading the passphrase: {e}")))?;
     Ok(line.trim().to_string())
 }
 
@@ -872,7 +874,11 @@ fn carry(
             return fail(why);
         }
     }
-    let asked = if from.is_none() { signed(kithd, method, path, b"")? } else { None };
+    let asked = if from.is_none() {
+        signed(kithd, method, path, b"")?
+    } else {
+        None
+    };
     let signed = match asked {
         Some(header) => format!("{}: {header}\r\n", signing::SIGNED),
         None => String::new(),
@@ -1032,7 +1038,14 @@ fn signed(kithd: &Kithd, method: &str, path: &str, body: &[u8]) -> Result<Option
     };
     let asked = signing::Request { method, path, body };
     // "*": this node is the one it is sent to, and a node passes it on only to where it belongs.
-    let header = signing::header(key, cluster, "*", &asked, kith_api::store::now() + 300, &signing::nonce()?);
+    let header = signing::header(
+        key,
+        cluster,
+        "*",
+        &asked,
+        kith_api::store::now() + 300,
+        &signing::nonce()?,
+    );
     Ok(Some(header))
 }
 
@@ -2443,7 +2456,10 @@ mod passphrase_tests {
     fn a_streamed_put_is_refused_where_writes_must_be_signed_and_says_why() {
         use super::streamed_refusal;
         let why = streamed_refusal(&serde_json::json!({"signing": "required"})).unwrap();
-        assert!(why.contains("as a stream") && why.contains("spec.signing: required"), "{why}");
+        assert!(
+            why.contains("as a stream") && why.contains("spec.signing: required"),
+            "{why}"
+        );
         assert!(streamed_refusal(&serde_json::json!({"signing": "open"})).is_none());
     }
 }

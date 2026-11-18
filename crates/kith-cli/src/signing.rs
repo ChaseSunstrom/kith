@@ -114,7 +114,10 @@ mod tests {
     #[test]
     fn signed_header_is_the_form_kithd_reads() {
         let key = key(PASSPHRASE, CLUSTER);
-        let sig = base64(key.sign(message(CLUSTER, "*", &asked(), EXPIRES, NONCE).as_bytes()).as_ref());
+        let sig = base64(
+            key.sign(message(CLUSTER, "*", &asked(), EXPIRES, NONCE).as_bytes())
+                .as_ref(),
+        );
         assert_eq!(
             header(&key, CLUSTER, "*", &asked(), EXPIRES, NONCE),
             format!("v1; who=local socket; target=*; expires={EXPIRES}; nonce={NONCE}; sig={sig}")
@@ -137,6 +140,9 @@ mod tests {
     #[test]
     fn signed_cross_vector_is_kithds() {
         assert_eq!(public(&key(PASSPHRASE, CLUSTER)), PUBLIC);
-        assert_eq!(header(&key(PASSPHRASE, CLUSTER), CLUSTER, "*", &asked(), EXPIRES, NONCE), HEADER);
+        assert_eq!(
+            header(&key(PASSPHRASE, CLUSTER), CLUSTER, "*", &asked(), EXPIRES, NONCE),
+            HEADER
+        );
     }
 }

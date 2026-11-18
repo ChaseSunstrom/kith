@@ -458,7 +458,10 @@ pub async fn passed(
         body: &bytes,
     };
     let signed = hop(shared, node, Some(&header), &asked, Some(named), log);
-    (request, signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes, room))))
+    (
+        request,
+        signed.map(|signed| signed.map(|signed| signed.relayed(&method, &path, &bytes, room))),
+    )
 }
 
 /// Is an unsigned call at the local socket taken under `required`, as the node, which reads?
@@ -703,7 +706,13 @@ mod tests {
         let mut seed = [0u8; 32];
         let rounds = std::num::NonZeroU32::new(600_000).unwrap();
         let passphrase = b"correct horse battery staple";
-        ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, rounds, CLUSTER.as_bytes(), passphrase, &mut seed);
+        ring::pbkdf2::derive(
+            ring::pbkdf2::PBKDF2_HMAC_SHA256,
+            rounds,
+            CLUSTER.as_bytes(),
+            passphrase,
+            &mut seed,
+        );
         let key = Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
         assert_eq!(
             crate::pki::hex(key.public_key().as_ref()),

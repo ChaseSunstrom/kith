@@ -895,9 +895,15 @@ impl Shared {
         match call.timeout(PATIENCE).send().await {
             Ok(reply) if reply.status().is_success() => {
                 let done = if relay.method == "DELETE" {
-                    reply.json::<kith_api::Resource>().await.map(|r| Done::Deleted(Box::new(r)))
+                    reply
+                        .json::<kith_api::Resource>()
+                        .await
+                        .map(|r| Done::Deleted(Box::new(r)))
                 } else if route.starts_with("/v1/rollback/") {
-                    reply.json::<kith_api::store::Change>().await.map(|c| Done::Changes(vec![c]))
+                    reply
+                        .json::<kith_api::store::Change>()
+                        .await
+                        .map(|c| Done::Changes(vec![c]))
                 } else {
                     reply.json::<Vec<kith_api::store::Change>>().await.map(Done::Changes)
                 };

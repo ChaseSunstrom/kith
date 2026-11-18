@@ -28,9 +28,10 @@ pub fn passed_on(method: &str, path: &str) -> bool {
     };
     let parts: Vec<&str> = rest.split('/').collect();
     match parts[..] {
-        ["logs", _, ..] | ["volumes", _, _, "files"] | ["lock", _, "passphrase" | "recovery"] | ["backups", _, _, "restore"] => {
-            true
-        }
+        ["logs", _, ..]
+        | ["volumes", _, _, "files"]
+        | ["lock", _, "passphrase" | "recovery"]
+        | ["backups", _, _, "restore"] => true,
         ["apply"] => method == "POST",
         ["resources", ..] => method == "DELETE",
         ["rollback", ..] => method == "POST",
