@@ -309,13 +309,14 @@ async fn change(
     command: Command,
 ) -> Result<Done, ApiError> {
     let (shared, caller) = (shared.clone(), caller.clone());
-    let done = tokio::spawn(async move {
+    // (With the request's signature: who signed it is asked where the admin's key is written.)
+    let done = tokio::spawn(crate::access_sign::within(crate::access_sign::current(), async move {
         // Who asked goes with the write: an Identity's is decided again where it is put in the log.
         let done = shared.submit_as(command, Some(&caller)).await;
         let said = done.as_ref().map(drop).map_err(Error::to_string);
         shared.audit.record(&caller, verb, what, said);
         done
-    });
+    }));
     let stopped = |e| ApiError::Store(Error::Io(format!("the change stopped: {e}")));
     done.await.map_err(stopped)?.map_err(ApiError::Store)
 }
@@ -817,8 +818,7 @@ pub(crate) async fn output(
         };
         // (That node, and no other at its address: the output of a unit may hold secrets.)
         let client = cluster.to(&there).map_err(|e| ApiError::Store(Error::Io(e)))?;
-        let asked = client
-            .get(url)
+        let asked = crate::access_sign::pass_on(client.get(url))
             .header(crate::access::FOR, caller.to_string())
             .timeout(std::time::Duration::from_secs(10))
             .send()

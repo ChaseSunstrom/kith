@@ -246,10 +246,7 @@ impl Crowd {
     /// own are not counted: only what runs on it can use them.
     fn place(self: &Arc<Crowd>, from: std::net::IpAddr) -> Option<Place> {
         use std::net::IpAddr;
-        let from = match from {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(from, IpAddr::V4),
-            v4 => v4,
-        };
+        let from = from.to_canonical();
         if from.is_loopback() {
             return Some(Place(self.clone(), None));
         }
@@ -1395,7 +1392,8 @@ async fn join(
     // nodes take it as a peer by this key, and it calls them.)
     let mut more = serde_json::Map::new();
     let address = match &request.mesh {
-        None => SocketAddr::new(peer.addr.ip(), request.port),
+        // (An IPv4 machine on a socket that takes both is `::ffff:a.b.c.d`: kept as a.b.c.d.)
+        None => SocketAddr::new(peer.addr.ip().to_canonical(), request.port),
         Some(said) => {
             let mesh = serde_json::json!({ "key": said.key, "address": mesh_address.to_string(), "port": said.port });
             more.insert("mesh".into(), mesh);
@@ -1791,6 +1789,35 @@ pub(crate) mod pinned_peer {
         );
         let store = shared.store.lock().unwrap();
         assert!(store.store.get("Node/w-gpu").is_none() && store.store.get("Device/w-gpu-card0").is_some());
+    }
+
+    /// A machine that joins over IPv4 to a socket that takes both is seen as `::ffff:a.b.c.d`:
+    /// its Node is reached at `a.b.c.d`, the form every reader of `status.address` expects.
+    #[tokio::test]
+    async fn joined_from_a_mapped_address_is_stored_at_its_ipv4() {
+        let ca = pki::Ca::create().unwrap();
+        let cluster = Cluster::new(node(&ca, "a"), Some(ca)).unwrap();
+        let token = cluster
+            .tokens
+            .mint(&cluster.me.ca, Some(&cluster.me), pki::Lets::Worker)
+            .unwrap();
+        let shared = shared_of("join-mapped", cluster, &[]).await;
+        let peer = Peer {
+            addr: "[::ffff:192.0.2.7]:40000".parse().unwrap(),
+            subject: None,
+        };
+        let request = JoinRequest {
+            token,
+            name: "w".into(),
+            port: 7000,
+            mesh: None,
+            view: true,
+            ingress: false,
+        };
+        let joined = join(State(shared.clone()), ConnectInfo(peer), Json(request)).await;
+        let _joined = joined.map_err(|(_, Json(said))| said).unwrap();
+        let node = shared.store.lock().unwrap().store.get("Node/w").cloned().unwrap();
+        assert_eq!(node.status.unwrap()["address"], "192.0.2.7:7000");
     }
 
     /// A token for an ingress worker lets in a worker that runs from a view, and the node that

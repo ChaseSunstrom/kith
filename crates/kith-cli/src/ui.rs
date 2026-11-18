@@ -8,10 +8,9 @@
 //! - names this machine as its `Host` (a page that points its own name here does not), and
 //! - comes from the page itself, when the browser says where from (`Origin`).
 
+use crate::wire::{Route, Wire};
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,7 +67,7 @@ fn admit(head: &str, secret: &str) -> Result<(String, u64), &'static str> {
     Ok((passed, length.unwrap_or(0)))
 }
 
-fn forward(mut browser: TcpStream, socket: &Path, secret: &str) -> io::Result<()> {
+fn forward(mut browser: TcpStream, route: &Route, secret: &str) -> io::Result<()> {
     // (Its head, promptly; after that a watch may wait as long as kithd lets it.)
     let by = Instant::now() + Duration::from_secs(10);
     let (mut read, mut some) = (Vec::new(), [0; 4096]);
@@ -98,7 +97,7 @@ fn forward(mut browser: TcpStream, socket: &Path, secret: &str) -> io::Result<()
         Ok(passes) => passes,
         Err(why) => return refuse(browser, "403 Forbidden", why),
     };
-    let mut kithd = match UnixStream::connect(socket) {
+    let mut kithd = match Wire::connect(route, None) {
         Ok(kithd) => kithd,
         Err(e) => return refuse(browser, "502 Bad Gateway", &format!("kithd is not there: {e}")),
     };
@@ -110,17 +109,17 @@ fn forward(mut browser: TcpStream, socket: &Path, secret: &str) -> io::Result<()
     browser.set_read_timeout(None)?;
     // The rest of the body goes on while the answer comes back.
     let rest = length - have.len() as u64;
-    let (sending, mut taking) = (browser.try_clone()?, kithd.try_clone()?);
+    let (sending, mut taking) = (browser.try_clone()?, kithd.dup()?);
     std::thread::spawn(move || {
         let _ = io::copy(&mut sending.take(rest), &mut taking);
-        let _ = taking.shutdown(Shutdown::Write);
+        let _ = taking.shutdown_write();
     });
     io::copy(&mut kithd, &mut browser)?;
     browser.shutdown(Shutdown::Both)
 }
 
 /// Serve until interrupted. The address to open is the one line on stdout.
-pub fn serve(socket: &Path, port: u16) -> Result<(), String> {
+pub fn serve(route: &Route, port: u16) -> Result<(), String> {
     let listener =
         TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("error: listening on 127.0.0.1:{port}: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -139,9 +138,9 @@ pub fn serve(socket: &Path, port: u16) -> Result<(), String> {
         if Arc::strong_count(&open) > OPEN {
             continue;
         }
-        let (socket, secret, held) = (socket.to_path_buf(), secret.clone(), open.clone());
+        let (route, secret, held) = (route.clone(), secret.clone(), open.clone());
         std::thread::spawn(move || {
-            drop(forward(browser, &socket, &secret));
+            drop(forward(browser, &route, &secret));
             drop(held);
         });
     }
@@ -176,7 +175,7 @@ mod tests {
         browser.write_all(format!("{first}{second}").as_bytes()).unwrap();
         browser.shutdown(Shutdown::Write).unwrap();
         let (taken, _) = listener.accept().unwrap();
-        forward(taken, &socket, "s3cret").unwrap();
+        forward(taken, &Route::Socket(socket), "s3cret").unwrap();
         let got = got.join().unwrap();
         assert!(
             got.starts_with("POST /v1/apply HTTP/1.1\r\n") && got.ends_with("\r\n\r\n[]"),

@@ -35,6 +35,9 @@ pub enum Caller {
     /// The same, on a worker that runs from a view: it has no Identity and no Role to ask
     /// again by, and takes the control node's word for what they may do as well.
     Checked(String, Box<Caller>),
+    /// The local socket, unsigned, where the cluster says `spec.signing: required`: the node
+    /// named, which reads and nothing more (`access_sign.rs`).
+    Console(String),
 }
 
 /// The header by which a node that passes a request on says who asked it.
@@ -85,6 +88,7 @@ impl std::fmt::Display for Caller {
             Caller::Node(node) => write!(f, "node {node}"),
             Caller::Identity(name) => f.write_str(name),
             Caller::Via(node, who) | Caller::Checked(node, who) => write!(f, "{who} via node {node}"),
+            Caller::Console(node) => write!(f, "console of node {node}"),
         }
     }
 }
@@ -105,6 +109,15 @@ impl Grants {
             // A node has no right of its own here: what it does for the cluster goes by the
             // node routes, and what it passes on is asked as whoever asked it.
             Caller::Node(_) => return Grants(Some(Vec::new())),
+            Caller::Console(_) => {
+                let reads = vec![Verb::Get, Verb::List, Verb::Watch];
+                let rule = AccessRule {
+                    kinds: vec!["*".into()],
+                    verbs: reads,
+                    namespaces: Vec::new(),
+                };
+                return Grants(Some(vec![rule]));
+            }
             Caller::Via(_, who) => return Grants::of(who, store),
             Caller::Identity(name) => name,
         };
@@ -479,11 +492,25 @@ pub async fn caller(
         Ok(caller) => caller,
         Err((status, why)) => return refuse(status, why).into_response(),
     };
+    // A node's word for who asked: under `spec.signing: required`, with their signature.
+    let mut signed = None;
+    if let Caller::Via(node, who) | Caller::Checked(node, who) = &caller {
+        let (method, path) = (request.method().to_string(), request.uri().path().to_string());
+        let (passed, checked) = crate::access_sign::passed(&shared, node, who, request).await;
+        request = passed;
+        match checked {
+            Ok(scope) => signed = scope,
+            Err(why) => {
+                shared.audit.record(&caller, &method, vec![path], Err(why.clone()));
+                return refuse(StatusCode::FORBIDDEN, why).into_response();
+            }
+        }
+    }
     if let Some(subject) = &peer.subject {
         request.extensions_mut().insert(Certificate(subject.clone()));
     }
     request.extensions_mut().insert(caller);
-    next.run(request).await
+    crate::access_sign::within(signed, next.run(request)).await
 }
 
 /// Refuse a Workload of `resources` that says it runs as an Identity which does not say it
