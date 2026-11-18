@@ -137,7 +137,6 @@ pub fn plan(asked: &[Asked], people: Ipv6Addr) -> BTreeMap<String, Said> {
         }
     }
     // Keepers first: a refused peer's held address is kept only where no keeper holds it.
-    // Keepers first: a refused peer's held address is kept only where no keeper holds it.
     lot.sort_by(|a, b| (a.1.is_some(), &a.0.name).cmp(&(b.1.is_some(), &b.0.name)));
 
     let mut said = BTreeMap::new();

@@ -225,7 +225,11 @@ fn candidate(resource: &Resource, node: &str, people64: Ipv6Addr, notes: &mut Ve
     let offset = u16::from_be_bytes([high, low]);
     let six = u128::from(v6);
     // (Not the first two addresses of the range, nor its last: docs/adr-people.md, Review 5.)
-    if !(2..0xffff).contains(&offset) || six >> 64 != u128::from(people64) >> 64 || (six as u64) < 2 {
+    if !(2..0xffff).contains(&offset)
+        || six >> 64 != u128::from(people64) >> 64
+        || (six as u64) < 2
+        || six as u64 == u64::MAX
+    {
         notes.push(format!("peer {name}: {v4} and {v6} are not the people's to give"));
         return None;
     }
@@ -438,7 +442,11 @@ impl Tend {
             self.sent = None;
             step(&mut self.steps, "peers emptied".into());
             match (self.kernel.set_peers)(&[]) {
-                Ok(()) => self.device.clear(),
+                // (Every peer that was on it left: the next pass flushes their connections.)
+                Ok(()) => {
+                    self.flush.extend(self.device.keys());
+                    self.device.clear();
+                }
                 Err(e) => notes.push(format!("emptying {}: {e}", kith_mesh::people::DEVICE)),
             }
             return notes;
@@ -680,23 +688,32 @@ pub(crate) mod tests {
         let (mesh, people64) = ids();
         let mut store = Store::default();
         apply(&mut store, &level_yaml("family", "{ services: ['*'] }"));
-        for (name, n) in [("first", 1), ("second", 2), ("last", 3), ("one-before", 4)] {
+        for (name, n) in [
+            ("first", 1),
+            ("second", 2),
+            ("last", 3),
+            ("one-before", 4),
+            ("top-six", 5),
+        ] {
             apply(&mut store, &peer_yaml(name, "n1", "family", n));
         }
-        let at = |name: &str, offset: u16| {
+        let with = |name: &str, offset: u16, six_id: u64| {
             let four = Ipv4Addr::new(100, 89, (offset >> 8) as u8, offset as u8);
-            let six = Ipv6Addr::from(u128::from(people64) | u128::from(offset));
+            let six = Ipv6Addr::from(u128::from(people64) | u128::from(six_id));
             let fields = serde_json::Map::from_iter([(
                 "addresses".to_string(),
                 serde_json::json!({"ipv4": four.to_string(), "ipv6": six.to_string()}),
             )]);
             (format!("RemotePeer/{name}"), fields)
         };
+        let at = |name: &str, offset: u16| with(name, offset, u64::from(offset));
         let statuses = vec![
             at("first", 1),
             at("second", 2),
             at("last", 0xffff),
             at("one-before", 0xfffe),
+            // A fine IPv4 offset, but the /64's last address (all ones in the low 64 bits).
+            with("top-six", 5, u64::MAX),
         ];
         kith_store::run(&mut store, Command::Patch { statuses }).unwrap();
         let asked = wanted(&store, (mesh, people64), "n1", &config(&[]), Vec::new());
@@ -704,7 +721,7 @@ pub(crate) mod tests {
         offsets.sort();
         assert_eq!(offsets, [2, 0xfffe], "{:?}", asked.notes);
         let said = asked.notes.join("\n");
-        for name in ["first", "last"] {
+        for name in ["first", "last", "top-six"] {
             assert!(
                 said.contains(&format!("peer {name}: ")) && said.contains("not the people's to give"),
                 "{said}"
@@ -1063,7 +1080,8 @@ pub(crate) mod tests {
         failed.kernel.table = kith_mesh::people::send_without_masquerade;
         failed.steps.clear();
         assert!(failed.pass(&asks(&[2, 3], Vec::new())).is_empty());
-        assert_eq!(failed.steps.last().map(String::as_str), Some("peers"));
+        // (Peer 2 left the device when it was emptied: its connections are flushed now, once.)
+        assert_eq!(&failed.steps[failed.steps.len() - 2..], ["peers", "flush 0x6b790002"]);
         assert_eq!(peers_on_device(), 2);
 
         kith_mesh::people::remove().unwrap();
@@ -1167,6 +1185,51 @@ pub(crate) mod tests {
             ["off the device", "table", "rule 9011 - 100.89.0.3", "flush 0x6b790003"]
         );
         assert_eq!(peers_on_device(), 0);
+
+        kith_mesh::people::remove().unwrap();
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Review 2.2: a pass that could not take a peer off the device, then fails in the table or the
+    /// rules and empties the device with success: every peer that was on it left, so each one's
+    /// connections are owed a flush (the next pass makes it); none is forgotten.
+    #[test]
+    fn people_removed_when_a_failed_pass_then_empties_the_device() {
+        let Some((_guard, state)) = alone() else { return };
+        start(&state);
+        let mut tend = tend();
+        assert!(tend.pass(&asks(&[2, 3], Vec::new())).is_empty());
+        tend.steps.clear();
+
+        // The device takes no peers but the empty list; the rules cannot be made.
+        tend.kernel.set_peers = |peers| {
+            if peers.is_empty() {
+                kith_mesh::people::set_peers(peers)
+            } else {
+                failing()
+            }
+        };
+        tend.kernel.internet = |_, _| failing();
+        let notes = tend.pass(&asks(&[3], Vec::new()));
+        assert_eq!(tend.steps.first().map(String::as_str), Some("off the device"));
+        assert_eq!(tend.steps.last().map(String::as_str), Some("peers emptied"));
+        assert!(notes.iter().any(|note| note.contains("taking peers off")), "{notes:?}");
+        assert_eq!(peers_on_device(), 0, "emptied");
+        assert!(tend.device.is_empty());
+        assert_eq!(tend.flush, BTreeSet::from([2, 3]), "both left the device");
+
+        tend.kernel = Kernel::real();
+        tend.kernel.table = kith_mesh::people::send_without_masquerade;
+        tend.steps.clear();
+        assert!(tend.pass(&asks(&[3], Vec::new())).is_empty());
+        assert!(
+            tend.steps
+                .ends_with(&["flush 0x6b790002".into(), "flush 0x6b790003".into()]),
+            "{:?}",
+            tend.steps
+        );
+        assert!(tend.flush.is_empty());
+        assert_eq!(peers_on_device(), 1);
 
         kith_mesh::people::remove().unwrap();
         let _ = std::fs::remove_dir_all(&state);

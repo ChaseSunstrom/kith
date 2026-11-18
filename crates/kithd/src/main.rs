@@ -757,6 +757,23 @@ fn run(args: Args, mut boot: Option<init::Boot>) -> Result<(), String> {
             format_args!("kithd: WARNING: {clash} (going on: pods may not reach, or be reached from, that network)\n"),
         );
     }
+    // --people: neither the pods' range nor a network of this node may overlap 100.89.0.0/16
+    // (docs/adr-people.md, Review 4). The range is a flag, so it refuses; a lease that lands in
+    // the people's range is only said where a refusal would restart the machine (as above).
+    if args.people.is_some() {
+        args.pod_range.refuse_people()?;
+        if let Err(clash) = kith_mesh::pod::Range::refuse_people_in_use() {
+            if !first_process {
+                return Err(clash);
+            }
+            let _ = std::io::Write::write_fmt(
+                &mut std::io::stderr(),
+                format_args!(
+                    "kithd: WARNING: {clash} (going on: people may not reach, or be reached from, that network)\n"
+                ),
+            );
+        }
+    }
     // An encrypted state is opened with a key the cluster holds: nothing below can be
     // done before that, and it takes as long as it takes. A stop that comes meanwhile ends it.
     //

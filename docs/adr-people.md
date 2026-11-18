@@ -391,8 +391,10 @@ Where the build differs from the text above:
 - An IPv6 overlap is not refused at apply: the mesh /48 and the people /64 come from the CA,
   which kith-api does not hold. kithd refuses an AccessLevel over either in its `refused` status
   instead. An IPv4 overlap with the people ranges or `100.88.0.0/16` is refused at apply.
-- The pods range checked is the default `100.88.0.0/16`. The start-time check of the people
-  ranges against `--pod-range` and the connected networks (condition 4) is not done yet.
+- The pods range checked at apply is the default `100.88.0.0/16`. At start, with `--people`,
+  kithd refuses a `--pod-range` that overlaps `100.89.0.0/16`, and a network of this node
+  (other than `kwg0` and loopback) that overlaps it; as PID 1 the second is only said, as the
+  pods' own clash is, since a refusal there restarts the machine (condition 4).
 - An IPv4 address is 16 bits of the name's SHA-256 inside `100.89.0.0/16`; the IPv6 address is
   the people /64 with the name's SHA-256 bytes 8 to 16 as its interface id. Of the peers that
   share a public key, one is given its addresses: the one already holding an address of ours,
