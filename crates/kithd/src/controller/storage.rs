@@ -409,6 +409,9 @@ fn scratch_name(near: &Path) -> PathBuf {
 /// (each a `scratch.*` of its own): they go at the next count of its pod's roots (which only a
 /// pod with running roots that is walked has), or when the pod is gone and its replica
 /// directory is removed. One that is gone or made while the directory is listed is no error.
+/// (Removals of a whole replica directory, of a pod's directory in `pods/` and of a sync's
+/// leftovers in `replicas/` make their levels beside the directory they remove: those are for
+/// `files::sweep` and `pods::forget`, not this.)
 pub fn sweep(replica: &Path, stop: &AtomicBool) {
     sweep_until(replica, &|| stop.load(Ordering::Relaxed));
 }
@@ -465,8 +468,11 @@ const BATCH: usize = 1024;
 /// into a level that holds its new name already (a level that was a pod's directory may) takes
 /// the next name.
 ///
-/// A halt leaves `root` and the levels where they are, each named `scratch.*` in the replica
-/// directory, for a sweep to remove as a tree of its own. A second remover of the same
+/// A halt leaves `root` and the levels where they are, each named `scratch.*` beside `root`:
+/// in a replica directory for a scratch of it (`sweep` removes them as trees of their own),
+/// and in `replicas/` (removed by `files::sweep`), in `pods/` (by the next `forget` of a pod)
+/// or beside an unpack (`.NAME.restoring`, where nothing removes them: a call that is never
+/// halted leaves levels only after an error, which it logs). A second remover of the same
 /// scratch at the same moment is harmless: what the first removed is `ENOENT` to the other,
 /// which ignores it (a directory that leaves not empty ends the removal at its own `rmdir`).
 /// Any other error that leaves an entry in place ends the removal with it, as `remove_dir_all`
@@ -1402,7 +1408,19 @@ pub(crate) mod tests {
     /// 2,000 deep ends what a removal that holds a descriptor per level does, where the
     /// 500,000 or so a test run is let have do not.
     pub(crate) fn few_files(name: &str, body: impl FnOnce()) {
+        // (The marker only the child below is given: one set in a run's own environment is no
+        // child, and its limit says so, so the body is not run with the limit it was to be run
+        // under left out.)
         if std::env::var_os("KITHD_FEW_FILES").is_some() {
+            let limits = std::fs::read_to_string("/proc/self/limits").unwrap();
+            let soft = limits.lines().find_map(|line| line.strip_prefix("Max open files"));
+            let soft: u64 = soft
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+                .unwrap();
+            assert!(
+                soft <= 256,
+                "KITHD_FEW_FILES is set, but this run may hold {soft} files"
+            );
             return body();
         }
         let name = name.split_once("::").map_or(name, |(_, path)| path);

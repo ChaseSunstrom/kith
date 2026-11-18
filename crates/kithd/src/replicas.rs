@@ -124,7 +124,12 @@ fn swap(new: &Path, dir: &Path, aside: Option<u64>) -> std::io::Result<()> {
     let mut old = dir.as_os_str().to_owned();
     old.push(aside.map_or(".old".to_string(), |at| format!(".was-{at}")));
     let old = PathBuf::from(old);
-    let _ = std::fs::remove_dir_all(&old);
+    // (One left here makes the rename below fail, so it is said.)
+    if let Err(e) = crate::controller::storage::remove_tree(&old, &|| false)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("kithd: removing {}: {e}", old.display());
+    }
     let empty = std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none());
     match std::fs::rename(dir, &old) {
         Ok(()) => {}
@@ -135,8 +140,11 @@ fn swap(new: &Path, dir: &Path, aside: Option<u64>) -> std::io::Result<()> {
         let _ = std::fs::rename(&old, dir);
         return Err(e);
     }
-    if aside.is_none() || empty {
-        let _ = std::fs::remove_dir_all(&old);
+    if (aside.is_none() || empty)
+        && let Err(e) = crate::controller::storage::remove_tree(&old, &|| false)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("kithd: removing {}: {e}", old.display());
     }
     Ok(())
 }
@@ -327,7 +335,13 @@ async fn sync(
 /// Removes what a stop in the middle of a sync left: a volume's files, which a container wrote.
 fn clear_unfinished(state: &Path) {
     for left in [".sending", ".receiving"] {
-        let _ = crate::controller::storage::remove_tree(&state.join("replicas").join(left), &|| false);
+        // (Levels a failed removal leaves are `scratch.*` in `replicas/`: `files::sweep` removes them.)
+        let path = state.join("replicas").join(left);
+        if let Err(e) = crate::controller::storage::remove_tree(&path, &|| false)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("kithd: removing {}: {e}", path.display());
+        }
     }
 }
 

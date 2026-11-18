@@ -89,7 +89,29 @@ pub fn range() -> kith_mesh::pod::Range {
 /// Removes a gone pod's directory. Not `remove_dir_all`, which holds a descriptor per level
 /// and fails on a tree thousands deep (a container may have made one).
 fn forget(dir: &Path) {
-    let _ = crate::controller::storage::remove_tree(dir, &|| false);
+    use crate::controller::storage::remove_tree;
+    let said = |path: &Path, e: std::io::Error| {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("kithd: removing {}: {e}", path.display());
+        }
+    };
+    if let Err(e) = remove_tree(dir, &|| false) {
+        said(dir, e);
+    }
+    // (The levels a removal that failed made beside the directory: nothing else removes them.)
+    for entry in dir
+        .parent()
+        .and_then(|pods| std::fs::read_dir(pods).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.file_name().to_string_lossy().starts_with("scratch.")
+            && let Err(e) = remove_tree(&entry.path(), &|| false)
+        {
+            said(&entry.path(), e);
+        }
+    }
 }
 
 impl Pods {
@@ -964,6 +986,27 @@ mod tests {
                 assert!(left.is_empty(), "{left:?}");
             },
         );
+    }
+
+    /// The levels a failed removal left beside a pod's directory go with the next one, and no
+    /// other pod's directory does.
+    #[test]
+    fn a_pods_forgetting_removes_the_scratch_levels_left_in_pods() {
+        let pods = std::env::temp_dir().join(format!("kith-pod-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pods);
+        for dir in ["w_default_web_0", "w_default_web_1", "scratch.1/a"] {
+            std::fs::create_dir_all(pods.join(dir)).unwrap();
+        }
+        std::fs::write(pods.join("scratch.1/a/f"), "x").unwrap();
+        forget(&pods.join("w_default_web_0"));
+        let mut left: Vec<_> = std::fs::read_dir(&pods)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let _ = std::fs::remove_dir_all(&pods);
+        left.sort();
+        assert_eq!(left, ["w_default_web_1"]);
     }
 
     #[test]
