@@ -18,7 +18,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// A peer silent for this long is not reached directly (WireGuard itself gives up on
 /// keys this old).
@@ -206,13 +206,10 @@ fn members(
     members
 }
 
-/// A roaming node that the house's holder has not shaken hands with for this long calls it at the
-/// house's endpoint (the router's forward to the house address).
-const HOME_AFTER: Duration = Duration::from_secs(30);
-
 /// Who `me` is to call at the Cluster's house endpoint (`spec.home.endpoint`, as written: a name
-/// or an address with a port): the holder (`status.home.holder`), and only when `me` roams, is not
-/// the holder, and has not shaken hands with it for `HOME_AFTER`. Every other peer, and the
+/// or an address with a port, the router's forward to the house address): the holder
+/// (`status.home.holder`), and only when `me` roams, is not the holder, and has not shaken hands
+/// with it for `QUIET` (a healthy tunnel does about every two minutes). Every other peer, and the
 /// holder once it answers, stays where it was last called from.
 fn home_endpoint(
     store: &Store,
@@ -220,15 +217,63 @@ fn home_endpoint(
     members: &[Member],
     shook: &BTreeMap<Key, Option<Duration>>,
 ) -> Option<(String, String)> {
-    let roaming = store.get(&format!("Node/{me}")).is_some_and(|node| node.spec["roaming"] == true);
-    let heard = |key: &Key| shook.get(key).copied().flatten().is_some_and(|ago| ago < HOME_AFTER);
-    let says = |cluster: &kith_api::Resource| {
-        let holder = cluster.status.as_ref()?["home"]["holder"].as_str()?.to_string();
-        Some((holder, cluster.spec["home"]["endpoint"].as_str()?.to_string()))
-    };
-    let (holder, endpoint) = store.list(Some("Cluster")).find_map(says)?;
+    let roaming = store
+        .get(&format!("Node/{me}"))
+        .is_some_and(|node| node.spec["roaming"] == true);
+    // The Cluster whose house address every node takes (`home::configured_in`), not the first listed.
+    let (key, _) = crate::home::configured_in(store)?;
+    let cluster = store.get(&key)?;
+    let holder = cluster.status.as_ref()?["home"]["holder"].as_str()?;
+    let endpoint = cluster.spec["home"]["endpoint"].as_str()?.to_string();
     let holder = members.iter().find(|member| member.name == holder)?;
-    (roaming && holder.name != me && !heard(&holder.key)).then(|| (holder.name.clone(), endpoint))
+    (roaming && holder.name != me && !shook_lately(shook, &holder.key)).then(|| (holder.name.clone(), endpoint))
+}
+
+/// What the house endpoint resolved to the last time it was looked up (`found`: not yet looked up,
+/// or the lookup's answer), when, how many lookups this endpoint has had, and whether one runs.
+#[derive(Default)]
+struct Lookup {
+    endpoint: String,
+    found: Option<Option<SocketAddr>>,
+    tried: Option<Instant>,
+    lookups: u32,
+    running: bool,
+}
+
+/// The address of the house endpoint, from the last lookup, never waiting for one: a lookup (a
+/// name may take seconds) runs in its own task when none is cached or the cached one is old (a
+/// minute when it resolved, half of that when it did not), and wakes the loop when its answer
+/// differs. The old answer is kept meanwhile. It logs when the outcome changes, not every try.
+fn resolving(cache: &Arc<std::sync::Mutex<Lookup>>, endpoint: &str, wake: &Arc<Notify>) -> Option<SocketAddr> {
+    let mut now = cache.lock().expect("nothing panics holding the lookup");
+    if now.endpoint != endpoint {
+        *now = Lookup {
+            endpoint: endpoint.to_string(),
+            ..Lookup::default()
+        };
+    }
+    let after = Duration::from_secs(if now.found.flatten().is_some() { 60 } else { 30 });
+    if !now.running && now.tried.is_none_or(|tried| tried.elapsed() >= after) {
+        (now.running, now.tried, now.lookups) = (true, Some(Instant::now()), now.lookups + 1);
+        let (cache, wake, endpoint) = (cache.clone(), wake.clone(), endpoint.to_string());
+        tokio::spawn(async move {
+            let found = tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(&endpoint)).await;
+            let at = found.ok().and_then(Result::ok).and_then(|mut found| found.next());
+            let mut now = cache.lock().expect("nothing panics holding the lookup");
+            now.running = false;
+            if now.endpoint != endpoint || now.found == Some(at) {
+                return;
+            }
+            now.found = Some(at);
+            let shown: String = endpoint.chars().filter(|c| !c.is_control()).collect();
+            match at {
+                Some(at) => eprintln!("kithd: mesh: the house endpoint {shown} is {at}"),
+                None => eprintln!("kithd: mesh: the house endpoint {shown} did not resolve"),
+            }
+            wake.notify_one();
+        });
+    }
+    now.found.flatten()
 }
 
 /// Set `field` in the status of Node `node`: what this node says of itself under it, or null to take it back.
@@ -266,6 +311,10 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
     let mut known = BTreeMap::new();
     let mut generation = shared.generation.subscribe();
     let mut warned = false;
+    let (lookup, wake) = (
+        Arc::new(std::sync::Mutex::new(Lookup::default())),
+        Arc::new(Notify::new()),
+    );
     loop {
         let peers = device.peers().unwrap_or_else(|e| {
             eprintln!("kithd: mesh: reading the peers of {}: {e}", options.interface);
@@ -299,14 +348,12 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
             let home = home_endpoint(&state.store, me, &members, &shook);
             (members, mine, said, edge, services.into_values().collect(), home)
         };
-        // (Resolved here, not under the store's lock: the endpoint may be a name.)
-        if let Some((holder, endpoint)) = home {
-            let found = tokio::time::timeout(Duration::from_secs(3), tokio::net::lookup_host(&endpoint)).await;
-            let at = found.ok().and_then(Result::ok).and_then(|mut found| found.next());
-            match (at, members.iter_mut().find(|member| member.name == holder)) {
-                (Some(at), Some(member)) => member.endpoint = Some(at),
-                _ => eprintln!("kithd: mesh: the house endpoint {endpoint} did not resolve"),
-            }
+        // (Resolved beside the loop, not here: the endpoint may be a name. Until it is, the holder is called where it was.)
+        if let Some((holder, endpoint)) = home
+            && let Some(at) = resolving(&lookup, &endpoint, &wake)
+            && let Some(member) = members.iter_mut().find(|member| member.name == holder)
+        {
+            member.endpoint = Some(at);
         }
         // Every node has every Service's address (crate::services listens on them).
         if let Err(e) = device.set_addresses(&services) {
@@ -343,6 +390,7 @@ pub async fn run(shared: Arc<Shared>, options: Options, mut stopping: watch::Rec
         *shared.mesh.lock().expect("nothing panics holding the mesh") = paths.into();
         tokio::select! {
             _ = generation.changed() => {}
+            () = wake.notified() => {}
             () = tokio::time::sleep(Duration::from_secs(10)) => {}
             _ = stopping.changed() => break,
         }
@@ -484,10 +532,11 @@ mod tests {
         assert_eq!(known.len(), 1);
     }
 
-    /// A roaming node unheard by the house's holder for 30 s calls it at the house endpoint, and
-    /// no one else: not a node that stays put, not a holder heard lately, not another peer.
+    /// A roaming node unheard by the house's holder for as long as a peer is called silent (QUIET)
+    /// calls it at the house endpoint, and no one else: not a node that stays put, not a holder
+    /// heard lately, not another peer.
     #[test]
-    fn home_endpoint_goes_to_the_holder_of_a_roaming_node_unheard_for_30_s() {
+    fn home_endpoint_goes_to_the_holder_of_a_roaming_node_unheard_for_quiet() {
         let mut store = Store::default();
         let source = |kind: &str, name: &str, spec: &str| {
             format!("apiVersion: kith.dev/v1\nkind: {kind}\nmetadata: {{ name: {name} }}\nspec: {spec}\n")
@@ -496,18 +545,34 @@ mod tests {
             source("Node", "a", "{ roaming: true }"),
             source("Node", "b", "{}"),
             source("Node", "c", "{}"),
-            source("Cluster", "house", "{ home: { address: 10.9.0.100/24, endpoint: \"203.0.113.7:51820\" } }"),
+            source(
+                "Cluster",
+                "house",
+                "{ home: { address: 10.9.0.100/24, endpoint: \"203.0.113.7:51820\" } }",
+            ),
         ];
         for text in sources {
-            store.apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()).unwrap();
+            store
+                .apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap())
+                .unwrap();
         }
         for (byte, name) in [(1, "a"), (2, "b"), (3, "c")] {
             let mesh = json!({ "key": hex(&[byte; 32]), "port": 51820 });
-            store.set_status(&format!("Node/{name}"), Some(json!({ "address": "10.0.0.1:7443", "mesh": mesh }))).unwrap();
+            store
+                .set_status(
+                    &format!("Node/{name}"),
+                    Some(json!({ "address": "10.0.0.1:7443", "mesh": mesh })),
+                )
+                .unwrap();
         }
         let holds = |store: &Store, holder: &str| {
             let mut store = store.clone();
-            store.set_status("Cluster/house", Some(json!({ "home": { "holder": holder, "since": "2026-01-01T00:00:00Z" } }))).unwrap();
+            store
+                .set_status(
+                    "Cluster/house",
+                    Some(json!({ "home": { "holder": holder, "since": "2026-01-01T00:00:00Z" } })),
+                )
+                .unwrap();
             store
         };
         let start = Instant::now();
@@ -520,21 +585,98 @@ mod tests {
         // No one holds it yet: nothing to call.
         assert_eq!(got(&store, "a", &none), None);
         let store = holds(&store, "b");
-        // Never heard, or heard 30 s ago: call the holder at the house endpoint.
+        // Never heard, or not for as long as a silent peer is (QUIET): call the holder at the house endpoint.
         assert_eq!(got(&store, "a", &none), at);
         assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], None)])), at);
-        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(HOME_AFTER))])), at);
-        // Heard lately: it keeps the address it called from. Another peer's silence is not the holder's.
-        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(Duration::from_secs(29)))])), None);
-        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(HOME_AFTER)), ([3; 32], Some(Duration::ZERO))])), at);
+        assert_eq!(got(&store, "a", &BTreeMap::from([([2; 32], Some(QUIET))])), at);
+        // Heard lately (a healthy tunnel shakes hands about every two minutes): it keeps the
+        // address it called from. Another peer's silence is not the holder's.
+        assert_eq!(
+            got(
+                &store,
+                "a",
+                &BTreeMap::from([([2; 32], Some(Duration::from_secs(120)))])
+            ),
+            None
+        );
+        assert_eq!(
+            got(
+                &store,
+                "a",
+                &BTreeMap::from([([2; 32], Some(QUIET - Duration::from_secs(1)))])
+            ),
+            None
+        );
+        assert_eq!(
+            got(
+                &store,
+                "a",
+                &BTreeMap::from([([2; 32], Some(QUIET)), ([3; 32], Some(Duration::ZERO))])
+            ),
+            at
+        );
+        // Two Clusters with a house: the one home.rs holds (the lowest address) is the one asked.
+        let mut two = store.clone();
+        let other = source(
+            "Cluster",
+            "aaa",
+            "{ home: { address: 10.9.0.200/24, endpoint: \"198.51.100.1:1\" } }",
+        );
+        two.apply(kith_api::Resource::from_source(&other).unwrap().remove(0).unwrap())
+            .unwrap();
+        two.set_status(
+            "Cluster/aaa",
+            Some(json!({ "home": { "holder": "b", "since": "2026-01-01T00:00:00Z" } })),
+        )
+        .unwrap();
+        assert_eq!(got(&two, "a", &none), at);
         // Only a node that roams (b and c stay put) and never the holder itself.
         assert_eq!(got(&store, "c", &none), None);
         assert_eq!(got(&holds(&store, "a"), "a", &none), None);
         // A Cluster that gives no endpoint gives none.
         let mut bare = store.clone();
         let text = source("Cluster", "house", "{ home: { address: 10.9.0.100/24 } }");
-        bare.apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap()).unwrap();
+        bare.apply(kith_api::Resource::from_source(&text).unwrap().remove(0).unwrap())
+            .unwrap();
         assert_eq!(got(&bare, "a", &none), None);
+    }
+
+    /// The house endpoint is resolved beside the loop: a pass is never held for it (the first answer
+    /// is nothing, and the loop is woken when the lookup is done), a settled answer is kept, and a
+    /// name that does not resolve is not looked up again until its backoff is over.
+    #[tokio::test]
+    async fn home_endpoint_is_resolved_beside_the_loop_and_a_failure_waits_its_backoff() {
+        let (cache, wake) = (
+            Arc::new(std::sync::Mutex::new(Lookup::default())),
+            Arc::new(Notify::new()),
+        );
+        let started = Instant::now();
+        assert_eq!(resolving(&cache, "127.0.0.1:51820", &wake), None);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the first call does not wait for the lookup"
+        );
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("the loop is woken");
+        let at: SocketAddr = "127.0.0.1:51820".parse().unwrap();
+        assert_eq!(resolving(&cache, "127.0.0.1:51820", &wake), Some(at));
+        assert_eq!(
+            cache.lock().unwrap().lookups,
+            1,
+            "a settled answer is not looked up again at once"
+        );
+        // A name that does not resolve: one lookup, then the backoff holds the next.
+        assert_eq!(resolving(&cache, "nowhere.invalid:1", &wake), None);
+        tokio::time::timeout(Duration::from_secs(5), wake.notified())
+            .await
+            .expect("a failure wakes it too");
+        assert_eq!(resolving(&cache, "nowhere.invalid:1", &wake), None);
+        assert_eq!(
+            cache.lock().unwrap().lookups,
+            1,
+            "the backoff holds the retry (a new endpoint starts the count)"
+        );
     }
 
     /// Two Nodes that say one key (one copied the other): the earlier-named one stays a member

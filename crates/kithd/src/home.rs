@@ -281,7 +281,7 @@ pub fn configured(store: &kith_api::store::Store) -> Option<Home> {
 }
 
 /// [`configured`], and the key of the Cluster that says it.
-fn configured_in(store: &kith_api::store::Store) -> Option<(String, Home)> {
+pub(crate) fn configured_in(store: &kith_api::store::Store) -> Option<(String, Home)> {
     let said = store.list(Some("Cluster")).filter_map(|cluster| {
         let home = cluster.spec["home"]["address"].as_str().and_then(Home::parse)?;
         Some((cluster.key(), home))
@@ -291,7 +291,8 @@ fn configured_in(store: &kith_api::store::Store) -> Option<(String, Home)> {
 
 /// Say in the Cluster that `me` holds the house address, since now, unless it says so already:
 /// the next holder writes it over, and a holder that is told it is not (a write that lost its
-/// turn to another's) says it again. A kithd that is not the leader sends the write on.
+/// turn to another's) says it again. Only the leader runs this: its write is local, so it never
+/// passes the default-deny list a follower's forwarded write does (`own_writes`).
 async fn keep_told(shared: &crate::Shared, me: &str) -> Result<(), String> {
     let key = {
         let state = shared.store.lock().expect("nothing panics holding the store");
@@ -537,7 +538,10 @@ pub async fn run(shared: std::sync::Arc<crate::Shared>, mut stopping: tokio::syn
                     let told = told.unwrap_or_else(|_| Err(format!("no answer in {} ms", CONFIRM_EVERY.as_millis())));
                     match told {
                         Ok(()) => told_said.clear(),
-                        Err(e) => say(&mut told_said, format!("saying in the Cluster that this node holds the house address: {e}")),
+                        Err(e) => say(
+                            &mut told_said,
+                            format!("saying in the Cluster that this node holds the house address: {e}"),
+                        ),
                     }
                 }
             }
@@ -964,7 +968,8 @@ mod tests {
             .current_leader(id, "leads")
             .await
             .unwrap();
-        let cluster = "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {name: house}\nspec: {home: {address: 10.9.0.100/24}}\n";
+        let cluster =
+            "apiVersion: kith.dev/v1\nkind: Cluster\nmetadata: {name: house}\nspec: {home: {address: 10.9.0.100/24}}\n";
         let cluster = kith_api::Resource::from_source(cluster).unwrap().remove(0).unwrap();
         shared.store.lock().unwrap().store.apply(cluster).unwrap();
         let says = || {
@@ -976,7 +981,10 @@ mod tests {
         keep_told(&shared, "hs-a").await.unwrap();
         let first = says().unwrap()["home"].clone();
         assert_eq!(first["holder"], "hs-a");
-        assert!(first["since"].as_str().is_some_and(|since| since.ends_with('Z')), "{first}");
+        assert!(
+            first["since"].as_str().is_some_and(|since| since.ends_with('Z')),
+            "{first}"
+        );
         // Told already: not written again (the same since).
         keep_told(&shared, "hs-a").await.unwrap();
         assert_eq!(says().unwrap()["home"], first);

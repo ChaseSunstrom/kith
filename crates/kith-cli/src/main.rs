@@ -2556,7 +2556,10 @@ mod drain_tests {
         );
         // Not held yet, and no endpoint: it says so, and no more.
         let bare = json!({ "home": { "address": "192.168.1.250/24" } });
-        assert_eq!(table_row(&cluster(bare, None))[4], "house 192.168.1.250/24, held by no one yet");
+        assert_eq!(
+            table_row(&cluster(bare, None))[4],
+            "house 192.168.1.250/24, held by no one yet"
+        );
         // A Cluster with no house says nothing here.
         assert_eq!(table_row(&cluster(json!({}), None))[4], "");
         // What a node writes there cannot drive the terminal.

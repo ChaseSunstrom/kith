@@ -1,6 +1,7 @@
 //! What a control node may write as itself (`raft.rs` `write`, a write that names no caller):
 //! its own Node's status, its units' status, the Devices, Blobs, NodeKey and Volume syncs it
-//! holds, and a Cluster's `status.home` when it holds the house address (`home.rs`). Default-deny: a kind that is not in [`CLASSES`] is refused, and a refusal is audited
+//! holds. (A Cluster's `status.home` is the leader's, written locally, never through here.)
+//! Default-deny: a kind that is not in [`CLASSES`] is refused, and a refusal is audited
 //! by the node's name and said on the console (`refused a control node's own write`).
 
 use crate::worker::{self, Worker};
@@ -88,28 +89,6 @@ fn own_node(store: &Store, name: &str, key: &str, fields: &Fields) -> Result<(),
         }
     }
     worker::mesh_key_elsewhere(store, name, key, fields)
-}
-
-/// The one write of a Cluster's a control node makes as itself: the holder of the house address
-/// (`home.rs`) says `status.home` {holder: itself, since}, in a Cluster that has a house address,
-/// and nothing else. The next holder writes it over.
-fn cluster_home(store: &Store, name: &str, key: &str, fields: &Fields) -> Result<(), String> {
-    let has_home = store
-        .get(key)
-        .is_some_and(|cluster| cluster.spec["home"]["address"].is_string());
-    let home = fields.get("home").and_then(Value::as_object);
-    let says = home.is_some_and(|home| {
-        home.len() == 2
-            && home.get("holder").and_then(Value::as_str) == Some(name)
-            && home.get("since").and_then(Value::as_str).is_some_and(|since| since.len() <= 32)
-    });
-    match fields.len() == 1 && has_home && says {
-        true => Ok(()),
-        false => Err(refused(
-            key,
-            "a control node says of a Cluster only that it holds the house address (status.home: holder itself, since)",
-        )),
-    }
 }
 
 /// A Node's raft id, if it says one, is the one its name gives (`kith_store::node_id`).
@@ -217,8 +196,6 @@ pub fn checked(shared: &crate::Shared, name: &str, command: Command) -> Result<C
                     own_node(store, name, key, fields)?;
                 } else if let Some(joined) = key.strip_prefix("Node/") {
                     registers(store, &who, joined, key, fields)?;
-                } else if kind_of(key) == "Cluster" {
-                    cluster_home(store, name, key, fields)?;
                 } else {
                     class(kind_of(key))?;
                     worker::patch(store, &who, key, fields)?;
@@ -631,11 +608,11 @@ mod tests {
         );
     }
 
-    /// The holder of the house address says so in the Cluster's status as itself, and a control
-    /// node writes nothing else of a Cluster: not another node as holder, not another field, not
-    /// a Cluster with no house address, not its spec.
+    /// The holder of the house address is the leader, and its own writes never come through here
+    /// (they are not forwarded): a write of a Cluster that is forwarded, status.home as the
+    /// holder's own included, is a taken control node's and is refused.
     #[tokio::test]
-    async fn own_writes_home_status_lets_the_holder_say_it_and_refuses_the_rest() {
+    async fn own_writes_refuse_a_forwarded_home_status_and_every_other_write_of_a_cluster() {
         let ca = pki::Ca::create().unwrap();
         let shared: Arc<Shared> = shared_with("own-home", node(&ca, "home-c"), &[]).await;
         for (name, spec) in [("house", "{home: {address: 10.9.0.100/24}}"), ("bare", "{}")] {
@@ -648,14 +625,23 @@ mod tests {
         };
         let since = "2026-11-18T10:00:00Z";
         let holder = |who: &str| serde_json::json!({ "home": { "holder": who, "since": since } });
-        assert!(checked(&shared, "home-c", patch("Cluster/house", holder("home-c"))).is_ok());
         let refused = [
+            patch("Cluster/house", holder("home-c")),
             patch("Cluster/house", holder("home-o")),
             patch("Cluster/bare", holder("home-c")),
             patch("Cluster/house", serde_json::json!({ "home": { "holder": "home-c" } })),
-            patch("Cluster/house", serde_json::json!({ "home": { "holder": "home-c", "since": 5 } })),
-            patch("Cluster/house", serde_json::json!({ "home": { "holder": "home-c", "since": since, "x": 1 } })),
-            patch("Cluster/house", serde_json::json!({ "home": holder("home-c")["home"], "signing": "open" })),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": { "holder": "home-c", "since": 5 } }),
+            ),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": { "holder": "home-c", "since": since, "x": 1 } }),
+            ),
+            patch(
+                "Cluster/house",
+                serde_json::json!({ "home": holder("home-c")["home"], "signing": "open" }),
+            ),
             patch("Cluster/house", serde_json::json!({ "adminKey": "x" })),
             Command::Status {
                 statuses: vec![("Cluster/house".into(), Some(holder("home-c")))],

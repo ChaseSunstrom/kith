@@ -323,11 +323,14 @@ addresses still.
 house address, the endpoint, the holder and since when; the next holder replaces it). To let a
 roaming laptop in, forward UDP 51820 (the mesh port) on the router to the house address, and
 point `endpoint` at the router's public name or address with that port. A laptop (`--roaming`)
-that has not shaken hands with the holder for 30 seconds calls the holder at `endpoint`; it does
+that has not shaken hands with the holder for three minutes (as long as any peer is called
+silent; a healthy tunnel shakes hands about every two) calls the holder at `endpoint`; it does
 not give it to any other node, and a node that calls it from somewhere keeps that address, so
 inside the house the laptop is reached where it is. When the leader moves, the forward still
-lands on the new holder, as the address moved with it. A name in `endpoint` is looked up each
-time it is used (kithd logs when it does not resolve).
+lands on the new holder, as the address moved with it. A name in `endpoint` is looked up beside
+the mesh's loop, never holding it: until the first answer the holder is called where it was, the
+answer is kept and looked up again each minute (each half minute while it does not resolve), and
+kithd logs when it starts or stops resolving, not on each try.
 
 ### Not yet
 
