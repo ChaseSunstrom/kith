@@ -683,6 +683,58 @@ fn workflows_kubectl_by_hand() {
 }
 
 #[test]
+fn workflows_json_patch_by_kubectl() {
+    let Some(cluster) = Cluster::start("kube-json-patch") else {
+        return;
+    };
+    cluster.write("web.yaml", WEB);
+    cluster.ok(&["apply", "-f", "web.yaml"]);
+    // Replicas and the image in one patch: each is the kith Workload's change.
+    let ops = r#"[{"op":"replace","path":"/spec/replicas","value":3},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"docker.io/library/nginx:1.27-alpine"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", ops]);
+    let held = cluster.held("workload/web");
+    assert_eq!(held["spec"]["replicas"], 3, "{held}");
+    assert_eq!(
+        held["spec"]["template"]["containers"][0]["image"],
+        "docker.io/library/nginx:1.27-alpine"
+    );
+
+    // A test that is not so refuses the whole patch (422), and what is there stays as it was.
+    // (Its spec, not all of it: the status of the containers is what runs, and moves on its own.)
+    let before = cluster.held("workload/web")["spec"].clone();
+    let stale =
+        r#"[{"op":"test","path":"/spec/replicas","value":2},{"op":"replace","path":"/spec/replicas","value":5}]"#;
+    cluster.refused(
+        &["patch", "deployment", "web", "--type", "json", "-p", stale],
+        &["test /spec/replicas: the value is not the one given"],
+    );
+    assert_eq!(cluster.held("workload/web")["spec"], before);
+
+    // A replace of a path that is not there is refused, not made.
+    let missing = r#"[{"op":"replace","path":"/spec/nope","value":1}]"#;
+    cluster.refused(
+        &["patch", "deployment", "web", "--type", "json", "-p", missing],
+        &["/spec/nope: the path is not there"],
+    );
+    assert_eq!(cluster.held("workload/web")["spec"], before);
+
+    // A label added, and removed again, as kubectl sees it.
+    let add = r#"[{"op":"add","path":"/metadata/labels/tier","value":"front"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", add]);
+    assert_eq!(
+        cluster.got(&["deployment", "web"])["metadata"]["labels"]["tier"],
+        "front"
+    );
+    let remove = r#"[{"op":"remove","path":"/metadata/labels/tier"}]"#;
+    cluster.ok(&["patch", "deployment", "web", "--type", "json", "-p", remove]);
+    assert!(
+        cluster.got(&["deployment", "web"])["metadata"]["labels"]
+            .get("tier")
+            .is_none()
+    );
+}
+
+#[test]
 fn workflows_helm() {
     for (n, helm) in helms().iter().enumerate() {
         let Some(cluster) = Cluster::start(&format!("kube-helm-{n}")) else {

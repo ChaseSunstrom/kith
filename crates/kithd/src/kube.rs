@@ -1369,6 +1369,171 @@ fn merged(have: &mut Value, items: Vec<Value>, by: &str) {
     }
 }
 
+/// The most operations a JSON patch has, and the most values its copies make in all: a copy of
+/// a whole document doubles it, so the copies are what is bounded.
+// ponytail: one budget for the whole patch; per-copy limits if a real patch ever meets these.
+const PATCH_OPS: usize = 256;
+const PATCH_COPIES: usize = 1 << 16;
+
+/// RFC 6902's operations applied in order to a copy of `live`, which is what comes back. One
+/// that fails (a `test` not so, a path not there, a pointer not written as one) refuses the
+/// whole patch, and `live` is not changed: the caller writes nothing then.
+fn json_patch(live: &Value, ops: &Value) -> Result<Value, String> {
+    let Value::Array(ops) = ops else {
+        return Err("the patch is a list of operations, each { op, path, ... }".into());
+    };
+    if ops.len() > PATCH_OPS {
+        return Err(format!("a patch has at most {PATCH_OPS} operations"));
+    }
+    let mut doc = live.clone();
+    let mut copied = 0;
+    for op in ops {
+        let kind = op.get("op").and_then(Value::as_str).ok_or("an operation has no op")?;
+        let pointer = op
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{kind}: needs a path"))?;
+        let value = || {
+            op.get("value")
+                .cloned()
+                .ok_or_else(|| format!("{kind} {pointer}: needs a value"))
+        };
+        let source = || {
+            op.get("from")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{kind} {pointer}: needs a from"))
+        };
+        match kind {
+            "add" => insert(&mut doc, pointer, value()?)?,
+            "replace" => {
+                let value = value()?;
+                *find(&mut doc, pointer)? = value;
+            }
+            "remove" => drop(take(&mut doc, pointer)?),
+            "test" => {
+                let want = value()?;
+                if *find(&mut doc, pointer)? != want {
+                    return Err(format!("test {pointer}: the value is not the one given"));
+                }
+            }
+            "copy" => {
+                let made = find(&mut doc, source()?)?;
+                copied += weight(made);
+                if copied > PATCH_COPIES {
+                    return Err(format!(
+                        "copy {pointer}: the copies make more than {PATCH_COPIES} values"
+                    ));
+                }
+                let made = made.clone();
+                insert(&mut doc, pointer, made)?;
+            }
+            "move" => {
+                let from = source()?;
+                // (A value is not moved into itself: `from` is not a proper prefix of `pointer`.)
+                if pointer.len() > from.len() && pointer.starts_with(from) && pointer[from.len()..].starts_with('/') {
+                    return Err(format!("move {pointer}: {from} is above it"));
+                }
+                let moved = take(&mut doc, from)?;
+                insert(&mut doc, pointer, moved)?;
+            }
+            other => return Err(format!("{other}: not one of add, remove, replace, move, copy, test")),
+        }
+    }
+    Ok(doc)
+}
+
+/// The steps of an RFC 6901 pointer: `""` is the whole document, `/a/0` is `a` then `0`, and a
+/// `~` in a step is `~0` or `~1`, nothing else.
+fn tokens(pointer: &str) -> Result<Vec<String>, String> {
+    if pointer.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return Err(format!("{pointer}: a path starts with /"));
+    };
+    rest.split('/')
+        .map(|step| {
+            if !step.split('~').skip(1).all(|after| after.starts_with(['0', '1'])) {
+                return Err(format!("{pointer}: a ~ is written ~0 or ~1"));
+            }
+            Ok(step.replace("~1", "/").replace("~0", "~"))
+        })
+        .collect()
+}
+
+/// An index of a list as RFC 6901 writes one: digits, with no leading zero (`-` is not one).
+fn index(step: &str, pointer: &str) -> Result<usize, String> {
+    let digits =
+        !step.is_empty() && step.bytes().all(|b| b.is_ascii_digit()) && !(step.len() > 1 && step.starts_with('0'));
+    digits
+        .then(|| step.parse::<usize>().ok())
+        .flatten()
+        .ok_or_else(|| format!("{pointer}: {step} is not an index"))
+}
+
+/// The place `pointer` names in `doc`, which must be there.
+fn find<'a>(doc: &'a mut Value, pointer: &str) -> Result<&'a mut Value, String> {
+    let mut at = doc;
+    for step in tokens(pointer)? {
+        let next = match at {
+            Value::Object(map) => map.get_mut(&step),
+            Value::Array(items) => items.get_mut(index(&step, pointer)?),
+            _ => None,
+        };
+        at = next.ok_or_else(|| format!("{pointer}: the path is not there"))?;
+    }
+    Ok(at)
+}
+
+/// Puts `value` at `pointer`: a key of a mapping (made if it is not there), or an index of a
+/// list where `-` is its end. The parent must be there; the root is replaced whole.
+fn insert(doc: &mut Value, pointer: &str, value: Value) -> Result<(), String> {
+    let Some(last) = tokens(pointer)?.pop() else {
+        *doc = value;
+        return Ok(());
+    };
+    let parent = find(doc, &pointer[..pointer.rfind('/').unwrap_or(0)])?;
+    match parent {
+        Value::Object(map) => drop(map.insert(last, value)),
+        Value::Array(items) if last == "-" => items.push(value),
+        Value::Array(items) => {
+            let at = index(&last, pointer)?;
+            if at > items.len() {
+                return Err(format!("add {pointer}: the index is past the end"));
+            }
+            items.insert(at, value);
+        }
+        _ => return Err(format!("add {pointer}: the parent is not a list or a mapping")),
+    }
+    Ok(())
+}
+
+/// Takes out what `pointer` names, which must be there, and says what it was.
+fn take(doc: &mut Value, pointer: &str) -> Result<Value, String> {
+    let Some(last) = tokens(pointer)?.pop() else {
+        return Err("the whole document cannot be removed".into());
+    };
+    let parent = find(doc, &pointer[..pointer.rfind('/').unwrap_or(0)])?;
+    let gone = match parent {
+        Value::Object(map) => map.remove(&last),
+        Value::Array(items) => {
+            let at = index(&last, pointer)?;
+            (at < items.len()).then(|| items.remove(at))
+        }
+        _ => None,
+    };
+    gone.ok_or_else(|| format!("{pointer}: the path is not there"))
+}
+
+/// How many values a JSON value is, itself counted: what a copy of it makes.
+fn weight(value: &Value) -> usize {
+    1 + match value {
+        Value::Array(items) => items.iter().map(weight).sum(),
+        Value::Object(map) => map.values().map(weight).sum(),
+        _ => 0,
+    }
+}
+
 // ---- Who set which field: server-side apply ----
 
 /// A field's place in an object, a step at a time as Kubernetes's `fieldsV1` spells it:
@@ -1707,6 +1872,8 @@ enum How {
     Patch {
         strategic: bool,
     },
+    /// An RFC 6902 list of operations, applied to what is there (`kubectl patch --type json`).
+    JsonPatch,
     /// A server-side apply: what is sent is the object, made if it is not there.
     Apply,
 }
@@ -1827,10 +1994,11 @@ async fn serve(
             let how = match said(header::CONTENT_TYPE).split(';').next().unwrap_or_default().trim() {
                 "application/strategic-merge-patch+json" => How::Patch { strategic: true },
                 "application/merge-patch+json" => How::Patch { strategic: false },
+                "application/json-patch+json" => How::JsonPatch,
                 "application/apply-patch+yaml" => How::Apply,
                 other => {
                     let why = format!(
-                        "a patch as {other} is not read: send a merge patch, a strategic merge patch or an apply"
+                        "a patch as {other} is not read: send a merge patch, a strategic merge patch, a JSON patch or an apply"
                     );
                     return Err(status(StatusCode::UNSUPPORTED_MEDIA_TYPE, "UnsupportedMediaType", why));
                 }
@@ -2177,7 +2345,7 @@ async fn write(
     // Who may not write here is told that, and nothing of what is there; and a change
     // of what is there (a patch is answered with all of it) is for who may read it.
     call.allowed(kind, namespace, Verb::Apply)?;
-    if matches!(how, How::Patch { .. }) {
+    if matches!(how, How::Patch { .. } | How::JsonPatch) {
         call.allowed(kind, namespace, Verb::Get)?;
     }
     let primary = key(kind, namespace, &name);
@@ -2245,6 +2413,8 @@ async fn write(
                 patched(&mut before, body, strategic);
                 before
             }
+            // A refused operation refuses the whole patch: what is there is not written.
+            (How::JsonPatch, Some((_, before))) => json_patch(&before, &body).map_err(invalid)?,
         };
         // A change of what was read is held to it: the revision, whatever its status did since.
         let based = sent.pointer("/metadata/resourceVersion").and_then(Value::as_str);
@@ -2297,7 +2467,7 @@ async fn write(
                 let force = call.asked.get("force").is_some_and(|force| force == "true");
                 sent = apply(was, sent, manager, &version_of(kind.group), force)?;
             }
-            (How::Replace | How::Patch { .. }, Some(was)) => updated(&was, &mut sent),
+            (How::Replace | How::Patch { .. } | How::JsonPatch, Some(was)) => updated(&was, &mut sent),
             _ => {}
         }
         held_as(&state.store, kind, place, &name, &sent).map(|held| (held, revision))
@@ -2922,6 +3092,109 @@ spec: {role: writer, subjects: [carol]}
             patched(&mut live.clone(), odd.clone(), true);
             patched(&mut json!(7), odd, true);
         }
+    }
+
+    /// RFC 6902's six operations, in order, over a document: each as the RFC says it works,
+    /// and a pointer's escapes (`~1` for a `/` in a key, `~0` for a `~`).
+    #[test]
+    fn json_patch_applies_the_six_operations_in_order() {
+        let live = json!({ "spec": { "replicas": 2, "tags": ["a", "b"] }, "metadata": { "labels": { "app": "web" } } });
+        let ops = json!([
+            { "op": "add", "path": "/metadata/labels/tier", "value": "front" },
+            { "op": "replace", "path": "/spec/replicas", "value": 3 },
+            { "op": "test", "path": "/metadata/labels/app", "value": "web" },
+            { "op": "copy", "from": "/spec/replicas", "path": "/spec/copied" },
+            { "op": "move", "from": "/spec/tags/0", "path": "/spec/tags/-" },
+            { "op": "remove", "path": "/metadata/labels/app" },
+            { "op": "add", "path": "/spec/tags/0", "value": "first" },
+        ]);
+        let want = json!({
+            "spec": { "replicas": 3, "copied": 3, "tags": ["first", "b", "a"] },
+            "metadata": { "labels": { "tier": "front" } },
+        });
+        assert_eq!(json_patch(&live, &ops), Ok(want));
+        let escaped = json!([
+            { "op": "add", "path": "/a~1b~0c", "value": 1 },
+            { "op": "test", "path": "/a~1b~0c", "value": 1 },
+        ]);
+        assert_eq!(json_patch(&json!({}), &escaped), Ok(json!({ "a/b~c": 1 })));
+        let whole = json!([{ "op": "replace", "path": "", "value": { "whole": true } }]);
+        assert_eq!(json_patch(&live, &whole), Ok(json!({ "whole": true })));
+    }
+
+    /// Each way a patch can fail is named, and a patch with one in it is refused whole: what
+    /// its earlier operations did is not kept, and nothing is added where a path is not there.
+    #[test]
+    fn json_patch_refuses_each_way_it_can_fail_and_changes_nothing() {
+        let live = json!({ "spec": { "replicas": 2, "tags": ["a"] } });
+        let refused = [
+            (
+                json!([{ "op": "test", "path": "/spec/replicas", "value": 9 }]),
+                "test /spec/replicas",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/nope", "value": 1 }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "remove", "path": "/spec/nope" }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "add", "path": "/spec/nope/deeper", "value": 1 }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "add", "path": "/spec/tags/9", "value": 1 }]),
+                "/spec/tags/9: the index is past the end",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/tags/-", "value": 1 }]),
+                "/spec/tags/-: - is not an index",
+            ),
+            (
+                json!([{ "op": "copy", "from": "/spec/nope", "path": "/x" }]),
+                "/spec/nope: the path is not there",
+            ),
+            (
+                json!([{ "op": "move", "from": "/spec", "path": "/spec/inside" }]),
+                "/spec is above it",
+            ),
+            (
+                json!([{ "op": "add", "path": "spec", "value": 1 }]),
+                "spec: a path starts with /",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/~2", "value": 1 }]),
+                "/spec/~2: a ~ is written ~0 or ~1",
+            ),
+            (
+                json!([{ "op": "replace", "path": "/spec/replicas" }]),
+                "replace /spec/replicas: needs a value",
+            ),
+            (json!([{ "op": "move", "path": "/x" }]), "move /x: needs a from"),
+            (json!([{ "op": "twist", "path": "/x" }]), "twist: not one of"),
+            (json!([{ "path": "/x" }]), "an operation has no op"),
+            (json!({ "op": "test", "path": "" }), "the patch is a list"),
+            (
+                json!([{ "op": "replace", "path": "/spec/replicas", "value": 3 }, { "op": "test", "path": "/spec/replicas", "value": 2 }]),
+                "test /spec/replicas",
+            ),
+        ];
+        for (ops, why) in refused {
+            let got = json_patch(&live, &ops);
+            assert!(got.as_ref().is_err_and(|e| e.contains(why)), "{ops}: {got:?}");
+        }
+        // A patch of too many operations, and copies that would double a document again and again.
+        let many = Value::Array(vec![
+            json!({ "op": "test", "path": "/spec/replicas", "value": 2 });
+            PATCH_OPS + 1
+        ]);
+        assert!(json_patch(&live, &many).is_err_and(|e| e.contains("operations")));
+        let doubling: Vec<Value> = (0..24)
+            .map(|n| json!({ "op": "copy", "from": "", "path": format!("/k{n}") }))
+            .collect();
+        assert!(json_patch(&live, &Value::Array(doubling)).is_err_and(|e| e.contains("copies")));
     }
 
     #[test]
