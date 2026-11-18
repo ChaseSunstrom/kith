@@ -46,6 +46,23 @@ spec:
 - Not yet: `subvolume: true` makes a plain directory; `size` is no quota; an `exec` unit and a
   NodeWorkload mount nothing.
 
+### A claim for each replica
+
+A mount with `perReplica: true` names the *base* of a claim, and replica `i` mounts the claim
+(or Volume) `<volume>-<i>`: the claim of a StatefulSet's `volumeClaimTemplates`, which the
+Kubernetes layer makes for each replica (`data-db-0`, `data-db-1`, ...).
+
+```yaml
+volumeMounts: [{ volume: data-db, perReplica: true, path: /var/lib/db }]
+```
+
+- Each replica is placed on the node of its own Volume, so three replicas can be on three nodes.
+  A plain mount beside it still puts all of them on its one node.
+- A replica whose claim has no Volume, or whose Volume's node is gone, waits (`unschedulable`
+  says why) and is never started on an empty directory elsewhere. The others go on.
+- Scaling down removes no claim and no data; scaling up again finds them. Deleting a claim is
+  what removes its Volume, as above. Moving a Volume's data to another node is not done.
+
 ### Shared volumes
 
 `shared: true` on a Volume lets a workload that mounts it run on any node:

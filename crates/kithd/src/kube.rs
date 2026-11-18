@@ -2065,11 +2065,17 @@ fn held_as(
     resources.extend(taken.resources);
     // A StatefulSet's claims are objects of their own in Kubernetes: each is shown as its template says.
     for template in sent["spec"]["volumeClaimTemplates"].as_array().into_iter().flatten() {
-        let claim = format!("{}-{name}-0", template["metadata"]["name"].as_str().unwrap_or_default());
-        let held = resources
-            .iter_mut()
-            .find(|held| held.kind == "VolumeClaim" && held.metadata.name == claim);
-        if let Some(held) = held.filter(|held| !held.metadata.annotations.contains_key(SENT)) {
+        // (One for each replica: TEMPLATE-NAME-ORDINAL.)
+        let base = format!("{}-{name}-", template["metadata"]["name"].as_str().unwrap_or_default());
+        let each = |held: &Resource| {
+            let ordinal = held.metadata.name.strip_prefix(&base);
+            held.kind == "VolumeClaim" && ordinal.is_some_and(|n| n.parse::<u32>().is_ok())
+        };
+        for held in resources.iter_mut().filter(|held| each(held)) {
+            if held.metadata.annotations.contains_key(SENT) {
+                continue;
+            }
+            let claim = held.metadata.name.clone();
             let mut object = json!({
                 "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                 "metadata": { "name": claim, "namespace": place }, "spec": template["spec"],

@@ -35,6 +35,7 @@
 {"u":"guide/workloads.html#a-pod-behind-a-vpn-exit","t":"What kithd does today","h":"A pod behind a VPN exit"},
 {"u":"guide/workloads.html#what-a-container-is-given","t":"What kithd does today","h":"What a container is given"},
 {"u":"guide/storage.html","t":"Storage","h":""},
+{"u":"guide/storage.html#a-claim-for-each-replica","t":"Storage","h":"A claim for each replica"},
 {"u":"guide/storage.html#shared-volumes","t":"Storage","h":"Shared volumes"},
 {"u":"guide/storage.html#shares-a-volume-for-machines-that-are-not-nodes","t":"Storage","h":"Shares: a volume for machines that are not nodes"},
 {"u":"guide/storage.html#replicas","t":"Storage","h":"Replicas"},

@@ -14,6 +14,10 @@ use std::collections::BTreeMap;
 type Map = serde_json::Map<String, Value>;
 type Strings = BTreeMap<String, String>;
 
+/// What a Workload may have of replicas (`kith-api` refuses more): and of a StatefulSet's
+/// claims, which would otherwise be as many as a number in a manifest says.
+const MAX_REPLICAS: u32 = 1000;
+
 /// Every document of a source as JSON; a document that cannot be read is an error.
 pub fn documents(name: &str, src: &str) -> Result<Vec<Value>, String> {
     let nodes = kith_yaml::parse(src).map_err(|e| e.render(name, src))?;
@@ -863,6 +867,8 @@ fn probe(cx: &mut Cx, container: &mut Map, key: &str, at: &str) -> Option<Value>
 /// What a volume of a pod is.
 enum Vol {
     Claim(String),
+    /// A StatefulSet's claim template: each replica's claim is this name and `-ORDINAL`.
+    Each(String),
     /// A ConfigMap's or (`secret`) a Secret's keys as files.
     Files {
         secret: bool,
@@ -1065,6 +1071,13 @@ fn container(cx: &mut Cx, mut c: Map, at: &str, list: &str, vols: &Volumes, of_p
                 ("readOnly", some(read_only)),
                 ("subPath", some(part)),
             ])),
+            (Some(Vol::Each(claim)), Some(path)) => mounts.push(obj([
+                ("volume", Some(json!(claim))),
+                ("perReplica", Some(json!(true))),
+                ("path", Some(json!(path))),
+                ("readOnly", some(read_only)),
+                ("subPath", some(part)),
+            ])),
             (Some(Vol::Scratch(memory, _)), Some(path)) => mounts.push(obj([
                 ("scratch", Some(json!(volume))),
                 ("path", Some(json!(path))),
@@ -1158,7 +1171,7 @@ fn pod(cx: &mut Cx, mut tpl: Map, at: &str, claims: &Strings, has_priority: bool
     let mut s = cx.map(&mut tpl, "spec", at);
     cx.rest(tpl, at);
 
-    let mut vols: Volumes = claims.iter().map(|(k, v)| (k.clone(), Vol::Claim(v.clone()))).collect();
+    let mut vols: Volumes = claims.iter().map(|(k, v)| (k.clone(), Vol::Each(v.clone()))).collect();
     for mut v in cx.maps(&mut s, "volumes", &sp) {
         let Some(name) = cx.text(&mut v, "name", &sp) else {
             cx.note(&join(&sp, "volumes"), "has a volume without a name: not translated");
@@ -1372,22 +1385,28 @@ fn workload(cx: &mut Cx, root: &mut Map, mut meta: Metadata, kind: &str, out: Ou
                 continue;
             };
             let template = std::mem::take(&mut claim.name);
-            // (As Kubernetes names the claim of a StatefulSet's first pod.)
-            claim.name = format!("{template}-{}-0", meta.name);
             claim.namespace.clone_from(&meta.namespace);
-            if replicas.is_some_and(|n| n > 1) {
-                cx.note(
-                    &tp,
-                    "would be one claim shared by all replicas: kith has no claim of each replica's own yet",
-                );
-            }
             let s = cx.map(&mut t, "spec", &tp);
             let spec_of_claim = claim_spec(cx, s, &join(&tp, "spec"));
             t.remove("status");
             cx.rest(t, &tp);
             if let Some(s) = spec_of_claim {
-                claims.insert(template, claim.name.clone());
-                out.push(make("VolumeClaim", claim, s));
+                // One claim for each replica, as Kubernetes names them: TEMPLATE-NAME-ORDINAL.
+                // (A scale down leaves them: the claims are what the replicas keep.)
+                let base = format!("{template}-{}", meta.name);
+                let wanted = replicas.unwrap_or(1);
+                if wanted > MAX_REPLICAS {
+                    cx.note(
+                        "spec.replicas",
+                        &format!("claims are made for the first {MAX_REPLICAS} replicas only"),
+                    );
+                }
+                for ordinal in 0..wanted.min(MAX_REPLICAS) {
+                    let mut each = claim.clone();
+                    each.name = format!("{base}-{ordinal}");
+                    out.push(make("VolumeClaim", each, s.clone()));
+                }
+                claims.insert(template, base);
             }
         }
     }
@@ -2397,10 +2416,43 @@ spec: { clusterIP: 10.96.0.9, selector: { app: db }, ports: [{ port: 80 }] }
         let claim = find(&all, "VolumeClaim", "pgdata-db-0");
         assert_eq!(claim.spec["size"], "10Gi");
         let db = find(&all, "Workload", "db");
+        // (Each replica's own: the mount names the claims by what they share.)
+        let mount = &db.spec["template"]["containers"][0]["volumeMounts"][0];
+        assert_eq!(mount["volume"], "pgdata-db");
+        assert_eq!(mount["perReplica"], true);
+    }
+
+    #[test]
+    fn statefulset_makes_a_claim_for_each_replica_and_scaling_does_not_touch_the_template() {
+        let three = TEN.replace("replicas: 1\n  serviceName: db", "replicas: 3\n  serviceName: db");
+        let (all, notes) = run(&three);
+        for ordinal in 0..3 {
+            let claim = find(&all, "VolumeClaim", &format!("pgdata-db-{ordinal}"));
+            assert_eq!(claim.spec["size"], "10Gi");
+            assert_eq!(claim.spec["provision"], true);
+        }
         assert_eq!(
-            db.spec["template"]["containers"][0]["volumeMounts"][0]["volume"],
-            "pgdata-db-0"
+            all.iter()
+                .filter(|r| r.kind == "VolumeClaim" && r.metadata.name.starts_with("pgdata-db-"))
+                .count(),
+            3
         );
+        assert!(!notes.iter().any(|n| n.contains("shared by all replicas")), "{notes:?}");
+        // The same template at one replica and at three: a scale is not a restart.
+        let (one, _) = run(TEN);
+        let template = |all: &[Resource]| find(all, "Workload", "db").spec["template"].clone();
+        assert_eq!(template(&one), template(&all));
+    }
+
+    #[test]
+    fn statefulset_claims_are_at_most_what_a_workload_may_have_replicas() {
+        let many = TEN.replace(
+            "replicas: 1\n  serviceName: db",
+            "replicas: 4000000000\n  serviceName: db",
+        );
+        let (all, _) = run(&many);
+        let made = all.iter().filter(|r| r.metadata.name.starts_with("pgdata-db-")).count();
+        assert_eq!(made, 1000);
     }
 
     /// What nearly every chart's pod has, taken as it is written: files from a ConfigMap

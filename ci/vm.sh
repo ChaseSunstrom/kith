@@ -212,7 +212,8 @@ has said something of kithd's (a line containing "kithd"), 1 if it did not.
                    the one on PATH) asking the first as the cluster's admin: the
                    manifests of ci/kube applied, rolled out and running, a
                    StatefulSet's claim given a volume that outlives its
-                   pod, a Job and a CronJob's Job reading all of it through their
+                   pod, a StatefulSet of three with a claim and a volume for each
+                   replica across the nodes, a Job and a CronJob's Job reading all of it through their
                    Services, kubectl create, expose, scale, set image, rollout
                    restart, wait and logs, helm install, upgrade and uninstall
                    with --wait, and nothing left when all is deleted. Skipped

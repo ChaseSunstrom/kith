@@ -290,18 +290,27 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
         let key = resource.key();
         // Where its claimed hardware and its volumes are; one whose claims or volumes do not come
         // to one node waits, with the reason.
-        let node = crate::volumes::together(claims.get(&key), mounts.get(&key));
-        // (And where its exit is.)
-        let node = match node.and_then(|node| crate::exits::pinned(store, resource, node)) {
-            Ok(node) => node,
-            Err(why) => {
-                waiting.extend((0..count).map(|replica| (format!("{key}#{replica}"), why.clone())));
-                continue;
-            }
+        // (And where its exit is.) A replica that has Volumes of its own (a StatefulSet's claims)
+        // goes where they are, and one whose are not anywhere waits alone.
+        let pin = |replica: u32| {
+            let held = mounts
+                .get(&key)
+                .map(|held| held.clone().and_then(|held| held.of_replica(replica)));
+            let node = crate::volumes::together(claims.get(&key), held.as_ref());
+            node.and_then(|node| crate::exits::pinned(store, resource, node))
         };
+        let own = matches!(mounts.get(&key), Some(Ok(held)) if !held.each.is_empty());
+        let same = if own { None } else { Some(pin(0)) };
         // A Job that is running now: a drain leaves it where it runs.
         let running = resource.kind == "Job" && resource.status.as_ref().is_some_and(|s| s["state"] == "running");
         for replica in 0..count {
+            let node = match same.clone().unwrap_or_else(|| pin(replica)) {
+                Ok(node) => node,
+                Err(why) => {
+                    waiting.insert(format!("{key}#{replica}"), why);
+                    continue;
+                }
+            };
             let bound = resource
                 .status
                 .as_ref()
@@ -313,7 +322,7 @@ fn decide(store: &Store, seen: Seen, grace: Duration, drain: Option<&str>) -> (V
                 requests: less(requests, seated.get(&key).filter(|_| replica == 0)),
                 placement: placement.clone(),
                 bound: bound.map(str::to_string),
-                node: node.clone(),
+                node,
                 running,
             });
         }
@@ -654,6 +663,50 @@ spec:
         assert_eq!(nodes("Workload/default/named"), json!({ "0": "a", "1": "a" }));
         assert_eq!(nodes("NodeWorkload/default/each"), json!({ "0": "a", "1": "b" }));
         assert_eq!(nodes("NodeWorkload/default/each-named"), json!({ "0": "a" }));
+    }
+
+    #[test]
+    fn per_replica_volumes_place_each_replica_on_its_own_and_one_without_waits_alone() {
+        // Replica 0's Volume is on a, 1's on b, 2's is nowhere (its node was removed, say).
+        let cluster = "
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: a }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Node
+metadata: { name: b }
+spec: {}
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data-db-0 }
+spec: { node: a, path: d0 }
+---
+apiVersion: kith.dev/v1
+kind: Volume
+metadata: { name: data-db-1 }
+spec: { node: b, path: d1 }
+---
+apiVersion: kith.dev/v1
+kind: Workload
+metadata: { name: db }
+spec:
+  replicas: 3
+  template:
+    containers: [{ name: run, image: img, volumeMounts: [{ volume: data-db, perReplica: true, path: /d }] }]
+";
+        let mut store = Store::default();
+        for resource in Resource::from_source(cluster).unwrap() {
+            store.apply(resource.unwrap()).unwrap();
+        }
+        let there = |_: &str| (Some((4.0, 8e9)), None);
+        let (fields, _) = plan(&store, &there, Duration::from_secs(300));
+        let (_, db) = fields.iter().find(|(key, _)| key == "Workload/default/db").unwrap();
+        assert_eq!(db["nodes"], json!({ "0": "a", "1": "b" }));
+        let wait = db["unschedulable"]["2"].as_str().unwrap();
+        assert!(wait.contains("data-db-2"), "{wait}");
     }
 
     #[test]

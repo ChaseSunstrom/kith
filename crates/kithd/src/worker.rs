@@ -394,6 +394,7 @@ pub(crate) fn report(store: &Store, who: &Worker, key: &str, said: Option<Value>
                 "observedRevision",
                 "containers",
                 "message",
+                "notes",
             ],
         )?,
         _ => only(key, &said, &["replicas", "containers", "notes"])?,
@@ -554,6 +555,15 @@ pub(crate) fn delete(store: &Store, who: &Worker, key: &str) -> Result<(), Strin
         }
         "Device" | "Seat" if discovered && live.spec["node"] == who.name => Ok(()),
         "Blob" if made_here => Ok(()),
+        // A Volume made for a claim that is gone, whose data is here: the node that removed the
+        // data deletes it (the same list that node removes from, `volumes::wipes`).
+        "Volume"
+            if crate::volumes::wipes(store, who.name)
+                .iter()
+                .any(|dir| key == format!("Volume/{}/{}", dir.namespace, dir.name)) =>
+        {
+            Ok(())
+        }
         _ => Err(refused(key, "it is not this node's to delete")),
     }
 }
@@ -1039,6 +1049,43 @@ spec: { volume: there, every: 1d }
             panic!("a report")
         };
         statuses.pop().unwrap().1
+    }
+
+    #[test]
+    fn a_node_deletes_the_volume_it_removed_the_data_of_and_no_other() {
+        let mut store = store();
+        let volume = |name: &str, node: &str, made: bool| -> Resource {
+            let marked = if made {
+                json!({ crate::volumes::MADE_FOR_CLAIM: "true" })
+            } else {
+                json!({})
+            };
+            serde_json::from_value(json!({
+                "apiVersion": "kith.dev/v1", "kind": "Volume",
+                "metadata": { "name": name, "annotations": marked },
+                "spec": { "node": node, "path": name },
+            }))
+            .unwrap()
+        };
+        // Made for a claim that is gone (there is none), on `w`; the same on `a`; one by hand on `w`.
+        for (name, node, made) in [("gone-w", "w", true), ("gone-a", "a", true), ("by-hand", "w", false)] {
+            store.apply(volume(name, node, made)).unwrap();
+        }
+        let delete = |key: &str| Command::Delete { key: key.into() };
+        assert!(try_as(&store, "w", delete("Volume/default/gone-w")).is_ok());
+        // Not a node's to delete where the data is on another, or where nobody made it for a claim.
+        assert!(try_as(&store, "w", delete("Volume/default/gone-a")).is_err());
+        assert!(try_as(&store, "w", delete("Volume/default/by-hand")).is_err());
+        assert!(try_as(&store, "w", delete("Volume/default/here")).is_err());
+    }
+
+    #[test]
+    fn a_job_report_may_carry_the_notes_kithd_writes_of_it() {
+        // A Job from `kubectl create job` has a restartPolicy, and the controller says so in its
+        // notes: the node that runs it must be able to send them with the rest.
+        let store = store();
+        let said = json!({ "state": "running", "succeeded": 0, "failed": 0, "containers": [], "notes": ["restartPolicy is ignored"] });
+        assert!(try_as(&store, "a", report_of("a", "Job/default/once", said)).is_ok());
     }
 
     #[test]
