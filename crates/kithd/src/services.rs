@@ -27,11 +27,12 @@ use crate::Shared;
 use crate::ingress::{Idle, Limits, Place};
 use futures_util::FutureExt;
 use kith_api::Resource;
-use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PortRef, Protocol, ServiceSpec, WorkloadSpec};
+use kith_api::kinds::{NetworkPolicySpec, Peer, PolicyAction, PolicyRule, PortRef, Protocol, ServiceSpec, WorkloadSpec};
 use kith_api::store::Store;
+use kith_mesh::pod::Egress;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -302,6 +303,62 @@ pub fn admits(store: &Store, workload: &str, node: Option<&str>, from: IpAddr, p
     !chosen
 }
 
+/// What a pod of `workload` may reach: the egress rules of the NetworkPolicies for it, in the
+/// order the store lists them and each is written; `None` when none has an egress rule (the
+/// pod is not held). `prefix`: the mesh's, where there is one: a peer by `node` is that node's
+/// address on it (nothing without a mesh). The peers of a rule are the networks it fits: a
+/// `cidr` is one, `node` and `cidr` together are the node's address if it is within the
+/// cidr, and neither is everything (both families). One that cannot be told apart by
+/// `namespace` or `selector` fits nothing in an allow (as for ingress) and, but for what its
+/// `node` or `cidr` say, everything in a deny. A rule whose peers hold no network is left out
+/// (it would fit anything). Nothing is let through that no rule allows: the node's resolver
+/// too (DNS to the gateway), so a policy that holds a pod must name it.
+pub fn egress_of(store: &Store, workload: &str, prefix: Option<Ipv6Addr>) -> Option<Vec<Egress>> {
+    let target = store.get(workload)?;
+    let specs: Vec<NetworkPolicySpec> = policies(store, target).filter(|spec| !spec.egress.is_empty()).collect();
+    if specs.is_empty() {
+        return None;
+    }
+    let rules = specs.iter().flat_map(|spec| &spec.egress);
+    Some(rules.filter_map(|rule| egress_rule(rule, prefix)).collect())
+}
+
+/// `10.0.0.0/8` as an address and its length; `None` for one that cannot be read, or whose
+/// length is over its family's size (as `within_cidr` holds nothing for it).
+fn parse_cidr(cidr: &str) -> Option<(IpAddr, u8)> {
+    let (address, length) = cidr.split_once('/')?;
+    let address: IpAddr = address.parse().ok()?;
+    let size = if address.is_ipv4() { 32 } else { 128 };
+    Some((address, length.parse::<u8>().ok().filter(|length| *length <= size)?))
+}
+
+fn egress_rule(rule: &PolicyRule, prefix: Option<Ipv6Addr>) -> Option<Egress> {
+    let allow = rule.action == PolicyAction::Allow;
+    let mut to = Vec::new();
+    for peer in &rule.peers {
+        if allow && !told_apart(peer) {
+            continue;
+        }
+        match (&peer.node, &peer.cidr) {
+            // (A node's address is a network of one, if the cidr has it.)
+            (Some(name), cidr) => {
+                let Some(prefix) = prefix else { continue };
+                let address = IpAddr::from(kith_mesh::node_address(prefix, name));
+                if cidr.as_deref().is_none_or(|cidr| within_cidr(cidr, address)) {
+                    to.push((address, 128));
+                }
+            }
+            (None, Some(cidr)) => to.extend(parse_cidr(cidr)),
+            (None, None) => to.extend([(Ipv4Addr::UNSPECIFIED.into(), 0), (Ipv6Addr::UNSPECIFIED.into(), 0)]),
+        }
+    }
+    (rule.peers.is_empty() || !to.is_empty()).then(|| Egress {
+        allow,
+        to,
+        ports: rule.ports.clone(),
+    })
+}
+
 /// The NetworkPolicies for `target`: of its namespace, with a selector its labels fit.
 fn policies<'a>(store: &'a Store, target: &'a Resource) -> impl Iterator<Item = NetworkPolicySpec> + 'a {
     store.list(Some("NetworkPolicy")).filter_map(move |policy| {
@@ -329,12 +386,12 @@ fn policy_report(policy: &Resource) -> Value {
         return json!({ "state": "error", "message": "cannot read this NetworkPolicy" });
     };
     let mut gaps = Vec::new();
-    if !spec.egress.is_empty() {
-        gaps.push("egress rules are not enforced yet");
-    }
+    // (Egress is enforced for a Workload's pods, by `egress_of`'s rules: a pod it holds
+    // reaches only what they allow, its DNS included.)
     if spec
         .ingress
         .iter()
+        .chain(&spec.egress)
         .flat_map(|rule| &rule.peers)
         .any(|peer| !told_apart(peer))
     {
@@ -979,6 +1036,19 @@ pub async fn run(
     let mut unbound = BTreeSet::new();
     let relay = port.map(|port| (me, port));
     loop {
+        // What each pod here may reach, in step with its policies: the owners asked of the pods,
+        // the rules of the store, then the pods told (never both locks at once).
+        let owners = shared.pods.lock().expect("nothing panics holding the pods").owners();
+        if !owners.is_empty() {
+            let held: BTreeMap<String, Option<Vec<Egress>>> = {
+                let state = shared.store.lock().expect("nothing panics holding the store");
+                let of = |owner: &String| egress_of(&state.store, owner, Some(prefix));
+                // (One no longer in the store keeps its rules until its pods go: not let loose.)
+                let present = owners.iter().filter(|owner| state.store.get(owner).is_some());
+                present.map(|owner| (owner.clone(), of(owner))).collect()
+            };
+            crate::pods::hold_again(&shared, &held);
+        }
         let (mut wanted, reports, plans) = {
             let state = shared.store.lock().expect("nothing panics holding the store");
             let table = table(&state.store, prefix);
@@ -1656,6 +1726,97 @@ spec:
         assert!(within_cidr("0.0.0.0/0", "11.0.0.1".parse().unwrap()));
         assert!(!within_cidr("0.0.0.0/0", from) && !within_cidr("10.0.0.0/40", "10.0.0.1".parse().unwrap()));
         assert!(!within_cidr("nonsense", from));
+    }
+
+    /// What a pod of a Workload may reach is its policies' egress rules, in the order they are
+    /// stored and written: a peer by node is the node's address on the mesh, by cidr the
+    /// network, and one that cannot be told apart matches nothing in an allow and everything in
+    /// a deny. A Workload with no egress rule in any policy is not held; the status says enforced.
+    #[test]
+    fn egress_rules_of_a_workload_come_from_its_policies() {
+        use kith_mesh::pod::Egress;
+        let mut store = Store::default();
+        let apply = |store: &mut Store, source: &str| {
+            for resource in Resource::from_source(source).unwrap() {
+                store.apply(resource.unwrap()).unwrap();
+            }
+        };
+        let (web, other) = ("Workload/default/web", "Workload/default/other");
+        let prefix = kith_mesh::prefix(b"test");
+        apply(&mut store, HOME);
+        assert_eq!(egress_of(&store, web, Some(prefix)), None, "no policy");
+        let policy = |name: &str, selector: &str, rules: &str| {
+            format!(
+                "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: {{ name: {name} }}\n\
+                 spec:\n  selector: {selector}\n  ingress: [{{ action: allow }}]\n  egress: {rules}\n"
+            )
+        };
+        let rules = "[{ action: deny, peers: [{ cidr: '10.1.0.0/16' }], ports: [22] }, \
+                     { action: allow, peers: [{ node: b }, { cidr: '10.0.0.0/8' }, { selector: { app: x } }], ports: [443, 80] }, \
+                     { action: allow, peers: [{ node: b, cidr: 'fd00::/8' }] }, { action: deny }]";
+        apply(&mut store, &policy("p", "{ app: web }", rules));
+        let b = IpAddr::from(kith_mesh::node_address(prefix, "b"));
+        let got = egress_of(&store, web, Some(prefix)).unwrap();
+        let net = |cidr: &str| {
+            let (address, bits) = cidr.split_once('/').unwrap();
+            (address.parse().unwrap(), bits.parse().unwrap())
+        };
+        assert_eq!(
+            got,
+            vec![
+                Egress {
+                    allow: false,
+                    to: vec![net("10.1.0.0/16")],
+                    ports: vec![22]
+                },
+                // (The peer by selector holds nothing in an allow; the other two are the rule's.)
+                Egress {
+                    allow: true,
+                    to: vec![(b, 128), net("10.0.0.0/8")],
+                    ports: vec![443, 80]
+                },
+                // (The node's address is within fd00::/8 only if the mesh's prefix is: it is.)
+                Egress {
+                    allow: true,
+                    to: vec![(b, 128)],
+                    ports: vec![]
+                },
+                Egress {
+                    allow: false,
+                    to: vec![],
+                    ports: vec![]
+                },
+            ]
+        );
+        // With no mesh a node has no address: its peer holds nothing.
+        let alone = egress_of(&store, web, None).unwrap();
+        assert_eq!(alone[1].to, vec![net("10.0.0.0/8")]);
+        assert_eq!(alone.len(), 3, "a rule whose peers hold nothing is no rule: it would be any");
+        // Others are not held, nor is a Workload whose policies have ingress rules only.
+        assert_eq!(egress_of(&store, other, Some(prefix)), None);
+        let mut ingress = Store::default();
+        apply(&mut ingress, HOME);
+        let only = "apiVersion: kith.dev/v1\nkind: NetworkPolicy\nmetadata: { name: i }\n\
+                    spec:\n  selector: { app: web }\n  ingress: [{ action: allow }]\n";
+        apply(&mut ingress, only);
+        assert_eq!(egress_of(&ingress, web, Some(prefix)), None);
+        // A deny of peers that cannot be told apart keeps everybody out, in both families.
+        let mut denied = Store::default();
+        apply(&mut denied, HOME);
+        apply(&mut denied, &policy("d", "{ app: web }", "[{ action: deny, peers: [{ namespace: x }] }]"));
+        let all = egress_of(&denied, web, Some(prefix)).unwrap();
+        assert_eq!(all[0].to, vec![net("0.0.0.0/0"), net("::/0")]);
+        // The status says egress is enforced.
+        let report = policy_report(store.get("NetworkPolicy/default/p").unwrap());
+        assert_eq!(report["state"], "partial", "(the selector peer)");
+        assert!(!report["message"].as_str().unwrap().contains("egress rules are not enforced"));
+        let report = policy_report(denied.get("NetworkPolicy/default/d").unwrap());
+        assert!(report["message"].as_str().unwrap().contains("cannot be told apart"));
+        let mut plain = Store::default();
+        apply(&mut plain, HOME);
+        apply(&mut plain, &policy("e", "{ app: web }", "[{ action: allow, peers: [{ cidr: '10.0.0.0/8' }] }]"));
+        let report = policy_report(plain.get("NetworkPolicy/default/e").unwrap());
+        assert_eq!(report, json!({ "state": "enforced", "message": null }));
     }
 
     #[tokio::test]
